@@ -21,16 +21,23 @@ Returns a DOUBLE equal to the number of rows through the current peer group divi
 ## Examples
 
 ```sql
-SELECT v, CUME_DIST() OVER (ORDER BY v) AS result
-FROM (SELECT 10 AS v UNION ALL SELECT 20) AS t ORDER BY v;
+SELECT id,v,CUME_DIST() OVER (ORDER BY v) AS result
+FROM (SELECT 1 id,10 v UNION ALL SELECT 2,10 UNION ALL SELECT 3,20) t
+ORDER BY id;
 ```
 
-Result: returns two rows with the corresponding window values in the order of `v`.
+Result:
+
+```text
+1	10	0.6666666666666666
+2	10	0.6666666666666666
+3	20	1
+```
 
 ## Notes
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`RANK`](rank.md), [`DENSE_RANK`](dense_rank.md), [`PERCENT_RANK`](percent_rank.md), [`ROW_NUMBER`](row_number.md).

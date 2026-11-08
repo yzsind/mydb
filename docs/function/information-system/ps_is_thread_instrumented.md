@@ -39,4 +39,4 @@ YES
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`PS_IS_ACCOUNT_ENABLED`](ps_is_account_enabled.md), [`PS_IS_CONSUMER_ENABLED`](ps_is_consumer_enabled.md), [`PS_IS_INSTRUMENT_DEFAULT_ENABLED`](ps_is_instrument_default_enabled.md), [`PS_IS_INSTRUMENT_DEFAULT_TIMED`](ps_is_instrument_default_timed.md).

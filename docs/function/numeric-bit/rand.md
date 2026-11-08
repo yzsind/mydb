@@ -14,11 +14,11 @@ RAND([seed])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | No | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `seed` | No | Numeric | Seed converted to an integer; SQL NULL initializes seed zero. |
 
 ## Return Value
 
-Returns an integer, fixed-point, or double-precision value; invalid domain, overflow, and `NULL` are handled according to the current SQL mode.
+Returns a DOUBLE in [0,1). An omitted seed advances the unseeded generator. SQL NULL seed follows seed zero, rather than returning NULL.
 
 ## Examples
 
@@ -31,8 +31,12 @@ Result: returns a `[0, 1)` value from a reproducible pseudorandom sequence.
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
+
+- A constant seed initializes one sequence per call position per statement. Rows advance that sequence; repeating the statement reproduces its first value. A column-dependent seed initializes from that row's seed.
+- Bound prepared parameters are statement-constant seeds. Do not assume seeded calls in different expression positions share generator state.
+- This generator is not a cryptographic random source.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[Category reference](README.md).

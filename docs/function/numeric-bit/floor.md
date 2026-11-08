@@ -14,28 +14,28 @@ FLOOR(number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
 
 ## Return Value
 
-Returns a rounded or truncated numeric value in the derived exact/approximate input domain; SQL NULL input returns NULL. ROUND/FLOOR/TRUNCATE differ in direction and decimal-place handling; the example uses exact integer input.
+Returns the largest integral value less than or equal to the input. The derived exact/approximate numeric domain is retained; SQL NULL returns NULL.
 
 ## Examples
 
 ```sql
-SELECT FLOOR(2);
+SELECT FLOOR(1.2), FLOOR(-1.2);
 ```
 
 Result:
 
 ```text
-2
+1	-2
 ```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ABS`](abs.md), [`SIGN`](sign.md), [`CEIL`](ceil.md), [`ROUND`](round.md).

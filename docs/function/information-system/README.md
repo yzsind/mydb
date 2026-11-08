@@ -27,10 +27,11 @@
 | [`PS_IS_INSTRUMENT_DEFAULT_ENABLED`](ps_is_instrument_default_enabled.md) | Reports the enabled flag exposed for a named Performance Schema instrument. |
 | [`PS_IS_INSTRUMENT_DEFAULT_TIMED`](ps_is_instrument_default_timed.md) | Reports the timing flag exposed for a named Performance Schema instrument. |
 | [`PS_IS_THREAD_INSTRUMENTED`](ps_is_thread_instrumented.md) | Returns the current thread-instrumentation compatibility response. |
-| [`PS_THREAD_ACCOUNT`](ps_thread_account.md) | Returns the current authorization account through the compatibility helper. |
-| [`PS_THREAD_ID`](ps_thread_id.md) | Returns a supplied connection identity through the compatibility helper. |
+| [`PS_THREAD_ACCOUNT`](ps_thread_account.md) | Returns the authorization account for the supplied live connection, or NULL. |
+| [`PS_THREAD_ID`](ps_thread_id.md) | Returns a supplied live connection identity, or NULL when it is unknown. |
 | [`PS_THREAD_STACK`](ps_thread_stack.md) | Provides the current compatibility entry point for thread-stack diagnostics. |
 | [`PS_THREAD_TRX_INFO`](ps_thread_trx_info.md) | Provides the current compatibility entry point for thread-transaction diagnostics. |
+| [`RLS_CONTEXT`](rls_context.md) | Reads nullable trusted row-security context text; assignment requires RLS_CONTEXT_ADMIN. |
 | [`ROW_COUNT`](row_count.md) | Returns the affected-row count recorded for the preceding statement. |
 | [`SCHEMA`](schema.md) | Returns the current default database; an alias of `DATABASE`. |
 | [`SESSION_USER`](session_user.md) | Returns the account that established the current connection; an alias of `USER`. |
@@ -44,3 +45,27 @@
 | [`VERSION_MAJOR`](version_major.md) | Returns the major version number of the version string. |
 | [`VERSION_MINOR`](version_minor.md) | Returns the minor version number of the version string. |
 | [`VERSION_PATCH`](version_patch.md) | Returns the patch version number of the version string. |
+
+
+## Session state and compatibility helpers
+
+CURRENT_USER is the matched authorization identity; USER is the login/peer identity.
+DEFINER/INVOKER execution can affect authorization identity. CURRENT_ROLE reports
+the active role set. Session state such as ROW_COUNT, FOUND_ROWS and LAST_INSERT_ID
+must be read after the relevant statement, not after unrelated intervening work.
+
+| Helper | Current implementation |
+| --- | --- |
+| PS_CURRENT_THREAD_ID | Current connection ID |
+| PS_THREAD_ID(id) | Live connection lookup; unknown IDs return NULL; one required argument |
+| PS_THREAD_ACCOUNT(id) | Authorization account of a live connection; unknown IDs return NULL |
+| PS_IS_CONSUMER_ENABLED | Reads current setup_consumers |
+| PS_IS_INSTRUMENT_DEFAULT_ENABLED/TIMED | Reads current setup_instruments flags, not immutable historical defaults |
+| PS_IS_ACCOUNT_ENABLED, PS_IS_THREAD_INSTRUMENTED | Evaluate supplied arguments and return YES; no account/thread instrumentation lookup |
+| PS_THREAD_STACK, PS_THREAD_TRX_INFO | Evaluate arguments and return NULL; no stack/transaction collection |
+
+The constant compatibility responses are not evidence that a target account/thread
+exists or is instrumented. Use actual transaction/lock/system views for diagnosis.
+ICU_VERSION reports a pinned compatibility value, not an ICU implementation guarantee.
+VERSION_MAJOR/MINOR/PATCH describe the advertised MySQL compatibility version, not
+the embedded mydb product version.

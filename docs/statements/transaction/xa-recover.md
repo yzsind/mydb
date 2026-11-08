@@ -14,7 +14,11 @@ Lists prepared XA branches that are currently recoverable.
 
 - Returns formatID, gtrid_length, bqual_length, and data.
 - CONVERT XID requests a readable hexadecimal representation; no branch is modified.
-- Usually requires XA_RECOVER_ADMIN or an equivalent administrative privilege.
+- Requires global XA_RECOVER_ADMIN.
+
+## Transaction and Error Details
+
+Requires global XA_RECOVER_ADMIN. Returns `formatID`, `gtrid_length`, `bqual_length` (integer metadata), and `data` (string). Lengths are bytes, not character counts. Plain data is concatenated gtrid+bqual when printable ASCII; otherwise it is 0x-prefixed uppercase hex. CONVERT XID always uses hex. Empty output means there are no prepared recoverable branches; ACTIVE/ENDED branches are not a prepared recovery list.
 
 ## Examples
 

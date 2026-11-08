@@ -19,20 +19,24 @@ JSON_MERGE_PATCH(json_doc, json_doc [, json_doc] ...)
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns JSON after applying documents left to right using merge-patch rules. Object keys with JSON null in a patch are deleted; arrays/scalars replace the target rather than concatenating it. A SQL NULL document argument returns SQL NULL.
 
 ## Examples
 
 ```sql
-SELECT JSON_MERGE_PATCH('{"a":1}', '{"b":2}');
+SELECT JSON_MERGE_PATCH('{"a":1,"b":[1,2]}','{"a":null,"b":[3]}');
 ```
 
-Result: {"a": 1, "b": 2}
+Result:
+
+```text
+{"b": [3]}
+```
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_MERGE_PRESERVE`](json_merge_preserve.md).

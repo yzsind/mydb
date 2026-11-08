@@ -39,7 +39,7 @@ mydb has a single native transactional storage engine. `ENGINE=InnoDB` and `ENGI
 - `LOAD DATA [LOCAL] INFILE` supports character sets, field/line formats, user variables, SET expressions, sql_mode conversions, and progress; `LOAD XML` supports attributes, nested elements, and `<field name=...>`.
 - `SELECT ... INTO @var`, `SELECT ... INTO OUTFILE|DUMPFILE`, and `DO expr` are available; `LOAD_FILE()` and file exports are uniformly governed by the FILE privilege, `secure_file_priv`, file size limits, and the unified memory governor.
 
-mydb also offers a PostgreSQL 18-style `INSERT|UPDATE|DELETE ... RETURNING` extension that can reference `OLD`/`NEW` row images and returns results through a MySQL result set. RETURNING works for single-target JOIN DML and updatable views; an UPDATE/DELETE RETURNING that actually modifies multiple target tables fails explicitly with 1235. See [`design/dml-returning.md`](design/dml-returning.md) for detailed semantics.
+mydb also offers a PostgreSQL 18-style `INSERT|UPDATE|DELETE ... RETURNING` extension that can reference `OLD`/`NEW` row images and returns results through a MySQL result set. RETURNING works for single-target JOIN DML and updatable views; an UPDATE/DELETE RETURNING that actually modifies multiple target tables fails explicitly with 1235. See [`dml-returning.md`](dml-returning.md) for detailed semantics.
 
 ### 2.3 Queries
 

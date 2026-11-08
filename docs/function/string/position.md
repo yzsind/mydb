@@ -19,7 +19,7 @@ POSITION(substr IN str)
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns a one-based match position, 0 if no match, or SQL NULL for NULL input. POSITION(substr IN str) reverses the parameter order of INSTR(str,substr).
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 3
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LOCATE`](locate.md), [`INSTR`](instr.md), [`FIND_IN_SET`](find_in_set.md), [`STRCMP`](strcmp.md).

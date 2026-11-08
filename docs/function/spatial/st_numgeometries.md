@@ -18,7 +18,7 @@ ST_NUMGEOMETRIES(geometry)
 
 ## Return Value
 
-Returns an integer geometry count, or SQL NULL for SQL NULL input.
+Returns an integer member count: a nonempty single geometry counts as 1; Multi geometries/collections use their member count. SQL NULL returns NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 2
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_GEOMETRYN`](st_geometryn.md), [`ST_GEOMETRYTYPE`](st_geometrytype.md), [`ST_DIMENSION`](st_dimension.md).

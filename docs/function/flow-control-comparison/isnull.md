@@ -14,7 +14,7 @@ ISNULL(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | Any SQL expression | Value tested for SQL NULL; JSON null and the text NULL are not SQL NULL. |
 
 ## Return Value
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`COALESCE`](coalesce.md), [`IFNULL`](ifnull.md), [`NULLIF`](nullif.md), [`IF`](if.md).

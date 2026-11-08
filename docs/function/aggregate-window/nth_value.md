@@ -14,8 +14,8 @@ NTH_VALUE(expr, n) OVER (window_spec)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | Any expression | The value to read |
-| `n` | Yes | Positive integer | 1-based position within the window frame |
+| `expr` | Yes | Any expression | Value to read, preserving NULL. |
+| `n` | Yes | Positive constant integer | One-based frame position; NULL/zero/negative/nonintegral input is invalid. |
 
 ## Return Value
 
@@ -37,8 +37,8 @@ Result:
 
 ## Notes
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FIRST_VALUE`](first_value.md), [`LAST_VALUE`](last_value.md), [`LAG`](lag.md), [`LEAD`](lead.md).

@@ -17,6 +17,12 @@ Lists the status of visible stored procedures or functions.
 - Returns compatibility columns such as Db, Name, Type, Definer, Modified, Created, Security_type, and Comment.
 - LIKE/WHERE are applied to the privilege-filtered result.
 
+## Result and Visibility Details
+
+LIKE matches Name; WHERE Db=... filters schemas. Modified and Created are definition timestamps. Visibility of the routine listing does not guarantee visibility of the stored body.
+
+See [ordered columns and wire types](result-columns.md#show-routine-status). Reading this metadata does not itself commit user DML.
+
 ## Examples
 
 ```sql

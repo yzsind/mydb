@@ -20,7 +20,7 @@ TIMESTAMPDIFF(unit, datetime_expr1, datetime_expr2)
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a signed integer number of complete units from datetime_expr1 to datetime_expr2. Fractional remainders are truncated toward zero; order is the reverse of DATEDIFF(date1,date2). SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -32,8 +32,12 @@ Result: 2
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- MONTH and YEAR count complete calendar units, not a fixed number of seconds. To reverse the sign, swap the two datetime arguments.
+
+- See [interval units](README.md#interval-units) for supported units, compound values, and operator restrictions.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DATE_ADD`](date_add.md), [`DATE_SUB`](date_sub.md), [`ADDTIME`](addtime.md), [`SUBTIME`](subtime.md).

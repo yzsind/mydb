@@ -20,7 +20,7 @@ JSON_SET(json_doc, path, value [, path, value] ...)
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns a JSON document with existing eligible paths replaced and eligible missing members/array positions added. This does not recursively create arbitrary missing parent objects. SQL NULL document or path returns SQL NULL; a SQL NULL value argument becomes JSON null.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: {"a": 1, "b": 2}
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_INSERT`](json_insert.md), [`JSON_REPLACE`](json_replace.md), [`JSON_REMOVE`](json_remove.md), [`JSON_ARRAY_APPEND`](json_array_append.md).

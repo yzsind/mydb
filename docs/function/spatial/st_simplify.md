@@ -31,8 +31,10 @@ Result: `LINESTRING(0 0,2 2)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
+
+- Tolerance must be finite and nonnegative and is measured in coordinate units. Zero tolerance retains nonredundant source detail. Simplification can produce degenerate or invalid topology; it is not a validity repair operation. Use ST_ISVALID/ST_VALIDATE when the application requires a valid surface.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_CENTROID`](st_centroid.md), [`ST_CONVEXHULL`](st_convexhull.md), [`ST_ENVELOPE`](st_envelope.md), [`ST_MAKEENVELOPE`](st_makeenvelope.md).

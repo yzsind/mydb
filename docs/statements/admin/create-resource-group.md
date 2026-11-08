@@ -16,7 +16,7 @@ mydb does not currently support RESOURCE GROUP; valid statements return error 12
 
 ## Behavior and Limitations
 
-- Valid statements uniformly return 1235 (ER_NOT_SUPPORTED_YET), including the case where the target name does not exist.
+- With sufficient statement privileges, recognized valid forms return 1235 (ER_NOT_SUPPORTED_YET), including a nonexistent target. Authentication/authorization errors can precede that unsupported error.
 - No names, attributes, or dedicated catalog entries are recorded; no compatibility success or warning is produced.
 - Syntax errors still return parse errors.
 

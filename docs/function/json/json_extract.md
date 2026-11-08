@@ -19,7 +19,7 @@ JSON_EXTRACT(json_doc, path [, path] ...)
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns a JSON value for one scalar match, or a JSON array when multiple paths/matches require wrapping. No matches return SQL NULL; a matched JSON null remains JSON null. SQL NULL document or path returns SQL NULL. Invalid JSON/path raises an error.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 1
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_VALUE`](json_value.md), [`JSON_KEYS`](json_keys.md), [`JSON_LENGTH`](json_length.md), [`JSON_DEPTH`](json_depth.md).

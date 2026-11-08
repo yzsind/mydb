@@ -14,11 +14,11 @@ COMPRESS(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | String or binary string; convertible scalar where accepted | Input bytes/text; numeric scalars are converted to their display bytes. |
 
 ## Return Value
 
-Compresses the input string and returns binary data. The return type is determined by the function semantics and the input types.
+Returns binary data containing a four-byte little-endian uncompressed byte length followed by a zlib stream. Empty input returns empty bytes; SQL NULL returns NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: mydb
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`UNCOMPRESS`](uncompress.md), [`UNCOMPRESSED_LENGTH`](uncompressed_length.md).

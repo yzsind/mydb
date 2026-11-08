@@ -18,7 +18,7 @@ ST_DIMENSION(geometry)
 
 ## Return Value
 
-Returns an integer geometry dimension, or SQL NULL for SQL NULL input.
+Returns integer topological dimension 0 for points, 1 for linear geometries or 2 for surfaces, taking the greatest dimension in a collection. SQL NULL or an empty geometry has no dimension and returns NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 1
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_GEOMETRYN`](st_geometryn.md), [`ST_NUMGEOMETRIES`](st_numgeometries.md), [`ST_GEOMETRYTYPE`](st_geometrytype.md).

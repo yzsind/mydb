@@ -27,7 +27,11 @@ Returns a 12-byte binary token (`strategy_id:u32 LE + parameter:f64 LE`), or SQL
 SELECT HEX(ST_BUFFER_STRATEGY('point_circle', 32));
 ```
 
-Result: Returns the hexadecimal text of the buffer strategy binary value.
+Result:
+
+```text
+050000000000000000004040
+```
 
 ## Notes
 
@@ -35,4 +39,4 @@ Result: Returns the hexadecimal text of the buffer strategy binary value.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[Category reference](README.md).

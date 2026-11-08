@@ -20,7 +20,7 @@ TIMESTAMPADD(unit, interval, datetime_expr)
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns the temporal value after adding the integer interval in unit. Date-only inputs with date units can produce DATE; time-bearing units require datetime precision. Month/year addition clamps unavailable month-end days. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -32,8 +32,10 @@ Result: `2026-09-01`; a date-only input with a DAY interval produces a date here
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [interval units](README.md#interval-units) for supported units, compound values, and operator restrictions.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DATE_ADD`](date_add.md), [`DATE_SUB`](date_sub.md), [`ADDTIME`](addtime.md), [`SUBTIME`](subtime.md).

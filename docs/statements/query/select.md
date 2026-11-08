@@ -63,6 +63,33 @@ COMMIT;
 
 The first example returns one row; the recursive example returns 1 through 5; the locking read skips candidate rows already locked by other transactions.
 
+## Query Clauses
+
+| Construct | Syntax and effect |
+| --- | --- |
+| Projection | SELECT [ALL/DISTINCT/DISTINCTROW] expressions, wildcards and aliases; DISTINCTROW is a DISTINCT spelling |
+| Sources | Base table/view/CTE, parenthesized derived query with alias/column aliases, supported table functions (including JSON_TABLE), and permitted LATERAL dependencies |
+| Joins | Comma/CROSS/INNER and supported LEFT/RIGHT/FULL/NATURAL/USING forms; ON is a scalar condition. Locking joins have additional restrictions linked above |
+| Filters/grouping | WHERE before grouping; GROUP BY expression lists, WITH ROLLUP, ROLLUP, CUBE and GROUPING SETS; HAVING filters groups |
+| Windows | Function OVER(...) or named WINDOW clauses; PARTITION BY, ORDER BY and supported ROWS/RANGE frames. [Window boundaries](../../mysql80-compatibility.md#window-function-boundaries) lists rejected combinations |
+| Set queries | UNION/INTERSECT/EXCEPT [ALL/DISTINCT]; INTERSECT binds more tightly. Parentheses retain their own ORDER/LIMIT scopes |
+| CTEs | WITH [RECURSIVE] name[(columns)] AS (query); recursive execution is bounded and unsupported recursive shapes fail explicitly |
+| TABLE/VALUES | TABLE table_name and VALUES ROW(...),ROW(...) are query sources, with ordinary outer ORDER/LIMIT |
+| Order/limit | ORDER BY expression [ASC/DESC]; LIMIT count OFFSET offset or LIMIT offset,count. Without ORDER BY no delivery order is guaranteed |
+| Historical source | table FOR SYSTEM_TIME AS OF expression; [history retention](../../mysql80-compatibility.md#time-travel-queries) and DDL epochs limit availability |
+| Plan modifiers | STRAIGHT_JOIN preserves the query block's join order; [hints](../../hints.md) select supported optimizer controls |
+
+`SQL_CALC_FOUND_ROWS` preserves the qualifying count for FOUND_ROWS() despite LIMIT. Result-size/priority/cache compatibility words do not imply a separate MySQL result cache or native scheduling engine; use EXPLAIN for the actual plan. All expression types use the [operator and function rules](../../operators-and-expressions.md). Unqualified objects resolve through the current schema with temporary-table shadowing where supported.
+
+Source reads require SELECT; locking references also follow locking-read authorization and read-only rules. Locks are transaction-duration when the transaction remains open. NOWAIT returns 3572 on conflict; SKIP LOCKED excludes conflicting candidates rather than waiting. RLS filters remain effective before user expressions. See [MVCC and locking](../../mvcc-and-locking.md).
+
+```sql
+TABLE customer ORDER BY id LIMIT 2;
+VALUES ROW(1,'Ada'),ROW(2,'Lin');
+SELECT customer_id,SUM(total) FROM orders
+GROUP BY ROLLUP(customer_id);
+```
+
 ## Table Sampling
 
 Ordinary user tables and partitioned tables accept sampling after the table alias:

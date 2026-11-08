@@ -14,8 +14,8 @@ PS_IS_ACCOUNT_ENABLED(user [, host [, ...]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `user` | Yes | An SQL expression matching the function semantics | The 1st argument; the meaning is determined by the function syntax and description |
-| `host ...` | No, repeatable | An SQL expression matching the function semantics | The 2nd argument; the meaning is determined by the function syntax and description |
+| `user` | Yes | Any SQL expression | Account name expression; this compatibility helper currently does not inspect its value. |
+| `host ...` | No, repeatable | Any SQL expression | Additional evaluated expressions; this compatibility helper does not validate an account. |
 
 ## Return Value
 
@@ -39,4 +39,4 @@ YES
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`PS_IS_THREAD_INSTRUMENTED`](ps_is_thread_instrumented.md), [`PS_IS_CONSUMER_ENABLED`](ps_is_consumer_enabled.md), [`PS_IS_INSTRUMENT_DEFAULT_ENABLED`](ps_is_instrument_default_enabled.md), [`PS_IS_INSTRUMENT_DEFAULT_TIMED`](ps_is_instrument_default_timed.md).

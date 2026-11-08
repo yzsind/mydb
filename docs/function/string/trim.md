@@ -20,7 +20,7 @@ TRIM([[BOTH | LEADING | TRAILING] [remstr] FROM] str)
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns text/binary content after removing repeated whole remstr sequences at the requested end(s). remstr defaults to one space and direction to BOTH. It is substring removal, not removal of an arbitrary character set. SQL NULL input returns NULL.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: mydb
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LPAD`](lpad.md), [`RPAD`](rpad.md), [`LTRIM`](ltrim.md), [`RTRIM`](rtrim.md).

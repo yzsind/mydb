@@ -14,7 +14,7 @@ BIN(number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
 
 ## Return Value
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`OCT`](oct.md), [`CONV`](conv.md), [`BIT_COUNT`](bit_count.md), [`CRC32`](crc32.md).

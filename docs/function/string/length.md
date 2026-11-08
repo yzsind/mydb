@@ -14,11 +14,11 @@ LENGTH(str)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns the encoded byte count as an integer. SQL NULL returns NULL; an empty string has length 0.
 
 ## Examples
 
@@ -30,7 +30,7 @@ Result: 4
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 

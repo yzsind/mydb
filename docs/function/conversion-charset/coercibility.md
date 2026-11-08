@@ -14,11 +14,11 @@ COERCIBILITY(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | Any expression | Expression whose collation precedence is inspected. |
 
 ## Return Value
 
-Returns an integer coercibility level used in collation resolution; numeric expressions have level 5.
+Returns an integer collation-coercibility level from 0 through 6; lower values have stronger precedence. See the category table. This is expression metadata, so COERCIBILITY(NULL) returns 6 rather than SQL NULL.
 
 ## Examples
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CHARSET`](charset.md), [`COLLATION`](collation.md), [`WEIGHT_STRING`](weight_string.md).

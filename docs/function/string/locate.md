@@ -14,13 +14,13 @@ LOCATE(substr, str [, pos])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `substr` | Yes | String | The 1st argument; the substring to search for |
-| `str` | Yes | String | The 2nd argument; The string to process |
-| `pos` | No | Numeric or integer | The 3rd argument; the 1-based position |
+| `substr` | Yes | String | Substring to locate. |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `pos` | No | Numeric or integer | One-based starting position; negative positions are supported only by SUBSTRING and its aliases. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns the one-based match position in str, searching from pos (default 1). No match or a start below 1 returns 0; SQL NULL input returns NULL. Text positions count characters and binary positions count bytes.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: 3
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`INSTR`](instr.md), [`POSITION`](position.md), [`FIND_IN_SET`](find_in_set.md), [`STRCMP`](strcmp.md).

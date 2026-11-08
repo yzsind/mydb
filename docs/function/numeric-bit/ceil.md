@@ -14,23 +14,27 @@ CEIL(number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
 
 ## Return Value
 
-Returns an integer, fixed-point, or double-precision value; invalid domain, overflow, and `NULL` are handled according to the current SQL mode.
+Returns the smallest integral value greater than or equal to the input. The derived exact/approximate numeric domain is retained; SQL NULL returns NULL.
 
 ## Examples
 
 ```sql
-SELECT CEIL(1.2);
+SELECT CEIL(1.2), CEIL(-1.2);
 ```
 
-Result: 2
+Result:
+
+```text
+2	-1
+```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 

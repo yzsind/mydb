@@ -14,12 +14,12 @@ SYS_GET_CONFIG(variable, default)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `variable` | Yes | String | The 1st argument; the name of the sys configuration option |
-| `default` | Yes | An SQL expression matching the function semantics | The 2nd argument; the value to return when the configuration does not exist |
+| `variable` | Yes | String | Name in sys.sys_config. |
+| `default` | Yes | Any SQL expression | Value returned when no configuration value exists. |
 
 ## Return Value
 
-Reads a value from the sys schema configuration, returning a default value when it does not exist. The return type is determined by the function semantics and the input type.
+Returns the sys.sys_config value as text when present; otherwise the supplied fallback converted to text, or NULL when appropriate. Reads configuration state rather than modifying it.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: returns the configured value; returns the default value 64 when it does 
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FORMAT_STATEMENT`](format_statement.md), [`STATEMENT_DIGEST`](statement_digest.md), [`STATEMENT_DIGEST_TEXT`](statement_digest_text.md).

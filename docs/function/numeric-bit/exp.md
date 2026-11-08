@@ -14,11 +14,11 @@ EXP(number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
 
 ## Return Value
 
-Returns a double-precision numeric value; SQL NULL input returns NULL. Invalid real-valued domains and overflow produce the applicable numeric diagnostic; an invalid domain can return NULL.
+Returns the exponential e raised to the operand as DOUBLE. SQL NULL returns NULL. A non-finite overflow raises error 1690/22003.
 
 ## Examples
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LN`](ln.md), [`LOG`](log.md), [`LOG2`](log2.md), [`LOG10`](log10.md).

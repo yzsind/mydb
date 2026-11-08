@@ -14,8 +14,8 @@ DOT_PRODUCT(vector1, vector2)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `vector1` | Yes | VECTOR or valid vector text | The 1st argument; the first vector |
-| `vector2` | Yes | VECTOR or valid vector text | The 2nd argument; the second vector |
+| `vector1` | Yes | VECTOR or valid vector text | The first vector |
+| `vector2` | Yes | VECTOR or valid vector text | The second vector |
 
 ## Return Value
 

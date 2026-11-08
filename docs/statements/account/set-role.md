@@ -19,6 +19,12 @@ Selects the set of roles active in the current session.
 - This changes the privilege closure of the current connection without modifying the account's default roles.
 - Role changes affect subsequent privilege checks and any caches that depend on privilege semantics.
 
+## Privileges and Result Details
+
+No extra administration privilege is needed to activate applicable roles. An explicit role list is checked against direct/applicable and mandatory roles. ALL EXCEPT is subtractive; naming an ungranted exclusion does not grant it. DEFAULT uses the account default set; NONE clears explicit activation. mandatory_roles/activate_all_roles_on_login affect the applicable/default sets.
+
+This is current-session state, not a grant mutation or DDL implicit commit. Use CURRENT_ROLE() and SHOW GRANTS ... USING ... to inspect role context. Changing roles revalidates subsequent privilege-dependent executions, including prepared statements.
+
 ## Examples
 
 ```sql

@@ -393,7 +393,7 @@ union-of-intersections; the four `optimizer_switch` toggles and the
 `INDEX_MERGE`/`NO_INDEX_MERGE` hints are all part of plan-cache semantics.
 When a query does not match a proven shape, execution falls back to the
 general physical plan before consuming input; prepared and text execution can
-reuse the same compiled memo. See [`executor.md`](executor.md) for the full
+reuse the same compiled memo. See [query execution](optimizer-and-operators.md#execution-modes-and-resource-limits) for the full
 execution contract.
 
 The bounds, NULL/step semantics, and currently unsupported shapes of
@@ -1045,7 +1045,7 @@ Current format versions are listed in
 [Storage Format Versions](storage-format-versions.md).
 WAL v28 includes the generic PageDelta, and Zone Map pages are covered by physical backups, checkpoints, and native replication.
 
-> mydb **keeps no legacy dev storage compatibility paths**. Version mismatch → use a new `MYDB_DATA_DIR` or rebuild. Physical format details for tables and B-trees are in [docs/table-and-btree-storage-format.md](table-and-btree-storage-format.md).
+> mydb **keeps no legacy dev storage compatibility paths**. Version mismatch → use a new `MYDB_DATA_DIR` or rebuild. See [Data Directory, Persistence, and Recovery](storage-format.md) for file roles and recovery boundaries.
 
 ### Time Travel Queries
 
@@ -1242,6 +1242,6 @@ The following expression differences are retained:
 - [Startup Configuration](configuration.md) — configuration files, environment variables, and precedence
 - [ALTER TABLE](statements/ddl/alter-table.md) — supported actions, algorithms, and locking boundaries
 - [docs/hints.md](hints.md) — query hint syntax and behavior
-- [DML RETURNING](design/dml-returning.md) — PostgreSQL 18-style extension semantics
-- [docs/table-and-btree-storage-format.md](table-and-btree-storage-format.md) — physical storage format for tables and B-trees
+- [DML RETURNING](dml-returning.md) — PostgreSQL 18-style extension semantics
+- [Data Directory, Persistence, and Recovery](storage-format.md) — file roles, durability, and recovery boundaries
 - [docs/mysql80-metadata-compat-matrix.json](mysql80-metadata-compat-matrix.json) — machine-readable metadata compatibility matrix

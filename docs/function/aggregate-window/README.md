@@ -34,3 +34,66 @@
 | [`VAR_POP`](var_pop.md) | Returns the population variance; also usable as a window aggregate function. |
 | [`VAR_SAMP`](var_samp.md) | Returns the sample variance; also usable as a window aggregate function. |
 | [`VARIANCE`](variance.md) | Returns the population variance, an alias of `VAR_POP`; also usable as a window aggregate function. |
+
+
+## Window partitions and frames
+
+```sql
+function(arguments) OVER (
+  [PARTITION BY expressions]
+  [ORDER BY expressions]
+  [ROWS | RANGE | GROUPS frame_bounds]
+)
+```
+
+PARTITION BY resets the function for each partition. Window ORDER BY defines
+positions/peers and does not order final output: use an outer ORDER BY too.
+Without window ordering, the default frame is the whole partition. With ordering,
+the default is RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW, including the
+current row's peers. SUM/AVG/COUNT and frame-sensitive FIRST/LAST/NTH_VALUE use the
+frame; ranking functions and LAG/LEAD use partition positions.
+
+ROWS counts row offsets; RANGE uses ordered value distances (one appropriate
+numeric/temporal ORDER BY key for offset ranges); GROUPS counts peer groups as a
+mydb extension. Bounds include UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW and
+nonnegative PRECEDING/FOLLOWING offsets. Reversed/invalid bounds and incompatible
+RANGE offset domains are errors. Temporal RANGE offsets use compatible INTERVAL
+units. Supported EXCLUDE forms omit the current row, peers or ties; these extensions
+should not be assumed portable to MySQL 8.0.
+
+RESPECT NULLS is the default. IGNORE NULLS is not implemented and returns an error.
+DISTINCT inside a window aggregate is rejected with an unsupported-context error.
+For distinct window input, deduplicate in a pure inner query before applying OVER. GROUP_CONCAT and ST_COLLECT
+have no window form. ANY_VALUE is a scalar identity, not a grouping exemption.
+
+For the partition's final value, specify a full frame explicitly:
+
+```sql
+SELECT v, LAST_VALUE(v) OVER (
+  ORDER BY v ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING
+) AS partition_last
+FROM (SELECT 10 v UNION ALL SELECT 20) t ORDER BY v;
+```
+
+Both rows have partition_last=20; omitting the frame returns 10 then 20 here.
+Ranking ties require a separate unique ordering key when ROW_NUMBER must be stable.
+
+
+## Grouped input and result domains
+
+COUNT(*) counts rows; other ordinary numeric aggregates skip SQL NULL. COUNT
+returns 0 for empty input, while SUM/AVG/MIN/MAX and statistics return NULL except
+population statistics with one non-NULL value return 0. Sample statistics require
+two non-NULL values. BIT_AND uses all-ones numeric neutrality; BIT_OR/BIT_XOR use 0.
+JSON_ARRAYAGG includes JSON null for SQL NULL values; empty input is SQL NULL.
+JSON_OBJECTAGG rejects NULL keys and keeps the last encountered duplicate key.
+
+Grouped COUNT/SUM/AVG/MIN/MAX and the documented GROUP_CONCAT/ST_COLLECT forms accept
+DISTINCT. COUNT(DISTINCT a,b) excludes a row if any key component is NULL. Collation
+and type conversion affect grouping/equality. JSON_ARRAYAGG has no in-function
+ORDER BY clause; use its window ordering/frame when a stable ordered array is needed.
+
+Integer/DECIMAL SUM uses exact decimal accumulation; AVG adds div_precision_increment
+to its result scale. Floating input uses approximate arithmetic; statistics return
+DOUBLE. Results remain subject to overflow and governed-memory limits. See
+[GROUP_CONCAT](group_concat.md) for its independent byte limit and truncation warning.

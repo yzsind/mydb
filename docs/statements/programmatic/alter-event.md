@@ -22,6 +22,10 @@ Modifies an event's schedule, state, name, attributes, or routine body.
 - Unspecified attributes keep their current values; the new schedule and routine body are validated first and then updated atomically.
 - Disabling an event does not delete its definition; renames and attribute changes update the data dictionary.
 
+## Context, Errors, and Lifecycle
+
+Requires EVENT on the schema; naming another definer has its own privilege check. This is an implicit-commit DDL operation. The [CREATE EVENT schedule](create-event.md) defines interval values/units and timestamp validation. At least the new requested definition must be valid before publication; omitted fields are retained. ENABLE makes a definition eligible, not proof the global scheduler is ON. A renamed/disabled/dropped definition does not roll back already committed event work.
+
 ## Examples
 
 ```sql

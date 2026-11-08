@@ -14,9 +14,8 @@ FIELD(value, value1 [, value2 [, ...]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
-| `value1` | Yes | SQL expression matching the function semantics | The 2nd argument; the meaning is determined by the function syntax and description |
-| `value2 ...` | No, repeatable | SQL expression matching the function semantics | The 3rd argument; the meaning is determined by the function syntax and description |
+| `value` | Yes | Comparable SQL expression | Value to locate; SQL NULL never matches. |
+| `value1 ...` | Yes, repeatable | Comparable SQL expressions | Candidates in one-based order; all strings compare as strings, all numbers numerically, and mixed domains use conversion. |
 
 ## Return Value
 
@@ -25,19 +24,19 @@ Returns a one-based integer position, or 0 if no candidate matches. NULL search 
 ## Examples
 
 ```sql
-SELECT FIELD(2, 2);
+SELECT FIELD('b','a','b'), FIELD('x','a','b'), FIELD(NULL,'a',NULL);
 ```
 
 Result:
 
 ```text
-1
+2	0	0
 ```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`GREATEST`](greatest.md), [`LEAST`](least.md), [`ELT`](elt.md), [`INTERVAL`](interval.md).

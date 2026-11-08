@@ -14,8 +14,8 @@ POW(base, exponent)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `base` | Yes | Numeric or integer | The 1st argument; the base of the power operation |
-| `exponent` | Yes | Numeric or integer | The 2nd argument; the exponent of the power operation |
+| `base` | Yes | Numeric expression | Base of the power. |
+| `exponent` | Yes | Numeric expression | Exponent of the power. |
 
 ## Return Value
 
@@ -31,7 +31,7 @@ Result: 1024
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 

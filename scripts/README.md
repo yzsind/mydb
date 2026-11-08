@@ -30,8 +30,9 @@ optional dependencies.
 | Replication consistency under load | `run_repl_tpcc_consistency.sh`, `run_mysql_repl_tpcc_consistency.sh`, `run_mydb_master_mysql_replica.sh`, `check_benchmarksql_consistency.sql` |
 | Client tooling compatibility | `run_client_compat_matrix.sh`; see [client examples](../examples/README.md) |
 | MySQL 8.0 capture, diff, and generated catalogs | `capture_mysql80_*.py`, `mysql80_*_diff.*`, `generate_mysql80_*.py` |
+| Public documentation links and heading anchors | `check_docs.py`; rejects links requiring private files |
 | Function and collation coverage | `check_function_test_coverage.py`, `generate_legacy_general_weights.py`, `generate_uca9_weights.py` |
-| Function/expression performance comparison | `function_expression_bench.py`, `function_expression_report.py`; see [design and execution notes](../docs-internal/function-expression-benchmark-design.md) |
+| Function/expression performance comparison | `function_expression_bench.py`, `function_expression_report.py` |
 | Storage format documentation, MTR import, and TSAN | `render_storage_format_versions.sh`, `mtr_import.sh`, `run_tsan_btree.sh` |
 | SQL oracle inputs and result checks | `tpch/`, `tpcds/`, `clickbench/`, `*_check_results.py`, `clickbench_results.py` |
 
@@ -46,6 +47,14 @@ not depend on private tools. Historical audit drivers and one-off verification
 regressions (`verify_*_audit.py`, `test_*_audit*.py`, `*_audit_verify.py`, and
 similar) live in `scripts-internal/` and are not needed by public builds or
 default correctness runs.
+
+Pinned MySQL 8.0.46 catalog and status baselines live in
+`tests/fixtures/mysql80/`. They are tracked regression inputs used by Rust tests
+and catalog generators; they must remain available in a clean checkout.
+The information-schema and status capture scripts default to that directory,
+independently of the current working directory. Performance-schema capture
+requires an explicit `--output` path. Capturing new baselines requires the
+pinned reference server; generator checks use the committed JSON files offline.
 
 `storage_oracle.py` provides the physical heap-version and WAL-frame checks used
 by publication and promotion gates. It rejects unsupported formats, bad bounds,
@@ -71,6 +80,7 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_linux_compat.py
 PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_elf_abi.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_function_expression_bench.py
 python3 scripts/check_function_test_coverage.py --check
+python3 scripts/check_docs.py
 python3 scripts/generate_mysql80_information_schema_rust.py --check
 python3 scripts/generate_mysql80_performance_schema_rust.py --check
 scripts/render_storage_format_versions.sh --check

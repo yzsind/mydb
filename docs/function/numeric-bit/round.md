@@ -14,29 +14,29 @@ ROUND(number [, decimals])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `decimals` | No | Numeric or integer | The 2nd argument; the number of decimal places to keep or process |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
+| `decimals` | No | Numeric expression | Decimal places; a negative value operates to the left of the decimal point. |
 
 ## Return Value
 
-Returns the number rounded to the requested decimal places (default 0), preserving the derived exact/approximate numeric domain. Negative decimal places round to tens, hundreds, and so on; SQL NULL input returns NULL. Use TRUNCATE when fractional digits should be discarded without rounding.
+Returns the input rounded to decimals places, default 0. Exact DECIMAL half values round away from zero. Negative decimals round to tens, hundreds, and so on. SQL NULL in either argument returns NULL; the derived type/scale follows the numeric input domain.
 
 ## Examples
 
 ```sql
-SELECT ROUND(2);
+SELECT ROUND(12.55,1), ROUND(-12.55,1), ROUND(125,-1);
 ```
 
 Result:
 
 ```text
-2
+12.6	-12.6	130
 ```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ABS`](abs.md), [`SIGN`](sign.md), [`CEIL`](ceil.md), [`FLOOR`](floor.md).

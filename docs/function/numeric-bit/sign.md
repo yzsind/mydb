@@ -14,28 +14,28 @@ SIGN(number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
 
 ## Return Value
 
-Returns an integer (unsigned for CRC32 and BIT_COUNT). SQL NULL input returns NULL; argument conversion and overflow follow the numeric rules.
+Returns integer -1, 0, or 1 for a negative, zero, or positive converted number. SQL NULL returns NULL.
 
 ## Examples
 
 ```sql
-SELECT SIGN(2);
+SELECT SIGN(-2), SIGN(0), SIGN(2), SIGN(NULL);
 ```
 
 Result:
 
 ```text
-1
+-1	0	1	NULL
 ```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ABS`](abs.md), [`CEIL`](ceil.md), [`FLOOR`](floor.md), [`ROUND`](round.md).

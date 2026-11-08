@@ -14,29 +14,29 @@ MOD(dividend, divisor)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `dividend` | Yes | Numeric expression | The 1st argument; the meaning is determined by the function syntax and description |
-| `divisor` | Yes | Numeric expression | The 2nd argument; the meaning is determined by the function syntax and description |
+| `dividend` | Yes | Numeric expression | Number to divide. |
+| `divisor` | Yes | Numeric expression | Number to divide by; zero produces the division-by-zero diagnostic. |
 
 ## Return Value
 
-Returns the remainder in the derived numeric domain. SQL NULL input or a zero divisor returns NULL; division-by-zero diagnostics follow sql_mode.
+Returns the remainder in the common numeric domain. Its sign follows the dividend. SQL NULL or a zero divisor returns NULL, with the applicable division diagnostic.
 
 ## Examples
 
 ```sql
-SELECT MOD(4, 2);
+SELECT MOD(-7,3), MOD(7,-3);
 ```
 
 Result:
 
 ```text
-0
+-1	1
 ```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DIV`](div.md).

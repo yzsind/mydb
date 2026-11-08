@@ -37,6 +37,10 @@ Result: yourdb
 
 - Text operands use character positions and the resolved collation. When all string operands are binary, matching, positions, and results preserve bytes; mixing binary and text operands returns error 3995. Unsupported pattern backreferences return an explicit error.
 
+- Defaults, flag precedence, supported pattern constructs and SQL escaping are described in [regular expression rules](README.md#regular-expression-rules). Invalid positions, flags or patterns raise SQL errors.
+
+- For example, REGEXP_REPLACE('ab','(a)(b)','$2$1') returns ba. Dollar-number capture references are distinct from SQL backslash escapes.
+
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`REPLACE`](replace.md), [`REGEXP_SUBSTR`](regexp_substr.md), [`REGEXP_INSTR`](regexp_instr.md), [`REGEXP_LIKE`](regexp_like.md).

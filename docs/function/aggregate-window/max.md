@@ -7,7 +7,7 @@ Returns the maximum of non-`NULL` values in the group; also usable as a window a
 ## Syntax
 
 ```sql
-MAX(expr)
+MAX([DISTINCT] expr)
 MAX(expr) OVER (window_spec)
 ```
 
@@ -15,7 +15,7 @@ MAX(expr) OVER (window_spec)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | Any SQL expression | The 1st argument; the expression to evaluate |
+| `expr` | Yes | Any SQL expression | Expression to evaluate. |
 
 ## Return Value
 
@@ -35,8 +35,8 @@ Result:
 
 ## Notes
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MIN`](min.md), [`ANY_VALUE`](any_value.md).

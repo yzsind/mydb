@@ -14,14 +14,14 @@ MASK_INNER(str, margin1, margin2 [, mask_char])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `margin1` | Yes | Integer | The 2nd argument; the meaning is determined by the function syntax and description |
-| `margin2` | Yes | Integer | The 3rd argument; the meaning is determined by the function syntax and description |
-| `mask_char` | No | SQL expression matching the function semantics | The 4th argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `margin1` | Yes | Integer | Number of characters at the left end. |
+| `margin2` | Yes | Integer | Number of characters at the right end. |
+| `mask_char` | No | String | Mask content; the current implementation takes its first character, default X. |
 
 ## Return Value
 
-Masks the middle characters of a string while keeping both ends. The return type is determined by the function semantics and the input types.
+Returns text with the middle masked and the two character margins retained. Default mask is X; only the first supplied mask character is used. Negative margins or SQL NULL return NULL. If margins cover the whole input, it is returned unchanged.
 
 ## Examples
 
@@ -33,8 +33,8 @@ Result: 12XXXXXX90
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MASK_OUTER`](mask_outer.md), [`MASK_PAN`](mask_pan.md), [`MASK_PAN_RELAXED`](mask_pan_relaxed.md), [`MASK_SSN`](mask_ssn.md).

@@ -18,6 +18,12 @@ Atomically renames one or more tables in the declared order.
 - Permitted objects can be swapped or moved across databases within the same statement; privileges are checked against both the source and target schemas.
 - Acquires exclusive metadata locks on the related objects and updates the data dictionary.
 
+## Privileges, Transactions, and Dependencies
+
+Requires ALTER+DROP on each source and CREATE+INSERT on each target. RENAME TABLE operates on the persistent namespace; use ALTER TABLE ... RENAME for a session temporary table. It is rejected under explicit LOCK TABLES (1192) and implicitly commits preceding DML.
+
+Multiple pairs are applied in declaration order with atomic rollback on failure. For a name swap use an intermediate unused name. Both schemas must permit moves and all dependencies must remain valid. Foreign keys/triggers, stable sequence ownership and RLS dependencies can restrict cross-schema moves; referenced policy-subquery tables cannot be renamed while depended on. See [RLS dependencies](../../row-level-security.md#policies).
+
 ## Examples
 
 ```sql

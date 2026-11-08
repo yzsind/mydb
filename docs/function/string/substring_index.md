@@ -14,30 +14,30 @@ SUBSTRING_INDEX(str, delimiter, count)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `delimiter` | Yes | String or binary string | The 2nd argument; the meaning is determined by the function syntax and description |
-| `count` | Yes | Integer | The 3rd argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `delimiter` | Yes | String or binary string | Delimiter whose occurrences are counted. |
+| `count` | Yes | Integer | Repetition count. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns the prefix before count delimiters when count is positive, or the suffix after -count delimiters when negative. Zero count or empty delimiter returns an empty string; too few delimiters preserves the source. SQL NULL input returns NULL. Delimiter matching is case-sensitive.
 
 ## Examples
 
 ```sql
-SELECT SUBSTRING_INDEX('mydb', ',', 2);
+SELECT SUBSTRING_INDEX('a/b/c','/',2), SUBSTRING_INDEX('a/b/c','/',-1);
 ```
 
 Result:
 
 ```text
-mydb
+a/b	c
 ```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SUBSTRING`](substring.md), [`LEFT`](left.md), [`RIGHT`](right.md), [`INSERT`](insert.md).

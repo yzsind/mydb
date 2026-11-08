@@ -30,8 +30,10 @@ Result: `LINESTRING(1 2,2 3)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
+
+- Members must have the requested geometry type and share an SRID. A nonempty LineString needs at least two points; Polygon rings must be closed and have at least four coordinates including the closure. Constructor arguments are not silently skipped when SQL NULL.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`POINT`](point.md), [`POLYGON`](polygon.md), [`MULTIPOINT`](multipoint.md), [`MULTILINESTRING`](multilinestring.md).

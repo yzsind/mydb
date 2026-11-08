@@ -11,3 +11,5 @@
 | Server status | [SHOW PLUGINS](show-plugins.md) · [SHOW OPEN TABLES](show-open-tables.md) · [SHOW PROCESSLIST](show-processlist.md) |
 
 Account-related SHOW statements are listed under [Accounts and privileges](../account/README.md); replication and backup status are in their respective categories.
+
+Extension metadata: [AI objects](../integration/README.md), [API credentials](../account/README.md), [SHOW CREATE POLICY](../security/show-create-policy.md), and [SHOW HTTP STATUS](../integration/show-http-status.md). [Legacy SHOW PROFILE](../replication/show-profiles.md) is an empty compatibility probe, not measured profiling. [Result columns](result-columns.md) provides the exact column order and wire types for core SHOW output.

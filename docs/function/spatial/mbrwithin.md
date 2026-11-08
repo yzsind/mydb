@@ -19,20 +19,24 @@ MBRWITHIN(geometry1, geometry2)
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1/0 when the minimum-bounding-rectangle relationship holds/does not hold. SQL NULL or an empty geometry returns SQL NULL. Both geometries must have the same SRID; this tests rectangles, not the exact topology of the shapes.
 
 ## Examples
 
 ```sql
-SELECT MBRWITHIN(ST_GEOMFROMTEXT('POINT(1 2)'), ST_GEOMFROMTEXT('POINT(2 3)'));
+SELECT MBRWITHIN(ST_GEOMFROMTEXT('POINT(1 2)'),ST_GEOMFROMTEXT('POINT(2 3)'));
 ```
 
-Result: returns 0 or 1, indicating whether the spatial relationship holds.
+Result:
+
+```text
+0
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MBRCONTAINS`](mbrcontains.md), [`MBRCOVERS`](mbrcovers.md), [`MBRCOVEREDBY`](mbrcoveredby.md), [`MBRTOUCHES`](mbrtouches.md).

@@ -14,9 +14,9 @@ CONCAT_WS(separator, str1 [, str2 [, ...]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `separator` | Yes | String or binary string | The 1st argument; the separator used in the concatenated result |
-| `str1` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
-| `str2 ...` | No, repeatable | String | The 3rd argument; the meaning is determined by the function syntax and description |
+| `separator` | Yes | String or binary string | The separator used in the concatenated result |
+| `str1` | Yes | String | First string. |
+| `str2 ...` | No, repeatable | String | Additional strings, in argument order. |
 
 ## Return Value
 
@@ -25,19 +25,19 @@ Returns text/binary concatenation separated by the first argument. A NULL separa
 ## Examples
 
 ```sql
-SELECT CONCAT_WS(',', 'mydb');
+SELECT CONCAT_WS(':','a',NULL,'','b');
 ```
 
 Result:
 
 ```text
-mydb
+a::b
 ```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CONCAT`](concat.md), [`REPEAT`](repeat.md), [`SPACE`](space.md).

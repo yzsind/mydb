@@ -14,11 +14,11 @@ BIT_COUNT(number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
 
 ## Return Value
 
-Returns an integer (unsigned for CRC32 and BIT_COUNT). SQL NULL input returns NULL; argument conversion and overflow follow the numeric rules.
+Returns an integer count of set bits. Numeric evaluation uses an unsigned 64-bit representation; binary-string evaluation counts set bits in the bytes. SQL NULL returns NULL.
 
 ## Examples
 
@@ -34,8 +34,10 @@ Result:
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
+
+- `BIT_COUNT(-1)` uses 64-bit numeric evaluation and returns 64. Explicit binary data is counted byte by byte; a numeric/hex literal and a typed binary string can therefore select different evaluation domains.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`BIN`](bin.md), [`OCT`](oct.md), [`CONV`](conv.md), [`CRC32`](crc32.md).

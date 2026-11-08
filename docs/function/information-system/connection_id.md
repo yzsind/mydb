@@ -16,7 +16,7 @@ This function takes no arguments.
 
 ## Return Value
 
-Returns the thread ID of the current connection. The return type is determined by the function semantics and the input type.
+Returns the current connection identity as an unsigned integer. It is specific to this connection; it is not a query sequence number or a durable cross-restart identifier.
 
 ## Examples
 
@@ -29,8 +29,8 @@ Result: returns the unsigned connection ID of the current connection.
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`PS_CURRENT_THREAD_ID`](ps_current_thread_id.md), [`PS_THREAD_ID`](ps_thread_id.md), [`PS_THREAD_ACCOUNT`](ps_thread_account.md).

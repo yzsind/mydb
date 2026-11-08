@@ -1,67 +1,79 @@
-# mydb Documentation Index
+# mydb Documentation
 
-Last updated: 2026-10-27. This directory contains public product, SQL, deployment,
-execution, and storage documentation.
+Public product, SQL, deployment, and operations documentation. Start with the
+[project README](../README.md) for downloads and a first query.
 
-## Product and SQL
-
-| Document | Contents |
-| --- | --- |
-| [Project README](../README.md) | Product overview, quick start, and build instructions |
-| [Reporting Issues](reporting-issues.md) | Required environment details, logs, reproduction steps, scripts, and an issue template |
-| [Feature Overview](feature-overview.md) | Product capabilities and limitations |
-| [Performance Comparison](performance-comparison.md) | MyDB vs. MySQL measurements, test conditions, and interpretation |
-| [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Compatibility matrix, supported boundaries, and explicit differences |
-| [Data Types](data-types.md) | Declaration, ranges, conversion, comparison, and indexing semantics |
-| [Vector Data and Similarity Search](vector-search.md) | Practical guide to vector storage, working SQL examples, HNSW/IVF, compression, filtering, and recall validation |
-| [Vector Datatypes and Indexes](vector-indexes.md) | Native vector types, HNSW/IVF, WITH options, quantization, query tuning, training, and recovery |
-| [LLM and Embedding Calls](ai.md) | Encrypted API keys, model configuration, text generation, embeddings, permissions, and bounded execution |
-| [Hybrid Search](hybrid-search.md) | RRF/weighted RRF, typed identities, branch windows, SQL composition, explanations, and Agent/RAG examples |
-| [Operators and Expressions](operators-and-expressions.md) | Precedence, NULL handling, and evaluation semantics |
-| [SQL Syntax Capabilities](sql-parser-capabilities.md) | Supported syntax and explicit rejections |
-| [Time Travel Queries](mysql80-compatibility.md#time-travel-queries) | Historical query semantics and support boundaries |
-| [SQL Statement Index](statements/README.md) | Categories, syntax, limitations, and examples |
-| [SQL Function Index](function/README.md) | Function categories and usage notes |
-| [Hints](hints.md) | Index hints and optimizer hints |
-| [generate_series](generate-series.md) | Table function semantics and boundaries |
-| [Sequences](sequences.md) | Catalog-backed counters, caching, durability, strict native replication, failover, diagnostics, and validation |
-| [DML RETURNING](design/dml-returning.md) | Row images, result sets, and compatibility boundaries |
-| [SQL ROWID](rowid.md) | Unsigned physical row addresses, partition tags, direct access, and address reuse |
-
-## Configuration, Deployment, and Operations
+## Getting Started and Deployment
 
 | Document | Contents |
 | --- | --- |
-| [MyDB CLI](mydb-cli.md) | Rust interactive SQL monitor, scripts, output, TLS and client configuration |
-| [Startup Configuration](configuration.md) | Configuration file, CLI, environment variables, sysvars, and precedence |
-| [Hardware and OS Requirements](hardware-and-os-requirements.md) | Supported operating systems, CPU, memory and storage expectations, and sizing guidance |
-| [Server Limits and Specifications](limits.md) | Hard-coded and configurable capacity limits: schema objects, storage, connections, memory, parallelism, and subsystem caps |
+| [Project README](../README.md) | Downloads, quick start, building, and client examples |
+| [Feature Overview](feature-overview.md) | Capabilities, limitations, and release maturity |
+| [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Supported behavior, intentional differences, and migration boundaries |
+| [MyDB CLI](mydb-cli.md) | Interactive SQL, scripts, output, TLS, and client settings |
+| [Startup Configuration](configuration.md) | Configuration files, CLI, environment variables, system variables, and precedence |
+| [Hardware and OS Requirements](hardware-and-os-requirements.md) | Platforms, toolchains, memory, storage, and sizing |
 | [Docker](docker.md) | Image build, deployment, and container management |
-| [Backup and Recovery](backup-and-recovery.md) | Online full backups, WAL archiving, read-only queries, PITR, writable recovery, verification, export/import, and retention management |
-| [Native Replication](native-replication.md) | WAL-based physical replication, role switching, and operations |
-| [Performance Schema](performance-schema.md) | System tables, collection, memory, and diagnostics |
-| [SHOW STATUS](show-status.md) | Status variables and compatibility matrix |
-| [Error Codes](error-codes.md) | MySQL error catalog and the mydb diagnostics model |
-| [ANALYZE TABLE](statements/admin/analyze-table.md) | Statistics collection and concurrency boundaries |
-| [Online Column Type Change](online-column-type-change.md) | Supported scope, consistency, resources, and recovery |
+| [Reporting Issues](reporting-issues.md) | Environment details, logs, and reproducible issue reports |
 
-## Query Execution and Storage
+## SQL Reference
 
 | Document | Contents |
 | --- | --- |
-| [Optimizer and Operators](optimizer-and-operators.md) | CBO, access paths, physical operators, and plan diagnostics |
-| [Executor](executor.md) | Row-based, vectorized, streaming, and compiled executor constraints |
-| [MVCC and Locking](mvcc-and-locking.md) | Row versions, snapshots, undo, locks, and deadlock diagnostics |
-| [Storage Format Overview](storage-format.md) | Data directory, pages, indexes, logs, and recovery |
-| [Table and B-tree Byte Format](table-and-btree-storage-format.md) | Field-by-field format of heap, rows, LOBs, and B-trees |
-| [Format Versions](storage-format-versions.md) | Current storage format versions |
+| [SQL Statements](statements/README.md) | Statement categories, syntax, examples, and limitations |
+| [SQL Functions](function/README.md) | Function categories and usage |
+| [Data Types](data-types.md) | Ranges, conversion, comparison, and indexing semantics |
+| [Operators and Expressions](operators-and-expressions.md) | Precedence, NULL handling, and evaluation |
+| [SQL Syntax Capabilities](sql-parser-capabilities.md) | Supported syntax and explicit rejections |
+| [Hints](hints.md) | Index, join, parallelism, and query hints |
+| [DML RETURNING](dml-returning.md) | OLD/NEW row images and result-set semantics |
+| [Sequences](sequences.md) | Counters, caching, durability, and replication |
+| [SQL ROWID](rowid.md) | Physical addresses, direct access, lifetime, and reuse |
+| [generate_series](generate-series.md) | Table function syntax, types, and boundaries |
+| [Time Travel Queries](mysql80-compatibility.md#time-travel-queries) | Historical query semantics and retention boundaries |
+| [XML Functions](xml-functions.md) | XPath support, ExtractValue, UpdateXML, and diagnostics |
 
-## Machine-Readable Material
+## Search, AI, and APIs
 
-- The [metadata compatibility matrix](mysql80-metadata-compat-matrix.json) and the [protocol compatibility matrix](mysql80-protocol-compat-matrix.json).
-- Pinned MySQL 8.0.46 baselines: [INFORMATION_SCHEMA](fixtures/mysql80-information-schema-8.0.46.json), [Performance Schema](fixtures/mysql80-performance-schema-8.0.46.json), [SHOW STATUS](fixtures/mysql80-show-status-8.0.46.json).
-- [Unicode license](UNICODE-LICENSE.txt).
+| Document | Contents |
+| --- | --- |
+| [Vector Search Guide](vector-search.md) | Vector storage, similarity queries, index selection, and recall validation |
+| [Vector Index Reference](vector-indexes.md) | HNSW/IVF options, quantization, training, and diagnostics |
+| [Full-Text Search](fulltext-search.md) | MATCH, search modes, BM25, ngram, and limits |
+| [Hybrid Search](hybrid-search.md) | Reciprocal rank fusion, branch windows, and relational semantics |
+| [Spatial Indexes](spatial-indexes.md) | Spatial queries, transactions, persistence, and backup |
+| [LLM and Embedding Calls](ai.md) | Models, encrypted credentials, permissions, generation, and embeddings |
+| [HTTP SQL Functions](http.md) | Bounded outbound HTTP/HTTPS calls from SQL |
+| [REST SQL API](rest-api.md) | Authentication, sessions, transactions, and streaming results |
+| [MCP Server](mcp.md) | AI client tools, SQL sessions, authentication, and limits |
 
-- [REST SQL API](rest-api.md): authenticated HTTP SQL, persistent sessions, transactions, and streaming results.
-- [MCP Server](mcp.md) — AI client tools, SQL sessions, authentication, and limits.
-- [HTTP SQL Functions](http.md): bounded outbound HTTP/HTTPS calls from SQL.
+## Operations and Security
+
+| Document | Contents |
+| --- | --- |
+| [Backup and Recovery](backup-and-recovery.md) | Physical backups, WAL archiving, PITR, verification, and retention |
+| [Native Replication](native-replication.md) | Physical replication, role switching, and operations |
+| [MVCC and Locking](mvcc-and-locking.md) | Isolation, locking reads, deadlocks, savepoints, and concurrency diagnostics |
+| [Row-Level Security](row-level-security.md) | Policies, privileges, connection pools, and enforcement boundaries |
+| [Online Column Type Change](online-column-type-change.md) | Supported changes, consistency, resources, and recovery |
+| [Server Limits](limits.md) | Capacity limits and configurable subsystem budgets |
+| [Data Directory, Persistence, and Recovery](storage-format.md) | File roles, physical compatibility, durability, and crash recovery |
+| [Storage Format Versions](storage-format-versions.md) | Generated registry of current physical formats |
+
+## Performance and Diagnostics
+
+| Document | Contents |
+| --- | --- |
+| [Optimizer and Query Execution](optimizer-and-operators.md) | Access paths, join algorithms, execution modes, EXPLAIN, and tuning |
+| [ANALYZE TABLE](statements/admin/analyze-table.md) | Statistics collection and concurrency boundaries |
+| [Performance Schema](performance-schema.md) | Runtime tables, collection, memory, and diagnostics |
+| [SHOW STATUS](show-status.md) | Counters, scope, reset behavior, and compatibility |
+| [Error Codes](error-codes.md) | Error catalog and diagnostic details |
+| [Performance Comparison](performance-comparison.md) | Published measurements, test conditions, and interpretation |
+
+## Machine-Readable References and Licenses
+
+- [Metadata compatibility matrix](mysql80-metadata-compat-matrix.json)
+- [Protocol compatibility matrix](mysql80-protocol-compat-matrix.json)
+- [REST OpenAPI 3.1](rest-openapi.json)
+- [Unicode license](UNICODE-LICENSE.txt)

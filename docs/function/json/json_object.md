@@ -31,8 +31,8 @@ Result: {"a": 1}
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAY`](json_array.md), [`JSON_QUOTE`](json_quote.md), [`JSON_UNQUOTE`](json_unquote.md).

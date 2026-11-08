@@ -20,7 +20,11 @@ Arguments, return type, `NULL` behavior, errors, and limitations are identical t
 SELECT HEX(ST_ASWKB(ST_GEOMFROMTEXT('POINT(1 2)')));
 ```
 
-Result: Returns the hexadecimal text of the WKB for POINT(1 2).
+Result:
+
+```text
+0101000000000000000000F03F0000000000000040
+```
 
 ## Related Functions
 

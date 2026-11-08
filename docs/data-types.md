@@ -159,8 +159,8 @@ tier that can hold `M` bytes. `LONG` is a legacy alias for `MEDIUMTEXT`, and `LO
 legacy alias for `MEDIUMBLOB`.
 
 Large values can be externalized by the storage layer; see
-[`table-and-btree-storage-format.md`](table-and-btree-storage-format.md) for the heap/LOB
-formats. `TEXT`/`BLOB` columns in BTREE indexes usually require a prefix length, and the sum
+[Data Directory, Persistence, and Recovery](storage-format.md) for file roles
+and recovery boundaries. `TEXT`/`BLOB` columns in BTREE indexes usually require a prefix length, and the sum
 of the declared maximum bytes of ordinary column BTREE key parts must not exceed 3,072 bytes.
 
 Under non-strict DDL, a `VARCHAR` whose encoding exceeds 65,535 bytes or an overly wide

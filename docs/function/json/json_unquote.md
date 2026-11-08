@@ -14,11 +14,11 @@ JSON_UNQUOTE(json_doc)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `json_doc` | Yes | JSON document or JSON path/scalar | The 1st argument; the JSON document to process |
+| `json_doc` | Yes | JSON document or valid JSON text | The json document to process |
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns text after decoding a JSON string value and its escapes. Non-string JSON values retain their textual representation; ordinary unquoted text is preserved. SQL NULL returns NULL. Invalid quoted JSON string text raises an error.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: mydb
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAY`](json_array.md), [`JSON_OBJECT`](json_object.md), [`JSON_QUOTE`](json_quote.md).

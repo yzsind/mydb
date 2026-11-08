@@ -23,6 +23,12 @@ Declares a CONTINUE or EXIT condition handler.
 - Handler selection resolves by priority from a specific errno/SQLSTATE/named condition to its category.
 - STACKED diagnostics are available only while a handler executes.
 
+## Context, Errors, and Lifecycle
+
+Handlers are selected by matching errno before SQLSTATE before category; a named condition resolves to its underlying errno/SQLSTATE priority. CONTINUE resumes at the continuation of the failing inner statement, not by retrying it. EXIT leaves the declaring block. Re-entering an active handler is not a way to catch itself indefinitely.
+
+NOT FOUND handles cursor exhaustion and no-data SELECT INTO (1329/02000). Use STACKED while handling the condition and CURRENT for the current diagnostics area. UNDO is unsupported at creation (1235). [Complete cursor example](../examples.md#complete-stored-cursor-example) shows declaration ordering and end-of-data control.
+
 ## Examples
 
 ```sql

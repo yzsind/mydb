@@ -16,25 +16,29 @@ SUBSTRING(str FROM pos [FOR len])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `pos` | Yes | Numeric or integer | The 2nd argument; the 1-based position |
-| `len` | No | Integer | The 3rd argument; the length, interpreted in the function's character or byte semantics |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `pos` | Yes | Numeric or integer | One-based starting position; negative positions are supported only by SUBSTRING and its aliases. |
+| `len` | No | Integer | Requested length; text uses characters and binary input uses bytes. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns text/binary content from one-based pos, optionally limited by len. A negative pos counts backward from the end; pos=0 or nonpositive len returns an empty result. SQL NULL in a supplied argument returns NULL.
 
 ## Examples
 
 ```sql
-SELECT SUBSTRING('mydb', 3, 2);
+SELECT SUBSTRING('mydb',3,2), SUBSTRING('mydb',-2), LENGTH(SUBSTRING('mydb',0));
 ```
 
-Result: db
+Result:
+
+```text
+db	db	0
+```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 

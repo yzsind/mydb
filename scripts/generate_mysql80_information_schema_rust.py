@@ -24,7 +24,7 @@ from _mysql80_metadata import (
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/engine/information_schema.rs"
-FIXTURE = ROOT / "docs/fixtures/mysql80-information-schema-8.0.46.json"
+FIXTURE = ROOT / "tests/fixtures/mysql80/mysql80-information-schema-8.0.46.json"
 CHARACTER_METADATA_SOURCE = (
     ROOT / "src/engine/information_schema_mysql80_character_metadata.rs"
 )

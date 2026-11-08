@@ -14,11 +14,11 @@ FORMAT_BYTES(bytes)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `bytes` | Yes | Integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `bytes` | Yes | Numeric or convertible text | Signed magnitude; output is rounded human-readable text, not an exact numeric conversion. |
 
 ## Return Value
 
-Formats a byte count into human-readable text. The return type is determined by the function semantics and the input type.
+Returns text using bytes and binary multiples (KiB, MiB, GiB, TiB, PiB, EiB). SQL NULL returns NULL. Thresholds are powers of 1024; formatted rounded text is not an exact stored byte count.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 1.00 KiB
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FORMAT_PICO_TIME`](format_pico_time.md), [`FORMAT_TIME`](format_time.md).

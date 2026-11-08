@@ -33,9 +33,9 @@ Result:
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 - User-level locks belong to the current connection and are released when it ends.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`GET_LOCK`](get_lock.md), [`RELEASE_LOCK`](release_lock.md), [`IS_FREE_LOCK`](is_free_lock.md), [`IS_USED_LOCK`](is_used_lock.md).

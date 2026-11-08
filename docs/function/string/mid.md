@@ -7,7 +7,8 @@ Extracts a substring; an alias of `SUBSTRING`. This function shares the same imp
 ## Syntax
 
 ```sql
-MID(str, pos)
+MID(str, pos [, len])
+MID(str FROM pos [FOR len])
 ```
 
 ## Parameters and Return Value

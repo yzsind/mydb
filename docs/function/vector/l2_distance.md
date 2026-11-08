@@ -14,8 +14,8 @@ L2_DISTANCE(vector1, vector2)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `vector1` | Yes | VECTOR or valid vector text | The 1st argument; the first vector |
-| `vector2` | Yes | VECTOR or valid vector text | The 2nd argument; the second vector |
+| `vector1` | Yes | VECTOR or valid vector text | The first vector |
+| `vector2` | Yes | VECTOR or valid vector text | The second vector |
 
 ## Return Value
 
@@ -35,4 +35,4 @@ Result: 5
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DISTANCE`](distance.md), [`COSINE_DISTANCE`](cosine_distance.md), [`DOT_PRODUCT`](dot_product.md), [`MAX_INNER_PRODUCT_DISTANCE`](max_inner_product_distance.md).

@@ -14,12 +14,12 @@ FIND_IN_SET(str, strlist)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `strlist` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `strlist` | Yes | String | Comma-separated candidate list; positions start at 1. |
 
 ## Return Value
 
-Returns an integer computed from the input string(s). SQL NULL arguments return NULL; character-versus-byte interpretation follows the function definition and input type.
+Returns a one-based integer position in the comma-separated list, 0 for no match or an empty list, and SQL NULL for SQL NULL input. A search item containing a comma cannot be represented as a single list member.
 
 ## Examples
 
@@ -35,8 +35,8 @@ Result:
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LOCATE`](locate.md), [`INSTR`](instr.md), [`POSITION`](position.md), [`STRCMP`](strcmp.md).

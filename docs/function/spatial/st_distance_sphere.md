@@ -27,13 +27,17 @@ Returns a DOUBLE distance in meters, or SQL NULL when an argument is SQL NULL or
 SELECT ST_DISTANCE_SPHERE(ST_SRID(POINT(0,0),4326), ST_SRID(POINT(1,0),4326));
 ```
 
-Result: Returns the spherical distance, approximately 111 kilometers.
+Result:
+
+```text
+111194.68229846335
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 - Supports Cartesian SRID 0 interpreted as longitude/latitude degrees and geographic SRS axis order; projected SRSs are rejected. The default radius is 6370986 meters for both cases, not an ellipsoidal distance calculation. A nonpositive radius returns 3706.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_AREA`](st_area.md), [`ST_LENGTH`](st_length.md), [`ST_DISTANCE`](st_distance.md).

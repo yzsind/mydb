@@ -7,31 +7,35 @@ Converts a day number to a date.
 ## Syntax
 
 ```sql
-FROM_DAYS(temporal_value)
+FROM_DAYS(day_number)
 ```
 
 ## Parameters
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `temporal_value` | Yes | Date, time, datetime, or matching text/numeric value | The 1st argument; the meaning is determined by the function syntax and description |
+| `day_number` | Yes | Integer | MySQL day number; not a DATE or a Unix timestamp. |
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a DATE derived from the MySQL day number. Nonpositive day numbers return the zero date; out-of-calendar-range results return NULL with the applicable diagnostic. This is not a Unix epoch day count. SQL NULL in a required input returns NULL.
 
 ## Examples
 
 ```sql
-SELECT FROM_DAYS(739859);
+SELECT FROM_DAYS(740223);
 ```
 
-Result: returns the date corresponding to the day number.
+Result:
+
+```text
+2026-08-30
+```
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`TO_DAYS`](to_days.md), [`TO_SECONDS`](to_seconds.md).

@@ -14,13 +14,13 @@ FORMAT(number, decimals [, locale])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `decimals` | Yes | Numeric or integer | The 2nd argument; the number of decimal places to keep or process |
-| `locale` | No | String or binary string | The 3rd argument; the meaning is determined by the function syntax and description |
+| `number` | Yes | Numeric or integer | Numeric operand; strings use numeric conversion. |
+| `decimals` | Yes | Numeric or integer | Decimal places; a negative value operates to the left of the decimal point. |
+| `locale` | No | String or binary string | Locale name; omitted locale uses en_US. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns formatted text with grouping separators and the requested decimal digits. decimals is clamped to 0..30; omitted locale uses en_US. SQL NULL number/decimals returns NULL. An unknown locale uses the fallback locale with a diagnostic.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: 1,234.50
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`EXPORT_SET`](export_set.md), [`MAKE_SET`](make_set.md), [`LIST_ADD`](list_add.md), [`LIST_DROP`](list_drop.md).

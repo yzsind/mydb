@@ -44,6 +44,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all -- --check
       - run: scripts/render_storage_format_versions.sh --check
+      - run: python3 scripts/check_docs.py
+      - run: python3 scripts/generate_mysql80_information_schema_rust.py --check
+      - run: python3 scripts/generate_mysql80_performance_schema_rust.py --check
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_tests.py
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_storage_oracle.py

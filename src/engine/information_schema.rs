@@ -8135,7 +8135,7 @@ mod tests {
     #[test]
     fn mysql80_46_manifest_covers_all_core_tables_and_column_order() {
         let manifest: serde_json::Value = serde_json::from_str(include_str!(
-            "../../docs/fixtures/mysql80-information-schema-8.0.46.json"
+            "../../tests/fixtures/mysql80/mysql80-information-schema-8.0.46.json"
         ))
         .expect("MySQL 8.0.46 information_schema manifest must be valid JSON");
         assert_eq!(manifest["oracle_mysql_version"], "8.0.46");

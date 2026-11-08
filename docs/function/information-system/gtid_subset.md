@@ -14,12 +14,12 @@ GTID_SUBSET(subset, set)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `subset` | Yes | String | The 1st argument; the meaning is determined by the function syntax and description |
-| `set` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `subset` | Yes | String | GTID set to test. |
+| `set` | Yes | String | GTID set in UUID:interval notation; empty text is the empty set. |
 
 ## Return Value
 
-Determines whether one GTID set is a subset of another. The return type is determined by the function semantics and the input type.
+Returns integer 1 if every interval in subset is contained in set, otherwise 0. SQL NULL returns NULL. Empty text is an empty set; malformed UUIDs/intervals raise GTID-format errors. This is set arithmetic and does not inspect replication progress.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 1
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[Category reference](README.md).

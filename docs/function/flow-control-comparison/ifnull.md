@@ -14,8 +14,8 @@ IFNULL(expr, fallback)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | Any SQL expression | The 1st argument; the expression to evaluate |
-| `fallback` | Yes | Any SQL expression | The 2nd argument; returned when the main expression is NULL |
+| `expr` | Yes | Any SQL expression | Expression to evaluate. |
+| `fallback` | Yes | Any SQL expression | Result expression used only when the first argument is SQL NULL. |
 
 ## Return Value
 
@@ -24,19 +24,19 @@ Returns the first argument when non-NULL and otherwise the fallback. The result 
 ## Examples
 
 ```sql
-SELECT IFNULL('example', 'example');
+SELECT IFNULL(NULL,'fallback'), IFNULL('value','fallback');
 ```
 
 Result:
 
 ```text
-example
+fallback	value
 ```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`COALESCE`](coalesce.md), [`NULLIF`](nullif.md), [`ISNULL`](isnull.md), [`IF`](if.md).

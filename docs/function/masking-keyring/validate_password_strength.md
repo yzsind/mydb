@@ -14,11 +14,11 @@ VALIDATE_PASSWORD_STRENGTH(password)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `password` | Yes | String | The 1st argument; the password to score |
+| `password` | Yes | String | Password text to score using the built-in heuristic. |
 
 ## Return Value
 
-Returns a password strength score. The return type is determined by the function semantics and the input types.
+Returns integer 0, 25, 50, 75 or 100 using the built-in length/character-class heuristic. SQL NULL returns NULL; no password is stored or changed.
 
 ## Examples
 
@@ -26,12 +26,16 @@ Returns a password strength score. The return type is determined by the function
 SELECT VALIDATE_PASSWORD_STRENGTH('A-strong-password-1');
 ```
 
-Result: returns a strength score from 0 to 100.
+Result:
+
+```text
+100
+```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[Category reference](README.md).

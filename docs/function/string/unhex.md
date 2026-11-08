@@ -14,7 +14,7 @@ UNHEX(str)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
 
 ## Return Value
 
@@ -34,8 +34,10 @@ Result:
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
+
+- Odd-length hexadecimal input is interpreted with a leading zero nibble: HEX(UNHEX('F')) returns 0F. Non-hexadecimal input returns NULL; this function returns bytes, not decoded Unicode text.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`HEX`](hex.md), [`QUOTE`](quote.md), [`QUOTE_IDENTIFIER`](quote_identifier.md).

@@ -25,9 +25,15 @@ Has the server write query results directly to a file. `OUTFILE` exports with ro
 - Requires both the `SELECT` privilege on the queried objects and the global `FILE` privilege.
 - The target must be a new file the server can create; existing files are never overwritten.
 - `secure_file_priv`, parent-directory normalization, and symlink checks restrict writable paths. `character_set_filesystem` affects filename interpretation.
-- Both regular and streaming queries write directly to a cursor without full materialization; after success, affected rows and `ROW_COUNT()` report the number of rows written.
+- The exporter consumes ordinary or streaming query output without adding a full-result export buffer. Query operators themselves can still materialize or spill. After success, affected rows and `ROW_COUNT()` report the number of rows written.
 - `DUMPFILE` accepts multiple columns in one row and writes one NUL byte for a SQL NULL field. More than one row returns 1172; a failure may leave a partially written file.
 - The writer buffer is billed by capacity to StorageScratch under unified hard memory admission. `MYDB_MEMORY_TARGET` is an advisory sizing target.
+
+## Privileges, Results, and Boundaries
+
+INTO is accepted after the select list and at the query tail. Prefer the tail; after-select-list/before-locking export positions emit warning 1287. Default OUTFILE formatting is tab-separated fields and newline-separated records, no enclosure, backslash escaping; NULL uses the escaped NULL representation. CHARACTER SET controls output conversion, not filesystem paths.
+
+DUMPFILE writes one row with no separators; zero rows creates an empty file, SQL NULL contributes one NUL byte, and multiple rows returns 1172. Before query execution fails, the newly reserved empty file is removed; an error after writing starts can leave partial bytes. File output is an external side effect and ordinary ROLLBACK does not remove it. Correct a failed output path or remove an unwanted partial file before retrying.
 
 ## Examples
 

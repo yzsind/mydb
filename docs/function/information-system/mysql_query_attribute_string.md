@@ -14,7 +14,7 @@ MYSQL_QUERY_ATTRIBUTE_STRING(attribute_name)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `attribute_name` | Yes | String | The 1st argument; the query attribute name |
+| `attribute_name` | Yes | String | Attribute name in the current protocol command. |
 
 ## Return Value
 
@@ -34,8 +34,10 @@ NULL
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- The client must negotiate/query the protocol attribute capability and attach attributes to this command. Binding an ordinary SQL placeholder or setting @user_variable does not create a query attribute. An absent attribute returns NULL.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SLEEP`](sleep.md), [`BENCHMARK`](benchmark.md), [`LOAD_FILE`](load_file.md).

@@ -34,6 +34,18 @@ WINDOW_NAMES = {
     "NTH_VALUE",
 }
 
+# Extensions with dedicated SQL integration suites rather than oracle fixtures.
+# Keep these explicit so a newly registered function still requires coverage.
+INTEGRATION_SUITES = {
+    "ai.rs": {"AI_GENERATE", "AI_GENERATE_DETAIL", "AI_EMBED", "AI_EMBED_DETAIL"},
+    "xml_functions.rs": {"EXTRACTVALUE", "UPDATEXML"},
+    "rls.rs": {"RLS_CONTEXT"},
+    "vector_datatypes.rs": {
+        "VECTOR_DATATYPE", "VECTOR_FROM_BINARY", "VECTOR_TO_BINARY", "JACCARD_DISTANCE",
+    },
+    "vector_quality.rs": {"HAMMING_DISTANCE"},
+}
+
 
 def names_from_const(path: Path, const_name: str) -> set[str]:
     text = path.read_text()
@@ -76,13 +88,55 @@ def registered_names() -> set[str]:
     aggregate_block = aggregate_block[: aggregate_block.index("\n}")]
     aggregate = set(re.findall(r'"([A-Z0-9_]+)"', aggregate_block))
     aggregate.discard("__HIDDEN_FIRST_VALUE")
-    return scalar | geo | vector | aggregate | WINDOW_NAMES
+    # These handlers dispatch before the scalar match and must not disappear
+    # from the inventory merely because they have a separate implementation.
+    ai_source = (ROOT / "src/engine/ai/runtime.rs").read_text()
+    ai_body = ai_source.split("pub(crate) fn is_function(", 1)[1].split("\n}", 1)[0]
+    ai = set(re.findall(r'"(AI_[A-Z_]+)"', ai_body))
+    xml_source = (ROOT / "src/engine/expr/xml.rs").read_text()
+    xml_body = xml_source.split("pub(crate) fn is_xml(", 1)[1].split("\n}", 1)[0]
+    xml = set(re.findall(r'"([A-Z_]+)"', xml_body))
+    return scalar | geo | vector | aggregate | WINDOW_NAMES | ai | xml
 
 
 def documented_names() -> set[str]:
     names: set[str] = set()
     for path in DOC_ROOT.glob("*/README.md"):
-        names.update(re.findall(r'^\| \[`([A-Z][A-Z0-9_]*)`\]', path.read_text(), re.M))
+        names.update(re.findall(
+            r'^(?:\| |[-*] )\[`?([A-Z][A-Z0-9_]*)`?\]', path.read_text(), re.M
+        ))
+    return names
+
+
+def check_documentation_pages(errors: list[str]) -> None:
+    linked: set[Path] = set()
+    for index in DOC_ROOT.glob("*/README.md"):
+        for name, destination in re.findall(
+            r'^(?:\| |[-*] )\[`?([A-Z][A-Z0-9_]*)`?\]\(([^)]+)\)',
+            index.read_text(), re.M,
+        ):
+            page = (index.parent / destination).resolve()
+            linked.add(page)
+            if not page.is_file():
+                errors.append(f"{index}: missing function page {destination}")
+            elif not re.match(rf"# `?{re.escape(name)}`?\s*\n", page.read_text()):
+                errors.append(f"{page}: title does not match index name {name}")
+    for page in DOC_ROOT.glob("*/*.md"):
+        if page.name != "README.md" and page.resolve() not in linked:
+            errors.append(f"{page}: function page is not linked by its category")
+
+
+def integration_names(errors: list[str]) -> set[str]:
+    names: set[str] = set()
+    for filename, expected in INTEGRATION_SUITES.items():
+        path = TEST_ROOT.parent / filename
+        source = path.read_text()
+        if "#[test]" not in source:
+            errors.append(f"{path}: no integration tests")
+        for name in expected:
+            if not re.search(rf"\b{re.escape(name)}\s*\(", source, re.I):
+                errors.append(f"{path}: missing SQL coverage for {name}")
+        names.update(expected)
     return names
 
 
@@ -138,25 +192,26 @@ def main() -> int:
     documented = documented_names()
     tests = test_names()
     fixtures = fixture_functions(errors)
+    check_documentation_pages(errors)
     # External HTTP functions have deterministic loopback integration tests,
     # rather than MySQL oracle fixtures (MySQL has no corresponding functions).
     catalog = (ROOT / "src/engine/builtin_catalog.rs").read_text()
     external = set(re.findall(r'\("(HTTP_[A-Z_]+)",\s*"http_[a-z_]+"\)', catalog))
+    registered |= external
     external_tests = names_from_const(ROOT / "src/engine/executor/tests/http.rs", "HTTP_TEST_FUNCTIONS")
     if external_tests != external:
         errors.append("HTTP function registrations and live integration coverage differ")
     if not external.issubset(documented):
         errors.append("HTTP function documentation is incomplete")
-    documented -= external
-    registered -= external
+    integration = integration_names(errors) | external
 
     if len(tests) != len(set(tests)):
         errors.append("duplicate function_fixture_test invocation")
     surfaces = {
         "registered": registered,
         "documented": documented,
-        "tests": set(tests),
-        "fixtures": set(fixtures),
+        "tests": set(tests) | integration,
+        "fixtures or integration": set(fixtures) | integration,
     }
     union = set().union(*surfaces.values())
     for label, names in surfaces.items():
@@ -205,7 +260,8 @@ def main() -> int:
 
     print(
         f"registered={len(registered)} documented={len(documented)} "
-        f"fixtures={len(fixtures)} tests={len(tests)} errors={len(errors)}"
+        f"fixtures={len(fixtures)} tests={len(tests)} "
+        f"integration={len(integration)} errors={len(errors)}"
     )
     for error in errors:
         print(f"ERROR: {error}")
