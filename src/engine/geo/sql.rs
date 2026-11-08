@@ -423,21 +423,21 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
         "ST_CENTROID" => {
             let g = one_geom(name, values)?;
             match algo::centroid(&g.geom) {
-                Some(c) => Ok(geom_to_value(Geometry::new(g.srid, Geom::Point(c)))),
+                Some(c) => geom_to_value(Geometry::new(g.srid, Geom::Point(c))),
                 None => Ok(Value::Null),
             }
         }
         "ST_ENVELOPE" => {
             let g = one_geom(name, values)?;
             match algo::envelope(&g.geom) {
-                Some(geom) => Ok(geom_to_value(Geometry::new(g.srid, geom))),
+                Some(geom) => geom_to_value(Geometry::new(g.srid, geom)),
                 None => Ok(Value::Null),
             }
         }
         "ST_CONVEXHULL" => {
             let g = one_geom(name, values)?;
             match algo::convex_hull(&g.geom) {
-                Some(geom) => Ok(geom_to_value(Geometry::new(g.srid, geom))),
+                Some(geom) => geom_to_value(Geometry::new(g.srid, geom)),
                 None => Ok(Value::Null),
             }
         }
@@ -674,10 +674,7 @@ fn st_point_from_geohash(name: &str, values: &[Value]) -> Result<Value, QueryErr
         )
     })?;
     let srid = as_srid(&values[1], name)?;
-    Ok(geom_to_value(Geometry::new(
-        srid,
-        Geom::Point(Coord { x: lon, y: lat }),
-    )))
+    geom_to_value(Geometry::new(srid, Geom::Point(Coord { x: lon, y: lat })))
 }
 
 fn check_count(name: &str, values: &[Value], n: usize) -> Result<(), QueryError> {
@@ -818,8 +815,8 @@ fn as_srid(v: &Value, function: &str) -> Result<u32, QueryError> {
     Ok(srid)
 }
 
-fn geom_to_value(g: Geometry) -> Value {
-    Value::Geometry(write_geometry(&g))
+fn geom_to_value(g: Geometry) -> Result<Value, QueryError> {
+    Ok(Value::Geometry(write_geometry(&g)?))
 }
 
 // ---------------------------------------------------------------------------
@@ -871,7 +868,7 @@ fn from_text(name: &str, values: &[Value], require: Option<u32>) -> Result<Value
             ));
         }
     }
-    Ok(geom_to_value(Geometry::new(srid, geom)))
+    geom_to_value(Geometry::new(srid, geom))
 }
 
 fn from_wkb(name: &str, values: &[Value], require: Option<u32>) -> Result<Value, QueryError> {
@@ -895,7 +892,7 @@ fn from_wkb(name: &str, values: &[Value], require: Option<u32>) -> Result<Value,
             ));
         }
     }
-    Ok(geom_to_value(Geometry::new(srid, geom)))
+    geom_to_value(Geometry::new(srid, geom))
 }
 
 fn geom_from_geojson(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -921,14 +918,14 @@ fn geom_from_geojson(name: &str, values: &[Value]) -> Result<Value, QueryError> 
             std::mem::swap(&mut coord.x, &mut coord.y);
         });
     }
-    Ok(geom_to_value(g))
+    geom_to_value(g)
 }
 
 fn point_ctor(name: &str, values: &[Value]) -> Result<Value, QueryError> {
     check_count(name, values, 2)?;
     let x = as_f64(&values[0])?;
     let y = as_f64(&values[1])?;
-    Ok(geom_to_value(Geometry::new(0, Geom::Point(Coord { x, y }))))
+    geom_to_value(Geometry::new(0, Geom::Point(Coord { x, y })))
 }
 
 fn typed_collection_ctor(
@@ -1021,7 +1018,7 @@ where
         WKB_GEOMETRYCOLLECTION => Geom::GeometryCollection(parts),
         _ => return Err(wrong_type()),
     };
-    Ok(geom_to_value(Geometry::new(srid.unwrap_or(0), geom)))
+    geom_to_value(Geometry::new(srid.unwrap_or(0), geom))
 }
 
 fn make_envelope(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1034,7 +1031,7 @@ fn make_envelope(name: &str, values: &[Value]) -> Result<Value, QueryError> {
     };
     let envelope =
         algo::envelope(&Geom::MultiPoint(vec![a, b])).ok_or_else(|| invalid_gis_data(name))?;
-    Ok(geom_to_value(Geometry::new(left.srid, envelope)))
+    geom_to_value(Geometry::new(left.srid, envelope))
 }
 
 fn swap_xy(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1044,13 +1041,13 @@ fn swap_xy(name: &str, values: &[Value]) -> Result<Value, QueryError> {
 
     let mut geometry = one_geom(name, values)?;
     swap(&mut geometry.geom);
-    Ok(geom_to_value(geometry))
+    geom_to_value(geometry)
 }
 
 fn validate_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> {
     let geometry = one_geom(name, values)?;
     if is_valid(&geometry.geom) {
-        Ok(geom_to_value(geometry))
+        geom_to_value(geometry)
     } else {
         Ok(Value::Null)
     }
@@ -1081,7 +1078,7 @@ fn st_srid(name: &str, values: &[Value]) -> Result<Value, QueryError> {
                 });
             }
             g.srid = target_srid;
-            Ok(geom_to_value(g))
+            geom_to_value(g)
         }
     }
 }
@@ -1123,7 +1120,7 @@ fn xy(name: &str, values: &[Value], x_axis: bool) -> Result<Value, QueryError> {
             } else {
                 Coord { x: c.x, y: nv }
             };
-            Ok(geom_to_value(Geometry::new(g.srid, Geom::Point(newc))))
+            geom_to_value(Geometry::new(g.srid, Geom::Point(newc)))
         }
     }
 }
@@ -1137,7 +1134,7 @@ fn endpoint(name: &str, values: &[Value], start: bool) -> Result<Value, QueryErr
         return Ok(Value::Null);
     }
     let c = if start { cs[0] } else { cs[cs.len() - 1] };
-    Ok(geom_to_value(Geometry::new(g.srid, Geom::Point(c))))
+    geom_to_value(Geometry::new(g.srid, Geom::Point(c)))
 }
 
 fn point_n(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1150,10 +1147,7 @@ fn point_n(name: &str, values: &[Value]) -> Result<Value, QueryError> {
     if n < 1 || n as usize > cs.len() {
         return Ok(Value::Null);
     }
-    Ok(geom_to_value(Geometry::new(
-        g.srid,
-        Geom::Point(cs[(n - 1) as usize]),
-    )))
+    geom_to_value(Geometry::new(g.srid, Geom::Point(cs[(n - 1) as usize])))
 }
 
 fn num_points(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1186,9 +1180,9 @@ fn geometry_n(name: &str, values: &[Value]) -> Result<Value, QueryError> {
             }
         }
     };
-    Ok(sub
-        .map(|s| geom_to_value(Geometry::new(g.srid, s)))
-        .unwrap_or(Value::Null))
+    sub.map(|s| geom_to_value(Geometry::new(g.srid, s)))
+        .transpose()
+        .map(|value| value.unwrap_or(Value::Null))
 }
 
 fn num_interior_rings(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1210,10 +1204,10 @@ fn interior_ring_n(name: &str, values: &[Value]) -> Result<Value, QueryError> {
     if n < 1 || n as usize >= rings.len() {
         return Ok(Value::Null);
     }
-    Ok(geom_to_value(Geometry::new(
+    geom_to_value(Geometry::new(
         g.srid,
         Geom::LineString(rings[n as usize].clone()),
-    )))
+    ))
 }
 
 fn exterior_ring(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1222,10 +1216,7 @@ fn exterior_ring(name: &str, values: &[Value]) -> Result<Value, QueryError> {
         return Ok(Value::Null);
     };
     match rings.first() {
-        Some(r) => Ok(geom_to_value(Geometry::new(
-            g.srid,
-            Geom::LineString(r.clone()),
-        ))),
+        Some(r) => geom_to_value(Geometry::new(g.srid, Geom::LineString(r.clone()))),
         None => Ok(Value::Null),
     }
 }
@@ -1583,10 +1574,7 @@ fn line_interpolate(
         *coords.last().unwrap()
     };
     if !repeated {
-        return Ok(geom_to_value(Geometry::new(
-            geometry.srid,
-            Geom::Point(point_at(step)),
-        )));
+        return geom_to_value(Geometry::new(geometry.srid, Geom::Point(point_at(step))));
     }
     if step == 0.0 {
         return Err(geo_err(
@@ -1607,10 +1595,7 @@ fn line_interpolate(
         )
     })?;
     points.extend((1..=count).map(|index| point_at(step * index as f64)));
-    Ok(geom_to_value(Geometry::new(
-        geometry.srid,
-        Geom::MultiPoint(points),
-    )))
+    geom_to_value(Geometry::new(geometry.srid, Geom::MultiPoint(points)))
 }
 
 fn simplify_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1704,7 +1689,7 @@ fn simplify_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> 
         Ok(())
     }
     simplify(&mut geometry.geom, tolerance)?;
-    Ok(geom_to_value(geometry))
+    geom_to_value(geometry)
 }
 
 fn transform_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> {
@@ -1712,7 +1697,7 @@ fn transform_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError>
     let mut geometry = geom_value(&values[0], name)?;
     let target = as_srid(&values[1], name)?;
     if geometry.srid == target {
-        return Ok(geom_to_value(geometry));
+        return geom_to_value(geometry);
     }
     match (geometry.srid, target) {
         (4326, 3857) => geometry.geom.for_each_coord_mut(&mut |coord| {
@@ -1741,7 +1726,7 @@ fn transform_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError>
         }
     }
     geometry.srid = target;
-    Ok(geom_to_value(geometry))
+    geom_to_value(geometry)
 }
 
 // ---------------------------------------------------------------------------

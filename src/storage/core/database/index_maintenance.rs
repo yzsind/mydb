@@ -3751,7 +3751,7 @@ impl Database {
         // subpartitions. Opening table.id creates an empty parent index and
         // incorrectly sends every cold writer through the heap fallback.
         for storage_id in table.storage_ids() {
-            let value = self.with_index_mut(storage_id, &index.name, |index_file| {
+            let value = self.with_index_read(storage_id, &index.name, |index_file| {
                 let Some((key, _)) = index_file.last_entry()? else {
                     return Ok(Some(0));
                 };
@@ -4817,6 +4817,7 @@ mod concurrent_load_publish_tests {
             data_type: DataType::Int,
             unsigned: false,
             zerofill: false,
+            display_width: None,
             invisible: false,
             nullable: false,
             primary_key: true,

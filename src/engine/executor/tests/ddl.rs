@@ -82,7 +82,7 @@ fn multi_action_alter_is_prevalidated_before_mutation() {
     let err = engine
         .execute("ALTER TABLE t ADD COLUMN b INT, DROP COLUMN missing")
         .unwrap_err();
-    assert_eq!(err.code(), 1054, "{}", err.message());
+    assert_eq!(err.code(), 1091, "{}", err.message());
 
     let columns = rows(engine.execute("SHOW COLUMNS FROM t").unwrap());
     assert_eq!(columns.len(), 1);

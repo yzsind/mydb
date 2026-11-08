@@ -332,6 +332,8 @@ pub struct ViewSchema {
     /// before normalization existed — callers lazily fall back to `sql`.
     #[serde(default)]
     pub definition_normalized: String,
+    #[serde(default)]
+    pub created_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1284,7 +1286,11 @@ impl TableSchema {
                 data_type: data_type_kind_for_result_column(c),
                 nullable: c.source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0,
                 unsigned: c.source.flags & crate::mysql::protocol::UNSIGNED_FLAG != 0,
-                zerofill: false,
+                zerofill: c.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0,
+                display_width: c
+                    .source
+                    .length
+                    .and_then(|length| u16::try_from(length).ok()),
                 invisible: false,
                 auto_increment: false,
                 default: None,
@@ -1939,9 +1945,6 @@ impl TableSchema {
     pub fn bump_schema_version(&mut self) {
         self.schema_version = self.schema_version.saturating_add(1);
         self.system_time_epoch_us = crate::storage::naming::current_unix_ms().saturating_mul(1_000);
-        // Structural DDL may replace a column while retaining its name.
-        // Never publish a histogram sampled from the previous definition.
-        self.stats.explicit_histograms.clear();
         let bindings = self.statistics_definition_bindings();
         let previous = &self.stats.definition_bindings;
         let retained = |kind: &str, name: &str| {
@@ -1950,6 +1953,9 @@ impl TableSchema {
                 .get(&key)
                 .is_some_and(|current| previous.get(&key) == Some(current))
         };
+        self.stats
+            .explicit_histograms
+            .retain(|name, _| retained("c", name));
         let columns_unchanged = self.stats.columns.keys().all(|name| retained("c", name));
         self.stats.columns.retain(|name, _| retained("c", name));
         self.stats.indexes.retain(|name, _| retained("i", name));
@@ -1971,6 +1977,7 @@ impl TableSchema {
     fn statistics_definition_bindings(&self) -> BTreeMap<String, Vec<u8>> {
         let mut bindings = BTreeMap::new();
         if self.stats.columns.is_empty()
+            && self.stats.explicit_histograms.is_empty()
             && self.stats.indexes.is_empty()
             && self
                 .stats
@@ -1981,7 +1988,7 @@ impl TableSchema {
             return bindings;
         }
 
-        for column in &self.columns {
+        for (_, column) in self.iter_visible_columns() {
             let definition = (
                 &column.column_id,
                 &column.data_type,
@@ -2212,6 +2219,8 @@ pub struct ColumnSchema {
     /// display width. No storage-format impact.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub zerofill: bool,
+    #[serde(default)]
+    pub display_width: Option<u16>,
     /// MySQL 8.0.23+ `INVISIBLE` column attribute: excluded from
     /// `SELECT *` and from INSERT column-list-less arity, still fully
     /// addressable by name. SHOW COLUMNS reports `INVISIBLE` in Extra.
@@ -4774,6 +4783,12 @@ impl TableSchema {
         };
         let length: Option<u32> = match &column.data_type {
             DataTypeKind::Bool => Some(1),
+            data_type if data_type.is_integer() && column.zerofill => {
+                column.display_width.map(u32::from)
+            }
+            DataTypeKind::Float { precision, .. } | DataTypeKind::Double { precision, .. } => {
+                precision.map(u32::from)
+            }
             DataTypeKind::Char { len } | DataTypeKind::VarChar { len } => {
                 len.map(|n| (n as u32).saturating_mul(text_max_bytes_per_character()))
             }
@@ -6688,6 +6703,7 @@ mod tests {
                 unsigned: false,
                 invisible: false,
                 zerofill: false,
+                display_width: None,
                 auto_increment: false,
                 default: None,
                 read_backfill_default: None,

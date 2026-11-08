@@ -1477,6 +1477,13 @@ fn prune_subpartition_bucket(
         .len()
         .try_into()
         .ok()?;
+    if part
+        .partitions
+        .iter()
+        .any(|parent| parent.subpartitions.len() != leaf_count as usize)
+    {
+        return None;
+    }
     if leaf_count == 0 {
         return None;
     }

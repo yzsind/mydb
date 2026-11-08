@@ -12,7 +12,7 @@
 SHOW MYDB BACKUP JOBS;
 ```
 
-Lists running and recent durable job history, bounded to 256 entries and ordered newest sequence first. Running work returns immediately; completion must be observed explicitly. Read-only images expose an empty local job list. Reading does not copy data files.
+Lists running and recent durable job history, ordered newest sequence first. Completed history retains up to 256 WAL jobs and, independently, 256 other jobs, so continuous WAL archiving cannot evict recent database-backup results. Running work returns immediately; completion must be observed explicitly. Read-only images expose an empty local job list. Reading does not copy data files.
 
 A RUNNING job restored after process interruption becomes FAILED with Failure_Class=PROCESS_INTERRUPTED; committed repository artifacts are reconciled independently. Retrying is a new request and must take the current publication state into account.
 

@@ -117,7 +117,7 @@ pub(crate) fn srid_mismatch(func: &str, a: u32, b: u32) -> QueryError {
 /// regardless of the byte order the value arrived in.
 pub(crate) fn normalize_internal(bytes: &[u8]) -> Result<Vec<u8>, QueryError> {
     let g = read_geometry(bytes)?;
-    Ok(write_geometry(&g))
+    write_geometry(&g)
 }
 
 /// Validate an internal geometry against a column's subtype / SRID
@@ -159,7 +159,7 @@ pub(crate) fn validate_internal_constraints(
 #[cfg(test)]
 pub(crate) fn parse_wkt_internal(text: &str, srid: u32) -> Result<Vec<u8>, QueryError> {
     let geom = parse_wkt(text)?;
-    Ok(write_geometry(&types::Geometry::new(srid, geom)))
+    write_geometry(&types::Geometry::new(srid, geom))
 }
 
 /// Render an internal geometry as WKT (SRID dropped), used by

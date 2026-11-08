@@ -504,6 +504,7 @@ fn column(name: &str, data_type: DataType, nullable: bool) -> ColumnDef {
         data_type,
         unsigned: false,
         zerofill: false,
+        display_width: None,
         invisible: false,
         nullable,
         primary_key: false,

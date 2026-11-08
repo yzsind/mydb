@@ -49,13 +49,17 @@ fn vector_result_format_is_validated_and_session_local() {
         );
         assert!(session.vector_result_format_text);
     }
-    assert_eq!(
-        engine
-            .execute_with_session(&mut session, "SET GLOBAL vector_result_format='TEXT'")
-            .unwrap_err()
-            .code(),
-        1228
-    );
+    engine
+        .execute_with_session(&mut session, "SET GLOBAL vector_result_format='TEXT'")
+        .unwrap();
+    let inherited = SessionContext::default();
+    assert!(inherited.vector_result_format_text);
+    assert!(!other.vector_result_format_text);
+    engine
+        .execute_with_session(&mut session, "SET GLOBAL vector_result_format='NATIVE'")
+        .unwrap();
+    assert!(!SessionContext::default().vector_result_format_text);
+    assert!(inherited.vector_result_format_text);
     let result = one_row(&engine, &mut session, "SELECT TO_VECTOR('[1,2,3]')");
     assert!(
         matches!(&result[0], Value::Vector(_)),

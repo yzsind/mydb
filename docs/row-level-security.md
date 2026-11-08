@@ -72,6 +72,8 @@ rejected. Tables referenced by policy subqueries cannot be dropped or renamed
 until their dependent policies are altered or removed. This includes
 `RENAME TABLE` and `ALTER TABLE ... RENAME`; a multi-table rename is rejected
 before changing any names. Renaming the table that owns a policy preserves it.
+Destructive column ALTER operations on a table referenced by a policy subquery are also
+rejected before mutation; alter or remove the dependent policy first.
 Each clause retains its creation-time SQL mode, type-related session
 settings and connection collation; ALTER replaces these settings only for a
 changed clause. External-column and function dependency rebinding still needs

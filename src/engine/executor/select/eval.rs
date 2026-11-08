@@ -197,6 +197,17 @@ pub(super) fn input_schema_for_plan_row(row: &PlanRow) -> crate::engine::expr_pr
     }
     let mut schema =
         crate::engine::expr_program::InputSchema::new_with_bound_types(columns, bound_types);
+    schema.mark_numeric_display_columns(row.fields.iter().enumerate().filter_map(
+        |(index, field)| {
+            (field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0).then_some((
+                index,
+                crate::mysql::protocol::numeric_display_width(
+                    field.column_type,
+                    field.source.length,
+                ),
+            ))
+        },
+    ));
     schema.mark_silent_string_columns(row.fields.iter().enumerate().filter_map(
         |(index, field)| {
             plan_expr_uses_silent_implicit_string_conversion(
@@ -1155,6 +1166,33 @@ fn function_arg_with_source_octets(
     row: &PlanRow,
     value: Value,
 ) -> Result<Value, QueryError> {
+    let value = if crate::engine::expr::function_uses_numeric_display(function_name) {
+        let field = match expr {
+            Expr::Identifier(name) => resolve_plan_field(row, None, name).ok(),
+            Expr::CompoundIdentifier(parts) => parts.last().and_then(|name| {
+                resolve_plan_field(
+                    row,
+                    (parts.len() >= 2).then(|| parts[parts.len() - 2].as_str()),
+                    name,
+                )
+                .ok()
+            }),
+            _ => None,
+        };
+        if let Some(field) =
+            field.filter(|field| field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0)
+        {
+            let width = crate::mysql::protocol::numeric_display_width(
+                field.column_type,
+                field.source.length,
+            );
+            crate::engine::expr::format_zerofill_value(value, width)
+        } else {
+            value
+        }
+    } else {
+        value
+    };
     if crate::engine::expr::is_charset_octet_function(function_name) {
         if let Some(collation) = plan_expr_collation(expr, row) {
             return crate::engine::expr::value_in_charset_octets(value, collation.charset);

@@ -62,8 +62,14 @@ fn apply_column_default(
 ) -> Result<(), QueryError> {
     match default {
         Some(expr) if is_current_timestamp_expr(&expr) => {
+            let declared = current_timestamp_expr_fsp(&expr).flatten().unwrap_or(0);
+            let fsp = match table.columns[idx].data_type {
+                DataTypeKind::Timestamp { fsp } | DataTypeKind::DateTime { fsp } => fsp,
+                _ => return Err(error(crate::error::catalog::ER_INVALID_DEFAULT, format!("Invalid default value for '{column_name}'"))),
+            };
+            if declared != fsp { return Err(error(crate::error::catalog::ER_INVALID_DEFAULT, format!("Invalid default value for '{column_name}'"))); }
             table.columns[idx].default = None;
-            table.columns[idx].default_expr = Some("CURRENT_TIMESTAMP".to_string());
+            table.columns[idx].default_expr = Some(if fsp == 0 { "CURRENT_TIMESTAMP".to_string() } else { format!("CURRENT_TIMESTAMP({fsp})") });
         }
         Some(expr) => {
             let value = literal_default_value(&expr)?;
@@ -96,6 +102,7 @@ fn apply_column_default(
             }
             table.columns[idx].default = Some(value);
             table.columns[idx].default_expr = None;
+            validate_literal_column_default(&mut table.columns[idx])?;
         }
         None => {
             table.columns[idx].default = None;
@@ -305,7 +312,24 @@ fn validate_add_index_definition(
     // their `columns[pos]` slot holds the expression SQL text,
     // not a column name. Functional parts have already passed
     // a stricter check inside `compile_index_key_expressions`.
+    validate_mysql_identifier(&index.name)?;
     validate_index_column_names(table, index)?;
+    if index.primary { validate_primary_generated_columns(&index.columns, &table.columns)?; }
+    if index.is_spatial() {
+        if index.columns.len() != 1 || index.unique {
+            return Err(error(crate::error::catalog::ER_SPATIAL_UNIQUE_INDEX, "a SPATIAL index requires one non-unique geometry column"));
+        }
+        if index.has_expression_parts() || index.column_prefix_lengths.iter().any(Option::is_some) {
+            return Err(error(crate::error::catalog::ER_SPATIAL_FUNCTIONAL_INDEX, "SPATIAL indexes require a geometry column without a prefix"));
+        }
+        if !matches!(table.columns[table.column_index(&index.columns[0])?].data_type, DataTypeKind::Geometry { .. }) {
+            return Err(error(crate::error::catalog::ER_SPATIAL_MUST_HAVE_GEOM_COL, "A SPATIAL index may only contain a geometrical type column"));
+        }
+        validate_spatial_columns_not_null(&index.columns, &table.columns)?;
+    }
+    if (index.is_spatial() || index.is_fulltext()) && index.column_directions.iter().any(|direction| *direction == crate::storage::IndexColumnDirection::Desc) {
+        return Err(error(crate::error::catalog::ER_WRONG_USAGE, "SPATIAL/FULLTEXT indexes do not support descending key parts"));
+    }
     let prefix_lengths =
         normalized_index_prefix_lengths(index.column_prefix_lengths.clone(), index.columns.len());
     for (pos, len) in prefix_lengths.iter().enumerate() {
@@ -2758,24 +2782,28 @@ impl Database {
             })
             .ok_or_else(|| {
                 error(
-                    crate::error::catalog::ER_BAD_FIELD_ERROR,
+                    crate::error::catalog::ER_CANT_DROP_FIELD_OR_KEY,
                     format!("unknown column '{column_name}'"),
                 )
             })?;
+        self.reject_policy_dependency_column_ddl(&snapshot)?;
         reject_column_referenced_by_check(&snapshot, column_name)?;
         reject_column_referenced_by_generated(&snapshot, column_name)?;
-        if snapshot
-            .primary_key
-            .iter()
-            .any(|column| column.eq_ignore_ascii_case(column_name))
-        {
-            return Err(error(
-                crate::error::catalog::ER_CANT_REMOVE_ALL_FIELDS,
-                "cannot drop column that is part of PRIMARY KEY",
-            ));
-        }
         let (drop_indexes, rebuild_indexes) =
             plan_index_cascade_for_drop_column(&snapshot, column_name)?;
+        if snapshot.primary_key.iter().any(|name| name.eq_ignore_ascii_case(column_name)) {
+            let mut candidate = snapshot.as_ref().clone();
+            candidate.indexes.retain(|index| !drop_indexes.contains(&index.name));
+            for replacement in rebuild_indexes {
+                if let Some(index) = candidate.indexes.iter_mut().find(|index| index.name == replacement.name) { *index = replacement; }
+            }
+            candidate.columns[target].state = ColumnState::Dropped;
+            candidate.primary_key.retain(|name| !name.eq_ignore_ascii_case(column_name));
+            candidate.build_column_index();
+            validate_auto_increment_schema(&candidate)?;
+            self.rewrite_temp_table_candidate(internal_key, snapshot, candidate, true)?;
+            return Ok(());
+        }
         for index in drop_indexes {
             self.drop_temp_index(internal_key, &index)?;
         }
@@ -3641,15 +3669,9 @@ impl Database {
             // mydb rejected it with 1064.
             return Ok(());
         }
-        let (database, table_name) = split_table_name(DEFAULT_DATABASE, name);
+        let (database, _) = split_table_name(DEFAULT_DATABASE, name);
         check_table_ddl_writable(&database)?;
-        let key = table_key(&database, &table_name);
-        let table = self
-            .catalog_read()?
-            .tables
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| ddl_table_not_found(&name))?;
+        let table = self.table(name)?;
         validate_auto_increment_schema(&table)?;
         if table.auto_increment_column_index().is_none() {
             return Err(error(
@@ -3675,6 +3697,9 @@ impl Database {
     ) -> Result<(), QueryError> {
         use crate::parser::AlterAction as A;
         Self::validate_alter_identifiers(actions)?;
+        if actions.iter().any(|action| matches!(action, A::DropColumn(_) | A::RenameColumn { .. } | A::ModifyColumn(_) | A::ChangeColumn { .. })) {
+            self.reject_policy_dependency_column_ddl(self.table(table_name)?.as_ref())?;
+        }
         if actions.len() <= 1 {
             return Ok(());
         }
@@ -3734,7 +3759,7 @@ impl Database {
                             "cannot drop the only column in a table",
                         ));
                     }
-                    candidate.column_index(column_name)?;
+                    candidate.column_index(column_name).map_err(|_| error(crate::error::catalog::ER_CANT_DROP_FIELD_OR_KEY, format!("Can't DROP '{column_name}'; check that column/key exists")))?;
                     reject_column_referenced_by_check(&candidate, column_name)?;
                     reject_column_referenced_by_generated(&candidate, column_name)?;
                     // P0-8 — same partition-column guard as the single-action
@@ -3742,16 +3767,6 @@ impl Database {
                     // TABLE fails early before any physical work is scheduled.
                     reject_column_referenced_by_partitioning(&candidate, column_name)?;
                     self.fk_reject_column_referenced(&candidate, column_name)?;
-                    if candidate
-                        .primary_key
-                        .iter()
-                        .any(|c| c.eq_ignore_ascii_case(column_name))
-                    {
-                        return Err(error(
-                            crate::error::catalog::ER_CANT_REMOVE_ALL_FIELDS,
-                            "cannot drop column that is part of PRIMARY KEY",
-                        ));
-                    }
                     // Cascade the drop through referencing indexes so the
                     // candidate schema stays consistent (issue #83): a
                     // single-column / functional / special index is removed,
@@ -3772,6 +3787,7 @@ impl Database {
                     }
                     let idx = candidate.column_index(column_name)?;
                     candidate.columns[idx].state = ColumnState::Dropped;
+                    candidate.primary_key.retain(|name| !name.eq_ignore_ascii_case(column_name));
                     candidate.build_column_index();
                 }
                 A::MoveColumn { column, position } => {
@@ -4296,6 +4312,10 @@ impl Database {
                             .find(|existing| existing.name.eq_ignore_ascii_case(index_name))
                         {
                             slot.state = crate::storage::IndexState::Public;
+                            if slot.primary {
+                                table.primary_key = slot.columns.clone();
+                                enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
+                            }
                         }
                         table.stats.modified_rows_since_analyze = table
                             .stats
@@ -4377,6 +4397,10 @@ impl Database {
                         .find(|existing| existing.name.eq_ignore_ascii_case(&index_name))
                     {
                         slot.state = crate::storage::IndexState::Public;
+                        if slot.primary {
+                            table.primary_key = slot.columns.clone();
+                            enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
+                        }
                     }
                     table.stats.modified_rows_since_analyze = table
                         .stats
@@ -4641,18 +4665,6 @@ impl Database {
                 candidate.indexes.push(index.clone());
                 validate_mysql80_partition_compat(&candidate, false)?;
             }
-            if index.primary && !capture_online {
-                for column_name in &index.columns {
-                    if let Some(column) = table
-                        .columns
-                        .iter_mut()
-                        .find(|column| column.name.eq_ignore_ascii_case(column_name))
-                    {
-                        column.nullable = false;
-                    }
-                }
-                table.primary_key = index.columns.clone();
-            }
             if index.primary && capture_online {
                 let final_index = index.clone();
                 let job_id = ddl_txn_id.expect("online prepare owns a transaction");
@@ -4798,6 +4810,10 @@ impl Database {
                     .find(|existing| existing.name.eq_ignore_ascii_case(index_name))
                 {
                     slot.state = crate::storage::IndexState::Public;
+                    if slot.primary {
+                        table.primary_key = slot.columns.clone();
+                        enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
+                    }
                 }
                 table.bump_schema_version();
             }
@@ -5197,10 +5213,11 @@ impl Database {
             .any(|c| c.state != ColumnState::Dropped && c.name.eq_ignore_ascii_case(column_name))
         {
             return Err(error(
-                crate::error::catalog::ER_BAD_FIELD_ERROR,
+                crate::error::catalog::ER_CANT_DROP_FIELD_OR_KEY,
                 format!("unknown column '{column_name}'"),
             ));
         }
+        self.reject_policy_dependency_column_ddl(&snapshot)?;
         reject_column_referenced_by_check(&snapshot, column_name)?;
         reject_column_referenced_by_generated(&snapshot, column_name)?;
         // P0-8 — a column referenced by the table's PARTITION BY /
@@ -5209,16 +5226,6 @@ impl Database {
         // change is scheduled.
         reject_column_referenced_by_partitioning(&snapshot, column_name)?;
         self.fk_reject_column_referenced(&snapshot, column_name)?;
-        if snapshot
-            .primary_key
-            .iter()
-            .any(|c| c.eq_ignore_ascii_case(column_name))
-        {
-            return Err(error(
-                crate::error::catalog::ER_CANT_REMOVE_ALL_FIELDS,
-                "cannot drop column that is part of PRIMARY KEY",
-            ));
-        }
         // MySQL: dropping a column referenced by an index cascades to the
         // index — a single-column / functional / special index is dropped,
         // and a plain composite index drops just that column (issue #83).
@@ -5244,8 +5251,10 @@ impl Database {
         }
         let pos = candidate.column_index(column_name)?;
         candidate.columns[pos].state = ColumnState::Dropped;
+        candidate.primary_key.retain(|name| !name.eq_ignore_ascii_case(column_name));
         candidate.publish_new_row_layout()?;
         candidate.build_column_index();
+        validate_auto_increment_schema(&candidate)?;
         candidate.bump_schema_version();
         let replacements = candidate
             .indexes
@@ -6053,7 +6062,7 @@ impl Database {
                 if table
                     .check_constraints
                     .iter()
-                    .any(|existing| existing.name == added.name)
+                    .any(|existing| existing.name.eq_ignore_ascii_case(&added.name))
                 {
                     return Err(error(
                         crate::error::catalog::ER_CHECK_CONSTRAINT_DUP_NAME,
@@ -6093,7 +6102,7 @@ impl Database {
                 .ok_or_else(|| ddl_table_not_found(&table_name))?;
             let table = Arc::make_mut(table_arc);
             let before = table.check_constraints.len();
-            table.check_constraints.retain(|check| check.name != name);
+            table.check_constraints.retain(|check| !check.name.eq_ignore_ascii_case(name));
             if table.check_constraints.len() != before {
                 table.build_column_index();
                 table.bump_schema_version();
@@ -6139,7 +6148,7 @@ impl Database {
                     .ok_or_else(|| ddl_table_not_found(&table_name))?;
                 self.acquire_table_exclusive(ddl_txn.txn_id, existing.id)?;
                 let mut candidate = (*existing).clone();
-                set_check_enforced_in_candidate::<false>(&mut candidate, name, true)?;
+                set_check_enforced_in_candidate::<true>(&mut candidate, name, true)?;
                 candidate.build_column_index();
                 let check = candidate
                     .check_constraints
@@ -6176,7 +6185,7 @@ impl Database {
                 )
             })?;
             let table = Arc::make_mut(table_arc);
-            set_check_enforced_in_candidate::<false>(table, name, enforced)?;
+            set_check_enforced_in_candidate::<true>(table, name, enforced)?;
             table.build_column_index();
             table.bump_schema_version();
         }
@@ -6719,6 +6728,7 @@ impl Database {
                     }
                     let position = candidate.column_index(column_name)?;
                     candidate.columns[position].state = ColumnState::Dropped;
+                    candidate.primary_key.retain(|name| !name.eq_ignore_ascii_case(column_name));
                     changes_row_shape = true;
                 }
                 A::ModifyColumn(column) => {
@@ -6978,6 +6988,7 @@ impl Database {
         column: ColumnDef,
     ) -> Result<(Arc<TableSchema>, TableSchema, bool), QueryError> {
         let table = self.table_for_column_change(table_name)?;
+        self.reject_policy_dependency_column_ddl(&table)?;
         let mut new_schema = column_def_to_schema(column)?;
         let pos = table
             .columns
@@ -7014,11 +7025,12 @@ impl Database {
         column: ColumnDef,
     ) -> Result<(Arc<TableSchema>, TableSchema, bool), QueryError> {
         let table = self.table_for_column_change(table_name)?;
+        self.reject_policy_dependency_column_ddl(&table)?;
         let mut new_schema = column_def_to_schema(column)?;
         let pos = table
             .columns
             .iter()
-            .position(|c| c.name.eq_ignore_ascii_case(old_name))
+            .position(|c| c.state != ColumnState::Dropped && c.name.eq_ignore_ascii_case(old_name))
             .ok_or_else(|| {
                 error(
                     crate::error::catalog::ER_BAD_FIELD_ERROR,
@@ -7117,6 +7129,10 @@ impl Database {
         new_schema: &ColumnSchema,
     ) -> Result<(), QueryError> {
         let old = &table.columns[pos];
+        if !new_schema.nullable && table.foreign_keys.iter().any(|fk| fk.references_column(&old.name)
+            && (fk.on_delete == ReferentialAction::SetNull || fk.on_update == ReferentialAction::SetNull)) {
+            return Err(error(crate::error::catalog::ER_FK_COLUMN_NOT_NULL, format!("Column '{}' cannot be NOT NULL: needed in a foreign key constraint with SET NULL", old.name)));
+        }
         let type_changed =
             old.data_type != new_schema.data_type || old.unsigned != new_schema.unsigned;
         if !type_changed {
@@ -9696,6 +9712,7 @@ impl Database {
         coerce_row_for_alter_copy_masked(candidate, values, strict, warnings, Some(coercion_mask))?;
         for (idx, column) in candidate.columns.iter().enumerate() {
             if coercion_mask.get(idx).copied().unwrap_or(true)
+                && column.state != ColumnState::Dropped
                 && !column.nullable
                 && matches!(values.get(idx), Some(Value::Null))
             {
@@ -9742,6 +9759,19 @@ impl Database {
         Ok(())
     }
 
+    fn reject_policy_dependency_column_ddl(&self, source: &TableSchema) -> Result<(), QueryError> {
+        let names = self.catalog_read()?.tables.values().filter(|table| table.row_security.version != 0)
+            .map(|table| table.qualified_name()).collect::<Vec<_>>();
+        for name in names {
+            let table = self.table(&name)?;
+            if table.row_security.policies.iter().any(|policy| policy.table_dependencies.iter().any(|(id, _)| *id == source.object_id)) {
+                return Err(error(crate::error::catalog::ER_ROW_SECURITY_POLICY,
+                    "Table is referenced by a row security policy; alter or drop dependent policies before changing dependency columns"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn rename_column(
         &self,
         table_name: &str,
@@ -9753,6 +9783,7 @@ impl Database {
         check_table_ddl_writable(&database)?;
         let key = table_key(&database, &table_only);
         let source = self.table(table_name)?;
+        self.reject_policy_dependency_column_ddl(&source)?;
         let dependent_keys = source
             .fk_referenced_by
             .iter()
@@ -9773,7 +9804,7 @@ impl Database {
             let pos = table
                 .columns
                 .iter()
-                .position(|c| c.name.eq_ignore_ascii_case(old_name))
+                .position(|c| c.state != ColumnState::Dropped && c.name.eq_ignore_ascii_case(old_name))
                 .ok_or_else(|| {
                     error(
                         crate::error::catalog::ER_BAD_FIELD_ERROR,
@@ -9789,7 +9820,7 @@ impl Database {
                 && table
                     .columns
                     .iter()
-                    .any(|c| c.name.eq_ignore_ascii_case(new_name))
+                    .any(|c| c.state != ColumnState::Dropped && c.name.eq_ignore_ascii_case(new_name))
             {
                 return Err(error(
                     crate::error::catalog::ER_DUP_FIELDNAME,
@@ -10062,6 +10093,10 @@ impl Database {
             let catalog = self.catalog_read()?;
             let kind = if let Some(table) = catalog.tables.get(&old_key) {
                 self.check_ddl_table_lock(table.id)?;
+                if old_database != new_database && !self.sequences.owned_definitions(&[table.object_id]).is_empty() {
+                    return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                        "moving a table with owned sequences to another database is not supported"));
+                }
                 RenameKind::Table {
                     id: table.id,
                     index_names: table.indexes.iter().map(|i| i.name.clone()).collect(),
@@ -10089,6 +10124,7 @@ impl Database {
                     format!("unknown database '{new_database}'"),
                 ));
             }
+            if old_key == new_key { return Ok((old_database, old_table, None)); }
             if catalog.tables.contains_key(&new_key)
                 || catalog.views.contains_key(&new_key)
                 || catalog.sequences.contains_key(&new_key)
@@ -10488,6 +10524,7 @@ fn apply_column_charset_defaults(
     column.charset = Some(charset_name.to_string());
     column.collation = Some(collation_name.to_string());
     enforce_varchar_encoded_width(column, charset_name)?;
+    validate_literal_column_default(column)?;
     Ok(())
 }
 
@@ -10784,6 +10821,13 @@ fn coerce_row_for_alter_copy_masked(
         ));
     }
     for (idx, (value, column)) in values.iter_mut().zip(&table.columns).enumerate() {
+        // A physical rewrite retires the old row layouts. Keeping tombstone
+        // values here would allocate fresh LOB chains that the active layout
+        // never encodes, leaking them even after OPTIMIZE/COPY.
+        if column.state == ColumnState::Dropped {
+            *value = Value::Null;
+            continue;
+        }
         if coercion_mask.is_some_and(|mask| !mask.get(idx).copied().unwrap_or(true)) {
             continue;
         }
@@ -13645,7 +13689,11 @@ pub(crate) fn partition_count_from_def(
             })
         })?;
         let sub_count = if explicit_sub_count > 0 {
+            let expected = def.partitions[0].subpartitions.len();
             for item in &def.partitions {
+                if item.subpartitions.len() != expected {
+                    return Err(error(crate::error::catalog::ER_PARTITION_WRONG_NO_SUBPART_ERROR, "Wrong number of subpartitions defined"));
+                }
                 if item.subpartitions.is_empty() {
                     return Err(error(
                         crate::error::catalog::ER_TOO_MANY_PARTITIONS_ERROR,
@@ -13922,7 +13970,11 @@ pub(crate) fn build_partition_info_from_def(
                 "explicit SUBPARTITION definitions require SUBPARTITION BY",
             ));
         }
+        let expected = def.partitions[0].subpartitions.len();
         for item in &def.partitions {
+            if item.subpartitions.len() != expected {
+                return Err(error(crate::error::catalog::ER_PARTITION_WRONG_NO_SUBPART_ERROR, "Wrong number of subpartitions defined"));
+            }
             if item.subpartitions.is_empty() {
                 return Err(error(
                     crate::error::catalog::ER_TOO_MANY_PARTITIONS_ERROR,

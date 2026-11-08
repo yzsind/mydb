@@ -31,13 +31,23 @@ static GLOBAL_TRANSACTION_READ_ONLY: std::sync::atomic::AtomicBool =
 /// `@@global.sql_log_bin` — global default for sql_log_bin inherited by
 /// new sessions; default ON.
 static GLOBAL_SQL_LOG_BIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GLOBAL_VECTOR_RESULT_FORMAT_TEXT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn global_vector_result_format_text() -> bool {
+    GLOBAL_VECTOR_RESULT_FORMAT_TEXT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_global_vector_result_format_text(text: bool) {
+    GLOBAL_VECTOR_RESULT_FORMAT_TEXT.store(text, Ordering::Relaxed);
+}
 /// `@@global.innodb_lock_wait_timeout` — row-lock wait timeout (seconds)
 /// inherited by new sessions. MySQL default 50.
 static GLOBAL_INNODB_LOCK_WAIT_TIMEOUT: AtomicU64 = AtomicU64::new(50);
 /// `@@global.lock_wait_timeout` — metadata-lock (MDL) wait timeout (seconds)
-/// MySQL display default is 31536000 (1 year). Zero means no SQL override
+/// MySQL display default is 31536000 (1 year). MAX means no SQL override
 /// has been configured, so the executor retains the startup lock-wait default.
-static GLOBAL_LOCK_WAIT_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_LOCK_WAIT_TIMEOUT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 const EXPLAIN_FORMAT_TRADITIONAL: u8 = 0;
 const EXPLAIN_FORMAT_TREE: u8 = 1;
@@ -85,7 +95,7 @@ pub fn global_lock_wait_timeout() -> u64 {
 
 pub(crate) fn configured_global_lock_wait_timeout() -> Option<u64> {
     let seconds = GLOBAL_LOCK_WAIT_TIMEOUT.load(Ordering::Relaxed);
-    (seconds != 0).then_some(seconds)
+    (seconds != u64::MAX).then_some(seconds)
 }
 
 pub fn set_global_lock_wait_timeout(secs: u64) {
@@ -3335,7 +3345,7 @@ impl SessionContext {
             connection_attrs: std::collections::BTreeMap::new(),
             statement_query_attributes: std::collections::BTreeMap::new(),
             resultset_metadata_full: true,
-            vector_result_format_text: false,
+            vector_result_format_text: global_vector_result_format_text(),
             temp_tables: HashMap::new(),
             temp_quota: Arc::new(crate::storage::temp_quota::SessionTempQuota::default()),
             temp_table_journal: Vec::new(),

@@ -618,7 +618,7 @@ pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
         SysVarDef::new(
             "vector_result_format",
-            Scope::Session,
+            Scope::Both,
             DataType::Enum {
                 values: &["NATIVE", "TEXT"],
             },
@@ -626,7 +626,10 @@ pub(crate) fn register(reg: &mut Registry) {
         .with_doc("VECTOR output on the text protocol; prepared binary results remain native."),
         |ctx| {
             SysVarValue::String(
-                if ctx.session.is_some_and(|s| s.vector_result_format_text) {
+                if match (ctx.session, ctx.scope) {
+                    (Some(session), Scope::Session) => session.vector_result_format_text,
+                    _ => crate::engine::api::global_vector_result_format_text(),
+                } {
                     "TEXT"
                 } else {
                     "NATIVE"
@@ -635,8 +638,12 @@ pub(crate) fn register(reg: &mut Registry) {
             )
         },
         |ctx: &mut WriteCtx<'_>, value: SysVarValue| -> Result<(), QueryError> {
-            ctx.session.vector_result_format_text =
-                value.to_display_string().eq_ignore_ascii_case("TEXT");
+            let text = value.to_display_string().eq_ignore_ascii_case("TEXT");
+            if ctx.scope == Scope::Global {
+                crate::engine::api::set_global_vector_result_format_text(text);
+            } else {
+                ctx.session.vector_result_format_text = text;
+            }
             Ok(())
         },
     ));

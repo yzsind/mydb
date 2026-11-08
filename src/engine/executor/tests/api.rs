@@ -1744,7 +1744,7 @@ fn show_table_status_supports_dbeaver_metadata_sql() {
         Value::String(crate::charset::DEFAULT_COLLATION.to_string())
     );
     assert!(matches!(&row[11], Value::String(ts) if !ts.is_empty()));
-    assert!(matches!(&row[12], Value::String(ts) if !ts.is_empty()));
+    assert_eq!(row[12], Value::Null);
     assert_eq!(row[17], Value::String("tpch lineitem".to_string()));
 
     let QueryResponse::ResultSet(where_status) = engine

@@ -620,7 +620,7 @@ fn rc_audit_xa_start_allows_idle_autocommit_off() {
 fn rc_audit_timeout_parameter_bounds_are_strict() {
     let (_dir, e) = fixture();
     let mut a = session();
-    for value in ["0", "-1", "1073741825"] {
+    for value in ["-1", "1073741825"] {
         let err = e
             .execute_with_session(
                 &mut a,
@@ -629,7 +629,7 @@ fn rc_audit_timeout_parameter_bounds_are_strict() {
             .unwrap_err();
         assert!(err.is(crate::error::catalog::ER_WRONG_VALUE_FOR_VAR));
     }
-    for value in [1, 1073741824] {
+    for value in [0, 1, 1073741824] {
         sql(
             &e,
             &mut a,

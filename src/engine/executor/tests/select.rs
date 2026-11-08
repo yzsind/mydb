@@ -11926,15 +11926,18 @@ fn derived_table_with_group_by() {
 }
 
 #[test]
-fn alter_table_drop_column_fails_on_primary_key() {
-    let dir = tempfile::tempdir().unwrap();
+fn alter_table_drop_column_removes_primary_key_member() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-
-    let err = engine.execute("ALTER TABLE t DROP COLUMN id").unwrap_err();
-    assert_eq!(err.code(), 1090);
+    engine.execute("INSERT INTO t VALUES(1,7)").unwrap();
+    engine.execute("ALTER TABLE t DROP COLUMN id").unwrap();
+    engine.execute("INSERT INTO t VALUES(8)").unwrap();
+    let table = engine.db.table("test.t").unwrap();
+    assert!(table.primary_key.is_empty());
+    assert_eq!(table.visible_column_count(), 1);
 }
 
 #[test]

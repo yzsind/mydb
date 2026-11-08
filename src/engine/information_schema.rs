@@ -3131,7 +3131,7 @@ fn tables_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
             }
         } else if let Some(view) = db.view_definition(schema, table_name) {
             if vis.table_visible(&view.database, &view.name) {
-                rows.push(view_table_row(&view.database, &view.name));
+                rows.push(view_table_row(&view.database, &view.name, view.created_ms));
             }
         }
         for def in system_table_definitions()
@@ -3151,7 +3151,7 @@ fn tables_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
     });
     visit_requested_views(&catalog, request, |view| {
         if vis.table_visible(&view.database, &view.name) {
-            rows.push(view_table_row(&view.database, &view.name));
+            rows.push(view_table_row(&view.database, &view.name, view.created_ms));
         }
     });
     for def in system_table_definitions()
@@ -3254,7 +3254,7 @@ fn base_table_row(db: &Database, table: &TableSchema) -> Vec<Value> {
         Value::Int(saturating_i64(stats.data_free)),
         auto_increment,
         mysql_time_value(table.created_ms),
-        mysql_time_value(table.updated_ms),
+        Value::Null,
         Value::Null,
         s(&table.collation),
         Value::Null,
@@ -3263,7 +3263,7 @@ fn base_table_row(db: &Database, table: &TableSchema) -> Vec<Value> {
     ]
 }
 
-fn view_table_row(database: &str, name: &str) -> Vec<Value> {
+fn view_table_row(database: &str, name: &str, created_ms: u64) -> Vec<Value> {
     vec![
         s("def"),
         s(database),
@@ -3279,7 +3279,7 @@ fn view_table_row(database: &str, name: &str) -> Vec<Value> {
         Value::Null,
         Value::Null,
         Value::Null,
-        metadata_create_time_value(),
+        mysql_time_value(created_ms),
         Value::Null,
         Value::Null,
         Value::Null,
@@ -3533,11 +3533,7 @@ fn base_column_row(
         mysql_datetime_precision(&column.data_type),
         column_charset_value(column),
         column_collation_value(column),
-        s(&crate::engine::show::mysql_type_name_with_attrs(
-            &column.data_type,
-            column.unsigned,
-            column.zerofill,
-        )),
+        s(&crate::engine::show::mysql_column_type_name(column)),
         s(&column_key(table, &column.name)),
         s(&column_extra(column)),
         s(privileges),
@@ -3728,7 +3724,16 @@ fn append_table_statistics_rows(
                 if let Some(expr) = index.key_expression(idx) {
                     (
                         Value::Null,
-                        Value::String(expr.expr_sql.clone()),
+                        Value::String(if expr.multi_valued {
+                            crate::parser::parse_catalog_expr(&expr.expr_sql)
+                                .ok()
+                                .and_then(|ast| {
+                                    crate::parser::index_expression_to_catalog_sql(&ast, true).ok()
+                                })
+                                .unwrap_or_else(|| expr.expr_sql.clone())
+                        } else {
+                            expr.expr_sql.clone()
+                        }),
                         if expr.nullable { "YES" } else { "" },
                     )
                 } else {
@@ -3738,11 +3743,21 @@ fn append_table_statistics_rows(
                         .find(|col| col.name.eq_ignore_ascii_case(column))
                         .map(|col| if col.nullable { "YES" } else { "" })
                         .unwrap_or("");
-                    (s(column), Value::Null, label)
+                    (
+                        s(table
+                            .column_index(column)
+                            .ok()
+                            .map(|i| table.columns[i].name.as_str())
+                            .unwrap_or(column)),
+                        Value::Null,
+                        label,
+                    )
                 };
             let sub_part = if matches!(column_value, Value::Null) {
                 // Expression key parts can't have a prefix length.
                 Value::Null
+            } else if index.is_spatial() {
+                Value::Int(32)
             } else {
                 index
                     .column_prefix_len(idx)
@@ -3773,9 +3788,7 @@ fn append_table_statistics_rows(
                 s(&index.name),
                 Value::Int((idx + 1) as i64),
                 column_value,
-                if index.index_type.eq_ignore_ascii_case("FULLTEXT")
-                    || index.index_type.eq_ignore_ascii_case("SPATIAL")
-                {
+                if index.index_type.eq_ignore_ascii_case("FULLTEXT") {
                     Value::Null
                 } else {
                     s(match index.column_direction(idx) {
@@ -6325,7 +6338,7 @@ fn files_row(
         Value::Int(saturating_i64(stats.index_length)),
         Value::Int(saturating_i64(stats.data_free)),
         mysql_time_value(table.created_ms),
-        mysql_time_value(table.updated_ms),
+        Value::Null,
         Value::Null,
         Value::Null,
         s("NORMAL"),

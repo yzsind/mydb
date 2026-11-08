@@ -528,6 +528,7 @@ fn col(name: &str, data_type: DataTypeKind, pos: usize) -> ColumnSchema {
         unsigned: false,
         invisible: false,
         zerofill: false,
+        display_width: None,
         auto_increment: false,
         default: None,
         read_backfill_default: None,

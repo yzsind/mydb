@@ -1527,6 +1527,13 @@ fn column_alter_actions(
     comment: Option<String>,
     position: Option<sqlparser::ast::MySQLColumnPosition>,
 ) -> ConvertedAlterAction {
+    let keys = match &action {
+        AlterAction::AddColumn(def) | AlterAction::ModifyColumn(def) => {
+            Some((def.primary_key, def.unique))
+        }
+        AlterAction::ChangeColumn { new_def, .. } => Some((new_def.primary_key, new_def.unique)),
+        _ => None,
+    };
     let position = convert_column_position(position);
     let mut actions =
         Vec::with_capacity(1 + usize::from(comment.is_some()) + usize::from(position.is_some()));
@@ -1538,7 +1545,31 @@ fn column_alter_actions(
         });
     }
     if let Some(position) = position {
-        actions.push(AlterAction::MoveColumn { column, position });
+        actions.push(AlterAction::MoveColumn {
+            column: column.clone(),
+            position,
+        });
+    }
+    if let Some((primary, unique)) = keys {
+        for is_primary in [true, false] {
+            if (is_primary && primary) || (!is_primary && unique) {
+                actions.push(AlterAction::AddIndex(IndexDef {
+                    name: is_primary.then(|| "PRIMARY".to_string()),
+                    columns: vec![column.clone()],
+                    column_prefix_lengths: vec![None],
+                    column_descending: vec![false],
+                    key_expressions: vec![None],
+                    key_expression_multi_valued: vec![false],
+                    unique: true,
+                    included_columns: Vec::new(),
+                    index_type: "BTREE".to_string(),
+                    visible: true,
+                    comment: String::new(),
+                    fulltext_parser: String::new(),
+                    vector_options: None,
+                }));
+            }
+        }
     }
     ConvertedAlterAction::Actions(actions)
 }
@@ -3439,8 +3470,22 @@ fn convert_column_parts(
     let mut precision_suffix = false;
     let mut signed_suffix = None;
     let mut signed_requested = false;
+    let display_width = match &data_type {
+        SqlDataType::TinyInt(width)
+        | SqlDataType::TinyIntUnsigned(width)
+        | SqlDataType::SmallInt(width)
+        | SqlDataType::SmallIntUnsigned(width)
+        | SqlDataType::MediumInt(width)
+        | SqlDataType::MediumIntUnsigned(width)
+        | SqlDataType::Int(width)
+        | SqlDataType::IntUnsigned(width)
+        | SqlDataType::BigInt(width)
+        | SqlDataType::BigIntUnsigned(width) => width.map(|width| width as u16),
+        _ => None,
+    };
     let column_name = ident_value(name);
     let mut nullable = true;
+    let mut explicit_null = false;
     let mut primary_key = false;
     let mut unique = false;
     let mut auto_increment = false;
@@ -3455,7 +3500,10 @@ fn convert_column_parts(
     let mut srid = None;
     for (option_index, option) in options.into_iter().enumerate() {
         match option.option {
-            ColumnOption::Null => nullable = true,
+            ColumnOption::Null => {
+                nullable = true;
+                explicit_null = true;
+            }
             ColumnOption::NotNull => nullable = false,
             // MySQL 8.0.13+: `DEFAULT (<expr>)` (parenthesised) means evaluate
             // the expression at INSERT / ALTER ADD COLUMN backfill time, not
@@ -3485,6 +3533,11 @@ fn convert_column_parts(
             }
             ColumnOption::Unique(_) => unique = true,
             ColumnOption::DialectSpecific(tokens) => {
+                if matches!(tokens.as_slice(), [sqlparser::tokenizer::Token::Word(word)] if word.value.eq_ignore_ascii_case("VISIBLE"))
+                {
+                    invisible = false;
+                    continue;
+                }
                 if let Some(suffix) = super::adapter::decode_column_type_suffix(&tokens)? {
                     use super::adapter::TypeSuffix;
                     if matches!(suffix, TypeSuffix::Zerofill) {
@@ -3692,12 +3745,20 @@ fn convert_column_parts(
             "A primary key index cannot be invisible",
         ));
     }
+    if explicit_null
+        && nullable
+        && matches!(data_type, DataType::Timestamp { .. })
+        && default.is_none()
+    {
+        default = Some(Expr::Literal(Literal::Null));
+    }
     Ok((
         ColumnDef {
             name: column_name,
             data_type,
             unsigned,
             zerofill,
+            display_width,
             invisible,
             nullable,
             primary_key,
@@ -3872,7 +3933,11 @@ fn convert_data_type_with_unsigned(
     let dt = match data_type {
         SqlDataType::TinyInt(width) | SqlDataType::TinyIntUnsigned(width) => {
             validate_integer_display_width(width)?;
-            DataType::TinyInt
+            if width == Some(1) {
+                DataType::Bool
+            } else {
+                DataType::TinyInt
+            }
         }
         SqlDataType::UTinyInt => DataType::TinyInt,
         SqlDataType::SmallInt(width)

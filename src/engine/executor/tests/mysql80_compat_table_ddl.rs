@@ -545,25 +545,18 @@ fn serial_expands_to_bigint_unsigned_autoinc_unique() {
 }
 
 #[test]
-fn serial_via_alter_add_column_is_honest_error() {
-    // SERIAL is scoped to CREATE TABLE: the ALTER ADD COLUMN path does not
-    // support an inline AUTO_INCREMENT + UNIQUE column (add_column rejects
-    // any auto column with 1075 and builds no key from a column-level UNIQUE
-    // flag). Rather than silently drop the implied attributes, ADD ... SERIAL
-    // returns a clear "unsupported" parse error — never a silent no-op.
-    let dir = tempfile::tempdir().unwrap();
+fn serial_via_alter_add_column_preserves_its_constraints() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
     exec_ok(&engine, "CREATE TABLE s2 (a INT PRIMARY KEY)");
-    // The column def still expands (shared CREATE-path builder), but the
-    // ADD COLUMN storage path rejects the implied auto-increment column that
-    // has no inline key with MySQL error 1075 — an honest failure, not a
-    // silent drop of the SERIAL attributes.
-    let err = engine.execute("ALTER TABLE s2 ADD sid SERIAL").unwrap_err();
-    assert_eq!(
-        err.code(),
-        1075,
-        "expected honest 1075 failure, got {err:?}"
-    );
+    exec_ok(&engine, "ALTER TABLE s2 ADD sid SERIAL");
+    exec_ok(&engine, "INSERT INTO s2(a) VALUES(1),(2)");
+    let table = engine.db.table("test.s2").unwrap();
+    assert!(table.columns[1].auto_increment);
+    assert!(table
+        .indexes
+        .iter()
+        .any(|index| index.unique && index.columns == ["sid"]));
 }
 
 // ---------- P0-3: ZEROFILL ----------

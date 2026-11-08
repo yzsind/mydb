@@ -2699,6 +2699,17 @@ pub fn batch_schema_to_input(schema: &BatchSchema) -> InputSchema {
         })
         .collect();
     let mut input = InputSchema::new_with_bound_types(cols, bound_types);
+    input.mark_numeric_display_columns(schema.fields().iter().enumerate().filter_map(
+        |(index, field)| {
+            (field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0).then_some((
+                index,
+                crate::mysql::protocol::numeric_display_width(
+                    field.column_type,
+                    field.source.length,
+                ),
+            ))
+        },
+    ));
     input.mark_silent_string_columns(schema.fields().iter().enumerate().filter_map(
         |(index, field)| match field.column_type {
             crate::types::ColumnType::Blob

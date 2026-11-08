@@ -1712,6 +1712,8 @@ pub struct ColumnDef {
     /// flag, echoes it from SHOW CREATE / SHOW COLUMNS, and zero-pads
     /// text-protocol output to the type's default display width.
     pub zerofill: bool,
+    #[serde(default)]
+    pub display_width: Option<u16>,
     /// MySQL 8.0.23+ `INVISIBLE` column attribute: hidden from
     /// `SELECT *` and INSERT-without-column-list, addressable by name.
     pub invisible: bool,

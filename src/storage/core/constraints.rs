@@ -163,7 +163,7 @@ fn coerce_row(table: &TableSchema, values: &mut [Value]) -> Result<(), QueryErro
         let current = std::mem::replace(value, Value::Null);
         *value = coerce_column_value_for_schema(current, column)?;
     }
-    validate_cosine_index_vectors(table, values)?;
+    validate_row_domain_constraints(table, values)?;
     Ok(())
 }
 
@@ -212,11 +212,12 @@ pub(crate) fn coerce_updated_row(
         values[idx] = coerce_column_value_for_schema(current, column)?;
     }
     compact_char_columns_for_storage(table, values);
-    validate_cosine_index_vectors(table, values)?;
+    validate_row_domain_constraints(table, values)?;
     Ok(())
 }
 
-fn validate_cosine_index_vectors(table: &TableSchema, values: &[Value]) -> Result<(), QueryError> {
+fn validate_row_domain_constraints(table: &TableSchema, values: &[Value]) -> Result<(), QueryError> {
+    crate::binlog::validate_row_domain(table, values)?;
     for index in table.indexes.iter().filter(|index| {
         index.is_vector()
             && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
@@ -418,7 +419,7 @@ fn build_check_constraints_for_table(
     let mut used = existing
         .unwrap_or(&[])
         .iter()
-        .map(|check| check.name.clone())
+        .map(|check| normalize_name(&check.name))
         .collect::<BTreeSet<_>>();
     let mut out = Vec::with_capacity(defs.len());
     let mut next_generated = preferred_start.unwrap_or(1);
@@ -433,12 +434,12 @@ fn build_check_constraints_for_table(
             None => loop {
                 let candidate = format!("{}_chk_{}", table.name, next_generated);
                 next_generated = next_generated.saturating_add(1);
-                if !used.contains(&candidate) {
+                if !used.contains(&normalize_name(&candidate)) {
                     break candidate;
                 }
             },
         };
-        if !used.insert(name.clone()) {
+        if !used.insert(normalize_name(&name)) {
             return Err(error(
                 crate::error::catalog::ER_CHECK_CONSTRAINT_DUP_NAME,
                 format!("Duplicate check constraint name '{name}'."),
@@ -475,7 +476,7 @@ fn check_constraint_names_in_schema(
             table
                 .check_constraints
                 .iter()
-                .map(|check| check.name.clone())
+                .map(|check| normalize_name(&check.name))
         })
         .collect()
 }
@@ -486,7 +487,7 @@ fn ensure_check_constraint_names_available(
 ) -> Result<(), QueryError> {
     let mut seen = BTreeSet::new();
     for check in candidates {
-        if !seen.insert(check.name.clone()) || used.contains(&check.name) {
+        if !seen.insert(normalize_name(&check.name)) || used.contains(&normalize_name(&check.name)) {
             return Err(error(
                 crate::error::catalog::ER_CHECK_CONSTRAINT_DUP_NAME,
                 format!("Duplicate check constraint name '{}'.", check.name),
@@ -619,21 +620,23 @@ fn collect_check_expr_columns(
 
 fn validate_check_expr_supported(table: &TableSchema, expr: &Expr) -> Result<(), QueryError> {
     let schema = crate::engine::expr_program::InputSchema::from_table(table);
-    crate::engine::expr_program::ExprCompiler::compile_check_constraint(expr, &schema)
-        .map(|_| ())
-        .map_err(|_| {
-            error(
-                crate::error::catalog::ER_CHECK_CONSTRAINT_FUNCTION_IS_NOT_ALLOWED,
-                "unsupported expression in CHECK constraint",
-            )
-        })
+    let program = crate::engine::expr_program::ExprCompiler::compile_check_constraint(expr, &schema)
+        .map_err(|_| error(crate::error::catalog::ER_CHECK_CONSTRAINT_FUNCTION_IS_NOT_ALLOWED, "unsupported expression in CHECK constraint"))?;
+    if !crate::engine::expr::expr_is_boolean_typed(expr) && matches!(program.result_type().column_type(), crate::types::ColumnType::VarString | crate::types::ColumnType::Blob) {
+        return Err(error(crate::error::catalog::ER_NON_BOOLEAN_EXPR_FOR_CHECK_CONSTRAINT, "An expression of non-boolean type specified to a check constraint"));
+    }
+    Ok(())
 }
 
 fn validate_and_prepare_generated_columns(table: &mut TableSchema) -> Result<(), QueryError> {
+    validate_primary_generated_columns(&table.primary_key, &table.columns)?;
     let generated_exprs = table
         .columns
         .iter()
         .map(|column| {
+            if column.state == ColumnState::Dropped {
+                return Ok(None);
+            }
             column
                 .generated_expr
                 .as_deref()
@@ -886,7 +889,8 @@ fn reject_column_referenced_by_generated(
     column_name: &str,
 ) -> Result<(), QueryError> {
     if table.columns.iter().any(|column| {
-        !column.name.eq_ignore_ascii_case(column_name)
+        column.state != ColumnState::Dropped
+            && !column.name.eq_ignore_ascii_case(column_name)
             && column
                 .generated_column_names
                 .iter()
@@ -3199,11 +3203,11 @@ fn coerce_value_with_unsigned(
             }
         }
         DataTypeKind::Geometry { subtype, srid } => {
-            // Geometry columns accept only an actual geometry expression.
-            // MySQL does not implicitly interpret text, raw WKB, or a BLOB
-            // prepared-statement parameter as geometry.
+            // Binary SQL literals and prepared parameters carry MySQL's SRID + WKB format.
             let bytes = match value {
                 Value::Geometry(b) => crate::engine::geo::normalize_internal(&b)?,
+                Value::Bytes(b) => crate::engine::geo::normalize_internal(&b).map_err(|err| error(crate::error::catalog::ER_CANT_CREATE_GEOMETRY_OBJECT,
+                    format!("Cannot get geometry object from data you send to the GEOMETRY field: {}", err.message())))?,
                 _ => {
                     return Err(error(
                         crate::error::catalog::ER_CANT_CREATE_GEOMETRY_OBJECT,
@@ -4176,8 +4180,8 @@ fn apply_float_md(
 /// user error.
 fn auto_increment_type_max(data_type: &DataTypeKind, unsigned: bool) -> Result<u64, QueryError> {
     Ok(match (data_type, unsigned) {
-        (DataTypeKind::TinyInt, false) => 127,
-        (DataTypeKind::TinyInt, true) => 255,
+        (DataTypeKind::TinyInt | DataTypeKind::Bool, false) => 127,
+        (DataTypeKind::TinyInt | DataTypeKind::Bool, true) => 255,
         (DataTypeKind::SmallInt, false) => 32_767,
         (DataTypeKind::SmallInt, true) => 65_535,
         (DataTypeKind::MediumInt, false) => 8_388_607,
@@ -4228,6 +4232,7 @@ fn validate_auto_increment_schema(table: &TableSchema) -> Result<(), QueryError>
     if !matches!(
         column.data_type,
         DataTypeKind::TinyInt
+            | DataTypeKind::Bool
             | DataTypeKind::SmallInt
             | DataTypeKind::MediumInt
             | DataTypeKind::Int
@@ -4414,6 +4419,12 @@ fn validate_index_key_parts(
     table_columns: &[ColumnSchema],
     index_type: &str,
 ) -> Result<(), QueryError> {
+    let mut seen = HashSet::new();
+    for column in columns {
+        if !column.is_empty() && !seen.insert(normalize_name(column)) {
+            return Err(error(crate::error::catalog::ER_DUP_FIELDNAME, format!("Duplicate column name '{column}'")));
+        }
+    }
     if columns.len() > MAX_INDEX_KEY_PARTS {
         return Err(error(
             crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
@@ -4686,6 +4697,7 @@ fn validate_existing_unique_index_values(
 
 fn literal_default_value(expr: &Expr) -> Result<Value, QueryError> {
     match expr {
+        Expr::BoundValue(value) => Ok(value.clone()),
         Expr::Literal(Literal::Null) => Ok(Value::Null),
         Expr::Literal(Literal::Bool(value)) => Ok(Value::Int(*value as i64)),
         Expr::Literal(Literal::Int(value)) => Ok(Value::Int(*value)),
@@ -4851,6 +4863,7 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
     // ALTER ADD COLUMN backfill can re-parse and evaluate at runtime. Plain
     // `DEFAULT CURRENT_TIMESTAMP` (no parens) keeps the legacy bare-string
     // sentinel.
+    let boolean_default = matches!(column.default, Some(Expr::Literal(Literal::Bool(_))));
     let default_expr = column
         .default
         .as_ref()
@@ -5183,6 +5196,11 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
         }
         _ => {}
     }
+    if matches!(data_type, DataTypeKind::Enum { .. } | DataTypeKind::Set { .. })
+        && (boolean_default
+            || matches!(data_type, DataTypeKind::Set { .. }) && default.as_ref().is_some_and(|value| matches!(value, Value::Int(_) | Value::UInt(_)))) {
+        return Err(error(crate::error::catalog::ER_INVALID_DEFAULT, format!("Invalid default value for '{}'", column.name)));
+    }
     // ENUM / SET literal DEFAULT: must be a declared member (or NULL for
     // nullable columns). Numeric DEFAULT is legal for ENUM but not SET.
     // Failing here mirrors MySQL's ER_INVALID_DEFAULT(1067) at DDL.
@@ -5197,48 +5215,14 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
             }
         }
     }
-    // Validate and canonicalize literal defaults at DDL time through the
-    // same type-coercion kernel used by INSERT/UPDATE. Invalid temporal and
-    // numeric defaults are definition errors (1067), not latent failures on
-    // the first row that happens to use DEFAULT.
-    if default_expr.is_none() {
-        if let Some(literal) = default.take() {
-            if matches!(literal, Value::Null) {
-                default = Some(Value::Null);
-            } else if matches!(data_type, DataTypeKind::Enum { .. })
-                && matches!(literal, Value::Int(0) | Value::UInt(0))
-            {
-                // ENUM/SET defaults have already gone through their dedicated
-                // member/ordinal validator above. Canonicalize an ENUM
-                // DEFAULT 0 to the internal stored sentinel now: applying a
-                // schema default is not a new invalid user conversion and
-                // must not emit 1265 for every subsequently inserted row.
-                default = Some(enum_zero_value());
-            } else if matches!(
-                data_type,
-                DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }
-            ) {
-                default = Some(literal);
-            } else {
-                default = Some(
-                    coerce_value_with_unsigned(literal, &data_type, column.unsigned, &column.name)
-                        .map_err(|_| {
-                            error(
-                                crate::error::catalog::ER_INVALID_DEFAULT,
-                                format!("Invalid default value for '{}'", column.name),
-                            )
-                        })?,
-                );
-            }
-        }
-    }
-    Ok(ColumnSchema {
+    let mut schema = ColumnSchema {
         not_null_from_scn: 0,
         name: column.name,
         data_type,
         nullable: column.nullable,
         unsigned: column.unsigned,
         zerofill: column.zerofill,
+        display_width: column.display_width,
         invisible: column.invisible,
         auto_increment: column.auto_increment,
         default,
@@ -5263,7 +5247,41 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
         generated_column_names: Vec::new(),
         generated_expr_ast: None,
         generated_program: None,
-    })
+    };
+    validate_literal_column_default(&mut schema)?;
+    Ok(schema)
+}
+
+fn validate_literal_column_default(column: &mut ColumnSchema) -> Result<(), QueryError> {
+    if column.default_expr.is_some() { return Ok(()); }
+    let Some(value) = column.default.clone() else { return Ok(()); };
+    let invalid = || error(crate::error::catalog::ER_INVALID_DEFAULT, format!("Invalid default value for '{}'", column.name));
+    if matches!(value, Value::Null) {
+        return if column.nullable { Ok(()) } else { Err(invalid()) };
+    }
+    if matches!(column.data_type, DataTypeKind::Enum { .. }) && matches!(&value, Value::Bytes(bytes) if bytes.is_empty()) { return Ok(()); }
+    if let Some(err) = enum_set_default_error(&column.name, &column.data_type, &value, column.collation.as_deref()) { return Err(err); }
+    let value = if matches!(column.data_type, DataTypeKind::Enum { .. }) && matches!(value, Value::Int(0) | Value::UInt(0)) {
+        enum_zero_value()
+    } else if matches!(column.data_type, DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+        value
+    } else {
+        coerce_partition_bound(value, column).map_err(|_| invalid())?
+    };
+    validate_column_charset_value(column, &value).map_err(|_| invalid())?;
+    column.default = Some(value);
+    Ok(())
+}
+
+fn validate_primary_generated_columns(columns: &[String], table_columns: &[ColumnSchema]) -> Result<(), QueryError> {
+    for name in columns {
+        if table_columns.iter().any(|column| column.state != ColumnState::Dropped && column.name.eq_ignore_ascii_case(name)
+            && column.generated_expr.is_some() && !column.generated_stored) {
+            return Err(error(crate::error::catalog::ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN,
+                "Defining a virtual generated column as primary key is not supported"));
+        }
+    }
+    Ok(())
 }
 
 /// Persist only expressions accepted by the scalar SQL encoder.

@@ -3,6 +3,8 @@ use super::repository::{Base, Lease, Position, Publication, Range, Repository};
 use super::*;
 use crate::storage::capture::WalLease;
 
+const JOB_HISTORY_PER_KIND: usize = 256;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Policy {
@@ -2076,7 +2078,8 @@ impl Coordinator {
         }
         let values: Vec<Job> =
             serde_json::from_slice(&value.payload).map_err(|e| backup_err(e.to_string()))?;
-        if values.len() > 256 {
+        let wal_jobs = values.iter().filter(|job| job.kind == "WAL").count();
+        if wal_jobs > JOB_HISTORY_PER_KIND || values.len() - wal_jobs > JOB_HISTORY_PER_KIND {
             return Err(backup_err("job history exceeds limit"));
         }
         let mut jobs = self.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -2188,10 +2191,16 @@ impl Coordinator {
             .unwrap_or(0)
             .checked_add(1)
             .ok_or_else(|| backup_err("job sequence overflow"))?;
-        if jobs.len() >= 256 {
+        let archive_job = kind == "WAL";
+        if jobs
+            .values()
+            .filter(|entry| (entry.job.kind == "WAL") == archive_job)
+            .count()
+            >= JOB_HISTORY_PER_KIND
+        {
             if let Some(id) = jobs
                 .values()
-                .filter(|e| e.job.state != "RUNNING")
+                .filter(|e| e.job.state != "RUNNING" && (e.job.kind == "WAL") == archive_job)
                 .min_by_key(|e| e.job.sequence)
                 .map(|e| e.job.id.clone())
             {
@@ -2603,5 +2612,78 @@ fn failure_class(message: &str) -> &'static str {
         "STALE_TARGET"
     } else {
         "IO_OR_EXECUTION"
+    }
+}
+
+#[cfg(test)]
+mod ddl1108_history_tests {
+    use super::*;
+
+    #[test]
+    fn archive_history_preserves_baselines_across_eviction_and_reload() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        let coordinator = Coordinator::get(engine.db_handle()).unwrap();
+        let initial = coordinator
+            .spawn("DATABASE", None, None, |_, _, _| Ok(()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let template = loop {
+            let job = coordinator
+                .jobs()
+                .into_iter()
+                .find(|job| job.id == initial.id)
+                .unwrap();
+            if job.state != "RUNNING" {
+                assert_eq!(job.state, "COMPLETED");
+                break job;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        };
+        {
+            let mut jobs = coordinator.jobs.lock().unwrap();
+            jobs.clear();
+            for sequence in 0..258 {
+                let mut job = template.clone();
+                job.id = format!("history-{sequence}");
+                job.sequence = sequence;
+                job.kind = if sequence < 2 { "DATABASE" } else { "WAL" }.into();
+                jobs.insert(
+                    job.id.clone(),
+                    JobEntry {
+                        job,
+                        cancel: Arc::new(AtomicBool::new(false)),
+                        phase_started: Instant::now(),
+                    },
+                );
+            }
+            coordinator.save_jobs(&jobs).unwrap();
+        }
+        let next = coordinator
+            .spawn("WAL", None, None, |_, _, _| Ok(()))
+            .unwrap();
+        loop {
+            if coordinator
+                .jobs()
+                .into_iter()
+                .find(|job| job.id == next.id)
+                .unwrap()
+                .state
+                != "RUNNING"
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        coordinator.shutdown().unwrap();
+        coordinator.jobs.lock().unwrap().clear();
+        coordinator.load_jobs().unwrap();
+        let jobs = coordinator.jobs();
+        assert_eq!(jobs.iter().filter(|job| job.kind == "DATABASE").count(), 2);
+        assert_eq!(jobs.iter().filter(|job| job.kind == "WAL").count(), 256);
+        assert!(!jobs.iter().any(|job| job.id == "history-2"));
+        assert!(jobs.iter().all(|job| job.state == "COMPLETED"));
     }
 }

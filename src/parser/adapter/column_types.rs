@@ -55,7 +55,7 @@ pub(in crate::parser) fn parse_suffix(
         );
     }
     if matches!(&parser.peek_token_ref().token, Token::Word(word)
-        if word.quote_style.is_none() && ["BYTE", "SIGNED", "UNSIGNED", "ZEROFILL"].iter().any(|name| word.value.eq_ignore_ascii_case(name)))
+        if word.quote_style.is_none() && ["BYTE", "SIGNED", "UNSIGNED", "ZEROFILL", "VISIBLE"].iter().any(|name| word.value.eq_ignore_ascii_case(name)))
     {
         return Some(Ok(ColumnOption::DialectSpecific(vec![
             parser.next_token().token,

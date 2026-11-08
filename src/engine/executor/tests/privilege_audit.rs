@@ -55,7 +55,7 @@ fn audit_password_self_service_cannot_change_account_policy() {
         for password in ["IDENTIFIED BY 'new'", "IDENTIFIED BY RANDOM PASSWORD"] {
             let sql = format!("ALTER USER CURRENT_USER() {password} {option}");
             let err = engine.execute_with_session(&mut user, &sql).unwrap_err();
-            assert_eq!(err.code(), 1142, "{sql}: {err:?}");
+            assert_eq!(err.code(), 1227, "{sql}: {err:?}");
             assert_eq!(engine.db.auth_catalog().accounts[&key], before, "{sql}");
         }
     }
@@ -102,7 +102,7 @@ fn audit_dual_password_authority_does_not_exempt_policy_changes() {
                 .execute_with_session(&mut user, sql)
                 .unwrap_err()
                 .code(),
-            1142
+            1227
         );
         assert_eq!(engine.db.auth_catalog().accounts[&key], before);
     }

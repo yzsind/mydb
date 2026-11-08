@@ -544,3 +544,5 @@ mod release_audit_1101;
 mod xml_functions;
 
 mod audit_fixes_1106;
+
+mod table_ddl_audit_1108;

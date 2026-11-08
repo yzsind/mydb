@@ -1037,16 +1037,20 @@ impl Database {
         let _timer = OnlineIndexTimer(&ONLINE_INDEX_BARRIER_WAIT_US, Instant::now());
         let started = Instant::now();
         let key = MdlObjectKey::table(&table.database, &table.name);
+        let mut attempted = false;
         loop {
             if !cleanup {
                 self.ensure_operational()?;
                 crate::engine::cancel::check_cancelled()?;
                 check()?;
             }
-            if !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout() {
+            if attempted && !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout() {
                 return Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
                     "online index build timed out waiting for metadata lock"));
             }
+            // A zero timeout forbids waiting, but still permits an
+            // uncontended first acquisition.
+            attempted = true;
             match self.acquire_mdl(
                 owner,
                 Some(owner),
@@ -1059,6 +1063,10 @@ impl Database {
             ) {
                 Ok(()) => return Ok(()),
                 Err(err) if is_lock_wait_pending_error(&err) => {
+                    if !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout() {
+                        return Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                            "online index build timed out waiting for metadata lock"));
+                    }
                     if self.mdl.has_long_lived_blocker(&key,owner,mode) {
                         // Publish the initial wait, then withdraw the ticket
                         // for the holder's entire remaining lifetime. Repeated

@@ -724,6 +724,17 @@ impl Database {
         if ids.len() != before {
             dedup_row_ids(&mut ids);
         }
+        if txn.historical {
+            let mut visible = Vec::with_capacity(ids.len());
+            for id in ids {
+                if let Some(row) = self.read_row(table, id, txn)? {
+                    if table.index_key(index, &row.values)? == key {
+                        visible.push(id);
+                    }
+                }
+            }
+            return Ok(visible);
+        }
         Ok(ids)
     }
 

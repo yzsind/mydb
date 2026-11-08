@@ -139,6 +139,24 @@ impl Cursor<'_> {
             if self.eat("PUBLIC") {
                 public = true;
             } else {
+                let folded_account = match self.tokens.get(self.pos) {
+                    Some(Token::Word(word)) if word.quote_style.is_none() => word
+                        .value
+                        .split_once('@')
+                        .map(|(user, host)| (user.to_string(), host.to_string())),
+                    _ => None,
+                };
+                if let Some((user, host)) = folded_account {
+                    if user.is_empty() || host.is_empty() || host.contains('@') {
+                        return Err(err("Invalid policy account"));
+                    }
+                    self.pos += 1;
+                    roles.push(AccountKey::new(user, host));
+                    if self.symbol(Token::Comma) {
+                        continue;
+                    }
+                    break;
+                }
                 let name = self.name()?;
                 let host = if self.symbol(Token::AtSign) {
                     self.name()?

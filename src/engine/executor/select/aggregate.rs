@@ -909,7 +909,7 @@ impl Accumulator for SpatialCollectAcc {
             ),
             _ => Geom::GeometryCollection(geometries),
         };
-        Ok(Value::Geometry(write_geometry(&Geometry::new(srid, geom))))
+        Ok(Value::Geometry(write_geometry(&Geometry::new(srid, geom))?))
     }
 
     fn heap_bytes(&self) -> usize {

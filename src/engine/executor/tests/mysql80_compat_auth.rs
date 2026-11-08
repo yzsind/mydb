@@ -2178,7 +2178,7 @@ fn b5_set_default_role_self_needs_no_role_admin() {
         .unwrap_err();
     assert_eq!(
         err.code(),
-        1142,
+        1227,
         "cross-account default role needs ROLE_ADMIN: {err:?}"
     );
 }

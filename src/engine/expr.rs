@@ -2442,6 +2442,10 @@ pub(crate) fn eval_current_user_func() -> Value {
 
 /// `CONNECTION_ID()` — per-connection thread id as an unsigned integer.
 /// Returns `Value::UInt`; JDBC and other clients depend on the type.
+pub(crate) fn session_connection_id() -> Option<u64> {
+    with_session_view(|view| view.map(|v| v.connection_id() as u64))
+}
+
 pub(crate) fn eval_connection_id_func() -> Value {
     Value::UInt(with_session_view(|view| match view {
         Some(v) => v.connection_id() as u64,
@@ -15306,6 +15310,29 @@ fn function_arg_with_table_octets(
     table: &TableSchema,
     value: Value,
 ) -> Result<Value, QueryError> {
+    let value = if function_uses_numeric_display(function_name) {
+        let name = match expr {
+            Expr::Identifier(name) => Some(name.as_str()),
+            Expr::CompoundIdentifier(parts) => parts.last().map(String::as_str),
+            _ => None,
+        };
+        if let Some(column) = name
+            .and_then(|name| table.column_index(name).ok())
+            .map(|index| &table.columns[index])
+            .filter(|column| column.zerofill)
+        {
+            format_zerofill_value(
+                value,
+                column
+                    .display_width
+                    .unwrap_or_else(|| default_numeric_display_width(&column.data_type)),
+            )
+        } else {
+            value
+        }
+    } else {
+        value
+    };
     if is_charset_octet_function(function_name)
         && (!function_name.eq_ignore_ascii_case("CRC32")
             || matches!(
@@ -29774,7 +29801,81 @@ mod aes_kdf_tests {
     }
 }
 
-/// SQL octet consumers observe their argument's declared encoding.
+/// Display widths used when a numeric column is consumed as a string.
+pub(crate) fn default_numeric_display_width(kind: &DataTypeKind) -> u16 {
+    match kind {
+        DataTypeKind::Bool => 1,
+        DataTypeKind::TinyInt => 3,
+        DataTypeKind::SmallInt => 5,
+        DataTypeKind::MediumInt => 8,
+        DataTypeKind::Int => 10,
+        DataTypeKind::BigInt => 20,
+        DataTypeKind::Decimal { precision, scale } => {
+            u16::from(precision.unwrap_or(10)) + u16::from(scale.unwrap_or(0) > 0)
+        }
+        DataTypeKind::Float { precision, .. } => u16::from(precision.unwrap_or(12)),
+        DataTypeKind::Double { precision, .. } => u16::from(precision.unwrap_or(22)),
+        _ => 0,
+    }
+}
+
+pub(crate) fn function_uses_numeric_display(name: &str) -> bool {
+    [
+        "CONCAT",
+        "CONCAT_WS",
+        "LENGTH",
+        "OCTET_LENGTH",
+        "CHAR_LENGTH",
+        "CHARACTER_LENGTH",
+        "BIT_LENGTH",
+        "ASCII",
+        "ORD",
+        "CRC32",
+        "TO_BASE64",
+        "COMPRESS",
+        "MD5",
+        "SHA",
+        "SHA1",
+        "SHA2",
+        "LOWER",
+        "LCASE",
+        "UPPER",
+        "UCASE",
+        "LEFT",
+        "RIGHT",
+        "SUBSTRING",
+        "SUBSTR",
+        "MID",
+        "TRIM",
+        "LTRIM",
+        "RTRIM",
+        "LPAD",
+        "RPAD",
+        "REPLACE",
+        "REPEAT",
+        "REVERSE",
+        "LOCATE",
+        "INSTR",
+        "FIND_IN_SET",
+        "STRCMP",
+        "SOUNDEX",
+    ]
+    .iter()
+    .any(|function| name.eq_ignore_ascii_case(function))
+}
+
+pub(crate) fn format_zerofill_value(value: Value, width: u16) -> Value {
+    if width == 0 || matches!(value, Value::Null) {
+        return value;
+    }
+    let text = crate::storage::value_to_string(&value);
+    Value::String(if text.len() < usize::from(width) {
+        format!("{:0>width$}", text, width = usize::from(width))
+    } else {
+        text
+    })
+}
+
 pub(crate) fn is_charset_octet_function(name: &str) -> bool {
     [
         "HEX",

@@ -24,20 +24,34 @@ pub fn read_geometry(buf: &[u8]) -> Result<Geometry, QueryError> {
         pos: 4,
         depth: 0,
     };
-    let geom = r.read_geom()?;
+    let mut geom = r.read_geom()?;
     if r.pos != buf.len() {
         return Err(invalid_gis("trailing bytes"));
     }
     super::validate_shape(&geom)?;
+    if internal_axis_swap(srid)? {
+        geom.for_each_coord_mut(&mut |coord| std::mem::swap(&mut coord.x, &mut coord.y));
+    }
     Ok(Geometry { srid, geom })
 }
 
 /// Serialize to the MySQL internal format (SRID prefix + NDR WKB).
-pub fn write_geometry(g: &Geometry) -> Vec<u8> {
+pub fn write_geometry(g: &Geometry) -> Result<Vec<u8>, QueryError> {
     let mut out = Vec::with_capacity(4 + 64);
     out.extend_from_slice(&g.srid.to_le_bytes());
-    write_geom(&mut out, &g.geom);
-    out
+    write_geom_axes(&mut out, &g.geom, internal_axis_swap(g.srid)?);
+    Ok(out)
+}
+
+// SQL algorithms use SRS-defined axes. MySQL's internal geographic bytes use longitude/latitude.
+fn internal_axis_swap(srid: u32) -> Result<bool, QueryError> {
+    if srid == 0 {
+        return Ok(false);
+    }
+    Ok(super::srs::find(srid)?.is_some_and(|srs| {
+        srs.kind == super::srs::SrsKind::Geographic
+            && srs.axis_order == super::srs::AxisOrder::LatLong
+    }))
 }
 
 /// Read bare WKB (no SRID prefix) — `ST_GeomFromWKB` input.
@@ -244,54 +258,61 @@ fn write_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
 }
 
-fn write_coord(out: &mut Vec<u8>, c: Coord) {
+fn write_coord(out: &mut Vec<u8>, mut c: Coord, swap: bool) {
+    if swap {
+        std::mem::swap(&mut c.x, &mut c.y);
+    }
     out.extend_from_slice(&c.x.to_le_bytes());
     out.extend_from_slice(&c.y.to_le_bytes());
 }
 
-fn write_seq(out: &mut Vec<u8>, cs: &[Coord]) {
+fn write_seq(out: &mut Vec<u8>, cs: &[Coord], swap: bool) {
     write_u32(out, cs.len() as u32);
     for c in cs {
-        write_coord(out, *c);
+        write_coord(out, *c, swap);
     }
 }
 
-fn write_rings(out: &mut Vec<u8>, rings: &[Vec<Coord>]) {
+fn write_rings(out: &mut Vec<u8>, rings: &[Vec<Coord>], swap: bool) {
     write_u32(out, rings.len() as u32);
     for r in rings {
-        write_seq(out, r);
+        write_seq(out, r, swap);
     }
 }
 
 pub(super) fn write_geom(out: &mut Vec<u8>, geom: &Geom) {
+    write_geom_axes(out, geom, false);
+}
+
+fn write_geom_axes(out: &mut Vec<u8>, geom: &Geom, swap: bool) {
     out.push(1); // NDR
     write_u32(out, geom.type_code());
     match geom {
-        Geom::Point(c) => write_coord(out, *c),
-        Geom::LineString(cs) => write_seq(out, cs),
-        Geom::Polygon(rings) => write_rings(out, rings),
+        Geom::Point(c) => write_coord(out, *c, swap),
+        Geom::LineString(cs) => write_seq(out, cs, swap),
+        Geom::Polygon(rings) => write_rings(out, rings, swap),
         Geom::MultiPoint(ps) => {
             write_u32(out, ps.len() as u32);
             for c in ps {
-                write_geom(out, &Geom::Point(*c));
+                write_geom_axes(out, &Geom::Point(*c), swap);
             }
         }
         Geom::MultiLineString(ls) => {
             write_u32(out, ls.len() as u32);
             for l in ls {
-                write_geom(out, &Geom::LineString(l.clone()));
+                write_geom_axes(out, &Geom::LineString(l.clone()), swap);
             }
         }
         Geom::MultiPolygon(ps) => {
             write_u32(out, ps.len() as u32);
             for p in ps {
-                write_geom(out, &Geom::Polygon(p.clone()));
+                write_geom_axes(out, &Geom::Polygon(p.clone()), swap);
             }
         }
         Geom::GeometryCollection(gs) => {
             write_u32(out, gs.len() as u32);
             for g in gs {
-                write_geom(out, g);
+                write_geom_axes(out, g, swap);
             }
         }
     }

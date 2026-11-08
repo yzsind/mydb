@@ -1688,6 +1688,29 @@ pub fn enabled() -> bool {
     MANAGER_ENABLED.load(Ordering::Acquire)
 }
 
+pub(crate) fn validate_row_domain(table: &TableSchema, values: &[Value]) -> Result<(), QueryError> {
+    if !should_record_table_rows(table) {
+        return Ok(());
+    }
+    for (column, value) in table.columns.iter().zip(values) {
+        if column.state == crate::storage::ColumnState::Dropped
+            || !matches!(column.data_type, DataTypeKind::Timestamp { .. })
+        {
+            continue;
+        }
+        if let Value::Timestamp(micros) = value {
+            if *micros == crate::types::ZERO_DATETIME {
+                continue;
+            }
+            if u32::try_from(micros.div_euclid(1_000_000)).is_err() {
+                return Err(error(crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE,
+                    "TIMESTAMP exceeds the MySQL TIMESTAMP2 binlog range; use native WAL replication or disable sql_log_bin for this write"));
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn should_record_table_rows(table: &TableSchema) -> bool {
     !should_skip_recording() && !crate::storage::is_temp_table_id(table.id)
 }
@@ -7498,6 +7521,7 @@ mod tests {
                     unsigned: false,
                     invisible: false,
                     zerofill: false,
+                    display_width: None,
                     auto_increment: false,
                     default: None,
                     read_backfill_default: None,
@@ -7525,6 +7549,7 @@ mod tests {
                     unsigned: false,
                     invisible: false,
                     zerofill: false,
+                    display_width: None,
                     auto_increment: false,
                     default: None,
                     read_backfill_default: None,
@@ -8791,6 +8816,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -8818,6 +8844,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -8845,6 +8872,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -9966,6 +9994,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -9993,6 +10022,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -10020,6 +10050,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -10167,6 +10198,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,
@@ -10195,6 +10227,7 @@ mod tests {
             unsigned: false,
             invisible: false,
             zerofill: false,
+            display_width: None,
             auto_increment: false,
             default: None,
             read_backfill_default: None,

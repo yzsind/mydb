@@ -71,6 +71,7 @@ pub(crate) struct InputSchema {
     by_column: HashMap<String, Vec<usize>>,
     by_qualified: HashMap<(String, String), usize>,
     bitwise_silent_string_columns: HashSet<usize>,
+    numeric_display: HashMap<usize, u16>,
     fingerprint: u64,
 }
 
@@ -117,6 +118,30 @@ impl InputSchema {
         let fingerprint = table_input_fingerprint(table);
         let mut schema = Self::with_fingerprint(columns, fingerprint);
         schema.bound_types = bound_types;
+        schema.numeric_display = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.zerofill)
+            .map(|(index, column)| {
+                (
+                    index,
+                    column.display_width.unwrap_or_else(|| {
+                        crate::engine::expr::default_numeric_display_width(&column.data_type)
+                    }),
+                )
+            })
+            .collect();
+        if table
+            .columns
+            .iter()
+            .any(|column| column.state == crate::storage::ColumnState::Dropped)
+        {
+            // Preserve physical operand offsets while excluding tombstones from SQL binding.
+            schema.rebuild_lookup(|idx| {
+                table.columns[idx].state != crate::storage::ColumnState::Dropped
+            });
+        }
         schema.bitwise_silent_string_columns = table
             .columns
             .iter()
@@ -151,9 +176,10 @@ impl InputSchema {
             by_column: HashMap::new(),
             by_qualified: HashMap::new(),
             bitwise_silent_string_columns: HashSet::new(),
+            numeric_display: HashMap::new(),
             fingerprint: 0,
         };
-        schema.rebuild_lookup();
+        schema.rebuild_lookup(|_| true);
         schema.fingerprint = fingerprint;
         schema
     }
@@ -179,6 +205,14 @@ impl InputSchema {
     /// CHAR/VARCHAR/BINARY counterparts when an InputSchema is reconstructed
     /// from a batch/PlanRow schema. Runtime `Value` and protocol ColumnType do
     /// not carry that distinction, but MySQL warning semantics do.
+    pub(crate) fn mark_numeric_display_columns(
+        &mut self,
+        columns: impl IntoIterator<Item = (usize, u16)>,
+    ) {
+        self.numeric_display.extend(columns);
+        self.fingerprint = self.compute_fingerprint();
+    }
+
     pub(crate) fn mark_silent_string_columns(&mut self, columns: impl IntoIterator<Item = usize>) {
         self.bitwise_silent_string_columns.extend(columns);
         // This attribute changes observable warning/error semantics, so it is
@@ -246,6 +280,11 @@ impl InputSchema {
             .saturating_add(by_qualified)
             .saturating_add(by_qualified_payload)
             .saturating_add(silent)
+            .saturating_add(
+                self.numeric_display
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, u16)>() + 1),
+            )
     }
 
     pub(crate) fn column_type(&self, index: usize) -> Option<ColumnType> {
@@ -318,8 +357,13 @@ impl InputSchema {
         }
     }
 
-    fn rebuild_lookup(&mut self) {
+    fn rebuild_lookup(&mut self, addressable: impl Fn(usize) -> bool) {
+        self.by_column.clear();
+        self.by_qualified.clear();
         for (idx, column) in self.columns.iter().enumerate() {
+            if !addressable(idx) {
+                continue;
+            }
             let col_key = column.name.to_ascii_lowercase();
             self.by_column.entry(col_key.clone()).or_default().push(idx);
             // SQL alias-shadows-name: once a column comes from an aliased
@@ -368,6 +412,7 @@ impl InputSchema {
         let mut hasher = schema_fingerprint_state().build_hasher();
         self.columns.len().hash(&mut hasher);
         for (index, column) in self.columns.iter().enumerate() {
+            self.numeric_display.get(&index).hash(&mut hasher);
             column.table.to_ascii_lowercase().hash(&mut hasher);
             column
                 .alias
@@ -465,6 +510,14 @@ pub(crate) fn table_input_fingerprint(table: &TableSchema) -> u64 {
             tbl.push_str(&table.name);
             tbl.make_ascii_lowercase();
             for (idx, column) in table.columns.iter().enumerate() {
+                column
+                    .zerofill
+                    .then(|| {
+                        column.display_width.unwrap_or_else(|| {
+                            crate::engine::expr::default_numeric_display_width(&column.data_type)
+                        })
+                    })
+                    .hash(&mut hasher);
                 // Hashing a `&str` is identical to hashing the owned
                 // `String` the original `compute_fingerprint` produced
                 // (String::hash delegates to str::hash).
@@ -2413,7 +2466,12 @@ fn contains_source_sensitive_function(root: &Expr, schema: &InputSchema) -> bool
                     });
             let needs_source_type = name.eq_ignore_ascii_case("UNIX_TIMESTAMP")
                 && (!bound_temporal || !std::ptr::eq(expr, root));
-            if is_json_cast || consumes_source_octets || needs_source_type {
+            let numeric_display = crate::engine::expr::function_uses_numeric_display(name)
+                && args.iter().any(|arg| {
+                    input_expr_column_index(arg, schema)
+                        .is_some_and(|index| schema.numeric_display.contains_key(&index))
+                });
+            if is_json_cast || consumes_source_octets || needs_source_type || numeric_display {
                 return Err(());
             }
         }
@@ -5062,6 +5120,7 @@ struct SyntheticEscapeColumn {
     collation_id: Option<u16>,
     silent: bool,
     max_octets: Option<u32>,
+    numeric_display: Option<u16>,
 }
 
 fn synthetic_escape_columns(schema: &InputSchema) -> Vec<SyntheticEscapeColumn> {
@@ -5076,6 +5135,7 @@ fn synthetic_escape_columns(schema: &InputSchema) -> Vec<SyntheticEscapeColumn> 
             collation_id: column.collation_id,
             silent: schema.bitwise_silent_string_columns.contains(&index),
             max_octets: schema.bound_types[index].max_octets,
+            numeric_display: schema.numeric_display.get(&index).copied(),
         })
         .collect()
 }
@@ -5104,6 +5164,10 @@ fn build_synthetic_escape_table(schema: &InputSchema) -> Arc<TableSchema> {
         .collect();
     let mut table = TableSchema::synthetic_for_planning("\0escape", &cols);
     for (index, column) in table.columns.iter_mut().enumerate() {
+        if let Some(width) = schema.numeric_display.get(&index) {
+            column.zerofill = true;
+            column.display_width = Some(*width);
+        }
         let silent = schema.bitwise_silent_string_columns.contains(&index);
         // `synthetic_for_planning` maps protocol VarString/Blob to their
         // unbounded TEXT/BLOB catalog forms. That default is too lossy for

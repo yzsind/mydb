@@ -886,12 +886,29 @@ pub fn command_err_packet_for_spec(
 }
 
 #[allow(dead_code)]
+/// Shared display conversion for protocol rows and SQL string consumers.
+pub(crate) fn numeric_display_width(column_type: ColumnType, declared: Option<u32>) -> u16 {
+    let width = match column_type {
+        ColumnType::Decimal { precision, scale } => u32::from(precision) + u32::from(scale > 0),
+        _ => declared.unwrap_or(match column_type {
+            ColumnType::Tiny => 3,
+            ColumnType::Short => 5,
+            ColumnType::MediumInt => 8,
+            ColumnType::Long => 10,
+            ColumnType::LongLong => 20,
+            ColumnType::Float => 12,
+            ColumnType::Double => 22,
+            ColumnType::Year => 4,
+            _ => 0,
+        }),
+    };
+    width.min(u32::from(u16::MAX)) as u16
+}
+
 /// Per-result-set ZEROFILL pad widths, or `None` when no projected
 /// column carries `ZEROFILL_FLAG` — the common case, so the per-row
-/// text encode path stays branch-free. Widths follow MySQL's default
-/// display widths for the unsigned integer types (mydb does not
-/// preserve explicit display widths) and `precision (+1 for the dot)`
-/// for DECIMAL.
+/// text encode path stays branch-free. Explicit numeric display widths
+/// are preserved; DECIMAL uses `precision (+1 for the dot)`.
 pub fn zerofill_pad_spec(columns: &[crate::types::Column]) -> Option<Vec<u16>> {
     let mut any = false;
     let spec: Vec<u16> = columns
@@ -900,23 +917,7 @@ pub fn zerofill_pad_spec(columns: &[crate::types::Column]) -> Option<Vec<u16>> {
             if column.source.flags & ZEROFILL_FLAG == 0 {
                 return 0;
             }
-            let width = match column.column_type {
-                crate::types::ColumnType::Tiny => 3,
-                crate::types::ColumnType::Short => 5,
-                crate::types::ColumnType::MediumInt => 8,
-                crate::types::ColumnType::Long => 10,
-                crate::types::ColumnType::LongLong => 20,
-                crate::types::ColumnType::Float => {
-                    column.source.length.unwrap_or(12).min(u32::from(u16::MAX)) as u16
-                }
-                crate::types::ColumnType::Double => {
-                    column.source.length.unwrap_or(22).min(u32::from(u16::MAX)) as u16
-                }
-                crate::types::ColumnType::Decimal { precision, scale } => {
-                    u16::from(precision) + u16::from(scale > 0)
-                }
-                _ => 0,
-            };
+            let width = numeric_display_width(column.column_type, column.source.length);
             if width > 0 {
                 any = true;
             }

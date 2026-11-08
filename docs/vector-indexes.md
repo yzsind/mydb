@@ -45,7 +45,7 @@ IVF uses sampled medoids scored with Jaccard distance.
 
 Native VECTOR results use MySQL's VECTOR wire type with little-endian FLOAT32
 coordinates. The `mysql` command-line client displays these bytes as hex.
-Set the session-only `vector_result_format` variable once to display coordinate
+Set the `vector_result_format` session variable once to display coordinate
 lists for all text-protocol VECTOR results, including table columns and functions:
 
 ```sql

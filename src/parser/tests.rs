@@ -839,8 +839,7 @@ fn parses_standalone_create_fulltext_index() {
     assert_eq!(index.index_type, "BTREE");
     assert_eq!(index.fulltext_parser, "");
 
-    // MySQL accepts and ignores FULLTEXT prefix lengths and sort directions, meaningless
-    // for inverted indexes. Parse successfully and clear both, matching inline syntax.
+    // FULLTEXT prefix lengths are ignored; explicit index order is rejected (1221).
     let Statement::CreateIndex(index) =
         parse_statement("CREATE FULLTEXT INDEX ft ON t (body(10))").unwrap()
     else {
@@ -848,12 +847,8 @@ fn parses_standalone_create_fulltext_index() {
     };
     assert_eq!(index.index_type, "FULLTEXT");
     assert!(index.column_prefix_lengths.iter().all(Option::is_none));
-    let Statement::CreateIndex(index) =
-        parse_statement("CREATE FULLTEXT INDEX ft ON t (body DESC)").unwrap()
-    else {
-        panic!("expected CreateIndex");
-    };
-    assert!(index.column_descending.iter().all(|d| !d));
+    let error = parse_statement("CREATE FULLTEXT INDEX ft ON t (body DESC)").unwrap_err();
+    assert_eq!(error.spec, crate::error::catalog::ER_WRONG_USAGE);
 }
 
 #[test]

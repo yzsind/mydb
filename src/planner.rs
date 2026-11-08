@@ -8791,6 +8791,21 @@ fn index_order_covers_order_by(
     true
 }
 
+fn validate_table_index_hints(table: &TableRef, schema: &TableSchema) -> Result<(), QueryError> {
+    for name in table.index_hints.iter().flat_map(|hint| &hint.index_names) {
+        if !schema
+            .iter_public_indexes()
+            .any(|index| index.name.eq_ignore_ascii_case(name))
+        {
+            return Err(error(
+                crate::error::catalog::ER_KEY_DOES_NOT_EXITS,
+                format!("Key '{name}' doesn't exist in table '{}'", schema.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> {
     if table.sample.is_some()
         && (table.generate_series.is_some()
@@ -8838,6 +8853,7 @@ fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> 
         ));
     }
     if let Some(plan_table) = plan_table_for_ref_if_resolved(db, table) {
+        validate_table_index_hints(table, &plan_table.schema)?;
         let mut plan_table = plan_table.with_system_time(table.system_time.clone());
         plan_table.sample = table.sample.clone();
         plan_table.explicit_partition_storage_ids =
@@ -8852,6 +8868,7 @@ fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> 
         return Err(error);
     }
     let schema = db.table(&table.name)?;
+    validate_table_index_hints(table, &schema)?;
     let sidecar = db.table_modification_delta(schema.id);
     let live_delta = db.table_live_row_delta(schema.id);
     if table.system_time.is_some() && schema.system {
@@ -25576,6 +25593,9 @@ fn projected_indices_for_referenced(
     let total = table.schema.columns.len();
     let mut indices = Vec::with_capacity(total);
     for (i, col) in table.schema.columns.iter().enumerate() {
+        if col.state == crate::storage::ColumnState::Dropped {
+            continue;
+        }
         if referenced.contains(&normalize_expr_column(&col.name)) {
             indices.push(i);
         }

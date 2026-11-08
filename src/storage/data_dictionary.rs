@@ -164,6 +164,7 @@ fn col(name: &str, data_type: DataTypeKind, nullable: bool) -> ColumnSchema {
         nullable,
         unsigned: false,
         zerofill: false,
+        display_width: None,
         invisible: false,
         auto_increment: false,
         default: None,
@@ -411,6 +412,7 @@ fn columns_table() -> TableSchema {
                 true,
             ),
             ucol("not_null_from_scn", DataTypeKind::BigInt, false),
+            ucol("display_width", DataTypeKind::Int, true),
         ],
     )
 }
@@ -595,6 +597,7 @@ fn views_table() -> TableSchema {
                 true,
             ),
             col("query_json", DataTypeKind::Text { max_len: u32::MAX }, true),
+            ucol("created_ms", DataTypeKind::BigInt, false),
         ],
     )
 }
@@ -1388,6 +1391,9 @@ fn push_table_rows(
             bv(col.invisible),
             jsonv(&col.read_backfill_default),
             uv(col.not_null_from_scn),
+            col.display_width
+                .map(|width| uv(u64::from(width)))
+                .unwrap_or(Value::Null),
         ]);
     }
     for (idx_pos, index) in table.indexes.iter().enumerate() {
@@ -2287,6 +2293,11 @@ fn reconstruct_column(r: &[Value]) -> Result<ColumnSchema, crate::types::QueryEr
         generated_stored: r_bool(r, 18),
         generated_column_names: r_json::<Vec<String>>(r, 19)?,
         zerofill: r_bool(r, 20),
+        display_width: r.get(24).and_then(|value| match value {
+            Value::UInt(width) => u16::try_from(*width).ok(),
+            Value::Int(width) => u16::try_from(*width).ok(),
+            _ => None,
+        }),
         invisible: r_bool(r, 21),
         generated_expr_ast: None,
         generated_program: None,
@@ -2414,6 +2425,7 @@ fn view_row(v: &ViewSchema) -> Vec<Value> {
             .as_ref()
             .map(|query| sv(query.encoded()))
             .unwrap_or(Value::Null),
+        uv(v.created_ms),
     ]
 }
 fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError> {
@@ -2471,6 +2483,7 @@ fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError>
         schema_version: r_u64(r, 15),
         // Missing in DD heaps written before this column → empty (raw echo).
         definition_normalized: r_str(r, 16),
+        created_ms: r_u64(r, 18),
         query,
     })
 }
@@ -3201,6 +3214,7 @@ mod tests {
                 character_set_client: crate::charset::DEFAULT_CHARSET.to_string(),
                 collation_connection: crate::charset::DEFAULT_COLLATION.to_string(),
                 definition_normalized: String::new(),
+                created_ms: 0,
             },
         );
         catalog.routines.insert(
