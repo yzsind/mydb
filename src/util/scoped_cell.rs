@@ -55,7 +55,7 @@ mod tests {
     #[test]
     fn overrides_do_not_cross_thread_boundaries() {
         with_value(&VALUE, Some(7), || {
-            std::thread::spawn(|| {
+            crate::util::thread_spawn::spawn(|| {
                 assert_eq!(VALUE.get(), None);
                 with_value(&VALUE, Some(9), || assert_eq!(VALUE.get(), Some(9)));
                 assert_eq!(VALUE.get(), None);

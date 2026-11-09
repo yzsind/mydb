@@ -10889,7 +10889,7 @@ fn try_vec_window_fast_path(
         // and bails surface as variants we fold after the scope.
         type ChunkOut = Result<Option<Vec<Vec<Value>>>, QueryError>;
         let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
-        let parts: Vec<ChunkOut> = std::thread::scope(|scope| {
+        let parts: Vec<ChunkOut> = crate::util::thread_spawn::scope(|scope| {
             let handles: Vec<_> = partitions
                 .chunks(chunk)
                 .map(|pc| {

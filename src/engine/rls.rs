@@ -144,7 +144,7 @@ pub(crate) fn statement_catalog(db: &Database) -> Result<Arc<CatalogSnapshot>, Q
         if *owner != db as *const Database as usize {
             return Err(catalog_snapshot_conflict());
         }
-        Ok(policies.clone())
+        Ok(Arc::clone(policies))
     })
 }
 pub(crate) fn statement_security(
@@ -188,7 +188,7 @@ pub(crate) fn authorization_snapshot(db: &Database) -> Arc<AuthCatalog> {
         let (owner, auth, _, _) = state.snapshot.auth.get_or_init(|| capture_catalogs(db));
         // A scope cannot transfer authorization between database instances.
         if *owner == db as *const Database as usize {
-            auth.clone()
+            Arc::clone(auth)
         } else {
             db.auth_catalog()
         }
@@ -260,6 +260,7 @@ impl Drop for TrustedInternalScope {
 /// scopes replace it and restore it on exit; no per-row shared mutex is used.
 pub(crate) struct EvaluationScope {
     previous: Option<RlsExecutionContext>,
+    reused_policy_access: Option<bool>,
     ancestors: Vec<u64>,
     _policy: crate::engine::auth::PolicySnapshotScope,
 }
@@ -293,6 +294,32 @@ impl EvaluationScope {
         Self::enter_snapshot(None)
     }
     pub(crate) fn enter_snapshot(captured: Option<&EvaluationSnapshot>) -> Self {
+        if captured.is_none() {
+            let reused = EXECUTION.with(|state| {
+                let mut state = state.borrow_mut();
+                let current = state.as_mut()?;
+                // Reuse only an unallocated cache frame. A nested identity
+                // must never see bindings computed by its caller.
+                if current.bindings.capacity() != 0
+                    || current.context_integers.capacity() != 0
+                    || current.expression_settings.capacity() != 0
+                {
+                    return None;
+                }
+                let policy =
+                    crate::engine::auth::PolicySnapshotScope::enter(&current.snapshot.policy);
+                let observed = std::mem::replace(&mut current.policy_access_observed, false);
+                Some((observed, policy))
+            });
+            if let Some((observed, policy)) = reused {
+                return Self {
+                    previous: None,
+                    reused_policy_access: Some(observed),
+                    ancestors: POLICY_STACK.with(|stack| stack.borrow().clone()),
+                    _policy: policy,
+                };
+            }
+        }
         let current = EXECUTION.with(|state| state.borrow().as_ref().map(|s| s.snapshot.clone()));
         let snapshot = captured
             .map(|s| s.authorization.clone())
@@ -319,6 +346,7 @@ impl EvaluationScope {
             previous
         });
         Self {
+            reused_policy_access: None,
             previous: EXECUTION.with(|state| {
                 state.borrow_mut().replace(RlsExecutionContext {
                     policy_access_observed: false,
@@ -337,6 +365,17 @@ impl Drop for EvaluationScope {
     fn drop(&mut self) {
         EXECUTION.with(|state| {
             let mut state = state.borrow_mut();
+            if let Some(observed) = self.reused_policy_access {
+                let current = state.as_mut().expect("active reused row-security scope");
+                current.policy_access_observed |= observed;
+                // Nested evaluation may have populated any of these caches.
+                // Release both governed entries and bucket allocations at the
+                // same boundary as a fully isolated frame.
+                release_nested_cache(&mut current.bindings);
+                release_nested_cache(&mut current.context_integers);
+                release_nested_cache(&mut current.expression_settings);
+                return;
+            }
             if let Some(previous) = self.previous.as_mut() {
                 previous.policy_access_observed |= state
                     .as_ref()
@@ -345,6 +384,12 @@ impl Drop for EvaluationScope {
             *state = self.previous.take();
         });
         POLICY_STACK.with(|stack| *stack.borrow_mut() = std::mem::take(&mut self.ancestors));
+    }
+}
+
+fn release_nested_cache<K, V>(cache: &mut std::collections::HashMap<K, V>) {
+    if cache.capacity() != 0 {
+        *cache = std::collections::HashMap::with_hasher(cache.hasher().clone());
     }
 }
 
@@ -780,6 +825,137 @@ mod context_tests {
     }
 }
 
+#[cfg(test)]
+mod evaluation_scope_tests {
+    use super::*;
+    use crate::engine::executor::mem_budget::{
+        controlled_memory_snapshot, ControlledMemoryCategory, ControlledMemoryCharge,
+    };
+
+    fn cache_integer(value: i64) {
+        let charge =
+            ControlledMemoryCharge::try_new(ControlledMemoryCategory::Executor, 4096).unwrap();
+        EXECUTION.with(|state| {
+            state
+                .borrow_mut()
+                .as_mut()
+                .unwrap()
+                .context_integers
+                .insert("tenant".into(), [Some((Value::Int(value), charge)), None]);
+        });
+    }
+
+    fn cached_integer() -> Option<Value> {
+        EXECUTION.with(|state| {
+            state.borrow().as_ref().and_then(|state| {
+                state.context_integers.get("tenant")?[0]
+                    .as_ref()
+                    .map(|(value, _)| value.clone())
+            })
+        })
+    }
+
+    #[test]
+    fn empty_nested_evaluation_releases_caches_and_merges_access_on_unwind() {
+        let memory = controlled_memory_snapshot().0;
+        let outer = EvaluationScope::enter();
+        let snapshot = evaluation_snapshot().unwrap();
+        let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _inner = EvaluationScope::enter();
+            assert!(Arc::ptr_eq(
+                &snapshot.authorization,
+                &evaluation_snapshot().unwrap().authorization
+            ));
+            assert!(!policy_access_observed());
+            cache_integer(22);
+            EXECUTION
+                .with(|state| state.borrow_mut().as_mut().unwrap().policy_access_observed = true);
+            assert_eq!(cached_integer(), Some(Value::Int(22)));
+            assert!(controlled_memory_snapshot().0 >= memory + 4096);
+            panic!("restore the enclosing evaluation");
+        }));
+        assert!(failure.is_err());
+        assert_eq!(cached_integer(), None);
+        assert!(policy_access_observed());
+        assert_eq!(controlled_memory_snapshot().0, memory);
+        {
+            let _next = EvaluationScope::enter();
+            assert!(!policy_access_observed());
+            assert_eq!(cached_integer(), None);
+        }
+        assert!(policy_access_observed());
+        drop(outer);
+        assert!(evaluation_snapshot().is_none());
+    }
+
+    #[test]
+    fn populated_parent_bindings_remain_isolated_from_nested_evaluation() {
+        let memory = controlled_memory_snapshot().0;
+        let _outer = EvaluationScope::enter();
+        cache_integer(11);
+        {
+            let _inner = EvaluationScope::enter();
+            assert_eq!(cached_integer(), None);
+            cache_integer(22);
+            assert_eq!(cached_integer(), Some(Value::Int(22)));
+            assert!(controlled_memory_snapshot().0 >= memory + 8192);
+        }
+        assert_eq!(cached_integer(), Some(Value::Int(11)));
+        assert_eq!(controlled_memory_snapshot().0, memory + 4096);
+    }
+
+    #[test]
+    fn explicit_worker_snapshot_replaces_and_restores_empty_parent_identity() {
+        let _outer = EvaluationScope::enter();
+        let parent = evaluation_snapshot().unwrap();
+        let captured = EvaluationSnapshot {
+            authorization: Arc::new(AuthorizationSnapshot {
+                auth: std::sync::OnceLock::new(),
+                policy: crate::engine::auth::PolicySnapshot::capture(),
+            }),
+            ancestors: vec![17, 29],
+        };
+        {
+            let _inner = EvaluationScope::enter_snapshot(Some(&captured));
+            let active = evaluation_snapshot().unwrap();
+            assert!(Arc::ptr_eq(&active.authorization, &captured.authorization));
+            assert_eq!(active.ancestors, vec![17, 29]);
+            cache_integer(22);
+        }
+        assert!(Arc::ptr_eq(
+            &evaluation_snapshot().unwrap().authorization,
+            &parent.authorization
+        ));
+        assert_eq!(cached_integer(), None);
+        assert!(evaluation_snapshot().unwrap().ancestors.is_empty());
+    }
+
+    #[test]
+    fn catalog_leases_outlive_database_and_release_after_worker_handoff() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let db = Database::open(dir.path()).unwrap();
+        // Retained statement snapshots must outlive their database and
+        // release both immutable roots after the final worker finishes.
+        let leases: Vec<_> = (0..24).map(|_| capture_catalogs(&db)).collect();
+        let expected = (leases[0].1.epoch, leases[0].3.epoch);
+        let auth = Arc::downgrade(&leases[0].1);
+        let policies = Arc::downgrade(&leases[0].3);
+        drop(db);
+        assert!(auth.upgrade().is_some());
+        assert!(policies.upgrade().is_some());
+        crate::util::thread_spawn::spawn(move || {
+            for (_, auth, _, policies) in &leases {
+                assert_eq!((auth.epoch, policies.epoch), expected);
+            }
+        })
+        .join()
+        .unwrap();
+        assert!(auth.upgrade().is_none());
+        assert!(policies.upgrade().is_none());
+    }
+}
+
 thread_local! { static STRICT_OLD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
 pub(crate) struct StrictOldScope(bool);
 impl StrictOldScope {
@@ -873,43 +1049,102 @@ pub struct PlanIdentity {
     expression_settings: Arc<crate::engine::expr::PolicyExpressionSettings>,
 }
 
-pub fn session_signature(
-    db: &Database,
-    session: &crate::engine::api::SessionContext,
-) -> Arc<PlanIdentity> {
-    let auth = authorization_snapshot(db);
-    let generation = EXECUTION
-        .with(|state| {
-            state.borrow().as_ref().and_then(|s| {
-                s.snapshot
-                    .auth
-                    .get()
-                    .map(|(_, _, generation, _)| *generation)
+/// Statement-bound catalog/settings state shared by identity construction and
+/// validation. Keep validation independent of the connection's last signature:
+/// alternating prepared handles can retain different parameter domains.
+struct PlanIdentityEnvironment {
+    generation: u64,
+    auth_epoch: u64,
+    security_epoch: u64,
+    policy: crate::engine::auth::PolicySnapshot,
+    trusted: bool,
+}
+
+impl PlanIdentityEnvironment {
+    fn capture(db: &Database) -> Self {
+        let captured = EXECUTION.with(|state| {
+            let state = state.borrow();
+            let current = state.as_ref()?;
+            let (owner, auth, generation, policies) = current.snapshot.auth.get()?;
+            (*owner == db as *const Database as usize).then_some((
+                *generation,
+                auth.epoch,
+                policies.epoch,
+            ))
+        });
+        if let Some((generation, auth_epoch, security_epoch)) = captured {
+            // The statement already owns both immutable roots. Reading their
+            // epochs does not require extra shared reference-count writes.
+            return Self {
+                generation,
+                auth_epoch,
+                security_epoch,
+                policy: crate::engine::auth::PolicySnapshot::capture(),
+                trusted: trusted_internal(),
+            };
+        }
+        let auth = authorization_snapshot(db);
+        let generation = EXECUTION
+            .with(|state| {
+                state.borrow().as_ref().and_then(|s| {
+                    s.snapshot
+                        .auth
+                        .get()
+                        .map(|(_, _, generation, _)| *generation)
+                })
             })
-        })
-        .unwrap_or_else(crate::engine::auth::authorization_generation);
-    let security_epoch = statement_catalog(db).map_or(0, |catalog| catalog.epoch);
-    let policy = crate::engine::auth::PolicySnapshot::capture();
-    let trusted = trusted_internal();
-    let mut cached = session.rls.identity.borrow_mut();
-    if let Some(identity) = cached.as_ref() {
-        if identity.account == session.authenticated_as
-            && identity.roles.iter().eq(session.active_roles.iter())
-            && identity.generation == generation
-            && identity.auth_epoch == auth.epoch
-            && identity.security_epoch == security_epoch
-            && identity.policy == policy
-            && identity.internal == session.internal_system_session
-            && identity.trusted == trusted
-            && identity.enabled == session.rls.enabled
-            && identity.expression_settings.matches_session(session)
+            .unwrap_or_else(crate::engine::auth::authorization_generation);
+        Self {
+            generation,
+            auth_epoch: auth.epoch,
+            security_epoch: statement_catalog(db).map_or(0, |catalog| catalog.epoch),
+            policy: crate::engine::auth::PolicySnapshot::capture(),
+            trusted: trusted_internal(),
+        }
+    }
+}
+
+impl PlanIdentity {
+    pub(crate) fn matches_session(
+        &self,
+        db: &Database,
+        session: &crate::engine::api::SessionContext,
+    ) -> bool {
+        self.matches_environment(session, &PlanIdentityEnvironment::capture(db))
+    }
+
+    fn matches_environment(
+        &self,
+        session: &crate::engine::api::SessionContext,
+        environment: &PlanIdentityEnvironment,
+    ) -> bool {
+        self.account == session.authenticated_as
+            && self.roles.iter().eq(session.active_roles.iter())
+            && self.generation == environment.generation
+            && self.auth_epoch == environment.auth_epoch
+            && self.security_epoch == environment.security_epoch
+            && self.policy == environment.policy
+            && self.internal == session.internal_system_session
+            && self.trusted == environment.trusted
+            && self.enabled == session.rls.enabled
+            && self.expression_settings.matches_session(session)
             && crate::engine::params::with_current_params(|params, _| {
-                identity.parameter_domains.iter().copied().eq(params
+                self.parameter_domains.iter().copied().eq(params
                     .unwrap_or_default()
                     .iter()
                     .map(std::mem::discriminant))
             })
-        {
+    }
+}
+
+pub fn session_signature(
+    db: &Database,
+    session: &crate::engine::api::SessionContext,
+) -> Arc<PlanIdentity> {
+    let environment = PlanIdentityEnvironment::capture(db);
+    let mut cached = session.rls.identity.borrow_mut();
+    if let Some(identity) = cached.as_ref() {
+        if identity.matches_environment(session, &environment) {
             return identity.clone();
         }
     }
@@ -923,12 +1158,12 @@ pub fn session_signature(
     let identity = Arc::new(PlanIdentity {
         account: session.authenticated_as.clone(),
         roles: session.active_roles.iter().cloned().collect(),
-        generation,
-        auth_epoch: auth.epoch,
-        security_epoch,
-        policy,
+        generation: environment.generation,
+        auth_epoch: environment.auth_epoch,
+        security_epoch: environment.security_epoch,
+        policy: environment.policy,
         internal: session.internal_system_session,
-        trusted,
+        trusted: environment.trusted,
         enabled: session.rls.enabled,
         parameter_domains,
         expression_settings: Arc::new(crate::engine::expr::PolicyExpressionSettings::capture(

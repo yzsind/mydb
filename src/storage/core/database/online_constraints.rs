@@ -1398,8 +1398,9 @@ impl Database {
                 )?;
                 publication_started = true;
                 for target in &mut targets {
-                    self.index_cache.write().insert(
-                        (target.table.id, normalize_name(&target.index.name)),
+                    self.publish_index_handle(
+                        target.table.id,
+                        &target.index.name,
                         Arc::new(parking_lot::RwLock::new(target.file.take().unwrap())),
                     );
                 }

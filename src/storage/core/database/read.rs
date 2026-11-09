@@ -1047,7 +1047,7 @@ impl Database {
         txn: TxnView,
     ) -> Result<Vec<bool>, QueryError> {
         self.check_primary_read_view(table, txn)?;
-        let suspects = match self.index_entry_suspects(table, index) {
+        let suspects = match self.index_entry_suspects(table, index, entries.len()) {
             Some(IndexEntrySuspects::All) => {
                 return self.filter_visible_index_entries_mask_exact(table, index, entries, txn)
             }
@@ -1084,7 +1084,7 @@ impl Database {
         txn: TxnView,
     ) -> Result<Vec<bool>, QueryError> {
         self.check_primary_read_view(table, txn)?;
-        let suspects = match self.index_entry_suspects(table, index) {
+        let suspects = match self.index_entry_suspects(table, index, entries.len()) {
             Some(IndexEntrySuspects::All) => {
                 return entries
                     .iter()
@@ -1123,6 +1123,7 @@ impl Database {
         &self,
         table: &TableSchema,
         index: &IndexSchema,
+        candidate_count: usize,
     ) -> Option<IndexEntrySuspects> {
         if ExactIndexVisibility::active() {
             return Some(IndexEntrySuspects::All);
@@ -1130,8 +1131,17 @@ impl Database {
         if !self.has_pending_index_repairs_for(table.id, &index.name) {
             return None;
         }
-        let rows = self.index_repair_state.suspect_rows(table.id, &index.name);
-        (!rows.is_empty()).then_some(IndexEntrySuspects::Rows(rows))
+        match self
+            .index_repair_state
+            .suspect_rows(table.id, &index.name, candidate_count)
+        {
+            // A large repair history must not dominate a small index read.
+            // Exact validation is the existing conservative path, including
+            // index-key ownership and rollback-overlap visibility checks.
+            None => Some(IndexEntrySuspects::All),
+            Some(rows) if !rows.is_empty() => Some(IndexEntrySuspects::Rows(rows)),
+            Some(_) => None,
+        }
     }
 
     /// [`Self::filter_visible_index_entries_mask_with_handle`] without the

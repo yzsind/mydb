@@ -2330,7 +2330,7 @@ fn sort_window_partitions(
         let chunk = partitions.len().div_ceil(degree).max(1);
         let sort_one = &sort_one;
         let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut workers = Vec::new();
             for part_chunk in partitions.chunks_mut(chunk) {
                 let cancellation = cancellation.clone();

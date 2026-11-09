@@ -305,7 +305,6 @@ impl BloomFilter {
 
     /// Build a filter over an ordered pair of canonical integer components.
     /// This is the common composite-FK runtime-filter shape.
-    #[cfg(test)]
     pub(crate) fn new_int_pair(expected_entries: usize) -> Self {
         let mut filter = Self::new(expected_entries);
         filter.int_key_arity = 2;
@@ -411,7 +410,6 @@ impl BloomFilter {
         self.contains_hash_pair(h1, h2)
     }
 
-    #[cfg(test)]
     pub(crate) fn insert_int_pair(&mut self, first: i128, second: i128) {
         debug_assert!(self.uses_int_pair_keys());
         let (h1, h2) = hash_pair_int_pair(first, second, self.legacy_double_hash);

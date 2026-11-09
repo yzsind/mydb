@@ -27,7 +27,7 @@ fn number(name: &str, default: u64, min: u64, max: u64) -> Result<u64, String> {
 }
 impl Limits {
     fn load() -> Result<Self, String> {
-        let cpus = std::thread::available_parallelism()
+        let cpus = crate::util::thread_spawn::available_parallelism()
             .map(usize::from)
             .unwrap_or(1)
             .div_ceil(2)

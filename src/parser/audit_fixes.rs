@@ -694,7 +694,7 @@ fn audit_plain_explain_target_matches_upstream_lowering() {
 
 #[test]
 fn audit_upstream_prefix_stack_is_bounded_during_scalar_roundtrip() {
-    std::thread::Builder::new()
+    crate::util::thread_spawn::Builder::new()
         .stack_size(2 * 1024 * 1024)
         .spawn(|| {
             let before = crate::engine::controlled_memory_snapshot().2[12];

@@ -20,6 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::engine::api::{QueryResponse, ResultSet};
 use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 use crate::parser::Statement;
+use crate::storage::image::validate_restore_path;
 use crate::storage::{error, Database, DurabilityMode, StartupValidationMode, StorageConfig};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
@@ -845,7 +846,7 @@ impl Drop for PoolPanicGuard<'_> {
 fn desired_chunk_parallelism(task_count: usize) -> usize {
     // Leave CPU capacity for foreground requests while backup workers hash
     // large chunks, including when the offline sealer runs in another process.
-    std::thread::available_parallelism()
+    crate::util::thread_spawn::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .div_ceil(2)
@@ -914,7 +915,7 @@ fn process_chunks_parallel<T: Send>(
     let failed = AtomicBool::new(false);
     // Bound queued results even if progress reporting is slower than workers.
     let (sender, receiver) = mpsc::sync_channel(charges.len().max(1));
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         for charge in charges {
             let context = context.clone();
             let sender = sender.clone();
@@ -1444,48 +1445,6 @@ fn relative_path(root: &Path, path: &Path) -> Result<String, QueryError> {
         .join("/"))
 }
 
-fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
-    let path = Path::new(relative);
-    if relative.split('/').count() > 64
-        || relative.is_empty()
-        || relative.len() > 4096
-        || relative.contains(['\\', ':', '\0'])
-        || relative
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."))
-        || path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
-        return Err(backup_err(format!("unsafe backup path '{relative}'")));
-    }
-    let allowed = relative.starts_with("schemas/")
-        || relative.starts_with("objects/")
-        || relative.starts_with("system/catalog/")
-        || relative.starts_with("system/undo/")
-        || relative.starts_with("system/object-owners/")
-        || relative.starts_with("system/xa-binlog/")
-        || relative.starts_with("system/wal/")
-        || matches!(
-            relative,
-            "system/commit-ledger.v1"
-                | "system/commit-clock.v1"
-                | "system/storage.control"
-                | "system/history-index.v1"
-                | "system/tablespaces.json"
-                | "system/zone-map-checkpoint.manifest"
-                | "system/vector-purges.v1"
-                | "system/vector-maintenance.jobs"
-        );
-    if !allowed {
-        return Err(backup_err(format!(
-            "backup path '{relative}' is outside the persistent restore set"
-        )));
-    }
-    Ok(())
-}
-
 fn confirm_immutable(path: &Path) -> Result<(), QueryError> {
     let file = File::open(path).map_err(|e| io_err("open immutable backup object", e))?;
     crate::platform::fs::sync_before_atomic_rename_at(&file, path)
@@ -1600,7 +1559,7 @@ fn sync_paths_parallel(paths: &[PathBuf]) -> Result<(), QueryError> {
     }
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::sync_channel(grants.len().max(1));
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         // On an error, drop the receiver before joining workers so a blocked
         // producer cannot deadlock the scoped join.
         let receiver = receiver;

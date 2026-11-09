@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Guard backup acceptance admission, WAL framing, and integrity checks."""
+"""Guard backup acceptance WAL evidence, integrity, and writer admission."""
 from pathlib import Path
 import struct
 import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 import zlib
@@ -12,6 +13,78 @@ import test_backup_recovery as recovery
 
 
 class CaptureAdmissionTests(unittest.TestCase):
+    def test_measurement_retries_capture_barriers_and_lock_timeouts(self):
+        release = threading.Event()
+        self.addCleanup(release.set)
+        errors = [
+            recovery.mysql.connector.Error(errno=1290, msg=message)
+            for message in [
+                'new writes are paused while physical backup drains active writers; retry',
+                'write blocked by capture admission barrier; retry after physical backup capture',
+            ]
+        ] + [recovery.mysql.connector.Error(errno=1205, msg='lock wait timeout')]
+
+        def operation():
+            if not release.wait(5):
+                raise TimeoutError('writer never resumed')
+            return 'backup complete'
+
+        def query(*args):
+            if errors:
+                raise errors.pop(0)
+            release.set()
+
+        with patch.object(recovery, 'sql', query):
+            metric, value = recovery.measure_while(None, operation)
+        self.assertEqual(value, 'backup complete')
+        self.assertEqual(metric['admission_retries'], 3)
+        self.assertGreaterEqual(metric['transactions'], 1)
+
+    def test_unrelated_write_errors_propagate_after_worker_cleanup(self):
+        for errno, message in [
+            (1290, 'server is read-only'),
+            (1290, 'pending WAL budget exhausted'),
+            (1064, 'syntax error'),
+        ]:
+            with self.subTest(errno=errno, message=message):
+                release = threading.Event()
+                finished = threading.Event()
+                self.addCleanup(release.set)
+                error = recovery.mysql.connector.Error(errno=errno, msg=message)
+
+                def operation():
+                    release.wait(5)
+                    time.sleep(.01)
+                    finished.set()
+
+                def query(*args):
+                    release.set()
+                    raise error
+
+                with patch.object(recovery, 'sql', query), \
+                        self.assertRaises(recovery.mysql.connector.Error) as caught:
+                    recovery.measure_while(None, operation)
+                self.assertIs(caught.exception, error)
+                self.assertTrue(finished.is_set(), 'background operation must finish before its connection closes')
+
+    def test_backup_failure_is_not_hidden_by_admission_retries(self):
+        started = threading.Event()
+
+        def operation():
+            started.wait(5)
+            raise RuntimeError('backup failed')
+
+        def query(*args):
+            started.set()
+            raise recovery.mysql.connector.Error(
+                errno=1290,
+                msg='write blocked by capture admission barrier; retry after physical backup capture',
+            )
+
+        with patch.object(recovery, 'sql', query), \
+                self.assertRaisesRegex(AssertionError, 'backup failed'):
+            recovery.measure_while(None, operation)
+
     barriers = [
         'new writes are paused while physical backup drains active writers; retry',
         'write blocked by capture admission barrier; retry after physical backup capture',

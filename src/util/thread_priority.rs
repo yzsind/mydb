@@ -31,7 +31,7 @@ mod tests {
     fn lowers_only_the_calling_thread() {
         let main_tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
         let before = unsafe { libc::getpriority(libc::PRIO_PROCESS, main_tid) };
-        let lowered = std::thread::spawn(|| {
+        let lowered = crate::util::thread_spawn::spawn(|| {
             super::lower_current_thread_priority();
             let tid = unsafe { libc::syscall(libc::SYS_gettid) } as libc::id_t;
             unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) }

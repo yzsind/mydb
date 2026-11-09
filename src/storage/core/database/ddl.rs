@@ -5361,7 +5361,13 @@ impl Database {
                 self.drop_vector_graph(snapshot.id, &old.name);
             }
         }
-        self.index_cache.write().extend(built_indexes);
+        {
+            let mut cache = self.index_cache.write();
+            for ((id, _), _) in &built_indexes {
+                self.invalidate_storage_handle_open_epoch(*id);
+            }
+            cache.extend(built_indexes);
+        }
         self.mark_table_stats_stale(&key, 0)?;
         Ok(())
     }
@@ -7989,7 +7995,7 @@ impl Database {
                 || table_has_externalizable_column(&candidate);
             let configured_pages = if external { 1 } else { ddl_copy_batch_pages() };
             let mut lo = 0_u64;
-            std::thread::scope(|scope| -> Result<(), QueryError> {
+            crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
                 // One ordered heap writer trails the scanner by one batch.
                 // This overlaps page encoding/checksumming/pwrite with the
                 // next source scan without changing source-page order or the
@@ -8200,7 +8206,7 @@ impl Database {
                 self.flush_online_copy_shadow(&shadow_table)?;
             }
             if self.config.durability == DurabilityMode::Strict {
-                std::thread::scope(|scope| {
+                crate::util::thread_spawn::scope(|scope| {
                     let heap_path = self.table_path(shadow_id);
                     let heap_sync = scope.spawn(move || {
                         OpenOptions::new()
@@ -8723,7 +8729,7 @@ impl Database {
         // Schema coercion also emits statement diagnostics through TLS. Share a
         // batched sink with workers so those warnings survive their exit.
         let warning_sink = crate::engine::api::StatementWarningSink::default();
-        let result = std::thread::scope(|scope| {
+        let result = crate::util::thread_spawn::scope(|scope| {
             let defaults = &defaults;
             let session_info = &session_info;
             let handles = ranges

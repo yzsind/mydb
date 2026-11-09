@@ -1,7 +1,7 @@
 //! Parallel in-place sort utility.
 //!
 //! `parallel_sort_unstable` splits a slice into roughly equal chunks,
-//! sorts each on its own thread via `std::thread::scope`, then merges
+//! sorts each on its own thread via `crate::util::thread_spawn::scope`, then merges
 //! the sorted runs back into a fresh `Vec` and writes the result back
 //! into the input slice with `swap_nonoverlapping`. Output buffer
 //! costs one extra allocation the size of the input — acceptable for
@@ -45,7 +45,7 @@ where
         .min(data.len().div_ceil(PARALLEL_SORT_THRESHOLD / 2))
         .max(2);
     let chunk_size = data.len().div_ceil(effective);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for chunk in data.chunks_mut(chunk_size) {
             scope.spawn(|| chunk.sort_unstable());
         }
@@ -77,7 +77,7 @@ where
         .min(data.len().div_ceil(PARALLEL_SORT_THRESHOLD / 2))
         .max(2);
     let chunk_size = data.len().div_ceil(effective);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for chunk in data.chunks_mut(chunk_size) {
             let compare = &compare;
             scope.spawn(move || chunk.sort_unstable_by(compare));

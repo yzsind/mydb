@@ -1331,41 +1331,42 @@ pub(super) fn try_execute_nested_loop_join_block(
 
     let pre_ref = &pre;
     type ChunkResult = (Vec<PlanRow>, Option<Vec<bool>>, u64, u64);
-    let parts_result: Result<Vec<ChunkResult>, QueryError> = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for chunk in left_rows.chunks(chunk_size) {
-            let worker_context = execution_context.clone();
+    let parts_result: Result<Vec<ChunkResult>, QueryError> =
+        crate::util::thread_spawn::scope(|scope| {
+            let mut handles = Vec::new();
+            for chunk in left_rows.chunks(chunk_size) {
+                let worker_context = execution_context.clone();
 
-            handles.push(scope.spawn(move || -> Result<ChunkResult, QueryError> {
-                let run = || {
-                    nlj_block_process_chunk(
-                        right,
-                        chunk,
-                        right_rows,
-                        pre_ref,
-                        join_type,
-                        block_size,
-                        vectorized_ref,
+                handles.push(scope.spawn(move || -> Result<ChunkResult, QueryError> {
+                    let run = || {
+                        nlj_block_process_chunk(
+                            right,
+                            chunk,
+                            right_rows,
+                            pre_ref,
+                            join_type,
+                            block_size,
+                            vectorized_ref,
+                        )
+                    };
+                    worker_context.run(db, || {
+                        let _materialization_scope = MaterializationChargeScope::enter();
+                        run()
+                    })
+                }));
+            }
+            let mut all = Vec::with_capacity(handles.len());
+            for h in handles {
+                let part = h.join().map_err(|_| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "NLJ outer worker panicked",
                     )
-                };
-                worker_context.run(db, || {
-                    let _materialization_scope = MaterializationChargeScope::enter();
-                    run()
-                })
-            }));
-        }
-        let mut all = Vec::with_capacity(handles.len());
-        for h in handles {
-            let part = h.join().map_err(|_| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "NLJ outer worker panicked",
-                )
-            })??;
-            all.push(part);
-        }
-        Ok(all)
-    });
+                })??;
+                all.push(part);
+            }
+            Ok(all)
+        });
     let parts = parts_result?;
 
     let mut total_eval = 0u64;

@@ -295,10 +295,7 @@ fn parse_env_u64(name: &str) -> Result<Option<u64>, ()> {
 }
 
 fn parse_bool(v: &str) -> bool {
-    matches!(
-        v.trim().to_ascii_lowercase().as_str(),
-        "1" | "true" | "on" | "yes" | "y"
-    )
+    crate::util::env::parse_bool_with_short(v).unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -374,5 +371,21 @@ fn release1106_disk_reserve_does_not_wrap() {
             ReplConfig::from_env,
         );
         assert_eq!(cfg.base_backup_disk_reserve_pct, 90);
+    }
+}
+
+#[cfg(test)]
+mod boolean_contract_tests {
+    use super::*;
+    #[test]
+    fn replication_boolean_true_set_and_unknown_false_policy_are_preserved() {
+        for raw in ["1", "TrUe", "on", " yes ", "y", "\u{2003}Y\u{a0}"] {
+            assert!(parse_bool(raw), "{raw}");
+        }
+        for raw in [
+            "0", "false", "OFF", "no", "n", "", "2", "+1", "yy", "TRUE!", "ßy",
+        ] {
+            assert!(!parse_bool(raw), "{raw}");
+        }
     }
 }

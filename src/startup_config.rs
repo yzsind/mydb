@@ -630,6 +630,14 @@ static OPTION_SPECS: &[OptionSpec] = &[
         sensitive: false,
     },
     OptionSpec {
+        name: "tokio_affinity",
+        env: "MYDB_TOKIO_AFFINITY",
+        kind: OptionKind::Enum(&["auto", "off"]),
+        aliases: &[],
+        cli: false,
+        sensitive: false,
+    },
+    OptionSpec {
         name: "event_workers",
         env: "MYDB_EVENT_WORKERS",
         kind: OptionKind::U64Range(1, 32),

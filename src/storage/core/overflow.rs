@@ -216,6 +216,10 @@ pub(crate) struct OverflowFile {
     /// `alloc_one_page` (-1) / `free_chain` (+chain length) / `shrink_to_fit`
     /// (-number of tail pages trimmed). Used for shrink decisions and M6 observability.
     free_count: u64,
+    /// Verified suffix of the free list. Prepending freed chains preserves
+    /// this set; allocation and shrinking invalidate it before unlinking.
+    free_list_cache: HashSet<u64>,
+    free_list_cache_charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
     file_key: Arc<BufferPageFileKey>,
     buffer_pool: Arc<BufferPool>,
     log: Arc<crate::wal::LogMutex>,
@@ -281,6 +285,12 @@ impl OverflowFile {
             free_head: 0,
             next_generation: 1,
             free_count: 0,
+            free_list_cache: HashSet::new(),
+            free_list_cache_charge:
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
+                    0,
+                )?,
             file_key,
             buffer_pool,
             log,
@@ -676,6 +686,7 @@ impl OverflowFile {
     /// a failure before the meta write restores the in-memory allocator, which
     /// still matches the durable meta page.
     fn reserve_chain_pages(&mut self, n_pages: usize) -> Result<(u64, Vec<u64>), QueryError> {
+        self.clear_free_list_cache();
         let saved_free_head = self.free_head;
         let saved_page_count = self.page_count;
         let saved_next_generation = self.next_generation;
@@ -722,7 +733,7 @@ impl OverflowFile {
         // already-listed head as an idempotent completion. The free list is
         // authoritative here: an allocated chain can never legitimately have
         // its head in that list.
-        if self.free_list_contains(lob.first_page_id)? {
+        if self.free_list_contains_cached(lob.first_page_id)? {
             return Ok(());
         }
         // M3/M5 — first **walk this chain** along next to count its actual pages (for free_count), and this
@@ -838,6 +849,65 @@ impl OverflowFile {
             }
         }
         Ok(false)
+    }
+
+    fn clear_free_list_cache(&mut self) {
+        self.free_list_cache = HashSet::new();
+        self.free_list_cache_charge
+            .shrink(self.free_list_cache_charge.bytes());
+    }
+
+    fn free_list_contains_cached(&mut self, target: u64) -> Result<bool, QueryError> {
+        if self.free_list_cache.contains(&target) {
+            return Ok(true);
+        }
+        // Cover both the hash table and the temporary walk before allocating.
+        // This accelerator must never consume rollback's emergency reserve;
+        // admission failure retains the exact constant-space list scan.
+        let bytes = usize::try_from(self.free_count)
+            .ok()
+            .and_then(|count| count.checked_mul(128));
+        if bytes.is_none_or(|bytes| {
+            !self.free_list_cache_charge.try_grow_optional(
+                bytes.saturating_sub(self.free_list_cache_charge.bytes()),
+            )
+        }) {
+            self.clear_free_list_cache();
+            return self.free_list_contains(target);
+        }
+        let mut pid = self.free_head;
+        let mut prefix = Vec::new();
+        while pid != 0 && !self.free_list_cache.contains(&pid) {
+            if pid >= self.page_count {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt overflow free list page id",
+                ));
+            }
+            if prefix.len() as u64 >= self.free_count {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt overflow free list (cycle or count mismatch)",
+                ));
+            }
+            prefix.push(pid);
+            pid = self.buffer_pool.with_raw_page(self.page_key(pid), |page| {
+                if page.len() != PAGE_SIZE
+                    || read_u32(page, OVFL_OFF_MAGIC) != OVFL_MAGIC
+                    || read_u16(page, OVFL_OFF_VERSION) != OVFL_VERSION
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt overflow page in free list",
+                    ));
+                }
+                Ok(read_u64(page, OVFL_OFF_NEXT))
+            })?;
+        }
+        // Publish only after reaching a previously verified suffix or zero;
+        // a failed walk must not turn an unverified prefix into a cache hit.
+        self.free_list_cache.extend(prefix);
+        Ok(self.free_list_cache.contains(&target))
     }
 
     /// Counts a chain's actual pages by walking next, from `first` until **`last` (the chain's known tail
@@ -983,6 +1053,7 @@ impl OverflowFile {
             out
         };
         let old_page_count = self.page_count;
+        self.clear_free_list_cache();
         // Re-string the surviving pages into a chain: survivors[i].next = survivors[i+1], tail 0.
         // Each NEXT rewrite goes through WAL as a full page image. Only the NEXT field is changed;
         // the payload is untouched (these are free pages; their content is meaningless).

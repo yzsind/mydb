@@ -1,7 +1,5 @@
 use super::*;
-use serde::de::{MapAccess, SeqAccess, Visitor};
 use serde_json::Value as Json;
-use std::fmt;
 use std::net::IpAddr;
 use std::path::Path;
 
@@ -19,60 +17,7 @@ pub(crate) fn parse_json_budgeted(
     if input.len() > max {
         return Err(error("ER_AI_INVALID_ARGUMENT", "JSON exceeds byte limit"));
     }
-    struct Strict(Json);
-    impl<'de> Deserialize<'de> for Strict {
-        fn deserialize<D: serde::Deserializer<'de>>(de: D) -> Result<Self, D::Error> {
-            struct V;
-            impl<'de> Visitor<'de> for V {
-                type Value = Strict;
-                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    f.write_str("bounded JSON")
-                }
-                fn visit_bool<E: serde::de::Error>(self, v: bool) -> Result<Strict, E> {
-                    Ok(Strict(v.into()))
-                }
-                fn visit_i64<E: serde::de::Error>(self, v: i64) -> Result<Strict, E> {
-                    Ok(Strict(v.into()))
-                }
-                fn visit_u64<E: serde::de::Error>(self, v: u64) -> Result<Strict, E> {
-                    Ok(Strict(v.into()))
-                }
-                fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<Strict, E> {
-                    serde_json::Number::from_f64(v)
-                        .map(|n| Strict(Json::Number(n)))
-                        .ok_or_else(|| E::custom("non-finite number"))
-                }
-                fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Strict, E> {
-                    Ok(Strict(v.into()))
-                }
-                fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Strict, E> {
-                    Ok(Strict(v.into()))
-                }
-                fn visit_unit<E: serde::de::Error>(self) -> Result<Strict, E> {
-                    Ok(Strict(Json::Null))
-                }
-                fn visit_seq<A: SeqAccess<'de>>(self, mut a: A) -> Result<Strict, A::Error> {
-                    let mut v = Vec::new();
-                    while let Some(x) = a.next_element::<Strict>()? {
-                        v.push(x.0);
-                    }
-                    Ok(Strict(Json::Array(v)))
-                }
-                fn visit_map<A: MapAccess<'de>>(self, mut a: A) -> Result<Strict, A::Error> {
-                    let mut m = serde_json::Map::new();
-                    while let Some(k) = a.next_key::<String>()? {
-                        if m.contains_key(&k) {
-                            return Err(serde::de::Error::custom("duplicate JSON key"));
-                        }
-                        let v = a.next_value::<Strict>()?;
-                        m.insert(k, v.0);
-                    }
-                    Ok(Strict(Json::Object(m)))
-                }
-            }
-            de.deserialize_any(V)
-        }
-    }
+    crate::util::strict_json::define_strict_value!(Strict);
     // Count lexical nesting before recursively invoking serde.
     let (mut depth, mut quoted, mut escaped) = (0usize, false, false);
     let (mut nodes, mut objects, mut scalar) = (0usize, 0usize, false);

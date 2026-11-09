@@ -149,6 +149,7 @@ pub(super) fn compile_uncached_prepared_select(
         )?;
     let template = Arc::new(PreparedSelectTemplate {
         select: Arc::clone(&normalized),
+        has_locking_read: super::tx::select_has_locking_read(&normalized),
         deps,
         object_deps,
         semantics: super::plan_semantics(db, session),
@@ -192,8 +193,10 @@ pub(super) fn semantics_match(
     optimizer_switch: &str,
     session: &SessionContext,
 ) -> bool {
-    semantics.rls_authorization.as_deref()
-        == Some(crate::engine::rls::session_signature(db, session).as_ref())
+    semantics
+        .rls_authorization
+        .as_ref()
+        .is_some_and(|identity| identity.matches_session(db, session))
         && semantics.sql_mode_fingerprint == crate::binlog::sql_mode_str_to_bits(&session.sql_mode)
         && optimizer_switch == session.sysvars.optimizer_switch
         && semantics.sql_select_limit == session.sysvars.sql_select_limit
@@ -359,6 +362,7 @@ pub(super) fn compile_prepared_select_from_memo(
         semantics: super::plan_semantics(db, session),
         optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
         compiled,
+        has_locking_read: super::tx::select_has_locking_read(&normalized),
         presentation_select: normalized,
         structural_fingerprint,
         parameter_plan_signature: Arc::from(parameter_plan_signature),

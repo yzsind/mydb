@@ -491,7 +491,9 @@ pub(crate) struct IndexFile {
     /// lock; structural modifications (root split) update both.
     root_page: AtomicU64,
     /// Bounded weak root-page hint; it never prevents buffer eviction.
-    root_frame_hint: parking_lot::RwLock<std::sync::Weak<Frame>>,
+    root_frame_hint: AtomicFrameHint,
+    root_routing: OnceLock<arc_swap::ArcSwapOption<RootRoutingCache>>,
+    root_routing_reads: AtomicU8,
     /// Serializes structural B-tree changes (split/merge/root/meta).
     /// Ordinary leaf-only DML can hold this in shared mode and rely on
     /// per-leaf latches; any fallback that may change topology takes it
@@ -2600,7 +2602,7 @@ fn with_parallel_bulk_image_writes<T>(
     let cancel = crate::engine::cancel::CancellationSnapshot::capture();
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(1);
     let receiver = Mutex::new(receiver);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(degree);
         for _ in 0..degree {
             let receiver = &receiver;
@@ -2968,7 +2970,9 @@ impl IndexFile {
             log_atomics,
             durability,
             root_page: root_page_atomic,
-            root_frame_hint: parking_lot::RwLock::new(std::sync::Weak::new()),
+            root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -3024,7 +3028,9 @@ impl IndexFile {
             log_atomics,
             durability,
             root_page: root_page_atomic,
-            root_frame_hint: parking_lot::RwLock::new(std::sync::Weak::new()),
+            root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -3264,7 +3270,9 @@ impl IndexFile {
             log_atomics,
             durability: DurabilityMode::Strict,
             root_page: root_page_atomic,
-            root_frame_hint: parking_lot::RwLock::new(std::sync::Weak::new()),
+            root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -3613,7 +3621,9 @@ impl IndexFile {
             log_atomics,
             durability,
             root_page: root_page_atomic,
-            root_frame_hint: parking_lot::RwLock::new(std::sync::Weak::new()),
+            root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -5527,7 +5537,7 @@ impl IndexFile {
         let degree = degree.min(records.len().div_ceil(128 * 1024)).max(1);
         let chunk = records.len().div_ceil(degree);
         let cancel = crate::engine::cancel::CancellationSnapshot::capture();
-        let plans = std::thread::scope(|scope| -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
+        let plans = crate::util::thread_spawn::scope(|scope| -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
             let mut handles = Vec::new();
             for (worker, slice) in records.chunks(chunk).enumerate() {
                 let key_bytes = &key_bytes;
@@ -5562,7 +5572,7 @@ impl IndexFile {
         for _ in 0..count {
             ids.push(self.reserve_page_id()?);
         }
-        let level = std::thread::scope(|scope| -> Result<Vec<(u64, IndexEntry)>, QueryError> {
+        let level = crate::util::thread_spawn::scope(|scope| -> Result<Vec<(u64, IndexEntry)>, QueryError> {
             let mut handles = Vec::new();
             let mut offset = 0usize;
             for pages in plans {
@@ -6242,7 +6252,7 @@ impl IndexFile {
 
     fn first_entry_follows_right_edge(&self, entry: &IndexEntry) -> Result<bool, QueryError> {
         let leaf_id = self.rightmost_leaf()?;
-        let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
         let can_append =
             pinned.with_index_raw_bytes(|bytes| raw_last_leaf_entry_less_than(bytes, entry))?;
         drop(pinned);
@@ -6270,7 +6280,7 @@ impl IndexFile {
             // right edge. Fitting batches need neither a whole-leaf decode
             // nor a re-encode; splits and layout changes retain the oracle.
             if self.durability != DurabilityMode::Memory {
-                let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+                let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
                 let append = pinned.with_index_raw_bytes(|bytes| {
                     Ok(parse_leaf_payload_header(bytes)?.next_leaf.is_none()
                         && raw_last_leaf_entry_less_than(bytes, &entries[pos])?)
@@ -6900,7 +6910,7 @@ impl IndexFile {
             .map(|(page, _)| *page)
             .chain([leaf, INDEX_META_PAGE])
         {
-            pins.push(self.buffer_pool.pin_page(self.page_key(page))?);
+            pins.push(self.buffer_pool.pin_page_ref(self.page_key_ref(page))?);
         }
         // Decode and update the leaf outside the topology write lock. The
         // frame epoch is captured under the same byte latch as the snapshot;
@@ -6957,7 +6967,7 @@ impl IndexFile {
                 })?;
                 page
             };
-            pins.push(self.buffer_pool.pin_page(self.page_key(page))?);
+            pins.push(self.buffer_pool.pin_page_ref(self.page_key_ref(page))?);
         }
         Ok(Some(PreparedIndexInsert {
             pins,
@@ -7339,7 +7349,7 @@ impl IndexFile {
             }
             chain.advance(next_leaf)?;
             leaf_id = next_leaf;
-            pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+            pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
         }
     }
 
@@ -7367,7 +7377,7 @@ impl IndexFile {
             };
             chain.advance(next_leaf)?;
             leaf_id = next_leaf;
-            pinned = self.buffer_pool.pin_page_borrowed(self.page_key(leaf_id))?;
+            pinned = self.buffer_pool.pin_page_borrowed_ref(self.page_key_ref(leaf_id))?;
         }
     }
 
@@ -7393,7 +7403,7 @@ impl IndexFile {
             };
             chain.advance(next_leaf)?;
             leaf_id = next_leaf;
-            pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+            pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
         }
     }
 
@@ -7837,7 +7847,7 @@ impl IndexFile {
         let mut entries: Vec<E> = Vec::new();
         let mut seen = dedup_row_ids.then(crate::util::fast_hash::ah_hash_set);
         for range in leaf_ranges {
-            let pinned = self.buffer_pool.pin_page(self.page_key(range.leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(range.leaf_id))?;
             let result = pinned.with_index_raw_bytes(|buf| {
                 lookup_leaf_entries_many_page_bytes(
                     buf,
@@ -7853,7 +7863,7 @@ impl IndexFile {
             if let Some(next_leaf) = result.next_leaf {
                 for offset in result.continue_key_offsets {
                     let _page_max_trx_id = self.collect_lookup_entries_from_leaf(
-                        self.buffer_pool.pin_page(self.page_key(next_leaf))?,
+                        self.buffer_pool.pin_page_ref(self.page_key_ref(next_leaf))?,
                         &keys[range.start + offset],
                         range.start + offset,
                         exact,
@@ -7909,7 +7919,7 @@ impl IndexFile {
         }
         merge_adjacent_leaf_key_ranges(&mut leaf_ranges);
         for range in leaf_ranges {
-            let pinned = self.buffer_pool.pin_page(self.page_key(range.leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(range.leaf_id))?;
             let result = pinned.with_index_raw_bytes(|buf| {
                 keys_first_visible_match_leaf_page(
                     buf,
@@ -7934,7 +7944,7 @@ impl IndexFile {
                     // a `Greater` or end-of-chain).
                     let mut leaf = leaf_id;
                     loop {
-                        let pinned = self.buffer_pool.pin_page(self.page_key(leaf))?;
+                        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf))?;
                         let inner = pinned.with_index_raw_bytes(|buf| {
                             keys_first_visible_match_leaf_page(
                                 buf,
@@ -8017,7 +8027,7 @@ impl IndexFile {
         let mut entries: Vec<(u32, RowId)> = Vec::new();
         let mut seen = dedup_row_ids.then(crate::util::fast_hash::ah_hash_set);
         for range in leaf_ranges {
-            let pinned = self.buffer_pool.pin_page(self.page_key(range.leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(range.leaf_id))?;
             let native = if exact {
                 pinned.packed_leaf_lookup_many_keyed(
                     &keys[range.start..range.end],
@@ -8110,7 +8120,7 @@ impl IndexFile {
                 return Ok(page_max_trx_id);
             };
             chain.advance(next_leaf)?;
-            pinned = self.buffer_pool.pin_page(self.page_key(next_leaf))?;
+            pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(next_leaf))?;
         }
     }
 
@@ -8126,7 +8136,7 @@ impl IndexFile {
     ) -> Result<bool, QueryError> {
         let mut chain = IndexPageProgress::new(leaf_id);
         loop {
-            let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
             let native = if exact {
                 pinned.packed_leaf_lookup_many_keyed(std::slice::from_ref(key), key_index, seen)?
             } else {
@@ -8176,7 +8186,7 @@ impl IndexFile {
         // for each internal page visited by a batched INLJ.  Reuse the
         // allocation-free scalar router and coalesce adjacent keys that map
         // to the same child before descending.
-        let pinned = self.buffer_pool.pin_page(self.page_key(page_id))?;
+        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
         if pinned.frame.has_packed_leaf() {
             out.push(LeafKeyRange {
                 leaf_id: page_id,
@@ -8234,7 +8244,7 @@ impl IndexFile {
         loop {
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(leaf_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(leaf_id), AccessIntent::Scan)?;
             let pulled = pinned.with_index_raw_bytes(|buf| {
                 range_leaf_row_ids_page_bytes(
                     buf,
@@ -8530,7 +8540,7 @@ impl IndexFile {
         let mut row_ids = Vec::new();
         let mut last_row_id = None;
         for &leaf_id in leaf_ids {
-            let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
             let (next, terminal) = pinned.with_index_raw_bytes(|bytes| {
                 let header = parse_leaf_payload_header(bytes)?;
                 let (start, end, terminal) = raw_leaf_in_bounds_span(&header, low, high)?;
@@ -8625,7 +8635,7 @@ impl IndexFile {
             if let Some(seed_leaf_id) = seed_leaf_id {
                 let pinned = self
                     .buffer_pool
-                    .pin_page_with_intent(self.page_key(seed_leaf_id), AccessIntent::Scan)?;
+                    .pin_page_with_intent_ref(self.page_key_ref(seed_leaf_id), AccessIntent::Scan)?;
                 last_row_id = pinned.with_index_raw_bytes(|buf| {
                     let hdr = parse_leaf_payload_header(buf)?;
                     let (start, end, _) = raw_leaf_in_bounds_span(&hdr, low, high)?;
@@ -8650,7 +8660,7 @@ impl IndexFile {
             }
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(leaf_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(leaf_id), AccessIntent::Scan)?;
             let terminal = pinned.with_index_raw_bytes(|buf| {
                 let hdr = parse_leaf_payload_header(buf)?;
                 let (start, end, terminal) = raw_leaf_in_bounds_span(&hdr, low, high)?;
@@ -8714,14 +8724,14 @@ impl IndexFile {
         )?;
 
         loop {
-            let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
             let next = pinned
                 .with_index_raw_bytes(|bytes| Ok(parse_leaf_payload_header(bytes)?.next_leaf))?;
             drop(pinned);
             let Some(next_leaf_id) = next else {
                 return Ok(leaf_id);
             };
-            let pinned = self.buffer_pool.pin_page(self.page_key(next_leaf_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(next_leaf_id))?;
             let overlaps = pinned.with_index_raw_bytes(|bytes| {
                 let header = parse_leaf_payload_header(bytes)?;
                 let (start, end, _) = raw_leaf_in_bounds_span(&header, low, Some(high))?;
@@ -8740,7 +8750,7 @@ impl IndexFile {
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
         let leaf_id = self.rightmost_leaf()?;
-        let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
         pinned.with_index_raw_bytes(|bytes| {
             let header = parse_leaf_payload_header(bytes)?;
             if header.count == 0 {
@@ -9095,10 +9105,10 @@ impl IndexFile {
         }
         if page_id == self.root_page.load(Ordering::Acquire) {
             self.buffer_pool
-                .pin_frame_with_hint(self.page_key(page_id), &self.root_frame_hint)
+                .pin_frame_with_hint(self.page_key_ref(page_id), &self.root_frame_hint)
         } else {
             self.buffer_pool.pin_frame_with_candidate(
-                self.page_key(page_id),
+                self.page_key_ref(page_id),
                 AccessIntent::Normal,
                 None,
             )
@@ -9180,6 +9190,13 @@ impl IndexFile {
         let mut page_id = self.root_page.load(Ordering::Acquire);
         let mut progress = IndexPageProgress::new(page_id);
         loop {
+            if let Some(RawIndexPageRoute::Child { page_id: child, .. }) =
+                self.route_cached_root(page_id, key, zero)?
+            {
+                progress.advance(child)?;
+                page_id = child;
+                continue;
+            }
             let pinned = pin(page_id)?;
             if pinned.frame.has_packed_leaf() {
                 return Ok(pinned);
@@ -9189,6 +9206,7 @@ impl IndexFile {
             match route {
                 RawIndexPageRoute::Leaf => return Ok(pinned),
                 RawIndexPageRoute::Child { page_id: child, .. } => {
+                    self.remember_root_routing(&pinned)?;
                     progress.advance(child)?;
                     page_id = child;
                 }
@@ -9618,7 +9636,7 @@ impl IndexFile {
         // `rebalance_child` (which does take ownership) when the leaf
         // actually under-flowed.
         let (live_size, entry_count) = {
-            let pinned = self.buffer_pool.pin_page(self.page_key(page_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
             let result = pinned.with_index_raw_bytes(raw_leaf_live_encoded_len_and_count);
             drop(pinned);
             result?
@@ -10113,7 +10131,7 @@ impl IndexFile {
         let mut current = page_id;
         let mut progress = IndexPageProgress::new(current);
         loop {
-            let pinned = self.buffer_pool.pin_page(self.page_key(current))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(current))?;
             let step = pinned.with_index_raw_bytes(raw_first_entry_step)?;
             drop(pinned);
             match step {
@@ -10130,7 +10148,7 @@ impl IndexFile {
         let mut page_id = self.root_page.load(Ordering::Acquire);
         let mut progress = IndexPageProgress::new(page_id);
         loop {
-            let pinned = self.buffer_pool.pin_page(self.page_key(page_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
             let child =
                 pinned.with_index_raw_bytes(|bytes| edge_child_index_page_bytes(bytes, false))?;
             drop(pinned);
@@ -10195,7 +10213,7 @@ impl IndexFile {
         &self,
         leaf_id: u64,
     ) -> Result<Option<Vec<(u64, usize)>>, QueryError> {
-        let pinned = self.buffer_pool.pin_page(self.page_key(leaf_id))?;
+        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
         let first = pinned.with_index_raw_bytes(|bytes| {
             let header = parse_leaf_payload_header(bytes)?;
             (header.count > 0)
@@ -10218,7 +10236,7 @@ impl IndexFile {
     fn rightmost_leaf_from(&self, mut page_id: u64) -> Result<u64, QueryError> {
         let mut progress = IndexPageProgress::new(page_id);
         loop {
-            let pinned = self.buffer_pool.pin_page(self.page_key(page_id))?;
+            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
             let child =
                 pinned.with_index_raw_bytes(|bytes| edge_child_index_page_bytes(bytes, true))?;
             drop(pinned);
@@ -10349,7 +10367,7 @@ impl IndexFile {
         }
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(page_id), intent)?;
+            .pin_page_with_intent_ref(self.page_key_ref(page_id), intent)?;
         pinned.index_page()
     }
 
@@ -10389,7 +10407,7 @@ impl IndexFile {
             }
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
             let summary = pinned.with_index_raw_bytes(raw_leaf_count_and_writer_bound)?;
             drop(pinned);
             let Some((leaf_count, page_max_trx_id)) = summary else {
@@ -10446,7 +10464,7 @@ impl IndexFile {
             }
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
             let accepted = pinned.with_index_raw_bytes(|buf| {
                 let Some((_, bound)) = raw_leaf_count_and_writer_bound(buf)? else {
                     return Ok(true);
@@ -10580,7 +10598,7 @@ impl IndexFile {
                     }
                     let pinned = self
                         .buffer_pool
-                        .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                        .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
                     let summary = pinned.with_index_raw_bytes(|bytes| {
                         let header = parse_leaf_payload_header(bytes)?;
                         let (start, end, _) = raw_leaf_in_bounds_span(&header, low, high)?;
@@ -10711,7 +10729,7 @@ impl IndexFile {
         }
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(leaf.page_id), AccessIntent::Normal)?;
+            .pin_page_with_intent_ref(self.page_key_ref(leaf.page_id), AccessIntent::Normal)?;
         let selected = pinned.with_index_raw_bytes(|bytes| {
             let header = parse_leaf_payload_header(bytes)?;
             let (start, end, _) = raw_leaf_in_bounds_span(&header, low, high)?;
@@ -10845,7 +10863,7 @@ impl IndexFile {
             needed[self.page_latch_index(page_id)] = true;
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
             next_page = pinned.with_index_raw_bytes(|bytes| {
                 let header = parse_leaf_payload_header(bytes)?;
                 let (start, end, terminal) = raw_leaf_in_bounds_span(&header, low, high)?;
@@ -10887,7 +10905,7 @@ impl IndexFile {
             }
             let pinned = self
                 .buffer_pool
-                .pin_page_with_intent(self.page_key(page_id), AccessIntent::Scan)?;
+                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
             let result = pinned.with_index_raw_bytes(|bytes| {
                 let header = parse_leaf_payload_header(bytes)?;
                 let (start, end, terminal) = raw_leaf_in_bounds_span(&header, low, high)?;
@@ -10969,7 +10987,7 @@ impl IndexFile {
         };
         let pinned = self
             .buffer_pool
-            .pin_page_with_intent(self.page_key(*page_id), AccessIntent::Normal)?;
+            .pin_page_with_intent_ref(self.page_key_ref(*page_id), AccessIntent::Normal)?;
         let selected = pinned.with_index_raw_bytes(|bytes| {
             let header = parse_leaf_payload_header(bytes)?;
             let slot = header.read_slot(slot_index);
@@ -10979,6 +10997,13 @@ impl IndexFile {
             Ok(Some((key, row_id)))
         })?;
         Ok(selected.map(|entry| (Some(entry), total)))
+    }
+
+    fn page_key_ref(&self, page_id: u64) -> PageKeyRef<'_> {
+        PageKeyRef {
+            file: &self.file_key,
+            page_id,
+        }
     }
 
     fn page_key(&self, page_id: u64) -> PageKey {
@@ -18636,7 +18661,7 @@ mod logged_delete_batch_tests {
         let topology = file.structure_lock.read();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_file = Arc::clone(&file);
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             tx.send(worker_file.apply_batch_with_lsn(7, deletes.into(), Some(lsn)))
                 .unwrap();
         });

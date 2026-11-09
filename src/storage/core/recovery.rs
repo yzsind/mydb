@@ -271,7 +271,7 @@ fn recover_from_wal_with_options(
     let partition_count = heap_partitions.len();
     let parallel = recovery_parallel_enabled() && partition_count > 1;
     let parallelism = if parallel {
-        std::thread::available_parallelism()
+        crate::util::thread_spawn::available_parallelism()
             .map(|p| p.get())
             .unwrap_or(2)
             .min(partition_count)
@@ -310,7 +310,7 @@ fn recover_from_wal_with_options(
         let first_err: std::sync::Mutex<Option<QueryError>> = std::sync::Mutex::new(None);
         let redone_total = std::sync::atomic::AtomicUsize::new(0);
 
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..parallelism {
                 let next = &next;
                 let work = &work;
@@ -409,7 +409,7 @@ fn recover_from_wal_with_options(
             )?));
             shared_log.lock().set_local_recovery(context.is_restore());
             let work = index_partitions.values().collect::<Vec<_>>();
-            let worker_count = std::thread::available_parallelism()
+            let worker_count = crate::util::thread_spawn::available_parallelism()
                 .map(|value| value.get())
                 .unwrap_or(2)
                 .min(work.len());
@@ -419,7 +419,7 @@ fn recover_from_wal_with_options(
             let skipped_total = std::sync::atomic::AtomicUsize::new(0);
             let records = &scan.records;
             let redoable_ref = &redoable;
-            std::thread::scope(|scope| {
+            crate::util::thread_spawn::scope(|scope| {
                 for _ in 0..worker_count {
                     let shared_log = Arc::clone(&shared_log);
                     let work = &work;
@@ -2763,7 +2763,7 @@ mod zone_map_physical_redo_tests {
             restore
         )
         .unwrap());
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope
                 .spawn(|| {
                     assert!(
@@ -2927,7 +2927,7 @@ mod zone_map_physical_redo_tests {
         image.truncate(PAGE_SIZE);
         let reading = map.data_gate.read().unwrap();
         let applying = Arc::clone(&db);
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             applying.apply_wal_record(&WalRecord {
                 source_time_us: 0,
                 lsn: 777,

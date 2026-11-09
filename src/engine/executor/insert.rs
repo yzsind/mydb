@@ -1524,9 +1524,9 @@ fn execute_insert_from_select_parallel(
     string_targets: &[(usize, bool, bool)],
     target_width: usize,
 ) -> Result<(u64, u64), QueryError> {
+    use crate::util::thread_spawn as thread;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::mpsc;
-    use std::thread;
     let degree = degree.max(1);
     let (input_tx, input_rx) = mpsc::sync_channel::<Vec<Vec<Value>>>(degree * 2);
     let (result_tx, result_rx) = mpsc::channel::<Result<u64, QueryError>>();

@@ -4432,7 +4432,7 @@ impl ZoneMap {
         for window in zones.chunks(ENCODE_WINDOW) {
             let mut encoded_window = if encoders > 1 {
                 let part = window.len().div_ceil(encoders);
-                std::thread::scope(|scope| {
+                crate::util::thread_spawn::scope(|scope| {
                     let handles = window
                         .chunks(part)
                         .map(|zones| {
@@ -9613,7 +9613,7 @@ impl Database {
         // epochs and registered its snapshot before scanning, and publishing
         // N touches only N's zones, so per-batch validation is unchanged.
         let reclaim_database = crate::engine::executor::mem_budget::current_reclaim_database();
-        let pipelined = std::thread::scope(|scope| -> Result<Option<bool>, QueryError> {
+        let pipelined = crate::util::thread_spawn::scope(|scope| -> Result<Option<bool>, QueryError> {
             let mut fully_replaced = true;
             type Scanned<G> = (
                 ZoneRebuildBatch<G>,
@@ -9925,7 +9925,7 @@ impl Database {
                 let partials = if degree == 1 {
                     vec![scan(page_lo, page_hi)]
                 } else {
-                    std::thread::scope(|scope| {
+                    crate::util::thread_spawn::scope(|scope| {
                         let mut handles = Vec::new();
                         for lo in (page_lo..page_hi).step_by(step as usize) {
                             let scan = &scan;
@@ -10805,7 +10805,7 @@ mod zone_map_tests {
         let map = paged_test_map(1, 64, 99);
         let gate = map.data_gate.read().unwrap();
         let (send, recv) = std::sync::mpsc::channel();
-        let completed = std::thread::scope(|scope| {
+        let completed = crate::util::thread_spawn::scope(|scope| {
             scope.spawn(|| send.send(map.merge(&paged_delta(1))).unwrap());
             let completed = recv.recv_timeout(Duration::from_millis(250));
             drop(gate);
@@ -10824,7 +10824,7 @@ mod zone_map_tests {
         let map = paged_test_map(1, 64, 99);
         let zone = map.merge_latches[0].lock().unwrap();
         let (send, recv) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope.spawn(|| send.send(map.merge(&paged_delta(1))).unwrap());
             let mut other = paged_delta(2);
             let value = other.zones.remove(&0).unwrap();
@@ -10843,7 +10843,7 @@ mod zone_map_tests {
         // 32 values stay within the exact fingerprint set, which foreground
         // DML maintains synchronously.
         let map = paged_test_map(1, 64, 99);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..4 {
                 let map = &map;
                 scope.spawn(move || {
@@ -10933,7 +10933,7 @@ mod zone_map_tests {
         let map = paged_test_map(1, 64, 99);
         let latch = map.merge_latches[0].lock().unwrap();
         let (send, recv) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for value in 0..4 {
                 let (map, send) = (&map, send.clone());
                 scope.spawn(move || {
@@ -11567,7 +11567,7 @@ mod zone_map_tests {
         let map = paged_test_map(1, 64, 99);
         map.merge(&paged_delta(0)).unwrap();
         let published = AtomicU64::new(0);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope.spawn(|| {
                 for value in 1..=100 {
                     map.merge(&paged_delta(value)).unwrap();
@@ -11630,7 +11630,7 @@ mod zone_map_tests {
         map.merge(&paged_delta(42)).unwrap();
         map.pool.flush_and_evict_all().unwrap();
         let gate = map.data_gate.read().unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let worker = scope.spawn(|| map.pool.flush_and_evict_all());
             worker.join().unwrap().unwrap();
             assert_eq!(
@@ -12018,7 +12018,7 @@ mod zone_map_tests {
         let table = db.table("test.t").unwrap();
         db.forget_zone_map(table.id).unwrap();
         let barrier = std::sync::Barrier::new(16);
-        let maps = std::thread::scope(|scope| {
+        let maps = crate::util::thread_spawn::scope(|scope| {
             let handles = (0..16)
                 .map(|_| {
                     scope.spawn(|| {
@@ -12084,7 +12084,7 @@ mod zone_map_tests {
         let before = db.buffer_pool.last_checkpoint_lsn();
         let (done_tx, done_rx) = mpsc::channel();
         let checkpointer_db = db.clone();
-        let checkpointer = std::thread::spawn(move || {
+        let checkpointer = crate::util::thread_spawn::spawn(move || {
             let result = checkpointer_db.checkpoint();
             done_tx.send(result).unwrap();
         });
@@ -12156,7 +12156,7 @@ mod zone_map_tests {
         let operation = db.zone_map_gate.read_recursive();
         let (done_tx, done_rx) = mpsc::channel();
         let checkpointer_db = db.clone();
-        let checkpointer = std::thread::spawn(move || {
+        let checkpointer = crate::util::thread_spawn::spawn(move || {
             done_tx.send(checkpointer_db.checkpoint()).unwrap();
         });
         let result = done_rx.recv_timeout(Duration::from_secs(10));
@@ -13336,7 +13336,7 @@ mod zone_map_tests {
         let table = db.snapshot_table_schema("test.t").unwrap();
         let barrier = Arc::new(std::sync::Barrier::new(2));
         *ZONE_MAP_REBUILD_SCAN_BARRIER.lock().unwrap() = Some(Arc::clone(&barrier));
-        let outcome = std::thread::scope(|scope| {
+        let outcome = crate::util::thread_spawn::scope(|scope| {
             let rebuild = scope.spawn(|| {
                 db.rebuild_zone_map_for_storage_zones(
                     &table,
@@ -13531,7 +13531,7 @@ mod zone_map_tests {
         let db = engine.db_for_tests();
         let hook = db.install_analyze_test_hook();
         let worker = Arc::clone(db);
-        let analyze = std::thread::spawn(move || worker.analyze_table("test.t"));
+        let analyze = crate::util::thread_spawn::spawn(move || worker.analyze_table("test.t"));
         let reached = hook.wait_until_reached(std::time::Duration::from_secs(10));
         // Advance the database frontier after ANALYZE pins its statistics
         // snapshot, without changing any row in the table being analyzed.
@@ -13752,7 +13752,7 @@ mod zone_map_tests {
                 .unwrap();
         }
         let poisoned = Arc::clone(&broken);
-        assert!(std::thread::spawn(move || {
+        assert!(crate::util::thread_spawn::spawn(move || {
             let _guard = poisoned.data_gate.write().unwrap();
             panic!("injected local map failure");
         })
@@ -14350,7 +14350,7 @@ mod zone_map_tests {
         };
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let worker_barrier = Arc::clone(&barrier);
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             let mut iter = ranges.into_iter();
             assert_eq!(iter.next(), Some((0, 1)));
             worker_barrier.wait();
@@ -14735,7 +14735,7 @@ mod zone_map_tests {
         assert!(total > 64);
         let (work_tx, work_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let engine_ref = &engine;
             scope.spawn(move || {
                 while work_rx.recv().is_ok() {
@@ -14818,7 +14818,7 @@ mod zone_map_tests {
             .div_ceil(u64::from(map.zone_pages));
         let barrier = Arc::new(std::sync::Barrier::new(2));
         *map.coverage_publish_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let worker =
                 scope.spawn(|| db.advance_zone_map_coverage(table.id, &map, total, &|| false));
             barrier.wait();
@@ -14859,7 +14859,7 @@ mod zone_map_tests {
             .div_ceil(u64::from(map.zone_pages));
         let barrier = Arc::new(std::sync::Barrier::new(2));
         *map.coverage_publish_barrier.lock().unwrap() = Some(Arc::clone(&barrier));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let worker =
                 scope.spawn(|| db.advance_zone_map_coverage(table.id, &map, total, &|| false));
             barrier.wait();
@@ -14983,7 +14983,7 @@ mod zone_map_tests {
         let db = engine.db_for_tests();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let operation = db.zone_map_operation().unwrap();
             scope.spawn(|| {
                 started_tx.send(()).unwrap();
@@ -15031,7 +15031,7 @@ mod zone_map_tests {
         let latch = &db.zone_map_load_locks[table.id as usize % db.zone_map_load_locks.len()];
         *latch.lock().unwrap() = None;
         let (lookup_tx, lookup_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let catalog = db.catalog_write().unwrap();
             let worker = scope.spawn(|| {
                 ZONE_INVALIDATION_DESCRIPTOR_TEST_HOOK.with(|hook| {
@@ -15097,7 +15097,7 @@ mod zone_map_tests {
         let before = db.log.lock().last_lsn();
         let barrier = std::sync::Barrier::new(8);
         let storage_id = table.id;
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..8 {
                 let barrier = &barrier;
                 scope.spawn(move || {
@@ -15176,7 +15176,7 @@ mod zone_map_tests {
         let db = engine.db_for_tests();
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let operation = db.zone_map_operation().unwrap();
             scope.spawn(|| {
                 started_tx.send(()).unwrap();

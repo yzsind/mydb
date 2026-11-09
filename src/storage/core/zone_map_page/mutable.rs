@@ -1591,7 +1591,7 @@ mod tests {
         let wider = bounds(0, 30);
         let updates = vec![(key(0), wider.clone()), (key(1999), wider.clone())];
         let (sent, received) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = crate::util::thread_spawn::spawn(move || {
             sent.send(writer.apply_widening(&updates)).unwrap();
         });
         // Holding a directory snapshot must not stall a conservative update
@@ -1626,7 +1626,7 @@ mod tests {
             let writer = Arc::clone(&store);
             let (started, ready) = std::sync::mpsc::channel();
             let (sent, received) = std::sync::mpsc::channel();
-            let thread = std::thread::spawn(move || {
+            let thread = crate::util::thread_spawn::spawn(move || {
                 started.send(()).unwrap();
                 let result = if widening {
                     // An insertion changes root counters, even without a split.
@@ -1729,7 +1729,7 @@ mod tests {
             .map(|id| {
                 let store = Arc::clone(&store);
                 let start = Arc::clone(&start);
-                std::thread::spawn(move || {
+                crate::util::thread_spawn::spawn(move || {
                     start.wait();
                     for max in 1..=32 {
                         store.apply_widening(&[(key(id), bounds(max))]).unwrap();
@@ -1790,7 +1790,7 @@ mod tests {
         let writer = Arc::clone(&store);
         let value = wider.clone();
         let (sent, received) = std::sync::mpsc::channel();
-        let thread = std::thread::spawn(move || {
+        let thread = crate::util::thread_spawn::spawn(move || {
             sent.send(writer.apply_widening(&[(key(other), value)]))
                 .unwrap();
         });

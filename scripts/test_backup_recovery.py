@@ -258,7 +258,8 @@ def measure_while(c, operation):
             tick=time.perf_counter()
             try:sql(c,f'UPDATE probe SET v=v+1 WHERE id={1+n%2}')
             except mysql.connector.Error as error:
-                if capture_admission_retry(error):retries+=1;continue
+                if capture_admission_retry(error):
+                    retries+=1;time.sleep(.001);continue
                 raise
             samples.append(time.perf_counter()-tick);n+=1
     finally:
@@ -350,6 +351,7 @@ def scenario(binary, cli, root, rows, pairs, encrypted):
                     sql(w,'ROLLBACK')
                     if capture_admission_retry(error):
                         n-=1
+                        time.sleep(.001)
                         continue
                     raise
         except Exception as e:writer_errors.append(str(e))

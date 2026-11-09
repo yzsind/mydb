@@ -2293,7 +2293,7 @@ where
     let subquery_ctes = &subquery_ctes;
 
     let run_chunk = &run_chunk;
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in left_rows.chunks(chunk_size) {
             let worker_context = execution_context.clone();
@@ -3792,7 +3792,7 @@ pub(super) fn execute_fused_semi_anti_inlj(
             .map(|lo| (lo, (lo + chunk_size).min(left_rows.len())))
             .collect();
         record_inlj_outer_parallel_chunks(ranges.len() as u64);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let handles: Vec<_> = ranges
                 .iter()
                 .map(|&(lo, hi)| {
@@ -4666,7 +4666,7 @@ pub(super) fn lookup_inlj_entries_parallel(
     let execution_context =
         crate::engine::executor::select::execution_context::ExecutionContext::capture(txn);
 
-    let mut completed = std::thread::scope(|scope| {
+    let mut completed = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(degree);
         for _ in 0..degree {
             let next_task = &next_task;
@@ -4884,7 +4884,7 @@ pub(super) fn filter_batched_right_row_ids(
     let execution_context =
         crate::engine::executor::select::execution_context::ExecutionContext::capture(txn);
 
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in row_ids.chunks(chunk_size) {
             let worker_context = execution_context.clone();

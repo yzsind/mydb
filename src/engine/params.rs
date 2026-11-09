@@ -188,23 +188,35 @@ pub fn current_param_usize(idx: usize) -> Option<usize> {
 }
 
 pub(crate) fn limit_param_usize(value: &Value) -> Result<usize, crate::types::QueryError> {
+    let wrong_arguments = || {
+        crate::error::catalog::ER_WRONG_ARGUMENTS
+            .error("LIMIT/OFFSET parameter must be an integer or an integer string")
+    };
+    let out_of_range = || {
+        crate::error::catalog::ER_DATA_OUT_OF_RANGE
+            .error("unsigned integer value is out of range in LIMIT/OFFSET")
+    };
+    let parse_integer = |text: &str| {
+        text.trim_matches(|c: char| c.is_ascii_whitespace())
+            .parse::<i128>()
+            .map_err(|err| match err.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    out_of_range()
+                }
+                _ => wrong_arguments(),
+            })
+    };
     let number = match value {
         Value::Int(n) => i128::from(*n),
         Value::UInt(n) => i128::from(*n),
-        Value::String(text) => crate::util::decimal::parse_lenient_int(text).value,
+        Value::String(text) => parse_integer(text)?,
         Value::Bytes(bytes) => {
-            crate::util::decimal::parse_lenient_int(&String::from_utf8_lossy(bytes)).value
+            parse_integer(std::str::from_utf8(bytes).map_err(|_| wrong_arguments())?)?
         }
         Value::Null => 0,
-        _ => {
-            return Err(crate::error::catalog::ER_WRONG_ARGUMENTS
-                .error("LIMIT/OFFSET parameter must be an integer or an integer string"))
-        }
+        _ => return Err(wrong_arguments()),
     };
-    usize::try_from(number).map_err(|_| {
-        crate::error::catalog::ER_DATA_OUT_OF_RANGE
-            .error("unsigned integer value is out of range in LIMIT/OFFSET")
-    })
+    usize::try_from(number).map_err(|_| out_of_range())
 }
 
 /// Capture a clone of the active parameter context, suitable for handing
@@ -378,6 +390,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limit_parameters_validate_complete_integer_strings_and_ranges() {
+        for (text, expected) in [
+            ("0", 0),
+            ("+2", 2),
+            (" 2 ", 2),
+            (&usize::MAX.to_string(), usize::MAX),
+        ] {
+            for value in [
+                Value::String(text.into()),
+                Value::Bytes(text.as_bytes().to_vec()),
+            ] {
+                assert_eq!(limit_param_usize(&value).unwrap(), expected, "{value:?}");
+            }
+        }
+        for text in ["invalid", "", " ", "2abc", "2.5", "2e1", "+", "-", "１２"] {
+            for value in [
+                Value::String(text.into()),
+                Value::Bytes(text.as_bytes().to_vec()),
+            ] {
+                assert_eq!(
+                    limit_param_usize(&value).unwrap_err().code(),
+                    1210,
+                    "{value:?}"
+                );
+            }
+        }
+        for text in [
+            "-1".to_string(),
+            (usize::MAX as u128 + 1).to_string(),
+            "9".repeat(100),
+            format!("-{}", "9".repeat(100)),
+        ] {
+            for value in [
+                Value::String(text.clone()),
+                Value::Bytes(text.as_bytes().to_vec()),
+            ] {
+                assert_eq!(
+                    limit_param_usize(&value).unwrap_err().code(),
+                    1690,
+                    "{value:?}"
+                );
+            }
+        }
+        for value in [
+            Value::Bytes(vec![0xff]),
+            Value::Float(2.0),
+            Value::Double(2.0),
+        ] {
+            assert_eq!(
+                limit_param_usize(&value).unwrap_err().code(),
+                1210,
+                "{value:?}"
+            );
+        }
+        assert_eq!(limit_param_usize(&Value::Null).unwrap(), 0);
+    }
+
+    #[test]
     fn no_params_returns_none() {
         assert!(current_param(0).is_none());
         assert!(!has_active_params());
@@ -456,7 +526,7 @@ mod tests {
     fn context_snapshot_reinstalls_auto_parameterized_provenance() {
         with_auto_params(vec![Value::Int(5)], || {
             let snapshot = snapshot_current_context().expect("active context");
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 assert!(!auto_parameterized_active());
                 snapshot.run(|| {
                     assert!(auto_parameterized_active());

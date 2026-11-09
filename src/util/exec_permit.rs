@@ -153,7 +153,7 @@ struct ParallelReadGate {
 fn parallel_read_gate() -> &'static Arc<ParallelReadGate> {
     static GATE: OnceLock<Arc<ParallelReadGate>> = OnceLock::new();
     GATE.get_or_init(|| {
-        let cpus = std::thread::available_parallelism()
+        let cpus = crate::util::thread_spawn::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4);
         let degree = crate::util::env::var("MYDB_PARALLEL_DEGREE")
@@ -279,7 +279,7 @@ fn mixed_workload_limit_for(cpus: usize, parallel_degree: usize) -> usize {
 }
 
 fn mixed_workload_limit() -> usize {
-    let cpus = std::thread::available_parallelism()
+    let cpus = crate::util::thread_spawn::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(4);
     let parallel_degree = crate::util::env::var("MYDB_PARALLEL_DEGREE")
@@ -296,7 +296,7 @@ pub(super) fn automatic_limit_for(cpus: usize) -> usize {
 
 fn automatic_limit() -> usize {
     automatic_limit_for(
-        std::thread::available_parallelism()
+        crate::util::thread_spawn::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(4),
     )
@@ -423,7 +423,7 @@ mod tests {
                 .collect::<Vec<_>>()
         });
         let (tx, rx) = mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             with_query_budget(budget, || {
                 let nested = enter_pressure(true).unwrap();
                 tx.send(()).unwrap();
@@ -459,7 +459,7 @@ mod tests {
         let nested = gate.enter(1, || Ok(())).unwrap();
         let (tx, rx) = mpsc::channel();
         let peer_gate = gate.clone();
-        let peer = std::thread::spawn(move || {
+        let peer = crate::util::thread_spawn::spawn(move || {
             let permit = peer_gate.enter(2, || Ok(())).unwrap();
             tx.send(()).unwrap();
             drop(permit);
@@ -499,7 +499,7 @@ mod tests {
             let worker_gate = Arc::clone(&gate);
             let (started_tx, started_rx) = mpsc::channel();
             let (tx, rx) = mpsc::channel();
-            let worker = std::thread::spawn(move || {
+            let worker = crate::util::thread_spawn::spawn(move || {
                 started_tx.send(()).unwrap();
                 let result = worker_gate.enter(2, || worker_cancel.check());
                 tx.send(result.err().map(|error| error.code())).unwrap();
@@ -539,7 +539,7 @@ mod tests {
         let worker_gate = gate.clone();
         let (tx, rx) = mpsc::channel();
         let before = super::status_snapshot();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             let result = worker_gate.enter(2, || worker_budget.terminal_oom().map_or(Ok(()), Err));
             tx.send(result.err().map(|error| error.code())).unwrap();
         });

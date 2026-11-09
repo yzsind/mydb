@@ -53,6 +53,21 @@ eases incremental migration of existing configurations. Test, benchmark,
 crash-injection, and debug environment switches cannot be written into the config
 file.
 
+## Connection Reactors
+
+`tokio_workers` (`MYDB_TOKIO_WORKERS`) sets the number of connection reactors
+at startup, in the range 1..1024. It is a config/environment option, not a CLI
+flag. On Linux, `tokio_affinity=auto` (`MYDB_TOKIO_AFFINITY`, the default) assigns
+one allowed CPU to each reactor when the reactor count fits the calling
+thread's effective CPU affinity mask and CPU quota. Sparse CPU masks and cgroup restrictions
+are respected. Oversubscribed pools and other platforms retain scheduler-managed
+placement. Use `tokio_affinity=off` to retain scheduler-managed placement on Linux.
+Database-created compute and background threads retain the full server CPU mask.
+Lazy pool sizing on bound reactors uses the server parallelism captured before
+binding, including the startup CPU quota, rather than the single assigned CPU.
+Both settings require a restart; they do not set query execution parallelism or
+reserve CPUs exclusively for the database.
+
 ## TLS
 
 The server defaults to `ssl_mode=auto`: it advertises TLS and generates an

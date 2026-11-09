@@ -41,17 +41,6 @@ pub(crate) fn equality_fixes_order_value(
     if matches!(target, ParamTarget::JsonScalar) {
         return false;
     }
-    if matches!(target, ParamTarget::Decimal { .. }) {
-        let approximate = match value {
-            ConstraintValue::Concrete(value) => matches!(value, Value::Float(_) | Value::Double(_)),
-            ConstraintValue::Param(index) => crate::engine::params::current_param(*index)
-                .is_none_or(|value| matches!(value, Value::Float(_) | Value::Double(_))),
-            ConstraintValue::Statement(_) => false,
-        };
-        if approximate {
-            return false;
-        }
-    }
     let target = if matches!(target, ParamTarget::Bytes) {
         ParamTarget::String
     } else {
@@ -59,6 +48,39 @@ pub(crate) fn equality_fixes_order_value(
     };
     super::index_in_lookup_preserves_comparison(target, std::slice::from_ref(value))
 }
+/// Whether a known operand stays in DECIMAL's exact comparison domain.
+/// None denotes an unbound template parameter, not proof of a safe key.
+pub(super) fn exact_decimal_comparison(value: &ConstraintValue) -> Option<bool> {
+    fn exact(value: &Value) -> bool {
+        matches!(
+            value,
+            Value::Null
+                | Value::Int(_)
+                | Value::UInt(_)
+                | Value::Decimal(_)
+                | Value::DecimalCompact(..)
+                | Value::Decimal128(..)
+                | Value::DecimalWide(_)
+        )
+    }
+    match value {
+        ConstraintValue::Concrete(value) => Some(exact(value)),
+        ConstraintValue::Param(index) => super::PLANNING_PARAMS
+            .with(|slot| {
+                slot.borrow()
+                    .as_ref()
+                    .and_then(|params| params.get(*index))
+                    .map(exact)
+            })
+            .or_else(|| {
+                crate::engine::params::with_current_params(|params, _| {
+                    params.and_then(|params| params.get(*index)).map(exact)
+                })
+            }),
+        ConstraintValue::Statement(_) => Some(false),
+    }
+}
+
 impl ConstraintValue {
     pub(crate) fn try_into_key_part(self, target: ParamTarget) -> Option<KeyPart> {
         match self {
@@ -472,11 +494,15 @@ pub(crate) fn build_range_bounds(
     Some((low, high))
 }
 
-/// Reject literal bounds whose SQL comparison domain differs from stored key
-/// ordering. Deferred parameters keep their existing prepare/bind lifecycle.
+/// Reject bounds whose SQL comparison domain differs from stored key ordering.
+/// Unbound parameters retain their prepare/bind lifecycle; known DECIMAL
+/// bindings must also pass the runtime domain proof.
 #[inline]
 pub(crate) fn concrete_comparison_preserved(target: ParamTarget, value: &ConstraintValue) -> bool {
     match (target, value) {
+        (ParamTarget::Decimal { .. }, ConstraintValue::Param(_)) => {
+            exact_decimal_comparison(value).unwrap_or(true)
+        }
         (_, ConstraintValue::Param(_)) => true,
         (ParamTarget::Int, ConstraintValue::Concrete(Value::Int(_)))
         | (ParamTarget::UInt, ConstraintValue::Concrete(Value::UInt(_))) => true,

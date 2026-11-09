@@ -274,7 +274,7 @@ where
     let vector_mode = crate::engine::executor::vec::config::effective_mode();
     let spill_context = spill_context.cloned();
 
-    std::thread::scope(|scope| -> Result<Vec<HashAggSink>, QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<Vec<HashAggSink>, QueryError> {
         let mut handles = Vec::with_capacity(worker_count);
         for receiver in receivers {
             let groups = group_columns.to_vec();
@@ -622,7 +622,7 @@ fn merge_rollup_partitions(
     let params = crate::engine::params::snapshot_current_context();
     let cancellation = crate::engine::cancel::current_token();
     let mode = crate::engine::executor::vec::config::effective_mode();
-    let merged = std::thread::scope(|scope| {
+    let merged = crate::util::thread_spawn::scope(|scope| {
         let handles = jobs
             .into_iter()
             .map(|jobs| {
@@ -737,13 +737,13 @@ fn align_worker_dictionaries(
             return Ok(());
         };
         let cancel = crate::engine::cancel::CancellationSnapshot::capture();
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::with_capacity(sinks.len());
             for sink in sinks {
                 let budget = budget.clone();
                 let cancel = cancel.clone();
                 handles.push(
-                    std::thread::Builder::new()
+                    crate::util::thread_spawn::Builder::new()
                         .stack_size(STACK_BYTES)
                         .spawn_scoped(scope, move || {
                             let _cancel = cancel.enter();
@@ -837,7 +837,7 @@ fn align_worker_dictionaries(
             return spill(sinks);
         };
         let cancel = crate::engine::cancel::CancellationSnapshot::capture();
-        let normalized = std::thread::scope(|scope| {
+        let normalized = crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::with_capacity(sinks.len());
             for sink in sinks.iter_mut() {
                 if !active(sink) || sink.agg.parallel_dictionary_layout().as_ref() == Some(&layout)
@@ -944,7 +944,7 @@ fn align_worker_dictionaries(
         if descriptor.0 != 0 {
             continue;
         }
-        let shards = std::thread::scope(|scope| -> Result<Vec<_>, QueryError> {
+        let shards = crate::util::thread_spawn::scope(|scope| -> Result<Vec<_>, QueryError> {
             let mut handles = Vec::with_capacity(shards_count);
             for shard in 0..shards_count {
                 let sinks = &*sinks;
@@ -993,7 +993,7 @@ fn align_worker_dictionaries(
         for shard in 1..shards_count {
             offsets[shard] = offsets[shard - 1] + shards[shard - 1].len() as u32;
         }
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::with_capacity(sinks.len());
             for sink in sinks.iter_mut() {
                 let shards = &shards;
@@ -1025,7 +1025,7 @@ fn build_parallel_stream_sinks(
 ) -> Result<ParallelStreamBuild, QueryError> {
     if let Some(workers) = stream.take_parallel_workers(worker_count)? {
         let abort = Arc::new(AtomicBool::new(false));
-        let sinks = std::thread::scope(|scope| {
+        let sinks = crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::with_capacity(workers.len());
             for worker in workers {
                 let abort = abort.clone();
@@ -1219,7 +1219,7 @@ fn parallel_finalize_stream(
         let session_info = session_info.clone();
         let params = params.clone();
         let cancel_token = cancel_token.clone();
-        workers.push(std::thread::spawn(move || {
+        workers.push(crate::util::thread_spawn::spawn(move || {
             let _cancel_guard = cancel_token.map(crate::engine::cancel::enter);
             let _vector_mode = crate::engine::executor::vec::config::enter_mode(vector_mode);
             let run = || -> Result<(), QueryError> {

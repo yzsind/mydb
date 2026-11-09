@@ -832,7 +832,7 @@ fn score_selection_parallel(
     let degree = degree.min(selection.len().div_ceil(256)).max(1);
     let context = super::super::execution_context::ExecutionContext::capture(txn);
     let mut best: BinaryHeap<Scored<(u64, RowId)>> = BinaryHeap::new();
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         let mut handles = Vec::new();
         for worker in 0..degree {
             let context = context.clone();

@@ -1618,7 +1618,7 @@ mod tests {
     fn spatial_index_concurrent_leaf_writes_and_queries() {
         let dir = directory();
         let tree = Arc::new(open(dir.path(), true));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..4 {
                 let tree = tree.clone();
                 scope.spawn(move || {
@@ -1636,7 +1636,7 @@ mod tests {
         });
         tree.validate().unwrap();
         assert_eq!(tree.entries().unwrap().len(), 1600);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..4 {
                 let tree = tree.clone();
                 scope.spawn(move || {

@@ -4714,37 +4714,8 @@ pub(super) fn strip_create_table_pctfree_pctused(
                     if !has_equals && (j >= bytes.len() || !bytes[j].is_ascii_digit()) {
                         continue;
                     }
-                    let num_start = j;
-                    while j < bytes.len() && bytes[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                    if j == num_start {
-                        return Err(parse_error_at_zero(&format!(
-                            "{kw} expects an integer literal between 0 and 50"
-                        )));
-                    }
-                    let raw = std::str::from_utf8(&bytes[num_start..j]).map_err(|_| {
-                        parse_error_at_zero("PCTFREE/PCTUSED value is not valid UTF-8")
-                    })?;
-                    let n: u32 = raw.parse().map_err(|_| {
-                        parse_error_at_zero(&format!(
-                            "{kw} expects an integer literal between 0 and 50"
-                        ))
-                    })?;
-                    if n > 50 {
-                        return Err(parse_error_at_zero(&format!(
-                            "{kw}={n} out of range — must be between 0 and 50"
-                        )));
-                    }
-                    *slot = Some(n as u8);
-                    // Skip a trailing comma so the residue doesn't look
-                    // like a dangling option separator.
-                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                        j += 1;
-                    }
-                    if j < bytes.len() && bytes[j] == b',' {
-                        j += 1;
-                    }
+                    let (value, j) = parse_pct_option_value(bytes, j, kw)?;
+                    *slot = Some(value);
                     i = j;
                     matched = true;
                     break;
@@ -4763,6 +4734,39 @@ pub(super) fn strip_create_table_pctfree_pctused(
         std::borrow::Cow::Owned(kept),
         CreateTablePctOverride { pctfree, pctused },
     ))
+}
+
+/// Parse the shared numeric tail after an entry-specific option match.
+fn parse_pct_option_value(bytes: &[u8], mut j: usize, kw: &str) -> Result<(u8, usize), ParseError> {
+    let num_start = j;
+    while j < bytes.len() && bytes[j].is_ascii_digit() {
+        j += 1;
+    }
+    if j == num_start {
+        return Err(parse_error_at_zero(&format!(
+            "{kw} expects an integer literal between 0 and 50"
+        )));
+    }
+    let raw = std::str::from_utf8(&bytes[num_start..j])
+        .map_err(|_| parse_error_at_zero("PCTFREE/PCTUSED value is not valid UTF-8"))?;
+    let n: u32 = raw.parse().map_err(|_| {
+        parse_error_at_zero(&format!("{kw} expects an integer literal between 0 and 50"))
+    })?;
+    if n > 50 {
+        return Err(parse_error_at_zero(&format!(
+            "{kw}={n} out of range — must be between 0 and 50"
+        )));
+    }
+
+    // Skip a trailing comma so the residue doesn't look
+    // like a dangling option separator.
+    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+        j += 1;
+    }
+    if j < bytes.len() && bytes[j] == b',' {
+        j += 1;
+    }
+    Ok((n as u8, j))
 }
 
 /// Scan an `ALTER TABLE … <tail>` body for `PCTFREE=N` / `PCTUSED=N`
@@ -4812,37 +4816,8 @@ fn strip_pctfree_pctused(tail: &str) -> Result<(String, Option<u8>, Option<u8>),
                     while j < bytes.len() && bytes[j].is_ascii_whitespace() {
                         j += 1;
                     }
-                    let num_start = j;
-                    while j < bytes.len() && bytes[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                    if j == num_start {
-                        return Err(parse_error_at_zero(&format!(
-                            "{kw} expects an integer literal between 0 and 50"
-                        )));
-                    }
-                    let raw = std::str::from_utf8(&bytes[num_start..j]).map_err(|_| {
-                        parse_error_at_zero("PCTFREE/PCTUSED value is not valid UTF-8")
-                    })?;
-                    let n: u32 = raw.parse().map_err(|_| {
-                        parse_error_at_zero(&format!(
-                            "{kw} expects an integer literal between 0 and 50"
-                        ))
-                    })?;
-                    if n > 50 {
-                        return Err(parse_error_at_zero(&format!(
-                            "{kw}={n} out of range — must be between 0 and 50"
-                        )));
-                    }
-                    *slot = Some(n as u8);
-                    // Also skip a trailing comma between options so the
-                    // residue doesn't start with `,`.
-                    while j < bytes.len() && bytes[j].is_ascii_whitespace() {
-                        j += 1;
-                    }
-                    if j < bytes.len() && bytes[j] == b',' {
-                        j += 1;
-                    }
+                    let (value, j) = parse_pct_option_value(bytes, j, kw)?;
+                    *slot = Some(value);
                     i = j;
                     continue 'outer;
                 }
@@ -5160,3 +5135,7 @@ fn rewrite_keyword_matches_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool 
         && (pos == 0 || !returning_ident_byte(bytes[pos - 1]))
         && (end == bytes.len() || !returning_ident_byte(bytes[end]))
 }
+
+#[cfg(test)]
+#[path = "pct_option_contract_tests.rs"]
+mod pct_option_contract_tests;

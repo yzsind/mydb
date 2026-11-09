@@ -176,7 +176,7 @@ mod tests {
         };
         let (first, expected_first) = capture(37);
         let (second, expected_second) = capture(73);
-        std::thread::spawn(move || {
+        crate::util::thread_spawn::spawn(move || {
             let default = current_config();
             for _ in 0..3 {
                 expr::with_session_expr_info_snapshot(first.clone(), || {

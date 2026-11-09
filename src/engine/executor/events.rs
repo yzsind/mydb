@@ -192,7 +192,7 @@ impl EventWorkerPool {
             let worker_inner = Arc::clone(&inner);
             let env = crate::util::env::override_snapshot();
             workers.push(
-                std::thread::Builder::new()
+                crate::util::thread_spawn::Builder::new()
                     .name(format!("mydb-event-worker-{index}"))
                     .spawn(move || {
                         crate::util::env::with_override_snapshot(env, || {
@@ -305,7 +305,7 @@ fn event_worker_count() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|count| *count > 0)
         .unwrap_or_else(|| {
-            std::thread::available_parallelism()
+            crate::util::thread_spawn::available_parallelism()
                 .map(|count| count.get().min(4))
                 .unwrap_or(2)
         })
@@ -406,7 +406,7 @@ impl EventSchedulerHandle {
 
         let worker = Arc::clone(&inner);
         let env = crate::util::env::override_snapshot();
-        let worker = std::thread::Builder::new()
+        let worker = crate::util::thread_spawn::Builder::new()
             .name("mydb-event-scheduler".to_string())
             .spawn(move || crate::util::env::with_override_snapshot(env, || run_scheduler(worker)))
             .expect("failed to spawn event scheduler thread");
@@ -1896,7 +1896,7 @@ fn shutdown_waits_for_event_worker_past_old_detach_deadline() {
     );
     scheduler.shutdown();
     let (release, blocked) = std::sync::mpsc::channel();
-    let worker = std::thread::spawn(move || {
+    let worker = crate::util::thread_spawn::spawn(move || {
         blocked.recv().unwrap();
     });
     let pool = EventWorkerPool {
@@ -1905,7 +1905,7 @@ fn shutdown_waits_for_event_worker_past_old_detach_deadline() {
         inner: Arc::clone(&scheduler.inner),
     };
     let (done, completed) = std::sync::mpsc::channel();
-    let shutdown = std::thread::spawn(move || {
+    let shutdown = crate::util::thread_spawn::spawn(move || {
         pool.shutdown();
         done.send(()).unwrap();
     });

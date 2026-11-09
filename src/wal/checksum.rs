@@ -138,7 +138,7 @@ mod tests {
 
     #[test]
     fn shift_cache_collisions_remain_correct_across_threads() {
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for lane in 0..4 {
                 scope.spawn(move || {
                     for i in 0..1000 {

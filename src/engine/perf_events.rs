@@ -2507,7 +2507,7 @@ mod tests {
         crate::engine::perf_digest::reset();
         let workers = (0..16)
             .map(|worker| {
-                std::thread::spawn(move || {
+                crate::util::thread_spawn::spawn(move || {
                     let mut session = SessionContext::default();
                     session.connection_id = 8_000_000 + worker;
                     for _ in 0..100 {

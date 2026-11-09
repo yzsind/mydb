@@ -713,7 +713,7 @@ const BULK_PARSE_PARALLEL_MIN_BYTES: usize = 256 * 1024;
 pub(super) fn host_cores() -> usize {
     static CORES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *CORES.get_or_init(|| {
-        std::thread::available_parallelism()
+        crate::util::thread_spawn::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
     })
@@ -991,7 +991,7 @@ fn parse_bulk_value_tuples_from_source(
     // the matching span range. `thread::scope` joins all workers before the
     // function returns, so the later read of `results` sees every write.
     let chunk = n.div_ceil(degree);
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut rest: &mut [Option<Vec<Expr>>] = &mut results[1..];
         let mut base = 1usize;
         while !rest.is_empty() {
@@ -1015,7 +1015,7 @@ fn parse_bulk_value_tuples_from_source(
                 parse_chunk();
                 break;
             }
-            let spawn = std::thread::Builder::new()
+            let spawn = crate::util::thread_spawn::Builder::new()
                 .name("mydb-sql-parser".to_string())
                 .stack_size(PARSER_WORKER_STACK_BYTES)
                 .spawn_scoped(s, parse_chunk);
@@ -3842,6 +3842,9 @@ fn looks_like_create_routine(sql: &str) -> bool {
     let Some(mut idx) = consume_keyword_at(sql, 0, "CREATE") else {
         return false;
     };
+    if let Some(next) = consume_keywords_at(sql, idx, &["OR", "REPLACE"]) {
+        idx = next;
+    }
     if let Some(next) = consume_keyword_at(sql, idx, "DEFINER") {
         idx = skip_ws(sql, next);
         if sql[idx..].starts_with('=') {
@@ -3896,6 +3899,12 @@ fn trim_sql_statement(sql: &str) -> &str {
 
 fn parse_create_routine_statement(_original_sql: &str, sql: &str) -> Result<Statement, ParseError> {
     let mut idx = consume_keyword_at(sql, 0, "CREATE").unwrap_or(0);
+    let or_replace = if let Some(next) = consume_keywords_at(sql, idx, &["OR", "REPLACE"]) {
+        idx = next;
+        true
+    } else {
+        false
+    };
     let mut definer = None;
     if let Some(next) = consume_keyword_at(sql, idx, "DEFINER") {
         idx = skip_ws(sql, next);
@@ -3927,6 +3936,11 @@ fn parse_create_routine_statement(_original_sql: &str, sql: &str) -> Result<Stat
     } else {
         false
     };
+    if or_replace && if_not_exists {
+        return Err(parse_error_at_zero(
+            "OR REPLACE and IF NOT EXISTS cannot be combined for routines",
+        ));
+    }
     let (name, next) = parse_routine_object_name(sql, idx)?;
     idx = skip_ws(sql, next);
     let (param_sql, next) = consume_parenthesized(sql, idx)
@@ -3982,6 +3996,7 @@ fn parse_create_routine_statement(_original_sql: &str, sql: &str) -> Result<Stat
     Ok(Statement::CreateRoutine(RoutineDef {
         kind,
         name,
+        or_replace,
         if_not_exists,
         definer,
         params,

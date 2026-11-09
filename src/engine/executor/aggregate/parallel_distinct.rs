@@ -60,7 +60,7 @@ pub(crate) fn count_union<K: Eq + Hash + Sync>(
     };
     let builder = ahash::RandomState::new();
     let abort = AtomicBool::new(false);
-    let batches = std::thread::scope(|scope| {
+    let batches = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(sources.len());
         for source in sources.iter().copied() {
             let builder = &builder;
@@ -87,7 +87,7 @@ pub(crate) fn count_union<K: Eq + Hash + Sync>(
         }
         join_all(handles, &abort)
     })?;
-    let counts = std::thread::scope(|scope| {
+    let counts = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for worker in 0..workers {
             let batches = &batches;

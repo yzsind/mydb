@@ -16,6 +16,8 @@ thread_local! {
         std::cell::RefCell::new(None);
     static INDEX_HANDLE_READ_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static STORAGE_HANDLE_MEMO_UPGRADE_TEST_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        std::cell::RefCell::new(None);
 }
 
 #[cfg(test)]
@@ -102,11 +104,310 @@ impl Drop for CatalogTxnBatchGuard {
     }
 }
 
-/// Cold opens share this fence with same-path physical publication. Cached
-/// operations continue to use their existing file latch without another lock.
+/// Cold opens share a fence with same-path physical publication. Memo hits
+/// protect only ownership handoff; file I/O retains its existing file latch.
 struct StorageHandleOpenEpoch {
     epoch: AtomicU64,
     publication: parking_lot::RwLock<()>,
+    /// Only the weak-to-strong ownership handoff, never file I/O. Keep this
+    /// separate from the cold-open publication fence to preserve lock order.
+    heap_handoff: StorageHandleHandoff,
+    index_handoff: StorageHandleHandoff,
+}
+
+#[derive(Debug, Default)]
+struct StorageHandleEpochRegistry {
+    epochs: HashMap<u64, std::sync::Weak<StorageHandleOpenEpoch>>,
+    opens_since_sweep: usize,
+}
+
+// Keep the two ownership counters and the read-mostly epoch on different
+// cache lines on both x86 and Apple Silicon.
+#[repr(align(128))]
+#[derive(Default)]
+struct StorageHandleHandoff {
+    single: CachePadded<parking_lot::RwLock<()>>,
+    extra: OnceLock<Option<Box<StorageHandleHandoffShards>>>,
+    reads: AtomicU8,
+    active: AtomicU64,
+    retirement: parking_lot::Mutex<()>,
+}
+
+struct StorageHandleHandoffShards {
+    gates: [CachePadded<parking_lot::RwLock<()>>; 31],
+    _memory: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+struct StorageHandleHandoffWrite<'a> {
+    handoff: &'a StorageHandleHandoff,
+    guards: smallvec::SmallVec<[parking_lot::RwLockWriteGuard<'a, ()>; 32]>,
+    _retirement: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl Drop for StorageHandleHandoffWrite<'_> {
+    fn drop(&mut self) {
+        self.guards.clear();
+        self.handoff.reads.store(0, Ordering::Relaxed);
+        self.handoff.active.store(0, Ordering::Release);
+    }
+}
+
+thread_local! {
+    static STORAGE_HANDOFF_SLOT: usize = {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) % 32
+    };
+}
+
+impl StorageHandleHandoff {
+    const CLOSED: u64 = 1 << 63;
+
+    fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        let reads = self.reads.load(Ordering::Relaxed);
+        if reads < 64 {
+            self.reads.fetch_max(reads + 1, Ordering::Relaxed);
+            return self.try_read_slot(0);
+        }
+        if self.extra_gates().is_none() {
+            return self.try_read_slot(0);
+        }
+        STORAGE_HANDOFF_SLOT.with(|slot| self.try_read_slot(*slot))
+    }
+
+    fn extra_gates(&self) -> Option<&StorageHandleHandoffShards> {
+        self.extra
+            .get_or_init(|| {
+                use crate::engine::executor::mem_budget::{
+                    ControlledMemoryCategory, ControlledMemoryCharge, StorageLatchAdmissionScope,
+                };
+                let _admission = StorageLatchAdmissionScope::enter();
+                let memory = ControlledMemoryCharge::try_new_optional(
+                    ControlledMemoryCategory::SystemMetadata,
+                    std::mem::size_of::<StorageHandleHandoffShards>(),
+                )?;
+                Some(Box::new(StorageHandleHandoffShards {
+                    gates: std::array::from_fn(|_| CachePadded::default()),
+                    _memory: memory,
+                }))
+            })
+            .as_deref()
+    }
+
+    fn gate(&self, slot: usize) -> Option<&parking_lot::RwLock<()>> {
+        if slot == 0 {
+            Some(&self.single)
+        } else {
+            Some(&self.extra_gates()?.gates[slot - 1])
+        }
+    }
+
+    fn try_read_slot(&self, slot: usize) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        if !self.register_slot(slot) {
+            return None;
+        }
+        self.read_registered_slot(slot)
+    }
+
+    fn register_slot(&self, slot: usize) -> bool {
+        let bit = 1 << slot;
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active & Self::CLOSED != 0 {
+                return false;
+            }
+            if active & bit != 0 {
+                break;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active | bit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
+        true
+    }
+
+    fn read_registered_slot(&self, slot: usize) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        let guard = self.gate(slot)?.try_read()?;
+        let bit = 1 << slot;
+        let active = self.active.load(Ordering::Acquire);
+        // A reader can pause between registration and taking its gate while
+        // a whole retirement completes. Do not use an unregistered gate in
+        // the next epoch, even when the caller will also recheck its version.
+        (active & (Self::CLOSED | bit) == bit).then_some(guard)
+    }
+
+    fn write(&self) -> StorageHandleHandoffWrite<'_> {
+        let retirement = self.retirement.lock();
+        // Close registration before sampling the used gates. A new reader
+        // either registers before this RMW and is drained, or falls back.
+        let active = self.active.fetch_or(Self::CLOSED, Ordering::AcqRel);
+        let mut active = active & !Self::CLOSED;
+        let mut guards = smallvec::SmallVec::new();
+        while active != 0 {
+            let slot = active.trailing_zeros() as usize;
+            if let Some(gate) = self.gate(slot) {
+                guards.push(gate.write());
+            }
+            active &= active - 1;
+        }
+        StorageHandleHandoffWrite {
+            handoff: self,
+            guards,
+            _retirement: retirement,
+        }
+    }
+}
+
+trait StorageHandleKind {
+    fn handoff(epoch: &StorageHandleOpenEpoch) -> &StorageHandleHandoff;
+}
+
+impl StorageHandleKind for HeapFile {
+    fn handoff(epoch: &StorageHandleOpenEpoch) -> &StorageHandleHandoff {
+        &epoch.heap_handoff
+    }
+}
+
+impl StorageHandleKind for IndexFile {
+    fn handoff(epoch: &StorageHandleOpenEpoch) -> &StorageHandleHandoff {
+        &epoch.index_handoff
+    }
+}
+
+// Weak entries do not pin files or defeat the authoritative cache's eviction.
+// Database identities are monotonic, so a new Database at the same address
+// cannot reuse another instance's handles.
+struct StorageHandleMemo<T> {
+    database: u64,
+    table: u64,
+    name: String,
+    epoch: Arc<StorageHandleOpenEpoch>,
+    version: u64,
+    handle: std::sync::Weak<parking_lot::RwLock<T>>,
+    _memory: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+struct StorageHandleMemos<T> {
+    entries: [Option<StorageHandleMemo<T>>; 8],
+    next: usize,
+    misses: usize,
+}
+
+impl<T: StorageHandleKind> StorageHandleMemos<T> {
+    const fn new() -> Self {
+        Self {
+            entries: [const { None }; 8],
+            next: 0,
+            misses: 0,
+        }
+    }
+
+    fn should_admit(&mut self, database: u64, table: u64, name: &str) -> bool {
+        if self.entries.iter().any(|entry| {
+            entry.as_ref().is_none_or(|entry| {
+                entry.database == database && entry.table == table && entry.name == name
+            })
+        }) {
+            return true;
+        }
+        // A working set larger than this tiny L0 must not pay epoch lookup,
+        // allocation and memory-governor traffic on every authoritative hit.
+        self.misses = self.misses.wrapping_add(1);
+        self.misses & 63 == 0
+    }
+
+    fn get(&self, database: u64, table: u64, name: &str) -> Option<Arc<parking_lot::RwLock<T>>> {
+        let entry = self.entries.iter().flatten().find(|entry| {
+            entry.database == database && entry.table == table && entry.name == name
+        })?;
+        if entry.epoch.load(Ordering::Acquire) != entry.version {
+            return None;
+        }
+        #[cfg(test)]
+        {
+            let hook = STORAGE_HANDLE_MEMO_UPGRADE_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
+        // Retirement waits for in-flight ownership handoffs before checking
+        // idle refcounts or replacing the binding. Readers after retirement
+        // observe the new epoch before upgrading the old weak owner. Thus an
+        // obsolete temporary Arc cannot outlive replacement and run a stale
+        // file destructor. A successful handoff has the same strong lifetime
+        // as the authoritative cache's read-locked lookup.
+        let _handoff = T::handoff(&entry.epoch).try_read()?;
+        if entry.epoch.load(Ordering::Acquire) != entry.version {
+            return None;
+        }
+        entry.handle.upgrade()
+    }
+
+    fn insert(
+        &mut self,
+        database: u64,
+        table: u64,
+        name: &str,
+        epoch: Arc<StorageHandleOpenEpoch>,
+        version: u64,
+        handle: &Arc<parking_lot::RwLock<T>>,
+    ) {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let position = self
+            .entries
+            .iter()
+            .position(|entry| {
+                entry.as_ref().is_some_and(|entry| {
+                    entry.database == database && entry.table == table && entry.name == name
+                })
+            })
+            .unwrap_or(self.next);
+        self.entries[position] = None;
+        let bytes = std::mem::size_of::<StorageHandleMemo<T>>()
+            .saturating_add(std::mem::size_of::<StorageHandleOpenEpoch>())
+            .saturating_add(
+                std::mem::align_of::<StorageHandleOpenEpoch>()
+                    .max(2 * std::mem::size_of::<usize>()),
+            )
+            // A weak owner can retain its allocation after the file closes.
+            .saturating_add(std::mem::size_of::<parking_lot::RwLock<T>>())
+            .saturating_add(
+                std::mem::align_of::<parking_lot::RwLock<T>>()
+                    .max(2 * std::mem::size_of::<usize>()),
+            )
+            .saturating_add(name.len());
+        let Some(memory) = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::SystemMetadata,
+            bytes,
+        ) else {
+            self.entries = [const { None }; 8];
+            return;
+        };
+        self.entries[position] = Some(StorageHandleMemo {
+            database,
+            table,
+            name: name.to_owned(),
+            epoch,
+            version,
+            handle: Arc::downgrade(handle),
+            _memory: memory,
+        });
+        self.next = (position + 1) % self.entries.len();
+    }
+}
+
+thread_local! {
+    static HEAP_HANDLE_MEMOS: std::cell::RefCell<StorageHandleMemos<HeapFile>> =
+        const { std::cell::RefCell::new(StorageHandleMemos::new()) };
+    static INDEX_HANDLE_MEMOS: std::cell::RefCell<StorageHandleMemos<IndexFile>> =
+        const { std::cell::RefCell::new(StorageHandleMemos::new()) };
 }
 
 impl std::ops::Deref for StorageHandleOpenEpoch {
@@ -118,35 +419,49 @@ impl std::ops::Deref for StorageHandleOpenEpoch {
 
 impl Database {
     fn storage_handle_open_epoch(&self, table_id: u64) -> Arc<StorageHandleOpenEpoch> {
-        let mut epochs = self
+        let mut registry = self
             .storage_handle_open_epochs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(epoch) = epochs.get(&table_id).and_then(std::sync::Weak::upgrade) {
+        if let Some(epoch) = registry
+            .epochs
+            .get(&table_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
             return epoch;
         }
         // Dead weak entries need no persistent per-table allocation. Keep
         // cleanup amortized and bounded independently of catalog history.
-        if epochs.len() >= 128 {
-            epochs.retain(|_, epoch| epoch.strong_count() != 0);
+        registry.opens_since_sweep = registry.opens_since_sweep.saturating_add(1);
+        if registry.epochs.len() >= 128 && registry.opens_since_sweep >= 128 {
+            registry.epochs.retain(|_, epoch| epoch.strong_count() != 0);
+            registry.opens_since_sweep = 0;
         }
         let epoch = Arc::new(StorageHandleOpenEpoch {
             epoch: AtomicU64::new(0),
             publication: parking_lot::RwLock::new(()),
+            heap_handoff: StorageHandleHandoff::default(),
+            index_handoff: StorageHandleHandoff::default(),
         });
-        epochs.insert(table_id, Arc::downgrade(&epoch));
+        registry.epochs.insert(table_id, Arc::downgrade(&epoch));
         epoch
     }
 
     fn invalidate_storage_handle_open_epoch(&self, table_id: u64) {
-        let mut epochs = self
+        let mut registry = self
             .storage_handle_open_epochs
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        if let Some(epoch) = epochs.get(&table_id).and_then(std::sync::Weak::upgrade) {
+        if let Some(epoch) = registry
+            .epochs
+            .get(&table_id)
+            .and_then(std::sync::Weak::upgrade)
+        {
+            let _heap_handoffs = epoch.heap_handoff.write();
+            let _index_handoffs = epoch.index_handoff.write();
             epoch.fetch_add(1, Ordering::AcqRel);
         } else {
-            epochs.remove(&table_id);
+            registry.epochs.remove(&table_id);
         }
     }
 
@@ -435,10 +750,11 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn diagnostic_catalog_snapshot_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_ROW_SECURITY_POLICIES, DD_ROW_SECURITY_DEPENDENCIES, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
+            catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
             DD_COLUMN_STATS, DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
             DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
-            DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
+            DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES,
+            DD_ROW_SECURITY_DEPENDENCIES, DD_ROW_SECURITY_POLICIES, DD_SCHEMATA, DD_SEQUENCES,
             DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
         };
         let load = |dd_id: u64| self.scan_dd_table(dd_id);
@@ -715,6 +1031,9 @@ impl Database {
         macro_rules! rebind {
             ($cache:expr, $keys:expr) => {{
                 let mut cache = $cache.write();
+                for (old, _) in &$keys {
+                    self.invalidate_storage_handle_open_epoch(old.0);
+                }
                 let entries = $keys
                     .iter()
                     .filter_map(|(old, new)| cache.remove(old).map(|value| (new.clone(), value)))
@@ -751,6 +1070,12 @@ impl Database {
             index.write().discard_without_flush();
         }
         Ok(())
+    }
+
+    fn publish_index_handle(&self, table_id: u64, index_name: &str, handle: IndexHandle) {
+        let mut cache = self.index_cache.write();
+        self.invalidate_storage_handle_open_epoch(table_id);
+        cache.insert((table_id, normalize_name(index_name)), handle);
     }
 
     fn remove_overflow_cache_entry(&self, table_id: u64) -> Result<(), QueryError> {
@@ -801,6 +1126,40 @@ impl Database {
     }
 
     fn heap_handle(&self, table_id: u64) -> Result<HeapHandle, QueryError> {
+        if let Some(handle) = HEAP_HANDLE_MEMOS.with(|cache| {
+            cache
+                .try_borrow()
+                .ok()?
+                .get(self.visibility_cache_id, table_id, "")
+        }) {
+            return Ok(handle);
+        }
+        if !HEAP_HANDLE_MEMOS.with(|cache| {
+            cache
+                .try_borrow_mut()
+                .is_ok_and(|mut cache| cache.should_admit(self.visibility_cache_id, table_id, ""))
+        }) {
+            return self.open_heap_handle(table_id);
+        }
+        let epoch = self.storage_handle_open_epoch(table_id);
+        let version = epoch.load(Ordering::Acquire);
+        let handle = self.open_heap_handle(table_id)?;
+        HEAP_HANDLE_MEMOS.with(|cache| {
+            if let Ok(mut cache) = cache.try_borrow_mut() {
+                cache.insert(
+                    self.visibility_cache_id,
+                    table_id,
+                    "",
+                    epoch,
+                    version,
+                    &handle,
+                );
+            }
+        });
+        Ok(handle)
+    }
+
+    fn open_heap_handle(&self, table_id: u64) -> Result<HeapHandle, QueryError> {
         loop {
             // Hot SELECT path: check the cache under a shared read lock first so
             // concurrent readers don't serialize on a Mutex.
@@ -920,8 +1279,14 @@ impl Database {
                 .iter()
                 .find_map(|(id, handle)| (Arc::strong_count(handle) == 1).then_some(*id));
             if let Some(victim_id) = victim_id {
-                if let Some(victim) = cache.remove(&victim_id) {
-                    victim.write().retain_buffered_pages_on_drop();
+                self.invalidate_storage_handle_open_epoch(victim_id);
+                if cache
+                    .get(&victim_id)
+                    .is_some_and(|handle| Arc::strong_count(handle) == 1)
+                {
+                    if let Some(victim) = cache.remove(&victim_id) {
+                        victim.write().retain_buffered_pages_on_drop();
+                    }
                 }
             }
         }
@@ -1167,6 +1532,45 @@ impl Database {
     }
 
     fn index_handle(&self, table_id: u64, index_name: &str) -> Result<IndexHandle, QueryError> {
+        let normalized = normalize_name_cow(index_name);
+        if let Some(handle) = INDEX_HANDLE_MEMOS.with(|cache| {
+            cache
+                .try_borrow()
+                .ok()?
+                .get(self.visibility_cache_id, table_id, &normalized)
+        }) {
+            return Ok(handle);
+        }
+        if !INDEX_HANDLE_MEMOS.with(|cache| {
+            cache.try_borrow_mut().is_ok_and(|mut cache| {
+                cache.should_admit(self.visibility_cache_id, table_id, &normalized)
+            })
+        }) {
+            return self.open_index_handle(table_id, &normalized);
+        }
+        let epoch = self.storage_handle_open_epoch(table_id);
+        let version = epoch.load(Ordering::Acquire);
+        let handle = self.open_index_handle(table_id, &normalized)?;
+        INDEX_HANDLE_MEMOS.with(|cache| {
+            if let Ok(mut cache) = cache.try_borrow_mut() {
+                cache.insert(
+                    self.visibility_cache_id,
+                    table_id,
+                    &normalized,
+                    epoch,
+                    version,
+                    &handle,
+                );
+            }
+        });
+        Ok(handle)
+    }
+
+    fn open_index_handle(
+        &self,
+        table_id: u64,
+        index_name: &str,
+    ) -> Result<IndexHandle, QueryError> {
         loop {
             // Hot SELECT path: shared read lock + zero-allocation borrowed
             // probe. `normalize_name` allocated a String per call just to
@@ -1262,6 +1666,7 @@ impl Database {
         index.flush()?;
         let removed = {
             let mut cache = self.index_cache.write();
+            self.invalidate_storage_handle_open_epoch(key.0);
             if Arc::strong_count(&victim) == 2
                 && cache
                     .get(&key)

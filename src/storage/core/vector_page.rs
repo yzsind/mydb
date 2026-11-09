@@ -3467,7 +3467,7 @@ mod vector_page_tests {
         for worker in 0..threads {
             let file = Arc::clone(&file);
             let start = Arc::clone(&start);
-            handles.push(std::thread::spawn(move || {
+            handles.push(crate::util::thread_spawn::spawn(move || {
                 start.wait();
                 for i in 0..per_thread {
                     let ordinal = worker * per_thread + i;
@@ -3748,7 +3748,7 @@ mod vector_page_tests {
                 }
                 assert_eq!(cache.get(good), None);
                 assert_eq!(cache.get(bad), None);
-                std::thread::scope(|scope| {
+                crate::util::thread_spawn::scope(|scope| {
                     let mut readers = Vec::new();
                     for _ in 0..8 {
                         readers.push(scope.spawn(|| {
@@ -3906,7 +3906,7 @@ mod vector_page_tests {
             .unwrap();
         let (ready_tx, ready_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let read = graph.file().mapped_navigation.read();
             scope.spawn(|| {
                 ready_tx.send(()).unwrap();
@@ -4041,7 +4041,7 @@ mod vector_page_tests {
             !graph.has_reverse_seed_for_test(),
             "first DML lookup must consume the scanned seed"
         );
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for (query, want) in vectors[..4].iter().zip(&expected) {
                 let graph = &graph;
                 scope.spawn(move || assert_eq!(graph.search(query, 10, 64).unwrap(), *want));
@@ -4996,7 +4996,7 @@ mod vector_page_tests {
         // searcher hammering the graph as it grows.
         let threads = 4usize;
         let per = n / threads;
-        std::thread::scope(|s| {
+        crate::util::thread_spawn::scope(|s| {
             for t in 0..threads {
                 let g = g.clone();
                 let vecs = vecs.clone();
@@ -5698,7 +5698,7 @@ mod vector_page_tests {
             .unwrap();
         let barrier = std::sync::Barrier::new(2);
         let claims = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for (id, level) in [(first, 1), (second, 2)] {
                 let barrier = &barrier;
                 let claims = &claims;

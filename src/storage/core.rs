@@ -1,4 +1,5 @@
 use crate::platform::file::{File, OpenOptions};
+use crate::util::thread_spawn as thread;
 use std::cell::RefCell;
 use std::cmp::Reverse;
 use std::collections::hash_map::DefaultHasher;
@@ -17,7 +18,6 @@ use std::sync::atomic::{
 use std::sync::{
     Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-use std::thread;
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
@@ -1127,7 +1127,7 @@ pub struct Database {
     heap_cache: parking_lot::RwLock<HeapCacheMap>,
     /// Weak per-storage fences cover only concurrent cold opens. Cache hits
     /// need no epoch lookup, and unrelated tables cannot invalidate an open.
-    storage_handle_open_epochs: Mutex<HashMap<u64, std::sync::Weak<StorageHandleOpenEpoch>>>,
+    storage_handle_open_epochs: Mutex<StorageHandleEpochRegistry>,
     index_cache: parking_lot::RwLock<IndexCacheMap>,
     /// Per-table overflow (LOB) file handles, opened lazily on first
     /// externalization. Mirrors `heap_cache` / `index_cache`.
@@ -3146,6 +3146,45 @@ struct PageKey {
     page_id: u64,
 }
 
+/// Synchronous probes borrow file ownership; only resident map entries and
+/// asynchronous I/O need to retain an owning key.
+#[derive(Clone, Copy)]
+struct PageKeyRef<'a> {
+    file: &'a Arc<BufferPageFileKey>,
+    page_id: u64,
+}
+
+impl PageKey {
+    fn borrowed(&self) -> PageKeyRef<'_> {
+        PageKeyRef {
+            file: &self.file,
+            page_id: self.page_id,
+        }
+    }
+}
+
+impl PageKeyRef<'_> {
+    fn into_owned(self) -> PageKey {
+        PageKey {
+            file: Arc::clone(self.file),
+            page_id: self.page_id,
+        }
+    }
+}
+
+impl hashbrown::Equivalent<PageKey> for PageKeyRef<'_> {
+    fn equivalent(&self, key: &PageKey) -> bool {
+        self.page_id == key.page_id && (Arc::ptr_eq(self.file, &key.file) || self.file == &key.file)
+    }
+}
+
+impl Hash for PageKeyRef<'_> {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.file.hash);
+        self.page_id.hash(state);
+    }
+}
+
 impl BufferPageFileKey {
     fn new(kind: BufferPageFileKind, path: PathBuf) -> Self {
         let mut hasher = DefaultHasher::new();
@@ -3173,8 +3212,7 @@ impl Hash for BufferPageFileKey {
 
 impl Hash for PageKey {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        state.write_u64(self.file.hash);
-        self.page_id.hash(state);
+        self.borrowed().hash(state);
     }
 }
 
@@ -3183,6 +3221,8 @@ struct Frame {
     key: PageKey,
     raw_memory_charge: Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
     bytes: RwLock<Vec<u8>>,
+    root_routing: parking_lot::Mutex<Option<Arc<RootRoutingCache>>>,
+    has_root_routing: AtomicBool,
     /// Number of logical SmallScan demands observed for this frame. Unlike a
     /// cache hit counter this starts at zero for Prefetch, so consuming a
     /// prefetched page during the first scan does not masquerade as reuse.
@@ -3264,6 +3304,16 @@ struct Frame {
     flushed_at_us: AtomicU64,
     flush_lock: Mutex<()>,
 }
+
+/// Atomically published residency hint. The weak owner never keeps page
+/// bytes alive, and its optional descriptor remains governed metadata.
+#[derive(Debug)]
+struct FrameHint {
+    frame: std::sync::Weak<Frame>,
+    _memory: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+type AtomicFrameHint = arc_swap::ArcSwapOption<FrameHint>;
 
 #[derive(Debug, Clone)]
 pub(crate) struct BufferPageDiagnostic {
@@ -4844,6 +4894,7 @@ mod zone_map_page;
 include!("core/heap.rs");
 include!("core/overflow.rs");
 include!("core/btree.rs");
+include!("core/root_routing.rs");
 include!("core/packed_index_leaf.rs");
 include!("core/vector_page_io.rs");
 include!("core/vector_page.rs");

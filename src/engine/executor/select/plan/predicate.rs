@@ -1865,11 +1865,26 @@ pub(super) fn fast_compare_typed_const(
             ));
         }
     }
-    if let (PredicateValue::F64(left), Some(right)) = (left, right.numeric) {
-        return Ok(Some(
-            left.partial_cmp(&right)
-                .unwrap_or(std::cmp::Ordering::Equal),
-        ));
+    if let Some(right_numeric) = right.numeric {
+        // Floating operands use the row evaluator's approximate domain while
+        // retaining typed lanes for exact numeric columns.
+        let approximate = matches!(right.value, Value::Float(_) | Value::Double(_));
+        let left_numeric = match left {
+            PredicateValue::F64(value) => Some(*value),
+            PredicateValue::I64(value) if approximate => Some(*value as f64),
+            PredicateValue::U64(value) if approximate => Some(*value as f64),
+            PredicateValue::Decimal(magnitude, scale) if approximate => {
+                Some(*magnitude as f64 / 10f64.powi(i32::from(*scale)))
+            }
+            _ => None,
+        };
+        if let Some(left_numeric) = left_numeric {
+            return Ok(Some(
+                left_numeric
+                    .partial_cmp(&right_numeric)
+                    .unwrap_or(std::cmp::Ordering::Equal),
+            ));
+        }
     }
     if let PredicateValue::Value(left) = left {
         return fast_compare_value_const(left, right);
@@ -1948,7 +1963,18 @@ pub(super) fn fast_const_for_column(
     {
         return None;
     }
-    if matches!(value, Value::DecimalWide(_)) && fast_const_decimal_parts(&value).is_none() {
+    let decimal_parts = fast_const_decimal_parts(&value);
+    if decimal_parts.is_none()
+        && matches!(
+            value,
+            Value::Decimal(_)
+                | Value::DecimalWide(_)
+                | Value::String(_)
+                | Value::SmallString(_)
+                | Value::Bytes(_)
+        )
+    {
+        // Keep wide exact operands and their diagnostic context in ExprProgram.
         return None;
     }
     Some(FastConst {
@@ -1958,15 +1984,9 @@ pub(super) fn fast_const_for_column(
             Value::Timestamp(micros) => Some(*micros),
             _ => None,
         },
-        decimal_parts: fast_const_decimal_parts(&value).or_else(|| match &value {
-            Value::Float(value) => {
-                crate::util::decimal::parse_exact_decimal_str(&value.to_string())
-            }
-            Value::Double(value) => {
-                crate::util::decimal::parse_exact_decimal_str(&value.to_string())
-            }
-            _ => None,
-        }),
+        // A floating operand must retain approximate comparison semantics.
+        // Its decimal display text is not an exact comparison constant.
+        decimal_parts,
         value,
     })
 }
@@ -1985,19 +2005,24 @@ pub(super) fn fast_compare_value_const(
     if let (Value::Timestamp(left), Some(right)) = (left, right.timestamp_micros) {
         return Ok(Some(left.cmp(&right)));
     }
-    let left_decimal = match left {
-        Value::Int(value) => Some((*value as i128, 0)),
-        Value::UInt(value) => Some((*value as i128, 0)),
-        Value::DecimalCompact(magnitude, scale) => Some((*magnitude as i128, *scale)),
-        _ => None,
-    };
-    if let (Some((left_magnitude, left_scale)), Some((right_magnitude, right_scale))) =
-        (left_decimal, right.decimal_parts)
-    {
-        if let Some(ordering) =
-            compare_decimal_parts(left_magnitude, left_scale, right_magnitude, right_scale)
-        {
-            return Ok(Some(ordering));
+    if let Some((right_magnitude, right_scale)) = right.decimal_parts {
+        if let Some((left_magnitude, left_scale)) = fast_const_decimal_parts(left) {
+            if let Some(ordering) =
+                compare_decimal_parts(left_magnitude, left_scale, right_magnitude, right_scale)
+            {
+                return Ok(Some(ordering));
+            }
+            return crate::engine::expr::compare_nullable_values(
+                left,
+                &Value::Decimal128(right_magnitude, right_scale),
+            );
+        }
+        if matches!(left, Value::Decimal(_) | Value::DecimalWide(_)) {
+            // Exact values outside i128 must not round through f64.
+            return crate::engine::expr::compare_nullable_values(
+                left,
+                &Value::Decimal128(right_magnitude, right_scale),
+            );
         }
     }
     if let (Some(l), Some(r)) = (value_to_f64_fast(left), right.numeric) {

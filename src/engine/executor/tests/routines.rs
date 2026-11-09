@@ -2,6 +2,527 @@ use super::support::execute_materialized as exec;
 use super::*;
 
 #[test]
+fn create_or_replace_procedure_replaces_signature_metadata_and_prepared_calls() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE PROCEDURE replace_p(IN x INT, OUT y INT)
+         DETERMINISTIC NO SQL SQL SECURITY INVOKER COMMENT 'old' SET y = x + 1",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "PREPARE replace_call FROM 'CALL replace_p(?, ?)'",
+    )
+    .unwrap();
+    exec(&engine, &mut session, "SET @input = 41").unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "EXECUTE replace_call USING @input, @output",
+    )
+    .unwrap();
+    assert_eq!(session.user_variable("output"), Some(&Value::Int(42)));
+    exec(&engine, &mut session, "SET sql_mode = 'PIPES_AS_CONCAT'").unwrap();
+    exec(&engine, &mut session,
+        "CREATE OR REPLACE PROCEDURE test.replace_p(IN text_value VARCHAR(20), INOUT result VARCHAR(30))
+         BEGIN SET result = text_value || '!'; END").unwrap();
+    exec(&engine, &mut session, "SET sql_mode = ''").unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "EXECUTE replace_call USING @input, @output",
+    )
+    .unwrap();
+    assert_eq!(
+        session.user_variable("output"),
+        Some(&Value::String("41!".into()))
+    );
+    let routine = engine
+        .db
+        .routine_definition(
+            "test",
+            crate::storage::RoutineKindSchema::Procedure,
+            "replace_p",
+        )
+        .unwrap();
+    assert_eq!(routine.schema_version, 2);
+    assert_eq!(routine.params[0].name, "text_value");
+    assert_eq!(routine.params[1].data_type_sql, "VARCHAR(30)");
+    assert_eq!(
+        routine.params[1].mode,
+        crate::storage::RoutineParamModeSchema::InOut
+    );
+    assert!(!routine.deterministic);
+    assert_eq!(routine.comment, "");
+    assert_eq!(
+        routine.security_type,
+        crate::storage::RoutineSecuritySchema::Definer
+    );
+    assert_eq!(
+        routine.sql_data_access,
+        crate::storage::RoutineSqlDataAccessSchema::ContainsSql
+    );
+    assert_eq!(routine.sql_mode, "PIPES_AS_CONCAT");
+    let QueryResponse::ResultSet(show) =
+        exec(&engine, &mut session, "SHOW CREATE PROCEDURE replace_p").unwrap()
+    else {
+        panic!()
+    };
+    assert!(show.rows[0].iter().any(|value| matches!(value, Value::String(sql) if sql.contains("text_value") && sql.contains("result"))));
+    exec(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE PROCEDURE replace_p(OUT result BIGINT) SET result = 99",
+    )
+    .unwrap();
+    let err = exec(&engine, &mut session, "CALL replace_p(41, @output)").unwrap_err();
+    assert_eq!(err.code(), 1318);
+    assert_eq!(
+        exec(
+            &engine,
+            &mut session,
+            "EXECUTE replace_call USING @input, @output"
+        )
+        .unwrap_err()
+        .code(),
+        1318
+    );
+    exec(&engine, &mut session, "CALL replace_p(@output)").unwrap();
+    assert_eq!(session.user_variable("output"), Some(&Value::Int(99)));
+}
+
+#[test]
+fn create_or_replace_function_refreshes_cached_queries_prepared_metadata_and_views() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE FUNCTION replace_f(x INT) RETURNS INT DETERMINISTIC NO SQL RETURN x + 1",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE FUNCTION replace_wrapper() RETURNS VARCHAR(30) RETURN replace_f(41)",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE PROCEDURE replace_wrapper(OUT result VARCHAR(30)) SET result = replace_f(41)",
+    )
+    .unwrap();
+    exec(&engine, &mut session, "CALL replace_wrapper(@wrapped)").unwrap();
+    assert_eq!(
+        session.user_variable("wrapped"),
+        Some(&Value::String("42".into()))
+    );
+    exec(&engine, &mut session, "SELECT replace_wrapper()").unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE VIEW replace_view AS SELECT replace_f(41) AS v",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE VIEW nested_replace_view AS SELECT * FROM replace_view",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "PREPARE replace_select FROM 'SELECT replace_f(41) AS v'",
+    )
+    .unwrap();
+    let QueryResponse::ResultSet(old) =
+        exec(&engine, &mut session, "SELECT replace_f(41) AS v").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(old.rows, vec![vec![Value::Int(42)]]);
+    exec(&engine, &mut session, "CREATE OR REPLACE FUNCTION test.replace_f(text_value VARCHAR(20)) RETURNS VARCHAR(30) SQL SECURITY INVOKER RETURN CONCAT(text_value, '!')").unwrap();
+    let QueryResponse::ResultSet(direct) =
+        exec(&engine, &mut session, "SELECT replace_f(41) AS v").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(direct.rows, vec![vec![Value::String("41!".into())]]);
+    assert_ne!(old.columns[0].column_type, direct.columns[0].column_type);
+    let QueryResponse::ResultSet(prepared) =
+        exec(&engine, &mut session, "EXECUTE replace_select").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(prepared, direct);
+    exec(&engine, &mut session, "CALL replace_wrapper(@wrapped)").unwrap();
+    assert_eq!(
+        session.user_variable("wrapped"),
+        Some(&Value::String("41!".into()))
+    );
+    let QueryResponse::ResultSet(wrapped) =
+        exec(&engine, &mut session, "SELECT replace_wrapper()").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(wrapped.rows, direct.rows);
+    for view in ["replace_view", "nested_replace_view"] {
+        let QueryResponse::ResultSet(result) =
+            exec(&engine, &mut session, &format!("SELECT * FROM {view}")).unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.rows, direct.rows);
+        assert_eq!(result.columns[0].column_type, direct.columns[0].column_type);
+    }
+    exec(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE FUNCTION replace_f(a INT, b INT) RETURNS INT RETURN a + b",
+    )
+    .unwrap();
+    assert_eq!(
+        exec(&engine, &mut session, "SELECT replace_f(41)")
+            .unwrap_err()
+            .code(),
+        1318
+    );
+    let QueryResponse::ResultSet(result) =
+        exec(&engine, &mut session, "SELECT replace_f(40, 2)").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int(42)]]);
+    for view in ["replace_view", "nested_replace_view"] {
+        assert!(exec(&engine, &mut session, &format!("SELECT * FROM {view}")).is_err());
+    }
+}
+
+#[test]
+fn create_or_replace_function_recompiles_unchanged_body_with_new_parameter_scope() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE replacement_scope (v INT)",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "INSERT INTO replacement_scope VALUES (42)",
+    )
+    .unwrap();
+    let body =
+        "BEGIN DECLARE result INT; SELECT v INTO result FROM replacement_scope; RETURN result; END";
+    for (params, expected) in [("v INT", 7), ("input INT", 42), ("v INT", 7)] {
+        exec(&engine, &mut session, &format!("CREATE OR REPLACE FUNCTION scope_replace({params}) RETURNS INT READS SQL DATA {body}")).unwrap();
+        let QueryResponse::ResultSet(result) =
+            exec(&engine, &mut session, "SELECT scope_replace(7)").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(expected)]]);
+    }
+}
+
+#[test]
+fn create_or_replace_routine_validation_failure_preserves_definition_and_grants() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE PROCEDURE preserved(OUT result INT) SET result = 42",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE FUNCTION preserved() RETURNS INT RETURN 42",
+    )
+    .unwrap();
+    let procedure = engine
+        .db
+        .routine_definition(
+            "test",
+            crate::storage::RoutineKindSchema::Procedure,
+            "preserved",
+        )
+        .unwrap();
+    let function = engine
+        .db
+        .routine_definition(
+            "test",
+            crate::storage::RoutineKindSchema::Function,
+            "preserved",
+        )
+        .unwrap();
+    let grants = engine.db.auth_catalog().grants.clone();
+    for invalid in [
+        "CREATE OR REPLACE PROCEDURE preserved(x INT, x INT) SET @result = 0",
+        "CREATE OR REPLACE PROCEDURE preserved() BEGIN LEAVE missing_label; END",
+        "CREATE OR REPLACE PROCEDURE preserved() BEGIN SET @result = ; END",
+        "CREATE OR REPLACE PROCEDURE IF NOT EXISTS preserved() SET @result = 0",
+        "CREATE OR REPLACE FUNCTION preserved() RETURNS INT SELECT 0",
+        "CREATE OR REPLACE FUNCTION preserved() RETURNS INT BEGIN SELECT 0; RETURN 0; END",
+        "CREATE OR REPLACE FUNCTION IF NOT EXISTS preserved() RETURNS INT RETURN 0",
+    ] {
+        assert!(exec(&engine, &mut session, invalid).is_err(), "{invalid}");
+        assert!(Arc::ptr_eq(
+            &engine
+                .db
+                .routine_definition(
+                    "test",
+                    crate::storage::RoutineKindSchema::Procedure,
+                    "preserved"
+                )
+                .unwrap(),
+            &procedure
+        ));
+        assert!(Arc::ptr_eq(
+            &engine
+                .db
+                .routine_definition(
+                    "test",
+                    crate::storage::RoutineKindSchema::Function,
+                    "preserved"
+                )
+                .unwrap(),
+            &function
+        ));
+        assert!(engine.db.auth_catalog().grants.iter().eq(grants.iter()));
+        exec(&engine, &mut session, "CALL preserved(@result)").unwrap();
+        assert_eq!(session.user_variable("result"), Some(&Value::Int(42)));
+        let QueryResponse::ResultSet(result) =
+            exec(&engine, &mut session, "SELECT preserved()").unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(42)]]);
+    }
+    exec(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE PROCEDURE preserved(OUT result INT) SET result = 7",
+    )
+    .unwrap();
+    assert!(Arc::ptr_eq(
+        &engine
+            .db
+            .routine_definition(
+                "test",
+                crate::storage::RoutineKindSchema::Function,
+                "preserved"
+            )
+            .unwrap(),
+        &function
+    ));
+    exec(
+        &engine,
+        &mut session,
+        "CREATE OR REPLACE FUNCTION preserved() RETURNS INT RETURN 8",
+    )
+    .unwrap();
+    assert!(engine.db.auth_catalog().grants.iter().eq(grants.iter()));
+}
+
+#[test]
+fn create_or_replace_routines_require_create_and_existing_routine_alter_privileges() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    exec(
+        &engine,
+        &mut root,
+        "CREATE USER 'replacer'@'%' IDENTIFIED BY 'pw'",
+    )
+    .unwrap();
+    let mut user = SessionContext::default();
+    user.user = "replacer".into();
+    user.login_user = "replacer".into();
+    user.authenticated_as = crate::engine::auth::AccountKey::new("replacer", "%");
+    for (kind, definition) in [
+        ("PROCEDURE", "replace_auth() SET @auth_result = 7"),
+        ("FUNCTION", "replace_auth() RETURNS INT RETURN 7"),
+    ] {
+        let sql = format!("CREATE OR REPLACE {kind} {definition}");
+        assert!(exec(&engine, &mut user, &sql).is_err());
+        exec(&engine, &mut root, &format!("CREATE {kind} {definition}")).unwrap();
+    }
+    exec(
+        &engine,
+        &mut root,
+        "GRANT CREATE ROUTINE ON test.* TO 'replacer'@'%'",
+    )
+    .unwrap();
+    for (kind, definition) in [
+        ("PROCEDURE", "replace_auth() SET @auth_result = 42"),
+        ("FUNCTION", "replace_auth() RETURNS INT RETURN 42"),
+    ] {
+        let sql = format!("CREATE OR REPLACE {kind} {definition}");
+        let denied = exec(&engine, &mut user, &sql).unwrap_err();
+        assert_eq!(denied.code(), 1370);
+        assert_eq!(
+            denied.message(),
+            "alter routine command denied to user 'replacer'@'%' for routine 'test.replace_auth'"
+        );
+        exec(
+            &engine,
+            &mut root,
+            &format!("GRANT ALTER ROUTINE, EXECUTE ON {kind} test.replace_auth TO 'replacer'@'%'"),
+        )
+        .unwrap();
+        let grants = engine.db.auth_catalog().grants.clone();
+        exec(&engine, &mut user, &sql).unwrap();
+        assert!(engine.db.auth_catalog().grants.iter().eq(grants.iter()));
+        let routine = engine
+            .db
+            .routine_definition(
+                "test",
+                if kind == "PROCEDURE" {
+                    crate::storage::RoutineKindSchema::Procedure
+                } else {
+                    crate::storage::RoutineKindSchema::Function
+                },
+                "replace_auth",
+            )
+            .unwrap();
+        assert_eq!(routine.definer_user, "replacer");
+        assert_eq!(
+            exec(
+                &engine,
+                &mut user,
+                &format!("CREATE OR REPLACE DEFINER='root'@'localhost' {kind} {definition}")
+            )
+            .unwrap_err()
+            .code(),
+            1227
+        );
+    }
+    exec(&engine, &mut user, "CALL replace_auth()").unwrap();
+    assert_eq!(user.user_variable("auth_result"), Some(&Value::Int(42)));
+    let QueryResponse::ResultSet(result) =
+        exec(&engine, &mut user, "SELECT replace_auth()").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int(42)]]);
+    exec(
+        &engine,
+        &mut user,
+        "CREATE OR REPLACE PROCEDURE new_auth() SET @auth_result = 1",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut user,
+        "CREATE OR REPLACE FUNCTION new_auth() RETURNS INT RETURN 1",
+    )
+    .unwrap();
+    exec(
+        &engine,
+        &mut root,
+        "REVOKE CREATE ROUTINE ON test.* FROM 'replacer'@'%'",
+    )
+    .unwrap();
+    assert!(exec(
+        &engine,
+        &mut user,
+        "CREATE OR REPLACE PROCEDURE replace_auth() SET @auth_result = 0"
+    )
+    .is_err());
+    assert!(exec(
+        &engine,
+        &mut user,
+        "CREATE OR REPLACE FUNCTION replace_auth() RETURNS INT RETURN 0"
+    )
+    .is_err());
+}
+
+#[test]
+fn create_or_replace_routines_survive_reopen_and_keep_other_databases() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    {
+        let engine = open_strict_test_engine(dir.path());
+        let mut session = SessionContext::default();
+        exec(&engine, &mut session, "CREATE DATABASE replace_other").unwrap();
+        for database in ["test", "replace_other"] {
+            exec(
+                &engine,
+                &mut session,
+                &format!("CREATE PROCEDURE {database}.durable_replace(OUT v INT) SET v = 1"),
+            )
+            .unwrap();
+            exec(
+                &engine,
+                &mut session,
+                &format!("CREATE FUNCTION {database}.durable_replace() RETURNS INT RETURN 1"),
+            )
+            .unwrap();
+        }
+        exec(&engine, &mut session, "CREATE OR REPLACE PROCEDURE test.durable_replace(OUT text_value VARCHAR(20)) SET text_value = 'durable'").unwrap();
+        exec(&engine, &mut session, "CREATE OR REPLACE FUNCTION test.durable_replace() RETURNS VARCHAR(20) RETURN 'durable'").unwrap();
+    }
+    let engine = open_strict_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(&engine, &mut session, "CALL test.durable_replace(@v)").unwrap();
+    assert_eq!(
+        session.user_variable("v"),
+        Some(&Value::String("durable".into()))
+    );
+    exec(
+        &engine,
+        &mut session,
+        "CALL replace_other.durable_replace(@v)",
+    )
+    .unwrap();
+    assert_eq!(session.user_variable("v"), Some(&Value::Int(1)));
+    let QueryResponse::ResultSet(result) = exec(
+        &engine,
+        &mut session,
+        "SELECT test.durable_replace(), replace_other.durable_replace()",
+    )
+    .unwrap() else {
+        panic!()
+    };
+    assert_eq!(
+        result.rows,
+        vec![vec![Value::String("durable".into()), Value::Int(1)]]
+    );
+    for kind in [
+        crate::storage::RoutineKindSchema::Procedure,
+        crate::storage::RoutineKindSchema::Function,
+    ] {
+        assert_eq!(
+            engine
+                .db
+                .routine_definition("test", kind, "durable_replace")
+                .unwrap()
+                .schema_version,
+            2
+        );
+    }
+}
+
+#[test]
 fn call_procedure_writes_out_parameter_and_returns_result_sets() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -2867,6 +3388,13 @@ fn audit_sys_builtin_names_are_already_existing_routines() {
     ] {
         let sql = format!("CREATE {kind} sys.{name}() {body}");
         assert_eq!(exec(&engine, &mut session, &sql).unwrap_err().code(), 1304);
+        let replace_sql = format!("CREATE OR REPLACE {kind} sys.{name}() {body}");
+        assert_eq!(
+            exec(&engine, &mut session, &replace_sql)
+                .unwrap_err()
+                .code(),
+            1304
+        );
         exec(
             &engine,
             &mut session,

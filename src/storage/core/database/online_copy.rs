@@ -1563,7 +1563,7 @@ mod online_copy_log_tests {
         let capture = AlterCopyCapture::new(dir.path());
         let finished = AtomicUsize::new(0);
         let mut found = BTreeSet::new();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for writer in 0..4u64 {
                 let capture = &capture;
                 let finished = &finished;
@@ -1616,7 +1616,7 @@ mod online_copy_log_tests {
                     let shared = Mutex::new(AlterCopyChangeLog::new(dir.path()));
                     let capture = AlterCopyCapture::new(dir.path());
                     let start = Instant::now();
-                    std::thread::scope(|scope| {
+                    crate::util::thread_spawn::scope(|scope| {
                         for writer in 0..writers {
                             let shared = &shared;
                             let capture = &capture;

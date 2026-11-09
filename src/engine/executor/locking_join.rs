@@ -355,9 +355,8 @@ pub(super) fn execute(
     let mut skipped = HashSet::new();
     loop {
         crate::engine::cancel::check_cancelled()?;
-        let (mut current, _snapshot) = db.session_statement_view_with_guard(
-            txn.txn_id, txn.isolation, None, false,
-        );
+        let (mut current, _snapshot) =
+            db.session_statement_view_with_guard(txn.txn_id, txn.isolation, None, false);
         current.snapshot_scn = u64::MAX;
         let mut query = stmt.clone();
         query.for_update = false;

@@ -57,17 +57,35 @@ impl PolicySnapshot {
         }
     }
 }
-pub(crate) struct PolicySnapshotScope(Option<PolicySnapshot>);
+pub(crate) struct PolicySnapshotScope {
+    previous: Option<PolicySnapshot>,
+    installed: bool,
+}
 impl PolicySnapshotScope {
     pub(crate) fn enter(snapshot: &PolicySnapshot) -> Self {
-        Self(STATEMENT_POLICY.with(|slot| slot.borrow_mut().replace(snapshot.clone())))
+        STATEMENT_POLICY.with(|slot| {
+            let mut current = slot.borrow_mut();
+            if current.as_ref() == Some(snapshot) {
+                return Self {
+                    previous: None,
+                    installed: false,
+                };
+            }
+            Self {
+                previous: current.replace(snapshot.clone()),
+                installed: true,
+            }
+        })
     }
 }
 impl Drop for PolicySnapshotScope {
     fn drop(&mut self) {
-        STATEMENT_POLICY.with(|slot| *slot.borrow_mut() = self.0.take());
+        if self.installed {
+            STATEMENT_POLICY.with(|slot| *slot.borrow_mut() = self.previous.take());
+        }
     }
 }
+
 pub(crate) fn invalidate_authorization_cache() {
     AUTHORIZATION_GENERATION.fetch_add(1, Ordering::Release);
 }
@@ -4510,4 +4528,28 @@ fn malformed_hex_credentials_are_rejected_without_panicking() {
         &[0; 32],
         &[0; 20],
     ));
+}
+
+#[cfg(test)]
+mod policy_snapshot_scope_tests {
+    use super::*;
+
+    #[test]
+    fn equal_and_changed_nested_policies_restore_after_unwind() {
+        let base = PolicySnapshot::capture();
+        let mut changed = base.clone();
+        changed.partial_revokes = !base.partial_revokes;
+        let _outer = PolicySnapshotScope::enter(&base);
+        {
+            let _same = PolicySnapshotScope::enter(&base);
+            let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _changed = PolicySnapshotScope::enter(&changed);
+                assert_eq!(PolicySnapshot::capture(), changed);
+                panic!("restore policy settings");
+            }));
+            assert!(failure.is_err());
+            assert_eq!(PolicySnapshot::capture(), base);
+        }
+        assert_eq!(PolicySnapshot::capture(), base);
+    }
 }

@@ -388,7 +388,7 @@ pub(crate) fn validate_manifest(manifest: &BackupManifest) -> Result<(), QueryEr
     Ok(())
 }
 
-fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
+pub(crate) fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
     let path = Path::new(relative);
     if relative.split('/').count() > 64
         || relative.is_empty()
@@ -691,4 +691,74 @@ pub(crate) fn cleanup_abandoned_staging(source: &Path) -> Result<(), QueryError>
             .map_err(|err| io_err("remove native staging registration", err))?;
     }
     sync_dir(&registry)
+}
+
+#[cfg(test)]
+mod restore_path_tests {
+    use super::*;
+
+    #[test]
+    fn persistent_restore_set_preserves_boundaries_and_diagnostics() {
+        for prefix in [
+            "schemas/",
+            "objects/",
+            "system/catalog/",
+            "system/undo/",
+            "system/object-owners/",
+            "system/xa-binlog/",
+            "system/wal/",
+        ] {
+            validate_restore_path(&format!("{prefix}汉🙂.bin")).unwrap();
+        }
+        for file in [
+            "commit-ledger.v1",
+            "commit-clock.v1",
+            "storage.control",
+            "history-index.v1",
+            "tablespaces.json",
+            "zone-map-checkpoint.manifest",
+            "vector-purges.v1",
+            "vector-maintenance.jobs",
+        ] {
+            validate_restore_path(&format!("system/{file}")).unwrap();
+        }
+        let path64 = format!("schemas/{}", vec!["x"; 63].join("/"));
+        validate_restore_path(&path64).unwrap();
+        let path4096 = format!("objects/{}", "x".repeat(4088));
+        validate_restore_path(&path4096).unwrap();
+        for path in [
+            "",
+            "/schemas/a",
+            "schemas//a",
+            "schemas/./a",
+            "schemas/../a",
+            "schemas/a/",
+            "objects/a\\b",
+            "objects/C:a",
+            "objects/a\0b",
+            &format!("{path64}/x"),
+            &format!("{path4096}x"),
+        ] {
+            let error = validate_restore_path(path).unwrap_err();
+            assert!(error.is(crate::error::catalog::MYDB_ER_BACKUP_FAILED));
+            assert_eq!(error.message(), format!("unsafe backup path '{path}'"));
+        }
+        for path in [
+            "schemas",
+            "objects",
+            "system",
+            "system/wal",
+            "schemas-other/a",
+            "system/storage.control/extra",
+            "system/logs/log",
+            "other/a",
+        ] {
+            let error = validate_restore_path(path).unwrap_err();
+            assert!(error.is(crate::error::catalog::MYDB_ER_BACKUP_FAILED));
+            assert_eq!(
+                error.message(),
+                format!("backup path '{path}' is outside the persistent restore set")
+            );
+        }
+    }
 }

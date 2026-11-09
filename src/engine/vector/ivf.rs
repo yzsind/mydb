@@ -229,7 +229,7 @@ fn kmeans_assign_threads(n: usize, k: usize, dim: usize) -> usize {
     if n < 4096 || k * dim < 4096 {
         return 1;
     }
-    std::thread::available_parallelism()
+    crate::util::thread_spawn::available_parallelism()
         .map(|c| c.get())
         .unwrap_or(1)
         .clamp(1, 16)
@@ -250,7 +250,7 @@ fn kmeans_assign_parallel<V: AsRef<[f32]> + Sync>(
 ) -> bool {
     let n = samples.len();
     let chunk = n.div_ceil(threads).max(1);
-    let any_changed = std::thread::scope(|scope| {
+    let any_changed = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::new();
         let mut base = 0usize;
         for slice in assign.chunks_mut(chunk) {

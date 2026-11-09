@@ -1085,7 +1085,7 @@ impl WalWriter {
         let worker_wake = Arc::clone(&wake);
         let weak = Arc::downgrade(&log);
         let worker_log = Arc::clone(&log);
-        let handle = std::thread::Builder::new()
+        let handle = crate::util::thread_spawn::Builder::new()
             .name("mydb-wal-write".into())
             .spawn(move || {
                 let _ = worker_wake.thread.set(std::thread::current());
@@ -8938,7 +8938,7 @@ mod tests {
             .map(|_| {
                 let log = Arc::clone(&log);
                 let ready = Arc::clone(&ready);
-                std::thread::spawn(move || {
+                crate::util::thread_spawn::spawn(move || {
                     ready.wait();
                     LogManager::sync_durable_to(&log, lsn)
                 })
@@ -8969,7 +8969,7 @@ mod tests {
         let (started_tx, started_rx) = std::sync::mpsc::channel();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker_log = Arc::clone(&log);
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             started_tx.send(()).unwrap();
             let result = LogManager::sync_durable_high_water_to(&worker_log, first);
             done_tx.send(result).unwrap();
@@ -9011,7 +9011,7 @@ mod tests {
         let held = gate.lock();
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker_log = Arc::clone(&log);
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             done_tx
                 .send(LogManager::sync_durable_high_water_to(&worker_log, lsn))
                 .unwrap();
@@ -9653,7 +9653,7 @@ mod tests {
         let (entered, entered_rx) = std::sync::mpsc::channel();
         let (finished, finished_rx) = std::sync::mpsc::channel();
         let drainer_log = Arc::clone(&log);
-        let drainer = std::thread::spawn(move || {
+        let drainer = crate::util::thread_spawn::spawn(move || {
             let mut guard = drainer_log.lock();
             entered.send(()).unwrap();
             let result = guard.flush_pending_writes();

@@ -15667,6 +15667,14 @@ fn index_in_lookup_preserves_comparison(
             PlanConstraintValue::Statement(_) => false,
         });
     }
+    if matches!(target, crate::storage::ParamTarget::Decimal { .. }) {
+        // Approximate comparison can equate adjacent exact decimals. A
+        // rounded point or endpoint then omits qualifying rows, even with a
+        // residual filter. Use a scan unless the operand's domain is exact.
+        return values
+            .iter()
+            .all(|value| index_bounds::exact_decimal_comparison(value) == Some(true));
+    }
     let character_target = matches!(
         target,
         crate::storage::ParamTarget::CharString
@@ -15679,11 +15687,10 @@ fn index_in_lookup_preserves_comparison(
             target,
             crate::storage::ParamTarget::Float32
                 | crate::storage::ParamTarget::Float64
-                | crate::storage::ParamTarget::Decimal { .. }
                 | crate::storage::ParamTarget::Year
         ) {
             // Text comparisons use the evaluator's numeric domain, which can
-            // differ from a rounded FLOAT/DECIMAL/YEAR storage bound.
+            // differ from a rounded FLOAT/YEAR storage bound.
             return values.iter().all(|value| match value {
                 PlanConstraintValue::Concrete(value) => !matches!(
                     value,
@@ -17510,6 +17517,7 @@ pub(crate) fn choose_join_with_hints(
                 candidate_condition.as_ref(),
                 residual.as_ref(),
                 right_covering,
+                right.output_width(),
             );
             let right_filter = extract_scan_filter(&right);
             let full_condition = match (candidate_condition, right_filter) {
@@ -21067,30 +21075,10 @@ pub(crate) fn expr_to_explain_string(expr: &Expr) -> String {
         Expr::BoundValue(value) => value_to_string(value),
         Expr::Binary { left, op, right } => {
             let op_str = match op {
-                BinaryOp::Eq => "=",
-                BinaryOp::NullSafeEq => "<=>",
-                BinaryOp::NotEq => "<>",
-                BinaryOp::Lt => "<",
-                BinaryOp::LtEq => "<=",
-                BinaryOp::Gt => ">",
-                BinaryOp::GtEq => ">=",
-                BinaryOp::Add => "+",
-                BinaryOp::Sub => "-",
-                BinaryOp::Mul => "*",
-                BinaryOp::Div => "/",
-                BinaryOp::IntDiv => "DIV",
-                BinaryOp::Mod => "%",
-                BinaryOp::BitAnd => "&",
-                BinaryOp::BitOr => "|",
-                BinaryOp::BitXor => "^",
-                BinaryOp::ShiftLeft => "<<",
-                BinaryOp::ShiftRight => ">>",
                 BinaryOp::And => " AND ",
                 BinaryOp::Or => " OR ",
                 BinaryOp::Xor => " XOR ",
-                BinaryOp::Arrow => "->",
-                BinaryOp::LongArrow => "->>",
-                BinaryOp::Concat => "||",
+                _ => crate::parser::binary_op_sql_pub(*op),
             };
             format!(
                 "{}{}{}",
@@ -24506,7 +24494,7 @@ fn propagate_equivalence_constraints(db: &Database, select: &mut Select) {
         .chain(select.joins.iter().map(|j| &j.table))
         .filter_map(|t| db.table(&t.name).ok().map(|schema| (t.clone(), schema)))
         .collect();
-    let domain = |key: &EqColumnKey| {
+    let column = |key: &EqColumnKey| {
         let mut matches = sources
             .iter()
             .filter(|(t, _)| {
@@ -24519,6 +24507,10 @@ fn propagate_equivalence_constraints(db: &Database, select: &mut Select) {
         if matches.next().is_some() {
             return None;
         }
+        Some(c)
+    };
+    let domain = |key: &EqColumnKey| {
+        let c = column(key)?;
         Some(crate::storage::ParamTarget::for_column_with_collation(
             &c.data_type,
             c.unsigned,
@@ -24614,6 +24606,55 @@ fn propagate_equivalence_constraints(db: &Database, select: &mut Select) {
         }
     }
 
+    // A range on an equijoin key restricts every key in the same comparison
+    // domain. Expose it before access-path enumeration so a selective range
+    // can drive either input. Keep null-extending joins outside this rewrite;
+    // their ON and WHERE predicates do not share one filtering scope.
+    if !adj.is_empty()
+        && select.derived.is_none()
+        && select.joins.iter().all(|join| {
+            join.derived.is_none() && matches!(join.join_type, JoinType::Inner | JoinType::Cross)
+        })
+        && select
+            .from
+            .iter()
+            .chain(select.joins.iter().map(|join| &join.table))
+            .all(|table| {
+                // These sources have their own schema or sampling boundary; the
+                // current base-table catalog cannot prove their comparison domain.
+                table.generate_series.is_none()
+                    && table.system_time.is_none()
+                    && table.sample.is_none()
+                    && !crate::engine::executor::cte::has_cte(&table.name)
+            })
+    {
+        let ordered = |key: &EqColumnKey, bound: &Expr| {
+            column(key).is_some_and(|column| match column.data_type {
+                crate::storage::schema::DataTypeKind::Enum { .. }
+                | crate::storage::schema::DataTypeKind::Set { .. }
+                | crate::storage::schema::DataTypeKind::Json
+                | crate::storage::schema::DataTypeKind::Geometry { .. }
+                | crate::storage::schema::DataTypeKind::Vector { .. } => false,
+                crate::storage::schema::DataTypeKind::Char { .. }
+                | crate::storage::schema::DataTypeKind::VarChar { .. }
+                | crate::storage::schema::DataTypeKind::Text { .. } => {
+                    // Collation equality need not imply numeric or binary
+                    // equality (for example full-width digits). Only ordinary
+                    // text bounds retain the columns' comparison collation.
+                    // Unbound parameters and explicit COLLATE/charset casts
+                    // keep their original predicate until their domain is known.
+                    matches!(
+                        bound,
+                        Expr::Literal(crate::parser::Literal::String(_))
+                            | Expr::BoundValue(Value::String(_))
+                    )
+                }
+                _ => true,
+            })
+        };
+        propagate_equivalence_ranges(&adj, &join_conjunct_storage, &mut where_conjuncts, ordered);
+    }
+
     // ---- Transitive `col = col` closure synthesis ----
     //
     // For any equivalence class {c1, c2, ..., ck} formed by `col = col`
@@ -24627,6 +24668,73 @@ fn propagate_equivalence_constraints(db: &Database, select: &mut Select) {
     synthesize_transitive_equalities(&adj, &existing_eq_pairs, &mut where_conjuncts);
 
     select.selection = combine_conjuncts(where_conjuncts);
+}
+
+/// Propagate only stable scalar bounds through equal, ordered column domains.
+/// The caller excludes outer joins and the adjacency map already excludes
+/// ambiguous names and mismatched comparison domains.
+fn propagate_equivalence_ranges(
+    adj: &HashMap<EqColumnKey, Vec<EqColumnKey>>,
+    join_conjuncts: &[Vec<Expr>],
+    predicates: &mut Vec<Expr>,
+    ordered: impl Fn(&EqColumnKey, &Expr) -> bool,
+) {
+    let mut bounds = Vec::new();
+    let mut add_bound = |column: &Expr, op: BinaryOp, bound: &Expr| {
+        if let Some(key) = equivalence_column_key(column) {
+            if ordered(&key, bound) && expr_to_plan_constraint(bound).is_some() {
+                bounds.push((key, op, bound.clone()));
+            }
+        }
+    };
+    for predicate in predicates.iter().chain(join_conjuncts.iter().flatten()) {
+        match predicate {
+            Expr::Binary { left, op, right }
+                if matches!(
+                    op,
+                    BinaryOp::Lt | BinaryOp::LtEq | BinaryOp::Gt | BinaryOp::GtEq
+                ) =>
+            {
+                add_bound(left, *op, right);
+                add_bound(right, crate::engine::expr::flip_cmp(*op), left);
+            }
+            Expr::Between {
+                expr,
+                low,
+                high,
+                negated: false,
+            } => {
+                add_bound(expr, BinaryOp::GtEq, low);
+                add_bound(expr, BinaryOp::LtEq, high);
+            }
+            _ => {}
+        }
+    }
+    for (root, op, bound) in bounds {
+        let mut visited = HashSet::new();
+        let mut stack = adj.get(&root).cloned().unwrap_or_default();
+        visited.insert(root);
+        while let Some(key) = stack.pop() {
+            if !visited.insert(key.clone()) || !ordered(&key, &bound) {
+                continue;
+            }
+            let predicate = Expr::Binary {
+                left: Box::new(equivalence_column_to_expr(&key)),
+                op,
+                right: Box::new(bound.clone()),
+            };
+            if !predicates
+                .iter()
+                .chain(join_conjuncts.iter().flatten())
+                .any(|existing| expr_semantically_eq(existing, &predicate))
+            {
+                predicates.push(predicate);
+            }
+            if let Some(neighbors) = adj.get(&key) {
+                stack.extend(neighbors.iter().cloned());
+            }
+        }
+    }
 }
 
 fn synthesize_transitive_equalities(
@@ -26731,3 +26839,7 @@ mod audit_arithmetic_tests {
         assert_eq!(series_row_count(&descending), 2.0);
     }
 }
+
+#[cfg(test)]
+#[path = "planner/operator_display_tests.rs"]
+mod operator_display_tests;

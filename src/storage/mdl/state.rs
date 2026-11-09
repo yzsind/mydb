@@ -340,7 +340,7 @@ mod tests {
         let held = manager.state.lock_key(&first);
         let (send, receive) = std::sync::mpsc::channel();
         let worker = Arc::clone(&manager);
-        let thread = std::thread::spawn(move || {
+        let thread = crate::util::thread_spawn::spawn(move || {
             send.send(worker.acquire_many(
                 2,
                 Some(2),
@@ -383,8 +383,9 @@ mod tests {
             .unwrap();
         let held = manager.state.lock_key(&second);
         let releasing = Arc::clone(&manager);
-        let release =
-            std::thread::spawn(move || releasing.release_duration(1, MdlDuration::Transaction));
+        let release = crate::util::thread_spawn::spawn(move || {
+            releasing.release_duration(1, MdlDuration::Transaction)
+        });
         // Wait until release has reached the first shard. The old path keeps
         // it locked while waiting for the second; the streaming path has
         // already removed its ticket before waiting for the second.
@@ -403,7 +404,7 @@ mod tests {
         }
         let acquiring = Arc::clone(&manager);
         let (send, receive) = std::sync::mpsc::channel();
-        let acquire = std::thread::spawn(move || {
+        let acquire = crate::util::thread_spawn::spawn(move || {
             send.send(acquiring.acquire_cached(
                 2,
                 Some(2),

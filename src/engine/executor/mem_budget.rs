@@ -2202,15 +2202,24 @@ thread_local! {
 /// thread-local and must be entered and dropped within one Future::poll.
 /// It deliberately does not install a query budget or hide a SQL-owned one.
 pub struct ReclaimDatabaseScope {
-    previous: Option<Weak<crate::storage::Database>>,
+    previous: Option<Option<Weak<crate::storage::Database>>>,
     _not_send: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 impl ReclaimDatabaseScope {
     pub(crate) fn enter(database: &Arc<crate::storage::Database>) -> Self {
         Self {
-            previous: CURRENT_RECLAIM_DATABASE
-                .with(|current| current.replace(Some(Arc::downgrade(database)))),
+            previous: CURRENT_RECLAIM_DATABASE.with(|current| {
+                if current
+                    .borrow()
+                    .as_ref()
+                    .is_some_and(|owner| std::ptr::eq(owner.as_ptr(), Arc::as_ptr(database)))
+                {
+                    None
+                } else {
+                    Some(current.replace(Some(Arc::downgrade(database))))
+                }
+            }),
             _not_send: std::marker::PhantomData,
         }
     }
@@ -2218,7 +2227,9 @@ impl ReclaimDatabaseScope {
 
 impl Drop for ReclaimDatabaseScope {
     fn drop(&mut self) {
-        CURRENT_RECLAIM_DATABASE.with(|current| *current.borrow_mut() = self.previous.take());
+        if let Some(previous) = self.previous.take() {
+            CURRENT_RECLAIM_DATABASE.with(|current| *current.borrow_mut() = previous);
+        }
     }
 }
 
@@ -2735,7 +2746,7 @@ mod tests {
         let admission = RECLAIM_ADMISSION.get_or_init(|| Mutex::new(()));
         let held = admission.lock().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             let result = record_process_charge_with_reclaim(usize::MAX, false);
             let budget = MemBudget::process_tracked_for_test(1024);
             assert!(budget.try_charge_spill_buffer(usize::MAX).is_err());
@@ -2856,7 +2867,7 @@ mod tests {
         let writers = CATEGORY_ACTIVITY_SHARDS + 8;
         let barrier = std::sync::Barrier::new(writers);
         let category = ControlledMemoryCategory::PerformanceSchema;
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..writers {
                 let barrier = &barrier;
                 scope.spawn(move || {
@@ -2901,9 +2912,11 @@ mod tests {
         // Allocation and release can belong to different workers. The
         // releasing thread has never recorded statistics before its exit.
         record_category_alloc(ControlledMemoryCategory::PerformanceSchema, 16, 16);
-        std::thread::spawn(|| RELEASE.with(|slot| *slot.borrow_mut() = Some(ReleaseOnExit)))
-            .join()
-            .unwrap();
+        crate::util::thread_spawn::spawn(|| {
+            RELEASE.with(|slot| *slot.borrow_mut() = Some(ReleaseOnExit))
+        })
+        .join()
+        .unwrap();
         let snapshot = pfs_memory_category_snapshots()
             [category_slot(ControlledMemoryCategory::PerformanceSchema)];
         assert_eq!(snapshot.alloc_count, 1);
@@ -2944,13 +2957,45 @@ mod tests {
         };
         assert!(current_reclaim_database().is_none());
         let expected = Arc::clone(&database);
-        std::thread::spawn(move || {
+        crate::util::thread_spawn::spawn(move || {
             with_query_budget(budget, || {
                 assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &expected));
             })
         })
         .join()
         .unwrap();
+        assert!(current_reclaim_database().is_none());
+    }
+
+    #[test]
+    fn nested_reclaim_scopes_reuse_owner_and_restore_different_databases() {
+        let a_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let b_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let a = Arc::new(crate::storage::Database::open(a_dir.path()).unwrap());
+        let b = Arc::new(crate::storage::Database::open(b_dir.path()).unwrap());
+        assert!(current_reclaim_database().is_none());
+        {
+            let _outer = ReclaimDatabaseScope::enter(&a);
+            let owners = Arc::weak_count(&a);
+            {
+                let _same = ReclaimDatabaseScope::enter(&a);
+                assert_eq!(Arc::weak_count(&a), owners);
+                assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &a));
+                {
+                    let _other = ReclaimDatabaseScope::enter(&b);
+                    assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &b));
+                    let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        let _nested_a = ReclaimDatabaseScope::enter(&a);
+                        assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &a));
+                        panic!("database scope unwind");
+                    }));
+                    assert!(error.is_err());
+                    assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &b));
+                }
+                assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &a));
+            }
+            assert_eq!(Arc::weak_count(&a), owners);
+        }
         assert!(current_reclaim_database().is_none());
     }
 
@@ -3097,7 +3142,7 @@ mod tests {
         for _ in 0..8 {
             let admitted = Arc::clone(&admitted);
             let release = Arc::clone(&release);
-            workers.push(std::thread::spawn(move || {
+            workers.push(crate::util::thread_spawn::spawn(move || {
                 let charge = ControlledMemoryCharge::try_new(
                     ControlledMemoryCategory::DerivedCache,
                     384 * 1024,
@@ -3144,7 +3189,9 @@ mod tests {
         assert_eq!(owner.bytes() + worker.bytes(), limit);
         drop(owner);
         assert_eq!(controlled_memory_snapshot().0, worker.bytes());
-        std::thread::spawn(move || drop(worker)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(worker))
+            .join()
+            .unwrap();
         assert_eq!(controlled_memory_snapshot().0, 0);
         MEMORY_TARGET_BYTES.store(prior_target, Ordering::Release);
         EFFECTIVE_MEMORY_LIMIT_BYTES.store(prior_effective, Ordering::Release);
@@ -3165,7 +3212,7 @@ mod tests {
         .unwrap();
         let admission = RECLAIM_ADMISSION.get_or_init(|| Mutex::new(()));
         let held = admission.lock().unwrap();
-        let worker = std::thread::spawn(|| {
+        let worker = crate::util::thread_spawn::spawn(|| {
             ControlledMemoryCharge::try_new(ControlledMemoryCategory::Executor, 64 * 1024)
         });
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3603,7 +3650,7 @@ mod tests {
     fn concurrent_release_is_saturating() {
         let budget = Arc::new(MemBudget::new(4096));
         budget.charge(1024).unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..8 {
                 let budget = Arc::clone(&budget);
                 scope.spawn(move || budget.release(1024));
@@ -3704,7 +3751,7 @@ mod tests {
     fn terminal_oom_is_shared_across_query_workers() {
         let budget = Arc::new(MemBudget::new(1024));
         let published = Arc::new(std::sync::Barrier::new(2));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let failing_budget = Arc::clone(&budget);
             let failing_barrier = Arc::clone(&published);
             let failing = scope.spawn(move || {

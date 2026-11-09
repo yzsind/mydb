@@ -160,6 +160,61 @@ fn tablesample_prepared_parameters_and_invalid_arguments() {
 }
 
 #[test]
+fn tablesample_cached_nested_bindings_do_not_capture_amounts_or_leak_into_plain_reads() {
+    let (_dir, engine) = fixture();
+    let mut session = SessionContext::default();
+    engine.execute_with_session(&mut session,
+        "PREPARE nested_sample FROM 'SELECT id FROM sampled WHERE id IN (SELECT id FROM sampled TABLESAMPLE BERNOULLI (? ROWS) REPEATABLE (?)) ORDER BY id'").unwrap();
+    engine
+        .execute_with_session(
+            &mut session,
+            "PREPARE plain_read FROM 'SELECT COUNT(*) FROM sampled'",
+        )
+        .unwrap();
+    for (amount, seed) in [(0, 7), (37, 7), (1, 19), (37, 7)] {
+        engine
+            .execute_with_session(&mut session, &format!("SET @amount={amount}, @seed={seed}"))
+            .unwrap();
+        let sampled = support::result_rows(
+            support::execute_materialized(
+                &engine,
+                &mut session,
+                "EXECUTE nested_sample USING @amount,@seed",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sampled.len(), amount);
+        let repeated = support::result_rows(
+            support::execute_materialized(
+                &engine,
+                &mut session,
+                "EXECUTE nested_sample USING @amount,@seed",
+            )
+            .unwrap(),
+        );
+        assert_eq!(sampled, repeated);
+        let plain = support::result_rows(
+            support::execute_materialized(&engine, &mut session, "EXECUTE plain_read").unwrap(),
+        );
+        assert_eq!(plain[0][0].to_display_string(), "2048");
+    }
+    engine
+        .execute_with_session(&mut session, "SET @amount=-1, @seed=7")
+        .unwrap();
+    let error = support::execute_materialized(
+        &engine,
+        &mut session,
+        "EXECUTE nested_sample USING @amount,@seed",
+    )
+    .unwrap_err();
+    assert!(error.message().contains("TABLESAMPLE"));
+    let plain = support::result_rows(
+        support::execute_materialized(&engine, &mut session, "EXECUTE plain_read").unwrap(),
+    );
+    assert_eq!(plain[0][0].to_display_string(), "2048");
+}
+
+#[test]
 fn tablesample_fresh_samples_numeric_casts_and_large_row_limits() {
     let (_dir, engine) = fixture();
     let sql = "WITH q AS (SELECT id FROM sampled TABLESAMPLE BERNOULLI (37 ROWS)) SELECT id FROM q ORDER BY id";

@@ -4931,7 +4931,11 @@ impl TableSchema {
     /// Existing row images were validated when written. Retry only a failed
     /// functional-key evaluation without the caller's newer strict policy;
     /// successful probes and ordinary column keys keep their original cost.
-    pub(crate) fn stored_index_key(&self, index: &IndexSchema, values: &[Value]) -> Result<IndexKey, QueryError> {
+    pub(crate) fn stored_index_key(
+        &self,
+        index: &IndexSchema,
+        values: &[Value],
+    ) -> Result<IndexKey, QueryError> {
         match self.index_key(index, values) {
             Err(_) if index.has_expression_parts() => {
                 let _maintenance = crate::engine::expr::CompensationExpressionGuard::new();
@@ -4941,7 +4945,11 @@ impl TableSchema {
         }
     }
 
-    pub(crate) fn stored_index_keys(&self, index: &IndexSchema, values: &[Value]) -> Result<Vec<IndexKey>, QueryError> {
+    pub(crate) fn stored_index_keys(
+        &self,
+        index: &IndexSchema,
+        values: &[Value],
+    ) -> Result<Vec<IndexKey>, QueryError> {
         match self.index_keys(index, values) {
             Err(_) if index.has_expression_parts() => {
                 let _maintenance = crate::engine::expr::CompensationExpressionGuard::new();

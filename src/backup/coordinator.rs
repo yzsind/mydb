@@ -377,7 +377,7 @@ impl Coordinator {
         self.stop.store(false, Ordering::Release);
         let weak = Arc::downgrade(self);
         *owner = Some(
-            std::thread::Builder::new()
+            crate::util::thread_spawn::Builder::new()
                 .name("mydb-wal-archive".into())
                 .spawn(move || loop {
                     std::thread::park_timeout(Duration::from_secs(1));
@@ -2236,7 +2236,7 @@ impl Coordinator {
                 let receiver = Arc::new(Mutex::new(receiver));
                 for _ in 0..super::resources::limits()?.workers {
                     let receiver = receiver.clone();
-                    let worker = std::thread::Builder::new()
+                    let worker = crate::util::thread_spawn::Builder::new()
                         .name("mydb-backup-worker".into())
                         .spawn(move || loop {
                             let work = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();

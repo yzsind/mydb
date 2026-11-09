@@ -354,7 +354,7 @@ pub(super) fn sort_plan_rows_parallel_spill(
     let session_info = super::eval::current_session_expr_info();
     let session_info = &session_info;
     let params_snapshot = crate::engine::params::snapshot_current_context();
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(chunks.len());
         for (idx, chunk) in chunks.into_iter().enumerate() {
             let tmp_ref = &tmp;
@@ -936,74 +936,78 @@ fn merge_stream_run_pass(
     let params = crate::engine::params::snapshot_current_context();
     let env = crate::util::env::override_snapshot();
     let collector = super::analyze_stats::current_collector_handle();
-    let mut merged = std::thread::scope(|scope| -> Result<Vec<(usize, SortRun)>, QueryError> {
-        let mut handles = Vec::new();
-        for _ in 0..workers {
-            let groups = &groups;
-            let next = &next;
-            let budget = budget.clone();
-            let cancel = cancel.clone();
-            let session = session.clone();
-            let tuning = tuning.clone();
-            let params = params.clone();
-            let env = env.clone();
-            let collector = collector.clone();
-            handles.push(
-                std::thread::Builder::new()
-                    .stack_size(2 * 1024 * 1024)
-                    .name("mydb-sort-spill".into())
-                    .spawn_scoped(scope, move || {
-                        let _cancel = cancel.enter();
-                        let _tuning = crate::engine::executor::tuning::enter(tuning);
-                        let run = || -> Result<Vec<(usize, SortRun)>, QueryError> {
-                            let mut output = Vec::new();
-                            loop {
-                                crate::engine::cancel::check_cancelled()?;
-                                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if index >= groups.len() {
-                                    break;
-                                }
-                                output.push((
-                                    index,
-                                    merge_runs_to_run(tmp, groups[index], fields, pass, index)?,
-                                ));
-                            }
-                            Ok(output)
-                        };
-                        let run = || {
-                            crate::engine::expr::with_session_expr_info_option(&session, || {
-                                let run = || match budget {
-                                    Some(budget) => {
-                                        crate::engine::executor::mem_budget::with_query_budget(
-                                            budget, run,
-                                        )
+    let mut merged =
+        crate::util::thread_spawn::scope(|scope| -> Result<Vec<(usize, SortRun)>, QueryError> {
+            let mut handles = Vec::new();
+            for _ in 0..workers {
+                let groups = &groups;
+                let next = &next;
+                let budget = budget.clone();
+                let cancel = cancel.clone();
+                let session = session.clone();
+                let tuning = tuning.clone();
+                let params = params.clone();
+                let env = env.clone();
+                let collector = collector.clone();
+                handles.push(
+                    crate::util::thread_spawn::Builder::new()
+                        .stack_size(2 * 1024 * 1024)
+                        .name("mydb-sort-spill".into())
+                        .spawn_scoped(scope, move || {
+                            let _cancel = cancel.enter();
+                            let _tuning = crate::engine::executor::tuning::enter(tuning);
+                            let run = || -> Result<Vec<(usize, SortRun)>, QueryError> {
+                                let mut output = Vec::new();
+                                loop {
+                                    crate::engine::cancel::check_cancelled()?;
+                                    let index =
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if index >= groups.len() {
+                                        break;
                                     }
-                                    None => run(),
-                                };
-                                match params {
-                                    Some(params) => params.run(run),
-                                    None => run(),
+                                    output.push((
+                                        index,
+                                        merge_runs_to_run(tmp, groups[index], fields, pass, index)?,
+                                    ));
                                 }
+                                Ok(output)
+                            };
+                            let run = || {
+                                crate::engine::expr::with_session_expr_info_option(&session, || {
+                                    let run = || match budget {
+                                        Some(budget) => {
+                                            crate::engine::executor::mem_budget::with_query_budget(
+                                                budget, run,
+                                            )
+                                        }
+                                        None => run(),
+                                    };
+                                    match params {
+                                        Some(params) => params.run(run),
+                                        None => run(),
+                                    }
+                                })
+                            };
+                            crate::util::env::with_override_snapshot(env, || {
+                                super::analyze_stats::with_collector_handle_if_present(
+                                    collector, run,
+                                )
                             })
-                        };
-                        crate::util::env::with_override_snapshot(env, || {
-                            super::analyze_stats::with_collector_handle_if_present(collector, run)
                         })
-                    })
-                    .map_err(|error| {
-                        crate::error::catalog::ER_GET_ERRNO
-                            .error(format!("cannot start external sort spill worker: {error}"))
-                    })?,
-            );
-        }
-        let mut output = Vec::new();
-        for handle in handles {
-            output.extend(handle.join().map_err(|_| {
-                crate::error::catalog::ER_GET_ERRNO.error("external sort spill worker panicked")
-            })??);
-        }
-        Ok(output)
-    })?;
+                        .map_err(|error| {
+                            crate::error::catalog::ER_GET_ERRNO
+                                .error(format!("cannot start external sort spill worker: {error}"))
+                        })?,
+                );
+            }
+            let mut output = Vec::new();
+            for handle in handles {
+                output.extend(handle.join().map_err(|_| {
+                    crate::error::catalog::ER_GET_ERRNO.error("external sort spill worker panicked")
+                })??);
+            }
+            Ok(output)
+        })?;
     // Leaf-index ties must retain the original chronological run order.
     merged.sort_unstable_by_key(|(index, _)| *index);
     Ok(merged.into_iter().map(|(_, run)| run).collect())
@@ -1030,30 +1034,11 @@ impl SpillMergeStream {
     ) -> Result<Self, QueryError> {
         let fields: Arc<[crate::engine::executor::sort::SortField]> = Arc::from(fields.to_vec());
         let charger = tmp.charger();
-        let mut readers: Vec<SortRunReader> = Vec::with_capacity(runs.len());
-        let mut initial_heads: Vec<Option<(MergeKey, PlanRow)>> = Vec::with_capacity(runs.len());
-        for run in runs {
-            let Some(mut reader) =
-                SortRunReader::open(run, charger.clone(), runs.len().saturating_mul(2))?
-            else {
-                continue;
-            };
-            let Some((keys, row)) = reader.next_entry()? else {
-                continue;
-            };
-            readers.push(reader);
-            initial_heads.push(Some((
-                MergeKey {
-                    keys,
-                    fields: fields.clone(),
-                },
-                row,
-            )));
-        }
+        let (readers, tree) = open_merge_run_readers(&charger, runs, &fields)?;
         Ok(Self {
             _tmp: tmp,
             readers,
-            tree: super::loser_tree::LoserTree::new(initial_heads),
+            tree,
             analyze_plan_key: None,
         })
     }
@@ -1204,18 +1189,23 @@ impl Ord for MergeKey {
     }
 }
 
-fn merge_runs(
-    charger: crate::engine::executor::spill_quota::SpillCharger,
+/// Admit nonempty run heads in original order for both merge consumers.
+fn open_merge_run_readers(
+    charger: &crate::engine::executor::spill_quota::SpillCharger,
     runs: &[SortRun],
-    fields: &[crate::engine::executor::sort::SortField],
-    mut emit: impl FnMut(&[Value], PlanRow) -> Result<(), QueryError>,
-) -> Result<(), QueryError> {
-    let fields: Arc<[crate::engine::executor::sort::SortField]> = Arc::from(fields.to_vec());
+    fields: &Arc<[crate::engine::executor::sort::SortField]>,
+) -> Result<
+    (
+        Vec<SortRunReader>,
+        super::loser_tree::LoserTree<MergeKey, PlanRow>,
+    ),
+    QueryError,
+> {
     let mut readers: Vec<SortRunReader> = Vec::with_capacity(runs.len());
     let mut initial_heads: Vec<Option<(MergeKey, PlanRow)>> = Vec::with_capacity(runs.len());
     for run in runs {
         let Some(mut reader) =
-            SortRunReader::open(run, charger.clone(), runs.len().saturating_mul(2))?
+            SortRunReader::open(run, (*charger).clone(), runs.len().saturating_mul(2))?
         else {
             continue;
         };
@@ -1226,13 +1216,22 @@ fn merge_runs(
         initial_heads.push(Some((
             MergeKey {
                 keys,
-                fields: fields.clone(),
+                fields: Arc::clone(fields),
             },
             row,
         )));
     }
+    Ok((readers, super::loser_tree::LoserTree::new(initial_heads)))
+}
 
-    let mut tree = super::loser_tree::LoserTree::new(initial_heads);
+fn merge_runs(
+    charger: crate::engine::executor::spill_quota::SpillCharger,
+    runs: &[SortRun],
+    fields: &[crate::engine::executor::sort::SortField],
+    mut emit: impl FnMut(&[Value], PlanRow) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
+    let fields: Arc<[crate::engine::executor::sort::SortField]> = Arc::from(fields.to_vec());
+    let (mut readers, mut tree) = open_merge_run_readers(&charger, runs, &fields)?;
     while let Some((key, row, leaf)) = tree.pop_winner() {
         crate::engine::cancel::check_cancelled()?;
         emit(&key.keys, row)?;
@@ -2211,5 +2210,94 @@ mod tests {
             before,
             "all spill bytes released after the sort dir drops"
         );
+    }
+
+    #[test]
+    fn merge_readers_skip_empty_runs_without_changing_equal_key_order() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let tmp = SpillTmpDir::create_kind(root.path(), "sort").unwrap();
+        let fields = [crate::engine::executor::sort::SortField {
+            ascending: true,
+            nulls_first: false,
+            collation_id: None,
+        }];
+        let mut runs = Vec::new();
+        for (index, values) in [vec![], vec![10, 11], vec![], vec![20, 21], vec![]]
+            .into_iter()
+            .enumerate()
+        {
+            let mut chunk = values
+                .into_iter()
+                .map(|value| KeyedRow {
+                    keys: vec![Value::Int(1)],
+                    row: row_int("t", "n", value),
+                    ordinal: value as u64,
+                })
+                .collect();
+            runs.push(flush_sort_run(&tmp, &mut chunk, &fields, index, "empty-test").unwrap());
+        }
+        let before = crate::engine::executor::spill_quota::active_spill_files();
+        let expected = vec![
+            Value::Int(10),
+            Value::Int(11),
+            Value::Int(20),
+            Value::Int(21),
+        ];
+        let mut actual = Vec::new();
+        merge_runs(tmp.charger(), &runs, &fields, |_, row| {
+            actual.push(row.fields[0].value.clone());
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(
+            crate::engine::executor::spill_quota::active_spill_files(),
+            before
+        );
+        let path = tmp.path().to_path_buf();
+        let mut stream = SpillMergeStream::open(tmp, &runs, &fields).unwrap();
+        let mut streamed = Vec::new();
+        while let Some(row) = super::super::plan::PlanStream::next(&mut stream).unwrap() {
+            streamed.push(row.fields[0].value.clone());
+        }
+        assert_eq!(streamed, expected);
+        drop(stream);
+        assert_eq!(
+            crate::engine::executor::spill_quota::active_spill_files(),
+            before
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn merge_reader_failure_releases_previously_opened_run_files() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let tmp = SpillTmpDir::create_kind(root.path(), "sort").unwrap();
+        let fields: Arc<[_]> = Arc::from(vec![crate::engine::executor::sort::SortField {
+            ascending: true,
+            nulls_first: false,
+            collation_id: None,
+        }]);
+        let mut runs = Vec::new();
+        for index in 0..2 {
+            let mut chunk = vec![KeyedRow {
+                keys: vec![Value::Int(index)],
+                row: row_int("t", "n", index),
+                ordinal: index as u64,
+            }];
+            runs.push(
+                flush_sort_run(&tmp, &mut chunk, &fields, index as usize, "corrupt-test").unwrap(),
+            );
+        }
+        std::fs::write(&runs[1].keys_path, b"corrupt").unwrap();
+        let before = crate::engine::executor::spill_quota::active_spill_files();
+        assert!(open_merge_run_readers(&tmp.charger(), &runs, &fields).is_err());
+        assert_eq!(
+            crate::engine::executor::spill_quota::active_spill_files(),
+            before
+        );
+        let path = tmp.path().to_path_buf();
+        drop(tmp);
+        assert!(!path.exists());
     }
 }

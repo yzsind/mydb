@@ -39,8 +39,8 @@ pub(super) fn can_use_lazy_read_only_transaction_select(
     session: &SessionContext,
     stmt: &Select,
 ) -> bool {
-    // Session checks first: the locking-read probe walks the whole AST and
-    // runs on every prepared SELECT execution.
+    // General dispatch avoids walking the AST when session state already
+    // excludes this transaction read path.
     session.current_txn.is_none()
         && session.xa_branch.is_none()
         && (session.explicit_txn || !session.autocommit)
@@ -50,24 +50,32 @@ pub(super) fn can_use_lazy_read_only_transaction_select(
 
 pub(super) fn can_use_current_transaction_read_select(
     session: &SessionContext,
-    stmt: &Select,
+    has_locking_read: bool,
 ) -> bool {
     session.current_txn.is_some()
         && session.xa_branch.is_none()
-        && stmt.lock_clause.is_none()
         && session.effective_isolation() != IsolationLevel::Serializable
-        && !select_has_locking_read(stmt)
+        && !has_locking_read
 }
 
-/// Shared view policy for cached and uncached prepared reads. Keep the
-/// statement guard alive through execution and RR's pin through transaction end.
+/// Recheck live session eligibility using the immutable prepared AST shape.
+pub(super) fn can_use_prepared_read(session: &SessionContext, has_locking_read: bool) -> bool {
+    !has_locking_read
+        && ((session.autocommit && !session.explicit_txn && session.current_txn.is_none())
+            || (session.xa_branch.is_none()
+                && session.effective_isolation() != IsolationLevel::Serializable
+                && (session.current_txn.is_some() || session.explicit_txn || !session.autocommit)))
+}
+
+/// The immutable locking shape was captured with the prepared AST. Session
+/// isolation and transaction state are still checked at every execution.
 pub(super) fn prepared_select_read_view(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    select: &Select,
+    has_locking_read: bool,
 ) -> Result<(TxnView, Option<crate::storage::SnapshotGuard>), QueryError> {
     Ok(
-        if tx::can_use_current_transaction_read_select(session, select) {
+        if can_use_current_transaction_read_select(session, has_locking_read) {
             tx::current_transaction_read_select_view(db, session)?
         } else if session.explicit_txn || !session.autocommit {
             let isolation = session.start_transaction_isolation();

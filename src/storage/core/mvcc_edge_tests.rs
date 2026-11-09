@@ -70,6 +70,79 @@ fn edge_current(db: &Arc<Database>) -> Vec<(i64, i64)> {
     edge_rows(db, view)
 }
 
+#[test]
+fn bounded_index_visibility_keeps_key_versions_and_rollback_overlap_exact() {
+    for commit in [false, true] {
+        let (_dir, db) = edge_db();
+        let table = db.table("test.t").unwrap();
+        let index = table.indexes.iter().find(|index| index.primary).unwrap();
+        let heap = db.heap_handle(table.id).unwrap();
+        let old_entries = db
+            .range_index_entries_chunk(&table, index, None, None, None, 16)
+            .unwrap();
+        let (old, _old_guard) =
+            db.read_only_statement_view_with_guard(IsolationLevel::RepeatableRead, None);
+        let writer = db.begin_txn().unwrap();
+        for (from, to) in [(1, 11), (11, 21), (2, 12)] {
+            db.update_rows(
+                writer,
+                "test.t",
+                None,
+                |row| Ok(row[0] == Value::Int(from)),
+                |row| Ok(vec![Value::Int(to), row[1].clone()]),
+            )
+            .unwrap();
+        }
+        let new_entries = db
+            .range_index_entries_chunk(&table, index, None, None, None, 16)
+            .unwrap();
+        assert_eq!(old_entries.len(), 2);
+        assert_eq!(new_entries.len(), 2);
+        assert!(db
+            .index_repair_state
+            .suspect_rows(table.id, &index.name, 2)
+            .is_none());
+        let check = |entries: &[(IndexKey, RowId)], view, expected: bool| {
+            let borrowed = entries
+                .iter()
+                .map(|(key, row)| (key, *row))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                db.filter_visible_index_entries_mask_with_handle(
+                    &heap, &table, index, entries, view,
+                )
+                .unwrap(),
+                vec![expected; entries.len()]
+            );
+            assert_eq!(
+                db.filter_visible_index_entries_refs_mask_with_handle(
+                    &heap, &table, index, &borrowed, view,
+                )
+                .unwrap(),
+                vec![expected; entries.len()]
+            );
+        };
+        check(&old_entries, old, true);
+        check(&new_entries, old, false);
+        check(&old_entries, writer, false);
+        check(&new_entries, writer, true);
+        if commit {
+            db.commit_txn(writer.txn_id).unwrap();
+        } else {
+            db.rollback_txn(writer.txn_id).unwrap();
+        }
+        let (current, _current_guard) =
+            db.read_only_statement_view_with_guard(IsolationLevel::ReadCommitted, None);
+        // Model a physical read that overlapped rollback. Restoring a visible
+        // heap header must not certify the captured, now-unowned index key.
+        let _exact = ExactIndexVisibility::enter();
+        check(&old_entries, old, true);
+        check(&new_entries, old, false);
+        check(&old_entries, current, !commit);
+        check(&new_entries, current, commit);
+    }
+}
+
 fn edge_mixed_dml(commit: bool) {
     let (_dir, db) = edge_db();
     let (old, _old_guard) =

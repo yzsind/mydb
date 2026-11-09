@@ -937,13 +937,9 @@ fn add_ddl_table_mdl_targets(
     }
 }
 
-fn add_fk_mdl_dependencies(
-    db: &Database,
-    session: &SessionContext,
-    statement: &Statement,
-    uses: &[StatementTableUse],
-    out: &mut std::collections::BTreeMap<String, MdlLockType>,
-) {
+/// Preserve the dependency collectors' single-layer wrapper order.
+#[inline]
+fn mdl_dependency_statement(statement: &Statement) -> &Statement {
     let statement = match statement {
         Statement::Explain {
             target,
@@ -952,10 +948,20 @@ fn add_fk_mdl_dependencies(
         } => target.as_ref(),
         other => other,
     };
-    let statement = match statement {
+    match statement {
         Statement::WithCte(with) => with.body.as_ref(),
         other => other,
-    };
+    }
+}
+
+fn add_fk_mdl_dependencies(
+    db: &Database,
+    session: &SessionContext,
+    statement: &Statement,
+    uses: &[StatementTableUse],
+    out: &mut std::collections::BTreeMap<String, MdlLockType>,
+) {
+    let statement = mdl_dependency_statement(statement);
     // Resolve new FK declarations against the child's schema, including
     // qualified CREATE targets and mixed ALTER actions. These locks must
     // span both validation and catalog publication.
@@ -1036,18 +1042,7 @@ fn add_trigger_mdl_dependencies(
     uses: &[StatementTableUse],
     out: &mut std::collections::BTreeMap<String, MdlLockType>,
 ) {
-    let statement = match statement {
-        Statement::Explain {
-            target,
-            analyze: true,
-            ..
-        } => target.as_ref(),
-        other => other,
-    };
-    let statement = match statement {
-        Statement::WithCte(with) => with.body.as_ref(),
-        other => other,
-    };
+    let statement = mdl_dependency_statement(statement);
     let Some(event) = trigger_event_for_statement(statement) else {
         return;
     };
@@ -1973,5 +1968,61 @@ mod transaction_memo_tests {
             .iter()
             .any(|held| held.key == b.key));
         db.release_mdl_owner(11);
+    }
+}
+
+#[cfg(test)]
+mod wrapper_contract_tests {
+    use super::*;
+    #[test]
+    fn mdl_wrapper_normalization_preserves_single_layer_order_and_borrows() {
+        let plain = crate::parser::parse_statement("SELECT 1").unwrap();
+        assert!(std::ptr::eq(mdl_dependency_statement(&plain), &plain));
+        let explain = crate::parser::parse_statement("EXPLAIN SELECT 1").unwrap();
+        assert!(std::ptr::eq(mdl_dependency_statement(&explain), &explain));
+        let mut analyze = crate::parser::parse_statement("EXPLAIN ANALYZE SELECT 1").unwrap();
+        let Statement::Explain { target, .. } = &analyze else {
+            panic!("EXPLAIN expected")
+        };
+        assert!(std::ptr::eq(
+            mdl_dependency_statement(&analyze),
+            target.as_ref()
+        ));
+        let with = crate::parser::parse_statement("WITH c AS (SELECT 1) SELECT * FROM c").unwrap();
+        let Statement::WithCte(definition) = &with else {
+            panic!("WITH expected")
+        };
+        assert!(std::ptr::eq(
+            mdl_dependency_statement(&with),
+            definition.body.as_ref()
+        ));
+        if let Statement::Explain { target, .. } = &mut analyze {
+            *target = Box::new(with.clone());
+        }
+        let Statement::Explain { target, .. } = &analyze else {
+            unreachable!()
+        };
+        let Statement::WithCte(definition) = target.as_ref() else {
+            unreachable!()
+        };
+        assert!(std::ptr::eq(
+            mdl_dependency_statement(&analyze),
+            definition.body.as_ref()
+        ));
+        let mut reverse = with;
+        if let Statement::WithCte(definition) = &mut reverse {
+            definition.body = Box::new(analyze);
+        }
+        let Statement::WithCte(definition) = &reverse else {
+            unreachable!()
+        };
+        assert!(std::ptr::eq(
+            mdl_dependency_statement(&reverse),
+            definition.body.as_ref()
+        ));
+        assert!(matches!(
+            mdl_dependency_statement(&reverse),
+            Statement::Explain { .. }
+        ));
     }
 }

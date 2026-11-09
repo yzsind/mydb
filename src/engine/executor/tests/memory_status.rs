@@ -32,6 +32,13 @@ fn status_map(engine: &StorageQueryEngine) -> HashMap<String, String> {
 
 #[test]
 fn show_engine_surfaces_memory_rollup() {
+    // Keep this tiny-dataset RSS comparison independent of host CPU count.
+    // Automatic transaction admission can reserve GiB of future worker stacks
+    // on large hosts; those governed reservations need not be resident yet.
+    let _workers = crate::util::env::scoped_vars(&[
+        ("MYDB_BLOCKING_POOL_SIZE", Some("4")),
+        ("MYDB_BLOCKING_POOL_MAX", Some("8")),
+    ]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine

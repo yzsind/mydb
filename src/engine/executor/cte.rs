@@ -1140,7 +1140,7 @@ fn materialize_cte_jobs_parallel(
     let collector = super::select::analyze_stats::current_collector_handle();
     let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
     let inherit_mdl = super::stream_mdl::StatementScope::active(db, session.connection_id as u64);
-    let mut results = std::thread::scope(|scope| {
+    let mut results = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(jobs.len());
         for job in jobs {
             let db = Arc::clone(db);
@@ -2469,7 +2469,7 @@ fn try_materialize_non_recursive_union_branches_parallel(
         std::sync::Mutex::new((0..total_branches).map(|_| None).collect());
     let early_abort = std::sync::atomic::AtomicBool::new(false);
     let context = super::select::execution_context::ExecutionContext::capture(txn);
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let db_cloned = Arc::clone(db);
@@ -2907,7 +2907,7 @@ fn materialize_cte_from_union_branches(
     if cte_union_branch_parallel_enabled() && branches.len() > 1 {
         let visible = current_cte_registry();
         let context = super::select::execution_context::ExecutionContext::capture(txn);
-        let branch_sets = std::thread::scope(|scope| {
+        let branch_sets = crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::with_capacity(branches.len());
             for (select, plan) in branches.iter().zip(plans.iter()) {
                 let db = Arc::clone(db);

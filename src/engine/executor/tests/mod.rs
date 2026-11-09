@@ -1,5 +1,3 @@
-mod routines_views_triggers_events_1109;
-mod txn_acid_audit_1108;
 mod ai;
 mod bug_report_1107;
 mod collated_constant_in;
@@ -17,6 +15,7 @@ mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;
 mod routine_handler_continuation;
+mod routines_views_triggers_events_1109;
 mod sql_execution_audit_1015;
 mod sql_execution_audit_1027;
 mod sql_execution_audit_1108;
@@ -27,6 +26,7 @@ mod table_ddl_audit_1012;
 mod table_ddl_audit_1027;
 mod tablesample;
 mod temporal_comparison_consistency;
+mod txn_acid_audit_1108;
 
 use super::*;
 use crate::parser::Assignment;
@@ -527,7 +527,9 @@ mod binlog_admin_metadata;
 
 mod replication_admin_metadata;
 
+mod cached_limit_validation;
 mod compiled_range_recipe;
+mod decimal_index_comparison;
 
 mod release_audit;
 

@@ -4608,6 +4608,133 @@ fn grace_unique_lookup_risk_requires_severe_build_overflow() {
 }
 
 #[test]
+fn index_nlj_cost_respects_projected_inner_width() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE projection_outer(id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE projection_inner(id INT PRIMARY KEY,v INT,pad VARCHAR(1024))")
+        .unwrap();
+    let outer = (1..=2048)
+        .map(|i| format!("({i})"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let pad = "x".repeat(512);
+    let inner = (1..=2048)
+        .map(|i| format!("({i},{i},'{pad}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO projection_outer VALUES {outer}"))
+        .unwrap();
+    engine
+        .execute(&format!("INSERT INTO projection_inner VALUES {inner}"))
+        .unwrap();
+    engine
+        .execute("ANALYZE TABLE projection_outer,projection_inner")
+        .unwrap();
+    fn lookup_cost(plan: &PhysicalPlan) -> Option<(f64, usize, f64)> {
+        if let PhysicalPlan::IndexNestedLoopJoin {
+            cost,
+            right_table,
+            right_projected_columns,
+            ..
+        } = plan
+        {
+            return Some((
+                cost.total,
+                right_projected_columns
+                    .as_ref()
+                    .map_or(right_table.schema.columns.len(), |columns| columns.len()),
+                cost.io_seq_pages + cost.io_rnd_pages,
+            ));
+        }
+        plan.children().iter().find_map(|child| lookup_cost(child))
+    }
+    let cost = |projection| {
+        let sql = format!("SELECT /*+ ORDERED INDEX_NLJ(d) */ {projection} FROM projection_outer f JOIN projection_inner d ON f.id=d.id");
+        let Statement::Select(select) = parse_statement(&sql).unwrap() else {
+            unreachable!()
+        };
+        let plan = build_physical_plan(engine.db_for_tests(), &select).unwrap();
+        lookup_cost(&plan).expect("forced indexed join must retain its projected inner columns")
+    };
+    let narrow = cost("d.v");
+    let wide = cost("d.v,d.pad");
+    assert!(narrow.1 < wide.1);
+    assert!(narrow.0 < wide.0, "narrow={narrow:?}, wide={wide:?}");
+    assert_eq!(
+        narrow.2, wide.2,
+        "projection must not shrink heap page geometry"
+    );
+}
+
+#[test]
+fn equijoin_uses_one_sided_ndv_for_expression_keys() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE expr_domain (id INT PRIMARY KEY, label VARCHAR(12))")
+        .unwrap();
+    let values = (1..=100)
+        .map(|i| format!("({i},'v{i}')"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO expr_domain VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE expr_domain").unwrap();
+    let scan = |alias| {
+        let Statement::Select(select) =
+            parse_statement(&format!("SELECT * FROM expr_domain {alias}")).unwrap()
+        else {
+            unreachable!()
+        };
+        build_physical_plan(engine.db_for_tests(), &select).unwrap()
+    };
+    let key = |sql: &str| {
+        let Statement::Select(select) = parse_statement(&format!("SELECT {sql}")).unwrap() else {
+            unreachable!()
+        };
+        let SelectItem::Expr { expr, .. } = &select.projection[0] else {
+            unreachable!()
+        };
+        expr.clone()
+    };
+    let left = scan("f");
+    let right = scan("d");
+    for (expression, column) in [("MOD(f.id,97)", "d.id"), ("LOWER(f.label)", "d.label")] {
+        let expression = key(expression);
+        let column = key(column);
+        let ndv = equijoin_ndv_in_plan(&right, &column).unwrap();
+        assert!(equijoin_ndv_in_plan(&left, &expression).is_none());
+        for (l, r, lk, rk) in [
+            (&left, &right, &expression, &column),
+            (&right, &left, &column, &expression),
+        ] {
+            let rows = estimate_equijoin_rows(l, r, &[lk.clone()], &[rk.clone()], 100.0, 100.0);
+            assert!((rows - 10_000.0 / ndv).abs() < 0.001, "{rows}");
+        }
+    }
+    // Neither expression has a measured domain. Preserve the public fallback
+    // rather than inferring an NDV from an arbitrary function's input.
+    let rows = estimate_equijoin_rows(
+        &left,
+        &right,
+        &[key("MOD(f.id,97)")],
+        &[key("MOD(d.id,97)")],
+        100.0,
+        100.0,
+    );
+    assert_eq!(
+        rows,
+        10_000.0 * crate::engine::cbo::cbo_consts().default_join_selectivity()
+    );
+}
+
+#[test]
 fn equijoin_joint_ndv_missing_on_unindexed_side_is_bounded_by_base_rows() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -4844,6 +4971,169 @@ fn serial_producer_parallel_reduction_preserves_producer_cost_and_small_plan_pol
                     assert!(super::plan_cost(&plan).total < total * 0.9);
                 }
             }
+        },
+    );
+}
+
+#[test]
+fn equivalence_ranges_reach_all_inner_join_keys() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for table in ["left_keys", "middle_keys", "right_keys"] {
+        engine
+            .execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY)"))
+            .unwrap();
+    }
+    for sql in [
+        "SELECT a.id FROM left_keys a JOIN middle_keys b ON a.id=b.id JOIN right_keys c ON b.id=c.id WHERE c.id<17 AND 3<=a.id",
+        "SELECT a.id FROM left_keys a,middle_keys b,right_keys c WHERE a.id=b.id AND b.id=c.id AND c.id<17 AND 3<=a.id",
+        "SELECT a.id FROM left_keys a CROSS JOIN middle_keys b CROSS JOIN right_keys c WHERE a.id=b.id AND b.id=c.id AND c.id<17 AND 3<=a.id",
+    ] {
+        let Statement::Select(mut select) = parse_statement(sql).unwrap() else { panic!("expected SELECT") };
+    propagate_equivalence_constraints(engine.db_for_tests(), &mut select);
+    let mut predicates = Vec::new();
+    split_conjuncts(select.selection.as_ref().unwrap(), &mut predicates);
+    for alias in ["a", "b", "c"] {
+        for (op, value) in [(BinaryOp::Lt, 17), (BinaryOp::GtEq, 3)] {
+            assert!(
+                predicates.iter().any(|expr| {
+                    let Expr::Binary {
+                        left,
+                        op: actual_op,
+                        right,
+                    } = expr
+                    else {
+                        return false;
+                    };
+                    let matches_bound = |column: &Expr, bound: &Expr, actual_op| {
+                        actual_op == op
+                            && equivalence_column_key(column) == Some(col(alias, "id"))
+                            && expr_to_plan_constraint(bound).is_some_and(|constraint| {
+                                matches!(constraint,
+                            PlanConstraintValue::Concrete(Value::Int(v)) if v == value)
+                            })
+                    };
+                    matches_bound(left, right, *actual_op)
+                        || matches_bound(right, left, crate::engine::expr::flip_cmp(*actual_op))
+                }),
+                "missing range on {alias}: {predicates:?}"
+            );
+        }
+    }
+    }
+}
+
+#[test]
+fn equivalence_ranges_keep_comparison_domains_and_outer_join_boundaries() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE domain_a (id INT, tag VARCHAR(10) COLLATE utf8mb4_bin, label ENUM('z','a'), name VARCHAR(10) COLLATE utf8mb4_0900_ai_ci)").unwrap();
+    engine.execute("CREATE TABLE domain_b (id INT UNSIGNED, tag VARCHAR(10) COLLATE utf8mb4_0900_ai_ci, label VARCHAR(10), name VARCHAR(10) COLLATE utf8mb4_0900_ai_ci)").unwrap();
+    for sql in [
+        "SELECT a.id FROM domain_a a,domain_b b WHERE a.id=b.id AND b.id<17",
+        "SELECT a.tag FROM domain_a a,domain_b b WHERE a.tag=b.tag AND b.tag<'z'",
+        "SELECT a.label FROM domain_a a,domain_b b WHERE a.label=b.label AND b.label<'z'",
+        "SELECT a.id FROM domain_a a LEFT JOIN domain_a b ON a.id=b.id WHERE a.id<17",
+        "SELECT a.name FROM domain_a a,domain_b b WHERE a.name=b.name AND b.name<17",
+        "SELECT a.name FROM domain_a a,domain_b b WHERE a.name=b.name AND b.name<X'62'",
+        "SELECT a.name FROM domain_a a,domain_b b WHERE a.name=b.name AND b.name<?",
+        "SELECT a.name FROM domain_a a,domain_b b WHERE a.name=b.name AND b.name<'z' COLLATE utf8mb4_bin",
+    ] {
+        let Statement::Select(mut select) = parse_statement(sql).unwrap() else {
+            panic!("expected SELECT")
+        };
+        let before = select.selection.clone();
+        propagate_equivalence_constraints(engine.db_for_tests(), &mut select);
+        assert_eq!(
+            select.selection, before,
+            "must retain domain/null-extension semantics: {sql}"
+        );
+    }
+}
+
+#[test]
+fn equivalence_ranges_accept_stable_bounds_across_ordered_types() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for (index, (data_type, bound)) in [
+        ("INT", "17"),
+        ("BIGINT UNSIGNED", "18446744073709551610"),
+        ("DECIMAL(20,4)", "17.1234"),
+        ("DOUBLE", "17.5"),
+        ("DATE", "'2025-01-01'"),
+        ("DATETIME(6)", "'2025-01-01 01:02:03.123456'"),
+        ("VARCHAR(12) COLLATE utf8mb4_0900_ai_ci", "'Éclair'"),
+        ("VARBINARY(12)", "'key'"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for side in ["a", "b"] {
+            engine
+                .execute(&format!("CREATE TABLE ranges_{side}{index}(k {data_type})"))
+                .unwrap();
+        }
+        let Statement::Select(mut select) = parse_statement(&format!(
+            "SELECT a.k FROM ranges_a{index} a JOIN ranges_b{index} b ON a.k=b.k WHERE b.k<{bound}"
+        ))
+        .unwrap() else {
+            panic!("expected SELECT")
+        };
+        propagate_equivalence_constraints(engine.db_for_tests(), &mut select);
+        let mut predicates = Vec::new();
+        split_conjuncts(select.selection.as_ref().unwrap(), &mut predicates);
+        assert!(
+            predicates.iter().any(
+                |expr| matches!(expr, Expr::Binary { left, op: BinaryOp::Lt, .. }
+            if equivalence_column_key(left)==Some(col("a","k")))
+            ),
+            "missing {data_type} bound: {predicates:?}"
+        );
+    }
+    let Statement::Select(mut select) = parse_statement(
+        "SELECT a.k FROM ranges_a0 a JOIN ranges_b0 b ON a.k=b.k AND b.k BETWEEN ? AND ?",
+    )
+    .unwrap() else {
+        panic!("expected SELECT")
+    };
+    propagate_equivalence_constraints(engine.db_for_tests(), &mut select);
+    let mut predicates = Vec::new();
+    split_conjuncts(select.selection.as_ref().unwrap(), &mut predicates);
+    for (op, parameter) in [(BinaryOp::GtEq, 0), (BinaryOp::LtEq, 1)] {
+        assert!(predicates.iter().any(|expr| matches!(expr, Expr::Binary { left, op: actual, right }
+            if *actual==op && equivalence_column_key(left)==Some(col("a","k")) && matches!(right.as_ref(), Expr::Placeholder(index) if *index==parameter))));
+    }
+}
+
+#[test]
+fn equivalence_ranges_do_not_use_a_shadowed_base_table_schema() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE range_shadow(k INT)").unwrap();
+    engine.execute("CREATE TABLE range_base(k INT)").unwrap();
+    let cte = crate::engine::api::CteResult::materialized(
+        vec![crate::types::Column {
+            name: "k".into(),
+            column_type: crate::types::ColumnType::VarString,
+            source: Default::default(),
+        }],
+        Vec::new(),
+    );
+    crate::engine::executor::cte::with_cte_registry(
+        HashMap::from([("range_shadow".into(), Arc::new(cte))]),
+        || {
+            let Statement::Select(mut select) = parse_statement(
+                "SELECT a.k FROM range_shadow a,range_base b WHERE a.k=b.k AND b.k<17",
+            )
+            .unwrap() else {
+                panic!("expected SELECT")
+            };
+            let before = select.selection.clone();
+            propagate_equivalence_constraints(engine.db_for_tests(), &mut select);
+            assert_eq!(
+                select.selection, before,
+                "a CTE can have a different type from its namesake base table"
+            );
         },
     );
 }

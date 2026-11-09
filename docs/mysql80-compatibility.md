@@ -788,6 +788,8 @@ that cannot be used in persistent expressions such as generated columns.
 
 **✅** `CREATE [DEFINER=] {PROCEDURE|FUNCTION} [IF NOT EXISTS]` (IN/OUT/INOUT, RETURNS, DETERMINISTIC, SQL DATA ACCESS, SQL SECURITY, COMMENT), `ALTER`/`DROP`, `CALL`, `SHOW CREATE`, `SHOW {PROCEDURE|FUNCTION} STATUS`, `I_S.ROUTINES` (31 columns)/`PARAMETERS` (16 columns).
 
+As a mydb extension, `CREATE OR REPLACE [DEFINER=] {PROCEDURE|FUNCTION}` replaces the complete definition without a separate DROP. It supports changing parameters, function return types, and bodies, preserves routine grants, and requires CREATE ROUTINE plus ALTER ROUTINE when replacing an existing routine. Invalid definitions leave the old routine available. OR REPLACE and IF NOT EXISTS are mutually exclusive; ALTER continues to update characteristics only. See [CREATE PROCEDURE](statements/programmatic/create-procedure.md) and [CREATE FUNCTION](statements/programmatic/create-function.md).
+
 Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` variables/CONDITION/CURSOR/HANDLER, `SET`, `SELECT…INTO`, `IF`/`CASE`, `LOOP`/`WHILE`/`REPEAT`, `LEAVE`/`ITERATE`, `RETURN`, `OPEN`/`FETCH`/`CLOSE`, `SIGNAL`/`RESIGNAL`, nested `CALL`, in-procedure `PREPARE`/`EXECUTE` dynamic SQL, and `GET [CURRENT|STACKED] DIAGNOSTICS`.
 
 - **Stored functions execute row by row in SQL expressions**: until the compiler can prove purity from the complete call graph, all user-defined functions execute serially per row; `DETERMINISTIC` / `NO SQL` remain declared metadata only and cannot alone trigger inlining or constant folding.

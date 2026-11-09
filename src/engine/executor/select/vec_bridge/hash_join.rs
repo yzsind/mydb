@@ -559,7 +559,7 @@ pub(super) fn merge_direct_count_lane_parallel(target: &mut [u64], source: &[u64
         return;
     }
     let chunk = target.len().div_ceil(workers.max(1));
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for (target, source) in target.chunks_mut(chunk).zip(source.chunks(chunk)) {
             scope.spawn(move || {
                 for (target, source) in target.iter_mut().zip(source) {
@@ -599,7 +599,7 @@ fn run_parallel_unique_build_count_probe(
     };
     let mut probe_batches = 0u64;
     let mut probe_rows = 0u64;
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut senders = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -874,6 +874,45 @@ impl HashJoinBatchOperator<'_> {
         let rejected =
             analyze_stats::is_recording().then(|| Arc::new(std::sync::atomic::AtomicU64::new(0)));
         if native_int_pair {
+            // Independent component filters lose key correlation: each
+            // component can be common while the complete pair is selective.
+            // Use the existing typed tuple probe when both keys can reach one
+            // input. Split-input graphs retain the component-filter fallback.
+            let same_input = self
+                .probe_schema
+                .fields()
+                .get(self.probe_keys[0])
+                .zip(self.probe_schema.fields().get(self.probe_keys[1]))
+                .is_some_and(|(first, second)| {
+                    first.table.eq_ignore_ascii_case(&second.table) && first.alias == second.alias
+                });
+            let simple_keys = keys
+                .iter()
+                .all(|key| matches!(key, Expr::Identifier(_) | Expr::CompoundIdentifier(_)));
+            if same_input && simple_keys {
+                let mut bloom = BloomFilter::new_int_pair(rows);
+                let first = &payload.columns[self.build_keys[0]];
+                let second = &payload.columns[self.build_keys[1]];
+                let first_values = first.as_i64_slice().expect("checked i64 pair");
+                let second_values = second.as_i64_slice().expect("checked i64 pair");
+                for row in 0..rows {
+                    if !first.is_null(row) && !second.is_null(row) {
+                        bloom.insert_int_pair(
+                            i128::from(first_values[row]),
+                            i128::from(second_values[row]),
+                        );
+                    }
+                }
+                if self.probe.install_runtime_filter(RuntimeFilter::BloomKey {
+                    keys: keys.clone(),
+                    null_safe: self.null_safe.clone(),
+                    filter: Arc::new(bloom),
+                    rejected: rejected.clone(),
+                }) {
+                    self.pushed_runtime_rejected = rejected;
+                    return;
+                }
+            }
             let mut installed = false;
             for (component, &column) in self.build_keys.iter().enumerate() {
                 let mut bloom = BloomFilter::new_int(rows.max(1).div_ceil(2));

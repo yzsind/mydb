@@ -1886,11 +1886,15 @@ pub(super) fn estimate_index_nlj_operator_cost(
     condition: Option<&Expr>,
     right_only_residual: Option<&Expr>,
     right_covering: bool,
+    right_width: f64,
 ) -> crate::engine::cbo::Cost {
     use crate::engine::cbo::{cbo_consts, operator_cost};
 
     let outer_cost = plan_cost(left);
-    let right_width = operator_cost::estimated_row_width(&right_table.schema);
+    // The scan already knows the required inner columns. Charging its full
+    // schema width here overprices a narrow lookup on a wide table relative
+    // to the hash alternative, which uses the projected child width.
+    let heap_row_width = operator_cost::estimated_row_width(&right_table.schema);
     let right_total_rows = right_table.schema.stats.row_count.max(1) as f64;
     let table_pages = table_heap_pages_for_cost(&right_table.schema);
     let height = index_cost_height(&right_table.schema, right_index, right_total_rows);
@@ -2005,7 +2009,9 @@ pub(super) fn estimate_index_nlj_operator_cost(
                 matched_rows,
                 probe_keys,
                 table_pages,
-                output_width: right_width,
+                // Projection reduces decode/output work, not the physical
+                // number of stored rows per heap page.
+                output_width: heap_row_width,
                 correlation,
                 // Cumulative diagnostic pages are a stable upper-bound for
                 // the outer subtree's resident working set. They come from
@@ -2075,8 +2081,11 @@ pub(super) fn estimate_index_nlj_operator_cost(
             let full_scan = operator_cost::seq_scan(
                 ctx,
                 table_pages,
-                right_total_rows,
-                right_total_rows,
+                // Page coverage does not imply decoding every stored row.
+                // A RID lookup addresses only its matched slots; charge the
+                // full physical page geometry but only the visited tuples.
+                matched_rows,
+                matched_rows,
                 right_width,
                 0.0,
             );
@@ -2272,7 +2281,7 @@ pub(super) fn estimate_index_nlj_operator_cost(
             leaf_pages,
             per_match,
             lookup_table_pages,
-            right_width,
+            heap_row_width,
             correlation,
         );
         batched.total /= left_rows.max(1.0);
@@ -2650,12 +2659,21 @@ pub(crate) fn estimate_equijoin_rows(
     for (lk, rk) in left_keys.iter().zip(right_keys.iter()) {
         let l_ndv = equijoin_ndv_in_plan(left, lk);
         let r_ndv = equijoin_ndv_in_plan(right, rk);
-        if let (Some(ln), Some(rn)) = (l_ndv, r_ndv) {
+        let denominator = match (l_ndv, r_ndv) {
+            (Some(left), Some(right)) => Some(left.max(right)),
+            (Some(known), None) | (None, Some(known)) => Some(known),
+            (None, None) => None,
+        };
+        if let Some(denom) = denominator {
             // FK-style join: |L ⋈ R| ≈ left_rows * right_rows / max(ndv).
             // Using `max` instead of `min` keeps the estimate sane when one
             // side has been pre-filtered (lower row count) but its NDV
             // statistic still reflects the unfiltered base column.
-            let denom = ln.max(rn);
+            // An expression on the other side need not have collected NDV.
+            // Retain the known domain rather than discarding both sides and
+            // treating a high-NDV equality like an unselective theta join.
+            // With only one domain known, it is the usual uniform estimate;
+            // it does not prove uniqueness or matching foreign-key values.
             selectivity *= 1.0 / denom.max(1.0);
             has_stats = true;
         }

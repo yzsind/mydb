@@ -2138,7 +2138,7 @@ static PARTITION_INDEX_FINISH_WORKERS: AtomicUsize = AtomicUsize::new(0);
 struct PartitionIndexFinishWorkers(usize);
 impl PartitionIndexFinishWorkers {
     fn acquire(requested: usize) -> Self {
-        let capacity = std::thread::available_parallelism()
+        let capacity = crate::util::thread_spawn::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(1)
             .saturating_sub(1);
@@ -2374,8 +2374,9 @@ impl DdlCopyIndexBuilders {
         };
         file.flush()?;
         if publish_cache {
-            db.index_cache.write().insert(
-                (table.id, normalize_name(&plan.index.name)),
+            db.publish_index_handle(
+                table.id,
+                &plan.index.name,
                 Arc::new(parking_lot::RwLock::new(file)),
             );
             Ok(None)
@@ -2438,12 +2439,12 @@ impl DdlCopyIndexBuilders {
                 break;
             }
         };
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::new();
             for _ in 0..workers.0 {
                 let run = &run;
                 let cancellation = cancellation.clone();
-                if let Ok(handle) = std::thread::Builder::new()
+                if let Ok(handle) = crate::util::thread_spawn::Builder::new()
                     .name("mydb-part-index".into())
                     .spawn_scoped(scope, move || {
                         let _cancel = cancellation.enter();
@@ -2892,7 +2893,7 @@ impl Database {
                     crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
                     parallel_bytes,
                 )?;
-            return std::thread::scope(|scope| {
+            return crate::util::thread_spawn::scope(|scope| {
                 let mut workers = Vec::with_capacity(table.indexes.len());
                 for index_offset in 0..table.indexes.len() {
                     let index = &table.indexes[(index_start + index_offset) % table.indexes.len()];

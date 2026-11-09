@@ -864,7 +864,7 @@ mod tests {
         let manager = fresh_manager(target);
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let wins = Arc::new(AtomicUsize::new(0));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..2 {
                 let manager = Arc::clone(&manager);
                 let barrier = Arc::clone(&barrier);

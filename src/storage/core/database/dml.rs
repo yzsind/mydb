@@ -2252,7 +2252,7 @@ impl Database {
                 let chunk_rows = updates.len().div_ceil(patch_degree);
                 let table_ref = &table;
                 let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
-                let worker_results = std::thread::scope(|scope| {
+                let worker_results = crate::util::thread_spawn::scope(|scope| {
                     let mut workers = Vec::with_capacity(patch_degree);
                     for (chunk_index, chunk) in updates.chunks(chunk_rows).enumerate() {
                         let cancellation = cancellation.clone();

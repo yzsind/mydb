@@ -431,7 +431,7 @@ mod tests {
             .unwrap();
         file.set_len(32 * 1024).unwrap();
         file.seek(SeekFrom::Start(17)).unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for lane in 0..8u64 {
                 let file = file.try_clone().unwrap();
                 scope.spawn(move || {

@@ -14,6 +14,8 @@ use super::memory_footprint::AllocatedBytes;
 use crate::types::Value;
 
 pub(crate) mod key_encode;
+mod string_prefix;
+pub(crate) use string_prefix::try_sort_by_string_prefix;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SortField {

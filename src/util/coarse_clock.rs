@@ -41,7 +41,7 @@ fn clock() -> &'static CoarseClock {
         // Ticker failure (thread limit) degrades to a frozen clock —
         // still monotone, still valid, just stale; acceptable for the
         // second-resolution consumers.
-        let _ = std::thread::Builder::new()
+        let _ = crate::util::thread_spawn::Builder::new()
             .name("mydb-coarse-clock".into())
             .spawn(|| loop {
                 std::thread::sleep(TICK);

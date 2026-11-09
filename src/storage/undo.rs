@@ -21,7 +21,11 @@ use super::core::{
 };
 
 type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
-type FastHashSet<T> = HashSet<T, ahash::RandomState>;
+
+#[cfg(test)]
+thread_local! {
+    static UNDO_METADATA_PRUNE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 
 // Binary undo version. v2 used the legacy 8-tag self-describing value
 // section that detoured DecimalCompact / Date / Time / DateTime / Year
@@ -1286,9 +1290,9 @@ pub(crate) struct UndoManager {
     /// short-lived undo record. The only consumer that needs pointer order is
     /// background compaction; it sorts its bounded candidate list explicitly.
     pub(crate) records: FastHashMap<u64, UndoRecord>,
-    /// Side index keyed by `created_unix_ms` → undo ids created in that ms.
-    /// AHashSet keeps arbitrary removal O(1) under dense write bursts.
-    pub(crate) created_index: BTreeMap<u64, FastHashSet<u64>>,
+    /// Ordered creation-time buckets. Ordering ids inside a bucket lets purge
+    /// resume at a record boundary without walking an already-scanned prefix.
+    pub(crate) created_index: BTreeMap<u64, BTreeSet<u64>>,
     /// Only resident, persistent records with releasable payload. Keeping this
     /// separate from retention history prevents rescanning evicted metadata on
     /// every append when the metadata floor alone exceeds the cache limit.
@@ -1349,6 +1353,8 @@ pub(crate) struct UndoManager {
     pub(crate) archive_floor: Arc<AtomicU64>,
     manifest_path: Option<PathBuf>,
     pub(crate) compensated: HashSet<u64>,
+    origins_need_prune: bool,
+    compensations_need_prune: bool,
     discarded: HashSet<u64>,
     compensation_manifest_dirty: AtomicBool,
     #[cfg(target_os = "macos")]
@@ -1411,6 +1417,29 @@ struct PurgeKeepCache {
     /// Union of `chain_per_txn` values, materialized for O(1) membership
     /// probes. Maintained alongside the per-txn sets — never rebuilt.
     flat_keep: HashSet<u64>,
+    /// Advisory traversal position, never an eligibility proof. Appends or
+    /// compaction can insert behind it; the next sweep visits that prefix.
+    scan_after: Option<(u64, u64)>,
+    /// A finite sweep must wrap even when appenders outrun its scan budget.
+    /// New records beyond this bound belong to the following sweep.
+    scan_through: Option<(u64, u64)>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct PurgePlan {
+    pub(crate) victims: Vec<u64>,
+    pub(crate) scanned: usize,
+    pub(crate) sweep_complete: bool,
+    pub(crate) newer_records: bool,
+}
+
+/// Identities from one bounded traversal round, without cached eligibility.
+#[derive(Debug)]
+pub(crate) struct PurgeCandidates {
+    pub(crate) records: Vec<(u64, u64)>,
+    pub(crate) scanned: usize,
+    pub(crate) sweep_complete: bool,
+    pub(crate) newer_records: bool,
 }
 
 pub(crate) type UndoTablespace = UndoManager;
@@ -1609,6 +1638,8 @@ impl Default for UndoManager {
             archive_floor: Arc::new(AtomicU64::new(0)),
             manifest_path: None,
             compensated: HashSet::new(),
+            origins_need_prune: false,
+            compensations_need_prune: false,
             discarded: HashSet::new(),
             compensation_manifest_dirty: AtomicBool::new(false),
             #[cfg(target_os = "macos")]
@@ -3220,6 +3251,8 @@ impl UndoManager {
         }
         self.compaction_forwarded.extend(manifest.forwardings);
         self.compensated.extend(manifest.compensated);
+        self.origins_need_prune = true;
+        self.compensations_need_prune = true;
         self.discarded.extend(manifest.discarded);
         self.compaction_seq_high = self.compaction_seq_high.max(manifest.compaction_seq_high);
         self.invalidate_keep_cache();
@@ -3258,6 +3291,8 @@ impl UndoManager {
         }
         self.finish_recovery_segment_publication(&manifest.pending_recovery_segments)?;
         self.compensated = manifest.compensated;
+        self.origins_need_prune = true;
+        self.compensations_need_prune = true;
         self.discarded = manifest.discarded;
         self.compaction_forwarded = manifest.forwardings;
         self.compaction_seq_high = manifest.compaction_seq_high.max(
@@ -3476,7 +3511,7 @@ impl UndoManager {
                 }
             }
         } else {
-            let workers = std::thread::available_parallelism()
+            let workers = crate::util::thread_spawn::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(2)
                 .min(ids.len())
@@ -3487,7 +3522,7 @@ impl UndoManager {
                 .collect();
             let chunk_size = paths.len().div_ceil(workers).max(1);
             let decoded_chunks: Vec<Result<Vec<DecodedSegment>, QueryError>> =
-                std::thread::scope(|scope| {
+                crate::util::thread_spawn::scope(|scope| {
                     let mut handles = Vec::with_capacity(workers);
                     for chunk in paths.chunks(chunk_size) {
                         let chunk = chunk.to_vec();
@@ -4064,6 +4099,15 @@ impl UndoManager {
         for &id in ids {
             let canonical = self.canonical_ptr(id);
             self.compensated.insert(canonical);
+            let segment = undo_ptr_segment(canonical);
+            if segment == 0
+                || !self
+                    .segment_file_bytes
+                    .get(&segment)
+                    .is_some_and(|len| undo_ptr_offset(canonical) < *len)
+            {
+                self.compensations_need_prune = true;
+            }
         }
         self.compensation_manifest_dirty
             .store(true, Ordering::Release);
@@ -4116,6 +4160,8 @@ impl UndoManager {
             self.compaction_forwarded.insert(old, new);
         }
         if !remap.is_empty() {
+            self.origins_need_prune = true;
+            self.compensations_need_prune = true;
             self.compensation_manifest_dirty
                 .store(true, Ordering::Release);
         }
@@ -4456,13 +4502,6 @@ impl UndoManager {
         self.txn_bytes.contains_key(&txn_id)
     }
 
-    /// Distinct creators that can actually participate in the next purge.
-    /// Using this bounded-to-undo set avoids materializing transaction state
-    /// for every retained read-only/committed slot on every purge tick.
-    pub(crate) fn creator_txn_ids(&self) -> Vec<u64> {
-        self.txn_bytes.keys().copied().collect()
-    }
-
     /// Phase 4 — the transaction holding the most undo bytes right now,
     /// as `(txn_id, bytes)` (`(0, 0)` when there is no undo). This is the
     /// "who is hogging undo / blocking purge" diagnostic surfaced through
@@ -4510,6 +4549,7 @@ impl UndoManager {
         let Some(record) = self.records.remove(&undo_ptr) else {
             return Ok(());
         };
+        self.compaction_origins.remove(&undo_ptr);
         self.eviction_candidates
             .remove(&(record.created_unix_ms, undo_ptr));
         self.debit_txn_bytes(record.txn_id, record_size(&record));
@@ -4523,6 +4563,9 @@ impl UndoManager {
         self.resident_bytes = self.resident_bytes.saturating_sub(resident_size(&record));
         self.release_resident_charge(resident_size(&record));
         let segment_id = undo_ptr_segment(undo_ptr);
+        if segment_id == 0 {
+            self.compensated.remove(&undo_ptr);
+        }
         if segment_id != 0 {
             if let Some(live) = self.segment_live_records.get_mut(&segment_id) {
                 *live = live.saturating_sub(1);
@@ -4586,6 +4629,9 @@ impl UndoManager {
                     .segment_file_bytes
                     .insert(segment_id, new_end)
                     .unwrap_or(new_end);
+                if new_end < old_end {
+                    self.compensations_need_prune = true;
+                }
                 self.disk_bytes = self
                     .disk_bytes
                     .saturating_sub(old_end)
@@ -4700,6 +4746,13 @@ impl UndoManager {
         committed_creator_watermark: u64,
         batch_limit: usize,
     ) -> Vec<u64> {
+        // Single-pass test callers retain the old full-prefix semantics.
+        // Production keeps the cursor across bounded maintenance passes.
+        {
+            let mut cache = self.keep_cache.lock();
+            cache.scan_after = None;
+            cache.scan_through = None;
+        }
         self.plan_purge_victims_with_recent(
             active_txn_heads,
             retain_since_unix_ms,
@@ -4707,17 +4760,18 @@ impl UndoManager {
             creator_states,
             committed_creator_watermark,
             &HashSet::new(),
-            &mut 0,
+            usize::MAX,
             batch_limit,
         )
+        .victims
     }
 
-    /// Select up to `batch_limit` purge victims in creation order, starting
-    /// at the `created_unix_ms` bucket `*resume_unix_ms` and leaving it at
-    /// the last bucket visited. A purge run that applies its victims in
-    /// several short lock rounds resumes there instead of rescanning the
-    /// records earlier rounds had to keep; that bucket is revisited because
-    /// the limit may have cut it short.
+    /// Select at most `batch_limit` victims while examining at most
+    /// `scan_limit` records. Retained records consume scan budget too.
+    /// The record-level cursor survives lock rounds and maintenance passes;
+    /// reaching its captured end resets it for the next sweep. Every
+    /// visit rechecks the current creator, snapshot and active-chain gates.
+    #[cfg(test)]
     pub(crate) fn plan_purge_victims_with_recent(
         &self,
         active_txn_heads: &[(u64, u64)],
@@ -4726,54 +4780,175 @@ impl UndoManager {
         creator_states: &BTreeMap<u64, UndoCreatorState>,
         committed_creator_watermark: u64,
         recent_committed_txns: &HashSet<u64>,
-        resume_unix_ms: &mut u64,
+        scan_limit: usize,
         batch_limit: usize,
+    ) -> PurgePlan {
+        self.refresh_keep_cache(active_txn_heads);
+        self.walk_purge_window(retain_since_unix_ms, scan_limit, batch_limit, |id, keep| {
+            self.purge_candidate_is_obsolete(
+                id,
+                keep,
+                oldest_snapshot_scn,
+                creator_states,
+                committed_creator_watermark,
+                recent_committed_txns,
+            )
+        })
+    }
+
+    /// Capture only this lock round's record identities and creators. The
+    /// caller classifies these creators outside the undo latch; no historical
+    /// creator directory is copied before a bounded scan.
+    pub(crate) fn scan_purge_candidates(
+        &self,
+        retain_since_unix_ms: u64,
+        scan_limit: usize,
+    ) -> PurgeCandidates {
+        let mut records = Vec::new();
+        let plan = self.walk_purge_window(retain_since_unix_ms, scan_limit, usize::MAX, |id, _| {
+            if let Some(record) = self.records.get(id) {
+                records.push((*id, record.txn_id));
+            }
+            false
+        });
+        PurgeCandidates {
+            records,
+            scanned: plan.scanned,
+            sweep_complete: plan.sweep_complete,
+            newer_records: plan.newer_records,
+        }
+    }
+
+    /// Recheck live records and all MVCC gates after creator classification.
+    /// Concurrent removal/relocation only makes a captured id disappear; a
+    /// newly published record cannot enter this batch without classification.
+    pub(crate) fn plan_purge_candidates(
+        &self,
+        candidates: &PurgeCandidates,
+        active_txn_heads: &[(u64, u64)],
+        oldest_snapshot_scn: Option<u64>,
+        creator_states: &BTreeMap<u64, UndoCreatorState>,
+        committed_creator_watermark: u64,
+        recent_committed_txns: &HashSet<u64>,
     ) -> Vec<u64> {
         self.refresh_keep_cache(active_txn_heads);
         let cache = self.keep_cache.lock();
-        let keep = &cache.flat_keep;
-        let limit = batch_limit.max(1);
-        let mut victims: Vec<u64> = Vec::new();
-        if *resume_unix_ms > retain_since_unix_ms {
-            return victims;
-        }
-        'buckets: for (&created_unix_ms, ids) in self
-            .created_index
-            .range(*resume_unix_ms..=retain_since_unix_ms)
-        {
-            *resume_unix_ms = created_unix_ms;
-            for id in ids {
-                if victims.len() >= limit {
-                    break 'buckets;
+        candidates
+            .records
+            .iter()
+            .filter_map(|(id, _)| {
+                self.purge_candidate_is_obsolete(
+                    id,
+                    &cache.flat_keep,
+                    oldest_snapshot_scn,
+                    creator_states,
+                    committed_creator_watermark,
+                    recent_committed_txns,
+                )
+                .then_some(*id)
+            })
+            .collect()
+    }
+
+    fn purge_candidate_is_obsolete(
+        &self,
+        id: &u64,
+        keep: &HashSet<u64>,
+        oldest_snapshot_scn: Option<u64>,
+        creator_states: &BTreeMap<u64, UndoCreatorState>,
+        committed_creator_watermark: u64,
+        recent_committed_txns: &HashSet<u64>,
+    ) -> bool {
+        let keep_for_creator = self.records.get(id).is_some_and(|record| {
+            if recent_committed_txns.contains(&record.txn_id) {
+                return true;
+            }
+            match creator_states.get(&record.txn_id).copied() {
+                Some(UndoCreatorState::Active | UndoCreatorState::Prepared) => true,
+                Some(UndoCreatorState::Committed(commit_scn)) => {
+                    oldest_snapshot_scn.is_some_and(|oldest| commit_scn > oldest)
                 }
-                let keep_for_creator = self.records.get(id).is_some_and(|record| {
-                    if recent_committed_txns.contains(&record.txn_id) {
-                        return true;
-                    }
-                    match creator_states.get(&record.txn_id).copied() {
-                        Some(UndoCreatorState::Active | UndoCreatorState::Prepared) => true,
-                        Some(UndoCreatorState::Committed(commit_scn)) => {
-                            oldest_snapshot_scn.is_some_and(|oldest| commit_scn > oldest)
-                        }
-                        Some(UndoCreatorState::RolledBack) => false,
-                        // `creator_states` and the undo map are sampled under
-                        // different locks. A transaction can begin, append
-                        // undo, and even commit after the transaction-state
-                        // snapshot but before this shared undo scan. Such a
-                        // creator is absent from the stale map, but is NOT an
-                        // old committed slot: retain it for this sweep and
-                        // classify it on the next one. Only an absent creator
-                        // at/below the transaction-slot GC watermark is known
-                        // to have committed and been collected.
-                        None => record.txn_id > committed_creator_watermark,
-                    }
-                });
-                if !keep.contains(id) && !keep_for_creator && self.records.contains_key(id) {
-                    victims.push(*id);
+                Some(UndoCreatorState::RolledBack) => false,
+                // `creator_states` and the undo map are sampled under
+                // different locks. A transaction can begin, append
+                // undo, and even commit after the transaction-state
+                // snapshot but before this shared undo scan. Such a
+                // creator is absent from the stale map, but is NOT an
+                // old committed slot: retain it for this sweep and
+                // classify it on the next one. Only an absent creator
+                // at/below the transaction-slot GC watermark is known
+                // to have committed and been collected.
+                None => record.txn_id > committed_creator_watermark,
+            }
+        });
+        !keep.contains(id) && !keep_for_creator && self.records.contains_key(id)
+    }
+
+    fn walk_purge_window(
+        &self,
+        retain_since_unix_ms: u64,
+        scan_limit: usize,
+        batch_limit: usize,
+        mut select: impl FnMut(&u64, &HashSet<u64>) -> bool,
+    ) -> PurgePlan {
+        let mut cache = self.keep_cache.lock();
+        let limit = batch_limit.max(1);
+        let mut plan = PurgePlan::default();
+        if cache
+            .scan_after
+            .is_some_and(|(created, _)| created > retain_since_unix_ms)
+        {
+            // Retention can increase or the wall clock can move backwards.
+            // Restart the eligible prefix instead of constructing an inverted
+            // range. The eligibility checks still enforce the new cutoff.
+            cache.scan_after = None;
+            cache.scan_through = None;
+        }
+        if cache.scan_through.is_none() {
+            cache.scan_through = self
+                .created_index
+                .range(..=retain_since_unix_ms)
+                .next_back()
+                .and_then(|(&created, ids)| ids.last().map(|&id| (created, id)));
+        }
+        let Some(through) = cache.scan_through else {
+            cache.scan_after = None;
+            plan.sweep_complete = true;
+            return plan;
+        };
+        let through = through.min((retain_since_unix_ms, u64::MAX));
+        let start = cache.scan_after.map_or(0, |(created, _)| created);
+        for (&created_unix_ms, ids) in self.created_index.range(start..=through.0) {
+            let lower = match cache.scan_after {
+                Some((created, id)) if created == created_unix_ms => std::ops::Bound::Excluded(id),
+                _ => std::ops::Bound::Unbounded,
+            };
+            let upper = if created_unix_ms == through.0 {
+                std::ops::Bound::Included(through.1)
+            } else {
+                std::ops::Bound::Unbounded
+            };
+            for id in ids.range((lower, upper)) {
+                if plan.scanned == scan_limit || plan.victims.len() == limit {
+                    return plan;
+                }
+                plan.scanned += 1;
+                cache.scan_after = Some((created_unix_ms, *id));
+                if select(id, &cache.flat_keep) {
+                    plan.victims.push(*id);
                 }
             }
         }
-        victims
+        plan.newer_records = self
+            .created_index
+            .range(..=retain_since_unix_ms)
+            .next_back()
+            .and_then(|(&created, ids)| ids.last().map(|&id| (created, id)))
+            .is_some_and(|last| last > through);
+        cache.scan_after = None;
+        cache.scan_through = None;
+        plan.sweep_complete = true;
+        plan
     }
 
     /// Bring `keep_cache` into sync with the latest active-txn snapshot.
@@ -4813,6 +4988,7 @@ impl UndoManager {
             head_per_txn,
             chain_per_txn,
             flat_keep,
+            ..
         } = &mut *cache;
         for (txn_id, head) in active_txn_heads {
             let stop = head_per_txn.get(txn_id).copied();
@@ -4861,6 +5037,9 @@ impl UndoManager {
         cache.head_per_txn.clear();
         cache.chain_per_txn.clear();
         cache.flat_keep.clear();
+        // The scan cursor is only a traversal hint. Keeping it across replica
+        // eviction and compaction avoids starving later records; relocated
+        // records behind it are reconsidered after the sweep wraps.
     }
 
     /// Account one purge run, whether or not it found anything to drop and
@@ -4906,6 +5085,7 @@ impl UndoManager {
             let Some(removed) = self.records.remove(id) else {
                 continue;
             };
+            self.compaction_origins.remove(id);
             self.eviction_candidates
                 .remove(&(removed.created_unix_ms, *id));
             if let Some(ids) = self.created_index.get_mut(&removed.created_unix_ms) {
@@ -4978,6 +5158,9 @@ impl UndoManager {
     /// reclamation or segment live-count mutation is allowed locally.
     /// Like `apply_purge_victims`, it does not account a run.
     pub(crate) fn evict_replica_records(&mut self, victims: &[u64]) {
+        // Preserve source identities until the next ordinary metadata prune;
+        // receiver eviction itself must not reclaim physical source state.
+        self.origins_need_prune |= !victims.is_empty();
         let mut released_resident = 0u64;
         for id in victims {
             let Some(removed) = self.records.remove(id) else {
@@ -5666,18 +5849,32 @@ impl UndoManager {
                 .copied()
                 .fold(0u64, u64::saturating_add);
         }
-        self.compaction_origins
-            .retain(|ptr, _| self.records.contains_key(ptr));
-        self.compensated.retain(|ptr| {
-            let segment = undo_ptr_segment(*ptr);
-            if segment == 0 {
+        // Ordinary victim removal already erases its origin and in-memory
+        // compensation entries. Do not rescan unchanged survivor directories
+        // on every small purge round, especially while snapshots pin them.
+        if self.origins_need_prune {
+            self.compaction_origins.retain(|ptr, _| {
+                #[cfg(test)]
+                UNDO_METADATA_PRUNE_VISITS.with(|n| n.set(n.get() + 1));
                 self.records.contains_key(ptr)
-            } else {
-                self.segment_file_bytes
-                    .get(&segment)
-                    .is_some_and(|len| undo_ptr_offset(*ptr) < *len)
-            }
-        });
+            });
+            self.origins_need_prune = false;
+        }
+        if self.compensations_need_prune || !paths.is_empty() {
+            self.compensated.retain(|ptr| {
+                #[cfg(test)]
+                UNDO_METADATA_PRUNE_VISITS.with(|n| n.set(n.get() + 1));
+                let segment = undo_ptr_segment(*ptr);
+                if segment == 0 {
+                    self.records.contains_key(ptr)
+                } else {
+                    self.segment_file_bytes
+                        .get(&segment)
+                        .is_some_and(|len| undo_ptr_offset(*ptr) < *len)
+                }
+            });
+            self.compensations_need_prune = false;
+        }
         paths
     }
 
@@ -5986,7 +6183,8 @@ mod purge_tests {
         let record = make_record(1, 7, 1, None);
         let expected = estimate_undo_resident_bytes(&record) as usize;
         let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || tx.send(admission.reserve(&record)).unwrap());
+        let worker =
+            crate::util::thread_spawn::spawn(move || tx.send(admission.reserve(&record)).unwrap());
         let reserved = rx.recv_timeout(std::time::Duration::from_secs(1));
         drop(held);
         worker.join().unwrap();
@@ -6650,6 +6848,454 @@ mod purge_tests {
         assert!(!undo.check_undo_admission(1000, false).unwrap());
         // Estimate above the soft cap flags pressure.
         assert!(undo.check_undo_admission(5000, false).unwrap());
+    }
+
+    #[test]
+    fn bounded_purge_does_not_rescan_unchanged_survivor_metadata() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut undo = UndoTablespace::open_with_segments(&[], dir.path(), 1024 * 1024).unwrap();
+        for id in 1..=4096 {
+            undo.insert(make_record(id, 1, 100, None), false, true)
+                .unwrap();
+            undo.compaction_origins.insert(id, id + 100_000);
+        }
+        undo.origins_need_prune = true;
+        undo.mark_compensated(&(1..=4096).collect::<Vec<_>>());
+        assert!(undo.detach_empty_segments().is_empty());
+        UNDO_METADATA_PRUNE_VISITS.with(|n| n.set(0));
+        for id in 1..=64 {
+            let outcome = undo.apply_purge_victims(&[id], &BTreeMap::new());
+            assert!(outcome.removable_segments.is_empty());
+            assert_eq!(undo.wal_identity(id), id);
+            assert!(!undo.compensated.contains(&id));
+        }
+        assert_eq!(
+            UNDO_METADATA_PRUNE_VISITS.with(|n| n.get()),
+            0,
+            "small purge rounds must not revisit unrelated survivor metadata"
+        );
+        assert_eq!(undo.compaction_origins.len(), 4096 - 64);
+        assert_eq!(undo.compensated.len(), 4096 - 64);
+        assert_eq!(undo.wal_identity(4096), 104_096);
+        undo.remove_record(4096).unwrap();
+        assert_eq!(undo.wal_identity(4096), 4096);
+        assert!(!undo.compensated.contains(&4096));
+    }
+
+    #[test]
+    fn purge_keeps_persistent_compensation_while_its_segment_survives() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut undo = UndoTablespace::open_with_segments(&[], dir.path(), 1024 * 1024).unwrap();
+        let mut pointers = Vec::new();
+        for _ in 0..=undo.write_shards.len() {
+            pointers.push(
+                undo.append_record(make_record(0, 7, 100, None), true)
+                    .unwrap()
+                    .0,
+            );
+        }
+        let retired = pointers[0];
+        let survivor = *pointers.last().unwrap();
+        assert_eq!(undo_ptr_segment(retired), undo_ptr_segment(survivor));
+        undo.flush().unwrap();
+        undo.mark_compensated(&[retired]);
+        let outcome = undo.apply_purge_victims(&[retired], &BTreeMap::new());
+        assert!(outcome.removable_segments.is_empty());
+        assert!(
+            undo.compensated.contains(&retired),
+            "a rollback marker protects the frame even after directory eviction"
+        );
+        undo.checkpoint_sync_manifest().unwrap();
+        drop(undo);
+        let reopened = UndoTablespace::open_with_segments(&[], dir.path(), 1024 * 1024).unwrap();
+        assert!(reopened.compensated.contains(&retired));
+        assert_eq!(reopened.get(survivor).unwrap().txn_id, 7);
+    }
+
+    #[test]
+    fn purge_metadata_rechecks_changed_tail_and_unknown_compensation() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut undo = UndoTablespace::open_with_segments(&[], dir.path(), 1024 * 1024).unwrap();
+        let ptr = undo
+            .append_record(make_record(0, 7, 100, None), true)
+            .unwrap()
+            .0;
+        undo.flush().unwrap();
+        undo.mark_compensated(&[ptr, 42, u64::MAX]);
+        undo.remove_record(ptr).unwrap();
+        // The active segment remains protected, so no file retirement can
+        // accidentally substitute for the invalidated-tail cleanup.
+        let _ = undo.detach_empty_segments();
+        assert!(!undo.compensated.contains(&ptr));
+        assert!(!undo.compensated.contains(&42));
+        assert!(!undo.compensated.contains(&u64::MAX));
+    }
+
+    #[test]
+    fn purge_candidate_window_bounds_creator_state_work() {
+        let mut undo = UndoTablespace::default();
+        for id in 1..=10_000 {
+            undo.insert(make_record(id, id, 100, None), false, true)
+                .unwrap();
+        }
+        let candidates = undo.scan_purge_candidates(100, 7);
+        assert_eq!(candidates.scanned, 7);
+        assert_eq!(
+            candidates.records,
+            (1..=7).map(|id| (id, id)).collect::<Vec<_>>()
+        );
+        assert!(!candidates.sweep_complete);
+        // Neither a second scanner nor a publisher can add an unclassified
+        // creator to an already captured candidate batch.
+        let other = undo.scan_purge_candidates(100, 7);
+        undo.insert(make_record(10_001, 10_001, 100, None), false, true)
+            .unwrap();
+        let creators = candidates
+            .records
+            .iter()
+            .map(|(_, txn)| (*txn, UndoCreatorState::Committed(5)))
+            .collect();
+        assert_eq!(
+            undo.plan_purge_candidates(&candidates, &[], Some(10), &creators, 0, &HashSet::new()),
+            (1..=7).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            other.records,
+            (8..=14).map(|id| (id, id)).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn purge_candidate_classification_rechecks_retention_and_live_ownership() {
+        let mut undo = UndoTablespace::default();
+        for id in 1..=8 {
+            undo.insert(make_record(id, id, 100, None), false, true)
+                .unwrap();
+        }
+        let candidates = undo.scan_purge_candidates(100, 8);
+        // Removal between enumeration and classification must not produce a
+        // victim or reclaim state owned by that removed/relocated identity.
+        undo.remove_record(8).unwrap();
+        let creators = BTreeMap::from([
+            (1, UndoCreatorState::Active),
+            (2, UndoCreatorState::Prepared),
+            (3, UndoCreatorState::Committed(20)),
+            (4, UndoCreatorState::Committed(5)),
+            (5, UndoCreatorState::Committed(5)),
+            (6, UndoCreatorState::RolledBack),
+            (8, UndoCreatorState::Committed(5)),
+        ]);
+        let recent = HashSet::from([4]);
+        assert_eq!(
+            undo.plan_purge_candidates(&candidates, &[(5, 5)], Some(10), &creators, 0, &recent),
+            vec![6]
+        );
+        // Reclassification of exactly the same identities sees newly closed
+        // snapshots/transactions; eligibility was never cached in the batch.
+        let released = (1..=8)
+            .map(|txn| (txn, UndoCreatorState::Committed(5)))
+            .collect();
+        assert_eq!(
+            undo.plan_purge_candidates(&candidates, &[], Some(10), &released, 0, &HashSet::new()),
+            (1..=7).collect::<Vec<_>>()
+        );
+        // An absent creator remains unsafe above the positive GC watermark.
+        assert_eq!(
+            undo.plan_purge_candidates(
+                &candidates,
+                &[],
+                Some(10),
+                &BTreeMap::new(),
+                3,
+                &HashSet::new()
+            ),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn purge_scan_wraps_fixed_sweep_despite_continuous_appends() {
+        let mut undo = UndoTablespace::default();
+        for id in 1..=8 {
+            undo.insert(make_record(id, 1, 100, None), false, true)
+                .unwrap();
+        }
+        let creators = BTreeMap::from([(1, UndoCreatorState::Committed(20))]);
+        let first = undo.plan_purge_victims_with_recent(
+            &[],
+            100,
+            Some(10),
+            &creators,
+            0,
+            &HashSet::new(),
+            2,
+            2,
+        );
+        assert!(first.victims.is_empty());
+        for round in 0..3 {
+            for id in 9 + round * 2..11 + round * 2 {
+                undo.insert(make_record(id, 1, 100, None), false, true)
+                    .unwrap();
+            }
+            let plan = undo.plan_purge_victims_with_recent(
+                &[],
+                100,
+                Some(30),
+                &creators,
+                0,
+                &HashSet::new(),
+                2,
+                2,
+            );
+            assert!(plan.victims.iter().all(|id| *id <= 8));
+            assert_eq!(
+                plan.sweep_complete,
+                round == 2,
+                "new appends must not extend an in-progress sweep"
+            );
+            if plan.sweep_complete {
+                assert!(
+                    plan.newer_records,
+                    "a finite sweep is not caught up with appenders"
+                );
+            }
+            undo.apply_purge_victims(&plan.victims, &creators);
+        }
+        let wrapped = undo.plan_purge_victims_with_recent(
+            &[],
+            100,
+            Some(30),
+            &creators,
+            0,
+            &HashSet::new(),
+            2,
+            2,
+        );
+        assert_eq!(
+            wrapped.victims,
+            vec![1, 2],
+            "the prefix that became eligible must not starve behind appends"
+        );
+    }
+
+    #[test]
+    fn purge_scan_budget_advances_inside_pinned_bucket_to_eligible_tail() {
+        let mut undo = UndoTablespace::default();
+        for id in 1..=129 {
+            undo.insert(
+                make_record(id, if id == 129 { 2 } else { 1 }, 100, None),
+                false,
+                true,
+            )
+            .unwrap();
+        }
+        let creators = BTreeMap::from([
+            (1, UndoCreatorState::Prepared),
+            (2, UndoCreatorState::Committed(5)),
+        ]);
+        let mut scanned = 0;
+        let mut victims = Vec::new();
+        for pass in 0..19 {
+            let plan = undo.plan_purge_victims_with_recent(
+                &[],
+                100,
+                Some(10),
+                &creators,
+                0,
+                &HashSet::new(),
+                7,
+                3,
+            );
+            assert!(plan.scanned <= 7);
+            scanned += plan.scanned;
+            victims.extend(plan.victims);
+            assert_eq!(plan.sweep_complete, pass == 18);
+        }
+        assert_eq!(scanned, 129);
+        assert_eq!(victims, vec![129]);
+        assert!(undo.keep_cache.lock().scan_after.is_none());
+        assert_eq!(undo.records.len(), 129, "planning never removes a version");
+    }
+
+    #[test]
+    fn purge_scan_cursor_revisits_backdated_appends_and_rechecks_creator_gates() {
+        let mut undo = UndoTablespace::default();
+        for id in [20, 40, 60] {
+            undo.insert(make_record(id, id, 100, None), false, true)
+                .unwrap();
+        }
+        let active = BTreeMap::from([
+            (20, UndoCreatorState::Active),
+            (40, UndoCreatorState::Prepared),
+            (60, UndoCreatorState::Active),
+        ]);
+        let first = undo.plan_purge_victims_with_recent(
+            &[],
+            100,
+            Some(10),
+            &active,
+            0,
+            &HashSet::new(),
+            2,
+            8,
+        );
+        assert_eq!(first.scanned, 2);
+        assert!(!first.sweep_complete);
+        assert_eq!(undo.keep_cache.lock().scan_after, Some((100, 40)));
+        // Replay and concurrent publication can insert before the cursor,
+        // including into a timestamp bucket already passed by this sweep.
+        undo.insert(make_record(10, 10, 50, None), false, true)
+            .unwrap();
+        undo.insert(make_record(50, 50, 100, None), false, true)
+            .unwrap();
+        let tail = undo.plan_purge_victims_with_recent(
+            &[],
+            100,
+            Some(10),
+            &active,
+            0,
+            &HashSet::new(),
+            2,
+            8,
+        );
+        assert_eq!(tail.scanned, 2);
+        assert!(tail.sweep_complete);
+        assert!(tail.victims.is_empty());
+        let creators = BTreeMap::from([
+            (20, UndoCreatorState::RolledBack),
+            (40, UndoCreatorState::Prepared),
+            (50, UndoCreatorState::Committed(3)),
+            (60, UndoCreatorState::Committed(30)),
+        ]);
+        let mut victims = Vec::new();
+        loop {
+            let plan = undo.plan_purge_victims_with_recent(
+                &[],
+                100,
+                Some(10),
+                &creators,
+                9,
+                &HashSet::new(),
+                2,
+                2,
+            );
+            assert!(plan.scanned <= 2);
+            undo.apply_purge_victims(&plan.victims, &creators);
+            victims.extend(plan.victims);
+            if plan.sweep_complete {
+                break;
+            }
+        }
+        assert_eq!(victims, vec![20, 50]);
+        assert!(
+            undo.records.contains_key(&10),
+            "unknown creator above watermark survives"
+        );
+        assert!(undo.records.contains_key(&40), "prepared creator survives");
+        assert!(
+            undo.records.contains_key(&60),
+            "version above snapshot survives"
+        );
+        let released = BTreeMap::from([
+            (40, UndoCreatorState::RolledBack),
+            (60, UndoCreatorState::Committed(30)),
+        ]);
+        loop {
+            let plan = undo.plan_purge_victims_with_recent(
+                &[],
+                100,
+                Some(40),
+                &released,
+                10,
+                &HashSet::new(),
+                1,
+                1,
+            );
+            undo.apply_purge_victims(&plan.victims, &released);
+            if plan.sweep_complete {
+                break;
+            }
+        }
+        assert!(
+            undo.records.is_empty(),
+            "later eligibility is not cached away"
+        );
+    }
+
+    #[test]
+    fn purge_scan_budget_preserves_snapshot_retention_and_active_chain_gates() {
+        let mut undo = UndoTablespace::default();
+        for id in 1..=9 {
+            let txn = if id == 8 { 99 } else { id };
+            undo.insert(
+                make_record(id, txn, if id == 9 { 101 } else { 100 }, None),
+                false,
+                true,
+            )
+            .unwrap();
+        }
+        let creators = BTreeMap::from([
+            (1, UndoCreatorState::Active),
+            (2, UndoCreatorState::Prepared),
+            (3, UndoCreatorState::RolledBack),
+            (4, UndoCreatorState::Committed(5)),
+            (5, UndoCreatorState::Committed(20)),
+            (7, UndoCreatorState::Committed(1)),
+            (99, UndoCreatorState::RolledBack),
+        ]);
+        let mut victims = Vec::new();
+        loop {
+            let plan = undo.plan_purge_victims_with_recent(
+                &[(99, 8)],
+                100,
+                Some(10),
+                &creators,
+                5,
+                &HashSet::from([7]),
+                2,
+                2,
+            );
+            assert!(plan.scanned <= 2);
+            undo.apply_purge_victims(&plan.victims, &creators);
+            victims.extend(plan.victims);
+            if plan.sweep_complete {
+                break;
+            }
+        }
+        assert_eq!(victims, vec![3, 4]);
+        assert_eq!(undo.records.len(), 7);
+        assert!(
+            undo.records.contains_key(&8),
+            "active chain beats creator eligibility"
+        );
+        assert!(
+            undo.records.contains_key(&9),
+            "retention cutoff is inclusive and bounded"
+        );
+    }
+
+    #[test]
+    fn purge_scan_cursor_handles_zero_budget_and_retention_moving_backwards() {
+        let mut undo = UndoTablespace::default();
+        for id in 1..=3 {
+            undo.insert(make_record(id, 1, id * 20, None), false, true)
+                .unwrap();
+        }
+        let creators = BTreeMap::from([(1, UndoCreatorState::Active)]);
+        let _ =
+            undo.plan_purge_victims_with_recent(&[], 60, None, &creators, 0, &HashSet::new(), 2, 3);
+        let before = undo.keep_cache.lock().scan_after;
+        let empty =
+            undo.plan_purge_victims_with_recent(&[], 60, None, &creators, 0, &HashSet::new(), 0, 3);
+        assert_eq!(empty.scanned, 0);
+        assert!(!empty.sweep_complete);
+        assert_eq!(undo.keep_cache.lock().scan_after, before);
+        let backwards =
+            undo.plan_purge_victims_with_recent(&[], 10, None, &creators, 0, &HashSet::new(), 2, 3);
+        assert_eq!(backwards.scanned, 0);
+        assert!(backwards.sweep_complete);
+        assert!(undo.keep_cache.lock().scan_after.is_none());
+        assert_eq!(undo.records.len(), 3);
     }
 
     #[test]
@@ -8607,7 +9253,7 @@ mod buffer_tests {
         let mut handles = Vec::new();
         for t in 0..threads {
             let undo = std::sync::Arc::clone(&undo);
-            handles.push(std::thread::spawn(move || {
+            handles.push(crate::util::thread_spawn::spawn(move || {
                 let mut ids = Vec::new();
                 for i in 0..per_thread {
                     let txn = t * 10_000 + i + 1;

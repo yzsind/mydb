@@ -1048,12 +1048,12 @@ impl LogManager {
         if discovered.len() > 0x0100_0000 {
             return Err(corrupt_directory());
         }
-        let workers = std::thread::available_parallelism()
+        let workers = crate::util::thread_spawn::available_parallelism()
             .map_or(1, |n| n.get())
             .min(4)
             .min(discovered.len())
             .max(1);
-        let jobs = std::thread::scope(|scope| {
+        let jobs = crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::new();
             for worker in 0..workers {
                 let discovered = &discovered;

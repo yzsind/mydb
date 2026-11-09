@@ -1409,7 +1409,7 @@ pub(super) fn try_execute_streaming_semi_anti_neq_join(
     let execution_context =
         crate::engine::executor::select::execution_context::ExecutionContext::capture(txn);
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective as usize);
         for (lo, hi) in parts {
             let worker_context = execution_context.clone();
@@ -3824,7 +3824,7 @@ pub(super) fn try_execute_streaming_inner_hash_join(
         return Ok(Some(final_out));
     }
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles: Vec<std::thread::ScopedJoinHandle<'_, Result<WorkerOut, QueryError>>> =
             Vec::with_capacity(effective_degree as usize);
         for _ in 0..effective_degree {
@@ -4474,7 +4474,7 @@ pub(super) fn try_execute_inner_hash_join_parallel_probe(
     if track_matched {
         record_hash_join_parallel_build_preserved();
     }
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles: Vec<std::thread::ScopedJoinHandle<'_, Result<WorkerOut, QueryError>>> =
             Vec::with_capacity(workers);
         for _ in 0..workers {
@@ -5559,7 +5559,7 @@ pub(super) fn runtime_filter_simple_column_for_table<'a>(
 }
 
 /// Multi-threaded hash join: splits build/probe into P parts by `stable_hash(keys) % P`,
-/// spawns P workers via `std::thread::scope` each running the in-memory hash join, then concatenates the results.
+/// spawns P workers via `crate::util::thread_spawn::scope` each running the in-memory hash join, then concatenates the results.
 ///
 /// The same (build_key, probe_key) pair always routes to the same partition (hashing is consistent),
 /// so the outer-preserved side "unmatched NULL-extension" is produced independently per partition without duplication.
@@ -5642,7 +5642,7 @@ pub(super) fn execute_hash_join_parallel(
         (0..workers).map(|_| Ok(Vec::new())).collect();
     let cursor = AtomicUsize::new(0);
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {
             let spec_ref: &HashJoinSpec<'_> = spec;
@@ -6194,7 +6194,7 @@ pub(super) fn compute_partition_ids(
     let cancel_token = crate::engine::cancel::current_token();
     let mut results: Vec<Result<Vec<u32>, QueryError>> =
         (0..chunks.len()).map(|_| Ok(Vec::new())).collect();
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(chunks.len());
         for (chunk_idx, rows_chunk) in chunks.iter().enumerate() {
             let rows_chunk: &[PlanRow] = rows_chunk;

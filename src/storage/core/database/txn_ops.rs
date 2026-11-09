@@ -29,6 +29,10 @@ pub(crate) enum LockingReadLockWatermark {
 /// records held the write latch ~160 us on average (up to ~3 ms) and the
 /// planning read latch ~130 us, stalling every publisher meanwhile.
 const UNDO_PURGE_ROUND_RECORDS: usize = 64;
+// A scan also visits active and snapshot-pinned versions. Give it bounded
+// headroom over the victim quota so a productive pass can fill that quota
+// and request immediate draining instead of throttling reclaim behind DML.
+const UNDO_PURGE_SCAN_BUDGET_FACTOR: usize = 4;
 
 /// A commit whose MVCC state and WAL record have been published, but whose
 /// durability barrier and post-durable hooks are intentionally deferred.
@@ -3114,7 +3118,7 @@ impl Database {
             let started = Instant::now();
             let files = reduced_redo_files(&self.log, txn_id);
             let pool = &self.buffer_pool;
-            std::thread::scope(|scope| -> Result<(), QueryError> {
+            crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
                 let handles = files
                     .into_iter()
                     .map(|file| {
@@ -5662,8 +5666,8 @@ impl Database {
     /// Run one purge batch. Returns `true` when the batch filled to
     /// `undo_purge_batch_records` — a signal that MORE eligible undo is
     /// still pending (we are *behind*). `false` means the batch came back
-    /// partial/empty: everything currently eligible has been reclaimed
-    /// (we are *caught up*).
+    /// partial/empty or exhausts its scan budget. A partial scan resumes on
+    /// the next pass rather than busy-looping over a snapshot-pinned backlog.
     ///
     /// The background worker uses the return value to (a) drain a burst by
     /// looping while `true`, and (b) run segment compaction ONLY when
@@ -5682,20 +5686,10 @@ impl Database {
         }
         let physical_replica = self.physical_replica_mode();
         self.retry_lob_reclaims();
-        let creator_ids = self.undo.read().creator_txn_ids();
-        let (active_txn_heads, creator_states) = {
-            let txns = self.txns.read();
-            (
-                txns.active_undo_heads_with_txn(),
-                txns.undo_creator_states_for(&creator_ids),
-            )
-        };
-        // A creator absent from `creator_states` is purge-safe only when
-        // transaction-slot GC has positively classified its id as committed.
-        // New transactions can append undo after the state snapshot above and
-        // before the undo scan below; treating every absent creator as an old
-        // committed transaction races those foreground writers.
-        let committed_creator_watermark = self.min_retained_txn_id.load(Ordering::Acquire);
+        // Capture the active-chain roots once per maintenance pass. Creator
+        // classification below is per bounded candidate window, not per
+        // historical transaction or repeatedly over the slot directory.
+        let active_txn_heads = self.txns.read().active_undo_heads_with_txn();
         let runtime = self.runtime_config_read();
         let batch_limit = runtime.undo_purge_batch_records.max(1);
         let retention_ms = runtime.undo_retention.as_millis().min(u128::from(u64::MAX)) as u64;
@@ -5723,44 +5717,50 @@ impl Database {
         // side, so the batch is planned and applied in short rounds: one
         // round per batch made each foreground writer that arrived during a
         // pass wait out the whole scan and removal (~1 ms per 4096 records).
-        let recent_committed_txns = if retention_ms == 0 {
-            // Time travel is disabled, so a commit timestamp at the same
-            // clock tick must not accidentally retain its undo payload.
-            HashSet::new()
-        } else {
-            self.temporal_history
-                .txn_ids_committed_since_for(retain_since.saturating_mul(1_000), &creator_ids)
-        };
-        let mut resume_unix_ms = 0;
+        let mut scan_remaining = batch_limit.saturating_mul(UNDO_PURGE_SCAN_BUDGET_FACTOR);
+        let mut sweep_complete = false;
+        let mut newer_records = false;
         let mut purged = 0usize;
         let mut outcome = crate::storage::undo::PurgeOutcome::default();
-        while purged < batch_limit {
+        while purged < batch_limit && scan_remaining > 0 {
             let round_limit = (batch_limit - purged).min(UNDO_PURGE_ROUND_RECORDS);
-            let victims = self.undo.read().plan_purge_victims_with_recent(
+            let candidates = self
+                .undo
+                .read()
+                .scan_purge_candidates(retain_since, scan_remaining.min(round_limit));
+            scan_remaining -= candidates.scanned;
+            sweep_complete = candidates.sweep_complete;
+            newer_records = candidates.newer_records;
+            let creator_ids: Vec<u64> = candidates.records.iter().map(|(_, txn)| *txn).collect();
+            let creator_states = self.txns.read().undo_creator_states_for(&creator_ids);
+            // Absent creators need positive committed-slot GC classification.
+            // Newly published records are outside this captured candidate batch.
+            let committed_creator_watermark = self.min_retained_txn_id.load(Ordering::Acquire);
+            let recent_committed_txns = if retention_ms == 0 {
+                HashSet::new()
+            } else {
+                self.temporal_history
+                    .txn_ids_committed_since_for(retain_since.saturating_mul(1_000), &creator_ids)
+            };
+            let victims = self.undo.read().plan_purge_candidates(
+                &candidates,
                 &active_txn_heads,
-                retain_since,
                 oldest_snapshot_scn,
                 &creator_states,
                 committed_creator_watermark,
                 &recent_committed_txns,
-                &mut resume_unix_ms,
-                round_limit,
             );
-            if victims.is_empty() {
-                break;
+            if !victims.is_empty() {
+                purged += victims.len();
+                let mut undo = self.undo.write();
+                if physical_replica {
+                    // Physical source pointers must not be remapped here.
+                    undo.evict_replica_records(&victims);
+                } else {
+                    outcome.absorb(undo.apply_purge_victims(&victims, &creator_states));
+                }
             }
-            purged += victims.len();
-            let mut undo = self.undo.write();
-            if physical_replica {
-                // Drop only resident directory entries. Source undo pointers
-                // are physical identities: never unlink/compact segments or
-                // reclaim heap/LOB state independently on a replica.
-                undo.evict_replica_records(&victims);
-            } else {
-                outcome.absorb(undo.apply_purge_victims(&victims, &creator_states));
-            }
-            drop(undo);
-            if victims.len() < round_limit {
+            if sweep_complete {
                 break;
             }
         }
@@ -5785,7 +5785,7 @@ impl Database {
         // acquire a read lock while a backup writer could be waiting.
         drop(maintenance);
         // Phase 5 — adaptive compaction, gated to the caught-up path.
-        if !was_full && !physical_replica {
+        if !was_full && sweep_complete && !newer_records && !physical_replica {
             self.maybe_compact_undo_when_caught_up(retention_ms);
         }
         was_full

@@ -2471,7 +2471,7 @@ impl Database {
             >,
         > = Vec::with_capacity(chunk_count);
         let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::with_capacity(chunk_count);
             for chunk in chunks {
                 let cancellation = cancellation.clone();

@@ -3249,7 +3249,7 @@ fn mysql_rand_arg_extreme_parallel(
     let workers = workers.max(1).min(rows);
     let chunk = rows.div_ceil(workers);
     let mut partials = Vec::with_capacity(workers);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for worker in 0..workers {
             let start = worker.saturating_mul(chunk);
@@ -4446,7 +4446,7 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
         } => eval_case(operand, conditions, results, else_result, eval_const),
         Expr::Function { name, args, .. } => {
             let value = eval_function(name, args, |arg| {
-            let value = eval_const(arg)?;
+                let value = eval_const(arg)?;
                 let value = function_argument_with_json_source(name, args, arg, value, |arg| {
                     crate::engine::expr_type::infer_expr_type_in_table(arg, empty_expr_schema())
                 });
@@ -4455,7 +4455,7 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                         crate::engine::expr_type::infer_expr_type_in_table(arg, empty_expr_schema())
                     })?;
                 function_arg_with_table_octets(name, arg, empty_expr_schema(), value)
-        })?;
+            })?;
             coerce_null_selection_result(name, args, value, |arg| {
                 crate::engine::expr_type::infer_expr_type_in_table(arg, empty_expr_schema())
             })
@@ -4747,7 +4747,11 @@ fn eval_expr_legacy_inner(
                 eval_expr_legacy(high, table, values)?,
             )?;
             with_compare_collation(collation_id, || {
-                eval_between_with_provenance(&value, &low_val, &high_val, *negated,
+                eval_between_with_provenance(
+                    &value,
+                    &low_val,
+                    &high_val,
+                    *negated,
                     [
                         ComparisonProvenance::from_exprs(expr, low)
                             .with_temporal_constant_context(expr, low),
@@ -4864,8 +4868,8 @@ fn eval_expr_legacy_inner(
                         descriptor.kind,
                         crate::engine::expr_type::ExprTypeKind::String {
                             kind: crate::engine::expr_type::StringKind::Enum
-                            | crate::engine::expr_type::StringKind::Set
-                            | crate::engine::expr_type::StringKind::Binary
+                                | crate::engine::expr_type::StringKind::Set
+                                | crate::engine::expr_type::StringKind::Binary
                                 | crate::engine::expr_type::StringKind::Blob
                         } | crate::engine::expr_type::ExprTypeKind::Bit { .. }
                     ) {
@@ -5884,8 +5888,7 @@ where
             if binary_result {
                 Ok(Value::Bytes(out))
             } else {
-                Ok(Value::String(
-                    String::from_utf8(out).map_err(|_| {
+                Ok(Value::String(String::from_utf8(out).map_err(|_| {
                     crate::error::catalog::ER_INVALID_CHARACTER_STRING
                         .error("Invalid CONCAT_WS character string")
                 })?))
@@ -7979,7 +7982,8 @@ where
             let mut result = eval_date_add_values(&dt_val, &amount_val, &unit, false)?;
             // String temporal results use six digits only when a fraction is present.
             if matches!(
-                dt_val, Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                dt_val,
+                Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
             ) {
                 if let Value::String(text) = &mut result {
                     if let Some(dot) = text.find('.') {
@@ -11392,13 +11396,16 @@ pub(crate) fn extract_datetime_part(
     ) {
         return match parse_time_value_components(value) {
             Ok((negative, h, m, s, us)) => Ok(Value::Int(
-                (if negative && name.eq_ignore_ascii_case("EXTRACT") { -1 } else { 1 })
-                    * i64::from(match part.as_str() {
-                        "HOUR" | "HOURS" => h,
-                        "MINUTE" | "MINUTES" => m,
-                        "SECOND" | "SECONDS" => s,
-                        _ => us,
-                    }),
+                (if negative && name.eq_ignore_ascii_case("EXTRACT") {
+                    -1
+                } else {
+                    1
+                }) * i64::from(match part.as_str() {
+                    "HOUR" | "HOURS" => h,
+                    "MINUTE" | "MINUTES" => m,
+                    "SECOND" | "SECONDS" => s,
+                    _ => us,
+                }),
             )),
             Err(err) => Ok(warn_invalid_temporal_function("time", value, err)),
         };
@@ -12677,10 +12684,9 @@ pub(crate) fn eval_enum_set_comparison_values(
     }
     // String comparisons use collation order; only numeric operands use ordinals.
     if matches!(
-            values[1],
-            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
-        )
-    {
+        values[1],
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+    ) {
         let cmp =
             with_optional_compare_collation(collation, || compare_values(&values[0], &values[1]))?;
         let matched = match op.as_str() {
@@ -16965,9 +16971,7 @@ pub(crate) fn json_extract_value_refs(doc: &Value, paths: &[&Value]) -> Result<V
 
 /// JSON_KEYS accepts one concrete path and never auto-wraps non-arrays.
 /// Keep this policy distinct from JSON_LENGTH and JSON_VALUE navigation.
-fn json_keys_path_target(
-    doc_bytes: &[u8],
-    path: &str) -> Result<Option<Vec<u8>>, QueryError> {
+fn json_keys_path_target(doc_bytes: &[u8], path: &str) -> Result<Option<Vec<u8>>, QueryError> {
     let jp = crate::engine::func_cache::cached_json_path(path)?;
     if jp.has_wildcard {
         return Err(crate::error::catalog::ER_INVALID_JSON_PATH_WILDCARD.error(
@@ -17460,7 +17464,8 @@ impl JsonSearch<'_> {
                 } else {
                     let identity = node.identity();
                     while self
-                        .scopes.get(self.scope_cursor)
+                        .scopes
+                        .get(self.scope_cursor)
                         .is_some_and(|(scope, _)| *scope < identity)
                     {
                         self.scope_cursor += 1;
@@ -19549,7 +19554,9 @@ pub(crate) fn binary_assignment_value(
     };
     if !matches!(
         target,
-        DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. } | DataTypeKind::Blob { .. }
+        DataTypeKind::Binary { .. }
+            | DataTypeKind::VarBinary { .. }
+            | DataTypeKind::Blob { .. }
             | DataTypeKind::Bit { .. }
     ) {
         return Ok(value);
@@ -22592,8 +22599,7 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
                         || zero_date
                         || (!matches!(data_type, DataTypeKind::Timestamp { .. })
                             && !zero_in_date
-                            && bits & crate::engine::api::TEMPORAL_MODE_ALLOW_INVALID_DATES
-                                    != 0)
+                            && bits & crate::engine::api::TEMPORAL_MODE_ALLOW_INVALID_DATES != 0)
                 },
             );
         if valid {
@@ -23414,34 +23420,34 @@ fn arithmetic_error_context(
 
 /// Convert temporal numbers without passing their calendar digits through f64.
 pub(crate) fn temporal_exact_number(value: &Value) -> Result<Option<Value>, QueryError> {
-        let localized;
-        let value = if let Value::Timestamp(ts) = value {
-            localized = Value::DateTime(session_utc_timestamp_to_local_datetime_micros(*ts)?);
-            &localized
-        } else {
-            value
-        };
-        Ok(crate::types::temporal_to_mysql_number(value).map(|number| {
-            if number.frac_micros == 0 {
-                Value::Int(if number.negative {
-                    -number.int_part
-                } else {
-                    number.int_part
-                })
+    let localized;
+    let value = if let Value::Timestamp(ts) = value {
+        localized = Value::DateTime(session_utc_timestamp_to_local_datetime_micros(*ts)?);
+        &localized
+    } else {
+        value
+    };
+    Ok(crate::types::temporal_to_mysql_number(value).map(|number| {
+        if number.frac_micros == 0 {
+            Value::Int(if number.negative {
+                -number.int_part
             } else {
-                let magnitude =
-                    i128::from(number.int_part) * 1_000_000 + i128::from(number.frac_micros);
-                make_exact_decimal_value(
-                    if number.negative {
-                        -magnitude
-                    } else {
-                        magnitude
-                    },
-                    6,
-                )
-            }
-        }))
-    }
+                number.int_part
+            })
+        } else {
+            let magnitude =
+                i128::from(number.int_part) * 1_000_000 + i128::from(number.frac_micros);
+            make_exact_decimal_value(
+                if number.negative {
+                    -magnitude
+                } else {
+                    magnitude
+                },
+                6,
+            )
+        }
+    }))
+}
 
 fn eval_temporal_arithmetic(
     left: &Value,
@@ -23515,27 +23521,28 @@ fn eval_arithmetic_inner(left: &Value, op: BinaryOp, right: &Value) -> Result<Va
                 })
             } else {
                 (decimal_op == crate::util::decimal::DecimalBinaryOp::Mod
-                    || left_decimal.scale().saturating_add(right_decimal.scale()) > 30).then(|| {
-                // MySQL exposes the full 81-digit scratch result for a
-                // standalone MOD expression.  A CTAS/DML destination still
-                // shapes it to the declared DECIMAL(65,30) metadata during
-                // column coercion.
-                let scale = if decimal_op == crate::util::decimal::DecimalBinaryOp::Mul {
+                    || left_decimal.scale().saturating_add(right_decimal.scale()) > 30)
+                    .then(|| {
+                        // MySQL exposes the full 81-digit scratch result for a
+                        // standalone MOD expression.  A CTAS/DML destination still
+                        // shapes it to the declared DECIMAL(65,30) metadata during
+                        // column coercion.
+                        let scale = if decimal_op == crate::util::decimal::DecimalBinaryOp::Mul {
                             left_decimal
-                    .scale()
-                    .saturating_add(right_decimal.scale())
+                                .scale()
+                                .saturating_add(right_decimal.scale())
                                 .min(30)
                         } else {
                             left_decimal
                                 .scale()
                                 .max(right_decimal.scale())
-                    .min(crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION)
+                                .min(crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION)
                         };
-                crate::util::decimal::DecimalResultSpec {
-                    precision: crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
-                    scale,
-                }
-            })
+                        crate::util::decimal::DecimalResultSpec {
+                            precision: crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
+                            scale,
+                        }
+                    })
             };
             let context = crate::util::decimal::DecimalContext {
                 result,
@@ -25744,7 +25751,8 @@ impl ComparisonProvenance {
         };
         self.left_constant = constant(left);
         self.right_constant = constant(right);
-        if self.left_constant || self.right_constant
+        if self.left_constant
+            || self.right_constant
             || self.left_parameter.is_some()
             || self.right_parameter.is_some()
         {
@@ -25787,7 +25795,8 @@ pub(crate) fn with_numeric_comparison_context<T>(
                 || matches!(
                     right_value,
                     Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_)
-                ) {
+                )
+            {
                 provenance.with_temporal_constant_context(left_expr, right_expr)
             } else {
                 provenance
@@ -26020,7 +26029,7 @@ pub(crate) fn report_invalid_date_comparison(kind: &str, value: &Value) -> Resul
     if TEMPORAL_STRING_CONSTANT.with(|slot| slot.get()) != Some(false)
         && !IN_LIST_COMPARISON_CONTEXT.with(std::cell::Cell::get)
         && (!crate::engine::params::has_active_params()
-        || crate::engine::params::auto_parameterized_active())
+            || crate::engine::params::auto_parameterized_active())
     {
         return Err(error(
             crate::error::catalog::ER_WRONG_VALUE,
@@ -26237,7 +26246,7 @@ fn compare_temporal_numeric_values(
     };
     if let Some(index) = TEMPORAL_NUMERIC_PARAMETER.with(|slot| slot.get()) {
         let text = numeric.to_display_string();
-    let valid = crate::util::temporal::parse_compact_datetime(&text).is_some_and(|parts| {
+        let valid = crate::util::temporal::parse_compact_datetime(&text).is_some_and(|parts| {
             NaiveDate::from_ymd_opt(parts.year as i32, parts.month, parts.day)
                 .and_then(|date| {
                     date.and_hms_micro_opt(parts.hour, parts.minute, parts.second, parts.micros)
@@ -27284,8 +27293,7 @@ pub(crate) fn coerce_result_to_expr_type(
             Ok(Value::String(string_value(&value)))
         }
         ExprTypeKind::String { .. }
-            if value_is_numeric(&value) || matches!(value, Value::Json(_)
-            ) =>
+            if value_is_numeric(&value) || matches!(value, Value::Json(_)) =>
         {
             Ok(Value::String(string_value(&value)))
         }
@@ -28592,8 +28600,8 @@ fn json_path_remove(doc: &mut OwnedJsonb, path: &str) -> Result<(), QueryError> 
     let mut physical = Vec::with_capacity(segments.len());
     let mut current = &*doc;
     for segment in &segments {
-            match segment {
-                JsonPathSegment::Key(key) => {
+        match segment {
+            JsonPathSegment::Key(key) => {
                 let Some(next) = current.object_get(key) else {
                     return Ok(());
                 };
@@ -28627,14 +28635,14 @@ fn json_path_remove(doc: &mut OwnedJsonb, path: &str) -> Result<(), QueryError> 
     }
     match (last, parent) {
         (JsonPathSegment::Key(key), OwnedJsonb::Object(map)) => {
-                        map.retain(|(candidate, _)| candidate != key)
+            map.retain(|(candidate, _)| candidate != key)
         }
         (segment, OwnedJsonb::Array(array)) => {
             if let Some(index) = resolve_dom_index(segment, array.len()) {
                 array.remove(index);
-                    }
-                }
-                _ => unreachable!("resolved physical JSON path"),
+            }
+        }
+        _ => unreachable!("resolved physical JSON path"),
     }
     Ok(())
 }
@@ -31239,7 +31247,7 @@ mod stack_safety_tests {
 
     #[test]
     fn recursive_scalar_paths_are_bounded_on_small_worker_stack() {
-        std::thread::Builder::new()
+        crate::util::thread_spawn::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(|| {
                 let schema = empty_expr_schema();
@@ -31440,7 +31448,9 @@ mod json_search_iterator_tests {
                                 expected.len()
                             };
                             assert_eq!(
-                                search.matches.iter()
+                                search
+                                    .matches
+                                    .iter()
                                     .map(|(_, path)| path)
                                     .collect::<Vec<_>>(),
                                 expected[..limit].iter().collect::<Vec<_>>(),

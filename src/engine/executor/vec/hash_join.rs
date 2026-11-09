@@ -35,8 +35,67 @@ pub(crate) type BuildIndex = hashbrown::HashMap<Vec<u8>, SmallVec<[u32; 1]>, aha
 /// Native two-integer join-key index. Composite integer joins are common for
 /// parent/child and bridge tables; keeping the pair typed avoids constructing
 /// a canonical byte buffer and hashing that buffer for every probe row.
-pub(crate) type I64PairBuildIndex =
-    hashbrown::HashMap<(i64, i64), SmallVec<[u32; 1]>, ahash::RandomState>;
+type I64PairHashIndex = hashbrown::HashMap<(i64, i64), SmallVec<[u32; 1]>, ahash::RandomState>;
+
+pub(crate) enum I64PairBuildIndex {
+    Hash(I64PairHashIndex),
+    /// A bounded Cartesian integer domain has an exact mixed-radix address.
+    /// Keep each dimension's bounds: checking only the packed offset would
+    /// let an out-of-range second key alias the next first-key bucket.
+    Dense {
+        first_min: i64,
+        first_span: u64,
+        second_min: i64,
+        second_span: u64,
+        index: I64BuildIndex,
+    },
+}
+
+impl I64PairBuildIndex {
+    #[inline]
+    pub(crate) fn get(&self, key: &(i64, i64)) -> Option<&[u32]> {
+        match self {
+            Self::Hash(index) => index.get(key).map(SmallVec::as_slice),
+            Self::Dense {
+                first_min,
+                first_span,
+                second_min,
+                second_span,
+                index,
+            } => {
+                let first = key.0.checked_sub(*first_min)? as u64;
+                let second = key.1.checked_sub(*second_min)? as u64;
+                if first >= *first_span || second >= *second_span {
+                    return None;
+                }
+                index.get(&((first * second_span + second) as i64))
+            }
+        }
+    }
+
+    pub(crate) fn all_unique(&self) -> bool {
+        match self {
+            Self::Hash(index) => index.values().all(|hits| hits.len() <= 1),
+            Self::Dense { index, .. } => index.all_unique(),
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        match self {
+            Self::Hash(index) => index.len(),
+            Self::Dense { index, .. } => match index {
+                I64BuildIndex::DenseUnique { entries, .. } => {
+                    entries.iter().filter(|&&row| row != u32::MAX).count()
+                }
+                I64BuildIndex::DenseMulti { offsets, .. } => {
+                    offsets.windows(2).filter(|pair| pair[0] != pair[1]).count()
+                }
+                I64BuildIndex::Hash(index) => index.len(),
+            },
+        }
+    }
+}
 
 pub(crate) enum I64BuildIndex {
     /// One row per key in a compact direct-address table. `u32::MAX` marks
@@ -407,9 +466,7 @@ impl<'a> PayloadProbe<'a> {
                 (
                     usable,
                     if usable {
-                        index
-                            .get(&(first.values[row], second.values[row]))
-                            .map(SmallVec::as_slice)
+                        index.get(&(first.values[row], second.values[row]))
                     } else {
                         None
                     },
@@ -592,8 +649,10 @@ fn build_i64_pair_index(
     let non_null = (0..first_values.len())
         .filter(|&row| !first.is_null(row) && !second.is_null(row))
         .count();
-    let mut index =
-        I64PairBuildIndex::with_capacity_and_hasher(non_null, ahash::RandomState::new());
+    if let Some(dense) = build_dense_i64_pair_index(first, second, non_null) {
+        return Some(dense);
+    }
+    let mut index = I64PairHashIndex::with_capacity_and_hasher(non_null, ahash::RandomState::new());
     for row in 0..first_values.len() {
         if !first.is_null(row) && !second.is_null(row) {
             index
@@ -602,7 +661,69 @@ fn build_i64_pair_index(
                 .push(row as u32);
         }
     }
-    Some(index)
+    Some(I64PairBuildIndex::Hash(index))
+}
+
+fn build_dense_i64_pair_index(
+    first: &ColumnVector,
+    second: &ColumnVector,
+    non_null: usize,
+) -> Option<I64PairBuildIndex> {
+    let first_values = first.as_i64_slice()?;
+    let second_values = second.as_i64_slice()?;
+    // Normal equality collectors have already removed NULL-key rows. A
+    // build-preserving collector can keep arbitrarily many NULL payloads;
+    // avoid a temporary packed lane whose size then exceeds the admitted
+    // non-NULL index state. Its existing hash representation stays valid.
+    if non_null == 0 || non_null != first_values.len() {
+        return None;
+    }
+    let mut first_min = i64::MAX;
+    let mut first_max = i64::MIN;
+    let mut second_min = i64::MAX;
+    let mut second_max = i64::MIN;
+    let limit = 64_000_000_u128.min((non_null as u128).saturating_mul(8));
+    let domain = |first_min: i64, first_max: i64, second_min: i64, second_max: i64| {
+        let first_span = (i128::from(first_max) - i128::from(first_min) + 1) as u128;
+        let second_span = (i128::from(second_max) - i128::from(second_min) + 1) as u128;
+        // Check each span before multiplication, including the full i64
+        // domain whose Cartesian product cannot be represented by u128.
+        (first_span <= limit && second_span <= limit && first_span * second_span <= limit)
+            .then_some((first_span as u64, second_span as u64))
+    };
+    for row in 0..first_values.len() {
+        first_min = first_min.min(first_values[row]);
+        first_max = first_max.max(first_values[row]);
+        second_min = second_min.min(second_values[row]);
+        second_max = second_max.max(second_values[row]);
+        // Bounds only expand. Once a prefix exceeds the admitted dense
+        // domain, later rows cannot make it eligible. Check periodically to
+        // keep sparse-key builds from paying for a complete extra scan.
+        if row & 1023 == 1023 {
+            domain(first_min, first_max, second_min, second_max)?;
+        }
+    }
+    // The temporary packed lane plus the dense index/CSR fit below the
+    // collector's existing conservative hash-index charge. Sparse or huge
+    // domains retain the hash representation, without allocating the lane.
+    let (first_span, second_span) = domain(first_min, first_max, second_min, second_max)?;
+    let mut packed = Vec::with_capacity(first_values.len());
+    for row in 0..first_values.len() {
+        let first = (i128::from(first_values[row]) - i128::from(first_min)) as u64;
+        let second = (i128::from(second_values[row]) - i128::from(second_min)) as u64;
+        packed.push((first * second_span + second) as i64);
+    }
+    let column = ColumnVector::I64 {
+        data: packed,
+        nulls: None,
+    };
+    Some(I64PairBuildIndex::Dense {
+        first_min,
+        first_span,
+        second_min,
+        second_span,
+        index: build_i64_index(&[column], &[0], &[false], &[])?,
+    })
 }
 
 /// Collect the build stream: column accumulation + key indexing. Rows containing a non-null-safe
@@ -844,7 +965,7 @@ pub(crate) fn collect_full_build_payload_i64_pair_only(
         .map(|_| ColumnVector::Null { len: 0 })
         .collect();
     let mut index =
-        I64PairBuildIndex::with_capacity_and_hasher(reserve_rows, ahash::RandomState::new());
+        I64PairHashIndex::with_capacity_and_hasher(reserve_rows, ahash::RandomState::new());
     let cap = current_vec_build_cap();
     let mut bytes = 0u64;
     let mut next_row = 0u32;
@@ -900,7 +1021,7 @@ pub(crate) fn collect_full_build_payload_i64_pair_only(
         columns,
         index: BuildIndex::default(),
         i64_index: None,
-        i64_pair_index: Some(index),
+        i64_pair_index: Some(I64PairBuildIndex::Hash(index)),
     })
 }
 
@@ -1453,7 +1574,7 @@ pub fn run_inner_hash_join_partitioned(
         .first()
         .map(|b| b.columns().len())
         .unwrap_or(0);
-    let payloads: Vec<BuildPayload> = std::thread::scope(|s| {
+    let payloads: Vec<BuildPayload> = crate::util::thread_spawn::scope(|s| {
         let handles: Vec<_> = (0..parts)
             .map(|pid| {
                 let build_batches = &build_batches;
@@ -2501,6 +2622,7 @@ mod tests {
     struct CapturingRuntimeFilterProbe {
         schema: Arc<BatchSchema>,
         installed: Rc<RefCell<Vec<crate::planner::RuntimeFilter>>>,
+        components_only: bool,
     }
 
     impl BatchOperator for CapturingRuntimeFilterProbe {
@@ -2509,6 +2631,11 @@ mod tests {
         }
 
         fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
+            if self.components_only
+                && matches!(&filter, crate::planner::RuntimeFilter::BloomKey { keys, .. } if keys.len() > 1)
+            {
+                return false;
+            }
             self.installed.borrow_mut().push(filter);
             true
         }
@@ -2742,7 +2869,7 @@ mod tests {
         assert!(payload.index.is_empty());
         let index = payload.i64_pair_index.as_ref().unwrap();
         assert_eq!(index.len(), 1);
-        assert_eq!(index.get(&(1, 2)).unwrap().as_slice(), &[0, 1]);
+        assert_eq!(index.get(&(1, 2)).unwrap(), &[0, 1]);
         for row in 0..5 {
             assert_eq!(
                 payload
@@ -2776,13 +2903,41 @@ mod tests {
         let input = batch(&schema, &[(10, 7), (10, 8), (10, 7), (11, 7)]);
         let index = build_i64_pair_index(input.columns(), &[0, 1], &[false, false], &[])
             .expect("two signed integer keys are indexable");
-        assert_eq!(
-            index.get(&(10, 7)).map(SmallVec::as_slice),
-            Some(&[0, 2][..])
-        );
-        assert_eq!(index.get(&(10, 8)).map(SmallVec::as_slice), Some(&[1][..]));
-        assert_eq!(index.get(&(11, 7)).map(SmallVec::as_slice), Some(&[3][..]));
+        assert!(matches!(index, I64PairBuildIndex::Dense { .. }));
+        assert_eq!(index.get(&(10, 7)), Some(&[0, 2][..]));
+        assert_eq!(index.get(&(10, 8)), Some(&[1][..]));
+        assert_eq!(index.get(&(11, 7)), Some(&[3][..]));
+        assert_eq!(index.len(), 3);
+        assert!(!index.all_unique());
+        assert!(index.get(&(10, 9)).is_none());
+        assert!(index.get(&(11, 6)).is_none());
         assert!(index.get(&(7, 10)).is_none());
+    }
+
+    #[test]
+    fn native_i64_pair_dense_extremes_and_sparse_fallback() {
+        let schema = schema_kv();
+        for base in [i64::MIN, -1, i64::MAX - 1] {
+            let input = batch(&schema, &[(base, -4), (base + 1, -4), (base, -3)]);
+            let index =
+                build_i64_pair_index(input.columns(), &[0, 1], &[false, false], &[]).unwrap();
+            assert!(matches!(index, I64PairBuildIndex::Dense { .. }));
+            assert!(index.all_unique());
+            assert_eq!(index.get(&(base, -4)), Some(&[0][..]));
+            assert_eq!(index.get(&(base + 1, -4)), Some(&[1][..]));
+            assert_eq!(index.get(&(base, -3)), Some(&[2][..]));
+            assert!(index.get(&(base, -2)).is_none());
+            assert!(index.get(&(base + 1, -5)).is_none());
+            assert!(index.get(&(base + 1, -3)).is_none());
+        }
+        // A domain product can exceed u128 at the complete i64 range.
+        // Decline before allocating; hashing preserves exact integer keys.
+        let input = batch(&schema, &[(i64::MIN, i64::MIN), (i64::MAX, i64::MAX)]);
+        let index = build_i64_pair_index(input.columns(), &[0, 1], &[false, false], &[]).unwrap();
+        assert!(matches!(index, I64PairBuildIndex::Hash(_)));
+        assert_eq!(index.get(&(i64::MIN, i64::MIN)), Some(&[0][..]));
+        assert_eq!(index.get(&(i64::MAX, i64::MAX)), Some(&[1][..]));
+        assert!(index.get(&(i64::MIN, i64::MAX)).is_none());
     }
 
     #[test]
@@ -2798,8 +2953,7 @@ mod tests {
             payload
                 .i64_pair_index
                 .as_ref()
-                .and_then(|index| index.get(&(1, 10)))
-                .map(SmallVec::as_slice),
+                .and_then(|index| index.get(&(1, 10))),
             Some(&[0, 2][..])
         );
     }
@@ -2985,50 +3139,67 @@ mod tests {
     }
 
     #[test]
-    fn composite_integer_runtime_filter_splits_into_short_circuit_components() {
+    fn composite_integer_runtime_filter_preserves_correlation_and_split_fallback() {
         let schema = schema_kv();
         let pairs = (0..4_096)
             .map(|key| (key as i64, (key as i64) * 17))
             .collect::<Vec<_>>();
-        let build_batch = batch(&schema, &pairs);
-        let mut build = MaterializedBatchOperator::new(schema.clone(), vec![build_batch]);
-        let installed = Rc::new(RefCell::new(Vec::new()));
-        let probe = CapturingRuntimeFilterProbe {
-            schema: schema.clone(),
-            installed: installed.clone(),
-        };
-        let _stream = HashJoinBatchOperator::for_test(
-            &mut build,
-            Box::new(probe),
-            &[0, 1],
-            &[0, 1],
-            &[],
-            joined_schema(&schema),
-            true,
-            VecJoinType::Inner,
-        )
-        .unwrap();
-
-        let installed = installed.borrow();
-        assert_eq!(installed.len(), 2);
-        let mut total_bytes = 0usize;
-        for (component, runtime_filter) in installed.iter().enumerate() {
-            let crate::planner::RuntimeFilter::BloomKey { keys, filter, .. } = runtime_filter
-            else {
-                panic!("composite integer key should install Bloom components")
+        for components_only in [false, true] {
+            let build_batch = batch(&schema, &pairs);
+            let mut build = MaterializedBatchOperator::new(schema.clone(), vec![build_batch]);
+            let installed = Rc::new(RefCell::new(Vec::new()));
+            let probe = CapturingRuntimeFilterProbe {
+                schema: schema.clone(),
+                installed: installed.clone(),
+                components_only,
             };
-            assert_eq!(keys.len(), 1);
-            assert!(filter.uses_int_keys());
-            assert!(!filter.uses_int_pair_keys());
-            assert!(filter.contains_int(if component == 0 { 123 } else { 123 * 17 }));
-            total_bytes = total_bytes.saturating_add(filter.byte_size());
+            let _stream = HashJoinBatchOperator::for_test(
+                &mut build,
+                Box::new(probe),
+                &[0, 1],
+                &[0, 1],
+                &[],
+                joined_schema(&schema),
+                true,
+                VecJoinType::Inner,
+            )
+            .unwrap();
+
+            let installed = installed.borrow();
+            assert_eq!(installed.len(), if components_only { 2 } else { 1 });
+            let mut total_bytes = 0usize;
+            for (component, runtime_filter) in installed.iter().enumerate() {
+                let crate::planner::RuntimeFilter::BloomKey { keys, filter, .. } = runtime_filter
+                else {
+                    panic!("composite integer key should install Bloom components")
+                };
+                if components_only {
+                    assert_eq!(keys.len(), 1);
+                    assert!(filter.uses_int_keys());
+                    assert!(filter.contains_int(if component == 0 { 123 } else { 123 * 17 }));
+                } else {
+                    assert_eq!(keys.len(), 2);
+                    assert!(filter.uses_int_pair_keys());
+                    for &(first, second) in &pairs {
+                        assert!(filter.contains_int_pair(i128::from(first), i128::from(second)));
+                    }
+                    let rejected = (0..4_096)
+                        .filter(|&key| !filter.contains_int_pair(key, ((key + 1) % 4_096) * 17))
+                        .count();
+                    assert!(
+                        rejected > 3_600,
+                        "correlated-pair misses admitted: {rejected}"
+                    );
+                }
+                total_bytes = total_bytes.saturating_add(filter.byte_size());
+            }
+            assert_eq!(
+                total_bytes,
+                crate::engine::executor::select::bloom::BloomFilter::new_int_pair(pairs.len())
+                    .byte_size(),
+                "tuple or component filters must retain the ordinary bitmap budget"
+            );
         }
-        assert_eq!(
-            total_bytes,
-            crate::engine::executor::select::bloom::BloomFilter::new_int_pair(pairs.len())
-                .byte_size(),
-            "component short-circuiting must not increase the ordinary bitmap budget"
-        );
     }
 
     #[test]

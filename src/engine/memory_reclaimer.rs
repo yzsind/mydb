@@ -493,7 +493,7 @@ fn initialize_config() {
 fn ensure_worker() {
     initialize_config();
     WORKER_STARTED.get_or_init(|| {
-        let _ = std::thread::Builder::new()
+        let _ = crate::util::thread_spawn::Builder::new()
             .name("mydb-memory-reclaimer".to_string())
             .spawn(worker_loop);
     });
@@ -1920,7 +1920,7 @@ mod tests {
         WORKER_RECLAIM_PENDING.with(|pending| pending.set(false));
         note_worker_memory_release(MIN_HEADROOM_RECLAIM_PEAK_BYTES - 1);
         assert!(!WORKER_RECLAIM_PENDING.with(|pending| pending.get()));
-        std::thread::spawn(|| {
+        crate::util::thread_spawn::spawn(|| {
             note_worker_memory_release(MIN_HEADROOM_RECLAIM_PEAK_BYTES);
             assert!(WORKER_RECLAIM_PENDING.with(|pending| pending.replace(false)));
         })
@@ -1938,7 +1938,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
             let reclaimer = reclaimer.clone();
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 let state = reclaimer.state.lock().unwrap();
                 tx.send(()).unwrap();
                 let state =
@@ -1969,7 +1969,7 @@ mod tests {
         let (done_tx, done_rx) = std::sync::mpsc::channel();
         let worker = {
             let reclaimer = reclaimer.clone();
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 let state = reclaimer.state.lock().unwrap();
                 started_tx.send(()).unwrap();
                 let state = wait_for_quiet_period(&reclaimer, state, quiet).unwrap();

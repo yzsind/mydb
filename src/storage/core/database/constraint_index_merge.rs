@@ -202,7 +202,7 @@ impl Database {
                 CONSTRAINT_INDEX_MERGE_PARALLEL_RUNS.fetch_add(1, Ordering::Relaxed);
                 let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
                 let budget = crate::engine::executor::mem_budget::current_budget();
-                std::thread::scope(|scope| {
+                crate::util::thread_spawn::scope(|scope| {
                     let mut handles = Vec::with_capacity(effective);
                     let mut failure = None;
                     for worker in 0..effective {
@@ -216,7 +216,7 @@ impl Database {
                         });
                         let cancellation = cancellation.clone();
                         let budget = budget.clone();
-                        match std::thread::Builder::new()
+                        match crate::util::thread_spawn::Builder::new()
                             .name(format!("mydb-fk-merge-{worker}"))
                             .stack_size(STACK)
                             .spawn_scoped(scope, move || {
@@ -295,7 +295,7 @@ fn constraint_merge_requested_degree() -> usize {
     #[cfg(test)]
     let requested = CONSTRAINT_MERGE_DEGREE.with(|degree| degree.get().unwrap_or(requested));
     requested
-        .min(std::thread::available_parallelism().map_or(1, usize::from))
+        .min(crate::util::thread_spawn::available_parallelism().map_or(1, usize::from))
         .clamp(1, 64)
 }
 

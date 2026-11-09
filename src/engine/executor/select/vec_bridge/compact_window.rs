@@ -928,7 +928,7 @@ pub(super) fn prepare_with_limit<'a>(
             let session = crate::engine::expr::current_session_expr_info();
             let budget = mem_budget::current_budget();
             let chunk = partitions.len().div_ceil(sort_workers).max(1);
-            std::thread::scope(|scope| {
+            crate::util::thread_spawn::scope(|scope| {
                 let handles = partitions
                     .chunks_mut(chunk)
                     .map(|partitions| {

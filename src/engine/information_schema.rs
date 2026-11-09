@@ -2356,7 +2356,7 @@ pub(crate) fn columns_for_table_name(table_name: &str) -> Result<Vec<Column>, Qu
                 });
             Column {
                 source: crate::types::ColumnSource {
-                        enum_set_values: None,
+                    enum_set_values: None,
                     vector_type: None,
                     collation_coercibility: Some(2),
                     dynamic_parameter: false,

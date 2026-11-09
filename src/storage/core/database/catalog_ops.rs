@@ -987,8 +987,10 @@ impl Database {
         let (database, name) = split_table_name(current_database, &routine.name);
         let key = routine_key(&database, routine.kind.lower(), &name);
         let routine_kind = routine.kind.lower().to_string();
+        let is_function = routine.kind == RoutineKindSchema::Function;
         let now = current_unix_ms();
         let mut next_version = 1;
+        let mut invalidated_views = Vec::new();
         {
             let mut catalog = self.catalog_write()?;
             if !catalog.databases.contains_key(&database) {
@@ -1016,7 +1018,6 @@ impl Database {
                 routine.created_ms = now;
             }
             routine.updated_ms = now;
-            catalog.routines.insert(key, Arc::new(routine));
             if automatic_privileges {
                 if let Some(creator) = creator {
                     let store_charge =
@@ -1064,8 +1065,25 @@ impl Database {
                     }
                 }
             }
+            catalog.routines.insert(key, Arc::new(routine));
+            if or_replace && is_function {
+                for view in catalog.views.values_mut() {
+                    if !view.invalid
+                        && view.routine_dependencies.iter().any(|dep| {
+                            dep.database.eq_ignore_ascii_case(&database)
+                                && dep.name.eq_ignore_ascii_case(&name)
+                        })
+                    {
+                        view.invalid = true;
+                        invalidated_views.push((view.database.clone(), view.name.clone()));
+                    }
+                }
+            }
         }
         self.note_catalog_routine(&database, &routine_kind, &name);
+        for (schema, view) in invalidated_views {
+            self.note_catalog_view(&schema, &view);
+        }
         if automatic_privileges && creator.is_some() {
             self.note_catalog_auth();
         }

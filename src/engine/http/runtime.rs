@@ -259,6 +259,8 @@ static RUNTIME: OnceLock<Result<Runtime, String>> = OnceLock::new();
 fn runtime() -> Result<&'static Runtime, QueryError> {
     RUNTIME
         .get_or_init(|| {
+            let _affinity = crate::util::connection_dispatch::unpin_for_spawn()
+                .map_err(|error| error.to_string())?;
             tokio::runtime::Builder::new_multi_thread()
                 .worker_threads(2)
                 .thread_name("mydb-http-io")

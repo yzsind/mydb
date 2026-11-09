@@ -418,6 +418,8 @@ pub(super) fn finish(
     let exe = std::env::current_exe()
         .map_err(|err| io_err("locate native preparation executable", err))?;
     let grants = super::resources::seal_grants(if pressured { 1 } else { usize::MAX })?;
+    let _affinity = crate::util::connection_dispatch::unpin_for_spawn()
+        .map_err(|err| io_err("restore preparation worker CPU mask", err))?;
     let mut command = std::process::Command::new(exe);
     #[cfg(test)]
     crate::platform::fs::inherit_fixture_sync_batch(&mut command, &stage.path);

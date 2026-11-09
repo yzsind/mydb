@@ -891,7 +891,7 @@ pub(super) fn run_integer_count_topk_index_proof(
         .filter_map(|row| row.first().and_then(count_topk_integer_value))
         .collect::<Vec<_>>();
     let cancel_token = crate::engine::cancel::current_token();
-    let worker_outputs = std::thread::scope(|scope| {
+    let worker_outputs = crate::util::thread_spawn::scope(|scope| {
         let mut senders = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
@@ -1023,7 +1023,7 @@ pub(super) fn run_integer_count_topk_index_proof(
     }
 
     let cancel_token = crate::engine::cancel::current_token();
-    let exact_outputs = std::thread::scope(|scope| {
+    let exact_outputs = crate::util::thread_spawn::scope(|scope| {
         let mut senders = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
@@ -1232,7 +1232,7 @@ pub(super) fn run_integer_count_topk_proof(
         // Reuse the physical scan's workers and governed source reservations;
         // decoding and counting stay on the same thread and own the same batch.
         let abort = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::with_capacity(workers.len());
             for worker in workers {
                 let candidates = &candidate_index;
@@ -1284,7 +1284,7 @@ pub(super) fn run_integer_count_topk_proof(
         // Each queue holds at most two governed batches; close every sender
         // before joining, including producer cancellation and decode errors.
         let cancel = crate::engine::cancel::current_token();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let mut senders = Vec::with_capacity(worker_count);
             let mut handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {
@@ -1859,7 +1859,7 @@ pub(super) fn radix_sort_fingerprint_records(
             counts.fill(0);
         }
         let chunk_rows = values.len().div_ceil(workers);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for (chunk, counts) in values.chunks(chunk_rows).zip(worker_counts.iter_mut()) {
                 scope.spawn(move || {
                     for &value in chunk {
@@ -1881,7 +1881,7 @@ pub(super) fn radix_sort_fingerprint_records(
             }
         }
         let destination = scratch.as_mut_ptr() as usize;
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for (chunk, offsets) in values.chunks(chunk_rows).zip(worker_counts.iter_mut()) {
                 scope.spawn(move || {
                     let destination = destination as *mut u64;
@@ -2253,7 +2253,7 @@ impl StatsProvenCountTopKBatchOperator<'_> {
             let discovery_collations = self.collation_ids.clone();
             let discovery_group_columns = self.proof_group_columns.clone();
             let local_candidate_limit = DISCOVERY_CANDIDATES;
-            let local_hottest = std::thread::scope(|scope| {
+            let local_hottest = crate::util::thread_spawn::scope(|scope| {
                 let mut senders = Vec::with_capacity(worker_count);
                 let mut handles = Vec::with_capacity(worker_count);
                 for _ in 0..worker_count {
@@ -2414,7 +2414,7 @@ impl StatsProvenCountTopKBatchOperator<'_> {
         let proof_column_count = self.proof_schema.len();
         let distinct_input_column = self.distinct_input_column;
         let cancel_token = crate::engine::cancel::current_token();
-        let worker_outputs = std::thread::scope(|scope| {
+        let worker_outputs = crate::util::thread_spawn::scope(|scope| {
             let mut senders = Vec::with_capacity(worker_count);
             let mut handles = Vec::with_capacity(worker_count);
             for _ in 0..worker_count {

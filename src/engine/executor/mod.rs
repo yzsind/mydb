@@ -4720,11 +4720,7 @@ impl QueryEngine for StorageQueryEngine {
                     }
                 },
             };
-            let select = &template.select;
-            if !tx::can_use_read_only_select(session, select)
-                && !tx::can_use_lazy_read_only_transaction_select(session, select)
-                && !tx::can_use_current_transaction_read_select(session, select)
-            {
+            if !tx::can_use_prepared_read(session, template.has_locking_read) {
                 return None;
             }
             return Some(
@@ -4789,11 +4785,7 @@ impl QueryEngine for StorageQueryEngine {
         //   3. Non-locking SELECT after the transaction has already issued
         //      a write — reuses the current txn id so own uncommitted writes
         //      stay visible while still skipping the AST clone + replanning.
-        let select = &rp.presentation_select;
-        if !tx::can_use_read_only_select(session, select)
-            && !tx::can_use_lazy_read_only_transaction_select(session, select)
-            && !tx::can_use_current_transaction_read_select(session, select)
-        {
+        if !tx::can_use_prepared_read(session, rp.has_locking_read) {
             return None;
         }
         Some(self.run_prepared_select(session, &rp, sql, params))
@@ -5095,6 +5087,7 @@ impl StorageQueryEngine {
         self.with_prepared_select_execution(
             session,
             &rp.presentation_select,
+            rp.has_locking_read,
             sql,
             params,
             |session, txn, connection_id| {
@@ -5114,6 +5107,7 @@ impl StorageQueryEngine {
         self.with_prepared_select_execution(
             session,
             &template.select,
+            template.has_locking_read,
             sql,
             params,
             |session, txn, connection_id| {
@@ -5136,6 +5130,7 @@ impl StorageQueryEngine {
         &self,
         session: &mut SessionContext,
         select: &Select,
+        has_locking_read: bool,
         sql: &str,
         params: &[crate::types::Value],
         run: impl FnOnce(&SessionContext, TxnView, u64) -> Result<QueryResponse, QueryError>,
@@ -5151,7 +5146,8 @@ impl StorageQueryEngine {
         // `next_txn_isolation`, RR pins `txn_snapshot_scn` after the
         // first statement), so we build the view here before locking
         // the session into the shared-borrow execution closure below.
-        let (txn, _snapshot_guard) = tx::prepared_select_read_view(&self.db, session, select)?;
+        let (txn, _snapshot_guard) =
+            tx::prepared_select_read_view(&self.db, session, has_locking_read)?;
         let connection_id = session.connection_id as u64;
         let _http_scope = crate::engine::http::enter(&self.db);
         let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
@@ -5169,7 +5165,7 @@ impl StorageQueryEngine {
                 }
                 // Compiled plans bypass execute_select, including its registry scope.
                 // A business-table plan can still scan system tables in joins/subqueries.
-                select::with_session_registry((*self.registry).clone(), || {
+                select::with_shared_session_registry(&self.registry, || {
                     run(session, txn, connection_id)
                 })
             })

@@ -740,6 +740,7 @@ impl RoutineKind {
 pub struct RoutineDef {
     pub kind: RoutineKind,
     pub name: String,
+    pub or_replace: bool,
     pub if_not_exists: bool,
     pub definer: Option<AccountIdent>,
     pub params: Vec<RoutineParam>,

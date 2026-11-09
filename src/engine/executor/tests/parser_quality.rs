@@ -743,6 +743,55 @@ fn quality_read_only_fast_path_checks_nested_query_locks() {
 }
 
 #[test]
+fn quality_prepared_read_shape_preserves_live_transaction_and_nested_lock_checks() {
+    use crate::storage::IsolationLevel;
+    use crate::xa::{XaBranch, XaBranchState, Xid};
+    for sql in [
+        "SELECT id FROM t WHERE id = ?",
+        "SELECT id FROM t FOR UPDATE",
+        "SELECT id FROM t WHERE id = ANY (SELECT id FROM t FOR SHARE)",
+        "SELECT * FROM (WITH c AS (SELECT id FROM t FOR UPDATE) SELECT id FROM c) d",
+    ] {
+        let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+            panic!("SELECT expected")
+        };
+        let locking = super::super::tx::select_has_locking_read(&select);
+        for isolation in [
+            IsolationLevel::ReadCommitted,
+            IsolationLevel::RepeatableRead,
+            IsolationLevel::Serializable,
+        ] {
+            for flags in 0..16 {
+                let mut session = SessionContext::default();
+                session.autocommit = flags & 1 != 0;
+                session.explicit_txn = flags & 2 != 0;
+                session.current_txn = (flags & 4 != 0).then_some(7);
+                session.isolation = isolation;
+                session.xa_branch = (flags & 8 != 0).then(|| XaBranch {
+                    xid: Xid::new(1, vec![1], Vec::new()).unwrap(),
+                    state: XaBranchState::Active,
+                    txn_id: 7,
+                });
+                let previous = super::super::tx::can_use_read_only_select(&session, &select)
+                    || super::super::tx::can_use_lazy_read_only_transaction_select(
+                        &session, &select,
+                    )
+                    || (session.current_txn.is_some()
+                        && session.xa_branch.is_none()
+                        && select.lock_clause.is_none()
+                        && session.effective_isolation() != IsolationLevel::Serializable
+                        && !super::super::tx::select_has_locking_read(&select));
+                assert_eq!(
+                    super::super::tx::can_use_prepared_read(&session, locking),
+                    previous,
+                    "{sql}; isolation={isolation:?}; session flags={flags}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn quality_partition_quoted_all_does_not_truncate_other_partitions() {
     let (_dir, engine, mut session) = fixture();
     run(&engine, &mut session, "CREATE TABLE token_parts(id INT PRIMARY KEY) PARTITION BY RANGE(id) (PARTITION `ALL` VALUES LESS THAN (10), PARTITION p1 VALUES LESS THAN (MAXVALUE))").unwrap();

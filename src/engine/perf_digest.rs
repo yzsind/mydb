@@ -958,7 +958,7 @@ mod tests {
                 stat.accumulate(timer, 3, true, 2, 4, 5, 6, "SELECT 'sample'", now);
             }
         }
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for writer in 0..24 {
                 let collector = &collector;
                 scope.spawn(move || {
@@ -1053,7 +1053,7 @@ mod tests {
         use std::sync::Barrier;
         let collector = Arc::new(DigestCollector::new(17));
         let start = Barrier::new(25);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for writer in 0..24 {
                 let collector = &collector;
                 let start = &start;
@@ -1110,7 +1110,7 @@ mod tests {
         let collector = Arc::new(DigestCollector::new(1));
         let ready = Barrier::new(17);
         let resume = Barrier::new(17);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for writer in 0..16 {
                 let collector = &collector;
                 let ready = &ready;
@@ -1230,7 +1230,7 @@ mod tests {
         use std::sync::Barrier;
         let collector = Arc::new(DigestCollector::new(1));
         let start = Barrier::new(9);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for writer in 0..8 {
                 let collector = &collector;
                 let start = &start;

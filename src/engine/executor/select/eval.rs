@@ -6573,7 +6573,7 @@ mod compiled_plan_expr_tests {
         let row = PlanRow::from_fields(vec![field("s", Value::String("数据库".into()))]);
         let present = ["SELECT s", "SELECT t.s", "SELECT db.t.s"].map(first_projection_expr);
         let missing = ["SELECT missing", "SELECT other.s"].map(first_projection_expr);
-        std::thread::Builder::new()
+        crate::util::thread_spawn::Builder::new()
             .stack_size(64 * 1024)
             .spawn(move || {
                 for expr in present {

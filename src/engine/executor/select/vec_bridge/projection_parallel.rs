@@ -193,7 +193,7 @@ impl ParallelProjection {
             let active = self.active.clone();
             let key = self.key;
             let charge = self._charge.clone();
-            let handle = std::thread::Builder::new()
+            let handle = crate::util::thread_spawn::Builder::new()
                 .name("mydb-projection".into())
                 .stack_size(4 * 1024 * 1024)
                 .spawn(move || {

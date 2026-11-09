@@ -1183,9 +1183,15 @@ pub(super) fn aggregate_requires_semantic_input_coercion(
     template: &[PlanField],
     schema: &BatchSchema,
 ) -> bool {
-    let Expr::Function { args, .. } = aggregate else {
+    let Expr::Function { name, args, .. } = aggregate else {
         return false;
     };
+    // COUNT consumes nullness or exact DISTINCT equality, never the numeric
+    // domain used by SUM/AVG. Coercing an exact computed value to DOUBLE can
+    // both disable native aggregation and collapse integers above 2^53.
+    if name.eq_ignore_ascii_case("COUNT") {
+        return false;
+    }
     let Some(argument) = args
         .first()
         .filter(|argument| !matches!(argument, Expr::Wildcard))
@@ -1631,24 +1637,7 @@ pub(super) fn build_vec_hash_agg_stream_from_input(
                 final_filter,
                 count_topk,
             )?;
-        if has_computed_expressions {
-            metrics.expression_mode = Some(if metrics.fallback_aggregate_rows > 0 {
-                "scalar"
-            } else if !computed_expressions_native {
-                "legacy_escape"
-            } else {
-                "compiled"
-            });
-            if computed_expressions_native {
-                metrics.native_expression_rows = metrics.native_aggregate_rows;
-                metrics.fallback_expression_rows = metrics.fallback_aggregate_rows;
-            } else {
-                metrics.native_expression_rows = 0;
-                metrics.fallback_expression_rows = metrics
-                    .native_aggregate_rows
-                    .saturating_add(metrics.fallback_aggregate_rows);
-            }
-        }
+        metrics.record_expression_rows(has_computed_expressions, computed_expressions_native);
         return Ok(Some(HashAggregateStream {
             stream: coerce_aggregate_output_stream(
                 out_stream,
@@ -1688,24 +1677,7 @@ pub(super) fn build_vec_hash_agg_stream_from_input(
         let m = agg.metrics();
         (agg, m)
     };
-    if has_computed_expressions {
-        metrics.expression_mode = Some(if metrics.fallback_aggregate_rows > 0 {
-            "scalar"
-        } else if !computed_expressions_native {
-            "legacy_escape"
-        } else {
-            "compiled"
-        });
-        if computed_expressions_native {
-            metrics.native_expression_rows = metrics.native_aggregate_rows;
-            metrics.fallback_expression_rows = metrics.fallback_aggregate_rows;
-        } else {
-            metrics.native_expression_rows = 0;
-            metrics.fallback_expression_rows = metrics
-                .native_aggregate_rows
-                .saturating_add(metrics.fallback_aggregate_rows);
-        }
-    }
+    metrics.record_expression_rows(has_computed_expressions, computed_expressions_native);
 
     let out_schema = agg.output_schema();
     let group_template: Vec<PlanField> = group_cols
@@ -1912,7 +1884,8 @@ pub(super) fn build_scalar_aggregate_kernel_stream<'a>(
         aggregate_keys.push(crate::engine::executor::select::aggregate::aggregate_key(
             aggregate,
         ));
-        let approximate_input = matches!(arg_type, Some(ColumnType::Double | ColumnType::Float))
+        let approximate_input = !slot.name.eq_ignore_ascii_case("COUNT")
+            && matches!(arg_type, Some(ColumnType::Double | ColumnType::Float))
             && !input_field.is_some_and(|field| {
                 matches!(field.column_type, ColumnType::Double | ColumnType::Float)
             });
@@ -2320,49 +2293,13 @@ pub(super) fn scheduler_hash_join_workers() -> usize {
         .unwrap_or_else(|| crate::planner::default_parallel_degree() as usize)
 }
 
-/// Build the same `BatchSchema` `HashAggregateCore::output_schema()` would
-/// emit, without instantiating the operator. Mirrors the layout
-/// (group cols first, then one column per agg) and the type rules:
-/// COUNT → LongLong, SUM/AVG → Double, MIN/MAX → the source column's
-/// type.
+/// Build aggregate metadata before the parallel operator takes ownership.
 pub(super) fn build_hash_agg_output_schema(
     input_schema: &Arc<BatchSchema>,
     group_columns: &[usize],
     aggs: &[vec_hash_agg::AggregateSpec],
 ) -> Arc<BatchSchema> {
-    let mut fields: Vec<BatchField> = Vec::with_capacity(group_columns.len() + aggs.len());
-    for &g in group_columns {
-        fields.push(input_schema.fields()[g].clone());
-    }
-    for (i, spec) in aggs.iter().enumerate() {
-        use crate::engine::executor::vec::hash_agg::AggregateKind;
-        let input_field = input_schema.fields().get(spec.input_column);
-        let column_type = spec.func.result_type_with_source(
-            input_field.map(|field| field.column_type),
-            input_field.map(|field| &field.source),
-        );
-        let mut source = if matches!(spec.func, AggregateKind::Min | AggregateKind::Max) {
-            input_field
-                .map(|field| field.source.clone().nullable_aggregate())
-                .unwrap_or_default()
-        } else {
-            crate::types::ColumnSource::default()
-        };
-        if matches!(
-            spec.func,
-            AggregateKind::BitAnd | AggregateKind::BitOr | AggregateKind::BitXor
-        ) {
-            source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
-        }
-        fields.push(BatchField {
-            table: "__agg".into(),
-            alias: None,
-            name: format!("a{i}"),
-            column_type,
-            source,
-        });
-    }
-    Arc::new(BatchSchema::new(fields))
+    vec_hash_agg::aggregate_output_schema(Some(input_schema.as_ref()), group_columns, aggs)
 }
 
 pub(in crate::engine::executor::select) fn try_vec_hash_aggregate(
@@ -2679,3 +2616,7 @@ pub(super) fn translate_aggregate_extended(
     };
     Some((func, AggInputSpec::Expr(program), result_type))
 }
+
+#[cfg(test)]
+#[path = "aggregation_refactor_tests.rs"]
+mod refactor_tests;

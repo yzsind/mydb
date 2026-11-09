@@ -3,9 +3,9 @@ use super::*;
 use crate::engine::api::{ResultBatch, ResultChunk};
 use crate::planner::RuntimeFilter;
 
+use crate::util::thread_spawn as thread;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::thread;
 
 static ACTIVE_STREAM_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 thread_local! {

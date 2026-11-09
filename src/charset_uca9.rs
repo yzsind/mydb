@@ -499,6 +499,20 @@ pub(super) fn key_into(value: &str, out: &mut Vec<u8>) {
 }
 
 pub(super) fn key_prefix_into(value: &str, max_bytes: usize, out: &mut Vec<u8>) {
+    // Scalar weights have no suffix context. An ASCII window that supplies
+    // the whole requested prefix needs no scan of the remaining UTF-8 input.
+    let start = out.len();
+    let window = &value.as_bytes()[..value.len().min(max_bytes)];
+    if window.is_ascii() {
+        out.extend(window.iter().filter_map(|byte| {
+            let key = ASCII_KEYS[*byte as usize];
+            (key != 0).then_some(key)
+        }));
+        if out.len() - start == max_bytes || window.len() == value.len() {
+            return;
+        }
+        out.truncate(start);
+    }
     if value.is_ascii() {
         if value.len() <= max_bytes {
             key_into(value, out);

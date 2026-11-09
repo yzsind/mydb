@@ -1153,6 +1153,9 @@ pub struct CompiledSelectPlan {
     pub executable: Arc<CompiledOperator>,
     pub(crate) compact_range:
         Option<Arc<crate::engine::executor::select::simple::CompactRangeRecipe>>,
+    /// Includes nested SELECTs and counts eliminated by physical planning.
+    /// Validate new bindings without walking the AST on each cache hit.
+    limit_parameters: SmallVec<[usize; 2]>,
     pub deps: SmallVec<[PlanDep; 4]>,
     /// Views expanded into this plan; validated against the live catalog on
     /// lookup so ALTER / DROP VIEW invalidates exactly these plans.
@@ -1173,6 +1176,8 @@ pub struct CompiledSelectPlan {
     /// without a value-dependent cardinality tier.
     pub(crate) runtime_scalar_point: OnceLock<Option<RuntimeScalarPointPlan>>,
     pub(crate) runtime_scalar_candidate: bool,
+    /// Presence is immutable; sampling amounts and seeds still bind per execution.
+    pub(crate) has_table_sampling: bool,
     /// Immutable execution-envelope recipes. They are initialized by the
     /// first runner that has session/catalog binding context (normally the
     /// compiling prepared handle) and then shared by every handle reusing the
@@ -1203,6 +1208,35 @@ impl CompiledSelectPlan {
                 matches!(node, crate::parser::Expr::Subquery(_))
             })
         });
+        struct ExecutionShape {
+            limits: SmallVec<[usize; 2]>,
+            sampling: bool,
+        }
+        impl crate::parser::visit::AstVisitor for ExecutionShape {
+            fn enter_select(&mut self, select: &Select) {
+                for value in [select.limit.as_ref(), select.offset.as_ref()] {
+                    if let Some(
+                        crate::parser::LimitValue::Placeholder(index)
+                        | crate::parser::LimitValue::OffsetCommaPlaceholder(index),
+                    ) = value
+                    {
+                        self.limits.push(*index);
+                    }
+                }
+                self.sampling |= select
+                    .from
+                    .iter()
+                    .chain(select.joins.iter().map(|join| &join.table))
+                    .any(|table| table.sample.is_some());
+            }
+        }
+        let mut shape = ExecutionShape {
+            limits: SmallVec::new(),
+            sampling: false,
+        };
+        crate::parser::visit::visit_select(&mut shape, &semantic_select);
+        shape.limits.sort_unstable();
+        shape.limits.dedup();
         Self {
             execution_class: SelectExecutionClass::from_select(&semantic_select),
             batch_route,
@@ -1216,6 +1250,8 @@ impl CompiledSelectPlan {
                 &semantic_select,
                 &physical,
             ),
+            limit_parameters: shape.limits,
+            has_table_sampling: shape.sampling,
             semantic_select,
             physical,
             deps,
@@ -1229,6 +1265,20 @@ impl CompiledSelectPlan {
             hits: AtomicU64::new(0),
             _cache_bytes: None,
         }
+    }
+
+    pub(crate) fn validate_limit_parameters(&self) -> Result<(), crate::types::QueryError> {
+        for &index in &self.limit_parameters {
+            if !crate::engine::params::has_active_param(index) {
+                return Err(
+                    crate::error::catalog::ER_WRONG_ARGUMENTS.error("parameter is not bound")
+                );
+            }
+            crate::engine::params::validate_limit(Some(&crate::parser::LimitValue::Placeholder(
+                index,
+            )))?;
+        }
+        Ok(())
     }
 
     pub fn initialize_execution_envelope(
@@ -2124,7 +2174,7 @@ mod tests {
         for batch in batches {
             let cache = Arc::clone(&cache);
             let phases = Arc::clone(&phases);
-            handles.push(std::thread::spawn(move || {
+            handles.push(crate::util::thread_spawn::spawn(move || {
                 phases.wait();
                 for _ in 0..ROUNDS {
                     for (sql, ast) in &batch {
@@ -2144,7 +2194,7 @@ mod tests {
 
         let cache_ddl = Arc::clone(&cache);
         let phases_ddl = Arc::clone(&phases);
-        handles.push(std::thread::spawn(move || {
+        handles.push(crate::util::thread_spawn::spawn(move || {
             phases_ddl.wait();
             for _ in 0..ROUNDS {
                 cache_ddl.bump_epoch();
