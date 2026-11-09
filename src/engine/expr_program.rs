@@ -1808,6 +1808,51 @@ impl ExprProgram {
         }
     }
 
+    /// Only immutable bounds or execution parameters may be read ahead of
+    /// the row oracle. Their concrete temporal domain is checked per batch.
+    pub(crate) fn as_column_between_shape(&self) -> Option<(usize, bool)> {
+        let ExprNode::Between {
+            expr,
+            low,
+            high,
+            negated,
+            ..
+        } = &self.root
+        else {
+            return None;
+        };
+        let ExprNode::Column(column) = expr.as_ref() else {
+            return None;
+        };
+        [low, high]
+            .iter()
+            .all(|bound| {
+                matches!(
+                    bound.as_ref(),
+                    ExprNode::Const(_) | ExprNode::Placeholder(_)
+                )
+            })
+            .then_some((*column, *negated))
+    }
+
+    pub(crate) fn column_between_bounds(
+        &self,
+    ) -> Option<(std::borrow::Cow<'_, Value>, std::borrow::Cow<'_, Value>)> {
+        let ExprNode::Between { low, high, .. } = &self.root else {
+            return None;
+        };
+        fn resolve(bound: &ExprNode) -> Option<std::borrow::Cow<'_, Value>> {
+            match bound {
+                ExprNode::Const(value) => Some(std::borrow::Cow::Borrowed(value)),
+                ExprNode::Placeholder(index) => {
+                    crate::engine::params::current_param(*index).map(std::borrow::Cow::Owned)
+                }
+                _ => None,
+            }
+        }
+        Some((resolve(low.as_ref())?, resolve(high.as_ref())?))
+    }
+
     /// Evaluate conjunctions/disjunctions of column/constant comparisons
     /// without acquiring expression scratch space or materialising values for
     /// the boolean nodes. Unsupported shapes return `None` and keep the full

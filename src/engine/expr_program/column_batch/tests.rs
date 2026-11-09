@@ -50,6 +50,160 @@ fn parity(sql: &str, kind: ColumnType, values: Vec<Value>) {
 }
 
 #[test]
+fn text_comparisons_compose_with_case_and_three_valued_boolean_columns() {
+    use crate::engine::executor::vec::batch::Selection;
+
+    for name in ["utf8mb4_0900_ai_ci", "utf8mb4_general_ci", "utf8mb4_bin"] {
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: ColumnType::VarString,
+            source: crate::types::ColumnSource {
+                length: Some(128),
+                collation_id: Some(crate::charset::collation_id(name)),
+                ..Default::default()
+            },
+        }]));
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::String("CAFÉ".into()),
+                Value::String("cafe".into()),
+                Value::String("cafe  ".into()),
+                Value::String("cafe\u{301}".into()),
+                Value::String("zeta".into()),
+                Value::String(String::new()),
+            ])],
+        );
+        for sql in [
+            "x='cafe'",
+            "x<>'cafe'",
+            "x<'cafe'",
+            "x<='cafe'",
+            "x>'cafe'",
+            "x>='cafe'",
+            "x<=>NULL",
+            "CASE WHEN x='cafe' OR x='zeta' THEN 3 ELSE -2 END",
+            "CASE WHEN x<>'cafe' AND x<>'zeta' THEN 1 ELSE 0 END",
+            "IF(x='cafe',NULL,7)",
+        ] {
+            let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+            let program = ExprCompiler::compile(
+                &ast,
+                &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+            )
+            .unwrap();
+            assert!(program.column_parallel_safe(&schema), "{name}: {sql}");
+            let expected = oracle(&program, &batch).unwrap();
+            for selected in [
+                batch.clone(),
+                batch
+                    .clone()
+                    .with_selection(Selection::Indices(vec![0, 1, 3, 5])),
+            ] {
+                let actual = program
+                    .try_eval_column(&selected)
+                    .unwrap_or_else(|| panic!("{name}: {sql}"));
+                for row in selected.visible_indices() {
+                    assert_eq!(
+                        actual.value_at(row),
+                        expected[row],
+                        "{name}: {sql}, row={row}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn text_comparison_parameter_rebinding_declines_mixed_domains_and_diagnostics() {
+    let (program, schema) =
+        crate::engine::params::with_params(vec![Value::String("a".into())], || {
+            compile("CASE WHEN x=? THEN 1 ELSE 0 END", ColumnType::VarString)
+        });
+    let batch = Batch::new(
+        schema.clone(),
+        vec![ColumnVector::from_values(vec![
+            Value::Null,
+            Value::String("a".into()),
+            Value::String("A".into()),
+            Value::String("2suffix".into()),
+        ])],
+    );
+    for bound in [
+        Value::String("A".into()),
+        Value::String("2suffix".into()),
+        Value::Null,
+    ] {
+        crate::engine::params::with_params(vec![bound], || {
+            let expected = oracle(&program, &batch).unwrap();
+            let actual = program.try_eval_column(&batch).unwrap();
+            for (row, expected) in expected.iter().enumerate() {
+                assert_eq!(actual.value_at(row), *expected);
+            }
+        });
+    }
+    for bound in [
+        Value::Int(2),
+        Value::Double(2.5),
+        Value::Bytes(b"a".to_vec()),
+    ] {
+        crate::engine::params::with_params(vec![bound], || {
+            assert!(!program.column_parallel_safe(&schema));
+            assert!(program.try_eval_column(&batch).is_none());
+        });
+    }
+    crate::engine::params::with_params(vec![Value::String("a".into())], || {
+        assert!(program.column_parallel_safe(&schema));
+        crate::engine::expr::with_numeric_comparison_context_from_provenance(
+            crate::engine::expr::ComparisonProvenance::default(),
+            &Value::DecimalCompact(1, 0),
+            &Value::String("1".into()),
+            || {
+                assert!(!program.column_parallel_safe(&schema));
+                assert!(program.try_eval_column(&batch).is_none());
+            },
+        );
+    });
+    let (diagnostic, schema) = compile(
+        "CASE WHEN x='safe' THEN 1 ELSE 1/0 END",
+        ColumnType::VarString,
+    );
+    assert!(!diagnostic.column_parallel_safe(&schema));
+}
+
+#[test]
+fn text_comparison_contract_keeps_binary_and_enum_semantics_on_oracle() {
+    for flag in [
+        crate::mysql::protocol::BINARY_FLAG,
+        crate::mysql::protocol::ENUM_FLAG,
+        crate::mysql::protocol::SET_FLAG,
+    ] {
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: ColumnType::VarString,
+            source: crate::types::ColumnSource {
+                flags: flag,
+                length: Some(16),
+                ..Default::default()
+            },
+        }]));
+        let ast = crate::parser::parse_expr_fragment("CASE WHEN x='a' THEN 1 ELSE 0 END").unwrap();
+        let program = ExprCompiler::compile(
+            &ast,
+            &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+        )
+        .unwrap();
+        assert!(!program.column_parallel_safe(&schema), "flag={flag}");
+    }
+}
+
+#[test]
 fn statement_scalar_integer_comparisons_match_the_row_oracle_at_domain_edges() {
     let signed = vec![
         Value::Int(i64::MIN),

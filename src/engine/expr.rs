@@ -16523,6 +16523,12 @@ pub(crate) fn session_local_datetime_to_utc_timestamp_micros(
     local_datetime_to_utc_timestamp_micros_in_tz(micros, if tz.is_empty() { "SYSTEM" } else { &tz })
 }
 
+/// UTC ordering and wall-clock ordering agree throughout a fixed-offset zone.
+/// Named/system zones can contain DST folds or gaps and require the wall oracle.
+pub(crate) fn session_timestamp_comparison_has_fixed_offset() -> bool {
+    matches!(session_tz_spec(), Ok(TzSpec::Fixed(_)))
+}
+
 /// Statement/worker-local wall-clock to TIMESTAMP converter. Bulk ingestion
 /// captures the session time zone before spawning workers, avoiding a
 /// thread-local lookup, String allocation and zone-spec resolution for every

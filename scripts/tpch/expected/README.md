@@ -9,9 +9,9 @@ These directories contain PostgreSQL-generated canonical result sets for the
 standard TPC-H Q1-Q22 SQL files in `scripts/tpch/queries`. They use data from
 the official TPC-H `dbgen` binary and are selected by `scripts-internal/run_tpch.sh`
 only when `TPCH_DATA_GENERATOR=dbgen` is active. Q23-Q26 are mydb workload
-extensions and currently have no checked-in canonical fixtures; automatic
-correctness mode reports them as skipped, while `TPCH_CHECK_CORRECTNESS=1`
-keeps missing fixtures as a hard failure. DuckDB's generator produces
+extensions with canonical fixtures at SF=10. At other scale factors, automatic
+correctness mode reports missing fixtures as skipped, while
+`TPCH_CHECK_CORRECTNESS=1` keeps missing fixtures as a hard failure. DuckDB's generator produces
 different random text fields, so its result fixtures must use a separate
 `TPCH_EXPECTED_ROOT`.
 
@@ -20,6 +20,9 @@ different random text fields, so its result fixtures must use a separate
 - `sf-0.1`: scale factor 0.1
 - `sf-1`: scale factor 1
 - `sf-5`: scale factor 5
+- `sf-10`: scale factor 10, including Q23-Q26 extension queries. The adjacent
+  manifest records input, SQL, schema, and expected-result SHA-256 hashes and
+  the PostgreSQL oracle version.
 
 Files are tab-separated rows without column headers. Cells are trimmed, and
 numeric values are canonicalized to integer form or 4 decimal places with

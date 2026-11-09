@@ -1,0 +1,151 @@
+{
+  "generator": "official TPC-H dbgen",
+  "scale_factor": 10,
+  "oracle": "PostgreSQL 18.6",
+  "generated_date": "2026-11-10",
+  "source_commit": "d27dc63f8fbbc7e37208a0cd26ecfd2699ead9b0",
+  "normalization": "scripts/_tabular_results.py: trim cells, preserve integer values, round fractions half-up to four decimal places; preserve query row order",
+  "schema_sha256": "64abcb84cbebbb255c003b95e6bd2d23e7fd203c0b41add58050a44af8d3b19d",
+  "input_sha256": {
+    "region": "6022658d673924389b54dcb70fa8c3d6da1b0d7afa3c1c017bab62a019df404f",
+    "nation": "66f96949939fa8fdf1c4ffed1e5f6c2842fe11a14b51fdc6ed1e17460031e8c5",
+    "supplier": "5de31112f00febc38aaa35581a7acf269b55f77b368c6ec3179fc138bf1fc996",
+    "customer": "d4ba00a59ddb3bdaabeb1bcf560a182f8874366c9db51cedc3bd5ec9d64d03bd",
+    "part": "0eba8e6d7787f4dda40916bc4e01871498f3a5c29b9711c00c13bf2231ba2904",
+    "partsupp": "0c66a4409078d92b2a1c1f66f5349468c32ce4016e4c2d198e1916552b361a60",
+    "orders": "f226ed1f69337bfd0dd2db00aa1c53d31ffb58dc03aa9386a80c7efcc24802c2",
+    "lineitem": "9a7b308b6ca31a88880421f5d1a8a540c6b9ff377d698b0401ed688534c7344d"
+  },
+  "queries": {
+    "q01": {
+      "rows": 4,
+      "sql_sha256": "8cebf9086881af6d11bdb1fbb3a3fa588d75c6fab628abc69e7dea4eb57fb0ff",
+      "expected_sha256": "6603c67d7c1e6b73ab756d4a3c8c6f55f395dee393b64b19ec1d700ed6daeb5e"
+    },
+    "q02": {
+      "rows": 100,
+      "sql_sha256": "8ef715a71424b2ee440e98a23a970480d50120ba3f24b9353c6af9c55f3487c2",
+      "expected_sha256": "3acd12c4e8413187cf02073d5702fda651825dffc491f9bb0ecc6a32cfd0bed8"
+    },
+    "q03": {
+      "rows": 10,
+      "sql_sha256": "b899fafe575634d62f6e71924fb1b3267033a3b8bf2e32f12aff737405cefd26",
+      "expected_sha256": "97ceed3343206b71ea1f5bfc735c4cf860557aa7ebc2f04d053cabe84669e1a9"
+    },
+    "q04": {
+      "rows": 5,
+      "sql_sha256": "4968596ffcd21fd903360e178202fbcb358b9dfbbc855ec189cfe2d638ca17b0",
+      "expected_sha256": "8f963f1ed845e54b56e053a6ac1ebaab3bd8d9321148533ccd2387f00acba732"
+    },
+    "q05": {
+      "rows": 5,
+      "sql_sha256": "21fe0786bd75ac12dd27f0179a719ba05854d56aae7d8f22713a3e5b68dadc5e",
+      "expected_sha256": "4f26e24d4a2f5a5d4a87c3a5584058286f8e3f54fbc88e22b8fbeb890ca0c751"
+    },
+    "q06": {
+      "rows": 1,
+      "sql_sha256": "0e7e4f9c5c52e5cd7d4539be3a94384316652f160a29a3f03b8d6f1748b964ac",
+      "expected_sha256": "085140a4231b076ae984bfc445b85a8b4b0deb0c4315eb893f354cf768752734"
+    },
+    "q07": {
+      "rows": 4,
+      "sql_sha256": "489715bc418de42b8cd1d18ed91cd24692d0989ae1afdf379b911244531db549",
+      "expected_sha256": "cfe7e54f70d404123e4afb9f133e8cacbd377e49b621a821f1b6f66d87b5654c"
+    },
+    "q08": {
+      "rows": 2,
+      "sql_sha256": "70e45892f394ac24d3d01464fd08eb1f7f90f5276afeaf62faf14bb9ac78ae5a",
+      "expected_sha256": "7b572fbe3951994a072cd01a7b8470fcd9e02e7ad80cc6dd84084f4a2f104a99"
+    },
+    "q09": {
+      "rows": 175,
+      "sql_sha256": "eb0f622ffc13725e9642e3054397a91a8118f523c9dced9f0dd6e7f622fba3c0",
+      "expected_sha256": "15ef001396911ca1110f9273f96d426fb9a87fb8a1eb81e7caf30f1749d3edb5"
+    },
+    "q10": {
+      "rows": 20,
+      "sql_sha256": "7236dfec3db61bc54cf300092c5b88e841c367172b2e6eb6325ef13fa7a0ef76",
+      "expected_sha256": "0b59a808088d99558ab6f7f4a6f664cc54bff0c67e18e5a5bb45595621507c2f"
+    },
+    "q11": {
+      "rows": 0,
+      "sql_sha256": "fa021c0cd2fd5679906625f5d6aa9961132ecbb042e5d769397471e20898c347",
+      "expected_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    "q12": {
+      "rows": 2,
+      "sql_sha256": "0e20e19c1509450798587a8351706b358317a05477e4096f7ea500ccd49eddc0",
+      "expected_sha256": "a4898a8f79631647ab153a1a58dee1cbadcac660eea25780a10d72a9b90e67d0"
+    },
+    "q13": {
+      "rows": 46,
+      "sql_sha256": "3d327abcb1afa4a1c10b39b55a80abee6c912b66177763de4ef58b322890767c",
+      "expected_sha256": "ffffe4ce2ade0c13366d79b5cda5a0c61b3bd9e6df883cc104c29fb38c371337"
+    },
+    "q14": {
+      "rows": 1,
+      "sql_sha256": "577e0676771aa61be8b1cfbff473e92fa26b68de643adf9b7b4da7b4899aa126",
+      "expected_sha256": "1b1807d1edfa9d0474eff363adac95ec1be8a5e85e9e704af9ac1c3835d245ec"
+    },
+    "q15": {
+      "rows": 1,
+      "sql_sha256": "b39d7214179c76dcc2cba9d64592989a07b2225e7b3d74f7d05ee97490ca6586",
+      "expected_sha256": "5220ab23249cc080c1754c3917d050808e039423c7ffba157440c8c659ffc929"
+    },
+    "q16": {
+      "rows": 27840,
+      "sql_sha256": "d4486d0a426de9dab07d86c13d9d8fbe86e012af34c82ab7ee0f45f5f46fff72",
+      "expected_sha256": "9572664b5193d38d10b74dc2bd3098bec9189c55acb26604e1f5323a16fe4b6a"
+    },
+    "q17": {
+      "rows": 1,
+      "sql_sha256": "a4271079206b256a8758c4dbb091791f88bed2dcab31654b5cfb116dc215b54d",
+      "expected_sha256": "30f5f52405e45fb1514af2166c58f5872673070b8beb503566d9022207556a6e"
+    },
+    "q18": {
+      "rows": 100,
+      "sql_sha256": "f38c3653ffc5570f68f1919a91928c232cfcb1e7392bd6860da5153fd39c4709",
+      "expected_sha256": "7ff16dab97764295ef36942c73ee7778fb6a6347be9bea238a0d4bad44cf9255"
+    },
+    "q19": {
+      "rows": 1,
+      "sql_sha256": "01e64073d1cb7b03d7e40a9de220fabf70f3a291aaf415c8dd30d56871ca3e00",
+      "expected_sha256": "9f58bd0331b4048c0c8830ae415e993916c8097e662b4eb3adde5680fdc82c62"
+    },
+    "q20": {
+      "rows": 1804,
+      "sql_sha256": "11d108824e6ed84e266b11206dbecb04801aa1d16c5595f0b5cb4aa25b7a603e",
+      "expected_sha256": "4f72c8182a5fa79d29ca7f2578161cfbf5a605691faeea77cd675c38b4edc176"
+    },
+    "q21": {
+      "rows": 100,
+      "sql_sha256": "91120df41d2bfa921d0114924d723e810d66f033bee5ed2fedb9b60233dfd405",
+      "expected_sha256": "d006839eef523906b72df92226fff71b86fb50d1079f74091576cb0fa287017c"
+    },
+    "q22": {
+      "rows": 7,
+      "sql_sha256": "3daabdff06cf24d388e13f7670f56e71b97b4f59ca6ef598501c54fa67630798",
+      "expected_sha256": "f78358a40df7fcf6b0698cf9b6bddb10bb0f01ace98d22c9efc3dcad4f285394"
+    },
+    "q23": {
+      "rows": 100,
+      "sql_sha256": "38ce2d7d380f49ac98aa986f9c6e449c1bd39010c3da4c261f4e2b1c4a4f3951",
+      "expected_sha256": "d053c1ae1201346e33f04cf8737cfc3868792eea5db9e609f2a43822b52a7850"
+    },
+    "q24": {
+      "rows": 100,
+      "sql_sha256": "4cbca30c2d0ba5b15f03282d85ec0bf343429912136d2d9df1ce4c0c77a4e9fe",
+      "expected_sha256": "e3fd81d377e88a2bdcb1c3e8420ab7bd422666266fb805bf406f99e20476d4f6"
+    },
+    "q25": {
+      "rows": 1,
+      "sql_sha256": "ce3dd71a269002b4a4c44df6abffd9f83ca2f7d2c3fccc9a8b5f48816b29e5ec",
+      "expected_sha256": "6abba99aa36a57601f50d46937f2625811edead29bc56095da9e82aa830bd4cb"
+    },
+    "q26": {
+      "rows": 10,
+      "sql_sha256": "6f55e31d0aae0f6303a16fe4215bad079959c561caafef1e88da5243888f0c30",
+      "expected_sha256": "c38331896efabc2394a1bb2b88b94b155ca1ce71c3a24c5ee725f82ec989727c"
+    }
+  }
+}

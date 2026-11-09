@@ -1052,6 +1052,147 @@ fn typed_compound_predicate_matches_value_oracle() {
 }
 
 #[test]
+fn integer_in_predicate_keeps_exact_signed_unsigned_and_null_domains() {
+    use crate::engine::executor::vec::scan_bridge::PredicateValue;
+
+    let mut schema = decimal_fact_schema();
+    schema.columns[0].data_type = DataTypeKind::BigInt;
+    for negated in [false, true] {
+        for has_null in [false, true] {
+            let mut list = vec![
+                Expr::Literal(Literal::Int(i64::MIN)),
+                Expr::Literal(Literal::Int(-1)),
+                Expr::Literal(Literal::Int(1)),
+                Expr::Literal(Literal::UInt(u64::MAX)),
+                Expr::Literal(Literal::Int(1)),
+            ];
+            if has_null {
+                list.push(Expr::Literal(Literal::Null));
+            }
+            let expr = Expr::InList {
+                expr: Box::new(Expr::Identifier("quantity".into())),
+                list,
+                negated,
+            };
+            let compiled = CompiledPredicate::compile_for_storage(&expr, &schema).unwrap();
+            assert!(compiled.supports_typed_eval());
+            assert!(matches!(compiled.root, PredicateNode::IntegerIn { .. }));
+            for value in [
+                Value::Null,
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(i64::MAX),
+                Value::UInt(i64::MAX as u64 + 1),
+                Value::UInt(u64::MAX),
+            ] {
+                let typed = match value {
+                    Value::Null => PredicateValue::Null,
+                    Value::Int(value) => PredicateValue::I64(value),
+                    Value::UInt(value) => PredicateValue::U64(value),
+                    _ => unreachable!(),
+                };
+                let row = vec![value];
+                let expected = crate::engine::expr::eval_bool(&expr, &schema, &row).unwrap();
+                assert_eq!(compiled.eval(&row).unwrap(), expected);
+                assert_eq!(compiled.eval_typed(&[typed]).unwrap(), Some(expected));
+            }
+            // Unexpected physical values keep the original semantic program.
+            let row = vec![Value::DecimalCompact(100, 2)];
+            assert_eq!(
+                compiled.eval(&row).unwrap(),
+                crate::engine::expr::eval_bool(&expr, &schema, &row).unwrap()
+            );
+            assert_eq!(
+                compiled
+                    .eval_typed(&[PredicateValue::Decimal(100, 2)])
+                    .unwrap(),
+                None
+            );
+        }
+    }
+}
+
+#[test]
+fn integer_in_predicate_binds_each_open_and_keeps_diagnostic_operands_on_oracle() {
+    let mut schema = decimal_fact_schema();
+    schema.columns[0].data_type = DataTypeKind::BigInt;
+    let expr = Expr::InList {
+        expr: Box::new(Expr::Identifier("quantity".into())),
+        list: vec![Expr::Placeholder(0), Expr::Placeholder(1)],
+        negated: false,
+    };
+    for params in [
+        vec![Value::Int(1), Value::UInt(u64::MAX)],
+        vec![Value::String("2".into()), Value::Null],
+    ] {
+        crate::engine::params::with_params(params, || {
+            let compiled = CompiledPredicate::compile_for_storage(&expr, &schema).unwrap();
+            assert!(matches!(compiled.root, PredicateNode::IntegerIn { .. }));
+            for value in [
+                Value::Int(1),
+                Value::Int(2),
+                Value::UInt(u64::MAX),
+                Value::Null,
+            ] {
+                let row = vec![value];
+                assert_eq!(
+                    compiled.eval(&row).unwrap(),
+                    crate::engine::expr::eval_bool(&expr, &schema, &row).unwrap()
+                );
+            }
+        });
+    }
+    for params in [
+        vec![Value::String("2suffix".into()), Value::Null],
+        vec![Value::Double(1.5), Value::Int(1)],
+        vec![Value::DecimalCompact(15, 1), Value::Int(1)],
+    ] {
+        crate::engine::params::with_params(params, || {
+            let compiled = CompiledPredicate::compile(&expr, &schema).unwrap();
+            assert!(matches!(compiled.root, PredicateNode::Program(_)));
+            for value in [
+                Value::Int(1),
+                Value::Int(2),
+                Value::UInt(u64::MAX),
+                Value::Null,
+            ] {
+                let row = vec![value];
+                assert_eq!(
+                    compiled.eval(&row).unwrap(),
+                    crate::engine::expr::eval_bool(&expr, &schema, &row).unwrap()
+                );
+            }
+        });
+    }
+}
+
+#[test]
+fn integer_in_compilation_does_not_publish_statement_cast_diagnostics() {
+    let mut schema = decimal_fact_schema();
+    schema.columns[0].data_type = DataTypeKind::BigInt;
+    let mut session = crate::engine::api::SessionContext::default();
+    session
+        .rls
+        .set("tenant".into(), Some("2suffix".into()), false)
+        .unwrap();
+    let expr =
+        crate::parser::parse_expr_fragment("quantity IN (CAST(RLS_CONTEXT('tenant') AS SIGNED),1)")
+            .unwrap();
+    let warnings = crate::engine::api::StatementWarningSink::default();
+    crate::engine::expr::with_session_expr_info(&session, || {
+        crate::engine::api::with_statement_warning_sink(warnings.clone(), || {
+            let _compiled = CompiledPredicate::compile(&expr, &schema);
+            assert!(
+                warnings.lock().is_empty(),
+                "opening an optional IN kernel must not evaluate diagnostic-producing bounds"
+            );
+        });
+    });
+}
+
+#[test]
 fn typed_date_comparison_rejects_uncoercible_constant() {
     let schema = decimal_fact_schema();
     let expr = Expr::Binary {

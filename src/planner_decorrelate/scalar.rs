@@ -365,7 +365,9 @@ fn build_decorrelation(
 /// conjuncts that reference the correlation-key table alone are copied.  A
 /// later multi-table predicate may shrink the outer rows further, but can
 /// never introduce a key absent from this domain. A semi join prevents duplicate
-/// outer keys from multiplying rows before MIN/SUM/AVG/etc. are updated.
+/// outer keys from multiplying rows before MIN/SUM/AVG/etc. are updated. A
+/// domain containing an original integer primary key is already unique and
+/// can use an inner join, exposing both access directions to the optimizer.
 fn add_outer_key_domain(
     state: &RewriteState<'_>,
     pairs: &[EqualityPair],
@@ -446,7 +448,11 @@ fn add_outer_key_domain(
             column_aliases: Vec::new(),
             generate_series: None,
         },
-        join_type: JoinType::Semi,
+        join_type: if outer_key_domain_is_unique(source, &schema, pairs) {
+            JoinType::Inner
+        } else {
+            JoinType::Semi
+        },
         condition: Some(condition),
         using_columns: Vec::new(),
         natural: false,
@@ -454,6 +460,35 @@ fn add_outer_key_domain(
         straight: false,
         lateral: false,
     });
+}
+
+fn outer_key_domain_is_unique(
+    source: &TableRef,
+    schema: &TableSchema,
+    pairs: &[EqualityPair],
+) -> bool {
+    // A later primary-key publication need not describe an older read view.
+    // Integer equality is injective in the matching comparison domains checked
+    // by try_rewrite_scalar; floating-point and textual keys retain SEMI.
+    source.system_time.is_none()
+        && schema.primary_definition_scn == 0
+        && !schema.primary_key.is_empty()
+        && schema.primary_key.iter().all(|key| {
+            pairs
+                .iter()
+                .any(|pair| pair.outer.column.eq_ignore_ascii_case(key))
+                && schema.column_index(key).ok().is_some_and(|index| {
+                    matches!(
+                        schema.columns[index].data_type,
+                        crate::storage::DataTypeKind::TinyInt
+                            | crate::storage::DataTypeKind::SmallInt
+                            | crate::storage::DataTypeKind::MediumInt
+                            | crate::storage::DataTypeKind::Int
+                            | crate::storage::DataTypeKind::BigInt
+                            | crate::storage::DataTypeKind::Bool
+                    )
+                })
+        })
 }
 
 fn collect_outer_base_sources(select: &Select) -> Vec<TableRef> {
