@@ -8895,7 +8895,9 @@ mod cache_tests {
         assert!(before.l1_entries > 0);
         // A different worker invalidates the cache, but this thread still owns
         // its old objects until its next compilation. Reading must not free them.
-        crate::util::thread_spawn::spawn(flush_program_caches).join().unwrap();
+        crate::util::thread_spawn::spawn(flush_program_caches)
+            .join()
+            .unwrap();
         let after = expr_program_stats();
         assert_eq!(after.l1_entries, before.l1_entries);
         assert_eq!(after.l1_bytes, before.l1_bytes);

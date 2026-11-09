@@ -49,10 +49,10 @@ use crate::engine::executor::select::bloom::BloomFilter;
 use crate::parser::JoinType;
 use crate::planner::BuildSide;
 use crate::util::env::is_disabled as env_off;
+use crate::util::thread_spawn as thread;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use crate::util::thread_spawn as thread;
 
 // ---------------------------------------------------------------------------
 // Counters (SHOW ENGINE MYDB STATUS)

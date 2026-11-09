@@ -816,7 +816,10 @@ fn delayed_heap_open_is_not_invalidated_by_unrelated_table_copy() {
             .values()
             .filter(|epoch| epoch.strong_count() == 0)
             .count();
-        assert!(retired <= 128, "retired open-epoch history must stay bounded");
+        assert!(
+            retired <= 128,
+            "retired open-epoch history must stay bounded"
+        );
     }
     engine.shutdown().unwrap();
 }
@@ -22877,6 +22880,103 @@ fn m4_extent_chain_is_contiguous_and_round_trips() {
         )
         .unwrap();
     assert_eq!(rows[0].values[1], Value::Bytes(vec![0x5A; big]));
+    db.buffer_pool.shutdown_flusher();
+    std::mem::forget(db);
+}
+
+#[test]
+fn overflow_bulk_free_does_not_rescan_previously_verified_free_pages() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = m4_open_db(dir.path(), DurabilityMode::Memory);
+    let table_id = m3_lob_table(&db);
+    let count = 256;
+    let chains = db
+        .with_overflow_mut(table_id, |overflow| {
+            (0..count)
+                .map(|_| {
+                    overflow.allocate_chain_compressible(&vec![42; OVFL_PAGE_PAYLOAD + 1], false)
+                })
+                .collect::<Result<Vec<_>, _>>()
+        })
+        .unwrap();
+    let before = db.storage_status();
+    db.with_overflow_mut(table_id, |overflow| {
+        for &chain in chains.iter().rev() {
+            overflow.free_chain(chain)?;
+        }
+        for &chain in &chains {
+            overflow.free_chain(chain)?;
+        }
+        assert_eq!(overflow.free_count, count * 2);
+        assert_eq!(overflow.count_free_list()?, count * 2);
+        Ok(())
+    })
+    .unwrap();
+    let after = db.storage_status();
+    let reads = after.buffer_hits + after.buffer_misses - before.buffer_hits - before.buffer_misses;
+    assert!(reads < count * 16, "bulk free performed {reads} page reads");
+    db.buffer_pool.shutdown_flusher();
+    std::mem::forget(db);
+}
+
+#[test]
+fn overflow_free_membership_remains_exact_after_reuse_and_shrink() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = m4_open_db(dir.path(), DurabilityMode::Memory);
+    let table_id = m3_lob_table(&db);
+    db.with_overflow_mut(table_id, |overflow| {
+        let payload = vec![43; OVFL_PAGE_PAYLOAD * 5];
+        let first = overflow.allocate_chain_compressible(&payload, false)?;
+        let second = overflow.allocate_chain_compressible(&payload, false)?;
+        overflow.free_chain(first)?;
+        overflow.free_chain(second)?;
+        overflow.free_chain(first)?;
+        let reused = overflow.allocate_chain_compressible(&payload, false)?;
+        assert_eq!(reused.first_page_id, second.first_page_id);
+        assert_eq!(overflow.read_chain(reused)?, payload);
+        overflow.free_chain(second)?;
+        assert_eq!(overflow.free_count, 5);
+        overflow.free_chain(reused)?;
+        assert_eq!(overflow.count_free_list()?, 10);
+        assert_eq!(overflow.shrink_to_fit(1)?, 10);
+        let grown = overflow.allocate_chain_compressible(&payload, false)?;
+        overflow.free_chain(grown)?;
+        overflow.free_chain(grown)?;
+        assert_eq!(overflow.count_free_list()?, 5);
+        overflow.validate_structure()?;
+        Ok(())
+    })
+    .unwrap();
+    db.buffer_pool.shutdown_flusher();
+    std::mem::forget(db);
+}
+
+#[test]
+fn overflow_free_membership_does_not_cache_a_corrupt_prefix() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = m4_open_db(dir.path(), DurabilityMode::Memory);
+    let table_id = m3_lob_table(&db);
+    db.with_overflow_mut(table_id, |overflow| {
+        let first = overflow.allocate_chain_compressible(b"first", false)?;
+        let second = overflow.allocate_chain_compressible(b"second", false)?;
+        overflow.free_chain(first)?;
+        overflow.free_chain(second)?;
+        let valid = overflow.read_raw_page(second.first_page_id)?;
+        let mut cycle = valid.clone();
+        write_u64(&mut cycle, OVFL_OFF_NEXT, second.first_page_id);
+        overflow.write_page_logged(second.first_page_id, cycle)?;
+        assert!(overflow
+            .free_list_contains_cached(second.first_page_id)
+            .is_err());
+        assert!(overflow
+            .free_list_contains_cached(second.first_page_id)
+            .is_err());
+        overflow.write_page_logged(second.first_page_id, valid)?;
+        assert!(overflow.free_list_contains_cached(second.first_page_id)?);
+        assert_eq!(overflow.count_free_list()?, 2);
+        Ok(())
+    })
+    .unwrap();
     db.buffer_pool.shutdown_flusher();
     std::mem::forget(db);
 }

@@ -770,83 +770,87 @@ impl ParallelIndexInBatchStream<'_> {
             let predicate = self.predicate.clone();
             let row_ids = Arc::clone(&row_ids);
             let row_ids_charge = Arc::clone(&row_ids_charge);
-            self.execution.workers.push(crate::util::thread_spawn::spawn(move || {
-                let _row_ids_charge = row_ids_charge;
-                context.run(&db, || {
-                    let result = (|| -> Result<(), QueryError> {
-                        let heap = db.cached_heap_handle(table.schema.id)?;
-                        // Heap Value rows coexist with the converted Batch.
-                        // Reserve before decoding and leave half this worker's
-                        // buffer share for conversion and queued output.
-                        let batch_rows = (scan_decode_batch_rows(&schema) / 2).max(1);
-                        for ids in row_ids[start..end].chunks(batch_rows) {
-                            context.cancellation().check()?;
-                            let row_slots =
-                                std::mem::size_of::<(crate::storage::RowId, Vec<Value>)>();
-                            let predicted = ids.len().saturating_mul(row_slots.saturating_add(
-                                columns.len().saturating_mul(std::mem::size_of::<Value>()),
-                            ));
-                            let mut rows_charge = mem_budget::force_charge_scoped(predicted)?;
-                            let mut rows = db.read_row_columns_many_with_handle(
-                                &heap,
-                                &table.schema,
-                                ids,
-                                context.txn(),
-                                &columns,
-                            )?;
-                            let actual = rows.iter().fold(
-                                rows.capacity().saturating_mul(row_slots),
-                                |bytes, (_, values)| {
-                                    bytes
-                                        .saturating_add(
-                                            mem_budget::estimate_row_bytes(values)
-                                                .saturating_sub(std::mem::size_of::<Vec<Value>>()),
-                                        )
-                                        .saturating_add(
-                                            values
-                                                .capacity()
-                                                .saturating_sub(values.len())
-                                                .saturating_mul(std::mem::size_of::<Value>()),
-                                        )
-                                },
-                            );
-                            if actual > predicted {
-                                rows_charge.add_force(actual - predicted)?;
-                            } else {
-                                rows_charge.release_bytes(predicted - actual);
-                            }
-                            if let Some(predicate) = predicate.as_deref() {
-                                let mut eval_error = None;
-                                rows.retain(|(_, values)| {
-                                    if eval_error.is_some() {
-                                        return false;
-                                    }
-                                    match predicate.eval(values) {
-                                        Ok(keep) => keep,
-                                        Err(error) => {
-                                            eval_error = Some(error);
-                                            false
+            self.execution
+                .workers
+                .push(crate::util::thread_spawn::spawn(move || {
+                    let _row_ids_charge = row_ids_charge;
+                    context.run(&db, || {
+                        let result = (|| -> Result<(), QueryError> {
+                            let heap = db.cached_heap_handle(table.schema.id)?;
+                            // Heap Value rows coexist with the converted Batch.
+                            // Reserve before decoding and leave half this worker's
+                            // buffer share for conversion and queued output.
+                            let batch_rows = (scan_decode_batch_rows(&schema) / 2).max(1);
+                            for ids in row_ids[start..end].chunks(batch_rows) {
+                                context.cancellation().check()?;
+                                let row_slots =
+                                    std::mem::size_of::<(crate::storage::RowId, Vec<Value>)>();
+                                let predicted = ids.len().saturating_mul(row_slots.saturating_add(
+                                    columns.len().saturating_mul(std::mem::size_of::<Value>()),
+                                ));
+                                let mut rows_charge = mem_budget::force_charge_scoped(predicted)?;
+                                let mut rows = db.read_row_columns_many_with_handle(
+                                    &heap,
+                                    &table.schema,
+                                    ids,
+                                    context.txn(),
+                                    &columns,
+                                )?;
+                                let actual = rows.iter().fold(
+                                    rows.capacity().saturating_mul(row_slots),
+                                    |bytes, (_, values)| {
+                                        bytes
+                                            .saturating_add(
+                                                mem_budget::estimate_row_bytes(values)
+                                                    .saturating_sub(
+                                                        std::mem::size_of::<Vec<Value>>(),
+                                                    ),
+                                            )
+                                            .saturating_add(
+                                                values
+                                                    .capacity()
+                                                    .saturating_sub(values.len())
+                                                    .saturating_mul(std::mem::size_of::<Value>()),
+                                            )
+                                    },
+                                );
+                                if actual > predicted {
+                                    rows_charge.add_force(actual - predicted)?;
+                                } else {
+                                    rows_charge.release_bytes(predicted - actual);
+                                }
+                                if let Some(predicate) = predicate.as_deref() {
+                                    let mut eval_error = None;
+                                    rows.retain(|(_, values)| {
+                                        if eval_error.is_some() {
+                                            return false;
                                         }
+                                        match predicate.eval(values) {
+                                            Ok(keep) => keep,
+                                            Err(error) => {
+                                                eval_error = Some(error);
+                                                false
+                                            }
+                                        }
+                                    });
+                                    if let Some(error) = eval_error {
+                                        return Err(error);
                                     }
-                                });
-                                if let Some(error) = eval_error {
-                                    return Err(error);
+                                }
+                                if let Some(batch) = projected_values_batch(&schema, rows) {
+                                    if !send_parallel_scan_message(&sender, &context, Ok(batch)) {
+                                        return Ok(());
+                                    }
                                 }
                             }
-                            if let Some(batch) = projected_values_batch(&schema, rows) {
-                                if !send_parallel_scan_message(&sender, &context, Ok(batch)) {
-                                    return Ok(());
-                                }
-                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = result {
+                            let error = context.terminal_error(error);
+                            let _ = send_parallel_scan_message(&sender, &context, Err(error));
                         }
-                        Ok(())
-                    })();
-                    if let Err(error) = result {
-                        let error = context.terminal_error(error);
-                        let _ = send_parallel_scan_message(&sender, &context, Err(error));
-                    }
-                });
-            }));
+                    });
+                }));
         }
         drop(sender);
         self.execution.receiver = Some(receiver);

@@ -16,8 +16,9 @@ impl ScoringShare {
 
     fn degree(&self, requested: usize) -> usize {
         static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let cpus =
-            *CPUS.get_or_init(|| crate::util::thread_spawn::available_parallelism().map_or(1, usize::from));
+        let cpus = *CPUS.get_or_init(|| {
+            crate::util::thread_spawn::available_parallelism().map_or(1, usize::from)
+        });
         let capacity =
             crate::planner::cpu_bound_parallel_degree(cpus.min(u32::MAX as usize) as u32) as usize;
         requested.min((capacity / self.0).max(1)).max(1)

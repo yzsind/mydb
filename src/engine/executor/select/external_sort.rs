@@ -934,74 +934,78 @@ fn merge_stream_run_pass(
     let params = crate::engine::params::snapshot_current_context();
     let env = crate::util::env::override_snapshot();
     let collector = super::analyze_stats::current_collector_handle();
-    let mut merged = crate::util::thread_spawn::scope(|scope| -> Result<Vec<(usize, SortRun)>, QueryError> {
-        let mut handles = Vec::new();
-        for _ in 0..workers {
-            let groups = &groups;
-            let next = &next;
-            let budget = budget.clone();
-            let cancel = cancel.clone();
-            let session = session.clone();
-            let tuning = tuning.clone();
-            let params = params.clone();
-            let env = env.clone();
-            let collector = collector.clone();
-            handles.push(
-                crate::util::thread_spawn::Builder::new()
-                    .stack_size(2 * 1024 * 1024)
-                    .name("mydb-sort-spill".into())
-                    .spawn_scoped(scope, move || {
-                        let _cancel = cancel.enter();
-                        let _tuning = crate::engine::executor::tuning::enter(tuning);
-                        let run = || -> Result<Vec<(usize, SortRun)>, QueryError> {
-                            let mut output = Vec::new();
-                            loop {
-                                crate::engine::cancel::check_cancelled()?;
-                                let index = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if index >= groups.len() {
-                                    break;
-                                }
-                                output.push((
-                                    index,
-                                    merge_runs_to_run(tmp, groups[index], fields, pass, index)?,
-                                ));
-                            }
-                            Ok(output)
-                        };
-                        let run = || {
-                            crate::engine::expr::with_session_expr_info_option(&session, || {
-                                let run = || match budget {
-                                    Some(budget) => {
-                                        crate::engine::executor::mem_budget::with_query_budget(
-                                            budget, run,
-                                        )
+    let mut merged =
+        crate::util::thread_spawn::scope(|scope| -> Result<Vec<(usize, SortRun)>, QueryError> {
+            let mut handles = Vec::new();
+            for _ in 0..workers {
+                let groups = &groups;
+                let next = &next;
+                let budget = budget.clone();
+                let cancel = cancel.clone();
+                let session = session.clone();
+                let tuning = tuning.clone();
+                let params = params.clone();
+                let env = env.clone();
+                let collector = collector.clone();
+                handles.push(
+                    crate::util::thread_spawn::Builder::new()
+                        .stack_size(2 * 1024 * 1024)
+                        .name("mydb-sort-spill".into())
+                        .spawn_scoped(scope, move || {
+                            let _cancel = cancel.enter();
+                            let _tuning = crate::engine::executor::tuning::enter(tuning);
+                            let run = || -> Result<Vec<(usize, SortRun)>, QueryError> {
+                                let mut output = Vec::new();
+                                loop {
+                                    crate::engine::cancel::check_cancelled()?;
+                                    let index =
+                                        next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                    if index >= groups.len() {
+                                        break;
                                     }
-                                    None => run(),
-                                };
-                                match params {
-                                    Some(params) => params.run(run),
-                                    None => run(),
+                                    output.push((
+                                        index,
+                                        merge_runs_to_run(tmp, groups[index], fields, pass, index)?,
+                                    ));
                                 }
+                                Ok(output)
+                            };
+                            let run = || {
+                                crate::engine::expr::with_session_expr_info_option(&session, || {
+                                    let run = || match budget {
+                                        Some(budget) => {
+                                            crate::engine::executor::mem_budget::with_query_budget(
+                                                budget, run,
+                                            )
+                                        }
+                                        None => run(),
+                                    };
+                                    match params {
+                                        Some(params) => params.run(run),
+                                        None => run(),
+                                    }
+                                })
+                            };
+                            crate::util::env::with_override_snapshot(env, || {
+                                super::analyze_stats::with_collector_handle_if_present(
+                                    collector, run,
+                                )
                             })
-                        };
-                        crate::util::env::with_override_snapshot(env, || {
-                            super::analyze_stats::with_collector_handle_if_present(collector, run)
                         })
-                    })
-                    .map_err(|error| {
-                        crate::error::catalog::ER_GET_ERRNO
-                            .error(format!("cannot start external sort spill worker: {error}"))
-                    })?,
-            );
-        }
-        let mut output = Vec::new();
-        for handle in handles {
-            output.extend(handle.join().map_err(|_| {
-                crate::error::catalog::ER_GET_ERRNO.error("external sort spill worker panicked")
-            })??);
-        }
-        Ok(output)
-    })?;
+                        .map_err(|error| {
+                            crate::error::catalog::ER_GET_ERRNO
+                                .error(format!("cannot start external sort spill worker: {error}"))
+                        })?,
+                );
+            }
+            let mut output = Vec::new();
+            for handle in handles {
+                output.extend(handle.join().map_err(|_| {
+                    crate::error::catalog::ER_GET_ERRNO.error("external sort spill worker panicked")
+                })??);
+            }
+            Ok(output)
+        })?;
     // Leaf-index ties must retain the original chronological run order.
     merged.sort_unstable_by_key(|(index, _)| *index);
     Ok(merged.into_iter().map(|(_, run)| run).collect())

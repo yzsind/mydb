@@ -1,9 +1,9 @@
 use crate::engine::executor::mem_budget::load_data_ancillary_headroom as load_data_ancillary_headroom_for_limit;
 use crate::engine::executor::mem_budget::load_data_reclaim_target as load_data_batch_reclaim_target_for_values;
+use crate::util::thread_spawn as thread;
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{mpsc, Arc};
-use crate::util::thread_spawn as thread;
 
 use memchr::{memchr, memchr2};
 

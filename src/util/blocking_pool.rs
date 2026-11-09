@@ -51,6 +51,7 @@
 //! [`spawn`]. Tests share the production pool — no per-test thread
 //! spinup.
 
+use crate::util::thread_spawn as thread;
 use std::any::Any;
 use std::future::Future;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -59,7 +60,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
-use crate::util::thread_spawn as thread;
 
 use crossbeam_deque::{Injector, Steal};
 use parking_lot::Mutex;

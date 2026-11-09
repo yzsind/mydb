@@ -9,6 +9,7 @@ use crate::replication_sql::{
 pub use crate::replication_types::{
     ReplThreadError, ReplicationChannelConfig, ReplicationSslMode, ReplicationStatus,
 };
+use crate::util::thread_spawn::{self as thread, JoinHandle};
 use std::cell::Cell;
 use std::collections::HashMap;
 use std::fs::{self, File, OpenOptions};
@@ -17,7 +18,6 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
-use crate::util::thread_spawn::{self as thread, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use chrono::NaiveDate;

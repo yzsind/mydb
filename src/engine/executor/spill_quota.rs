@@ -2121,7 +2121,9 @@ mod tests {
         let reader = TrackedSpillReader::open(&path, charger.clone(), 32 * 1024).unwrap();
         assert_eq!(budget.used(), manifest_memory + 32 * 1024);
         assert_eq!(active_spill_files(), active_before + 1);
-        crate::util::thread_spawn::spawn(move || drop(reader)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(reader))
+            .join()
+            .unwrap();
         assert_eq!(budget.used(), manifest_memory);
         assert_eq!(active_spill_files(), active_before);
         release_dir(&charger);
@@ -2571,7 +2573,9 @@ mod tests {
         drop(file);
         assert!(path.exists());
         assert!(charger.dir_bytes() >= 8);
-        crate::util::thread_spawn::spawn(move || drop(mirror)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(mirror))
+            .join()
+            .unwrap();
         assert!(!path.exists());
         assert_eq!(charger.dir_bytes(), 0);
         assert_eq!(global_spilled_bytes(), before);

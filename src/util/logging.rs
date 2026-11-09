@@ -1,9 +1,9 @@
+use crate::util::thread_spawn as thread;
 use std::fmt;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::OnceLock;
-use crate::util::thread_spawn as thread;
 
 use chrono::Local;
 

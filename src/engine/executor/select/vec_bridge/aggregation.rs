@@ -2557,7 +2557,6 @@ pub(super) fn translate_aggregate_extended(
     Some((func, AggInputSpec::Expr(program), result_type))
 }
 
-
 #[cfg(test)]
 #[path = "aggregation_refactor_tests.rs"]
 mod refactor_tests;

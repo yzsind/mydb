@@ -34,7 +34,7 @@ pub(crate) mod scoped_cell;
 
 pub(crate) mod ordered_float;
 
-pub(crate) mod thread_priority;
 pub(crate) mod strict_json;
+pub(crate) mod thread_priority;
 
 pub(crate) mod thread_spawn;

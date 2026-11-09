@@ -947,12 +947,16 @@ impl LazyValueRowWriterPool {
         batch: &Batch,
         row: usize,
     ) -> Result<(), QueryError> {
-        self.writer_for_partition(partition)?.append_batch_row(batch, row)
+        self.writer_for_partition(partition)?
+            .append_batch_row(batch, row)
     }
 
     // Preserve the original per-row call boundary for both append formats.
     #[inline(always)]
-    fn writer_for_partition(&mut self, partition: usize) -> Result<&mut ValueRowWriter, QueryError> {
+    fn writer_for_partition(
+        &mut self,
+        partition: usize,
+    ) -> Result<&mut ValueRowWriter, QueryError> {
         self.epoch = self.epoch.wrapping_add(1);
         if self.slots[partition].is_none() {
             if self.slots.iter().filter(|slot| slot.is_some()).count() >= self.max_open {
@@ -1661,7 +1665,6 @@ mod spill_contract_regressions {
         }
     }
 }
-
 
 #[cfg(test)]
 mod writer_pool_refactor_tests {

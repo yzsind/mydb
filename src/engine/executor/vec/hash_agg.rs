@@ -7680,7 +7680,11 @@ impl HashAggregateCore {
     /// Build the output BatchSchema (group cols + finalized agg cols).
     /// Shares the metadata contract with parallel bridge preparation.
     pub fn output_schema(&self) -> Arc<BatchSchema> {
-        aggregate_output_schema(self.input_schema.as_deref(), &self.group_columns, &self.aggs)
+        aggregate_output_schema(
+            self.input_schema.as_deref(),
+            &self.group_columns,
+            &self.aggs,
+        )
     }
 
     /// Streaming counterpart to `finalize` — returns a `BatchOperator` that

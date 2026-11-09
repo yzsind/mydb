@@ -8,9 +8,9 @@ use std::hash::{BuildHasher, Hash, Hasher};
 /// hashing buys nothing here: the keys are internal identifiers, never
 /// attacker-chosen strings hashed across a trust boundary.
 pub(crate) type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
+use crate::util::thread_spawn as thread;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use crate::util::thread_spawn as thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -5767,9 +5767,9 @@ impl LockManager {
 #[cfg(test)]
 mod group_commit_tests {
     use super::*;
+    use crate::util::thread_spawn as thread;
     use std::cell::RefCell;
     use std::sync::Arc;
-    use crate::util::thread_spawn as thread;
     use std::time::Duration;
 
     fn make_err() -> QueryError {

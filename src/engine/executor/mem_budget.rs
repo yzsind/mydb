@@ -2887,9 +2887,11 @@ mod tests {
         // Allocation and release can belong to different workers. The
         // releasing thread has never recorded statistics before its exit.
         record_category_alloc(ControlledMemoryCategory::PerformanceSchema, 16, 16);
-        crate::util::thread_spawn::spawn(|| RELEASE.with(|slot| *slot.borrow_mut() = Some(ReleaseOnExit)))
-            .join()
-            .unwrap();
+        crate::util::thread_spawn::spawn(|| {
+            RELEASE.with(|slot| *slot.borrow_mut() = Some(ReleaseOnExit))
+        })
+        .join()
+        .unwrap();
         let snapshot = pfs_memory_category_snapshots()
             [category_slot(ControlledMemoryCategory::PerformanceSchema)];
         assert_eq!(snapshot.alloc_count, 1);
@@ -3162,7 +3164,9 @@ mod tests {
         assert_eq!(owner.bytes() + worker.bytes(), limit);
         drop(owner);
         assert_eq!(controlled_memory_snapshot().0, worker.bytes());
-        crate::util::thread_spawn::spawn(move || drop(worker)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(worker))
+            .join()
+            .unwrap();
         assert_eq!(controlled_memory_snapshot().0, 0);
         MEMORY_TARGET_BYTES.store(prior_target, Ordering::Release);
         EFFECTIVE_MEMORY_LIMIT_BYTES.store(prior_effective, Ordering::Release);

@@ -26062,7 +26062,6 @@ mod audit_arithmetic_tests {
     }
 }
 
-
 #[cfg(test)]
 #[path = "planner/operator_display_tests.rs"]
 mod operator_display_tests;

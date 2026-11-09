@@ -7996,7 +7996,9 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
             let manager = manager.clone();
-            crate::util::thread_spawn::spawn(move || tx.send(stage_test_write(&manager, 2)).unwrap())
+            crate::util::thread_spawn::spawn(move || {
+                tx.send(stage_test_write(&manager, 2)).unwrap()
+            })
         };
         assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
         assert!(!manager

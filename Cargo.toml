@@ -29,7 +29,7 @@ fast-alloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 chrono = "0.4"
 
 [dependencies]
-rmcp = { version = "=3.8.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
+rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
 half = "=2.7.1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = { version = "1", features = ["unbounded_depth", "raw_value"] }

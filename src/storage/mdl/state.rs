@@ -383,8 +383,9 @@ mod tests {
             .unwrap();
         let held = manager.state.lock_key(&second);
         let releasing = Arc::clone(&manager);
-        let release =
-            crate::util::thread_spawn::spawn(move || releasing.release_duration(1, MdlDuration::Transaction));
+        let release = crate::util::thread_spawn::spawn(move || {
+            releasing.release_duration(1, MdlDuration::Transaction)
+        });
         // Wait until release has reached the first shard. The old path keeps
         // it locked while waiting for the second; the streaming path has
         // already removed its ticket before waiting for the second.

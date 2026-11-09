@@ -6183,7 +6183,8 @@ mod purge_tests {
         let record = make_record(1, 7, 1, None);
         let expected = estimate_undo_resident_bytes(&record) as usize;
         let (tx, rx) = std::sync::mpsc::channel();
-        let worker = crate::util::thread_spawn::spawn(move || tx.send(admission.reserve(&record)).unwrap());
+        let worker =
+            crate::util::thread_spawn::spawn(move || tx.send(admission.reserve(&record)).unwrap());
         let reserved = rx.recv_timeout(std::time::Duration::from_secs(1));
         drop(held);
         worker.join().unwrap();

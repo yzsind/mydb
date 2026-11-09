@@ -522,8 +522,8 @@ mod binlog_admin_metadata;
 
 mod replication_admin_metadata;
 
-mod compiled_range_recipe;
 mod cached_limit_validation;
+mod compiled_range_recipe;
 mod decimal_index_comparison;
 
 mod release_audit;

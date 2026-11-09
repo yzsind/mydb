@@ -693,7 +693,6 @@ pub(crate) fn cleanup_abandoned_staging(source: &Path) -> Result<(), QueryError>
     sync_dir(&registry)
 }
 
-
 #[cfg(test)]
 mod restore_path_tests {
     use super::*;
