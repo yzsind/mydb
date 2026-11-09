@@ -12,6 +12,13 @@ use num_traits::{Signed, ToPrimitive, Zero};
 
 /// MySQL's maximum DECIMAL scale.
 pub const MAX_DECIMAL_SCALE: u8 = 30;
+/// Fractional scratch words retained by exact expression division.
+/// Display scale remains a separate bound expression property.
+pub fn division_intermediate_scale(left: u8, right: u8, increment: u8) -> u8 {
+    let words = u16::from(left).div_ceil(9) + u16::from(right).div_ceil(9);
+    ((words * 9 + u16::from(increment)).div_ceil(9) * 9)
+        .min(u16::from(MAX_DECIMAL_INTERMEDIATE_SCALE)) as u8
+}
 /// MySQL's maximum DECIMAL precision.
 pub const MAX_DECIMAL_PRECISION: u8 = 65;
 /// Maximum digits held by MySQL's internal `my_decimal` scratch buffer.

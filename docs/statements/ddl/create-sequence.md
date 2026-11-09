@@ -31,6 +31,17 @@ Creates a PostgreSQL-style sequence object for use with nextval/currval/lastval/
 - `OWNED BY table.column` binds stable table/column identities; dropping that table or column also drops the sequence. Renames and table rewrites preserve the dependency. `OWNED BY NONE` removes it. Permanent sequences cannot depend on temporary tables; cross-database dependency moves are rejected.
 - NEXTVAL/SETVAL require UPDATE on the sequence; CURRVAL/LASTVAL require SELECT or UPDATE. Advancing values is rejected on physical replicas, in read-only transactions, under super_read_only or while master writes are stopped. See [Sequences](../../sequences.md) for cache, durability and synchronization rules.
 
+## Privileges, Transactions, and Dependencies
+
+CREATE on the sequence schema/object is required; temporary sequences use CREATE TEMPORARY TABLES. DDL and value allocation have separate transaction effects: rollback cannot reclaim NEXTVAL/SETVAL results. CACHE values are reserved per session and can be lost on disconnect or failure. The default type is BIGINT, increment 1, CACHE 1, NO CYCLE.
+
+| Direction | Default bounds | Default start |
+| --- | --- | --- |
+| Positive increment | MINVALUE 1; MAXVALUE backing type maximum | MINVALUE |
+| Negative increment | MINVALUE backing type minimum; MAXVALUE -1 | MAXVALUE |
+
+SMALLINT/INTEGER/BIGINT use their signed 16/32/64-bit domains. Explicit bounds/start must lie in the type domain; increment cannot be zero and CACHE must be positive. CYCLE restarts at the direction-appropriate bound; NO CYCLE reports exhaustion. [Sequence durability and sync](../../sequences.md) defines gaps, crash safety, OWNED BY and remote_apply.
+
 ## Examples
 
 ```sql
@@ -50,4 +61,4 @@ DROP SEQUENCE invoice_seq;
 
 - [DDL category index](README.md)
 - [Syntax notation](../syntax-conventions.md)
-- [SHOW CREATE TABLE](../metadata/show-create-table.md)
+- [SHOW CREATE SEQUENCE](../metadata/show-create-sequence.md)

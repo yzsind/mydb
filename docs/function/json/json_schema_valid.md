@@ -14,8 +14,8 @@ JSON_SCHEMA_VALID(schema, document)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `schema` | Yes | JSON document or JSON path/scalar | The 1st argument; the meaning is determined by the function syntax and description |
-| `document` | Yes | JSON document or JSON path/scalar | The 2nd argument; the meaning is determined by the function syntax and description |
+| `schema` | Yes | JSON object or matching JSON text | Draft 4 schema with validation keywords such as type/properties/required. |
+| `document` | Yes | JSON document or valid JSON text | Value validated against the schema. |
 
 ## Return Value
 
@@ -24,19 +24,22 @@ Returns integer 1 if the document conforms to the supplied JSON schema, otherwis
 ## Examples
 
 ```sql
-SELECT JSON_SCHEMA_VALID('{"a":1}', '{"a":1}');
+SELECT JSON_SCHEMA_VALID('{"type":"object","properties":{"a":{"type":"integer"}},"required":["a"]}', '{"a":1}'),
+       JSON_SCHEMA_VALID('{"type":"integer"}', '"text"');
 ```
 
 Result:
 
 ```text
-1
+1	0
 ```
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
+
+- Schemas use Draft 4 validation, must be JSON objects, and are validated before document validation. Use type/properties/required/items and supported constraints, not an example document as a schema. Invalid schema syntax/keywords produce explicit diagnostics; remote schemas are not fetched through a general network loader.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_SCHEMA_VALIDATION_REPORT`](json_schema_validation_report.md).

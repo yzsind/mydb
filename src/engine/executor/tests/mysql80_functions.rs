@@ -96,8 +96,8 @@ fn greatest_uses_one_string_context_for_mixed_arguments() {
         "SELECT GREATEST(-29858, 0x667adb23, 'zzzz', 0, 15720), \
                 LEAST(20, '3', 100)",
     );
-    assert_eq!(row[0], Value::String("zzzz".into()));
-    assert_eq!(row[1], Value::Int(100));
+    assert_eq!(row[0], Value::Bytes(b"zzzz".to_vec()));
+    assert_eq!(row[1], Value::String("100".into()));
 }
 
 #[test]

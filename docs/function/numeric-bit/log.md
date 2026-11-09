@@ -32,8 +32,8 @@ Result: approximately 2.302585092994046
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LN`](ln.md), [`LOG2`](log2.md), [`LOG10`](log10.md), [`EXP`](exp.md).

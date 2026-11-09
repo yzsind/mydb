@@ -58,6 +58,53 @@ pub(super) fn tokenize(
     dialect: &dyn sqlparser::dialect::Dialect,
     sql: &str,
 ) -> Result<Vec<TokenWithSpan>, sqlparser::tokenizer::TokenizerError> {
+    let mut tokens = tokenize_hex_prefixes(dialect, sql)?;
+    let mut read = 0;
+    let mut write = 0;
+    while read < tokens.len() {
+        let merged = match (&tokens[read].token, tokens.get(read + 1)) {
+            (Token::Number(number, _), Some(next)) => match &next.token {
+                Token::Word(word)
+                    if word.quote_style.is_none()
+                        && matches!(word.value.as_bytes().first(), Some(b'e' | b'E'))
+                        && tokens[read].span.end == next.span.start
+                        && !number.contains(['e', 'E']) =>
+                {
+                    if number.contains('.') {
+                        return Err(sqlparser::tokenizer::TokenizerError {
+                            message: "Invalid numeric literal with incomplete exponent".into(),
+                            location: tokens[read].span.start,
+                        });
+                    }
+                    let mut word = word.clone();
+                    word.value = format!("{number}{}", word.value);
+                    word.keyword = Keyword::NoKeyword;
+                    Some((word, next.span.end))
+                }
+                _ => None,
+            },
+            _ => None,
+        };
+        if write != read {
+            tokens.swap(write, read);
+        }
+        if let Some((word, end)) = merged {
+            tokens[write].token = Token::Word(word);
+            tokens[write].span.end = end;
+            read += 2;
+        } else {
+            read += 1;
+        }
+        write += 1;
+    }
+    tokens.truncate(write);
+    Ok(tokens)
+}
+
+fn tokenize_hex_prefixes(
+    dialect: &dyn sqlparser::dialect::Dialect,
+    sql: &str,
+) -> Result<Vec<TokenWithSpan>, sqlparser::tokenizer::TokenizerError> {
     let identifier_byte =
         |byte: &u8| byte.is_ascii_alphanumeric() || !byte.is_ascii() || matches!(byte, b'_' | b'$');
     let suspicious = memchr::memchr_iter(b'0', sql.as_bytes()).any(|start| {

@@ -138,7 +138,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             default_collation,
             ..
         } => Ok(Statement::CreateDatabase {
-            name: object_name_to_string(db_name)?,
+            name: database_object_name(db_name)?,
             if_not_exists,
             default_charset,
             default_collation,
@@ -182,7 +182,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             ObjectType::Database | ObjectType::Schema if names.len() == 1 => {
                 let mut names = names;
                 Ok(Statement::DropDatabase {
-                    name: object_name_to_string(names.remove(0))?,
+                    name: database_object_name(names.remove(0))?,
                     if_exists,
                 })
             }
@@ -766,7 +766,7 @@ fn convert_explain_format(format: Option<AnalyzeFormatKind>) -> Option<ExplainFo
 
 fn convert_use(use_expr: Use) -> Result<Statement, ParseError> {
     let name = match use_expr {
-        Use::Database(name) | Use::Schema(name) | Use::Object(name) => object_name_to_string(name)?,
+        Use::Database(name) | Use::Schema(name) | Use::Object(name) => database_object_name(name)?,
         Use::Default => "test".to_string(),
         _ => {
             return parse_error_from_sql_span(
@@ -942,7 +942,12 @@ fn convert_view_definer(
             if name.eq_ignore_ascii_case("CURRENT_USER")
                 || name.eq_ignore_ascii_case("CURRENT_USER()")
             {
-                Ok(None)
+                // An explicit CURRENT_USER must remain distinguishable from
+                // an omitted DEFINER, especially when ALTER replaces an owner.
+                Ok(Some(AccountIdent {
+                    user: "CURRENT_USER()".into(),
+                    host: String::new(),
+                }))
             } else {
                 parse_definer_account(&name)
                     .map(Some)
@@ -1527,6 +1532,13 @@ fn column_alter_actions(
     comment: Option<String>,
     position: Option<sqlparser::ast::MySQLColumnPosition>,
 ) -> ConvertedAlterAction {
+    let keys = match &action {
+        AlterAction::AddColumn(def) | AlterAction::ModifyColumn(def) => {
+            Some((def.primary_key, def.unique))
+        }
+        AlterAction::ChangeColumn { new_def, .. } => Some((new_def.primary_key, new_def.unique)),
+        _ => None,
+    };
     let position = convert_column_position(position);
     let mut actions =
         Vec::with_capacity(1 + usize::from(comment.is_some()) + usize::from(position.is_some()));
@@ -1538,7 +1550,31 @@ fn column_alter_actions(
         });
     }
     if let Some(position) = position {
-        actions.push(AlterAction::MoveColumn { column, position });
+        actions.push(AlterAction::MoveColumn {
+            column: column.clone(),
+            position,
+        });
+    }
+    if let Some((primary, unique)) = keys {
+        for is_primary in [true, false] {
+            if (is_primary && primary) || (!is_primary && unique) {
+                actions.push(AlterAction::AddIndex(IndexDef {
+                    name: is_primary.then(|| "PRIMARY".to_string()),
+                    columns: vec![column.clone()],
+                    column_prefix_lengths: vec![None],
+                    column_descending: vec![false],
+                    key_expressions: vec![None],
+                    key_expression_multi_valued: vec![false],
+                    unique: true,
+                    included_columns: Vec::new(),
+                    index_type: "BTREE".to_string(),
+                    visible: true,
+                    comment: String::new(),
+                    fulltext_parser: String::new(),
+                    vector_options: None,
+                }));
+            }
+        }
     }
     ConvertedAlterAction::Actions(actions)
 }
@@ -2585,6 +2621,7 @@ fn convert_order_by(items: &[sqlparser::ast::OrderByExpr]) -> Result<Vec<OrderBy
         .iter()
         .map(|item| {
             Ok(OrderBy {
+                names_bound: false,
                 expr: convert_expr(&item.expr)?,
                 asc: item.options.asc.unwrap_or(true),
                 nulls_first: item.options.nulls_first,
@@ -2743,7 +2780,11 @@ fn convert_select(
     for (internal, sql_item) in projection.iter_mut().zip(select.projection.iter()) {
         if let SelectItem::Expr { expr, alias } = internal {
             if alias.is_none()
-                && crate::engine::expr::expr_name(expr) == "expr"
+                && (crate::engine::expr::expr_name(expr) == "expr"
+                    || matches!(
+                        expr,
+                        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_))
+                    ))
                 && !parser_fragment_mode()
             {
                 if let SqlSelectItem::UnnamedExpr(sql_expr) = sql_item {
@@ -3435,8 +3476,22 @@ fn convert_column_parts(
     let mut precision_suffix = false;
     let mut signed_suffix = None;
     let mut signed_requested = false;
+    let display_width = match &data_type {
+        SqlDataType::TinyInt(width)
+        | SqlDataType::TinyIntUnsigned(width)
+        | SqlDataType::SmallInt(width)
+        | SqlDataType::SmallIntUnsigned(width)
+        | SqlDataType::MediumInt(width)
+        | SqlDataType::MediumIntUnsigned(width)
+        | SqlDataType::Int(width)
+        | SqlDataType::IntUnsigned(width)
+        | SqlDataType::BigInt(width)
+        | SqlDataType::BigIntUnsigned(width) => width.map(|width| width as u16),
+        _ => None,
+    };
     let column_name = ident_value(name);
     let mut nullable = true;
+    let mut explicit_null = false;
     let mut primary_key = false;
     let mut unique = false;
     let mut auto_increment = false;
@@ -3451,7 +3506,10 @@ fn convert_column_parts(
     let mut srid = None;
     for (option_index, option) in options.into_iter().enumerate() {
         match option.option {
-            ColumnOption::Null => nullable = true,
+            ColumnOption::Null => {
+                nullable = true;
+                explicit_null = true;
+            }
             ColumnOption::NotNull => nullable = false,
             // MySQL 8.0.13+: `DEFAULT (<expr>)` (parenthesised) means evaluate
             // the expression at INSERT / ALTER ADD COLUMN backfill time, not
@@ -3481,6 +3539,11 @@ fn convert_column_parts(
             }
             ColumnOption::Unique(_) => unique = true,
             ColumnOption::DialectSpecific(tokens) => {
+                if matches!(tokens.as_slice(), [sqlparser::tokenizer::Token::Word(word)] if word.value.eq_ignore_ascii_case("VISIBLE"))
+                {
+                    invisible = false;
+                    continue;
+                }
                 if let Some(suffix) = super::adapter::decode_column_type_suffix(&tokens)? {
                     use super::adapter::TypeSuffix;
                     if matches!(suffix, TypeSuffix::Zerofill) {
@@ -3688,12 +3751,20 @@ fn convert_column_parts(
             "A primary key index cannot be invisible",
         ));
     }
+    if explicit_null
+        && nullable
+        && matches!(data_type, DataType::Timestamp { .. })
+        && default.is_none()
+    {
+        default = Some(Expr::Literal(Literal::Null));
+    }
     Ok((
         ColumnDef {
             name: column_name,
             data_type,
             unsigned,
             zerofill,
+            display_width,
             invisible,
             nullable,
             primary_key,
@@ -3868,7 +3939,11 @@ fn convert_data_type_with_unsigned(
     let dt = match data_type {
         SqlDataType::TinyInt(width) | SqlDataType::TinyIntUnsigned(width) => {
             validate_integer_display_width(width)?;
-            DataType::TinyInt
+            if width == Some(1) {
+                DataType::Bool
+            } else {
+                DataType::TinyInt
+            }
         }
         SqlDataType::UTinyInt => DataType::TinyInt,
         SqlDataType::SmallInt(width)
@@ -4627,7 +4702,13 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                     for clause in &list.clauses {
                         match clause {
                             FunctionArgumentClause::Separator(value) => {
-                                separator = Some(convert_value(value, function.args.span())?);
+                                let value = convert_value(value, function.args.span())?;
+                                if !matches!(value, Expr::Literal(Literal::String(_))) {
+                                    return Err(parse_error_at_zero(
+                                        "GROUP_CONCAT SEPARATOR must be a string literal",
+                                    ));
+                                }
+                                separator = Some(value);
                             }
                             FunctionArgumentClause::OrderBy(order_exprs) => {
                                 for item in order_exprs {
@@ -4683,14 +4764,35 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                         }
                     }
                 }
+                if upper_name == "GROUP_CONCAT"
+                    && function_args_distinct(&function.args)
+                    && args.len() > 1
+                {
+                    // Preserve argument boundaries: CONCAT(a,b) alone cannot
+                    // distinguish ('ab','c') from ('a','bc') for DISTINCT.
+                    order_pairs.push(Expr::Function {
+                        name: "__DISTINCT_TUPLE".to_string(),
+                        args: args
+                            .iter()
+                            .cloned()
+                            .map(|arg| Expr::Function {
+                                name: "__DISTINCT_COLLATION_KEY".to_string(),
+                                args: vec![arg],
+                                distinct: false,
+                            })
+                            .collect(),
+                        distinct: false,
+                    });
+                    order_pairs.push(Expr::Literal(Literal::String("ASC".into())));
+                }
                 let value_expr = if args.is_empty() {
                     Expr::Literal(Literal::Null)
                 } else if args.len() == 1 || upper_name == "JSON_ARRAYAGG" {
                     args.swap_remove(0)
                 } else {
-                    // GROUP_CONCAT with multiple value expressions.
+                    // Keep aggregate value formatting distinct from explicit CONCAT.
                     Expr::Function {
-                        name: "CONCAT".to_string(),
+                        name: "__GROUP_CONCAT_VALUE".to_string(),
                         args: std::mem::take(&mut args),
                         distinct: false,
                     }
@@ -6994,6 +7096,13 @@ fn convert_group_by(
                     }
                 }
             }
+            if trailing_modifier == GroupByModifier::Rollup {
+                // Positional duplicate keys define distinct ROLLUP levels.
+                group_by_keys = exprs
+                    .iter()
+                    .map(convert_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             let grouping_sets = if trailing_modifier == GroupByModifier::Rollup {
                 rollup_sets((0..group_by_keys.len()).map(|idx| vec![idx]).collect())?
             } else if trailing_modifier == GroupByModifier::Cube {
@@ -8362,21 +8471,17 @@ fn resolve_order_by_refs(
         .into_iter()
         .map(|mut item| {
             match &item.expr {
-                Expr::Identifier(name) => {
-                    if let Some(expr) = projection_alias_expr(projection, name) {
-                        item.expr = clone_parser_expression(expr)
-                            .map_err(SelectListRefError::Allocation)?;
-                    }
-                }
                 // A plain integer literal in ORDER BY is a positional
                 // reference into the select list (MySQL semantics). Only
                 // raw number tokens reach here: `-1` stays a Unary minus
                 // expression, so it is never mistaken for a position.
                 Expr::Literal(Literal::Int(pos)) if *pos >= 0 && !has_wildcard => {
                     item.expr = ordinal_projection_expr(*pos as u64, projection, has_wildcard)?;
+                    item.names_bound = true;
                 }
                 Expr::Literal(Literal::UInt(pos)) if !has_wildcard => {
                     item.expr = ordinal_projection_expr(*pos, projection, has_wildcard)?;
+                    item.names_bound = true;
                 }
                 _ => {}
             }
@@ -8451,7 +8556,13 @@ fn resolve_group_by_ordinals(
                 return Err(GroupByRefError::Aggregate(display));
             }
         }
-        *expr = resolved;
+        *expr = match resolved {
+            Expr::Literal(Literal::Int(value)) => Expr::BoundValue(crate::types::Value::Int(value)),
+            Expr::Literal(Literal::UInt(value)) => {
+                Expr::BoundValue(crate::types::Value::UInt(value))
+            }
+            other => other,
+        };
     }
     Ok(())
 }
@@ -8571,16 +8682,6 @@ fn clone_parser_expression(expr: &Expr) -> Result<Expr, ParseError> {
         reserve_parser_expansion(size.0)?;
     }
     with_parser_stack(|| expr.clone())
-}
-
-fn projection_alias_expr<'a>(projection: &'a [SelectItem], name: &str) -> Option<&'a Expr> {
-    projection.iter().find_map(|item| match item {
-        SelectItem::Expr {
-            expr,
-            alias: Some(alias),
-        } if alias.eq_ignore_ascii_case(name) => Some(expr),
-        _ => None,
-    })
 }
 
 /// Extract the lowercased user-variable name from an assignment target,
@@ -9265,8 +9366,18 @@ fn object_name_to_qualified(name: ObjectName) -> Result<QualifiedName, ParseErro
     QualifiedName::new(database, object).map_err(parse_error_at_zero)
 }
 
+fn database_object_name(name: ObjectName) -> Result<String, ParseError> {
+    match name.0.as_slice() {
+        [ObjectNamePart::Identifier(identifier)] => Ok(identifier.value.clone()),
+        _ => Err(parse_error_at_zero("expected one database identifier")),
+    }
+}
+
 fn object_name_to_string(name: impl std::borrow::Borrow<ObjectName>) -> Result<String, ParseError> {
     join_name_parts(name.borrow().0.iter().map(|part| match part {
+        ObjectNamePart::Identifier(ident) if ident.value.contains('.') => Err(parse_error_at_zero(
+            "Dots inside quoted object identifiers are not supported",
+        )),
         ObjectNamePart::Identifier(ident) => Ok(ident.value.as_str()),
         ObjectNamePart::Function(_) => parse_error_from_sql_span(
             sqlparser::tokenizer::Span::empty(),

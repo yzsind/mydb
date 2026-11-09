@@ -33,6 +33,9 @@ pub(super) struct FieldLookup {
 pub(crate) struct RowSchema {
     metas: std::sync::Arc<[ColMetaRef]>,
     lookup: std::sync::OnceLock<FieldLookup>,
+    /// Native aggregation can discard its input columns while legacy scalar
+    /// wrappers still reference aggregate ASTs. Retain their bound domains.
+    aggregate_types: Box<[(u64, crate::engine::expr_type::ExprType)]>,
 }
 
 /// Compact schema handle carried by every row. `None` means metadata should
@@ -43,6 +46,13 @@ pub(crate) struct RowSchema {
 pub(super) struct RowSchemaRef(Option<std::sync::Arc<RowSchema>>);
 
 impl RowSchemaRef {
+    pub(super) fn aggregate_type(&self, key: u64) -> Option<crate::engine::expr_type::ExprType> {
+        self.0
+            .as_ref()?
+            .aggregate_types
+            .iter()
+            .find_map(|(candidate, ty)| (*candidate == key).then_some(*ty))
+    }
     pub(super) fn deferred() -> Self {
         Self(None)
     }
@@ -70,6 +80,16 @@ impl From<std::sync::Arc<RowSchema>> for RowSchemaRef {
 pub(super) const LOOKUP_THRESHOLD: usize = 8;
 
 impl RowSchema {
+    pub(super) fn from_fields_with_aggregate_types(
+        fields: &[PlanField],
+        types: impl Iterator<Item = (u64, crate::engine::expr_type::ExprType)>,
+    ) -> std::sync::Arc<Self> {
+        std::sync::Arc::new(Self {
+            metas: fields.iter().map(|field| field.meta.clone()).collect(),
+            lookup: std::sync::OnceLock::new(),
+            aggregate_types: types.collect(),
+        })
+    }
     pub(super) fn empty() -> std::sync::Arc<Self> {
         std::sync::Arc::new(Self::default())
     }
@@ -104,6 +124,7 @@ impl RowSchema {
         std::sync::Arc::new(Self {
             metas: metas.collect(),
             lookup: std::sync::OnceLock::new(),
+            aggregate_types: Box::default(),
         })
     }
 

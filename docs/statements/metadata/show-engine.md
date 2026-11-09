@@ -13,8 +13,14 @@ Shows the status or mutex information of a given engine.
 
 ## Behavior, Privileges, and Results
 
-- SHOW ENGINE MYDB STATUS returns engine diagnostics; MYDB MUTEX returns the synchronization information supported by the implementation.
+- SHOW ENGINE MYDB STATUS returns engine diagnostics; MYDB MUTEX currently returns the compatible three-column schema with zero rows, without per-latch measurements.
 - Non-mydb engines return 1286 per the compatibility probe instead of an ambiguous syntax error.
+
+## Result and Visibility Details
+
+Requires global PROCESS. STATUS and MUTEX use Type/Name/Status diagnostic rows. Only the native MYDB engine is handled; another engine name returns 1286, even though InnoDB is accepted as a CREATE TABLE compatibility engine alias.
+
+See [ordered columns and wire types](result-columns.md#show-engine). Reading this metadata does not itself commit user DML.
 
 ## Examples
 

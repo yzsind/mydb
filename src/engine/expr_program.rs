@@ -71,6 +71,7 @@ pub(crate) struct InputSchema {
     by_column: HashMap<String, Vec<usize>>,
     by_qualified: HashMap<(String, String), usize>,
     bitwise_silent_string_columns: HashSet<usize>,
+    numeric_display: HashMap<usize, u16>,
     fingerprint: u64,
 }
 
@@ -117,6 +118,30 @@ impl InputSchema {
         let fingerprint = table_input_fingerprint(table);
         let mut schema = Self::with_fingerprint(columns, fingerprint);
         schema.bound_types = bound_types;
+        schema.numeric_display = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| column.zerofill)
+            .map(|(index, column)| {
+                (
+                    index,
+                    column.display_width.unwrap_or_else(|| {
+                        crate::engine::expr::default_numeric_display_width(&column.data_type)
+                    }),
+                )
+            })
+            .collect();
+        if table
+            .columns
+            .iter()
+            .any(|column| column.state == crate::storage::ColumnState::Dropped)
+        {
+            // Preserve physical operand offsets while excluding tombstones from SQL binding.
+            schema.rebuild_lookup(|idx| {
+                table.columns[idx].state != crate::storage::ColumnState::Dropped
+            });
+        }
         schema.bitwise_silent_string_columns = table
             .columns
             .iter()
@@ -151,9 +176,10 @@ impl InputSchema {
             by_column: HashMap::new(),
             by_qualified: HashMap::new(),
             bitwise_silent_string_columns: HashSet::new(),
+            numeric_display: HashMap::new(),
             fingerprint: 0,
         };
-        schema.rebuild_lookup();
+        schema.rebuild_lookup(|_| true);
         schema.fingerprint = fingerprint;
         schema
     }
@@ -179,6 +205,14 @@ impl InputSchema {
     /// CHAR/VARCHAR/BINARY counterparts when an InputSchema is reconstructed
     /// from a batch/PlanRow schema. Runtime `Value` and protocol ColumnType do
     /// not carry that distinction, but MySQL warning semantics do.
+    pub(crate) fn mark_numeric_display_columns(
+        &mut self,
+        columns: impl IntoIterator<Item = (usize, u16)>,
+    ) {
+        self.numeric_display.extend(columns);
+        self.fingerprint = self.compute_fingerprint();
+    }
+
     pub(crate) fn mark_silent_string_columns(&mut self, columns: impl IntoIterator<Item = usize>) {
         self.bitwise_silent_string_columns.extend(columns);
         // This attribute changes observable warning/error semantics, so it is
@@ -246,6 +280,11 @@ impl InputSchema {
             .saturating_add(by_qualified)
             .saturating_add(by_qualified_payload)
             .saturating_add(silent)
+            .saturating_add(
+                self.numeric_display
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<(usize, u16)>() + 1),
+            )
     }
 
     pub(crate) fn column_type(&self, index: usize) -> Option<ColumnType> {
@@ -318,8 +357,13 @@ impl InputSchema {
         }
     }
 
-    fn rebuild_lookup(&mut self) {
+    fn rebuild_lookup(&mut self, addressable: impl Fn(usize) -> bool) {
+        self.by_column.clear();
+        self.by_qualified.clear();
         for (idx, column) in self.columns.iter().enumerate() {
+            if !addressable(idx) {
+                continue;
+            }
             let col_key = column.name.to_ascii_lowercase();
             self.by_column.entry(col_key.clone()).or_default().push(idx);
             // SQL alias-shadows-name: once a column comes from an aliased
@@ -368,6 +412,7 @@ impl InputSchema {
         let mut hasher = schema_fingerprint_state().build_hasher();
         self.columns.len().hash(&mut hasher);
         for (index, column) in self.columns.iter().enumerate() {
+            self.numeric_display.get(&index).hash(&mut hasher);
             column.table.to_ascii_lowercase().hash(&mut hasher);
             column
                 .alias
@@ -408,7 +453,10 @@ pub(crate) fn resolve_column_collation_id(
     use crate::storage::DataTypeKind;
     if matches!(
         column.data_type,
-        DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. } | DataTypeKind::Blob { .. }
+        DataTypeKind::Binary { .. }
+            | DataTypeKind::VarBinary { .. }
+            | DataTypeKind::Blob { .. }
+            | DataTypeKind::Geometry { .. }
     ) {
         return Some(crate::charset::BINARY_COLLATION_ID);
     }
@@ -465,6 +513,14 @@ pub(crate) fn table_input_fingerprint(table: &TableSchema) -> u64 {
             tbl.push_str(&table.name);
             tbl.make_ascii_lowercase();
             for (idx, column) in table.columns.iter().enumerate() {
+                column
+                    .zerofill
+                    .then(|| {
+                        column.display_width.unwrap_or_else(|| {
+                            crate::engine::expr::default_numeric_display_width(&column.data_type)
+                        })
+                    })
+                    .hash(&mut hasher);
                 // Hashing a `&str` is identical to hashing the owned
                 // `String` the original `compute_fingerprint` produced
                 // (String::hash delegates to str::hash).
@@ -784,6 +840,7 @@ pub(crate) struct ExprProgram {
     /// `ExprNode::Const(Value)` is only a payload and must never become the
     /// metadata oracle for compiled execution.
     result_type: crate::engine::expr_type::ExprType,
+    round_decimal_result: bool,
     /// Ordinary table expressions apply MySQL's statically inferred result
     /// domain to CASE/IF/IFNULL/COALESCE. Aggregate finalization is different:
     /// the row oracle selects from already-finalized runtime Values, so an
@@ -1017,6 +1074,10 @@ pub(crate) enum CompiledNumericExpr {
 }
 
 impl ExprProgram {
+    pub(crate) fn rounds_decimal_result(&self) -> bool {
+        self.round_decimal_result
+    }
+
     /// Spatial kernels consume already evaluated Values and retain bound
     /// constructor provenance. Their scalar IR does not need a row-schema
     /// interpreter when every descendant lowered successfully.
@@ -1111,7 +1172,8 @@ impl ExprProgram {
                 ExprNode::Column(_) | ExprNode::Const(_) | ExprNode::Placeholder(_) => true,
                 ExprNode::SubstringConst { expr, .. } => visit(expr),
                 ExprNode::Function { kernel, args, .. } => match kernel {
-                    FunctionKernel::Concat
+                    FunctionKernel::TemporalString(_)
+                    | FunctionKernel::Concat
                     | FunctionKernel::ConcatWs
                     | FunctionKernel::Crc32
                     | FunctionKernel::Length
@@ -1811,6 +1873,28 @@ pub(crate) enum CompiledTableExpr {
 }
 
 impl CompiledTableExpr {
+    pub(crate) fn temporal_fsp(&self, table: &TableSchema) -> Option<u8> {
+        use crate::engine::expr_type::ExprTypeKind;
+        let kind = match self {
+            Self::SimpleColumn(index) => {
+                return match table.columns[*index].data_type {
+                    crate::storage::DataTypeKind::Time { fsp }
+                    | crate::storage::DataTypeKind::DateTime { fsp }
+                    | crate::storage::DataTypeKind::Timestamp { fsp } => Some(fsp),
+                    _ => None,
+                }
+            }
+            Self::Program(program) => program.result_type().kind,
+            Self::Legacy(expr) => {
+                crate::engine::expr_type::infer_expr_type_in_table(expr, table).kind
+            }
+        };
+        match kind {
+            ExprTypeKind::Temporal { fsp, .. } => Some(fsp),
+            _ => None,
+        }
+    }
+
     pub(crate) fn source_charset(&self, table: &TableSchema) -> &'static str {
         let collation = match self {
             Self::SimpleColumn(index) => resolve_column_collation_id(table, &table.columns[*index]),
@@ -2090,6 +2174,15 @@ impl ExprCompiler {
             column_reference_bound,
             capability,
             result_type,
+            round_decimal_result: crate::parser::visit::any_expr(expr, |node| {
+                matches!(
+                    node,
+                    Expr::Binary {
+                        op: BinaryOp::Div,
+                        ..
+                    }
+                )
+            }),
             coerce_conditional_result,
             cache_charge: None,
         })
@@ -2413,7 +2506,12 @@ fn contains_source_sensitive_function(root: &Expr, schema: &InputSchema) -> bool
                     });
             let needs_source_type = name.eq_ignore_ascii_case("UNIX_TIMESTAMP")
                 && (!bound_temporal || !std::ptr::eq(expr, root));
-            if is_json_cast || consumes_source_octets || needs_source_type {
+            let numeric_display = crate::engine::expr::function_uses_numeric_display(name)
+                && args.iter().any(|arg| {
+                    input_expr_column_index(arg, schema)
+                        .is_some_and(|index| schema.numeric_display.contains_key(&index))
+                });
+            if is_json_cast || consumes_source_octets || needs_source_type || numeric_display {
                 return Err(());
             }
         }
@@ -3235,13 +3333,25 @@ impl From<QueryError> for CompileError {
 /// Comparison provenance and arithmetic warning policies are separate: the
 /// former must never double as a flag for integer-division diagnostics.
 #[derive(Debug, Clone, Copy, Default)]
+enum IntegerComparisonConstant {
+    #[default]
+    None,
+    Left,
+    Right,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
 struct BinarySemantics {
+    left_boolean: bool,
+    right_boolean: bool,
     unsigned_subtraction: bool,
+    unsigned_decimal_subtraction: bool,
     unsigned_operands: bool,
     collation_id: Option<u16>,
     suppress_left_string_truncation: bool,
     suppress_right_string_truncation: bool,
     comparison: ComparisonProvenance,
+    integer_constant: IntegerComparisonConstant,
     suppress_int_div_truncation: bool,
     exact_left_numeric: bool,
     exact_right_numeric: bool,
@@ -3249,6 +3359,28 @@ struct BinarySemantics {
 
 impl BinarySemantics {
     fn compare(&self, left: &Value, op: BinaryOp, right: &Value) -> Result<Value, QueryError> {
+        let integer = match self.integer_constant {
+            IntegerComparisonConstant::None => None,
+            IntegerComparisonConstant::Left => {
+                crate::engine::expr::exact_integer_comparison_constant(left)
+            }
+            IntegerComparisonConstant::Right => {
+                crate::engine::expr::exact_integer_comparison_constant(right)
+            }
+        };
+        let (left, right) = match (self.integer_constant, integer.as_ref()) {
+            (IntegerComparisonConstant::Left, Some(value)) => (value, right),
+            (IntegerComparisonConstant::Right, Some(value)) => (left, value),
+            _ => (left, right),
+        };
+        let left_json =
+            (self.left_boolean && matches!(right, Value::Json(_)) && !matches!(left, Value::Null))
+                .then(|| Value::Json(crate::engine::expr::value_to_jsonb_typed(left, true)));
+        let right_json =
+            (self.right_boolean && matches!(left, Value::Json(_)) && !matches!(right, Value::Null))
+                .then(|| Value::Json(crate::engine::expr::value_to_jsonb_typed(right, true)));
+        let left = left_json.as_ref().unwrap_or(left);
+        let right = right_json.as_ref().unwrap_or(right);
         let evaluate = || {
             crate::engine::expr::with_numeric_comparison_context_from_provenance(
                 self.comparison,
@@ -3301,6 +3433,7 @@ enum ExprNode {
         list: Vec<ExprNode>,
         negated: bool,
         collation_id: Option<u16>,
+        integer_column: bool,
     },
     InConstSet {
         expr: Box<ExprNode>,
@@ -4648,6 +4781,22 @@ fn try_compile_in_const_set(
     let Some(mut values) = values else {
         return Ok(None);
     };
+    if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        && matches!(
+            input_expr_result_type(expr, schema),
+            ColumnType::Tiny
+                | ColumnType::Short
+                | ColumnType::MediumInt
+                | ColumnType::Long
+                | ColumnType::LongLong
+        )
+    {
+        for value in &mut values {
+            if let Some(integer) = crate::engine::expr::exact_integer_comparison_constant(value) {
+                *value = integer;
+            }
+        }
+    }
     if let Some(info) = collation_id
         .and_then(crate::charset::resolve_collation_id)
         .filter(|info| info.charset != "binary")
@@ -4719,10 +4868,49 @@ fn try_compile_substring_const(
         None
     };
     Ok(Some(ExprNode::SubstringConst {
-        expr: Box::new(compile_node(&args[0], schema)?),
+        expr: Box::new(compile_string_node(&args[0], schema)?),
         start,
         len,
     }))
+}
+
+/// Retain declared FSP at a string boundary while keeping the expression
+/// compiled. Non-temporal arguments require no additional runtime node.
+fn compile_string_node(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, CompileError> {
+    let node = compile_node(expr, schema)?;
+    match input_expr_type(expr, schema).kind {
+        crate::engine::expr_type::ExprTypeKind::Bit { bits } => Ok(ExprNode::Function {
+            kernel: FunctionKernel::BitString(bits),
+            args: vec![node],
+            collation_id: None,
+            suppress_string_truncation: false,
+            result_coercion: None,
+        }),
+        crate::engine::expr_type::ExprTypeKind::Temporal {
+            kind:
+                crate::engine::expr_type::TemporalKind::Time
+                | crate::engine::expr_type::TemporalKind::DateTime
+                | crate::engine::expr_type::TemporalKind::Timestamp,
+            fsp,
+        } => Ok(ExprNode::Function {
+            kernel: FunctionKernel::TemporalString(fsp),
+            args: vec![node],
+            collation_id: None,
+            suppress_string_truncation: false,
+            result_coercion: None,
+        }),
+        _ => Ok(node),
+    }
+}
+
+fn json_scalar_node(value: ExprNode, source: crate::engine::json::SqlScalarSource) -> ExprNode {
+    ExprNode::Function {
+        kernel: FunctionKernel::JsonScalar(source),
+        args: vec![value],
+        collation_id: None,
+        suppress_string_truncation: false,
+        result_coercion: None,
+    }
 }
 
 #[inline]
@@ -4963,6 +5151,13 @@ fn bound_result_coercion(
 /// un-escapable shape (subquery, window/aggregate, grouping, …) still
 /// returns `Unsupported`, which bubbles up to `CompiledTableExpr::Legacy`.
 fn compile_node(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, CompileError> {
+    crate::util::stack::ensure_stack(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+        || compile_node_checked(expr, schema),
+    )
+}
+
+fn compile_node_checked(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, CompileError> {
     match compile_node_inner(expr, schema) {
         Ok(node) => Ok(node),
         Err(CompileError::Unsupported) => {
@@ -5062,6 +5257,7 @@ struct SyntheticEscapeColumn {
     collation_id: Option<u16>,
     silent: bool,
     max_octets: Option<u32>,
+    numeric_display: Option<u16>,
 }
 
 fn synthetic_escape_columns(schema: &InputSchema) -> Vec<SyntheticEscapeColumn> {
@@ -5076,6 +5272,7 @@ fn synthetic_escape_columns(schema: &InputSchema) -> Vec<SyntheticEscapeColumn> 
             collation_id: column.collation_id,
             silent: schema.bitwise_silent_string_columns.contains(&index),
             max_octets: schema.bound_types[index].max_octets,
+            numeric_display: schema.numeric_display.get(&index).copied(),
         })
         .collect()
 }
@@ -5104,6 +5301,10 @@ fn build_synthetic_escape_table(schema: &InputSchema) -> Arc<TableSchema> {
         .collect();
     let mut table = TableSchema::synthetic_for_planning("\0escape", &cols);
     for (index, column) in table.columns.iter_mut().enumerate() {
+        if let Some(width) = schema.numeric_display.get(&index) {
+            column.zerofill = true;
+            column.display_width = Some(*width);
+        }
         let silent = schema.bitwise_silent_string_columns.contains(&index);
         // `synthetic_for_planning` maps protocol VarString/Blob to their
         // unbounded TEXT/BLOB catalog forms. That default is too lossy for
@@ -5123,6 +5324,13 @@ fn build_synthetic_escape_table(schema: &InputSchema) -> Arc<TableSchema> {
             continue;
         }
         column.data_type = match schema.columns[index].column_type {
+            ColumnType::Blob if schema.bound_types[index].json_opaque_type == Some(254) => {
+                crate::storage::DataTypeKind::Binary {
+                    len: schema.bound_types[index]
+                        .max_octets
+                        .map(|length| length as usize),
+                }
+            }
             ColumnType::Blob if silent => crate::storage::DataTypeKind::Blob {
                 max_len: crate::storage::schema::DEFAULT_LOB_MAX,
             },
@@ -5714,13 +5922,53 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     op,
                     BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Mod
                 );
+            let integer_column = |operand: &Expr| {
+                matches!(operand, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+                    && matches!(
+                        input_expr_result_type(operand, schema),
+                        ColumnType::Tiny
+                            | ColumnType::Short
+                            | ColumnType::MediumInt
+                            | ColumnType::Long
+                            | ColumnType::LongLong
+                    )
+            };
+            let constant = |operand: &Expr| {
+                crate::engine::expr::expr_is_constant(operand)
+                    || matches!(operand, Expr::Placeholder(_) | Expr::BoundValue(_))
+            };
+            let mut integer_constant = if is_cmp && integer_column(left) && constant(right) {
+                IntegerComparisonConstant::Right
+            } else if is_cmp && integer_column(right) && constant(left) {
+                IntegerComparisonConstant::Left
+            } else {
+                IntegerComparisonConstant::None
+            };
+            let node = match integer_constant {
+                IntegerComparisonConstant::Left => Some(&mut lnode),
+                IntegerComparisonConstant::Right => Some(&mut rnode),
+                IntegerComparisonConstant::None => None,
+            };
+            if let Some(ExprNode::Const(value)) = node {
+                if let Some(integer) = crate::engine::expr::exact_integer_comparison_constant(value)
+                {
+                    *value = integer;
+                }
+                // Ordinary literal comparisons retain their allocation-free hot path.
+                integer_constant = IntegerComparisonConstant::None;
+            }
             Ok(ExprNode::Binary {
                 left: Box::new(lnode),
                 op: *op,
                 right: Box::new(rnode),
                 semantics: BinarySemantics {
+                    left_boolean: crate::engine::expr::expr_is_boolean_typed(left),
+                    right_boolean: crate::engine::expr::expr_is_boolean_typed(right),
                     unsigned_operands: operand_unsigned(left, schema)
                         || operand_unsigned(right, schema),
+                    unsigned_decimal_subtraction: *op == BinaryOp::Sub
+                        && operand_unsigned(left, schema)
+                        && operand_unsigned(right, schema),
                     unsigned_subtraction: *op == BinaryOp::Sub
                         && (operand_unsigned(left, schema) || operand_unsigned(right, schema)),
                     collation_id,
@@ -5731,6 +5979,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                         right, schema,
                     ),
                     comparison,
+                    integer_constant,
                     suppress_int_div_truncation: *op == BinaryOp::IntDiv
                         && (crate::engine::expr::expr_contains_user_variable_assignment(left)
                             || crate::engine::expr::expr_contains_user_variable_assignment(right)),
@@ -5813,6 +6062,17 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     .collect::<Result<Vec<_>, _>>()?,
                 negated: *negated,
                 collation_id: effective_collation,
+                integer_column: matches!(
+                    expr.as_ref(),
+                    Expr::Identifier(_) | Expr::CompoundIdentifier(_)
+                ) && matches!(
+                    input_expr_result_type(expr, schema),
+                    ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                ),
             })
         }
         Expr::Between {
@@ -5868,6 +6128,9 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 if matches!(const_pat, Value::Null) {
                     return Ok(ExprNode::Const(Value::Null));
                 }
+                let const_pat = crate::engine::expr::string_context_value(const_pat, || {
+                    input_expr_type(pattern, schema)
+                })?;
                 let pat_str = crate::storage::value_to_string(&const_pat);
                 // B1: bake the value operand's collation into the
                 // pre-classified plan so `col LIKE 'foo%'` respects
@@ -5883,7 +6146,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 .and_then(crate::charset::resolve_collation_id);
                 let plan = classify_like_plan(&pat_str, *escape_char, info);
                 return Ok(ExprNode::LikeConst {
-                    expr: Box::new(compile_node(expr, schema)?),
+                    expr: Box::new(compile_string_node(expr, schema)?),
                     plan,
                     negated: *negated,
                 });
@@ -5900,8 +6163,8 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 "like",
             )?;
             Ok(ExprNode::Like {
-                expr: Box::new(compile_node(expr, schema)?),
-                pattern: Box::new(compile_node(pattern, schema)?),
+                expr: Box::new(compile_string_node(expr, schema)?),
+                pattern: Box::new(compile_string_node(pattern, schema)?),
                 negated: *negated,
                 escape_char: *escape_char,
                 collation_id,
@@ -5954,6 +6217,82 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             args,
             distinct,
         } => {
+            if name.eq_ignore_ascii_case("__JSON_AGG_VALUE") && args.len() == 1 {
+                let node = compile_node(&args[0], schema)?;
+                return Ok(
+                    match crate::engine::json::SqlScalarSource::for_type(&input_expr_type(
+                        &args[0], schema,
+                    )) {
+                        Some(source) => json_scalar_node(node, source),
+                        None => node,
+                    },
+                );
+            }
+            if name.eq_ignore_ascii_case("__GROUP_CONCAT_VALUE") {
+                let args = args
+                    .iter()
+                    .map(|arg| {
+                        if matches!(input_expr_result_type(arg, schema), ColumnType::Bit { .. }) {
+                            Expr::Function {
+                                name: "CAST".into(),
+                                args: vec![
+                                    Expr::Function {
+                                        name: "CAST".into(),
+                                        args: vec![
+                                            arg.clone(),
+                                            Expr::Literal(Literal::String("UNSIGNED".into())),
+                                        ],
+                                        distinct: false,
+                                    },
+                                    Expr::Literal(Literal::String("BINARY".into())),
+                                ],
+                                distinct: false,
+                            }
+                        } else {
+                            arg.clone()
+                        }
+                    })
+                    .collect();
+                return compile_node(
+                    &Expr::Function {
+                        name: "CONCAT".into(),
+                        args,
+                        distinct: false,
+                    },
+                    schema,
+                );
+            }
+            if crate::engine::expr::uses_binary_geometry_arguments(name)
+                && args
+                    .iter()
+                    .any(|arg| input_expr_result_type(arg, schema) == ColumnType::Geometry)
+            {
+                let args = args
+                    .iter()
+                    .map(|arg| {
+                        if input_expr_result_type(arg, schema) == ColumnType::Geometry {
+                            Expr::Function {
+                                name: "CAST".into(),
+                                args: vec![
+                                    arg.clone(),
+                                    Expr::Literal(Literal::String("BINARY".into())),
+                                ],
+                                distinct: false,
+                            }
+                        } else {
+                            arg.clone()
+                        }
+                    })
+                    .collect();
+                return compile_node(
+                    &Expr::Function {
+                        name: name.clone(),
+                        args,
+                        distinct: *distinct,
+                    },
+                    schema,
+                );
+            }
             // Value-only lowering must retain JSON constructor syntax,
             // especially booleans versus numeric 1/0, inside its arguments.
             let value_surface = crate::engine::geo::sql::is_geo_function(
@@ -6009,7 +6348,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                     Expr::Function {
                         name, args: bound, ..
                     } if name.eq_ignore_ascii_case("__COLLATED_CONST")
-                        && bound.len() == 3
+                        && bound.len() >= 3
                         && crate::engine::expr::expression_metadata_collation_id(&args[0])
                             .is_some() =>
                     {
@@ -6068,7 +6407,8 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 {
                     bound_result_coercion(expr, schema)
                 }
-                "ABS" | "CEIL" | "CEILING" | "FLOOR" | "IF" | "IFNULL" | "COALESCE" | "NULLIF"
+                "IFNULL" | "COALESCE" => bound_result_coercion(expr, schema),
+                "ABS" | "CEIL" | "CEILING" | "FLOOR" | "IF" | "NULLIF"
                     if !COMPILE_DYNAMIC_CONDITIONAL.with(Cell::get) =>
                 {
                     bound_result_coercion(expr, schema)
@@ -6281,7 +6621,13 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                 kernel,
                 args: args
                     .iter()
-                    .map(|arg| {
+                    .enumerate()
+                    .map(|(index, arg)| {
+                        if crate::engine::expr::function_consumes_json_scalar(name,index) {
+                            if let Some(source) = crate::engine::json::SqlScalarSource::for_type(&input_expr_type(arg,schema)) {
+                                return Ok(json_scalar_node(compile_node(arg,schema)?,source));
+                            }
+                        }
                         if matches!(
                             kernel,
                             FunctionKernel::Field(
@@ -6300,7 +6646,14 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                                 ));
                             }
                         }
-                        compile_node(arg, schema)
+                        if crate::engine::expr::function_consumes_string_argument(name, args, index) {
+                            if (name.eq_ignore_ascii_case("HEX") || name.eq_ignore_ascii_case("__GROUP_CONCAT_VALUE"))
+                                && matches!(input_expr_type(arg,schema).kind, crate::engine::expr_type::ExprTypeKind::Bit { .. }) {
+                                compile_node(arg,schema)
+                            } else { compile_string_node(arg, schema) }
+                        } else {
+                            compile_node(arg, schema)
+                        }
                     })
                     .collect::<Result<Vec<_>, _>>()?,
                 collation_id,
@@ -6474,6 +6827,7 @@ fn fold_constants(node: ExprNode) -> ExprNode {
             list,
             negated,
             collation_id,
+            integer_column,
         } => {
             let expr = Box::new(fold_constants(*expr));
             let list: Vec<ExprNode> = list.into_iter().map(fold_constants).collect();
@@ -6483,6 +6837,7 @@ fn fold_constants(node: ExprNode) -> ExprNode {
                 list,
                 negated,
                 collation_id,
+                integer_column,
             };
             if all_const {
                 if let Some(v) = try_eval_const_node(&node) {
@@ -6869,7 +7224,16 @@ impl ExprNode {
                 list,
                 negated,
                 collation_id,
-            } => eval_in_list_node(expr, list, *negated, *collation_id, row, scratch),
+                integer_column,
+            } => eval_in_list_node(
+                expr,
+                list,
+                *negated,
+                *collation_id,
+                *integer_column,
+                row,
+                scratch,
+            ),
             ExprNode::InConstSet {
                 expr,
                 values,
@@ -7109,6 +7473,7 @@ fn eval_binary_node(
                     crate::engine::expr::enforce_unsigned_subtraction_result(
                         value,
                         semantics.unsigned_subtraction,
+                        semantics.unsigned_decimal_subtraction,
                     )
                 }
                 BinaryOp::IntDiv => {
@@ -7150,11 +7515,33 @@ fn eval_binary_node(
     }
 }
 
+fn node_comparison_provenance(left: &ExprNode, right: &ExprNode) -> ComparisonProvenance {
+    ComparisonProvenance {
+        left_parameter: if let ExprNode::Placeholder(index) = left {
+            Some(*index)
+        } else {
+            None
+        },
+        right_parameter: if let ExprNode::Placeholder(index) = right {
+            Some(*index)
+        } else {
+            None
+        },
+        left_constant: matches!(left, ExprNode::Const(_)),
+        right_constant: matches!(right, ExprNode::Const(_)),
+        temporal_warning_context: Some(
+            left as *const _ as usize as u64 ^ (right as *const _ as usize as u64).rotate_left(17),
+        ),
+        ..ComparisonProvenance::default()
+    }
+}
+
 fn eval_in_list_node(
     expr: &ExprNode,
     list: &[ExprNode],
     negated: bool,
     collation_id: Option<u16>,
+    integer_column: bool,
     row: &dyn RowSource,
     scratch: &mut EvalScratch,
 ) -> Result<Value, QueryError> {
@@ -7162,10 +7549,33 @@ fn eval_in_list_node(
     let mut iter = list.iter();
     let eval = || {
         crate::engine::expr::with_compare_collation(collation_id, || {
-            crate::engine::expr::eval_in_list(value, negated, || match iter.next() {
-                Some(item) => Ok(Some(item.eval(row, scratch)?)),
-                None => Ok(None),
-            })
+            crate::engine::expr::eval_in_list_compared(
+                value,
+                negated,
+                || match iter.next() {
+                    Some(item) => {
+                        let value = item.eval(row, scratch)?;
+                        let value = if integer_column
+                            && matches!(item, ExprNode::Const(_) | ExprNode::Placeholder(_))
+                        {
+                            crate::engine::expr::exact_integer_comparison_constant(&value)
+                                .unwrap_or(value)
+                        } else {
+                            value
+                        };
+                        Ok(Some(value))
+                    }
+                    None => Ok(None),
+                },
+                |value, item, index| {
+                    crate::engine::expr::with_numeric_comparison_context_from_provenance(
+                        node_comparison_provenance(expr, &list[index]),
+                        value,
+                        item,
+                        || crate::engine::expr::compare_nullable_values(value, item),
+                    )
+                },
+            )
         })
     };
     if list.iter().all(is_const_node) {
@@ -7241,11 +7651,15 @@ fn eval_between_node(
     let low_val = low.eval_ref(row, scratch)?;
     let high_val = high.eval_ref(row, scratch)?;
     crate::engine::expr::with_compare_collation(collation_id, || {
-        crate::engine::expr::eval_between(
+        crate::engine::expr::eval_between_with_provenance(
             value.as_value(),
             low_val.as_value(),
             high_val.as_value(),
             negated,
+            [
+                node_comparison_provenance(expr, low),
+                node_comparison_provenance(expr, high),
+            ],
         )
     })
 }
@@ -7343,6 +7757,15 @@ impl FunctionKernel {
         scratch: &mut EvalScratch,
     ) -> Result<Value, QueryError> {
         match self {
+            FunctionKernel::JsonScalar(source) => {
+                Ok(Value::Json(source.encode(args[0].eval(row, scratch)?)))
+            }
+            FunctionKernel::BitString(bits) => {
+                crate::engine::expr::bit_string_value(args[0].eval(row, scratch)?, bits)
+            }
+            FunctionKernel::TemporalString(fsp) => {
+                crate::engine::expr::temporal_string_value(args[0].eval(row, scratch)?, fsp)
+            }
             FunctionKernel::MakeSet => {
                 if args.len() < 2 {
                     return Err(error(
@@ -7555,7 +7978,7 @@ impl FunctionKernel {
                 let value = args[0].eval(row, scratch)?;
                 null_or(value, |value| {
                     let len = match &value {
-                        Value::Bytes(bytes) => bytes.len(),
+                        Value::Bytes(bytes) | Value::Geometry(bytes) => bytes.len(),
                         _ => crate::engine::expr::str_value(&value).len(),
                     };
                     Ok(Value::Int(len as i64))
@@ -8247,7 +8670,7 @@ fn eval_concat_kernel(
         if matches!(value, Value::Null) {
             return Ok(Value::Null);
         }
-        binary_result |= matches!(value, Value::Bytes(_));
+        binary_result |= matches!(value, Value::Bytes(_) | Value::Geometry(_));
         let part = crate::engine::expr::value_bytes_ref(value);
         if crate::engine::expr::string_result_exceeds_packet(
             "concat",
@@ -8260,7 +8683,7 @@ fn eval_concat_kernel(
     if binary_result {
         Ok(Value::Bytes(out))
     } else {
-        Ok(Value::String(concat_utf8_string(out)))
+        Ok(concat_utf8_value(out))
     }
 }
 
@@ -8282,7 +8705,7 @@ fn eval_concat_ws_kernel(
     }
     // Borrow source values and their octets; only formatted values and the
     // final concatenation need owned storage.
-    let mut binary_result = matches!(sep, Value::Bytes(_));
+    let mut binary_result = matches!(sep, Value::Bytes(_) | Value::Geometry(_));
     let sep = crate::engine::expr::value_bytes_ref(sep);
     let mut out = Vec::new();
     let mut first = true;
@@ -8292,7 +8715,7 @@ fn eval_concat_ws_kernel(
         if matches!(value, Value::Null) {
             continue;
         }
-        binary_result |= matches!(value, Value::Bytes(_));
+        binary_result |= matches!(value, Value::Bytes(_) | Value::Geometry(_));
         let part = crate::engine::expr::value_bytes_ref(value);
         let added = part.len() + if first { 0 } else { sep.len() };
         if crate::engine::expr::string_result_exceeds_packet(
@@ -8310,14 +8733,15 @@ fn eval_concat_ws_kernel(
     if binary_result {
         Ok(Value::Bytes(out))
     } else {
-        Ok(Value::String(concat_utf8_string(out)))
+        Ok(concat_utf8_value(out))
     }
 }
 
-fn concat_utf8_string(bytes: Vec<u8>) -> String {
-    simdutf8::basic::from_utf8(&bytes).expect("non-binary CONCAT operands render as UTF-8");
-    // SAFETY: validated above; moving the Vec preserves its bytes.
-    unsafe { String::from_utf8_unchecked(bytes) }
+fn concat_utf8_value(bytes: Vec<u8>) -> Value {
+    match String::from_utf8(bytes) {
+        Ok(text) => Value::String(text),
+        Err(error) => Value::Bytes(error.into_bytes()),
+    }
 }
 
 fn eval_substring_kernel(
@@ -10871,6 +11295,32 @@ mod legacy_escape_tests {
             })
             .expect("compiled comparison");
         assert_eq!(result, Value::Int(1));
+    }
+
+    #[test]
+    fn json_binary_parameters_keep_computed_opaque_type() {
+        let schema = input_schema(&[]);
+        let table = oracle_table(&[]);
+        let expr = Expr::Function {
+            name: "JSON_ARRAY".into(),
+            args: vec![Expr::Placeholder(0)],
+            distinct: false,
+        };
+        for (value, expected) in [
+            (Value::Bytes(vec![0, 255]), r#"["base64:type15:AP8="]"#),
+            (Value::Null, "[null]"),
+            (Value::Bytes(vec![97]), r#"["base64:type15:YQ=="]"#),
+        ] {
+            crate::engine::params::with_params(vec![value], || {
+                let program = ExprCompiler::compile(&expr, &schema).unwrap();
+                let row = RowView::from_values(&[]);
+                let compiled =
+                    with_eval_scratch(|scratch| program.eval_row(&row, scratch)).unwrap();
+                let legacy = eval_expr_legacy(&expr, &table, &[]).unwrap();
+                assert_eq!(compiled.to_display_string(), expected);
+                assert_eq!(legacy, compiled);
+            });
+        }
     }
 
     #[test]

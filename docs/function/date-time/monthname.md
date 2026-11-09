@@ -14,11 +14,11 @@ MONTHNAME(temporal_value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `temporal_value` | Yes | Date, time, datetime, or matching text/numeric value | The 1st argument; the meaning is determined by the function syntax and description |
+| `temporal_value` | Yes | Date, time, datetime, or matching text/numeric value | Temporal value to process; accepted forms and result range are specified below. |
 
 ## Return Value
 
-Returns the localized weekday/month name as text; the example uses the default English locale. SQL NULL input returns NULL.
+Returns the month name as text in the session lc_time_names locale. SQL NULL returns NULL; invalid temporal input produces the applicable diagnostic.
 
 ## Examples
 
@@ -34,8 +34,8 @@ August
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DAYOFMONTH`](dayofmonth.md), [`DAYOFYEAR`](dayofyear.md), [`MONTH`](month.md), [`YEAR`](year.md).

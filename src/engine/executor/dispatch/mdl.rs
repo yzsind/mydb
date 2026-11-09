@@ -541,6 +541,40 @@ fn mdl_requests_for_statement(
     if let Statement::DropDatabase { name, .. } = statement {
         requests.extend(drop_database_mdl_requests(db, name));
     }
+    let changes_sequence_ownership = match statement {
+        Statement::DropTable { .. }
+        | Statement::DropDatabase { .. }
+        | Statement::RenameTables { .. } => true,
+        Statement::AlterTable(alter) => alter.actions.iter().any(|action| {
+            matches!(
+                action,
+                AlterAction::DropColumn(_)
+                    | AlterAction::ChangeColumn { .. }
+                    | AlterAction::RenameColumn { .. }
+                    | AlterAction::RenameTable { .. }
+            )
+        }),
+        _ => false,
+    };
+    if changes_sequence_ownership && !statement_writes_only_temp_tables(session, statement) {
+        let table_ids = requests
+            .iter()
+            .filter(|request| request.key.object_type == MdlObjectType::Table)
+            .filter_map(|request| {
+                let schema = request.key.schema.as_deref()?;
+                let name = request.key.name.as_deref()?;
+                db.table(&format!("{schema}.{name}"))
+                    .ok()
+                    .map(|table| table.object_id)
+            })
+            .collect::<Vec<_>>();
+        for sequence in db.sequences_owned_by_tables(&table_ids) {
+            requests.push(MdlRequest {
+                key: MdlObjectKey::table(&sequence.database, &sequence.name),
+                lock_type: MdlLockType::Exclusive,
+            });
+        }
+    }
     add_non_table_mdl_targets(db, session, statement, &mut requests);
     add_account_mdl_targets(session, statement, &mut requests);
     if is_ddl_statement(statement) {

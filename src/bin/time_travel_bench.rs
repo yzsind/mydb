@@ -331,6 +331,7 @@ fn col(name: &str) -> ColumnDef {
         data_type: DataType::BigInt,
         unsigned: false,
         zerofill: false,
+        display_width: None,
         invisible: false,
         nullable: false,
         default: None,

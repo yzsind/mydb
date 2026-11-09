@@ -38,13 +38,35 @@ Modifies table structure, constraints, indexes, partitions, and table options.
 - Multiple actions form the atomic intent of a single DDL statement; on failure, no half-completed new schema is exposed.
 - Explicit ALGORITHM and LOCK requests are validated against the actual execution capability; unsupported combinations fail before mutation.
 
+## Actions and Requested Algorithms
+
+Column add/modify/change accepts FIRST or AFTER column where valid. Index actions include ADD/DROP/RENAME INDEX, visibility changes and primary-key changes. Constraint actions include CHECK enforcement and FOREIGN KEY replacement. Partition actions include supported ADD/DROP/TRUNCATE/REORGANIZE/EXCHANGE/maintenance forms. FORCE rebuilds through COPY. ALGORITHM and LOCK are comma-separated ALTER options, not unvalidated hints. [RLS enable/disable](../security/alter-row-security.md) is a separate whole-statement extension.
+
+| Action family | Nonblocking write capability |
+| --- | --- |
+| Add ordinary/unique BTREE indexes, including supported ADD PRIMARY KEY batches | Online INPLACE; LOCK=NONE allowed during build, brief writer barriers at prepare/publication |
+| Supported constraint-only CHECK/FK validation | Online validated path, subject to its action compatibility checks |
+| Supported encoding-compatible column domain checks | Validation without heap rebuild; restrictions in the behavior section apply |
+| Add AUTO_INCREMENT column, physical encoding changes, VARCHAR shrink, other COPY rewrites | Requires the matching COPY path; cannot promise LOCK=NONE |
+| Special indexes or mixed physical actions | No generic LOCK=NONE guarantee; unsupported combinations return 1846 or an explicit unsupported error |
+| Requested SHARED / EXCLUSIVE | Requests the corresponding blocking behavior, even when an online path exists |
+
+INSTANT is only available for implemented metadata actions; it is not a synonym for forcing a physical rewrite to be fast. Unknown actions/options or action mixes with no atomic plan fail explicitly. [DDL compatibility](../../mysql80-compatibility.md#table-ddl) lists concrete supported online column and partition forms.
+
+## Privileges, Transactions, and Dependencies
+
+Requires ALTER on the table. Foreign-key addition also requires REFERENCES; RENAME uses DROP on source and CREATE+INSERT on destination in addition to ALTER. The ordinary persistent ALTER is an implicit-commit boundary. All actions are checked before choosing an atomic publication path; an error does not establish that earlier user DML remains pending.
+
+DDL can wait for long transactions at preparation/publication even with LOCK=NONE. Track supported jobs through information_schema.mydb_ddl_jobs and CANCEL DDL JOB. A cancellation accepted before finalization prevents publication; poll the job for its terminal result. Snapshot readers can receive 1412 after physical generation replacement and must reopen their transaction. See [limits](../../limits.md) for naming/enforcement boundaries.
+
 ## Examples
 
 ```sql
 ALTER TABLE customer ADD COLUMN last_login TIMESTAMP NULL;
 ALTER TABLE orders ADD INDEX idx_orders_customer_created (customer_id, created_at);
 ALTER TABLE sales DROP PARTITION p2024;
-ALTER TABLE customer ADD PRIMARY KEY(id), ALGORITHM=INPLACE, LOCK=NONE;
+CREATE TABLE customer_without_pk(id BIGINT NOT NULL);
+ALTER TABLE customer_without_pk ADD PRIMARY KEY(id), ALGORITHM=INPLACE, LOCK=NONE;
 ```
 
 ## See Also

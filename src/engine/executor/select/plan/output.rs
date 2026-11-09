@@ -384,7 +384,20 @@ pub(super) fn projection_result_columns(
                     }
                 }));
             }
-            SelectItem::Expr { expr, alias } => columns.push(project_expr(expr, alias.as_deref())?),
+            SelectItem::Expr { expr, alias } => {
+                let mut column = project_expr(expr, alias.as_deref())?;
+                column.source.round_decimal_result |=
+                    crate::parser::visit::any_expr(expr, |node| {
+                        matches!(
+                            node,
+                            Expr::Binary {
+                                op: crate::parser::BinaryOp::Div,
+                                ..
+                            }
+                        )
+                    });
+                columns.push(column);
+            }
         }
     }
     Ok(columns)
@@ -486,9 +499,7 @@ pub(super) fn projected_expr_column(
                 let output_name = alias.map(str::to_string).unwrap_or_else(|| expr_name(expr));
                 if source_field_for_projection_expr(argument, sample).is_none() {
                     if let Some(field) = sample.fields.iter().find(|field| {
-                        field.table.is_empty()
-                            && field.column.eq_ignore_ascii_case(&output_name)
-                            && !field.source.org_name.is_empty()
+                        field.table.is_empty() && field.column.eq_ignore_ascii_case(&output_name)
                     }) {
                         return Ok(Column {
                             name: output_name,
@@ -499,7 +510,11 @@ pub(super) fn projected_expr_column(
                 }
                 if let Ok(mut column) = projected_expr_column(argument, alias, sample) {
                     column.name = alias.map(str::to_string).unwrap_or_else(|| expr_name(expr));
-                    column.source = min_max_column_source(column.source);
+                    column.source = if name.eq_ignore_ascii_case("__HIDDEN_FIRST_VALUE") {
+                        column.source.nullable_field()
+                    } else {
+                        min_max_column_source(column.source)
+                    };
                     return Ok(column);
                 }
             }
@@ -637,12 +652,17 @@ pub(super) fn plan_expression_metadata_length(expr: &Expr, sample: &PlanRow) -> 
     crate::engine::expr::expression_metadata_length(expr)
 }
 
-pub(super) fn plan_bound_expr_type(
+pub(in crate::engine::executor::select) fn plan_bound_expr_type(
     expr: &Expr,
     sample: &PlanRow,
 ) -> crate::engine::expr_type::ExprType {
     let resolve_column = |column_expr: &Expr| {
         let field = match column_expr {
+            Expr::Function { name, .. } if crate::planner::is_aggregate_function(name) => {
+                return sample
+                    .schema
+                    .aggregate_type(super::super::aggregate::aggregate_key(column_expr));
+            }
             Expr::Identifier(name) => {
                 crate::engine::executor::select::eval::resolve_plan_field(sample, None, name).ok()
             }
@@ -750,7 +770,7 @@ pub(in crate::engine::executor::select) fn null_extended_table_fields(
 /// Null-extension is part of the bound schema even if this execution is
 /// empty or happens to match every row. Preserve it through derived/CTE scans
 /// and expression binding rather than inferring it from observed values.
-pub(super) fn mark_outer_join_fields(
+pub(in crate::engine::executor::select) fn mark_outer_join_fields(
     fields: &mut [ColMeta],
     right_start: usize,
     join_type: &crate::parser::JoinType,

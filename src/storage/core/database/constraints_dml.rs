@@ -3,6 +3,10 @@
 const UNIQUE_SCAN_ENTRIES_PER_KEY: usize = 4;
 
 fn duplicate_entry_error(table: &TableSchema, index: &IndexSchema, key: &IndexKey) -> QueryError {
+    duplicate_entry_error_for_index(&format!("{}.{}", table.name, index.name), key)
+}
+
+fn duplicate_entry_error_for_index(index_name: &str, key: &IndexKey) -> QueryError {
     let value = key
         .0
         .iter()
@@ -28,7 +32,7 @@ fn duplicate_entry_error(table: &TableSchema, index: &IndexSchema, key: &IndexKe
         })
         .collect::<Vec<_>>()
         .join("-");
-    crate::error::messages::duplicate_entry(&value, &format!("{}.{}", table.name, index.name))
+    crate::error::messages::duplicate_entry(&value, index_name)
 }
 
 impl Database {
@@ -127,7 +131,7 @@ impl Database {
             if !index_may_be_affected_by_columns(table, index, changed_columns) {
                 continue;
             }
-            let old_key = table.index_key(index, old_values)?;
+            let old_key = table.stored_index_key(index, old_values)?;
             let new_key = table.index_key(index, new_values)?;
             if old_key == new_key {
                 continue;
@@ -800,7 +804,7 @@ impl Database {
         let Some(latest) = self.read_mvcc_row(storage_id, row_id)? else {
             return Ok(());
         };
-        if table.index_key(index, &latest.values)? == *key {
+        if table.stored_index_key(index, &latest.values)? == *key {
             let writer_status = self.txns_read()?.status(latest.header.last_txn_id);
             match writer_status {
                 Some(TxnStatus::Active | TxnStatus::Prepared)

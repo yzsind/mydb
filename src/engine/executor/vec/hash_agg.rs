@@ -123,6 +123,108 @@ use super::stream::{BatchOperator, BatchProperties};
 pub const NUM_PARTITIONS: usize = 64;
 const PARTITION_MASK: u64 = (NUM_PARTITIONS as u64) - 1;
 
+// A compact prefix may already have spilled. Keep its radix domain when a
+// later batch requires canonical keys, so equal groups still meet on replay.
+enum CompactPartitionHash {
+    Fixed(usize),
+    Zero,
+    Dictionary(Vec<DictionaryHashKind>),
+}
+
+enum DictionaryHashKind {
+    Text,
+    Signed,
+    Unsigned,
+    Date,
+    Bool,
+}
+
+impl CompactPartitionHash {
+    fn hash(&self, key: &[u8]) -> u64 {
+        self.try_hash(key)
+            .unwrap_or_else(|| super::key_encode::fxhash(key))
+    }
+
+    fn try_hash(&self, key: &[u8]) -> Option<u64> {
+        let mut pos = 0;
+        let mut component = || {
+            let start = pos;
+            let tag = *key.get(pos)?;
+            pos += 1;
+            match tag {
+                0 => {}
+                1 => pos += 16,
+                3 => {
+                    let len = u32::from_le_bytes(key.get(pos..pos + 4)?.try_into().ok()?) as usize;
+                    pos += 4 + len;
+                }
+                _ => return None,
+            }
+            Some((tag, key.get(start..pos)?))
+        };
+        match self {
+            Self::Zero => Some(0),
+            Self::Fixed(count) => {
+                let mut values = smallvec::SmallVec::<[i64; 8]>::new();
+                let mut nulls = 0;
+                for index in 0..*count {
+                    let (tag, bytes) = component()?;
+                    values.push(if tag == 0 {
+                        nulls |= 1 << index;
+                        0
+                    } else if tag == 1 {
+                        i64::try_from(i128::from_le_bytes(bytes[1..].try_into().ok()?)).ok()?
+                    } else {
+                        return None;
+                    });
+                }
+                Some(FixedWidthStateArena::hash_key(&values, nulls))
+            }
+            Self::Dictionary(kinds) => {
+                let mut hash = 0;
+                let mut first = 0;
+                for (index, kind) in kinds.iter().enumerate() {
+                    let (tag, bytes) = component()?;
+                    let part = if tag == 0 {
+                        0x9e37_79b9_7f4a_7c15
+                    } else {
+                        match kind {
+                            DictionaryHashKind::Text if tag == 3 => {
+                                super::key_encode::fxhash(bytes)
+                            }
+                            _ if tag == 1 => {
+                                let value = i128::from_le_bytes(bytes[1..].try_into().ok()?);
+                                let raw = match kind {
+                                    DictionaryHashKind::Signed => {
+                                        i64::try_from(value).ok()? as u64 as u128
+                                    }
+                                    DictionaryHashKind::Unsigned => {
+                                        u64::try_from(value).ok()? as u128
+                                    }
+                                    DictionaryHashKind::Date => {
+                                        i32::try_from(value).ok()? as u32 as u128
+                                    }
+                                    DictionaryHashKind::Bool if value == 0 || value == 1 => {
+                                        value as u128
+                                    }
+                                    _ => return None,
+                                };
+                                fx_mix_u128(raw)
+                            }
+                            _ => return None,
+                        }
+                    };
+                    if index == 0 {
+                        first = part;
+                    }
+                    hash = fx_mix_u128(u128::from(hash) ^ (u128::from(part) << 64) ^ index as u128);
+                }
+                Some(if kinds.len() == 1 { first } else { hash })
+            }
+        }
+    }
+}
+
 /// Cheap sufficient (not necessary) equality check for two rows in the same
 /// typed column.  This is used only to reuse the already-resolved bucket for
 /// adjacent equal GROUP BY keys.  Returning `false` merely falls back to the
@@ -1263,6 +1365,55 @@ fn dictionary_primitive_sample_distinct(source: &DictionaryColumnSource, batch: 
 }
 
 impl DictionaryGroupEncoder {
+    fn accepts_batch_lanes(&self, batch: &Batch) -> bool {
+        self.columns.iter().all(|key| match &key.source {
+            DictionaryColumnSource::Utf8 { column, .. } => {
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::Utf8 { .. } | ColumnVector::Null { .. }
+                )
+            }
+            DictionaryColumnSource::I64 { column, .. } => {
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::I64 { .. } | ColumnVector::Null { .. }
+                )
+            }
+            DictionaryColumnSource::U64 { column, .. } => {
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::U64 { .. } | ColumnVector::Null { .. }
+                )
+            }
+            DictionaryColumnSource::Date32 { column, .. } => {
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::Date32 { .. } | ColumnVector::Null { .. }
+                )
+            }
+            DictionaryColumnSource::Bool { column } => {
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::Bool { .. } | ColumnVector::Null { .. }
+                )
+            }
+        })
+    }
+
+    fn count_partition_hash(&self) -> CompactPartitionHash {
+        CompactPartitionHash::Dictionary(
+            self.columns
+                .iter()
+                .map(|key| match key.source {
+                    DictionaryColumnSource::Utf8 { .. } => DictionaryHashKind::Text,
+                    DictionaryColumnSource::I64 { .. } => DictionaryHashKind::Signed,
+                    DictionaryColumnSource::U64 { .. } => DictionaryHashKind::Unsigned,
+                    DictionaryColumnSource::Date32 { .. } => DictionaryHashKind::Date,
+                    DictionaryColumnSource::Bool { .. } => DictionaryHashKind::Bool,
+                })
+                .collect(),
+        )
+    }
     #[inline]
     fn try_build(group_columns: &[usize], batch: &Batch) -> Option<Self> {
         Self::try_build_impl(group_columns, batch, false)
@@ -1342,6 +1493,39 @@ impl DictionaryGroupEncoder {
                     32,
                 ),
                 ColumnVector::Bool { .. } => (DictionaryColumnSource::Bool { column }, 1),
+                ColumnVector::Null { .. } => match batch.schema().fields().get(column)?.column_type
+                {
+                    ColumnType::Date => (
+                        DictionaryColumnSource::Date32 {
+                            column,
+                            values: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+                            raw_values: Vec::new(),
+                            merge_tokens: Vec::new(),
+                        },
+                        32,
+                    ),
+                    ColumnType::Tiny
+                    | ColumnType::Short
+                    | ColumnType::MediumInt
+                    | ColumnType::Long
+                    | ColumnType::LongLong
+                        if batch.schema().fields()[column].source.flags
+                            & crate::mysql::protocol::UNSIGNED_FLAG
+                            == 0 =>
+                    {
+                        (
+                            DictionaryColumnSource::I64 {
+                                column,
+                                values: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+                                dense_tokens: Some(DenseI64TokenCache::new()),
+                                raw_values: Vec::new(),
+                                merge_tokens: Vec::new(),
+                            },
+                            64,
+                        )
+                    }
+                    _ => return None,
+                },
                 _ => return None,
             };
             sources.push(source);
@@ -1585,236 +1769,265 @@ impl DictionaryGroupEncoder {
         for (position, column) in self.columns.iter_mut().enumerate() {
             let direct = column.direct;
             let token_mask = column.token_mask;
-            let (value_bits, component_hash, is_null) = match &mut column.source {
-                DictionaryColumnSource::Utf8 {
-                    column,
-                    raw_to_token,
-                    canonical_to_token,
-                    canonical_keys,
-                    raw_values,
-                    raw_value_heap_bytes,
-                    canonical_key_capacity_bytes,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if vector.is_null(row) {
-                        if MATERIALIZE {
-                            scratch.push(0);
-                        }
-                        if RETAIN_RAW {
-                            self.current_raw_tokens.push(0);
-                        }
-                        (0, NULL_HASH, true)
-                    } else {
-                        let ColumnVector::Utf8 { offsets, data, .. } = vector else {
-                            return None;
-                        };
-                        let raw = &data[offsets[row] as usize..offsets[row + 1] as usize];
-                        let token = if let Some(token) = raw_to_token.get(raw, raw_values) {
-                            if MATERIALIZE {
-                                let canonical = canonical_keys.get(token.local as usize - 1)?;
-                                scratch.extend_from_slice(canonical);
-                            }
-                            token
-                        } else {
-                            let canonical_start = scratch.len();
-                            super::key_encode::encode_from_column_row_with_collation(
-                                vector,
-                                row,
-                                batch.schema().fields()[*column].source.collation_id,
-                                scratch,
-                            );
-                            let canonical = &scratch[canonical_start..];
-                            let token = if let Some(&token) = canonical_to_token.get(canonical) {
-                                token
-                            } else {
-                                let local = u32::try_from(canonical_to_token.len())
-                                    .ok()?
-                                    .checked_add(1)?;
-                                let token = DictionaryToken {
-                                    local,
-                                    // Retain one representative spelling per
-                                    // exact collation class, not one per raw
-                                    // spelling. Equality remains byte-exact on
-                                    // the canonical key.
-                                    raw_local: local,
-                                    stable_hash: super::key_encode::fxhash(canonical),
-                                };
-                                let canonical_key: Arc<[u8]> = Arc::from(canonical);
-                                *canonical_key_capacity_bytes = (*canonical_key_capacity_bytes)
-                                    .saturating_add(
-                                        canonical_key.len().saturating_add(ARC_SLICE_HEADER_BYTES),
-                                    );
-                                canonical_to_token.insert(canonical_key.clone(), token);
-                                canonical_keys.push(canonical_key);
-                                // ColumnVector::Utf8 guarantees valid UTF-8;
-                                // avoid constructing a temporary Value just
-                                // to retain its String.
-                                let text = unsafe { std::str::from_utf8_unchecked(raw) };
-                                let raw_value = Box::<str>::from(text);
-                                *raw_value_heap_bytes =
-                                    raw_value_heap_bytes.saturating_add(text.len());
-                                raw_values.push(raw_value);
-                                token
-                            };
-                            raw_to_token.insert(raw, token);
-                            token
-                        };
-                        if RETAIN_RAW {
-                            self.current_raw_tokens.push(token.raw_local);
-                        }
-                        if token.local > token_mask {
-                            return None;
-                        }
-                        (u128::from(token.local), token.stable_hash, false)
-                    }
-                }
-                DictionaryColumnSource::I64 {
-                    column,
-                    values,
-                    dense_tokens,
-                    raw_values,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::I64 { data, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null { 0 } else { data[row] as u64 as u128 };
-                    let encoded = if direct || null {
-                        raw
-                    } else {
-                        u128::from(
-                            dictionary_i64_token(values, dense_tokens, raw_values, data[row], raw)?
-                                .local,
-                        )
-                    };
-                    if encoded > u128::from(token_mask) && !direct {
-                        return None;
-                    }
-                    (
-                        encoded,
-                        if null { NULL_HASH } else { fx_mix_u128(raw) },
-                        null,
-                    )
-                }
-                DictionaryColumnSource::U64 {
-                    column,
-                    values,
-                    raw_values,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::U64 { data, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null { 0 } else { data[row] as u128 };
-                    let encoded = if direct || null {
-                        raw
-                    } else {
-                        u128::from(
-                            dictionary_primitive_token(
-                                values,
-                                raw_values,
-                                data[row],
-                                fx_mix_u128(raw),
-                            )?
-                            .local,
-                        )
-                    };
-                    if encoded > u128::from(token_mask) && !direct {
-                        return None;
-                    }
-                    (
-                        encoded,
-                        if null { NULL_HASH } else { fx_mix_u128(raw) },
-                        null,
-                    )
-                }
-                DictionaryColumnSource::Date32 {
-                    column,
-                    values,
-                    raw_values,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::Date32 { data, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null { 0 } else { data[row] as u32 as u128 };
-                    let encoded = if direct || null {
-                        raw
-                    } else {
-                        u128::from(
-                            dictionary_primitive_token(
-                                values,
-                                raw_values,
-                                data[row],
-                                fx_mix_u128(raw),
-                            )?
-                            .local,
-                        )
-                    };
-                    if encoded > u128::from(token_mask) && !direct {
-                        return None;
-                    }
-                    (
-                        encoded,
-                        if null { NULL_HASH } else { fx_mix_u128(raw) },
-                        null,
-                    )
-                }
-                DictionaryColumnSource::Bool { column } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::Bool { values, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null {
-                        0
-                    } else if direct {
-                        u128::from(values.get(row))
-                    } else {
-                        1 + u128::from(values.get(row))
-                    };
-                    (raw, if null { NULL_HASH } else { fx_mix_u128(raw) }, null)
-                }
+            let source_column = match &column.source {
+                DictionaryColumnSource::Utf8 { column, .. }
+                | DictionaryColumnSource::I64 { column, .. }
+                | DictionaryColumnSource::U64 { column, .. }
+                | DictionaryColumnSource::Date32 { column, .. }
+                | DictionaryColumnSource::Bool { column } => *column,
             };
+            let (value_bits, component_hash, is_null) =
+                if matches!(batch.columns()[source_column], ColumnVector::Null { .. }) {
+                    if MATERIALIZE {
+                        scratch.push(0);
+                    }
+                    if RETAIN_RAW && matches!(column.source, DictionaryColumnSource::Utf8 { .. }) {
+                        self.current_raw_tokens.push(0);
+                    }
+                    (0, NULL_HASH, true)
+                } else {
+                    match &mut column.source {
+                        DictionaryColumnSource::Utf8 {
+                            column,
+                            raw_to_token,
+                            canonical_to_token,
+                            canonical_keys,
+                            raw_values,
+                            raw_value_heap_bytes,
+                            canonical_key_capacity_bytes,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if vector.is_null(row) {
+                                if MATERIALIZE {
+                                    scratch.push(0);
+                                }
+                                if RETAIN_RAW {
+                                    self.current_raw_tokens.push(0);
+                                }
+                                (0, NULL_HASH, true)
+                            } else {
+                                let ColumnVector::Utf8 { offsets, data, .. } = vector else {
+                                    return None;
+                                };
+                                let raw = &data[offsets[row] as usize..offsets[row + 1] as usize];
+                                let token = if let Some(token) = raw_to_token.get(raw, raw_values) {
+                                    if MATERIALIZE {
+                                        let canonical =
+                                            canonical_keys.get(token.local as usize - 1)?;
+                                        scratch.extend_from_slice(canonical);
+                                    }
+                                    token
+                                } else {
+                                    let canonical_start = scratch.len();
+                                    super::key_encode::encode_from_column_row_with_collation(
+                                        vector,
+                                        row,
+                                        batch.schema().fields()[*column].source.collation_id,
+                                        scratch,
+                                    );
+                                    let canonical = &scratch[canonical_start..];
+                                    let token = if let Some(&token) =
+                                        canonical_to_token.get(canonical)
+                                    {
+                                        token
+                                    } else {
+                                        let local = u32::try_from(canonical_to_token.len())
+                                            .ok()?
+                                            .checked_add(1)?;
+                                        let token = DictionaryToken {
+                                            local,
+                                            // Retain one representative spelling per
+                                            // exact collation class, not one per raw
+                                            // spelling. Equality remains byte-exact on
+                                            // the canonical key.
+                                            raw_local: local,
+                                            stable_hash: super::key_encode::fxhash(canonical),
+                                        };
+                                        let canonical_key: Arc<[u8]> = Arc::from(canonical);
+                                        *canonical_key_capacity_bytes =
+                                            (*canonical_key_capacity_bytes).saturating_add(
+                                                canonical_key
+                                                    .len()
+                                                    .saturating_add(ARC_SLICE_HEADER_BYTES),
+                                            );
+                                        canonical_to_token.insert(canonical_key.clone(), token);
+                                        canonical_keys.push(canonical_key);
+                                        // ColumnVector::Utf8 guarantees valid UTF-8;
+                                        // avoid constructing a temporary Value just
+                                        // to retain its String.
+                                        let text = unsafe { std::str::from_utf8_unchecked(raw) };
+                                        let raw_value = Box::<str>::from(text);
+                                        *raw_value_heap_bytes =
+                                            raw_value_heap_bytes.saturating_add(text.len());
+                                        raw_values.push(raw_value);
+                                        token
+                                    };
+                                    raw_to_token.insert(raw, token);
+                                    token
+                                };
+                                if RETAIN_RAW {
+                                    self.current_raw_tokens.push(token.raw_local);
+                                }
+                                if token.local > token_mask {
+                                    return None;
+                                }
+                                (u128::from(token.local), token.stable_hash, false)
+                            }
+                        }
+                        DictionaryColumnSource::I64 {
+                            column,
+                            values,
+                            dense_tokens,
+                            raw_values,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::I64 { data, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null { 0 } else { data[row] as u64 as u128 };
+                            let encoded = if direct || null {
+                                raw
+                            } else {
+                                u128::from(
+                                    dictionary_i64_token(
+                                        values,
+                                        dense_tokens,
+                                        raw_values,
+                                        data[row],
+                                        raw,
+                                    )?
+                                    .local,
+                                )
+                            };
+                            if encoded > u128::from(token_mask) && !direct {
+                                return None;
+                            }
+                            (
+                                encoded,
+                                if null { NULL_HASH } else { fx_mix_u128(raw) },
+                                null,
+                            )
+                        }
+                        DictionaryColumnSource::U64 {
+                            column,
+                            values,
+                            raw_values,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::U64 { data, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null { 0 } else { data[row] as u128 };
+                            let encoded = if direct || null {
+                                raw
+                            } else {
+                                u128::from(
+                                    dictionary_primitive_token(
+                                        values,
+                                        raw_values,
+                                        data[row],
+                                        fx_mix_u128(raw),
+                                    )?
+                                    .local,
+                                )
+                            };
+                            if encoded > u128::from(token_mask) && !direct {
+                                return None;
+                            }
+                            (
+                                encoded,
+                                if null { NULL_HASH } else { fx_mix_u128(raw) },
+                                null,
+                            )
+                        }
+                        DictionaryColumnSource::Date32 {
+                            column,
+                            values,
+                            raw_values,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::Date32 { data, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null { 0 } else { data[row] as u32 as u128 };
+                            let encoded = if direct || null {
+                                raw
+                            } else {
+                                u128::from(
+                                    dictionary_primitive_token(
+                                        values,
+                                        raw_values,
+                                        data[row],
+                                        fx_mix_u128(raw),
+                                    )?
+                                    .local,
+                                )
+                            };
+                            if encoded > u128::from(token_mask) && !direct {
+                                return None;
+                            }
+                            (
+                                encoded,
+                                if null { NULL_HASH } else { fx_mix_u128(raw) },
+                                null,
+                            )
+                        }
+                        DictionaryColumnSource::Bool { column } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::Bool { values, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null {
+                                0
+                            } else if direct {
+                                u128::from(values.get(row))
+                            } else {
+                                1 + u128::from(values.get(row))
+                            };
+                            (raw, if null { NULL_HASH } else { fx_mix_u128(raw) }, null)
+                        }
+                    }
+                };
             key |= value_bits << column.shift;
             if direct && is_null {
                 key |= 1u128 << column.null_bit;
@@ -3497,7 +3710,7 @@ impl Packed64Encoder {
         let mut key: u128 = 0;
         for col in cols {
             let cv = &batch.columns()[col.col_idx];
-            let is_null = cv.nulls().map(|b| !b.get(row)).unwrap_or(false);
+            let is_null = cv.is_null(row);
             if is_null {
                 key |= 1u128 << col.null_bit_shift;
                 continue;
@@ -4520,8 +4733,13 @@ impl FixedWidthStateArena {
                         self.state_mut(group, slot)
                             .update_decimal_parts(data[row], scale)?;
                     } else {
-                        self.state_mut(group, slot)
-                            .update_ref(&column.value_at(row))?;
+                        crate::engine::expr::with_optional_compare_collation(
+                            spec.comparison_collation,
+                            || {
+                                self.state_mut(group, slot)
+                                    .update_ref(&column.value_at(row))
+                            },
+                        )?;
                     }
                 }
                 continue;
@@ -4576,8 +4794,13 @@ impl FixedWidthStateArena {
             self.state_mut(group, slot)
                 .update_decimal_parts(data[row], scale)?;
         } else {
-            self.state_mut(group, slot)
-                .update_ref(&column.value_at(row))?;
+            crate::engine::expr::with_optional_compare_collation(
+                spec.comparison_collation,
+                || {
+                    self.state_mut(group, slot)
+                        .update_ref(&column.value_at(row))
+                },
+            )?;
         }
         Ok(())
     }
@@ -5270,6 +5493,7 @@ pub struct HashAggregateCore {
 
     // ---- Spill-related state ----
     input_schema: Option<Arc<BatchSchema>>,
+    compact_partition_hash: Option<CompactPartitionHash>,
     spill_schema: Option<Arc<BatchSchema>>,
     mem_budget: Option<Arc<MemBudget>>,
     /// PGA-style work-area handle. Drives the spill decision in
@@ -6006,6 +6230,7 @@ impl HashAggregateCore {
             group_key_program: None,
             partitions,
             input_schema: None,
+            compact_partition_hash: None,
             spill_schema: None,
             mem_budget: None,
             // `new` cannot spill safely because it has no query owner/root.
@@ -6142,6 +6367,7 @@ impl HashAggregateCore {
         spill_root: PathBuf,
     ) {
         self.bind_comparison_domains(&input_schema);
+        self.bind_partition_domain(&input_schema);
         let spill_schema = build_spill_schema(&input_schema, &self.group_columns, &self.aggs);
         self.group_key_program = crate::engine::executor::hash_aggregate::GroupKeyProgram::compile(
             &self.group_columns,
@@ -6202,9 +6428,54 @@ impl HashAggregateCore {
         }
     }
 
+    fn bind_partition_domain(&mut self, schema: &BatchSchema) {
+        // Workers may see an all-NULL lane first and choose different
+        // kernels. Partition routing must follow the declared key domain.
+        if !self.group_columns.is_empty()
+            && self
+                .aggs
+                .iter()
+                .all(|spec| matches!(spec.func, AggregateKind::CountStar | AggregateKind::Count))
+        {
+            let kinds: Option<Vec<_>> = self
+                .group_columns
+                .iter()
+                .map(|column| {
+                    Some(match schema.fields().get(*column)?.column_type {
+                        ColumnType::VarString => DictionaryHashKind::Text,
+                        ColumnType::Date => DictionaryHashKind::Date,
+                        ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong => {
+                            if schema.fields()[*column].source.flags
+                                & crate::mysql::protocol::UNSIGNED_FLAG
+                                != 0
+                            {
+                                DictionaryHashKind::Unsigned
+                            } else {
+                                DictionaryHashKind::Signed
+                            }
+                        }
+                        _ => return None,
+                    })
+                })
+                .collect();
+            if let Some(kinds) = kinds.filter(|kinds| {
+                kinds
+                    .iter()
+                    .any(|kind| matches!(kind, DictionaryHashKind::Text))
+            }) {
+                self.compact_partition_hash = Some(CompactPartitionHash::Dictionary(kinds));
+            }
+        }
+    }
+
     pub fn set_input_schema(&mut self, schema: Arc<BatchSchema>) {
         if self.input_schema.is_none() {
             self.bind_comparison_domains(&schema);
+            self.bind_partition_domain(&schema);
             let spill_schema = build_spill_schema(&schema, &self.group_columns, &self.aggs);
             self.group_key_program =
                 crate::engine::executor::hash_aggregate::GroupKeyProgram::compile(
@@ -6381,7 +6652,41 @@ impl HashAggregateCore {
                                 && arena.decimal_state_columns[0].is_some();
                     }
                 }
+                if let Some(arena) = self.fixed_width.as_ref() {
+                    self.compact_partition_hash = Some(if arena.defer_i64_decimal_dedup {
+                        CompactPartitionHash::Zero
+                    } else {
+                        CompactPartitionHash::Fixed(arena.key_kinds.len())
+                    });
+                }
             }
+        }
+        if self.fixed_width.as_ref().is_some_and(|arena| {
+            self.group_columns
+                .iter()
+                .zip(&arena.key_kinds)
+                .any(|(&column, &kind)| {
+                    !matches!(batch.columns()[column], ColumnVector::Null { .. })
+                        && CompactKeyKind::from_column(&batch.columns()[column]) != Some(kind)
+                })
+        }) {
+            // Preserve the completed prefix before changing layouts. Check
+            // once per batch so no row can be applied twice during fallback.
+            if let Some(arena) = self.fixed_width.as_mut() {
+                arena.materialize_compressed_i64_decimal_runs();
+                if matches!(
+                    self.compact_partition_hash,
+                    Some(CompactPartitionHash::Zero)
+                ) {
+                    arena.hashes.fill(0);
+                    for groups in &mut arena.partition_groups {
+                        groups.clear();
+                    }
+                    arena.partition_groups[0].extend(0..arena.hashes.len() as u32);
+                }
+            }
+            self.do_spill_fixed_width()?;
+            self.fixed_width = None;
         }
         if let Some(fixed_width) = self.fixed_width.as_mut() {
             fixed_width.consume_batch(&self.group_columns, &self.aggs, batch)?;
@@ -6389,6 +6694,15 @@ impl HashAggregateCore {
         }
 
         let visible_rows = batch.visible_rows();
+        if self.dictionary_count.is_some()
+            && self
+                .dictionary_encoder
+                .as_ref()
+                .is_some_and(|encoder| !encoder.accepts_batch_lanes(batch))
+        {
+            self.do_spill_dictionary_count()?;
+            self.dictionary_probed = true;
+        }
         if self
             .dictionary_count
             .as_ref()
@@ -6489,6 +6803,8 @@ impl HashAggregateCore {
                         partition.float_sum = Some(Vec::with_capacity(partition.keys.capacity()));
                     }
                 }
+                self.compact_partition_hash =
+                    (!numeric_sum).then(|| encoder.count_partition_hash());
                 self.dictionary_count = Some(arena);
             }
         }
@@ -6560,6 +6876,14 @@ impl HashAggregateCore {
         batch: &Batch,
         scalar_mode: bool,
     ) -> Result<(), QueryError> {
+        if self.compact_partition_hash.is_some() {
+            self.dense_i64_probed = true;
+            self.dense_i64_lookup = None;
+            self.packed64_probed = true;
+            self.packed64_encoder = None;
+            self.dictionary_probed = true;
+            self.dictionary_encoder = None;
+        }
         let visible_rows = batch.visible_rows();
         // Two-phase GROUP BY: first map every visible row to its
         // (partition, bucket); then group rows by destination bucket and
@@ -6725,7 +7049,10 @@ impl HashAggregateCore {
                     .as_ref()
                     .expect("input schema compiles the canonical group-key program")
                     .encode_row(batch, r, &mut self.row_key_buf);
-                let h = super::key_encode::fxhash(&self.row_key_buf);
+                let h = self.compact_partition_hash.as_ref().map_or_else(
+                    || super::key_encode::fxhash(&self.row_key_buf),
+                    |domain| domain.hash(&self.row_key_buf),
+                );
                 // Implicit single group (empty GROUP BY reached with a
                 // selection mask) must land in partition 0, matching the
                 // selection-free fast path and the consume_row paths —
@@ -7436,9 +7763,10 @@ impl HashAggregateCore {
                 .input_schema
                 .as_ref()
                 .and_then(|schema| schema.fields().get(spec.input_column));
-            let column_type = spec
-                .func
-                .result_type(input_field.map(|field| field.column_type));
+            let column_type = spec.func.result_type_with_source(
+                input_field.map(|field| field.column_type),
+                input_field.map(|field| &field.source),
+            );
             let mut source = if matches!(spec.func, AggregateKind::Min | AggregateKind::Max) {
                 input_field
                     .map(|field| field.source.clone().nullable_aggregate())
@@ -9894,14 +10222,19 @@ fn update_state_from_lane_impl<const SELECTED: bool>(
 ) -> Result<(), QueryError> {
     let selection = SELECTED.then_some(rows);
     if spec.func.uses_distinct_state() {
-        for_lane_rows(col.len(), selection, |row| {
+        for index in 0..if SELECTED { rows.len() } else { col.len() } {
+            let row = if SELECTED {
+                rows[index] as usize
+            } else {
+                index
+            };
             if !col.is_null(row)
                 && (!matches!(spec.func, AggregateKind::CountDistinct)
                     || !count_distinct_key_from_lane(state, col, row))
             {
-                distinct_insert_from_lane(state, col, row);
+                distinct_insert_from_lane(state, col, row, spec.func)?;
             }
-        });
+        }
         return Ok(());
     }
     if spec.func.uses_extra() {
@@ -10112,7 +10445,12 @@ fn update_extra_from_typed_lane(
 /// `ColumnVector::value_at` dispatcher. Variable-width values still use the
 /// owning fallback because the dedup table must retain the winning value.
 #[inline]
-fn distinct_insert_from_lane(state: &mut AggState, col: &ColumnVector, row: usize) {
+fn distinct_insert_from_lane(
+    state: &mut AggState,
+    col: &ColumnVector,
+    row: usize,
+    kind: AggregateKind,
+) -> Result<(), QueryError> {
     let value = match col {
         ColumnVector::I64 { data, .. } => Value::Int(data[row]),
         ColumnVector::U64 { data, .. } => Value::UInt(data[row]),
@@ -10124,7 +10462,20 @@ fn distinct_insert_from_lane(state: &mut AggState, col: &ColumnVector, row: usiz
         ColumnVector::Decimal128 { data, scale, .. } => Value::Decimal128(data[row], *scale),
         _ => col.value_at(row),
     };
+    let converted = if matches!(
+        kind,
+        AggregateKind::SumDistinct | AggregateKind::AvgDistinct
+    ) {
+        crate::engine::executor::select::aggregate::numeric_distinct_value(&value)?
+    } else {
+        std::borrow::Cow::Borrowed(&value)
+    };
+    let value = match converted {
+        std::borrow::Cow::Owned(value) => value,
+        std::borrow::Cow::Borrowed(_) => value,
+    };
     state.distinct_insert(value);
+    Ok(())
 }
 
 /// COUNT(DISTINCT text/binary) receives a canonical byte lane from
@@ -10153,7 +10504,7 @@ fn update_extra_with_value(
     value: &Value,
 ) -> Result<(), QueryError> {
     if func.is_bit() {
-        let n = crate::engine::expr::int_value(value)? as u64;
+        let n = crate::engine::expr::bit_aggregate_int_value(value)?;
         bit_update(state.extra_mut(), func, n);
         return Ok(());
     }
@@ -10174,7 +10525,7 @@ fn update_state(
             if !matches!(spec.func, AggregateKind::CountDistinct)
                 || !count_distinct_key_from_lane(state, col, row)
             {
-                distinct_insert_from_lane(state, col, row);
+                distinct_insert_from_lane(state, col, row, spec.func)?;
             }
         }
         return Ok(());

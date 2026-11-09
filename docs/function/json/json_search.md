@@ -22,7 +22,7 @@ JSON_SEARCH(json_doc, one_or_all, search_str [, escape_char [, path] ...])
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns a JSON string path for one match, or a JSON array of paths when all finds multiple distinct matches. No match or a SQL NULL required input returns SQL NULL. Search is for JSON string values using LIKE-style % and _ wildcards, not numeric values.
 
 ## Examples
 
@@ -34,8 +34,8 @@ Result: "$.a"
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_CONTAINS`](json_contains.md), [`JSON_CONTAINS_PATH`](json_contains_path.md), [`JSON_OVERLAPS`](json_overlaps.md).

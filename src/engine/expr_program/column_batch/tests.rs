@@ -2796,7 +2796,8 @@ fn spatial_programs_lower_without_ast_escape_and_preserve_aliases_and_nulls() {
         ])
         .map(|geom| crate::engine::geo::types::Geometry { srid: 0, geom })
         .unwrap(),
-    );
+    )
+    .unwrap();
     let batch = Batch::new(
         schema.clone(),
         vec![ColumnVector::from_values(vec![
@@ -4293,7 +4294,8 @@ fn borrowed_geometry_constructor_arguments_are_eager_and_evaluated_once() {
     let geometry = crate::engine::geo::write_geometry(&crate::engine::geo::types::Geometry {
         srid: 0,
         geom: crate::engine::geo::parse_wkt("LINESTRING(0 0,1 1,2 3)").unwrap(),
-    });
+    })
+    .unwrap();
     for values in [
         vec![
             Value::Geometry(geometry.clone()),

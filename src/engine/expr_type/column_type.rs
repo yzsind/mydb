@@ -272,6 +272,16 @@ fn infer_column_type_checked<const SCHEMA: bool>(
                 ColumnType::LongLong
             }
         }
+        Expr::Unary {
+            op: crate::parser::UnaryOp::Neg,
+            expr,
+        } => match recurse(expr) {
+            ColumnType::Date | ColumnType::Time | ColumnType::DateTime | ColumnType::Timestamp => {
+                ColumnType::Double
+            }
+            ColumnType::Year => ColumnType::LongLong,
+            other => other,
+        },
         Expr::Unary { expr, .. } => recurse(expr),
         Expr::Binary { left, op, right } => {
             // A hex/bit literal becomes an unsigned integer in arithmetic
@@ -369,7 +379,16 @@ where
         "IF" => Some(unify_branch_types(args, 1, &mut type_of)),
         // NULLIF(a,b): the result is always `a` (or NULL), so it takes a's type.
         "NULLIF" => Some(args.first().map(type_of).unwrap_or(ColumnType::VarString)),
-        "ABS" => Some(args.first().map(type_of).unwrap_or(ColumnType::Double)),
+        "ABS" => Some(
+            match args.first().map(type_of).unwrap_or(ColumnType::Double) {
+                ColumnType::Date
+                | ColumnType::Time
+                | ColumnType::DateTime
+                | ColumnType::Timestamp => ColumnType::Double,
+                ColumnType::Year => ColumnType::LongLong,
+                other => other,
+            },
+        ),
         "ROUND" | "TRUNCATE" => {
             let input = args.first().map(&mut type_of).unwrap_or(ColumnType::Double);
             Some(match input {

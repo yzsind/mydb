@@ -14,12 +14,12 @@ BIN_TO_UUID(binary_uuid [, swap_flag])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `binary_uuid` | Yes | Address, UUID, sequence name, integer, or flag value | The 1st argument; the meaning is determined by the function syntax and description |
-| `swap_flag` | No | Address, UUID, sequence name, integer, or flag value | The 2nd argument; the meaning is determined by the function syntax and description |
+| `binary_uuid` | Yes | Exactly 16 binary bytes | UUID bytes, with optional matching time-part swap. |
+| `swap_flag` | No | Numeric flag | Default 0; nonzero swaps UUID time fields. Use the same flag in the inverse operation. |
 
 ## Return Value
 
-Converts a 16-byte UUID to the standard text format. The return type is determined by the function semantics and the input type.
+Returns lowercase hyphenated UUID text from exactly 16 binary bytes. SQL NULL returns NULL; invalid payloads raise an argument error. The inverse must use the same swap_flag.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 6ccd780c-baba-1026-9564-5b8c656024db
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`UUID`](uuid.md), [`UUID_SHORT`](uuid_short.md), [`UUID_TO_BIN`](uuid_to_bin.md), [`IS_UUID`](is_uuid.md).

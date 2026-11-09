@@ -47,6 +47,7 @@ pub mod wait_events;
 #[cfg(test)]
 pub(crate) use core::commit_visibility_test_hook;
 pub(crate) use core::default_buffer_pool_bytes;
+pub(crate) use core::enum_set_numeric_assignment;
 pub(crate) use core::index_build_extended_perf_snapshot;
 pub(crate) use core::is_lock_wait_pending_error;
 pub(crate) use core::quantize_time_text_micros;
@@ -191,3 +192,5 @@ pub(crate) fn fuzz_decode_storage_formats(bytes: &[u8]) {
     let _ = metadata::decode::<serde_json::Value>(metadata::PROGRESS, 1, bytes);
     core::fuzz_validate_storage_pages(bytes);
 }
+
+pub(crate) use core::resolve_index_key;

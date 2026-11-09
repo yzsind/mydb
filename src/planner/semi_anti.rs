@@ -699,6 +699,9 @@ fn build_exists_semi_join_derived(
 ) -> Option<(crate::parser::Join, Option<Expr>)> {
     let branch = exists_subquery_to_keyset_branch(db, outer, subquery)?;
     let pairs = branch.key_pairs;
+    if !keyset_domains_match(db, outer, &branch.inner_select, &pairs) {
+        return None;
+    }
     // Build derived: SELECT DISTINCT inner_side AS __sj_k_i FROM ... WHERE residue
     let mut derived = branch.inner_select;
     derived.distinct = true;
@@ -825,7 +828,11 @@ fn build_or_exists_union_join(
         else {
             return None;
         };
-        key_branches.push(exists_subquery_to_keyset_branch(db, outer, &subquery)?);
+        let key_branch = exists_subquery_to_keyset_branch(db, outer, &subquery)?;
+        if !keyset_domains_match(db, outer, &key_branch.inner_select, &key_branch.key_pairs) {
+            return None;
+        }
+        key_branches.push(key_branch);
     }
     let first_outer_keys: Vec<_> = key_branches
         .first()?
@@ -1446,4 +1453,37 @@ pub(super) fn subquery_expr_references_outer(
         Ok(!matches!(expr, Expr::WindowFunction { .. }))
     })
     .is_err()
+}
+
+fn keyset_domains_match(
+    db: &Database,
+    outer: &Select,
+    inner: &Select,
+    pairs: &[(Expr, Expr)],
+) -> bool {
+    let sources = |select: &Select| {
+        select
+            .from
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| *index != 0 || select.derived.is_none())
+            .map(|(_, table)| table.clone())
+            .chain(
+                select
+                    .joins
+                    .iter()
+                    .filter(|join| join.derived.is_none())
+                    .map(|join| join.table.clone()),
+            )
+            .collect::<Vec<_>>()
+    };
+    let outer_sources = sources(outer);
+    let inner_sources = sources(inner);
+    pairs.iter().all(|(outer, inner)| {
+        let domain =
+            crate::planner_decorrelate::column_comparison_domain(db, &inner_sources, inner);
+        domain.is_some()
+            && domain
+                == crate::planner_decorrelate::column_comparison_domain(db, &outer_sources, outer)
+    })
 }

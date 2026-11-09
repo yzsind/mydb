@@ -19,24 +19,24 @@ DIV(dividend, divisor)
 
 ## Return Value
 
-Returns an integer quotient truncated toward zero. SQL NULL input or a zero divisor returns NULL; zero-division diagnostics follow sql_mode. Out-of-range quotients return an explicit numeric error.
+Returns the integer quotient truncated toward zero; the corresponding operator spelling is `dividend DIV divisor`. SQL NULL or zero divisor returns NULL, with the applicable division diagnostic. An out-of-range quotient raises a numeric error.
 
 ## Examples
 
 ```sql
-SELECT DIV(4, 2);
+SELECT -7 DIV 3, DIV(7,3);
 ```
 
 Result:
 
 ```text
-2
+-2	2
 ```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MOD`](mod.md).

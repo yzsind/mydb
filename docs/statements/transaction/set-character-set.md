@@ -2,7 +2,7 @@
 
 ## Description
 
-Sets the client and result character sets, and makes the connection charset follow the current database default.
+Sets the client and result character sets. The current implementation preserves character_set_connection and collation_connection; it does not rebind them to the selected database defaults.
 
 ## Syntax
 
@@ -14,8 +14,12 @@ Sets the client and result character sets, and makes the connection charset foll
 
 ## Behavior and Limitations
 
-- The difference from SET NAMES is that character_set_connection takes the current database's character set instead of the specified value directly.
-- An unknown character set returns an error; DEFAULT restores the default combination.
+- Unlike SET NAMES, this statement leaves character_set_connection and collation_connection unchanged. This is a current compatibility boundary, including after USE selects a database with other defaults.
+- An unknown or disallowed client character set returns an error. DEFAULT selects utf8mb4 for client/results only; the connection charset/collation still remain unchanged.
+
+## Transaction and Error Details
+
+Client/results change together; connection charset/collation remain unchanged. This statement does not implicitly commit. To explicitly change all connection settings, use SET NAMES. Read back the four variables rather than assuming USE or SET CHARSET changed connection collation.
 
 ## Examples
 

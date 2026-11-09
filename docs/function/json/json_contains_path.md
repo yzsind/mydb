@@ -20,7 +20,7 @@ JSON_CONTAINS_PATH(json_doc, one_or_all, path [, path] ...)
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 when one/all requested paths exist, 0 otherwise, or SQL NULL for a SQL NULL document/mode/path. A JSON null at a path still counts as existing. The mode must be one or all.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: 1
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_CONTAINS`](json_contains.md), [`JSON_OVERLAPS`](json_overlaps.md), [`JSON_SEARCH`](json_search.md).

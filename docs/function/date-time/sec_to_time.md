@@ -14,11 +14,11 @@ SEC_TO_TIME(seconds)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `seconds` | Yes | date, time, datetime, or the corresponding text/numeric value | The 1st argument; the meaning is determined by the function syntax and description |
+| `seconds` | Yes | Numeric expression | Signed number of seconds, including a fractional part. |
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a signed TIME from seconds, retaining applicable microsecond precision. Values outside the TIME range are clamped with a temporal warning. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 01:01:01
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MAKEDATE`](makedate.md), [`MAKETIME`](maketime.md), [`TIME_TO_SEC`](time_to_sec.md).

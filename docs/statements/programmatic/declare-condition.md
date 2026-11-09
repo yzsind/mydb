@@ -17,6 +17,10 @@ Declares a local condition name for an SQLSTATE or MySQL errno.
 - Condition names can be used by handlers, SIGNAL, and RESIGNAL.
 - The SQLSTATE must be a valid five-character value; the errno must be within the allowed range.
 
+## Context, Errors, and Lifecycle
+
+SQLSTATE must be five ASCII alphanumeric characters and cannot start with 00. An errno condition must be nonzero. A name is block-scoped; handlers can use either errno or SQLSTATE conditions, but SIGNAL/RESIGNAL may only use a named condition defined with SQLSTATE, not an errno alias. Illegal combinations fail routine validation rather than silently changing the condition category.
+
 ## Examples
 
 ```sql

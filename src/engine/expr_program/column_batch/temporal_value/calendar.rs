@@ -237,14 +237,6 @@ pub(super) fn evaluate(
             return None;
         }
     }
-    let constant_fsp = if add {
-        match left {
-            Input::Constant(value) => Some(crate::engine::expr::text_fsp(value.as_ref()) as u8),
-            _ => None,
-        }
-    } else {
-        None
-    };
     let date_input = temporal_kind(left) == Some(0)
         || match left {
             Input::Constant(value) => {
@@ -255,10 +247,14 @@ pub(super) fn evaluate(
             }
             _ => false,
         };
-    let mut numbers = Vec::with_capacity(if add { 0 } else { rows });
+    let typed_add = add
+        && (temporal_kind(left).is_some()
+            || matches!(left, Input::Constant(value) if matches!(value.as_ref(), Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_))));
+    let date_output = matches!(unit.as_str(), "DAY" | "WEEK") && date_input;
+    let mut numbers = Vec::with_capacity(if add && !typed_add { 0 } else { rows });
     let mut data = Vec::new();
     let mut offsets = Vec::new();
-    if add {
+    if add && !typed_add {
         data.reserve(rows.checked_mul(27)?);
         offsets.reserve(rows + 1);
         offsets.push(0);
@@ -266,6 +262,20 @@ pub(super) fn evaluate(
     for row in 0..rows {
         check(row)?;
         if add {
+            if typed_add {
+                let value = if visible(&nulls, row) {
+                    let amount = i64::try_from(integer(&inputs[1], row)?).ok()?;
+                    let value = a[row].checked_add(amount.checked_mul(quantum)?)?;
+                    if !crate::types::datetime_micros_in_calendar_range(value) {
+                        return None;
+                    }
+                    value
+                } else {
+                    0
+                };
+                numbers.push(value);
+                continue;
+            }
             if visible(&nulls, row) {
                 let amount = integer(&inputs[1], row)? as i64;
                 let value = a[row].checked_add(amount.checked_mul(quantum)?)?;
@@ -282,11 +292,11 @@ pub(super) fn evaluate(
                 } else {
                     data.extend_from_slice(crate::types::write_datetime_canonical_with_fsp(
                         value,
-                        Some(
-                            constant_fsp
-                                .unwrap_or_else(|| fast::precision(a[row]))
-                                .max(if quantum == 1 { 6 } else { 0 }),
-                        ),
+                        Some(if value.rem_euclid(1_000_000) == 0 {
+                            0
+                        } else {
+                            6
+                        }),
                         &mut buffer,
                     ));
                 }
@@ -302,7 +312,20 @@ pub(super) fn evaluate(
             });
         }
     }
-    Some(if add {
+    Some(if typed_add && date_output {
+        ColumnVector::Date32 {
+            data: numbers
+                .into_iter()
+                .map(|value| value.div_euclid(DAY) as i32)
+                .collect(),
+            nulls,
+        }
+    } else if typed_add {
+        ColumnVector::DateTime64 {
+            data: numbers,
+            nulls,
+        }
+    } else if add {
         ColumnVector::Utf8 {
             data,
             offsets,

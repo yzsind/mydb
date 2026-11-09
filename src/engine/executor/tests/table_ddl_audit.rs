@@ -336,13 +336,7 @@ fn ddl_audit_names_and_check_determinism() {
             .code(),
         1091
     );
-    assert_eq!(
-        engine
-            .execute("RENAME TABLE names TO NAMES")
-            .unwrap_err()
-            .code(),
-        1050
-    );
+    engine.execute("RENAME TABLE names TO NAMES").unwrap();
     assert_eq!(
         engine
             .execute("RENAME TABLE missing TO MISSING")

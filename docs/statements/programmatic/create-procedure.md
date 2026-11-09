@@ -26,6 +26,12 @@ Creates a stored procedure and saves its parameters, characteristics, definer, a
 - The routine body is fully parsed at CREATE time; an unsupported inner statement fails the DDL and nothing partial is saved.
 - IF NOT EXISTS produces a Note for an existing procedure; call privileges and definer/invoker privileges are validated at CALL time.
 
+## Context, Errors, and Lifecycle
+
+Requires CREATE ROUTINE on the schema. It implicitly commits preceding DML. The body captures SQL mode/character-set metadata; DEFINER/INVOKER controls execution identity, and EXECUTE on the procedure is checked at CALL. Automatic routine privileges follow automatic_sp_privileges.
+
+Procedure recursion is bounded by max_sp_recursion_depth; recursive functions are forbidden. OUT/INOUT values are converted to declared types when assigned. The transfer example assumes a caller-provided business transaction if both updates must succeed together; CALL itself does not add that transaction. See [caller transaction](../examples.md#explicit-transaction-around-a-procedure).
+
 ## Examples
 
 ```sql

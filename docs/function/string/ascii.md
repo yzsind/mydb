@@ -14,28 +14,28 @@ ASCII(str)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
 
 ## Return Value
 
-Returns an integer computed from the input string(s). SQL NULL arguments return NULL; character-versus-byte interpretation follows the function definition and input type.
+Returns the unsigned value of the first encoded byte, or 0 for an empty string. SQL NULL returns NULL. For a multibyte first character this is not the Unicode code point; compare ORD.
 
 ## Examples
 
 ```sql
-SELECT ASCII('mydb');
+SELECT ASCII(''), ASCII('A');
 ```
 
 Result:
 
 ```text
-109
+0	65
 ```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LENGTH`](length.md), [`CHAR_LENGTH`](char_length.md), [`BIT_LENGTH`](bit_length.md), [`ORD`](ord.md).

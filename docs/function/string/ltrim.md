@@ -14,28 +14,28 @@ LTRIM(str)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns text/binary content after removing leading space characters (0x20). Other whitespace is retained. SQL NULL returns NULL.
 
 ## Examples
 
 ```sql
-SELECT LTRIM('mydb');
+SELECT CONCAT('[',LTRIM('  mydb  '),']');
 ```
 
 Result:
 
 ```text
-mydb
+[mydb  ]
 ```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LPAD`](lpad.md), [`RPAD`](rpad.md), [`RTRIM`](rtrim.md), [`TRIM`](trim.md).

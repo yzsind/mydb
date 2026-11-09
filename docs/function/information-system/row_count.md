@@ -34,8 +34,10 @@ Result:
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- Read immediately after the statement of interest. UPDATE affected counts depend on CLIENT_FOUND_ROWS (matched versus changed rows); result-set statements leave -1. DDL/DO commonly leave 0; do not interpret ROW_COUNT as the current SELECT cardinality.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FOUND_ROWS`](found_rows.md), [`LAST_INSERT_ID`](last_insert_id.md).

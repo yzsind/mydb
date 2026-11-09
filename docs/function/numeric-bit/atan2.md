@@ -14,12 +14,12 @@ ATAN2(y, x)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `y` | Yes | Numeric expression | The 1st argument; the meaning is determined by the function syntax and description |
-| `x` | Yes | Numeric expression | The 2nd argument; the meaning is determined by the function syntax and description |
+| `y` | Yes | Numeric expression | Second numeric operand. |
+| `x` | Yes | Numeric expression | First numeric operand. |
 
 ## Return Value
 
-Returns a double-precision numeric value; SQL NULL input returns NULL. Invalid real-valued domains and overflow produce the applicable numeric diagnostic; an invalid domain can return NULL.
+Returns the DOUBLE angle atan2(y,x), in radians, using both signs to select the quadrant. Any SQL NULL operand returns NULL.
 
 ## Examples
 
@@ -35,8 +35,8 @@ Result:
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SIN`](sin.md), [`COS`](cos.md), [`TAN`](tan.md), [`COT`](cot.md).

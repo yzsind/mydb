@@ -821,6 +821,7 @@ impl Database {
                     character_set_client,
                     collation_connection,
                     definition_normalized,
+                    created_ms: current_unix_ms(),
                     query: Some(query),
                 },
             );

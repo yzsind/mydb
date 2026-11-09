@@ -981,7 +981,7 @@ fn parameterizable_literal(expr: &Expr) -> Option<Value> {
         // off `Literal::BitBytes` / `Literal::HexBytes`, and folding them into
         // a `Value::Bytes` placeholder would erase that and drop rows. They
         // are rare in hot SELECTs, so the lost plan-cache sharing is immaterial.
-        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_)) => None,
+        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_) | Literal::Bool(_)) => None,
         Expr::Literal(lit) => Some(literal_to_value(lit)),
         // MySQL text-protocol drivers render a bytes parameter as
         // `_binary'…'`.  The parser deliberately preserves introducer
@@ -1025,7 +1025,7 @@ fn try_replace_literal(expr: &mut Expr, next_idx: &mut usize, params: &mut Vec<V
 
 fn parameterizable_literal_shape(expr: &Expr) -> bool {
     match expr {
-        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_)) => false,
+        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_) | Literal::Bool(_)) => false,
         Expr::Literal(_) => true,
         Expr::Unary {
             op: crate::parser::UnaryOp::Neg,
@@ -1049,7 +1049,7 @@ fn parameterizable_literal_shape(expr: &Expr) -> bool {
 
 fn parameterizable_literal_owned(expr: Expr) -> Option<Value> {
     match expr {
-        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_)) => None,
+        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_) | Literal::Bool(_)) => None,
         Expr::Literal(lit) => Some(literal_to_value_owned(lit)),
         Expr::Unary {
             op: crate::parser::UnaryOp::Neg,

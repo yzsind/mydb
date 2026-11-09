@@ -185,9 +185,9 @@ fn release_audit_prepared_dml_semantics_and_binding() {
     assert_eq!(
         rows(&engine, &mut s, "SELECT r FROM t ORDER BY id"),
         vec![
-            vec!["0.333300000000"],
-            vec!["0.333333333300"],
-            vec!["0.333333333300"]
+            vec!["0.333333333000"],
+            vec!["0.333333333333"],
+            vec!["0.333333333333"]
         ]
     );
 }

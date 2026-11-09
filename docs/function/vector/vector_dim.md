@@ -34,4 +34,4 @@ Result: 3
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`STRING_TO_VECTOR`](string_to_vector.md), [`VECTOR_TO_STRING`](vector_to_string.md), [`VECTOR_DATATYPE`](vector_datatype.md), [`VECTOR_FROM_BINARY`](vector_from_binary.md).

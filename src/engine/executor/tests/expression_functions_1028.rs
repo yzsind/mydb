@@ -252,14 +252,27 @@ fn e20_e21_temporal_comparison_diagnostics() {
         };
         assert_eq!(warnings.rows.len(), 1, "{mode:?}: {:?}", warnings.rows);
         for _ in 0..4 {
-            assert_eq!(
-                engine
-                    .execute("SELECT COUNT(*) FROM t WHERE dt='0000-00-00'")
-                    .unwrap_err()
-                    .code(),
-                1525
-            );
+            let QueryResponse::ResultSet(result) = engine
+                .execute("SELECT COUNT(*) FROM t WHERE dt='0000-00-00'")
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(result.rows, vec![vec![Value::Int(0)]]);
         }
+        engine
+            .execute_with_session(
+                &mut session,
+                "SET sql_mode='STRICT_TRANS_TABLES,NO_ZERO_DATE,NO_ZERO_IN_DATE'",
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .execute_with_session(&mut session, "SELECT COUNT(*) FROM t WHERE dt='0000-00-00'")
+                .unwrap_err()
+                .code(),
+            1525
+        );
     }
 }
 
@@ -307,7 +320,7 @@ fn year_string_order_maps_two_digit_years() {
     engine.execute("INSERT INTO t VALUES(1999)").unwrap();
     assert_eq!(
         strings(&engine, "SELECT y<'99','99'<y,y<99,99<y FROM t"),
-        ["0", "0", "0", "1"]
+        ["0", "0", "0", "0"]
     );
 }
 

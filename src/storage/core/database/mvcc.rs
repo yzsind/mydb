@@ -1463,6 +1463,7 @@ impl Database {
         let batch_record_limit = ROLLBACK_BATCH_RECORDS;
         let mut undo_ptr = self.txns_read()?.undo_head(txn_id)?;
         let mut touched_tables = HashSet::new();
+        let mut expression_compensation = None;
         let mut compensated = Vec::new();
         let mut walk = UndoChainWalk::default();
         let mut batch_records = 0usize;
@@ -1511,7 +1512,13 @@ impl Database {
                     .try_into()
                     .unwrap_or(usize::MAX)
             });
-            touched_tables.insert(record.table_id);
+            if touched_tables.insert(record.table_id) && expression_compensation.is_none()
+                && self.table_by_id(record.table_id).is_some_and(|table| {
+                    table.indexes.iter().any(|index| index.has_expression_parts())
+                })
+            {
+                expression_compensation = Some(crate::engine::expr::CompensationExpressionGuard::new());
+            }
             let header_only_delete = matches!(&record.kind, UndoKind::DeleteHeader);
             let owns_reclaimable = !record.before_external.is_empty()
                 || matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader);
@@ -1855,6 +1862,9 @@ impl Database {
         row_ids: &[RowId],
     ) -> Result<(), QueryError> {
         let table = self.table_by_id(table_id);
+        let _expression_compensation = table.as_ref().is_some_and(|table| {
+            table.indexes.iter().any(|index| index.has_expression_parts())
+        }).then(crate::engine::expr::CompensationExpressionGuard::new);
         let mut index_deletes = table.as_ref().map(|table| {
             table
                 .indexes

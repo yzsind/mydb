@@ -99,8 +99,11 @@ production-grade MySQL replacement.
 
 - **InnoDB-style table options** (`ROW_FORMAT` / `STATS_*` / `KEY_BLOCK_SIZE` / `MAX_ROWS` …): △ **accepted + persisted + echoed + physically ignored**. The `Row_Format` column of `SHOW TABLE STATUS` is backfilled from the persisted option (no longer hardcoded).
 - **CTAS** (`CREATE [TEMPORARY] TABLE [IF NOT EXISTS] [(columns/constraints)] ... AS SELECT`): ✅ full target-table options/partitioning are never lost; inferred columns stay faithful to catalog origin and outer-join nullability follows the join shape; persistent tables/temporary tables, declared columns, IGNORE/REPLACE, CTEs/set operations/derived tables load in unified chunks, and CTAS no longer actively materializes the entire result (query operators themselves may still materialize); unknown string upper bounds use the full LOB range. Persistent CTAS achieves crash atomicity via intent + deferred DD generation, and binlog puts the parsed CREATE and WRITE_ROWS into the same GTID/XID transaction.
-- **Naming and size limits**: table/column identifiers and indexes declared in CREATE/ALTER TABLE are validated up to 64 characters (errno 1059); standalone CREATE INDEX currently has no equivalent index-name length guard. Tables have at most 1017 live columns (errno 1117). Tables, views, and sequences share one relational-name namespace, and concurrent CREATEs are double-checked under the catalog write lock. See [limits and enforcement gaps](limits.md).
+- **Naming and size limits**: table/column identifiers and indexes declared in CREATE/ALTER TABLE or standalone CREATE INDEX are validated up to 64 characters (errno 1059). Tables have at most 1017 live columns (errno 1117). Tables, views, and sequences share one relational-name namespace, and concurrent CREATEs are double-checked under the catalog write lock. See [limits and enforcement gaps](limits.md). Quoted table-name components containing a dot, including dotted schema components in qualified table references, are explicitly rejected to avoid ambiguous binding. Database names remain available to structured namespaces such as AI models.
 - **Generated columns** (`GENERATED ALWAYS AS`, VIRTUAL / STORED): ✅
+- **Intentional DDL differences**: generated columns and functional indexes may reference an AUTO_INCREMENT column after its value has been assigned. MODIFY without an explicit character set preserves the column's current character set. SHOW CREATE consistently uses backticks, including under ANSI_QUOTES. CHECK accepts numeric truth values; statically string-valued non-boolean expressions are rejected with 3812. Unsupported algorithm/lock combinations use 1846; a duplicate key encountered during cascading updates can use 1062 instead of MySQL's context-specific 1761, with statement rollback preserved.
+- **INSTANT DROP and LOB space**: dropping a column preserves old row layouts and their LOB data without rewriting the heap. OPTIMIZE TABLE or a physical COPY rebuild removes the dropped values and reclaims their LOB space; the instantaneous drop itself does not promise immediate disk reclamation.
+- **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statements/metadata/show-tables.md). UPDATE_TIME is NULL when no reliable modification timestamp is available. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
 - **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
 - **CHECK constraints**: ✅ all actions
@@ -169,8 +172,9 @@ occurrences, and prepared `AGAINST(?)` all retain full boolean semantics.
 
 Partitioned and historical FULLTEXT reads use visible-text heap oracles rather
 than current inverted postings. They preserve document identity and historical
-membership at the cost of a corpus scan. BM25 scores and normalization do not
-promise full MySQL ranking/collation equivalence; see
+membership at the cost of a corpus scan. Token equality follows the indexed
+column's collation, including case and accent sensitivity. BM25 scores do not
+promise numeric equality with MySQL; see
 [Full-Text Search](fulltext-search.md) for operators, configuration, and limits.
 
 Immutable backup queries support FULLTEXT filtering and score projection using
@@ -219,7 +223,7 @@ for syntax and operational limits.
 - Storage IDs are assigned only to physical leaf partitions; RANGE/LIST parents of two-level partitioning are pure logical nodes and create no empty heap. See [§11](#11-storage-engine-and-persistence) for the current format versions.
 - KEY supports `ALGORITHM=1/2` (default 2) and LINEAR bucket mapping; write routing and equality pruning share the same column hash. `KEY()` automatically picks the primary key, or the first all-NOT-NULL unique key when there is no primary key.
 - KEY / LINEAR KEY use mydb's own deterministic column hash, so concrete physical partition placement is not guaranteed to match MySQL. Logical data restored across engines is re-routed by the target engine; programs relying on explicit `PARTITION(pN)` targeting must not assume identical physical buckets between the two engines.
-- HASH uses mathematical unsigned modulo for unsigned values, without MySQL's signed-bit reinterpretation. Constant partition expressions and unequal subpartition counts are supported extensions. `information_schema.PARTITIONS.CREATE_TIME` reports the parent table's creation time rather than a separate partition lifecycle timestamp.
+- HASH uses mathematical unsigned modulo for unsigned values, without MySQL's signed-bit reinterpretation. Constant partition expressions are a supported extension. Subpartition counts must be uniform across logical partitions; unequal counts return 1485. `information_schema.PARTITIONS.CREATE_TIME` reports the parent table's creation time rather than a separate partition lifecycle timestamp.
 - RANGE / RANGE COLUMNS write routing uses binary search over ordered boundaries; equality, NULL-safe equality, IN, range, AND/OR, and contradictory predicates share the pruning path, and an empty partition set opens no heap. A parent partition and its HASH/KEY subpartition can be pruned simultaneously down to one physical leaf under a full equality key. Integer `DIV` is allowed in partition expressions; `/`, bitwise operators, and LIST `DEFAULT` are explicitly rejected.
 - Repartitioning DDL is **crash safe**: streaming build-then-swap (COALESCE / REORGANIZE / REPARTITION / REMOVE PARTITIONING / ADD PARTITIONS), with the persistence phase fixed at `INTENT / SNAPSHOT_BUILD / CATCH_UP / QUIESCE / SWAPPED / CLEANUP / DONE|FAILED`; startup recovery idempotently rolls forward or back according to the physical generation in the catalog. `CANCEL DDL JOB <job_id>` is accepted only before the swap; status and progress are in `information_schema.mydb_ddl_jobs`.
 - `REBUILD PARTITION` rewrites only the target physical leaves into a new storage generation, compacting heap/LOB and rebuilding local indexes in bulk; `OPTIMIZE PARTITION` additionally analyzes only the target leaves — unselected leaves are not scanned; `CHECK PARTITION` validates row-routing membership and heap/B-tree equivalence.
@@ -269,7 +273,7 @@ for syntax and operational limits.
 | CHAR/VARCHAR, BINARY/VARBINARY | ✅ | Character sets, collations, PAD SPACE/NO PAD, and the column `BINARY` attribute participate in comparisons and indexes |
 | TEXT/BLOB four tiers | ✅ | LOBs can be externalized with optional LZ4; the physical format is not InnoDB |
 | DATE/TIME/DATETIME/TIMESTAMP/YEAR | ✅/◑ | fsp 0–6, sql_mode, named time zones; TIMESTAMP extends through 9999-12-31 23:59:59.999999 UTC |
-| ENUM/SET/BIT | ✅ | Enum ordinals, SET bitmasks, and binary bit aggregates are supported |
+| ENUM/SET/BIT | ✅ | Enum ordinals, SET bitmasks, and binary bit aggregates are supported; ENUM/SET `BINARY` selects the effective character set's binary collation |
 | JSON | ✅/◑ | Binary JSONB, JSON_TABLE/MVI/functions; the internal format is not identical to InnoDB binary JSON |
 | GEOMETRY family | ◑ | SRID+WKB, common functions, and spatial indexes work; see GIS boundaries |
 | VECTOR(n) | ➕ | MySQL 8.0.46 Community Server has no equivalent type |
@@ -380,8 +384,15 @@ Closing the loop on MySQL 8.0 semantics:
 | `generate_series(start, stop [, step])` | ➕ mydb extension; integer/exact decimal/temporal families and `WITH ORDINALITY` |
 | Window functions + ROWS/RANGE frames | ✅/◑; including exact numeric and temporal INTERVAL bounds and prepared frame rebinding |
 | Window frame `GROUPS` / `EXCLUDE` | ➕ mydb extensions |
-| `FOR UPDATE` / `FOR SHARE [NOWAIT\|SKIP LOCKED]` | ✅; `OF` alias lists and multiple clauses support per-source lock modes and NOWAIT/SKIP LOCKED; NATURAL/USING, lateral, and grouped locking-join shapes retain explicit restrictions |
+| `FOR UPDATE` / `FOR SHARE [NOWAIT\|SKIP LOCKED]` | ✅; `OF` alias lists and multiple clauses support per-source lock modes and NOWAIT/SKIP LOCKED; NATURAL/USING, lateral, and grouped locking-join shapes retain explicit restrictions; unsupported aggregate/DISTINCT SKIP LOCKED shapes return 1235 |
 | `SELECT ... INTO OUTFILE` / `INTO DUMPFILE` | ✅ |
+
+Aggregates inside correlated scalar subqueries belong to the enclosing block
+when their arguments bind entirely there. The inner `FROM`, filter and
+`LIMIT` still determine whether the scalar subquery returns zero, one or
+multiple rows. For an empty outer implicit group, mydb consistently returns
+zero for an outer-owned `COUNT`; MySQL 8.0.46 returns `NULL` in some such
+subquery placements.
 
 **Compiled SELECT fast paths**: cover
 projection-only point lookups, index range/multi lookups, fused
@@ -392,7 +403,7 @@ union-of-intersections; the four `optimizer_switch` toggles and the
 `INDEX_MERGE`/`NO_INDEX_MERGE` hints are all part of plan-cache semantics.
 When a query does not match a proven shape, execution falls back to the
 general physical plan before consuming input; prepared and text execution can
-reuse the same compiled memo. See [`executor.md`](executor.md) for the full
+reuse the same compiled memo. See [query execution](optimizer-and-operators.md#execution-modes-and-resource-limits) for the full
 execution contract.
 
 The bounds, NULL/step semantics, and currently unsupported shapes of
@@ -704,6 +715,14 @@ distance use the project's pure-Rust kernels;
 area/length/distance, polygon set operations, and Buffer without a reliable
 pure-Rust implementation return clear errors — no silent degradation.
 
+mydb also preserves typed empty LineString, Polygon, MultiPoint,
+MultiLineString, and MultiPolygon values, including WKT/WKB round trips.
+This is a deliberate extension beyond MySQL 8.0.46, which accepts only an
+empty GeometryCollection. MultiPoint WKT uses the compact coordinate-list
+spelling shown in [OGC Simple Feature Access](https://docs.ogc.org/is/05-126/05-126.pdf);
+MySQL can read this spelling. Typed empty values require conversion before
+export to MySQL.
+
 "Registered" here does not mean every input shape is accepted. Still missing
 are SRS DDL/dynamic privileges and DD persistence, full EPSG projection
 transforms, complete geographic/axis-order semantics, all Geometry combinations
@@ -943,12 +962,19 @@ mydb ships **two fully independent** replication stacks, distinguished in the SQ
 - ◑ Single SQL applier (no MTS multi-threaded/parallel apply; `replica_parallel_*` is advisory); consecutive
   row-only source transactions still commit independently in order but may share a bounded durability barrier at the highest WAL LSN.
 
+STRICT apply errors remain errors after STOP/START or restart. Recovery skips a row transaction only when an apply receipt committed atomically with its data proves that the source boundary was already applied; relay replay does not force IDEMPOTENT mode.
+
 Connection failures retry until STOP REPLICA. SOURCE_RETRY_COUNT is advisory
 and produces a warning; the legacy Source_Retry_Count status value of 86400
 is a compatibility display, not a finite retry limit. Deterministic source
 binlog errors stop the IO thread and preserve the source error number.
 
 ### mydb → MySQL (as a Binlog Source)
+
+Native physical replicas do not synthesize MySQL row binlog events from physical WAL.
+MySQL binlog dump requests on such replicas return 1235; connect the downstream
+MySQL-protocol consumer to the native master. `log_replica_updates` applies to
+the independent MySQL row-event receiver, not native physical apply.
 
 **◑** `sync_binlog` / `max_binlog_size` / `log_replica_updates` are writable at runtime.
 `sync_binlog=N` counts commit groups and `max_binlog_size` controls transaction-boundary
@@ -1044,7 +1070,7 @@ Current format versions are listed in
 [Storage Format Versions](storage-format-versions.md).
 WAL v28 includes the generic PageDelta, and Zone Map pages are covered by physical backups, checkpoints, and native replication.
 
-> mydb **keeps no legacy dev storage compatibility paths**. Version mismatch → use a new `MYDB_DATA_DIR` or rebuild. Physical format details for tables and B-trees are in [docs/table-and-btree-storage-format.md](table-and-btree-storage-format.md).
+> mydb **keeps no legacy dev storage compatibility paths**. Version mismatch → use a new `MYDB_DATA_DIR` or rebuild. See [Data Directory, Persistence, and Recovery](storage-format.md) for file roles and recovery boundaries.
 
 ### Time Travel Queries
 
@@ -1232,8 +1258,15 @@ The following expression differences are retained:
 - `TIME` vs. string comparisons preserve operand microsecond precision instead of re-rounding the comparison constant to the stored column's fsp; time literals also compare as time values. Hence `TIME '10:00:00' = '10:00:00.000000'` is true. This keeps exact-value semantics and requires index, scan, and row-based/vectorized agreement.
 - An UPDATE target table may also appear in a scalar subquery; non-correlated scalar subqueries in reports materialize before writes, avoiding the extra derived-table rewrites demanded by MySQL's 1093 restriction.
 - `PI()` returns the double-precision value `3.141592653589793` and is not truncated to six decimals to match the display form.
+- Empty-input `ROLLUP` retains its grand-total grouping set: `COUNT(*)` is zero and `SUM` is NULL. Constant expressions in window `PARTITION BY` and `ORDER BY` are accepted as values, without MySQL's ordinal restriction.
+- `ANY`/`ALL` subqueries may contain `ORDER BY` and `LIMIT`; these clauses are evaluated inside the subquery before the quantified comparison.
+- `ENUM`/`SET` `MIN`/`MAX` use string ordering consistently across indexed and unindexed execution. They do not reproduce MySQL's plan-dependent ordinal shortcut. SET/string equality also keeps string comparison semantics across access paths; it does not reorder a comparison string such as `b,a` into the stored canonical `a,b`.
+- Wide exact decimal multiplication retains intermediate digits before rounding the result to at most 30 fractional digits. Some large products therefore differ from MySQL's less precise intermediate arithmetic.
+- Prepared statements use each execution's bound value types instead of retaining MySQL's type-freezing behavior across mixed-type executions. Temporal comparison parameters retain their declared comparison conversion; internal parameters used for correlated columns do not change column semantics.
+- SQL `PREPARE` may defer semantic name/grouping validation until `EXECUTE`, where invalid statements return explicit errors. Numeric-string LIMIT/OFFSET parameters are applied; negative limits return 1690 and floating-point bindings return 1210.
+- `PAD_CHAR_TO_FULL_LENGTH` is unsupported and returns 1235 when assigned through `sql_mode`.
 - Error codes and SQLSTATEs are aligned; messages keep mydb's clear descriptions and position hints and are not required to copy MySQL's text verbatim.
-- `ONLY_FULL_GROUP_BY` is on by default; loose grouping requires explicitly removing it from the session `sql_mode`. `DISTINCT` does not allow ordering by unprojected source columns.
+- `ONLY_FULL_GROUP_BY` is on by default; loose grouping requires explicitly removing it from the session `sql_mode`. MySQL's complete primary-key functional-dependency inference is not reproduced; an otherwise ungrouped column can still return 1055. `DISTINCT` does not allow ordering by unprojected source columns.
 
 ## Related Documentation
 
@@ -1241,6 +1274,6 @@ The following expression differences are retained:
 - [Startup Configuration](configuration.md) — configuration files, environment variables, and precedence
 - [ALTER TABLE](statements/ddl/alter-table.md) — supported actions, algorithms, and locking boundaries
 - [docs/hints.md](hints.md) — query hint syntax and behavior
-- [DML RETURNING](design/dml-returning.md) — PostgreSQL 18-style extension semantics
-- [docs/table-and-btree-storage-format.md](table-and-btree-storage-format.md) — physical storage format for tables and B-trees
+- [DML RETURNING](dml-returning.md) — PostgreSQL 18-style extension semantics
+- [Data Directory, Persistence, and Recovery](storage-format.md) — file roles, durability, and recovery boundaries
 - [docs/mysql80-metadata-compat-matrix.json](mysql80-metadata-compat-matrix.json) — machine-readable metadata compatibility matrix

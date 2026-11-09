@@ -17,6 +17,10 @@ Stops the IO/SQL threads of a MySQL→mydb channel; STOP SLAVE is a deprecated a
 - Omitting the selector stops both threads; stopping an already-stopped channel is a safe state transition.
 - Stopping does not delete the relay log or the channel configuration.
 
+## Privileges, Results, and Operational Details
+
+Requires REPLICATION_SLAVE_ADMIN. Omitted FOR CHANNEL selects `default`. The thread-selector syntax is shared with START and allows IO_THREAD/SQL_THREAD in either order. Stopping IO can leave SQL consuming retained relay work; stopping SQL can leave IO receiving more relay data. Progress/configuration/relay history is retained. Legacy STOP SLAVE emits warning 1287. A timeout/error must be resolved before assuming channel quiescence.
+
 ## Examples
 
 ```sql

@@ -12,3 +12,7 @@
 
 See [Backup and Recovery](../../backup-and-recovery.md) for direct queries,
 PITR, offline export/import, retention and key configuration.
+
+## Operational Flow
+
+Configure MANUAL/CONTINUOUS, publish a full baseline, observe COMPLETED, then confirm WAL receipt coverage. New repositories default to DISABLED; BACKUP DATABASE alone does not enable continuous retention. All SQL, including SHOW, requires BACKUP_ADMIN. See [job columns and polling](show-backup-jobs.md#result-columns), [status fields](show-backup-status.md#fields-and-units), and [policy transitions](alter-backup.md#option-and-policy-transitions). CANCEL uses Job_ID; direct queries/recovery use Base_ID and confirmed coverage.

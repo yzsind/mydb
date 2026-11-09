@@ -23,20 +23,27 @@ AES_ENCRYPT(str, key_str [, init_vector [, kdf_name [, salt [, info_or_iteration
 
 ## Return Value
 
-Encrypts data using the AES mode configured for the session. The return type is determined by the function semantics and the input types.
+Returns ciphertext as binary bytes using the session block_encryption_mode. SQL NULL data or key returns NULL. Decryption with invalid ciphertext/padding can return NULL; parameter/KDF/IV validation errors raise SQL errors. See the shared AES contract.
 
 ## Examples
 
 ```sql
-SELECT HEX(AES_ENCRYPT('mydb', 'secret'));
+SET SESSION block_encryption_mode='aes-128-ecb';
+SELECT LENGTH(AES_ENCRYPT('mydb','secret'));
 ```
 
-Result: returns the hexadecimal representation of the AES ciphertext bytes; the exact value depends on block_encryption_mode.
+Result:
+
+```text
+16
+```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- See [AES modes and key derivation](README.md#aes-modes-and-key-derivation) for mode/IV/KDF defaults, limits, warnings and decryption failures. Use HEX for ciphertext and an explicit text conversion only when plaintext has that encoding.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`AES_DECRYPT`](aes_decrypt.md), [`RANDOM_BYTES`](random_bytes.md).

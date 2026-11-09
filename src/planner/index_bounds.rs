@@ -95,7 +95,7 @@ pub(crate) fn target_for_index_column(
         return crate::storage::schema::index_expression_param_target(expr);
     }
     let column_name = index.columns[pos].as_str();
-    table
+    let target = table
         .columns
         .iter()
         .find(|c| c.name.eq_ignore_ascii_case(column_name))
@@ -106,7 +106,14 @@ pub(crate) fn target_for_index_column(
                 c.collation.as_deref(),
             )
         })
-        .unwrap_or(crate::storage::ParamTarget::String)
+        .unwrap_or(crate::storage::ParamTarget::String);
+    match target {
+        ParamTarget::CharString => ParamTarget::String,
+        ParamTarget::CollatedCharString { collation_id } => {
+            ParamTarget::CollatedString { collation_id }
+        }
+        other => other,
+    }
 }
 
 pub(crate) fn like_prefix_key_parts(

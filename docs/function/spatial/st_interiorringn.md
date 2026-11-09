@@ -19,7 +19,7 @@ ST_INTERIORRINGN(geometry, n)
 
 ## Return Value
 
-Returns a GEOMETRY value; returns `NULL` when any required argument is `NULL`.
+Returns the one-based interior LineString ring of a Polygon, preserving SRID. The exterior ring is not counted. SQL NULL, an inapplicable type, or an absent/nonpositive ring position returns NULL.
 
 ## Examples
 
@@ -27,12 +27,16 @@ Returns a GEOMETRY value; returns `NULL` when any required argument is `NULL`.
 SELECT ST_ASTEXT(ST_INTERIORRINGN(ST_GEOMFROMTEXT('POLYGON((0 0, 0 2, 2 2, 0 0))'), 1));
 ```
 
-Result: Returns NULL when there is no first interior ring.
+Result:
+
+```text
+NULL
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_EXTERIORRING`](st_exteriorring.md), [`ST_NUMINTERIORRINGS`](st_numinteriorrings.md).

@@ -7243,7 +7243,8 @@ fn compile_zone_member_comparison(
         .iter()
         .map(literal_value)
         .collect::<Option<Vec<_>>>()?;
-    let members = &constants[2..];
+    let member_start = if matches!(constants.get(2), Some(Value::UInt(_))) { 3 } else { 2 };
+    let members = &constants[member_start..];
     let declared = match &column.data_type {
         DataTypeKind::Enum { values } | DataTypeKind::Set { values } => values,
         _ => return None,
@@ -11022,6 +11023,7 @@ mod zone_map_tests {
             data_type: DataType::Int,
             unsigned: false,
             zerofill: false,
+            display_width: None,
             invisible: false,
             nullable: false,
             primary_key: true,
@@ -11492,6 +11494,7 @@ mod zone_map_tests {
             nullable: true,
             unsigned: false,
             zerofill: false,
+            display_width: None,
             invisible: false,
             auto_increment: false,
             default: None,
@@ -12730,6 +12733,7 @@ mod zone_map_tests {
                     data_type: crate::parser::DataType::Int,
                     unsigned: false,
                     zerofill: false,
+                    display_width: None,
                     invisible: false,
                     nullable: false,
                     primary_key: false,
@@ -12796,6 +12800,7 @@ mod zone_map_tests {
                     data_type: crate::parser::DataType::Int,
                     unsigned: false,
                     zerofill: false,
+                    display_width: None,
                     invisible: false,
                     nullable: false,
                     primary_key: false,

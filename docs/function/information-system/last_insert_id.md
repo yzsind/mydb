@@ -15,11 +15,11 @@ LAST_INSERT_ID(expr)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | No | Numeric or integer | The 1st argument; the input value |
+| `value` | No | Numeric or integer | Input expression. |
 
 ## Return Value
 
-Returns the most recently generated auto-increment value for the current connection; can also set that session value. The return type is determined by the function semantics and the input type.
+With no argument, returns the connection's recorded first automatically generated ID from its most recent relevant insert. LAST_INSERT_ID(expr) stores/returns an unsigned session value; a NULL expression returns SQL NULL while storing zero. Read the value before another modifying statement changes that state.
 
 ## Examples
 
@@ -32,8 +32,10 @@ Result: returns the most recently recorded auto-increment value for the current 
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- Multirow inserts record the first generated ID, not necessarily the last row's ID. The explicit setter changes session state. A manual rollback does not restore that state; do not infer sequence-gap or failed-insert behavior from it. Use explicit AS aliases for the result column when needed.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ROW_COUNT`](row_count.md), [`FOUND_ROWS`](found_rows.md).

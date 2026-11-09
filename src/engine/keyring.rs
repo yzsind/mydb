@@ -91,6 +91,19 @@ fn store() -> &'static RwLock<KeyringStore> {
     STORE.get_or_init(|| RwLock::new(KeyringStore::default()))
 }
 
+#[cfg(test)]
+#[test]
+fn final_1107_generated_key_cannot_be_replayed_from_public_id() {
+    let id = "final_1107_entropy";
+    generate(id, "AES", 256).unwrap();
+    let first = store().read().unwrap().entries[id].key_bytes.clone();
+    store().write().unwrap().remove(id);
+    generate(id, "AES", 256).unwrap();
+    let second = store().read().unwrap().entries[id].key_bytes.clone();
+    store().write().unwrap().remove(id);
+    assert_ne!(first, second);
+}
+
 pub fn generate(key_id: &str, key_type: &str, length_bits: u32) -> Result<bool, QueryError> {
     if key_id.is_empty() {
         return Err(error(
@@ -125,21 +138,14 @@ pub fn generate(key_id: &str, key_type: &str, length_bits: u32) -> Result<bool, 
             "Function 'keyring_key_generate' failed because underlying keyring service returned an error. Please check if a keyring is installed and that provided arguments are valid for the keyring you are using.",
         ));
     }
-    // Pseudo-random bytes: hash the key_id + length + a process-local
-    // counter so generate() is deterministic per-process (callers can
-    // rely on stable round trips for tests) but distinct keys still
-    // get distinct bytes.
-    let mut bytes = Vec::with_capacity(len_bytes);
-    let mut counter: u32 = guard.entries.len() as u32;
-    while bytes.len() < len_bytes {
-        let mut hasher = crc32fast::Hasher::new();
-        hasher.update(key_id.as_bytes());
-        hasher.update(&counter.to_le_bytes());
-        let v = hasher.finalize();
-        bytes.extend_from_slice(&v.to_le_bytes());
-        counter = counter.wrapping_add(1);
-    }
-    bytes.truncate(len_bytes);
+    use rand::RngCore;
+    let mut bytes = vec![0; len_bytes];
+    rand::rngs::OsRng.try_fill_bytes(&mut bytes).map_err(|_| {
+        error(
+            crate::error::catalog::ER_KEYRING_UDF_KEYRING_SERVICE_ERROR,
+            "keyring random key generation failed",
+        )
+    })?;
     guard.insert(key_id, key_type, bytes)?;
     Ok(true)
 }

@@ -23,6 +23,10 @@ Replaces the query definition or attributes of an existing view.
 - The new definition is parsed, column-derived, and dependency-checked before commit; on failure, the old definition is kept.
 - After the catalog is updated, dependent plan caches are invalidated.
 
+## Privileges, Transactions, and Dependencies
+
+Uses CREATE VIEW plus DROP on the view and source privileges; definer changes are checked independently. It implicitly commits preceding DML. The same recursive CTE, variable, placeholder, locking-clause, updatability and CHECK OPTION restrictions as CREATE VIEW apply. A validated replacement keeps its logical name and revalidates dependents; a rejected definition leaves the old definition intact. See [CREATE VIEW boundaries](create-view.md).
+
 ## Examples
 
 ```sql

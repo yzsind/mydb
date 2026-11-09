@@ -15,7 +15,13 @@ Returns table-level status such as engine, row count, size, collation, timestamp
 ## Behavior, Privileges, and Results
 
 - Statistics come from the catalog, storage, and current estimates, and are not guaranteed to be exactly in sync with concurrent writes at any instant.
-- Compatibility columns without a physical counterpart return NULL/reasonable metadata instead of fabricated status.
+- Unavailable physical values are NULL; compatibility fields describe the native engine catalog rather than a distinct InnoDB implementation.
+
+## Result and Visibility Details
+
+LIKE matches Name. Rows and size fields are catalog/storage estimates. Base-table lengths use the common table statistics view; a view has no heap/index statistics and returns NULL for physical fields. Missing physical timestamps/auto-increment/checksum values remain NULL. Do not treat Data_free as space guaranteed reclaimable by one OPTIMIZE.
+
+See [ordered columns and wire types](result-columns.md#show-table-status). Reading this metadata does not itself commit user DML.
 
 ## Examples
 

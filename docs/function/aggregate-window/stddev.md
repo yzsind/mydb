@@ -8,6 +8,7 @@ Returns the population standard deviation; also usable as a window aggregate fun
 
 ```sql
 STDDEV(expr)
+STDDEV(expr) OVER (window_spec)
 ```
 
 ## Parameters and Return Value

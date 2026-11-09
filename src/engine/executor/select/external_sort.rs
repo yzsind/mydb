@@ -179,6 +179,7 @@ pub(in crate::engine::executor) fn sort_precomputed_dml_refs(
         .iter()
         .zip(fields.iter())
         .map(|(name, field)| OrderBy {
+            names_bound: false,
             expr: Expr::Identifier(name.clone()),
             asc: field.ascending,
             nulls_first: Some(field.nulls_first),
@@ -186,6 +187,7 @@ pub(in crate::engine::executor) fn sort_precomputed_dml_refs(
         .collect::<Vec<_>>();
     for name in ["__dml_storage_id", "__dml_page_id", "__dml_slot_id"] {
         order_by.push(OrderBy {
+            names_bound: false,
             expr: Expr::Identifier(name.to_string()),
             asc: true,
             nulls_first: None,
@@ -1615,6 +1617,7 @@ mod tests {
 
     fn order_by_col(table: &str, col: &str, asc: bool) -> OrderBy {
         OrderBy {
+            names_bound: false,
             expr: Expr::CompoundIdentifier(vec![table.to_string(), col.to_string()]),
             asc,
             nulls_first: None,
@@ -1631,6 +1634,7 @@ mod tests {
             .map(|i| row_str("t", "s", &format!("{i:04}")))
             .collect();
         let order = [OrderBy {
+            names_bound: false,
             expr: Expr::Function {
                 name: "REPEAT".into(),
                 distinct: false,
@@ -2113,6 +2117,7 @@ mod tests {
             .map(|value| row_int("t", "a", value))
             .collect();
         let order = vec![OrderBy {
+            names_bound: false,
             expr: Expr::Identifier("a".into()),
             asc: true,
             nulls_first: None,

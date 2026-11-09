@@ -38,8 +38,10 @@ Result:
 
 ## Notes
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
+
+- An offset of 0 reads the current row. The default is used only for an absent row, not for a present SQL NULL value. Offset must be a nonnegative constant integer; a frame clause does not restrict the partition lookup.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FIRST_VALUE`](first_value.md), [`LAST_VALUE`](last_value.md), [`NTH_VALUE`](nth_value.md), [`LAG`](lag.md).

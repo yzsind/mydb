@@ -56,11 +56,15 @@ pub struct Column {
 /// type-derived metadata".
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
 pub struct ColumnSource {
+    /// Native ENUM/SET members survive passthrough query boundaries.
+    pub enum_set_values: Option<std::sync::Arc<[String]>>,
     /// Native vector domain preserved by expressions, derived tables and set operations.
     pub vector_type: Option<(crate::vector::VectorDataType, Option<u32>)>,
     /// An untyped parameter projection obtains its domain at execution time.
     /// This provenance survives derived/CTE passthrough metadata.
     pub dynamic_parameter: bool,
+    /// Exact division keeps scratch digits until the outer result boundary.
+    pub round_decimal_result: bool,
     /// Catalog wire representation when the execution type intentionally
     /// groups several SQL domains (e.g. BINARY/VARBINARY as byte vectors).
     pub wire_type: Option<u8>,
@@ -100,9 +104,8 @@ pub struct ColumnSource {
 }
 
 impl ColumnSource {
-    /// MIN/MAX preserve the value domain and origin, but the aggregate may
-    /// be NULL and does not inherit the input column's key/default constraints.
-    pub(crate) fn nullable_aggregate(mut self) -> Self {
+    /// A field selected by an internal grouping slot keeps its native domain.
+    pub(crate) fn nullable_field(mut self) -> Self {
         use crate::mysql::protocol::{
             AUTO_INCREMENT_FLAG, MULTIPLE_KEY_FLAG, NOT_NULL_FLAG, NO_DEFAULT_VALUE_FLAG,
             PRI_KEY_FLAG, UNIQUE_KEY_FLAG,
@@ -113,6 +116,22 @@ impl ColumnSource {
             | MULTIPLE_KEY_FLAG
             | AUTO_INCREMENT_FLAG
             | NO_DEFAULT_VALUE_FLAG);
+        self
+    }
+    /// MIN/MAX preserve result representation, but produce an expression,
+    /// without a catalog field identity or native ENUM/SET ordinal domain.
+    pub(crate) fn nullable_aggregate(mut self) -> Self {
+        use crate::mysql::protocol::{ENUM_FLAG, MYSQL_TYPE_STRING, SET_FLAG};
+        if self.flags & (ENUM_FLAG | SET_FLAG) != 0 {
+            self.wire_type = Some(MYSQL_TYPE_STRING);
+        }
+        self.schema.clear();
+        self.table.clear();
+        self.org_table.clear();
+        self.org_name.clear();
+        self = self.nullable_field();
+        self.flags &= !(ENUM_FLAG | SET_FLAG);
+        self.enum_set_values = None;
         self
     }
 }
@@ -502,6 +521,18 @@ impl PartialEq for Value {
 }
 
 impl Value {
+    /// Row-change equality preserves floating-point payloads. SQL numeric
+    /// equality merges signed zeros, but a stored replacement must retain
+    /// the requested IEEE representation.
+    #[inline]
+    pub(crate) fn storage_eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Value::Float(left), Value::Float(right)) => left.to_bits() == right.to_bits(),
+            (Value::Double(left), Value::Double(right)) => left.to_bits() == right.to_bits(),
+            _ => self == other,
+        }
+    }
+
     /// Heap capacity owned by this value, excluding its inline representation.
     #[inline]
     pub(crate) fn heap_capacity(&self) -> usize {
@@ -1006,7 +1037,13 @@ pub(crate) fn ryu_to_mysql_text<'a>(
     if !s.contains(['e', 'E']) {
         if let Ok(value) = s.parse::<f64>() {
             if value.abs() >= 1e15 {
-                return Cow::Owned(compact_scientific_notation(&format!("{value:e}")));
+                let scientific = compact_scientific_notation(&format!("{value:e}"));
+                // Integral REAL values retain exponent presentation at this
+                // boundary. A fractional mantissa can need all 17 digits;
+                // keep its shorter fixed spelling instead of adding an exponent.
+                if s.ends_with(".0") || !s.contains('.') || scientific.len() < s.len() {
+                    return Cow::Owned(scientific);
+                }
             }
         }
     }

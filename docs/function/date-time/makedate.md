@@ -14,12 +14,12 @@ MAKEDATE(year, dayofyear)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `year` | Yes | date, time, datetime, or the corresponding text/numeric value | The 1st argument; the meaning is determined by the function syntax and description |
-| `dayofyear` | Yes | date, time, datetime, or the corresponding text/numeric value | The 2nd argument; the meaning is determined by the function syntax and description |
+| `year` | Yes | Numeric expression | Calendar year. |
+| `dayofyear` | Yes | Numeric expression | One-based day of the requested year; must be positive. |
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a DATE for the given year and one-based day-of-year. Day-of-year beyond that year rolls into the following year; nonpositive day-of-year or an out-of-range result returns NULL. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 2026-08-30
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MAKETIME`](maketime.md), [`SEC_TO_TIME`](sec_to_time.md), [`TIME_TO_SEC`](time_to_sec.md).

@@ -183,9 +183,15 @@ fn audit1106_ctas_and_temporal_assignment() {
             .code(),
         1292
     );
-    engine
-        .execute("INSERT INTO tm VALUES('838:59:59.999'),('-838:59:59.999')")
-        .unwrap();
+    for value in ["838:59:59.999", "-838:59:59.999"] {
+        assert_eq!(
+            engine
+                .execute(&format!("INSERT INTO tm VALUES('{value}')"))
+                .unwrap_err()
+                .code(),
+            1292
+        );
+    }
     engine
         .execute("SET sql_mode='STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO'")
         .unwrap();

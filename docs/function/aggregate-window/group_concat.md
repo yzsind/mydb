@@ -35,6 +35,8 @@ Result: a:b
 
 - Use its own ORDER BY for deterministic concatenation order; an outer ORDER BY does not order inputs within a group.
 
+- group_concat_max_len defaults to 1024 bytes and has a minimum of 4. Exceeding it truncates output and records a warning. A row whose concatenated expressions include SQL NULL is skipped. Binary inputs retain binary result semantics; use an internal ORDER BY for deterministic concatenation.
+
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAYAGG`](json_arrayagg.md), [`JSON_OBJECTAGG`](json_objectagg.md), [`ST_COLLECT`](st_collect.md), [`GROUPING`](grouping.md).

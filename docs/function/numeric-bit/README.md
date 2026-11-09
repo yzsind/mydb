@@ -36,3 +36,30 @@
 | [`SQRT`](sqrt.md) | Returns the square root of a non-negative number. |
 | [`TAN`](tan.md) | Returns the tangent. |
 | [`TRUNCATE`](truncate.md) | Truncates a number to the specified number of decimal places. |
+
+
+## Domains and diagnostics
+
+Numeric arguments can be integer, DECIMAL, floating-point, or convertible text.
+A SQL NULL operand returns SQL NULL, except that `RAND(NULL)` uses seed zero.
+Integer/DECIMAL arithmetic retains an exact domain where supported; transcendental
+functions return DOUBLE. Decimal spelling matters: `2.5` is exact, while `2.5E0`
+is approximate. Conversion warnings are visible through `SHOW WARNINGS`.
+
+| Operation | Exceptional input | SELECT behavior |
+| --- | --- | --- |
+| LN, LOG, LOG2, LOG10 | Nonpositive value, or LOG base not positive or equal to 1 | NULL and warning 3020 |
+| SQRT | Negative operand | NULL |
+| ASIN, ACOS | Outside [-1,1] | NULL |
+| EXP, POW/POWER, COT | Result outside the finite DOUBLE range | Error 1690/22003 |
+| DIV, MOD | Zero divisor | NULL; division diagnostics depend on SQL mode and statement context |
+| ABS | Smallest signed 64-bit integer | Numeric overflow error |
+
+Strict data-changing statements can promote conversion/domain warnings to errors.
+Changing sql_mode does not turn every overflow into NULL. Check the final statement
+status and `SHOW WARNINGS`, rather than assuming all mathematical errors are alike.
+
+Angles consumed by SIN/COS/TAN/COT are radians. ASIN/ACOS/ATAN/ATAN2 return radians;
+DEGREES and RADIANS perform explicit unit conversion. RAND is a pseudorandom SQL
+sequence; use [RANDOM_BYTES](../encryption-compression/random_bytes.md) for random
+key material. Bitwise operators are documented in [Operators and expressions](../../operators-and-expressions.md).

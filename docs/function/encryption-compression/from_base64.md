@@ -14,7 +14,7 @@ FROM_BASE64(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | String or binary string; convertible scalar where accepted | Input bytes/text; numeric scalars are converted to their display bytes. |
 
 ## Return Value
 
@@ -34,8 +34,10 @@ Result:
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- ASCII whitespace in wrapped Base64 is ignored. Invalid Base64 returns NULL; decoded output is binary. Use HEX or an explicit charset conversion to display it.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`TO_BASE64`](to_base64.md).

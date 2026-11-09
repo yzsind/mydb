@@ -357,7 +357,15 @@ pub(super) fn rollback_session_txn(
     db: &Arc<Database>,
     session: &mut SessionContext,
 ) -> Result<(), QueryError> {
-    if let Some(txn_id) = session.current_txn {
+    // XA END detaches the branch. A session can then own both an idle XA
+    // transaction and a separate current transaction; roll back both before
+    // releasing the XA reservation or clearing its session binding.
+    let detached_xa = session
+        .xa_branch
+        .as_ref()
+        .map(|branch| branch.txn_id)
+        .filter(|txn_id| Some(*txn_id) != session.current_txn);
+    for txn_id in [session.current_txn, detached_xa].into_iter().flatten() {
         if db.is_txn_active(txn_id) {
             match db.rollback_txn(txn_id) {
                 Ok(()) => {}
@@ -367,7 +375,10 @@ pub(super) fn rollback_session_txn(
         }
     }
     session.rls.finish_transaction();
-    rollback_temp_journal_to(db, session, 0)?;
+    let temp_rollback = rollback_temp_journal_to(db, session, 0);
+    if let Some(branch) = session.xa_branch.take() {
+        db.release_xa(&branch.xid, branch.txn_id);
+    }
     if session.created_temp_table_not_rollbackable {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
@@ -397,7 +408,7 @@ pub(super) fn rollback_session_txn(
     session.next_txn_read_only = None;
     db.release_mdl_duration(session.connection_id as u64, MdlDuration::Transaction);
     session.advance_mdl_txn_generation();
-    Ok(())
+    temp_rollback
 }
 
 fn is_inactive_transaction_error(err: &QueryError) -> bool {
@@ -560,23 +571,27 @@ pub(super) fn nonlocking_select_transaction_view(
     session: &mut SessionContext,
     txn: TxnView,
 ) -> TxnView {
-    let ro_snapshot = session_read_only_snapshot(session);
     if txn.isolation.uses_repeatable_snapshot() {
-        let mut view = db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot);
-        view.connection_id = session.connection_id;
         if let Some(snapshot_scn) = session.txn_snapshot_scn {
-            view.snapshot_scn = snapshot_scn;
-        } else {
-            session.pin_transaction_snapshot(db, view.snapshot_scn);
+            return TxnView {
+                snapshot_scn,
+                ..txn
+            };
         }
-        view
-    } else if txn.isolation == IsolationLevel::ReadUncommitted {
-        let mut view = db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot);
+        let (mut view, guard) = db.session_statement_view_with_guard(
+            txn.txn_id,
+            txn.isolation,
+            session_read_only_snapshot(session),
+            session.read_only_txn,
+        );
         view.connection_id = session.connection_id;
-        view.dirty_read = true;
+        session.pin_transaction_snapshot_with_guard(view.snapshot_scn, guard);
         view
     } else {
-        txn
+        TxnView {
+            dirty_read: txn.isolation == IsolationLevel::ReadUncommitted,
+            ..txn
+        }
     }
 }
 
@@ -1159,7 +1174,7 @@ pub(super) fn xa_start(
 }
 
 pub(super) fn xa_end(
-    _db: &Arc<Database>,
+    db: &Arc<Database>,
     session: &mut SessionContext,
     xid: Xid,
 ) -> Result<(), QueryError> {
@@ -1175,7 +1190,10 @@ pub(super) fn xa_end(
             "XAER_NOTA: XID does not match the session's active XA branch",
         ));
     }
-    if branch.state != XaBranchState::Active {
+    if branch.state != XaBranchState::Active
+        || session.current_txn != Some(branch.txn_id)
+        || !db.is_txn_active(branch.txn_id)
+    {
         return Err(xa_err(
             crate::error::catalog::ER_XAER_RMFAIL,
             "XAER_RMFAIL: XA branch is not in the ACTIVE state",
@@ -1387,9 +1405,11 @@ pub(super) fn execute_select_in_transaction(
             return Ok(response);
         }
         let locked_row_ids = lock_select_rows_for_update(db, txn, &stmt)?;
-        let ro_snapshot = session_read_only_snapshot(session);
         let txn = if stmt.for_update || txn.isolation == IsolationLevel::Serializable {
-            db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot)
+            TxnView {
+                snapshot_scn: u64::MAX,
+                ..txn
+            }
         } else {
             nonlocking_select_transaction_view(db, session, txn)
         };
@@ -1398,7 +1418,15 @@ pub(super) fn execute_select_in_transaction(
                 return Ok(response);
             }
         }
-        execute_select(db, txn, stmt, registry)
+        let locking = select_has_locking_read(&stmt);
+        let response = execute_select(db, txn, stmt, registry)?;
+        // Deferred subquery evaluation must acquire locks before the owning
+        // statement transaction commits, never from an already committed view.
+        if locking {
+            response.materialize_preserving_precision()
+        } else {
+            Ok(response)
+        }
     })
 }
 
@@ -1424,9 +1452,11 @@ pub(super) fn execute_select_in_transaction_borrowed(
             return Ok(response);
         }
         let locked_row_ids = lock_select_rows_for_update(db, txn, stmt)?;
-        let ro_snapshot = session_read_only_snapshot(session);
         let txn = if stmt.for_update || txn.isolation == IsolationLevel::Serializable {
-            db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot)
+            TxnView {
+                snapshot_scn: u64::MAX,
+                ..txn
+            }
         } else {
             nonlocking_select_transaction_view(db, session, txn)
         };
@@ -1435,6 +1465,11 @@ pub(super) fn execute_select_in_transaction_borrowed(
                 return Ok(response);
             }
         }
-        execute_select(db, txn, stmt.clone(), registry)
+        let response = execute_select(db, txn, stmt.clone(), registry)?;
+        if select_has_locking_read(stmt) {
+            response.materialize_preserving_precision()
+        } else {
+            Ok(response)
+        }
     })
 }

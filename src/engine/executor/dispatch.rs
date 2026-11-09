@@ -1455,15 +1455,20 @@ fn ctas_column_def(
                     data_type: ctas_data_type_from_kind(&column.data_type),
                     unsigned: column.unsigned,
                     zerofill: column.zerofill,
+                    display_width: column.display_width,
                     invisible: false,
                     // The query can null-extend a catalog NOT NULL column.
                     nullable: column.nullable || source_nullable,
                     primary_key: false,
                     unique: false,
                     auto_increment: false,
-                    default: column
-                        .auto_increment
-                        .then(|| crate::parser::Expr::Literal(crate::parser::Literal::Int(0))),
+                    default: if column.auto_increment {
+                        Some(crate::parser::Expr::Literal(crate::parser::Literal::Int(0)))
+                    } else if let Some(expr) = &column.default_expr {
+                        crate::parser::parse_catalog_expr(expr).ok()
+                    } else {
+                        column.default.clone().map(crate::parser::Expr::BoundValue)
+                    },
                     on_update: None,
                     checks: Vec::new(),
                     generated: None,
@@ -1608,6 +1613,7 @@ fn type_derived_ctas_column(
         data_type,
         unsigned,
         zerofill,
+        display_width: None,
         invisible: false,
         nullable,
         primary_key: false,
@@ -2800,6 +2806,56 @@ fn execute_create_temp_table_like(
     Ok(QueryResponse::Ok)
 }
 
+fn grant_access_denied(session: &SessionContext, scope: &PrivilegeScope) -> QueryError {
+    match scope {
+        PrivilegeScope::Database { database } => error(crate::error::catalog::ER_DBACCESS_DENIED_ERROR,
+            format!("Access denied for user '{}'@'{}' to database '{database}'; GRANT OPTION is required", session.user, session.host)),
+        _ => error(crate::error::catalog::ER_SPECIFIC_ACCESS_DENIED_ERROR,
+            "Access denied; GRANT OPTION and the delegated privilege are required"),
+    }
+}
+
+fn ensure_base_table(db: &Database, name: &str) -> Result<(), QueryError> {
+    let (database, table) =
+        crate::storage::split_table_name(crate::storage::DEFAULT_DATABASE, name);
+    if db.view_definition(&database, &table).is_some() {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_OBJECT,
+            format!("'{name}' is not BASE TABLE"),
+        ));
+    }
+    Ok(())
+}
+
+fn allocate_index_name(
+    db: &Database,
+    table_name: &str,
+    name: Option<String>,
+    columns: &[String],
+) -> Result<String, QueryError> {
+    Ok(match name {
+        Some(name) => name,
+        None => {
+            let table = db.table(table_name)?;
+            let base = columns
+                .first()
+                .cloned()
+                .unwrap_or_else(|| "functional_index".to_string());
+            let mut name = base.clone();
+            let mut suffix = 2;
+            while table
+                .indexes
+                .iter()
+                .any(|index| index.name.eq_ignore_ascii_case(&name))
+            {
+                name = format!("{base}_{suffix}");
+                suffix += 1;
+            }
+            name
+        }
+    })
+}
+
 fn create_index_schema_from_parts(
     db: &Database,
     table_name: &str,
@@ -2819,6 +2875,8 @@ fn create_index_schema_from_parts(
     vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
     defer_expressions: bool,
 ) -> Result<IndexSchema, QueryError> {
+    ensure_base_table(db, table_name)?;
+    let name = allocate_index_name(db, table_name, name, &columns)?;
     let column_directions: Vec<crate::storage::IndexColumnDirection> = column_descending
         .iter()
         .map(|desc| {
@@ -2923,7 +2981,7 @@ fn create_index_schema_from_parts(
     Ok(IndexSchema {
         readable_from_scn: 0,
         index_id: 0,
-        name: name.unwrap_or_else(|| columns.join("_")),
+        name,
         columns,
         column_prefix_lengths,
         column_directions,
@@ -3042,6 +3100,9 @@ fn execute_temp_alter_table(
         };
         let new_name = qualify_alter_rename_target(session, &stmt.table, &new_name);
         let new_visible_key = session.temp_visible_key(&new_name);
+        if new_visible_key == old_visible_key {
+            return Ok(QueryResponse::Ok);
+        }
         if session.temp_tables.contains_key(&new_visible_key) {
             return Err(error(
                 crate::error::catalog::ER_TABLE_EXISTS_ERROR,
@@ -3076,6 +3137,9 @@ fn execute_temp_alter_table(
                 AlterAction::SetColumnComment { column, comment } => {
                     db.set_temp_column_comment(&temp.internal_key, &column, &comment)?;
                 }
+                AlterAction::SetAutoIncrement(value) => {
+                    db.set_auto_increment(&temp.internal_key, value)?;
+                }
                 AlterAction::SetColumnDefault { column, default } => {
                     db.set_temp_column_default(&temp.internal_key, &column, default)?;
                 }
@@ -3084,11 +3148,12 @@ fn execute_temp_alter_table(
                         .name
                         .as_deref()
                         .is_some_and(|name| name.eq_ignore_ascii_case("PRIMARY"));
-                    let name = index.name.or_else(|| Some(index.columns.join("_")));
+                    let name =
+                        allocate_index_name(db, &temp.internal_key, index.name, &index.columns)?;
                     let index_schema = create_index_schema_from_parts(
                         db,
                         &temp.internal_key,
-                        name,
+                        Some(name),
                         index.columns,
                         index.column_prefix_lengths,
                         index.column_descending,
@@ -3636,6 +3701,9 @@ fn auth_required_privileges(
             }
             out
         }
+        Statement::DropTable {
+            temporary: true, ..
+        } => Vec::new(),
         Statement::DropTable { names, .. } => names
             .iter()
             .map(|name| table(Privilege::Drop, name))
@@ -6278,7 +6346,7 @@ fn execute_grant(
                                 &required,
                                 true,
                             ) {
-                                return Err(privilege_denied(&required.privilege, &required.scope));
+                                return Err(grant_access_denied(session, &required.scope));
                             }
                             let positions = grant_positions.entry(grantee.clone()).or_default();
                             let static_scope_grant_option = !matches!(privilege, Privilege::Dynamic(_))
@@ -6717,7 +6785,7 @@ fn execute_revoke(
                         &required,
                         true,
                     ) {
-                        return Err(privilege_denied(&required.privilege, &required.scope));
+                        return Err(grant_access_denied(session, &required.scope));
                     }
                 }
                 // L9: in partial_revokes=ON mode, a REVOKE at schema scope
@@ -6945,17 +7013,23 @@ pub(super) fn kill_session(
     let auth = db.auth_catalog();
     registry.kill_authorized(connection_id, query_only, |target| {
         if target != &session.authenticated_as && !session.internal_system_session {
+            let kill_denied = || {
+                error(
+                    crate::error::catalog::ER_KILL_DENIED_ERROR,
+                    format!("You are not owner of thread {connection_id}"),
+                )
+            };
             let required = RequiredPrivilege {
                 privilege: Privilege::Dynamic("CONNECTION_ADMIN".into()),
                 scope: PrivilegeScope::Global,
             };
             if !auth.account_has_privilege(&session.authorization_context(), &required, false) {
-                return Err(error(
-                    crate::error::catalog::ER_KILL_DENIED_ERROR,
-                    format!("You are not owner of thread {connection_id}"),
-                ));
+                return Err(kill_denied());
             }
-            ensure_system_account_access(&auth, session, std::iter::once(target))?;
+            // KILL reports the same denial for ownership and SYSTEM_USER
+            // protection; account-management statements retain error 1227.
+            ensure_system_account_access(&auth, session, std::iter::once(target))
+                .map_err(|_| kill_denied())?;
         }
         Ok(())
     })?;
@@ -7341,6 +7415,7 @@ fn execute_sql_prepare(
     registry: &SessionRegistry,
 ) -> Result<(), QueryError> {
     let prepare_started = std::time::Instant::now();
+    let result_catalog_epoch = db.catalog_publication_epoch();
     let key = name.to_ascii_lowercase();
     // MySQL drops the old named statement before compiling its replacement.
     session.remove_sql_prepared_statement(&key);
@@ -7473,6 +7548,7 @@ fn execute_sql_prepare(
             database: session.current_database.clone(),
             parameter_count,
             result_columns,
+            result_catalog_epoch,
             routine_result_metadata: !routine_resolution.routines.is_empty(),
             memory_charge,
         },
@@ -7549,7 +7625,9 @@ fn execute_sql_prepared(
     session.xml_parameter_types = saved_xml_types;
     session.xml_parameter_binding = saved_xml_binding;
     if let Ok(result) = &mut response {
-        if !prepared.routine_result_metadata {
+        if !prepared.routine_result_metadata
+            && prepared.result_catalog_epoch == db.catalog_publication_epoch()
+        {
             apply_sql_prepared_result_columns(result, &prepared.result_columns);
         }
         super::select::cap_prepared_group_concat_limit_warnings(&prepared.statement, result);
@@ -7575,16 +7653,28 @@ fn apply_sql_prepared_result_columns(
         prepared_columns: &[crate::types::Column],
     ) {
         if columns.len() == prepared_columns.len() {
+            // Schema-derived descriptors belong to the execution schema. Only
+            // expression descriptors may inherit PREPARE-time parameter labels.
             for (column, prepared) in columns.iter_mut().zip(prepared_columns) {
+                if !column.source.org_name.is_empty() || !prepared.source.org_name.is_empty() {
+                    continue;
+                }
                 if prepared.source.dynamic_parameter {
                     column.name.clone_from(&prepared.name);
                     continue;
                 }
-                // Bound arithmetic strings can resolve to exact DECIMAL at
-                // EXECUTE time. Do not overwrite that precision with the
-                // unbound PREPARE fallback DOUBLE descriptor.
-                if matches!(column.column_type, crate::types::ColumnType::Decimal { .. })
-                    && matches!(prepared.column_type, crate::types::ColumnType::Double)
+                // Bound arithmetic can resolve to an exact numeric domain at
+                // EXECUTE time. Keep its type, precision and signedness instead
+                // of the unbound PREPARE fallback DOUBLE descriptor.
+                if matches!(
+                    column.column_type,
+                    crate::types::ColumnType::Tiny
+                        | crate::types::ColumnType::Short
+                        | crate::types::ColumnType::MediumInt
+                        | crate::types::ColumnType::Long
+                        | crate::types::ColumnType::LongLong
+                        | crate::types::ColumnType::Decimal { .. }
+                ) && matches!(prepared.column_type, crate::types::ColumnType::Double)
                 {
                     continue;
                 }
@@ -7970,7 +8060,7 @@ pub(super) fn execute_qualified_statement(
                 (default_charset.as_deref(), default_collation.as_deref())
             };
             db.create_database_with_options(&name, if_not_exists, charset, collation)?;
-            Ok(QueryResponse::Ok)
+            Ok(QueryResponse::OkAffected { affected_rows: 1 })
         }
         Statement::AlterDatabase {
             name,
@@ -8022,6 +8112,12 @@ pub(super) fn execute_qualified_statement(
                     Err(err) => return Err(err),
                 }
             }
+            let affected_rows = db
+                .catalog()
+                .tables
+                .values()
+                .filter(|table| table.database.eq_ignore_ascii_case(&name))
+                .count() as u64;
             db.drop_database(&name, if_exists)?;
             if session.current_database.eq_ignore_ascii_case(&name) {
                 session.current_database.clear();
@@ -8032,7 +8128,7 @@ pub(super) fn execute_qualified_statement(
                 // stays in sync.
                 session.note_schema_change(String::new());
             }
-            Ok(QueryResponse::Ok)
+            Ok(QueryResponse::OkAffected { affected_rows })
         }
         Statement::UseDatabase(name) => {
             let db_name = name.to_ascii_lowercase();
@@ -8231,6 +8327,7 @@ pub(super) fn execute_qualified_statement(
             // Startup keeps compact catalog headers. Hydrate and pin the full
             // descriptor before any preflight/snapshot/mutation uses the map.
             // Otherwise a cold metadata-only ALTER can persist zero columns.
+            ensure_base_table(db, &table_name)?;
             let _alter_source = db.table(&table_name)?;
             let _ddl_definition = db.pin_ddl_table(&table_name)?;
             db.validate_alter_table_actions(&table_name, &stmt.actions)?;
@@ -8366,6 +8463,8 @@ pub(super) fn execute_qualified_statement(
                         }
                         fused_physical_copy = true;
                     }
+                    None if stmt.algorithm == AlterAlgorithm::Copy
+                        && alter_plan.required != AlterAlgorithm::Copy => {}
                     None if stmt.algorithm == AlterAlgorithm::Copy => {
                         return Err(error(
                             crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
@@ -8401,7 +8500,7 @@ pub(super) fn execute_qualified_statement(
                         .name
                         .as_deref()
                         .is_some_and(|name| name.eq_ignore_ascii_case("PRIMARY"));
-                    let name = index.name.unwrap_or_else(|| index.columns.join("_"));
+                    let name = allocate_index_name(db, &table_name, index.name, &index.columns)?;
                     let column_directions = index
                         .column_descending
                         .iter()
@@ -8585,7 +8684,12 @@ pub(super) fn execute_qualified_statement(
                                     .name
                                     .as_deref()
                                     .is_some_and(|name| name.eq_ignore_ascii_case("PRIMARY"));
-                                let name = index.name.unwrap_or_else(|| index.columns.join("_"));
+                                let name = allocate_index_name(
+                                    db,
+                                    &table_name,
+                                    index.name,
+                                    &index.columns,
+                                )?;
                                 let column_directions = index
                                     .column_descending
                                     .iter()
@@ -8768,6 +8872,14 @@ pub(super) fn execute_qualified_statement(
                     }
                 }
             }
+            if _alter_source.auto_increment_column_index().is_none()
+                && db
+                    .table(&table_name)?
+                    .auto_increment_column_index()
+                    .is_some()
+            {
+                db.set_auto_increment(&table_name, 1)?;
+            }
             // Run any partition actions captured by the partition
             // pre-parser. Unsupported mixed physical statements were rejected
             // by the plan before any regular action was executed.
@@ -8809,6 +8921,17 @@ pub(super) fn execute_qualified_statement(
                 }
             }
             revalidate_altered_table_views(db, session, &alter_db, &alter_name)?;
+            if db.table(&table_name)?.active_generation != _alter_source.active_generation
+                && maintenance_rows.is_empty()
+            {
+                let current = db.table(&table_name)?;
+                return Ok(QueryResponse::OkAffected {
+                    affected_rows: current
+                        .stats
+                        .row_count
+                        .saturating_add_signed(db.table_live_row_delta(current.id)),
+                });
+            }
             if !maintenance_rows.is_empty() {
                 let columns = ["Table", "Op", "Msg_type", "Msg_text"]
                     .into_iter()
@@ -8831,6 +8954,15 @@ pub(super) fn execute_qualified_statement(
             temporary,
             ..
         } => {
+            let mut seen = std::collections::HashSet::new();
+            for name in &names {
+                if !seen.insert(session.temp_visible_key(name)) {
+                    return Err(error(
+                        crate::error::catalog::ER_NONUNIQ_TABLE,
+                        format!("Not unique table/alias: '{name}'"),
+                    ));
+                }
+            }
             let temp_name_count = names
                 .iter()
                 .filter(|name| session.resolve_temp_table_name(name).is_some())
@@ -9035,6 +9167,7 @@ pub(super) fn execute_qualified_statement(
                 return execute_create_temp_index(db, session, stmt);
             }
             implicit_commit_for_ddl(db, session)?;
+            ensure_base_table(db, &qualify_persistent_table_name(session, &stmt.table))?;
             let CreateIndex {
                 name,
                 table,
@@ -9132,6 +9265,7 @@ pub(super) fn execute_qualified_statement(
                 }
             }
             implicit_commit_for_ddl(db, session)?;
+            ensure_base_table(db, &qualify_persistent_table_name(session, &table))?;
             db.drop_index(&qualify_persistent_table_name(session, &table), &name)?;
             Ok(QueryResponse::Ok)
         }
@@ -9292,7 +9426,7 @@ pub(super) fn execute_qualified_statement(
             or_replace,
             if_not_exists,
             algorithm,
-            definer,
+            mut definer,
             security_type,
             columns,
             check_option,
@@ -9311,6 +9445,7 @@ pub(super) fn execute_qualified_statement(
                 }
                 return Err(crate::error::messages::table_exists(&name));
             }
+            super::routines::bind_current_user_definer(session, &mut definer);
             super::routines::validate_definer_privilege(db, session, definer.as_ref())?;
             let view_options = materialize_view_options(session, algorithm, definer, security_type);
             // P3.2 — a missing DEFINER at CREATE time is only a warning (1449);
@@ -9342,7 +9477,7 @@ pub(super) fn execute_qualified_statement(
             sql,
             query,
             algorithm,
-            definer,
+            mut definer,
             security_type,
             columns,
             check_option,
@@ -9372,6 +9507,7 @@ pub(super) fn execute_qualified_statement(
                     format!("unknown view '{}'", name),
                 ));
             };
+            super::routines::bind_current_user_definer(session, &mut definer);
             super::routines::validate_definer_privilege(db, session, definer.as_ref())?;
             let view_options = materialize_alter_view_options(
                 session,
@@ -9579,16 +9715,14 @@ pub(super) fn execute_qualified_statement(
             // didn't supply one. `u64::MAX` is the registry's sentinel
             // for "no cap" so we skip the rewrite in that common case
             // to avoid touching the plan-cache key needlessly.
-            // P2-C3 SQL_CALC_FOUND_ROWS: snapshot the user-supplied
-            // LIMIT/OFFSET *before* the implicit `sql_select_limit` injection
-            // below, so the strip-limit pre-pass strips only the real user
-            // window and reports the true pre-LIMIT total via `FOUND_ROWS()`.
+            // Count the unlimited input, but return the effective client
+            // window, including an implicit session limit.
+            apply_sql_select_limit(session, &mut stmt);
             let calc_window = if stmt.sql_calc_found_rows {
                 Some((stmt.limit.clone(), stmt.offset.clone()))
             } else {
                 None
             };
-            apply_sql_select_limit(session, &mut stmt);
             if calc_window.is_some() {
                 // MySQL 8.0.17 deprecation warning for the modifier itself.
                 crate::engine::api::push_statement_warning(
@@ -10344,7 +10478,7 @@ fn execute_explain_for_connection(
 /// its result, check shape, and bind the row's columns to user variables.
 /// MySQL semantics:
 ///   • 0 rows: variables retain their previous value (no error).
-///   • 1 row: column count must match target count (error 1222 / 1241 otherwise).
+///   • Column count must match target count even with zero rows (error 1222).
 ///   • ≥2 rows: error 1172 ("Result consisted of more than one row").
 /// MySQL `DO expr [, expr] ...` (13.2.3). Evaluate each expression for its
 /// side effects (typically `RELEASE_LOCK()` / `GET_LOCK()` / `SLEEP()`),
@@ -10418,6 +10552,7 @@ fn execute_select_into_vars(
         ));
     }
     let response = execute_statement(db, session, inner.into_statement(), registry)?;
+    validate_into_column_count(&response, targets.len())?;
     let Some(row) = take_single_into_row(response)? else {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
@@ -10426,19 +10561,31 @@ fn execute_select_into_vars(
         );
         return Ok(QueryResponse::Ok);
     };
-    if row.len() != targets.len() {
-        return Err(error(crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-            format!(
-                "The used SELECT statements have a different number of columns ({}) than INTO targets ({})",
-                row.len(),
-                targets.len()
-            ),
-        ));
-    }
     for (name, value) in targets.iter().zip(row.into_iter()) {
         session.set_user_variable(name, value)?;
     }
     Ok(QueryResponse::Ok)
+}
+
+/// Result metadata exists even when the query produces no rows. Check shape
+/// before reading a streaming cursor so cardinality cannot hide a bind error.
+pub(super) fn validate_into_column_count(
+    response: &QueryResponse,
+    targets: usize,
+) -> Result<(), QueryError> {
+    let columns = match response {
+        QueryResponse::ResultSet(result) => result.columns.len(),
+        QueryResponse::SharedResultSet(result) => result.columns.len(),
+        QueryResponse::StreamingResultSet(result) => result.columns.len(),
+        _ => return Ok(()),
+    };
+    if columns != targets {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+            "The used SELECT statements have a different number of columns",
+        ));
+    }
+    Ok(())
 }
 
 /// SELECT INTO needs one row or a cardinality error. Do not drain a large

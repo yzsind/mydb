@@ -7,14 +7,14 @@ Pauses execution for the specified number of seconds.
 ## Syntax
 
 ```sql
-SLEEP(value)
+SLEEP(seconds)
 ```
 
 ## Parameters
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `seconds` | Yes | Numeric | Duration in seconds; may be fractional. NULL/negative/nonfinite values are invalid. |
 
 ## Return Value
 
@@ -35,8 +35,10 @@ Result:
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- Invalid duration raises 1210 in strict SQL mode; otherwise it records a warning and returns 0. Normal completion returns 0. KILL and statement-deadline cancellation follow the SQL cancellation contract; do not rely on sleeping to release transactional locks.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`BENCHMARK`](benchmark.md), [`LOAD_FILE`](load_file.md), [`MYSQL_QUERY_ATTRIBUTE_STRING`](mysql_query_attribute_string.md).

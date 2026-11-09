@@ -14,8 +14,19 @@ pub(super) fn execute_create_trigger(
     mut def: TriggerDef,
 ) -> Result<QueryResponse, QueryError> {
     super::implicit_commit_for_ddl(db, session)?;
+    super::routines::bind_current_user_definer(session, &mut def.definer);
     validate_trigger_body(session, &def.body.statements)?;
     validate_trigger_rows(&mut def.body.statements, def.event, def.timing)?;
+    let (database, table_name) =
+        crate::storage::split_table_name(&session.current_database, &def.table);
+    match db.table(&crate::storage::table_key(&database, &table_name)) {
+        Ok(table) => {
+            validate_trigger_columns(&mut def.body.statements, &table, def.event, def.timing)?
+        }
+        // Let catalog validation distinguish a missing table from a view.
+        Err(error) if error.code() == 1146 => {}
+        Err(error) => return Err(error),
+    }
     // B3 — setting DEFINER to another account requires SET_USER_ID/SUPER.
     super::routines::validate_definer_privilege(db, session, def.definer.as_ref())?;
     let schema = trigger_schema_from_def(session, &def);

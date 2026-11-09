@@ -14,7 +14,7 @@ ANY_VALUE(expr)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | Any SQL expression | The 1st argument; the expression to evaluate |
+| `expr` | Yes | Any SQL expression | Expression to evaluate. |
 
 ## Return Value
 
@@ -42,4 +42,4 @@ Result:
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MIN`](min.md), [`MAX`](max.md).

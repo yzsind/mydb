@@ -37,8 +37,8 @@ Result:
 
 ## Notes
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAYAGG`](json_arrayagg.md), [`GROUP_CONCAT`](group_concat.md), [`ST_COLLECT`](st_collect.md), [`GROUPING`](grouping.md).

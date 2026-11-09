@@ -6,6 +6,10 @@ use crate::storage::sequence::{
 };
 
 impl Database {
+    pub(crate) fn sequences_owned_by_tables(&self, tables: &[u64]) -> Vec<Arc<SequenceSchema>> {
+        self.sequences.owned_definitions(tables)
+    }
+
     fn read_sequence_value(&self, counter_id: u64) -> Result<Option<SequenceValue>, QueryError> {
         use crate::storage::data_dictionary::DD_SEQUENCE_VALUES;
         let rows = self.catalog_rows_for_selector(

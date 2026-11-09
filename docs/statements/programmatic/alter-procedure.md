@@ -17,6 +17,10 @@ Modifies stored procedure characteristics without replacing parameters or the ro
 - An error is returned when the target does not exist or is not a procedure; after the catalog is modified, related call caches are invalidated.
 - To change parameters or the routine body, DROP and then CREATE again.
 
+## Context, Errors, and Lifecycle
+
+Requires ALTER ROUTINE and implicitly commits preceding user DML. A missing routine or wrong object kind is an error, not a conversion into a procedure. Characteristic syntax is shared with [CREATE PROCEDURE](create-procedure.md). Replacing the body requires DROP/CREATE and can change automatic routine grants; it is not an in-transaction rollbackable edit.
+
 ## Examples
 
 ```sql

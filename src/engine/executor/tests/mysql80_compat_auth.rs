@@ -2178,7 +2178,7 @@ fn b5_set_default_role_self_needs_no_role_admin() {
         .unwrap_err();
     assert_eq!(
         err.code(),
-        1142,
+        1227,
         "cross-account default role needs ROLE_ADMIN: {err:?}"
     );
 }
@@ -5378,14 +5378,11 @@ fn audit_kill_checks_matched_account_and_live_grants() {
     );
     let mut alice = user_session(&engine, "alice");
     for sql in ["KILL QUERY 12345", "KILL CONNECTION 12345"] {
-        assert_eq!(
-            engine
-                .execute_with_session(&mut alice, sql)
-                .unwrap_err()
-                .code(),
-            1227
-        );
+        let err = engine.execute_with_session(&mut alice, sql).unwrap_err();
+        assert_eq!(err.code(), 1095);
+        assert_eq!(err.message(), "You are not owner of thread 12345");
     }
+    assert_eq!(engine.kill_session(&alice, 12345).unwrap_err().code(), 1095);
     assert!(!handle
         .kill_flag()
         .load(std::sync::atomic::Ordering::Acquire));
@@ -5405,7 +5402,7 @@ fn audit_kill_checks_matched_account_and_live_grants() {
             .execute_with_session(&mut alice, "KILL 12345")
             .unwrap_err()
             .code(),
-        1227
+        1095
     );
     handle.set_identity("alice".into(), "test".into(), AccountKey::new("alice", "%"));
     engine
@@ -5454,12 +5451,22 @@ fn kill_ownership_uses_authenticated_account_and_reports_1095() {
         .execute_with_session(&mut alice, "KILL QUERY 8801")
         .unwrap();
     assert_eq!(own.query_cancel_generation(), 1);
-    for id in [8802, 8803] {
-        for kind in ["QUERY", "CONNECTION"] {
-            let err = engine
-                .execute_with_session(&mut alice, &format!("KILL {kind} {id}"))
-                .unwrap_err();
-            assert_eq!(err.code(), 1095);
+    // PROCESS changes visibility, not KILL authorization or its denial code.
+    for process in [false, true, false] {
+        let sql = if process {
+            "GRANT PROCESS ON *.* TO alice"
+        } else {
+            "REVOKE PROCESS ON *.* FROM alice"
+        };
+        engine.execute_with_session(&mut root, sql).unwrap();
+        for id in [8802, 8803] {
+            for kind in ["QUERY", "CONNECTION"] {
+                let err = engine
+                    .execute_with_session(&mut alice, &format!("KILL {kind} {id}"))
+                    .unwrap_err();
+                assert_eq!(err.code(), 1095);
+                assert_eq!(err.message(), format!("You are not owner of thread {id}"));
+            }
         }
     }
     assert_eq!(other_host.query_cancel_generation(), 0);
@@ -5475,6 +5482,59 @@ fn kill_ownership_uses_authenticated_account_and_reports_1095() {
         .execute_with_session(&mut alice, "KILL CONNECTION 8801")
         .unwrap();
     assert!(own.kill_flag().load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn audit1109_locked_login_message_uses_peer_host_after_verifying_credentials() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    let username = "locked@name";
+    for plugin in [
+        "mysql_native_password",
+        "caching_sha2_password",
+        "sha256_password",
+    ] {
+        engine
+            .execute_with_session(&mut root, "DROP USER IF EXISTS 'locked@name'@'%'")
+            .unwrap();
+        let create = format!(
+            "CREATE USER 'locked@name'@'%' \
+             IDENTIFIED WITH {plugin} BY 'secret' ACCOUNT LOCK"
+        );
+        engine.execute_with_session(&mut root, &create).unwrap();
+        for host in ["127.0.0.1", "localhost", "2001:db8::1"] {
+            let request = auth::AuthRequest::legacy(username, host, &[], Some(plugin));
+            let wrong = engine
+                .authenticate_with_plaintext_password(username, host, "wrong", &request)
+                .unwrap_err();
+            assert_eq!(wrong.code(), 1045);
+            assert!(!wrong.message().contains("account is locked"), "{wrong:?}");
+            assert!(!wrong.message().contains("Account is locked"), "{wrong:?}");
+            let err = engine
+                .authenticate_with_plaintext_password(username, host, "secret", &request)
+                .unwrap_err();
+            assert_eq!(err.code(), 3118);
+            let expected =
+                format!("Access denied for user '{username}'@'{host}'. Account is locked.");
+            assert_eq!(err.message(), expected);
+            if plugin == "mysql_native_password" {
+                let nonce = crate::mysql::protocol::generate_auth_nonce();
+                let token = native_scramble("secret", &nonce);
+                let request = nonce_auth_request(username, host, &token, &nonce);
+                let err = engine.authenticate_request(request).unwrap_err();
+                assert_eq!(err.code(), 3118);
+                assert_eq!(err.message(), expected);
+            }
+        }
+        engine
+            .execute_with_session(&mut root, "ALTER USER 'locked@name'@'%' ACCOUNT UNLOCK")
+            .unwrap();
+        let request = auth::AuthRequest::legacy(username, "127.0.0.1", &[], Some(plugin));
+        engine
+            .authenticate_with_plaintext_password(username, "127.0.0.1", "secret", &request)
+            .unwrap();
+    }
 }
 
 #[test]

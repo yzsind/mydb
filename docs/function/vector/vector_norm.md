@@ -40,4 +40,4 @@ Result:
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`L2_NORMALIZE`](l2_normalize.md), [`SUBVECTOR`](subvector.md).

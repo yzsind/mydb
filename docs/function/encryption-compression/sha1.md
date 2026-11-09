@@ -14,7 +14,7 @@ SHA1(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | String or binary string; convertible scalar where accepted | Input bytes/text; numeric scalars are converted to their display bytes. |
 
 ## Return Value
 
@@ -34,7 +34,7 @@ da4b9237bacccdf19c0760cab7aec4a8359010b0
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 

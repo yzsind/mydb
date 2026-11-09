@@ -46,7 +46,12 @@ pub fn pushdown_derived_predicates(select: &mut Select) -> usize {
     // Handle FROM derived. Only an ordinary SELECT derived table is eligible
     // for predicate pushdown; a set-operation derived table is left untouched.
     if let Some(inner) = select.derived.as_ref().and_then(SubQuery::as_select) {
-        if !derived_pushdown_safe(inner) {
+        if !derived_pushdown_safe(inner)
+            || select
+                .joins
+                .iter()
+                .any(|join| matches!(join.join_type, JoinType::Right | JoinType::Full))
+        {
             return 0;
         }
         let alias_map = build_alias_map(inner);
@@ -112,6 +117,10 @@ pub fn pushdown_derived_predicates(select: &mut Select) -> usize {
         let mut pushdown: Vec<Expr> = Vec::new();
         let mut having_pushdown: Vec<Expr> = Vec::new();
         for conj in conjuncts {
+            if !repeatable_aggregate_filter(&conj) {
+                keep.push(conj);
+                continue;
+            }
             if let Some(rewritten) = alias_map
                 .as_ref()
                 .and_then(|map| rewrite_for_pushdown(&conj, &derived_alias, map))
@@ -255,7 +264,7 @@ fn pushdown_union_all_derived_predicates(db: &Database, select: &mut Select) -> 
         let alias = table.alias.as_deref().unwrap_or(&table.name);
         staged.push((
             None,
-            union_source_pushdown_candidates(db, select, set, alias),
+            union_source_pushdown_candidates(db, select, set, alias, &table.column_aliases),
         ));
     }
     for (index, join) in select.joins.iter().enumerate() {
@@ -263,7 +272,13 @@ fn pushdown_union_all_derived_predicates(db: &Database, select: &mut Select) -> 
             let alias = join.table.alias.as_deref().unwrap_or(&join.table.name);
             staged.push((
                 Some(index),
-                union_source_pushdown_candidates(db, select, set, alias),
+                union_source_pushdown_candidates(
+                    db,
+                    select,
+                    set,
+                    alias,
+                    &join.table.column_aliases,
+                ),
             ));
         }
     }
@@ -288,6 +303,7 @@ fn union_source_pushdown_candidates(
     select: &Select,
     set_stmt: &crate::parser::SetOperation,
     derived_alias: &str,
+    column_aliases: &[String],
 ) -> Vec<UnionPushdownCandidate> {
     let set_op = set_stmt;
     if !is_pure_union_all_setop(set_op) {
@@ -300,9 +316,19 @@ fn union_source_pushdown_candidates(
     {
         return Vec::new();
     }
-    let Some(derived_columns) = union_output_columns(set_stmt) else {
+    let Some(mut derived_columns) = union_output_columns(set_stmt) else {
         return Vec::new();
     };
+    if !column_aliases.is_empty() {
+        if column_aliases.len() != derived_columns.len() {
+            return Vec::new();
+        }
+        derived_columns = column_aliases
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.to_ascii_lowercase(), index))
+            .collect();
+    }
     let sources = collect_outer_sources(db, select, &derived_alias);
     if sources.is_empty() {
         return Vec::new();
@@ -954,12 +980,28 @@ fn projection_has_window(items: &[SelectItem]) -> bool {
 /// predicate on `key` can be pushed below the aggregate even though the
 /// aggregate output itself cannot.
 fn build_alias_map(inner: &Select) -> Option<HashMap<String, Expr>> {
+    // Superaggregate rows are created after WHERE. A group-key predicate
+    // cannot be removed from the outer query when those rows are possible.
+    if inner.group_by_modifier != crate::parser::GroupByModifier::None
+        || !inner.grouping_sets.is_empty()
+    {
+        return None;
+    }
     let group_keys: Vec<String> = inner
         .group_by
         .iter()
         .filter_map(direct_column_name)
         .collect();
-    let group_active = !inner.group_by.is_empty();
+    let group_active = !inner.group_by.is_empty()
+        || inner
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { expr, .. } if expr_has_aggregate(expr)))
+        || inner.having.as_ref().is_some_and(expr_has_aggregate)
+        || inner
+            .order_by
+            .iter()
+            .any(|item| expr_has_aggregate(&item.expr));
     let mut map = HashMap::new();
     for item in &inner.projection {
         match item {

@@ -92,7 +92,7 @@ fn enum_order_by_uses_index() {
 }
 
 #[test]
-fn set_equality_is_order_agnostic() {
+fn set_string_equality_preserves_member_order() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_test_engine(tmp.path());
     engine
@@ -102,10 +102,10 @@ fn set_equality_is_order_agnostic() {
         .execute("INSERT INTO s VALUES (1,'a,b'),(2,'c'),(3,'a,c')")
         .unwrap();
     // Stored canonical order is by member index ('a,b'); comparing to 'b,a'
-    // must still match by bitmask, not by display string.
+    // remains a string comparison, so a differently ordered string does not match.
     assert_eq!(
         ids(&engine, "SELECT id FROM s WHERE flags = 'b,a'"),
-        vec![1]
+        Vec::<i64>::new()
     );
 }
 
@@ -286,9 +286,7 @@ fn set_input_order_gets_canonicalised() {
 
 #[test]
 fn set_leading_space_in_token_rejected() {
-    // MySQL 8.0 rstrips SET tokens; a leading space must not silently
-    // match. `'a ,b'` splits to ['a ', 'b']; 'a ' rtrim → 'a'; 'b' fine.
-    // But `' a,b'` splits to [' a', 'b']; ' a' does NOT match 'a' → 1265.
+    // A leading space in a member token must not silently match.
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_test_engine(tmp.path());
     engine
@@ -413,6 +411,104 @@ fn ddl_enum_empty_member_list_rejected() {
     let res = engine.execute("CREATE TABLE t (e ENUM())");
     if let Ok(_) = res {
         panic!("empty ENUM member list should be rejected");
+    }
+}
+
+#[test]
+fn enum_defaults_trim_trailing_spaces_across_ddl_paths() {
+    let tmp = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(tmp.path());
+    for collation in [
+        "utf8mb4_0900_ai_ci",
+        "utf8mb4_0900_bin",
+        "utf8mb4_unicode_ci",
+        "utf8mb4_bin",
+    ] {
+        engine
+            .execute(&format!(
+                "CREATE TABLE spaced_enum (e ENUM(' ','a','b ') \
+                 COLLATE {collation} NOT NULL DEFAULT 'b ')"
+            ))
+            .unwrap();
+        engine.execute("INSERT INTO spaced_enum VALUES ()").unwrap();
+        engine
+            .execute("ALTER TABLE spaced_enum ALTER COLUMN e SET DEFAULT 'a  '")
+            .unwrap();
+        engine.execute("INSERT INTO spaced_enum VALUES ()").unwrap();
+        engine
+            .execute("ALTER TABLE spaced_enum ALTER COLUMN e SET DEFAULT '   '")
+            .unwrap();
+        engine.execute("INSERT INTO spaced_enum VALUES ()").unwrap();
+        assert_eq!(
+            response_rows(
+                engine
+                    .execute("SELECT CONCAT(e, ':', e+0) FROM spaced_enum ORDER BY e")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::String(":1".into())],
+                vec![Value::String("a:2".into())],
+                vec![Value::String("b:3".into())],
+            ],
+            "{collation}"
+        );
+        engine
+            .execute(&format!(
+                "ALTER TABLE spaced_enum ADD COLUMN added ENUM('a','b ') \
+                 COLLATE {collation} NOT NULL DEFAULT 'b  '"
+            ))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "ALTER TABLE spaced_enum MODIFY COLUMN added ENUM('a','b ') \
+                 COLLATE {collation} NOT NULL DEFAULT 'a  '"
+            ))
+            .unwrap();
+        engine
+            .execute("INSERT INTO spaced_enum VALUES (DEFAULT, DEFAULT)")
+            .unwrap();
+        assert_eq!(
+            response_rows(
+                engine
+                    .execute("SELECT added FROM spaced_enum ORDER BY added")
+                    .unwrap()
+            ),
+            vec![
+                vec![Value::String("a".into())],
+                vec![Value::String("b".into())],
+                vec![Value::String("b".into())],
+                vec![Value::String("b".into())],
+            ],
+            "{collation}"
+        );
+        engine.execute("DROP TABLE spaced_enum").unwrap();
+    }
+}
+
+#[test]
+fn enum_default_space_trimming_preserves_other_whitespace() {
+    let tmp = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(tmp.path());
+    engine
+        .execute(
+            "CREATE TABLE enum_whitespace (e ENUM('b','b\t') \
+             COLLATE utf8mb4_0900_bin DEFAULT 'b\t ')",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO enum_whitespace VALUES ()")
+        .unwrap();
+    assert_eq!(
+        response_rows(engine.execute("SELECT e FROM enum_whitespace").unwrap()),
+        vec![vec![Value::String("b\t".into())]]
+    );
+    for invalid in [" b ", "b\n", "b\u{00a0}", "   ", "missing "] {
+        let err = engine
+            .execute(&format!(
+                "ALTER TABLE enum_whitespace ALTER COLUMN e SET DEFAULT '{invalid}'"
+            ))
+            .unwrap_err();
+        assert_eq!((err.code(), err.sql_state().as_ref()), (1067, "42000"));
     }
 }
 

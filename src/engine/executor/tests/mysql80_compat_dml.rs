@@ -2426,7 +2426,7 @@ fn ordered_update_applies_writes_in_candidate_order() {
 }
 
 #[test]
-fn prepared_dml_limit_rejects_non_integer_parameters_without_writes() {
+fn prepared_dml_limit_converts_strings_and_rejects_invalid_numbers() {
     let tmp = tempfile::tempdir().unwrap();
     let engine = open_test_engine(tmp.path());
     engine
@@ -2437,11 +2437,9 @@ fn prepared_dml_limit_rejects_non_integer_parameters_without_writes() {
         .unwrap();
     let statement = parse_statement("UPDATE t SET v=v+1 ORDER BY id LIMIT ?").unwrap();
 
-    for value in [
-        Value::Int(-1),
-        Value::Float(1.5),
-        Value::Null,
-        Value::String("1".into()),
+    for (value, code, state) in [
+        (Value::Int(-1), 1690, "22003"),
+        (Value::Float(1.5), 1210, "HY000"),
     ] {
         let err = crate::engine::params::with_params(vec![value], || {
             engine.execute_prepared_for_test(
@@ -2451,13 +2449,36 @@ fn prepared_dml_limit_rejects_non_integer_parameters_without_writes() {
             )
         })
         .unwrap_err();
-        assert_eq!(err.code(), 1210, "{err:?}");
-        assert_eq!(err.sql_state(), "HY000");
+        assert_eq!(err.code(), code, "{err:?}");
+        assert_eq!(err.sql_state(), state);
     }
+    crate::engine::params::with_params(vec![Value::Null], || {
+        engine.execute_prepared_for_test(
+            &mut SessionContext::default(),
+            "UPDATE t SET v=v+1 ORDER BY id LIMIT ?",
+            statement.clone(),
+        )
+    })
+    .unwrap();
     assert_eq!(
         rows_of(engine.execute("SELECT id,v FROM t ORDER BY id").unwrap()),
         vec![
             vec![Value::Int(1), Value::Int(10)],
+            vec![Value::Int(2), Value::Int(20)]
+        ]
+    );
+    crate::engine::params::with_params(vec![Value::String("1".into())], || {
+        engine.execute_prepared_for_test(
+            &mut SessionContext::default(),
+            "UPDATE t SET v=v+1 ORDER BY id LIMIT ?",
+            statement.clone(),
+        )
+    })
+    .unwrap();
+    assert_eq!(
+        rows_of(engine.execute("SELECT id,v FROM t ORDER BY id").unwrap()),
+        vec![
+            vec![Value::Int(1), Value::Int(11)],
             vec![Value::Int(2), Value::Int(20)]
         ]
     );

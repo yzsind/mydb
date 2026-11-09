@@ -35,8 +35,8 @@ Result:
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`GREATEST`](greatest.md), [`FIELD`](field.md), [`ELT`](elt.md), [`INTERVAL`](interval.md).

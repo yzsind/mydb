@@ -19,7 +19,7 @@ JSON_REMOVE(json_doc, path [, path] ...)
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns a JSON document with each selected member/element removed. Unmatched paths preserve the document; removing the root is rejected. SQL NULL document/path returns SQL NULL.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: {"a": 1}
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_SET`](json_set.md), [`JSON_INSERT`](json_insert.md), [`JSON_REPLACE`](json_replace.md), [`JSON_ARRAY_APPEND`](json_array_append.md).

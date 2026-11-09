@@ -54,4 +54,4 @@ the batch pipeline and chooses scalar expression/aggregate processing;
 it does not select the legacy row executor. If a plan actually falls back
 to that executor, the series rows are materialized. Use sensible
 bounds and do not assume LIMIT is always pushed into the generator; verify
-the actual plan and route. See [executor boundaries](executor.md#5-vectorization-boundaries).
+the actual plan and route. See [executor boundaries](optimizer-and-operators.md#vectorization-boundaries).

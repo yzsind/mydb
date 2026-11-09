@@ -108,10 +108,12 @@ impl PostParseState {
                     .column_prefix_lengths
                     .iter_mut()
                     .for_each(|prefix| *prefix = None);
-                index
-                    .column_descending
-                    .iter_mut()
-                    .for_each(|descending| *descending = false);
+                if index.column_descending.iter().any(|descending| *descending) {
+                    return Err(parse_error_with_spec_at_zero(
+                        crate::error::catalog::ER_WRONG_USAGE,
+                        "FULLTEXT indexes do not support descending key parts",
+                    ));
+                }
                 if index.key_expressions.iter().any(Option::is_some) {
                     *statement = Statement::Unsupported {
                         kind: "FULLTEXT INDEX on expression".to_string(),
@@ -891,13 +893,6 @@ pub(super) fn strip_create_index_visibility(
 /// ALTER/DROP CHECK are outside sqlparser's MySQL AST. Split structurally before
 /// parsing its siblings so ALGORITHM/LOCK and compound actions are preserved.
 fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError> {
-    if !sql
-        .as_bytes()
-        .windows(5)
-        .any(|word| word.eq_ignore_ascii_case(b"CHECK"))
-    {
-        return Ok(None);
-    }
     use crate::sql_lex::{SqlTokenCursor, SqlTokenKind, StructuralCursor};
     let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
     let tokens = |text: &str| {
@@ -944,7 +939,11 @@ fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError>
         let is_check = words.len() >= 2
             && (words[0].1.eq_ignore_ascii_case("ALTER")
                 || words[0].1.eq_ignore_ascii_case("DROP"))
-            && words[1].1.eq_ignore_ascii_case("CHECK");
+            && (words[1].1.eq_ignore_ascii_case("CHECK")
+                || (words[0].1.eq_ignore_ascii_case("ALTER")
+                    && words[1].1.eq_ignore_ascii_case("CONSTRAINT"))
+                || (words[0].1.eq_ignore_ascii_case("ALTER")
+                    && words[1].1.eq_ignore_ascii_case("INDEX")));
         has_check |= is_check;
         parts.push((words, is_check));
     }
@@ -968,7 +967,21 @@ fn parse_alter_check_actions(sql: &str) -> Result<Option<Statement>, ParseError>
     };
     result.table = identity.table;
     for (clause, (words, is_check)) in clauses.iter().zip(parts) {
-        if is_check && words[0].1.eq_ignore_ascii_case("DROP") {
+        if is_check && words[1].1.eq_ignore_ascii_case("INDEX") {
+            if words.len() != 4
+                || !(words[3].1.eq_ignore_ascii_case("VISIBLE")
+                    || words[3].1.eq_ignore_ascii_case("INVISIBLE"))
+            {
+                return Err(parse_error_full_span(
+                    sql,
+                    "ALTER INDEX expects a name and VISIBLE or INVISIBLE",
+                ));
+            }
+            result.actions.push(AlterAction::AlterIndexVisibility {
+                name: words[2].1.clone(),
+                visible: words[3].1.eq_ignore_ascii_case("VISIBLE"),
+            });
+        } else if is_check && words[0].1.eq_ignore_ascii_case("DROP") {
             let (name, if_exists) = match words.as_slice() {
                 [_, _, name] => (name, false),
                 [_, _, if_word, exists, name]
@@ -1857,7 +1870,7 @@ pub(super) fn rewrite_enum_set_legacy_literals(sql: &str) -> std::borrow::Cow<'_
         }
         if is_word_at(sql, &upper, attribute, "BINARY") {
             out.push_str(&sql[index..attribute]);
-            out.push_str("COLLATE binary");
+            out.push_str("COLLATE __MYDB_BINARY_ATTRIBUTE");
             index = attribute + "BINARY".len();
             changed = true;
         }
@@ -2708,24 +2721,11 @@ pub(super) fn rewrite_empty_insert_rows(sql: &str) -> std::borrow::Cow<'_, str> 
     while let Some((idx, ch)) = chars.next() {
         match ch {
             '\'' | '"' | '`' => {
-                let quote = ch;
-                out.push(quote);
+                let end = quoted_span_end(sql.as_bytes(), idx);
+                out.push_str(&sql[idx..end]);
                 prev_ident = false;
-                while let Some((_, c)) = chars.next() {
-                    out.push(c);
-                    if c == quote {
-                        if matches!(chars.peek(), Some((_, q)) if *q == quote) {
-                            out.push(quote);
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                    if c == '\\' {
-                        if let Some((_, esc)) = chars.next() {
-                            out.push(esc);
-                        }
-                    }
+                while chars.peek().is_some_and(|(index, _)| *index < end) {
+                    chars.next();
                 }
             }
             '(' if depth == 0 => {
@@ -2869,24 +2869,11 @@ pub(super) fn rewrite_comma_update_targets(sql: &str) -> std::borrow::Cow<'_, st
         }
         match ch {
             '\'' | '"' | '`' => {
-                let quote = ch;
-                out.push(quote);
+                let end = quoted_span_end(sql.as_bytes(), idx);
+                out.push_str(&sql[idx..end]);
                 prev_ident = false;
-                while let Some((_, c)) = chars.next() {
-                    out.push(c);
-                    if c == quote {
-                        if matches!(chars.peek(), Some((_, q)) if *q == quote) {
-                            out.push(quote);
-                            chars.next();
-                            continue;
-                        }
-                        break;
-                    }
-                    if c == '\\' {
-                        if let Some((_, esc)) = chars.next() {
-                            out.push(esc);
-                        }
-                    }
+                while chars.peek().is_some_and(|(index, _)| *index < end) {
+                    chars.next();
                 }
             }
             '(' => {

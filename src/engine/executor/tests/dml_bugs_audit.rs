@@ -201,7 +201,7 @@ fn invalid_delete_join_is_rejected_without_deleting_rows() {
 }
 
 #[test]
-fn bit_integer_overflow_reports_out_of_range() {
+fn bit_integer_width_overflow_reports_data_too_long() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE t (b BIT(1))").unwrap();
@@ -210,7 +210,7 @@ fn bit_integer_overflow_reports_out_of_range() {
             .execute("INSERT INTO t VALUES (2)")
             .unwrap_err()
             .code(),
-        1264
+        1406
     );
 }
 

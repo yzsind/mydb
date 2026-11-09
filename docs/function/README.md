@@ -1,6 +1,6 @@
 # SQL Function Index
 
-This directory organizes the user-visible SQL functions currently provided by mydb by their purpose. The authoritative sources are the scalar evaluator and its shared math registry, aggregate and window executors, and GIS and vector registries. Synonymous functions are listed separately, while internal execution markers such as `__...` are not part of the user interface and are not included. Recognized names that always return an unsupported error are excluded.
+This directory organizes the user-visible SQL functions currently provided by mydb by their purpose. The authoritative sources are the scalar evaluator and its shared math registry, aggregate and window executors, and GIS and vector registries. Synonymous functions are listed separately, while internal execution markers such as `__...` are not part of the user interface and are not included. Recognized names that always return an unsupported error are excluded. MySQL-compatible functions, mydb extensions and partial compatibility helpers are distinguished in the category references; listing a name does not imply every MySQL overload is implemented.
 
 The `README.md` in each category directory lists one function per line and links to the detailed documentation for that function. Some functions can also be used as window functions; each is listed only once, in the category closest to its primary use.
 
@@ -18,6 +18,7 @@ The `README.md` in each category directory lists one function per line and links
 | [Network, UUID, and Sequence Functions](network-uuid-sequence/README.md) | IP addresses, UUIDs, and sequence operations |
 | [Data Masking and Keyring Functions](masking-keyring/README.md) | Data masking, password strength, and keyring operations |
 | [Locking Functions](locking/README.md) | User-level named locks |
+| [XML Functions](xml/README.md) | XML fragments, XPath extraction and replacement |
 | [Spatial Functions](spatial/README.md) | GIS construction, conversion, properties, measurement, and spatial predicates |
 | [HTTP Functions](http/README.md) | Bounded HTTP/HTTPS requests, authentication, binary payloads and response metadata |
 | [AI Functions](ai/README.md) | LLM text generation, structured responses, and native embedding calls |
@@ -30,4 +31,37 @@ have their varying fields and preconditions called out explicitly. Without an
 outer ORDER BY, displayed row order is illustrative. SQL NULL, JSON null and
 the text `NULL` are distinct; function pages identify the relevant case.
 
-`MATCH (...) AGAINST (...)` is full-text search syntax rather than a regular function call; see the full-text index documentation and tests. `generate_series` is a table function; see [`../generate-series.md`](../generate-series.md) separately.
+`MATCH (...) AGAINST (...)` is full-text search syntax rather than a regular function call; see [Full-text search](../fulltext-search.md). `generate_series` is a table function; see [`../generate-series.md`](../generate-series.md) separately.
+
+## Reproducing examples
+
+Unless a page states a different prerequisite, use a disposable database and this
+session baseline before comparing static outputs:
+
+```sql
+USE test;
+SET SESSION sql_mode='';
+SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci;
+SET SESSION time_zone='+00:00';
+SET SESSION lc_time_names='en_US';
+SET SESSION default_week_format=0;
+```
+
+`test` must exist. Empty SQL mode makes conversion diagnostics reproducible; it is
+an example baseline, not a production configuration recommendation. Check warnings
+with SHOW WARNINGS immediately after the statement. Strict writes can reject values
+that a SELECT reports as NULL plus a warning. Category references state the rules.
+
+Static Result blocks use text-protocol values without column headers. Empty text
+is not SQL NULL. JSON null and the text NULL are distinct again. Use HEX for binary
+results and VECTOR_TO_STRING for native vectors. Floating output can differ in its
+last digits and unordered row/aggregate input order is illustrative unless the
+example specifies ordering. Time, identity, random and external-service results
+use conditional examples instead of fixed invented values.
+
+Sequence/keyring/lock examples create state and must be run on an isolated instance
+with fresh names and the documented privileges. HTTP examples require the
+[local egress policy and test service](http/README.md#local-example-setup); AI examples
+require configured models and AI_USE. External operations are not undone by SQL
+rollback. No function-page example grants production credentials or isolation beyond
+its explicit current contract.

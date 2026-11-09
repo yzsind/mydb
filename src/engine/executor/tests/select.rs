@@ -3249,7 +3249,7 @@ fn compiled_expression_program_matches_scalar_semantics() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(result.rows, vec![vec![Value::Int(42)]]);
+    assert_eq!(result.rows, vec![vec![Value::String("42".into())]]);
 
     let table = engine.db_for_tests().table("exprprog").unwrap();
     let schema = InputSchema::from_table(&table);
@@ -4589,7 +4589,7 @@ fn join_using_and_natural_join_follow_mysql_projection_rules() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(qualified_common.rows, vec![vec![Value::Int(2)]]);
+    assert_eq!(qualified_common.rows, vec![vec![Value::Null]]);
 
     let QueryResponse::ResultSet(bare_id) = engine
         .execute("SELECT id, l.id, r.id FROM lefty l JOIN righty r USING (id)")
@@ -11926,15 +11926,18 @@ fn derived_table_with_group_by() {
 }
 
 #[test]
-fn alter_table_drop_column_fails_on_primary_key() {
-    let dir = tempfile::tempdir().unwrap();
+fn alter_table_drop_column_removes_primary_key_member() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
         .unwrap();
-
-    let err = engine.execute("ALTER TABLE t DROP COLUMN id").unwrap_err();
-    assert_eq!(err.code(), 1090);
+    engine.execute("INSERT INTO t VALUES(1,7)").unwrap();
+    engine.execute("ALTER TABLE t DROP COLUMN id").unwrap();
+    engine.execute("INSERT INTO t VALUES(8)").unwrap();
+    let table = engine.db.table("test.t").unwrap();
+    assert!(table.primary_key.is_empty());
+    assert_eq!(table.visible_column_count(), 1);
 }
 
 #[test]

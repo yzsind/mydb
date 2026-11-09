@@ -15,6 +15,7 @@ logs/
 /tests/fixtures/*
 !/tests/fixtures/storage-format-v1/
 !/tests/fixtures/function-compat/
+!/tests/fixtures/mysql80/
 !/tests/fixtures/xml-functions-mysql80.json
 docs/benchmark-results/
 docs/benchmarks/

@@ -114,6 +114,15 @@ fn expression_column_source_for_expr(
 ) -> crate::types::ColumnSource {
     let mut source = expression_column_source(unsigned);
     source.dynamic_parameter = matches!(expr, Expr::Placeholder(_));
+    source.round_decimal_result = crate::parser::visit::any_expr(expr, |node| {
+        matches!(
+            node,
+            Expr::Binary {
+                op: crate::parser::BinaryOp::Div,
+                ..
+            }
+        )
+    });
     // A standalone computed field has no original catalog column. Set
     // operations fill the first branch's expression label later, where MySQL
     // exposes it as aggregate UNION metadata; doing so here would incorrectly
@@ -503,7 +512,7 @@ fn execute_select_with_cte_joins_inner(
     // empty but the projection contains aggregates, treat all rows as a
     // single group (implicit aggregation). HAVING is evaluated after
     // grouping using the same aggregate-aware evaluator.
-    let projection_has_aggregate = select_projection_has_toplevel_aggregate(&stmt.projection);
+    let projection_has_aggregate = planner::select_has_aggregate(db, &stmt);
     let aggregating = !stmt.group_by.is_empty()
         || projection_has_aggregate
         || stmt
@@ -534,6 +543,8 @@ fn execute_select_with_cte_joins_inner(
         for ob in &stmt.order_by {
             slot_exprs.push(&ob.expr);
         }
+        let aggregate_calls = planner::collect_aggregate_calls_scoped(db, &stmt);
+        slot_exprs.extend(aggregate_calls.iter());
         let slots: Vec<AggregateSlot> = collect_aggregate_slots(&slot_exprs);
 
         struct GroupBucket {
@@ -2996,15 +3007,12 @@ pub(super) fn prepare_select_for_planning(
     // column before validation and before the row pipeline reads `order_by`,
     // so a name that is ambiguous across self-joined sources resolves to the
     // single projected column instead of raising 1052.
-    planner::resolve_order_by_output_refs(db, stmt);
+    planner::resolve_order_by_output_refs(db, stmt)?;
     planner::resolve_having_aliases(stmt);
     if stmt.group_by.is_empty()
         && stmt.grouping_sets.is_empty()
-        && !select_projection_has_toplevel_aggregate(&stmt.projection)
-        && stmt
-            .order_by
-            .iter()
-            .any(|order| expr_has_toplevel_aggregate(&order.expr))
+        && !planner::select_has_aggregate(db, &stmt)
+        && planner::select_order_has_aggregate(db, stmt)
     {
         return Err(error(
             crate::error::catalog::ER_AGGREGATE_ORDER_NON_AGG_QUERY,
@@ -3013,7 +3021,7 @@ pub(super) fn prepare_select_for_planning(
     }
     if stmt.group_by.is_empty()
         && stmt.grouping_sets.is_empty()
-        && select_projection_has_toplevel_aggregate(&stmt.projection)
+        && planner::select_has_aggregate(db, &stmt)
     {
         // The query produces exactly one aggregate row. ORDER BY cannot alter
         // that row's position, and retaining a base-column sort key until
@@ -3458,9 +3466,54 @@ pub(super) fn execute_select(
             crate::engine::session_registry::ProcessState::RemovingDuplicates,
         )
     });
-    with_session_registry(registry.clone(), || {
+    // Some physical routes replace the projection with synthetic fields.
+    // Retain result precision provenance from the SQL projection at entry.
+    let decimal_outputs: smallvec::SmallVec<[usize; 4]> = if stmt
+        .projection
+        .iter()
+        .all(|item| matches!(item, SelectItem::Expr { .. }))
+    {
+        stmt.projection
+            .iter()
+            .enumerate()
+            .filter_map(|(index, item)| {
+                let SelectItem::Expr { expr, .. } = item else {
+                    return None;
+                };
+                crate::parser::visit::any_expr(expr, |node| {
+                    matches!(
+                        node,
+                        Expr::Binary {
+                            op: crate::parser::BinaryOp::Div,
+                            ..
+                        }
+                    )
+                })
+                .then_some(index)
+            })
+            .collect()
+    } else {
+        smallvec::SmallVec::new()
+    };
+    let mut response = with_session_registry(registry.clone(), || {
         self::eval::with_subquery_context(db, txn, || execute_select_inner(db, txn, stmt, registry))
-    })
+    })?;
+    if !decimal_outputs.is_empty() {
+        let columns = match &mut response {
+            QueryResponse::ResultSet(result) => Some(result.columns.as_mut_slice()),
+            QueryResponse::SharedResultSet(result) => Some(Arc::make_mut(&mut result.columns)),
+            QueryResponse::StreamingResultSet(result) => Some(result.columns.as_mut_slice()),
+            _ => None,
+        };
+        if let Some(columns) = columns {
+            for index in decimal_outputs {
+                if let Some(column) = columns.get_mut(index) {
+                    column.source.round_decimal_result = true;
+                }
+            }
+        }
+    }
+    Ok(response)
 }
 
 fn execute_select_inner(
@@ -3827,7 +3880,9 @@ fn inject_order_limit_lower_bound(
     stmt: &mut Select,
     table_name: &str,
 ) -> Result<(), QueryError> {
-    if stmt.selection.is_some()
+    if !stmt.joins.is_empty()
+        || stmt.from.len() > 1
+        || stmt.selection.is_some()
         || stmt.order_by.is_empty()
         || (stmt.limit.is_none() && stmt.offset.is_none())
     {
@@ -3911,7 +3966,7 @@ pub(super) fn try_flatten_locking_derived_select(db: &Database, select: &Select)
     if !select.for_update
         || !select.group_by.is_empty()
         || select.having.is_some()
-        || select_projection_has_toplevel_aggregate(&select.projection)
+        || planner::select_has_aggregate(db, select)
     {
         return None;
     }
@@ -4049,6 +4104,11 @@ pub(super) fn try_flatten_simple_derived_select(select: &Select) -> Option<Selec
     // set-operation derived table falls through to the general path
     // (`as_select()` returns None → no flattening).
     let inner = select.derived.as_ref()?.as_select()?;
+    // A constant derived relation materializes its declared decimal scale.
+    // Inlining extended-precision division across that boundary changes values.
+    if inner.from.is_empty() && inner.projection.iter().any(|item| {
+        matches!(item, SelectItem::Expr { expr, .. } if crate::parser::visit::any_expr(expr, |node| matches!(node, Expr::Binary { op: crate::parser::BinaryOp::Div, .. })))
+    }) { return None; }
     if inner.no_merge
         || inner.derived.is_some()
         || inner.distinct
@@ -4112,6 +4172,7 @@ pub(super) fn try_flatten_simple_derived_select(select: &Select) -> Option<Selec
         .iter()
         .map(|item| {
             Some(OrderBy {
+                names_bound: item.names_bound,
                 expr: rewrite_expr_for_derived(&item.expr, &alias_map, derived_qualifier)?,
                 asc: item.asc,
                 nulls_first: item.nulls_first,
@@ -4866,6 +4927,7 @@ pub(super) fn describe_select_columns(
     db: &Database,
     stmt: &Select,
 ) -> Result<Vec<Column>, QueryError> {
+    planner::validate_outer_aggregate_nesting(db, stmt)?;
     if stmt.values.is_some() {
         return describe_values_select_columns(stmt);
     }
@@ -4972,7 +5034,8 @@ pub(super) fn describe_select_columns(
             return empty_result_columns(stmt, &plan);
         }
         let table = db.table(table_name)?;
-        return single_table_result_columns(stmt, &table, None);
+        let alias = stmt.from.first().and_then(|source| source.alias.as_deref());
+        return single_table_result_columns(stmt, &table, alias);
     }
     // PREPARE needs binding and wire types, but no join-order search, index
     // costing or runtime topology. Plain inner joins expose the concatenated
@@ -5037,14 +5100,10 @@ pub(super) fn describe_const_select_columns_with_db(
                 SelectItem::Expr { expr, alias } => {
                     let no_column = |_: &Expr| None;
                     let no_placeholder = |_: usize| None;
-                    let resolve_subquery = |select: &Select| {
-                        let columns = describe_select_columns(db?, select).ok()?;
-                        let column = columns.first()?;
-                        Some(crate::engine::expr_type::ExprType::from_column_type(
-                            column.column_type,
-                            &column.source,
-                        ))
-                    };
+                    let resolve_subquery =
+                        |select: &Select, outer: &crate::engine::expr_type::TypeContext<'_>| {
+                            eval::scalar_subquery_type_with_db(db?, select, outer)
+                        };
                     let mut context = crate::engine::expr_type::TypeContext::context_free(
                         &no_column,
                         &no_placeholder,
@@ -5649,14 +5708,14 @@ fn try_bridge_scalar_derived_parallel(
             .unwrap_or(true)
     }
 
-    fn scalar_aggregate(subquery: &crate::parser::SubQuery) -> bool {
+    fn scalar_aggregate(db: &Database, subquery: &crate::parser::SubQuery) -> bool {
         let Some(select) = subquery.as_select() else {
             return false;
         };
         select.group_by.is_empty()
             && select.grouping_sets.is_empty()
             && select.group_by_modifier == crate::parser::GroupByModifier::None
-            && select_projection_has_toplevel_aggregate(&select.projection)
+            && planner::select_has_aggregate(db, select)
             && !crate::engine::executor::dispatch::select_has_window_functions(select)
             && !self::explain::select_is_uncacheable(select)
             && !select.for_update
@@ -5669,22 +5728,29 @@ fn try_bridge_scalar_derived_parallel(
     if !enabled() {
         return Ok(None);
     }
-    let primary_eligible = stmt.derived.as_ref().is_some_and(scalar_aggregate);
+    let primary_eligible = stmt
+        .derived
+        .as_ref()
+        .is_some_and(|derived| scalar_aggregate(db, derived));
     let eligible_join_count = stmt
         .joins
         .iter()
-        .filter(|join| join.derived.as_ref().is_some_and(scalar_aggregate))
+        .filter(|join| {
+            join.derived
+                .as_ref()
+                .is_some_and(|derived| scalar_aggregate(db, derived))
+        })
         .count();
     let total = usize::from(primary_eligible) + eligible_join_count;
     if total < 2
         || stmt
             .derived
             .as_ref()
-            .is_some_and(|derived| !scalar_aggregate(derived))
+            .is_some_and(|derived| !scalar_aggregate(db, derived))
         || stmt.joins.iter().any(|join| {
             join.derived
                 .as_ref()
-                .is_some_and(|derived| join.lateral || !scalar_aggregate(derived))
+                .is_some_and(|derived| join.lateral || !scalar_aggregate(db, derived))
                 || join.table.name == "$nested_join_preserve"
         })
     {
@@ -6356,26 +6422,8 @@ pub(super) fn select_projection_has_aggregate(projection: &[SelectItem]) -> bool
     })
 }
 
-/// Whether a projection contains a *block-level* aggregate — i.e. one that
-/// makes THIS query block an implicit/explicit aggregation. Unlike
-/// [`select_projection_has_aggregate`], this does NOT descend into nested
-/// subqueries: `SELECT id, (SELECT MAX(id) FROM t) FROM t` has an aggregate in
-/// the scalar subquery, but that aggregate belongs to the subquery, so the
-/// outer block is NOT an aggregate query and must return one row per input.
-/// Use this for the "should I plan this block as an aggregation?" decision;
-/// using the descending variant collapses such queries to a single NULL row
-/// (issues #56 / #64).
-pub(super) fn select_projection_has_toplevel_aggregate(projection: &[SelectItem]) -> bool {
-    projection.iter().any(|item| match item {
-        SelectItem::Expr { expr, .. } => expr_has_toplevel_aggregate(expr),
-        _ => false,
-    })
-}
-
-/// Descends into nested subqueries — see the doc on
-/// [`select_projection_has_toplevel_aggregate`] for why that is WRONG for the
-/// block-aggregation decision. Kept for complex-expression detection sites that
-/// already test for subqueries separately (so the descent is a no-op there).
+/// Descends into nested query blocks for structural expression inspection.
+/// Aggregate ownership decisions use `planner::select_has_aggregate` instead.
 pub(super) fn expr_has_aggregate(expr: &Expr) -> bool {
     crate::parser::visit::any_expr_matching(
         expr,
@@ -6458,14 +6506,7 @@ fn resolve_limit_placeholder(idx: usize) -> Result<usize, QueryError> {
             "parameter is not bound",
         )
     })?;
-    match value {
-        crate::types::Value::Int(n) if n >= 0 => Ok(n as usize),
-        crate::types::Value::UInt(n) => Ok(n as usize),
-        _ => Err(error(
-            crate::error::catalog::ER_WRONG_ARGUMENTS,
-            "LIMIT/OFFSET parameter must be a non-negative integer",
-        )),
-    }
+    crate::engine::params::limit_param_usize(&value)
 }
 
 pub(super) fn limit_value_or_zero(value: Option<&LimitValue>) -> Result<usize, QueryError> {

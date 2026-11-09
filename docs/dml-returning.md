@@ -19,7 +19,7 @@ format is unchanged.
 - Explicit `ROWID`, `OLD.ROWID`, and `NEW.ROWID` return the physical address of
   the corresponding image as `BIGINT UNSIGNED`; an absent image returns NULL.
   A cross-partition update can return different OLD and NEW addresses. Wildcards
-  exclude the pseudocolumn. See [SQL ROWID](../rowid.md) for address reuse rules.
+  exclude the pseudocolumn. See [SQL ROWID](rowid.md) for address reuse rules.
 
 ## Execution and Compatibility Boundaries
 

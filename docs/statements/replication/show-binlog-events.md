@@ -19,6 +19,10 @@ Shows the binlog event catalog by file and position.
 - When the current mydb binlog manager has no enumerable events, a MySQL-compatible empty column shape is returned; events are never fabricated.
 - A single result reads at most 100,000 events and 64 MiB of raw event data; exceeding the limit returns an error, and `LIMIT` and `FROM` can be used to query in segments.
 
+## Privileges, Results, and Operational Details
+
+Requires REPLICATION SLAVE. Columns are Log_name, Pos, Event_type, Server_id, End_log_pos and Info. FROM is a byte event coordinate and values below the header are normalized to 4. Enumerating is bounded to 100,000 events/64 MiB raw data; use the next event boundary and LIMIT to continue. A compatibility empty event schema is not a successful data-history export. See [event coordinate rules](status-fields.md#binlog-and-relay-event-listings).
+
 ## Examples
 
 ```sql

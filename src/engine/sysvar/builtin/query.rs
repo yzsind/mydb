@@ -293,6 +293,13 @@ pub(crate) fn register(reg: &mut Registry) {
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
             let value = v.to_display_string();
+            if value
+                .split(',')
+                .any(|mode| mode.trim().eq_ignore_ascii_case("PAD_CHAR_TO_FULL_LENGTH"))
+            {
+                return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("PAD_CHAR_TO_FULL_LENGTH sql_mode is not supported"));
+            }
             if ctx.is_global() {
                 *global_sql_mode_cell().write().unwrap() = value;
             } else {
@@ -618,7 +625,7 @@ pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
         SysVarDef::new(
             "vector_result_format",
-            Scope::Session,
+            Scope::Both,
             DataType::Enum {
                 values: &["NATIVE", "TEXT"],
             },
@@ -626,7 +633,10 @@ pub(crate) fn register(reg: &mut Registry) {
         .with_doc("VECTOR output on the text protocol; prepared binary results remain native."),
         |ctx| {
             SysVarValue::String(
-                if ctx.session.is_some_and(|s| s.vector_result_format_text) {
+                if match (ctx.session, ctx.scope) {
+                    (Some(session), Scope::Session) => session.vector_result_format_text,
+                    _ => crate::engine::api::global_vector_result_format_text(),
+                } {
                     "TEXT"
                 } else {
                     "NATIVE"
@@ -635,8 +645,12 @@ pub(crate) fn register(reg: &mut Registry) {
             )
         },
         |ctx: &mut WriteCtx<'_>, value: SysVarValue| -> Result<(), QueryError> {
-            ctx.session.vector_result_format_text =
-                value.to_display_string().eq_ignore_ascii_case("TEXT");
+            let text = value.to_display_string().eq_ignore_ascii_case("TEXT");
+            if ctx.scope == Scope::Global {
+                crate::engine::api::set_global_vector_result_format_text(text);
+            } else {
+                ctx.session.vector_result_format_text = text;
+            }
             Ok(())
         },
     ));
@@ -918,7 +932,11 @@ pub(crate) fn register(reg: &mut Registry) {
             None => SysVarValue::String("en_US".to_string()),
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            ctx.session.sysvars.lc_messages = v.to_display_string();
+            if !v.to_display_string().eq_ignore_ascii_case("en_US") {
+                return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("mydb currently supports only lc_messages='en_US'"));
+            }
+            ctx.session.sysvars.lc_messages = "en_US".to_string();
             Ok(())
         },
     ));
@@ -1172,6 +1190,9 @@ fn optimizer_flag_default(key: &str) -> Option<&'static str> {
 /// Unknown flag names are rejected (MySQL ER 1231), so a flag that
 /// "takes" is guaranteed to exist — declared capability stays honest.
 fn merge_optimizer_switch(current: &str, delta: &str) -> Result<String, String> {
+    if delta.trim().eq_ignore_ascii_case("default") {
+        return Ok(default_optimizer_switch().to_string());
+    }
     // Parse current into ordered (key, value) pairs preserving insertion order.
     let mut entries: Vec<(String, String)> = Vec::new();
     for piece in current.split(',') {
@@ -1291,27 +1312,7 @@ fn register_settable_uint(
     _max: i64,
     doc: &'static str,
 ) {
-    // Standalone (no backing storage) variable that round-trips. Used for
-    // MySQL-compat knobs mydb honours conceptually but doesn't gate on.
-    // The default is whatever MySQL exposes; we return 0 if unset because
-    // these are advisory tuning knobs.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::OnceLock;
-    static CELLS: OnceLock<
-        std::sync::Mutex<std::collections::HashMap<&'static str, &'static AtomicU64>>,
-    > = OnceLock::new();
-    let cells = CELLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-    let cell: &'static AtomicU64 = {
-        let mut g = cells.lock().expect("cells lock");
-        if let Some(c) = g.get(name) {
-            c
-        } else {
-            let leaked: &'static AtomicU64 = Box::leak(Box::new(AtomicU64::new(0)));
-            g.insert(name, leaked);
-            leaked
-        }
-    };
-    reg.register(SysVar::settable(
+    reg.register(SysVar::session_backed(
         SysVarDef::new(
             name,
             scope,
@@ -1321,9 +1322,18 @@ fn register_settable_uint(
             },
         )
         .with_doc(doc),
-        move |_ctx| SysVarValue::UInt(cell.load(Ordering::Relaxed)),
-        move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            cell.store(v.as_u64().unwrap_or(0), Ordering::Relaxed);
+        move |ctx| {
+            SysVarValue::UInt(
+                ctx.session
+                    .and_then(|s| s.sysvars.advisory_uints.get(name).copied())
+                    .unwrap_or(0),
+            )
+        },
+        move |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
+            ctx.session
+                .sysvars
+                .advisory_uints
+                .insert(name, v.as_u64().unwrap_or(0));
             Ok(())
         },
     ));

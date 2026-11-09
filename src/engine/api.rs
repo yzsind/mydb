@@ -31,13 +31,23 @@ static GLOBAL_TRANSACTION_READ_ONLY: std::sync::atomic::AtomicBool =
 /// `@@global.sql_log_bin` — global default for sql_log_bin inherited by
 /// new sessions; default ON.
 static GLOBAL_SQL_LOG_BIN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static GLOBAL_VECTOR_RESULT_FORMAT_TEXT: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn global_vector_result_format_text() -> bool {
+    GLOBAL_VECTOR_RESULT_FORMAT_TEXT.load(Ordering::Relaxed)
+}
+
+pub(crate) fn set_global_vector_result_format_text(text: bool) {
+    GLOBAL_VECTOR_RESULT_FORMAT_TEXT.store(text, Ordering::Relaxed);
+}
 /// `@@global.innodb_lock_wait_timeout` — row-lock wait timeout (seconds)
 /// inherited by new sessions. MySQL default 50.
 static GLOBAL_INNODB_LOCK_WAIT_TIMEOUT: AtomicU64 = AtomicU64::new(50);
 /// `@@global.lock_wait_timeout` — metadata-lock (MDL) wait timeout (seconds)
-/// MySQL display default is 31536000 (1 year). Zero means no SQL override
+/// MySQL display default is 31536000 (1 year). MAX means no SQL override
 /// has been configured, so the executor retains the startup lock-wait default.
-static GLOBAL_LOCK_WAIT_TIMEOUT: AtomicU64 = AtomicU64::new(0);
+static GLOBAL_LOCK_WAIT_TIMEOUT: AtomicU64 = AtomicU64::new(u64::MAX);
 
 const EXPLAIN_FORMAT_TRADITIONAL: u8 = 0;
 const EXPLAIN_FORMAT_TREE: u8 = 1;
@@ -85,7 +95,7 @@ pub fn global_lock_wait_timeout() -> u64 {
 
 pub(crate) fn configured_global_lock_wait_timeout() -> Option<u64> {
     let seconds = GLOBAL_LOCK_WAIT_TIMEOUT.load(Ordering::Relaxed);
-    (seconds != 0).then_some(seconds)
+    (seconds != u64::MAX).then_some(seconds)
 }
 
 pub fn set_global_lock_wait_timeout(secs: u64) {
@@ -1478,6 +1488,41 @@ impl QueryResponse {
     }
 
     pub fn materialize(self) -> Result<Self, QueryError> {
+        let mut response = self.materialize_preserving_precision()?;
+        if let QueryResponse::ResultSet(result) = &mut response {
+            let decimals: Vec<_> = result
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.source.round_decimal_result
+                        && matches!(c.column_type, crate::types::ColumnType::Decimal { .. })
+                })
+                .map(|(index, c)| (index, c.column_type))
+                .collect();
+            for row in &mut result.rows {
+                for &(index, column_type) in &decimals {
+                    if let Some(value) = row.get_mut(index) {
+                        if let std::borrow::Cow::Owned(shaped) =
+                            crate::engine::expr::decimal_result_value(value, column_type)
+                        {
+                            *value = shaped;
+                        }
+                    }
+                }
+            }
+        }
+        if let QueryResponse::MultiResult(results) = response {
+            return results
+                .into_iter()
+                .map(QueryResponse::materialize)
+                .collect::<Result<Vec<_>, _>>()
+                .map(QueryResponse::MultiResult);
+        }
+        Ok(response)
+    }
+
+    pub(crate) fn materialize_preserving_precision(self) -> Result<Self, QueryError> {
         match self {
             QueryResponse::SharedResultSet(result) => Ok(QueryResponse::ResultSet(ResultSet {
                 columns: result.columns.to_vec(),
@@ -1504,7 +1549,7 @@ impl QueryResponse {
             QueryResponse::MultiResult(results) => Ok(QueryResponse::MultiResult(
                 results
                     .into_iter()
-                    .map(QueryResponse::materialize)
+                    .map(QueryResponse::materialize_preserving_precision)
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             other => Ok(other),
@@ -2377,6 +2422,9 @@ pub struct SessionContext {
     pub pending_statement_info: Option<String>,
     /// Matched rows must cross the execution-thread boundary with the OK metadata.
     pub pending_statement_matched_rows: Option<u64>,
+    /// Negotiated CLIENT_FOUND_ROWS semantics also apply to ROW_COUNT()
+    /// inside stored programs, before the final protocol response is built.
+    pub(crate) client_found_rows: bool,
     pub last_row_count: i64,
     /// ROW_COUNT in the retained diagnostics area, independent of the most
     /// recent diagnostics-reading statement's ROW_COUNT() return value.
@@ -2698,6 +2746,8 @@ pub struct SessionSysVarState {
     pub default_week_format: u64,
     /// `lc_messages` / `lc_time_names` — localisation.
     pub lc_messages: String,
+    /// Per-session values of advisory integer compatibility settings.
+    pub advisory_uints: std::collections::HashMap<&'static str, u64>,
     pub lc_time_names: String,
     /// `collation_database` is mirrored above; keep `collation_server`
     /// as a session override of the global (mostly cosmetic).
@@ -2847,6 +2897,7 @@ impl Default for SessionSysVarState {
                 crate::engine::sysvar::builtin::charset::global_block_encryption_mode(),
             default_week_format: 0,
             lc_messages: "en_US".to_string(),
+            advisory_uints: Default::default(),
             lc_time_names: "en_US".to_string(),
             collation_server: server_collation.to_string(),
             character_set_server: server_charset.to_string(),
@@ -2983,6 +3034,7 @@ pub(crate) struct SessionSqlPreparedStatement {
     /// Result metadata bound at PREPARE time. Declared domains stay fixed;
     /// untyped parameter-derived domains are resolved at EXECUTE time.
     pub(crate) result_columns: std::sync::Arc<[crate::types::Column]>,
+    pub(crate) result_catalog_epoch: u64,
     /// Routine domains are rebound by EXECUTE after routine DDL, so stale
     /// PREPARE descriptors must not replace the current execution metadata.
     pub(crate) routine_result_metadata: bool,
@@ -3290,6 +3342,7 @@ impl SessionContext {
             statement_insert_id: 0,
             pending_statement_info: None,
             pending_statement_matched_rows: None,
+            client_found_rows: false,
             seq_state: std::cell::RefCell::new(Default::default()),
             last_row_count: 0,
             diagnostics_row_count: 0,
@@ -3332,7 +3385,7 @@ impl SessionContext {
             connection_attrs: std::collections::BTreeMap::new(),
             statement_query_attributes: std::collections::BTreeMap::new(),
             resultset_metadata_full: true,
-            vector_result_format_text: false,
+            vector_result_format_text: global_vector_result_format_text(),
             temp_tables: HashMap::new(),
             temp_quota: Arc::new(crate::storage::temp_quota::SessionTempQuota::default()),
             temp_table_journal: Vec::new(),
@@ -3378,6 +3431,7 @@ impl SessionContext {
         fresh.current_user_is_system = self.current_user_is_system;
         fresh.internal_system_session = self.internal_system_session;
         fresh.connection_id = self.connection_id;
+        fresh.client_found_rows = self.client_found_rows;
         fresh.status = self.status.clone();
         fresh.ssl_cipher = self.ssl_cipher.clone();
         fresh.ssl_version = self.ssl_version.clone();

@@ -1,40 +1,6 @@
-// Crash-safe TRUNCATE TABLE: intent log + startup recovery.
-//
-// TRUNCATE TABLE must move a table's data (heap, LOB overflow, indexes) from
-// "old rows" to "empty" atomically. The old implementation appended raw WAL
-// `FileCreate`/`FileDelete` records with no barrier and no intent, so a crash
-// mid-way could leave any subset of files half-truncated (e.g. LOB deleted
-// while the heap still referenced its chains — a data-corruption window).
-//
-// This module makes TRUNCATE crash-safe with a *commit-first* protocol backed
-// by a durable intent log, mirroring `drop_table_recovery` / `partition_reorg`:
-//
-//   1. Record a `TruncateTableIntent` listing every storage id + index name to
-//      wipe, fsync it. Also snapshots the DDL SQL + binlog context so recovery
-//      can re-emit the binlog QUERY event if the crash landed after the
-//      physical wipe but before `record_ddl_autocommit_with` fired.
-//   2. Physical wipe (idempotent; recovery redoes on crash):
-//        heap-empty FIRST → LOB cleanup → index files.
-//      "heap-empty first" is the correctness ordering: emptying the heap
-//      invalidates every `LobRef`, so a crash between the LOB unlink and any
-//      heap update never leaves the heap referencing dead overflow chains.
-//   3. Reset AUTO_INCREMENT dynamic metadata, drop derived vector graphs, reset stats
-//      (and bump schema_version so plan cache re-costs against 0 rows).
-//   4. `commit_catalog_txn` — the single atomic commit point for the stats reset.
-//   5. Remove the intent.
-//
-// Recovery (`recover_truncate_tables`, run after the catalog is loaded and WAL
-// redo/undo has replayed) drives every lingering intent to a consistent state:
-//   - table absent from catalog  → drop the intent (the whole DDL was rolled
-//                                  back by a concurrent DROP TABLE).
-//   - table present              → the primary crashed mid-truncate. Re-run
-//                                  the physical wipe idempotently and emit the
-//                                  binlog event if the intent still asked for
-//                                  one. Then drop the intent.
-//
-// The intent lives at `ddl/truncate/<table_id>-<lsn>.json`; the LSN suffix
-// keeps back-to-back TRUNCATEs on the same table from clobbering each other's
-// pending intent (recovery finishes them in filename order).
+// Legacy truncate intent recovery. Current TRUNCATE uses generation/id swap
+// and the catalog transaction; it never creates these intents. Retain this
+// reader for explicit recovery fixtures, not as a model for new DDL code.
 
 const TRUNCATE_TABLE_INTENT_DIR: &str = "ddl/truncate";
 
@@ -116,15 +82,6 @@ impl Database {
         Ok(Some(path))
     }
 
-    /// Perform the physical wipe described by `intent`. Idempotent — safe to
-    /// call from both the live TRUNCATE path and startup recovery.
-    ///
-    /// **Ordering matters** (B1 fix): the empty heap must be written *before*
-    /// the LOB is unlinked. Otherwise a crash between the LOB `FileDelete`
-    /// (durable) and the heap `FileCreate` (not yet durable) leaves the heap
-    /// referencing overflow chains whose backing file was already reclaimed on
-    /// recovery — reads return decoded garbage or 1030. This mirrors the
-    /// `truncate_partitions` fix already documented in `ddl.rs`.
     /// Startup recovery for interrupted TRUNCATE TABLE statements. Must run
     /// after the catalog is loaded and WAL redo/undo has replayed so
     /// `table_by_id` reflects the committed catalog.

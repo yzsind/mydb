@@ -341,7 +341,16 @@ fn key_hash_bucket_for_table(
             let pad_space = collation
                 .and_then(|name| crate::charset::resolve_collation(name).ok())
                 .is_some_and(|info| info.pad_space);
-            mysql_hash_sort_bytes(&weights, pad_space, false, &mut nr1, &mut nr2);
+            if collation.unwrap_or(crate::charset::DEFAULT_COLLATION) == "utf8mb4_0900_ai_ci" {
+                // UCA 9 hashes complete 16-bit weights, seeded FNV-1a.
+                nr1 ^= 14_695_981_039_346_656_037;
+                for weight in weights.chunks_exact(2) {
+                    nr1 = (nr1 ^ u64::from(u16::from_be_bytes([weight[0], weight[1]])))
+                        .wrapping_mul(1_099_511_628_211);
+                }
+            } else {
+                mysql_hash_sort_bytes(&weights, pad_space, false, &mut nr1, &mut nr2);
+            }
         } else {
             // 5.1 special-cases ENUM/SET to latin1 hashing while 5.5+
             // hashes their packed integer bytes as binary. Other numeric
@@ -1477,6 +1486,13 @@ fn prune_subpartition_bucket(
         .len()
         .try_into()
         .ok()?;
+    if part
+        .partitions
+        .iter()
+        .any(|parent| parent.subpartitions.len() != leaf_count as usize)
+    {
+        return None;
+    }
     if leaf_count == 0 {
         return None;
     }

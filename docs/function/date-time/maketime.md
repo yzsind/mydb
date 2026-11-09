@@ -14,13 +14,13 @@ MAKETIME(hour, minute, second)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `hour` | Yes | date, time, datetime, or the corresponding text/numeric value | The 1st argument; the meaning is determined by the function syntax and description |
-| `minute` | Yes | date, time, datetime, or the corresponding text/numeric value | The 2nd argument; the meaning is determined by the function syntax and description |
-| `second` | Yes | date, time, datetime, or the corresponding text/numeric value | The 3rd argument; the meaning is determined by the function syntax and description |
+| `hour` | Yes | Numeric expression | Signed hours; values can exceed 23. |
+| `minute` | Yes | Numeric expression | Minute component, 0 through 59. |
+| `second` | Yes | Numeric expression | Second component, including fractional seconds; must be less than 60. |
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a signed TIME value built from hours, minutes and seconds. Hours can exceed 23; minutes must be 0..59 and seconds in [0,60). Invalid components return NULL; TIME-range overflow uses clamping/diagnostics. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: 12:34:56
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MAKEDATE`](makedate.md), [`SEC_TO_TIME`](sec_to_time.md), [`TIME_TO_SEC`](time_to_sec.md).

@@ -32,8 +32,10 @@ Result: wx4fbxxf
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
+
+- max_length must be 1..100, longitude within [-180,180] and latitude within [-90,90]. The point overload accepts SRID 0 or 4326 only; the text encodes a cell rather than preserving an exact coordinate.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_LATFROMGEOHASH`](st_latfromgeohash.md), [`ST_LONGFROMGEOHASH`](st_longfromgeohash.md), [`ST_POINTFROMGEOHASH`](st_pointfromgeohash.md).

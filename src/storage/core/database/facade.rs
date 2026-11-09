@@ -595,9 +595,9 @@ impl Database {
         undo.set_mem_cache_limit_bytes(runtime_config.undo_mem_cache_limit_bytes);
         undo.set_txn_max_bytes(runtime_config.undo_txn_max_bytes);
         undo.set_retention_guarantee(runtime_config.undo_retention_guarantee);
-        // Pin the WAL flush method before the first sync. Strict mode on
-        // macOS resolves to F_FULLFSYNC (true power-loss durability);
-        // MYDB_WAL_SYNC_METHOD / the mydb_wal_sync_method sysvar override.
+        // Pin the WAL flush method before the first sync. macOS defaults to
+        // fsync; true power-loss durability requires explicit fullfsync via
+        // MYDB_WAL_SYNC_METHOD / the mydb_wal_sync_method sysvar.
         crate::wal::configure_wal_sync_method(config.durability == DurabilityMode::Strict);
         let (log, log_state_atomics) = {
             let mut log = LogManager::open_from_replay(&data_dir, &scan)?;
@@ -1085,9 +1085,9 @@ impl Database {
         // live partition set.
         if !snapshot_read_only {
             db.recover_partition_reorgs()?;
-            // RENAME moves name-derived physical paths before publishing the DD
-            // name. Finish or reverse any interrupted move from authoritative
-            // table identity before DROP/TRUNCATE cleanup runs.
+            // Legacy physical-path rename intents are separate from current
+            // catalog-only RENAME. Reconcile any explicit recovery fixtures
+            // before DROP/TRUNCATE cleanup.
             db.recover_rename_tables()?;
             // Reconcile any DROP TABLE intent logs left by a crash between the
             // catalog commit and the physical file purge. Same ordering rationale
@@ -1095,11 +1095,8 @@ impl Database {
             // committed catalog.
             db.recover_drop_tables()?;
             db.recover_catalog_retirements()?;
-            // Reconcile any TRUNCATE TABLE intent logs left by a crash between
-            // the physical wipe and the intent removal. Runs after
-            // `recover_drop_tables` so a subsequent DROP that overtook the
-            // TRUNCATE has already made the table absent — recovery then
-            // recognises the truncate intent as stale.
+            // Current TRUNCATE uses generation/id swap. Legacy physical-wipe
+            // intents, if present, are reconciled only after DROP cleanup.
             db.recover_truncate_tables()?;
         }
         // Generic heap redo does not apply zone deltas. Load sidecars once,

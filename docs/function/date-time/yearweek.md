@@ -19,7 +19,7 @@ YEARWEEK(date [, mode])
 
 ## Return Value
 
-Returns an integer extracted or calculated from the temporal input. SQL NULL input returns NULL; invalid temporal values produce NULL and the applicable SQL-mode diagnostic.
+Returns an integer week-year times 100 plus week number. The week-year can differ from YEAR(date) near New Year. The default mode is 0; the result uses a week-year rather than returning week zero. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -35,8 +35,10 @@ Result:
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [week modes](README.md#week-modes) for the first-day/first-week rules and cross-year behavior.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DAYOFWEEK`](dayofweek.md), [`WEEKDAY`](weekday.md), [`WEEK`](week.md), [`WEEKOFYEAR`](weekofyear.md).

@@ -16,7 +16,7 @@ This function takes no arguments.
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a DATE for the statement-start instant in UTC, independent of the session display time zone.
 
 ## Examples
 
@@ -29,8 +29,8 @@ Result: Returns the current UTC DATE, for example `2026-10-22`; it can differ fr
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CURDATE`](curdate.md), [`CURTIME`](curtime.md), [`NOW`](now.md), [`SYSDATE`](sysdate.md).

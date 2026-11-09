@@ -14,11 +14,11 @@ FORMAT_TIME(picoseconds)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `picoseconds` | Yes | Integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `picoseconds` | Yes | Numeric or convertible text | Signed magnitude; output is rounded human-readable text, not an exact numeric conversion. |
 
 ## Return Value
 
-Formats a picosecond duration into human-readable text; a compatibility function for `FORMAT_PICO_TIME`. The return type is determined by the function semantics and the input type.
+Returns duration text using FORMAT_PICO_TIME formatting, with a trailing .00 fractional portion removed before the unit. SQL NULL returns NULL. It is not a SQL TIME formatter.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: `1 s`; FORMAT_TIME strips the `.00` fraction retained by FORMAT_PICO_TIM
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FORMAT_BYTES`](format_bytes.md), [`FORMAT_PICO_TIME`](format_pico_time.md).

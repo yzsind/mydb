@@ -64,11 +64,12 @@ Notes:
 
 - `BOOL` and `BOOLEAN` are aliases for signed `TINYINT(1)`, not a standalone boolean type that
   can only store `0`/`1`; the `TRUE` and `FALSE` literals evaluate to `1` and `0` respectively.
-- `SERIAL` expands to `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE` in `CREATE TABLE`.
-  `ALTER TABLE ... ADD ... SERIAL` is currently rejected explicitly, to avoid silently keeping
-  the type while dropping its implied attributes.
+- `SERIAL` expands to `BIGINT UNSIGNED NOT NULL AUTO_INCREMENT UNIQUE` in CREATE TABLE
+  and ALTER TABLE ADD COLUMN; adding it to an existing table uses the COPY path.
 - Legacy integer display widths such as `TINYINT(M)` parse and validate, but `M` changes
-  neither the range, nor arithmetic, nor the physical width.
+  neither the range, nor arithmetic, nor the physical width. ZEROFILL retains the declared
+  display width for text results and string-consuming functions. TINYINT(1) retains its
+  client-visible type and width without restricting values to 0 and 1.
 - On integer writes, fractional values are rounded following the MySQL numeric conversion
   rules. Out-of-range values raise an error in strict mode; when downgrading is permitted they
   are clamped to the target type boundary with a warning.
@@ -159,8 +160,8 @@ tier that can hold `M` bytes. `LONG` is a legacy alias for `MEDIUMTEXT`, and `LO
 legacy alias for `MEDIUMBLOB`.
 
 Large values can be externalized by the storage layer; see
-[`table-and-btree-storage-format.md`](table-and-btree-storage-format.md) for the heap/LOB
-formats. `TEXT`/`BLOB` columns in BTREE indexes usually require a prefix length, and the sum
+[Data Directory, Persistence, and Recovery](storage-format.md) for file roles
+and recovery boundaries. `TEXT`/`BLOB` columns in BTREE indexes usually require a prefix length, and the sum
 of the declared maximum bytes of ordinary column BTREE key parts must not exceed 3,072 bytes.
 
 Under non-strict DDL, a `VARCHAR` whose encoding exceeds 65,535 bytes or an overly wide
@@ -197,7 +198,9 @@ CREATE TABLE events (
 different wall-clock time when read under another session time zone; `wall_clock` always
 retains the original date-time fields. mydb intentionally allows `TIMESTAMP` to store values
 beyond 2038, but replication toward MySQL is still limited by the MySQL `TIMESTAMP2` 32-bit
-second range, and out-of-range values return an explicit error.
+second range. With both log_bin and sql_log_bin enabled, values outside that wire range
+are rejected with 1264 before row mutation. Native WAL replication preserves the full range;
+sql_log_bin=0 permits local extended-range writes that are absent from the MySQL binlog.
 
 Two-digit input to `YEAR` maps `1..69` to 2001..2069 and `70..99` to 1970..1999. Invalid
 times, zero dates, zero month/day, and dates with only valid components are governed by

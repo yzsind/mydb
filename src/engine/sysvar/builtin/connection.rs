@@ -26,10 +26,8 @@ const DEFAULT_MAX_ALLOWED_PACKET: u64 = 67_108_864;
 static MAX_ALLOWED_PACKET: AtomicU64 = AtomicU64::new(DEFAULT_MAX_ALLOWED_PACKET);
 static NET_BUFFER_LENGTH: AtomicU64 = AtomicU64::new(16_384);
 static MAX_CONNECTIONS: AtomicU64 = AtomicU64::new(1000);
-static BACK_LOG: AtomicU64 = AtomicU64::new(4096);
 static THREAD_STACK: AtomicU64 = AtomicU64::new(286_720);
 static THREAD_CACHE_SIZE: AtomicU64 = AtomicU64::new(9);
-static OPEN_FILES_LIMIT: AtomicU64 = AtomicU64::new(65535);
 static TABLE_OPEN_CACHE: AtomicU64 = AtomicU64::new(4000);
 static TABLE_DEFINITION_CACHE: AtomicU64 = AtomicU64::new(2000);
 static MAX_USER_CONNECTIONS: AtomicU64 = AtomicU64::new(0);
@@ -245,15 +243,18 @@ pub(crate) fn register(reg: &mut Registry) {
         1_000_000,
         "Maximum number of concurrent ordinary client connections; ten additional slots are reserved for CONNECTION_ADMIN accounts.",
     );
-    register_atomic_uint(
-        reg,
-        "back_log",
-        Scope::Global,
-        &BACK_LOG,
-        1,
-        65535,
-        "Listener backlog passed to the OS.",
-    );
+    reg.register(SysVar::runtime_read_only(
+        SysVarDef::new(
+            "back_log",
+            Scope::Global,
+            DataType::UInt {
+                min: 1,
+                max: u64::MAX,
+            },
+        )
+        .with_doc("Listener backlog passed to the OS at startup."),
+        || SysVarValue::UInt(crate::mysql::connection_manager::listen_backlog() as u64),
+    ));
     register_atomic_uint(
         reg,
         "thread_stack",
@@ -272,15 +273,18 @@ pub(crate) fn register(reg: &mut Registry) {
         16_384,
         "Threads kept warm between client connections.",
     );
-    register_atomic_uint(
-        reg,
-        "open_files_limit",
-        Scope::Global,
-        &OPEN_FILES_LIMIT,
-        0,
-        4_294_967_295,
-        "Maximum file descriptors the server may open.",
-    );
+    reg.register(SysVar::runtime_read_only(
+        SysVarDef::new(
+            "open_files_limit",
+            Scope::Global,
+            DataType::UInt {
+                min: 0,
+                max: u64::MAX,
+            },
+        )
+        .with_doc("Effective operating-system file descriptor limit at startup."),
+        || SysVarValue::UInt(crate::mysql::connection_manager::configure_open_files_limit().soft),
+    ));
     register_atomic_uint(
         reg,
         "table_open_cache",

@@ -419,6 +419,11 @@ SELECT VECTOR_TO_STRING(VECTOR_FROM_BINARY(X'0501', 'BINARY', 9)) AS signature;
 envelope. Preserve both separately and supply them to `VECTOR_FROM_BINARY`.
 Numeric payloads use little-endian floating-point representations or signed
 INT8 bytes as appropriate for the datatype.
+Assignment to a declared VECTOR column also accepts a valid binary literal in
+that column's native payload format. Fixed-dimension columns accept the FLOAT32
+coordinate bytes exported by the MySQL result protocol and convert them back to
+the declared datatype, allowing mysqldump restoration of all native datatypes.
+Invalid lengths, non-finite coordinates, and invalid binary padding are rejected.
 
 ## 11. SQL clients and diagnostics
 
@@ -436,8 +441,17 @@ SET SESSION vector_result_format = 'NATIVE';
 
 This changes text-protocol result formatting; stored vectors and calculations
 retain their native values. Prepared-statement binary results and cursor fetches
-always use the native wire format. New or reset sessions default to `NATIVE`.
+always use the native wire format. The initial global default is `NATIVE`;
+new or reset sessions inherit the current global setting.
 Use explicit native payload functions for datatype-preserving interchange.
+
+`SET GLOBAL vector_result_format='TEXT'` changes the default for new connections;
+existing sessions retain their setting. MySQL 8 dump clients do not recognize the
+native VECTOR wire type and can emit ambiguous string literals for its bytes,
+including zero vectors. Before using those clients, select the global TEXT default,
+run the dump, and restore the previous global value. This exports vector coordinates
+as readable arrays while retaining the declared storage datatypes in CREATE TABLE.
+The native default remains available for clients that understand VECTOR.
 
 Inspect the persisted configuration and current runtime state:
 

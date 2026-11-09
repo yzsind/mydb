@@ -14,12 +14,12 @@ RIGHT(str, len)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `len` | Yes | Integer | The 2nd argument; the length, interpreted with the function's character or byte semantics |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `len` | Yes | Integer | Requested length; text uses characters and binary input uses bytes. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns the last len characters of text, or len bytes of binary input. Nonpositive len returns an empty result; SQL NULL input returns NULL.
 
 ## Examples
 
@@ -35,8 +35,8 @@ db
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SUBSTRING`](substring.md), [`LEFT`](left.md), [`INSERT`](insert.md), [`SUBSTRING_INDEX`](substring_index.md).

@@ -2,7 +2,7 @@
 
 ## Description
 
-Converts a string using the specified charset.
+Converts bytes or text using the named character set. Write `CONVERT(expr USING charset_name)` in SQL; CONVERT_USING is the implementation/index name for that syntax.
 
 ## Syntax
 
@@ -14,12 +14,12 @@ CONVERT(expr USING charset_name)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | String or binary string | The content to convert |
-| `charset_name` | Yes | Charset name | The target charset |
+| `expr` | Yes | String, binary string or convertible scalar | Content to convert |
+| `charset_name` | Yes | Charset name | Target encoding; binary requests bytes |
 
 ## Return Value
 
-Converts a string using the specified charset. The return type is determined by the function semantics and the input types.
+Returns text in the named character set, or binary bytes for USING binary. SQL NULL input returns NULL. Binary input is decoded using the target encoding; text input is encoded into that charset. Invalid encodings and unrepresentable characters produce the applicable conversion error or replacement diagnostic.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: mydb
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CAST`](cast.md), [`COLLATE`](collate.md).

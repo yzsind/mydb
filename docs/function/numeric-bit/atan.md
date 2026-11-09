@@ -15,8 +15,8 @@ ATAN(y, x)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `x` | Yes | Numeric | Computes the arc tangent in the single-argument form |
-| `y_or_x` | No | Numeric | Participates in quadrant computation in the two-argument form |
+| `x_or_y` | Yes | Numeric | x in the one-argument form; y in the two-argument form. |
+| `x` | Only with two arguments | Numeric | Horizontal coordinate for atan2(y,x). |
 
 ## Return Value
 
@@ -32,8 +32,8 @@ Result: approximately 0.7853981633974483
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SIN`](sin.md), [`COS`](cos.md), [`TAN`](tan.md), [`COT`](cot.md).

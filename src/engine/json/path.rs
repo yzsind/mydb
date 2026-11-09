@@ -159,11 +159,25 @@ impl JsonPath {
 
     /// Navigate a concrete path without a result vector or traversal stack.
     /// Callers retain the general evaluator for wildcards, ranges and descent.
-    pub(crate) fn eval_one<'a>(&self, mut node: JsonbRef<'a>) -> Option<JsonbRef<'a>> {
+    pub(crate) fn eval_one<'a>(&self, node: JsonbRef<'a>) -> Option<JsonbRef<'a>> {
+        self.eval_one_mode::<true>(node)
+    }
+
+    pub(crate) fn eval_one_without_auto_wrap<'a>(
+        &self,
+        node: JsonbRef<'a>,
+    ) -> Option<JsonbRef<'a>> {
+        self.eval_one_mode::<false>(node)
+    }
+
+    fn eval_one_mode<'a, const AUTO_WRAP: bool>(
+        &self,
+        mut node: JsonbRef<'a>,
+    ) -> Option<JsonbRef<'a>> {
         for leg in &self.legs {
             node = match leg {
                 Leg::Member(key) => node.get(key)?,
-                Leg::Index(spec) => resolve_index(node, *spec)?,
+                Leg::Index(spec) => resolve_index::<AUTO_WRAP>(node, *spec)?,
                 _ => return None,
             };
         }
@@ -172,13 +186,30 @@ impl JsonPath {
 
     /// All nodes matching the path under `root`, in document order.
     pub(crate) fn eval<'a>(&self, root: JsonbRef<'a>) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
-        if !self.has_wildcard {
-            return self.eval_one(root).into_iter().collect();
-        }
-        self.eval_general(root)
+        self.eval_mode::<true>(root)
     }
 
-    fn eval_general<'a>(&self, root: JsonbRef<'a>) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
+    pub(crate) fn eval_without_auto_wrap<'a>(
+        &self,
+        root: JsonbRef<'a>,
+    ) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
+        self.eval_mode::<false>(root)
+    }
+
+    fn eval_mode<'a, const AUTO_WRAP: bool>(
+        &self,
+        root: JsonbRef<'a>,
+    ) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
+        if !self.has_wildcard {
+            return self.eval_one_mode::<AUTO_WRAP>(root).into_iter().collect();
+        }
+        self.eval_general::<AUTO_WRAP>(root)
+    }
+
+    fn eval_general<'a, const AUTO_WRAP: bool>(
+        &self,
+        root: JsonbRef<'a>,
+    ) -> smallvec::SmallVec<[JsonbRef<'a>; 8]> {
         let mut out = smallvec::SmallVec::new();
         let deduplicate = self.legs.iter().any(|leg| matches!(leg, Leg::Recursive));
         let mut seen = smallvec::SmallVec::<[usize; 8]>::new();
@@ -220,15 +251,17 @@ impl JsonPath {
                     stack.extend(children.into_iter().rev().map(|child| (child, next)));
                 }
                 Leg::Index(spec) => {
-                    if let Some(child) = resolve_index(node, *spec) {
+                    if let Some(child) = resolve_index::<AUTO_WRAP>(node, *spec) {
                         stack.push((child, next));
                     }
                 }
                 Leg::Range(first, last) => {
                     let len = if node.is_array() {
                         node.container_len().unwrap_or(0)
-                    } else {
+                    } else if AUTO_WRAP {
                         1
+                    } else {
+                        continue;
                     };
                     if let Some((start, end)) = resolve_range(*first, *last, len) {
                         if node.is_array() {
@@ -299,7 +332,7 @@ fn direct_children(node: JsonbRef<'_>) -> smallvec::SmallVec<[JsonbRef<'_>; 8]> 
     }
 }
 
-fn resolve_index(node: JsonbRef<'_>, spec: IdxSpec) -> Option<JsonbRef<'_>> {
+fn resolve_index<const AUTO_WRAP: bool>(node: JsonbRef<'_>, spec: IdxSpec) -> Option<JsonbRef<'_>> {
     let len = node.container_len().filter(|_| node.is_array());
     match (spec, len) {
         (IdxSpec::FromStart(idx), Some(arr_len)) => node.index(idx).filter(|_| idx < arr_len),
@@ -307,7 +340,7 @@ fn resolve_index(node: JsonbRef<'_>, spec: IdxSpec) -> Option<JsonbRef<'_>> {
             .checked_sub(1)
             .and_then(|last| last.checked_sub(off))
             .and_then(|idx| node.index(idx)),
-        (IdxSpec::FromStart(0), None) | (IdxSpec::FromLast(0), None) => Some(node),
+        (IdxSpec::FromStart(0), None) | (IdxSpec::FromLast(0), None) if AUTO_WRAP => Some(node),
         _ => None,
     }
 }
@@ -486,7 +519,7 @@ mod concrete_read_tests {
             for path in paths {
                 let path = JsonPath::parse(path).unwrap();
                 let expected = path
-                    .eval_general(root)
+                    .eval_general::<true>(root)
                     .into_iter()
                     .map(|v| v.to_owned_bytes())
                     .collect::<Vec<_>>();

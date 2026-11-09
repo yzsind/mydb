@@ -27,23 +27,42 @@ pub mod scalar;
 pub mod sublink;
 
 /// Catalog-backed name scope shared by scalar and semi/anti rewrites.
-/// Unresolved derived/CTE sources contribute names but no inferred columns.
+/// Include derived outputs so bare outer references cannot be mistaken for
+/// inner-only predicates during decorrelation.
 pub(crate) fn select_scope(
     db: &crate::storage::Database,
     select: &crate::parser::Select,
 ) -> sublink::Scope {
     let mut scope = sublink::Scope::new();
-    for table in select
+    for (table, derived) in select
         .from
         .iter()
-        .chain(select.joins.iter().map(|join| &join.table))
+        .map(|table| (table, select.derived.as_ref()))
+        .chain(
+            select
+                .joins
+                .iter()
+                .map(|join| (&join.table, join.derived.as_ref())),
+        )
     {
         let schema = db.table(&table.name);
         scope.add_table(&table.name);
         if let Some(alias) = &table.alias {
             scope.add_table(alias);
         }
-        if let Ok(schema) = schema {
+        if let Some(derived) = derived {
+            if !table.column_aliases.is_empty() {
+                for name in &table.column_aliases {
+                    scope.add_column(name);
+                }
+            } else if let Some(body) = derived.as_select() {
+                if let Ok(names) = crate::planner::query_output_column_names(db, body) {
+                    for name in names {
+                        scope.add_column(&name);
+                    }
+                }
+            }
+        } else if let Ok(schema) = schema {
             if let Some(bare) = table.name.rsplit('.').next() {
                 if bare != table.name {
                     scope.add_table(bare);
@@ -55,4 +74,48 @@ pub(crate) fn select_scope(
         }
     }
     scope
+}
+
+/// Grouping/deduplication may replace an equality comparison only when both
+/// keys inhabit the same comparison domain. Unknown expressions stay on Apply.
+pub(crate) fn column_comparison_domain(
+    db: &crate::storage::Database,
+    sources: &[crate::parser::TableRef],
+    expr: &crate::parser::Expr,
+) -> Option<crate::storage::ParamTarget> {
+    use crate::parser::Expr;
+    let (qualifier, name) = match expr {
+        Expr::Identifier(name) => (None, name),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            (Some(&parts[parts.len() - 2]), parts.last()?)
+        }
+        _ => return None,
+    };
+    let mut domains = sources.iter().filter_map(|source| {
+        if qualifier.is_some_and(|q| {
+            !source
+                .alias
+                .as_ref()
+                .unwrap_or(&source.name)
+                .eq_ignore_ascii_case(q)
+                && (source.alias.is_some()
+                    || !source
+                        .name
+                        .rsplit('.')
+                        .next()
+                        .unwrap_or(&source.name)
+                        .eq_ignore_ascii_case(q))
+        }) {
+            return None;
+        }
+        let schema = db.table(&source.name).ok()?;
+        let column = &schema.columns[schema.column_index(name).ok()?];
+        Some(crate::storage::ParamTarget::for_column_with_collation(
+            &column.data_type,
+            column.unsigned,
+            column.collation.as_deref().or(Some(&schema.collation)),
+        ))
+    });
+    let domain = domains.next()?;
+    domains.next().is_none().then_some(domain)
 }

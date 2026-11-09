@@ -31,8 +31,8 @@ Result: `POINT(116.39997482299805 39.90002632141113)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_GEOHASH`](st_geohash.md), [`ST_LATFROMGEOHASH`](st_latfromgeohash.md), [`ST_LONGFROMGEOHASH`](st_longfromgeohash.md).

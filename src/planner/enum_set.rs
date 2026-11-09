@@ -64,10 +64,46 @@ pub(crate) fn rewrite_enum_set_numeric_semantics(db: &Database, select: &mut Sel
         }
     }
     for (name, alias) in tables {
-        columns.add_table(db, name, alias);
+        let derived = select
+            .from
+            .iter()
+            .position(|table| table.name == name && table.alias.as_deref() == alias)
+            .filter(|index| *index == 0)
+            .and(select.derived.as_ref())
+            .or_else(|| {
+                select
+                    .joins
+                    .iter()
+                    .find(|join| join.table.name == name && join.table.alias.as_deref() == alias)
+                    .and_then(|join| join.derived.as_ref())
+            });
+        if let Some(derived) = derived {
+            if let Ok(fields) =
+                crate::engine::executor::select::describe_subquery_columns(db, derived)
+            {
+                let schema = crate::storage::TableSchema::synthetic_for_planning(name, &fields);
+                columns.add_schema(&schema, name, alias);
+            }
+        } else {
+            columns.add_table(db, name, alias);
+        }
     }
     if columns.is_empty() {
-        return;
+        struct InlineSource(bool);
+        impl crate::parser::visit::AstVisitor for InlineSource {
+            fn enter_expr(&mut self, expr: &Expr) {
+                self.0 |= matches!(expr, Expr::Function { name, args, .. }
+                    if name.eq_ignore_ascii_case("__COLLATED_CONST") && args.len() >= 4);
+            }
+            fn walk_expr_children(&self, _: &Expr) -> bool {
+                !self.0
+            }
+        }
+        let mut source = InlineSource(false);
+        crate::parser::visit::visit_select(&mut source, select);
+        if !source.0 {
+            return;
+        }
     }
     for item in &mut select.projection {
         if let SelectItem::Expr { expr, .. } = item {
@@ -83,7 +119,7 @@ pub(crate) fn rewrite_enum_set_numeric_semantics(db: &Database, select: &mut Sel
         rewrite_enum_set_function_numeric_args(&mut order_by.expr, &columns);
         rewrite_enum_set_comparisons(&mut order_by.expr, &columns);
         if let Some(entry) = columns.resolve(&order_by.expr) {
-            order_by.expr = ordinal_call(order_by.expr.clone(), entry);
+            order_by.expr = ordinal_call(order_by.expr.clone(), &entry);
         } else if let Some(entry) = enum_set_entry_in_string_expr(&order_by.expr, &columns) {
             if let Some(collation) = entry.collation.as_deref() {
                 order_by.expr = Expr::Function {
@@ -121,14 +157,14 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
                     if matches!(kind.to_ascii_uppercase().as_str(), "SIGNED" | "UNSIGNED" | "DECIMAL" | "FLOAT" | "DOUBLE" | "REAL"));
                 if numeric {
                     if let Some(entry) = columns.resolve(&args[0]) {
-                        args[0] = ordinal_call(args[0].clone(), entry);
+                        args[0] = ordinal_call(args[0].clone(), &entry);
                     }
                 }
             }
             if name.eq_ignore_ascii_case(crate::parser::GROUP_CONCAT_ORDERED_FN) {
                 for order in args.iter_mut().skip(1).step_by(2) {
                     if let Some(entry) = columns.resolve(order) {
-                        *order = ordinal_call(order.clone(), entry);
+                        *order = ordinal_call(order.clone(), &entry);
                     }
                 }
             }
@@ -136,7 +172,7 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
                 if let Some(entry) = columns
                     .resolve(&args[1])
                     .filter(|entry| entry.is_set)
-                    .cloned()
+                    .map(std::borrow::Cow::into_owned)
                 {
                     let binary_collation = entry
                         .collation
@@ -160,7 +196,7 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
                 "ELT" | "MAKE_SET" | "EXPORT_SET"
             ) {
                 if let Some(first) = args.first_mut() {
-                    if let Some(entry) = columns.resolve(first).cloned() {
+                    if let Some(entry) = columns.resolve(first).map(std::borrow::Cow::into_owned) {
                         *first = ordinal_call(first.clone(), &entry);
                     }
                 }
@@ -209,7 +245,7 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
             );
             for arg in args {
                 if numeric_args {
-                    if let Some(entry) = columns.resolve(arg).cloned() {
+                    if let Some(entry) = columns.resolve(arg).map(std::borrow::Cow::into_owned) {
                         *arg = ordinal_call(arg.clone(), &entry);
                     }
                 }
@@ -221,7 +257,7 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
                 op,
                 crate::parser::UnaryOp::Neg | crate::parser::UnaryOp::BitNot
             ) {
-                if let Some(entry) = columns.resolve(expr).cloned() {
+                if let Some(entry) = columns.resolve(expr).map(std::borrow::Cow::into_owned) {
                     **expr = ordinal_call((**expr).clone(), &entry);
                 }
             }
@@ -245,10 +281,10 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
                     | BinaryOp::ShiftLeft
                     | BinaryOp::ShiftRight
             ) {
-                if let Some(entry) = columns.resolve(left).cloned() {
+                if let Some(entry) = columns.resolve(left).map(std::borrow::Cow::into_owned) {
                     **left = ordinal_call((**left).clone(), &entry);
                 }
-                if let Some(entry) = columns.resolve(right).cloned() {
+                if let Some(entry) = columns.resolve(right).map(std::borrow::Cow::into_owned) {
                     **right = ordinal_call((**right).clone(), &entry);
                 }
             }
@@ -304,7 +340,7 @@ pub(super) fn rewrite_enum_set_function_numeric_args(expr: &mut Expr, columns: &
 pub(super) fn enum_set_entry_in_string_expr<'a>(
     expr: &Expr,
     columns: &'a EnumSetColumns,
-) -> Option<&'a EnumSetEntry> {
+) -> Option<std::borrow::Cow<'a, EnumSetEntry>> {
     match expr {
         Expr::Function { args, .. } if args.len() == 1 => columns.resolve(&args[0]),
         Expr::Unary { expr, .. } | Expr::GroupKeyRef { expr, .. } => columns.resolve(expr),
@@ -543,6 +579,16 @@ pub(super) fn enum_set_cmp_replacement(
     args.push(Expr::Literal(crate::parser::Literal::String(
         cmp_op_token(effective_op).to_string(),
     )));
+    {
+        args.push(Expr::Literal(crate::parser::Literal::UInt(u64::from(
+            crate::charset::collation_id(
+                entry
+                    .collation
+                    .as_deref()
+                    .unwrap_or(crate::charset::DEFAULT_COLLATION),
+            ),
+        ))));
+    }
     args.extend(
         entry
             .values

@@ -154,10 +154,11 @@ fn ensure_direct_group_capacity(
 #[inline]
 fn update_direct_state_from_column(
     state: &mut AggState,
-    func: AggregateKind,
+    spec: &AggregateSpec,
     column: &ColumnVector,
     row: usize,
 ) -> Result<(), QueryError> {
+    let func = spec.func;
     if column.is_null(row) {
         return Ok(());
     }
@@ -174,7 +175,11 @@ fn update_direct_state_from_column(
         ColumnVector::Decimal128 { data, scale, .. } => {
             state.update_decimal_parts(func, data[row], *scale)
         }
-        _ => state.update_ref(func, &column.value_at(row)),
+        _ => {
+            crate::engine::expr::with_optional_compare_collation(spec.comparison_collation, || {
+                state.update_ref(func, &column.value_at(row))
+            })
+        }
     }
 }
 
@@ -193,7 +198,7 @@ impl HashAggregateCore {
     pub(crate) fn remap_direct_input_columns(
         &mut self,
         projection: &[usize],
-    ) -> Option<(Vec<usize>, Vec<usize>)> {
+    ) -> Option<(Vec<usize>, Vec<usize>, Option<Arc<BatchSchema>>)> {
         let saved_groups = self.group_columns.clone();
         let saved_inputs = self
             .aggs
@@ -224,11 +229,37 @@ impl HashAggregateCore {
             self.aggs.clone(),
         );
         self.group_key_program = None;
-        Some((saved_groups, saved_inputs))
+        let saved_schema = self.input_schema.clone();
+        if let Some(schema) = &saved_schema {
+            let width = projection
+                .iter()
+                .copied()
+                .max()
+                .map_or(0, |index| index + 1);
+            let mut fields = vec![
+                super::super::schema::BatchField {
+                    table: String::new(),
+                    alias: None,
+                    name: String::new(),
+                    column_type: ColumnType::Blob,
+                    source: Default::default(),
+                };
+                width
+            ];
+            for (field, &index) in schema.fields().iter().zip(projection) {
+                fields[index] = field.clone();
+            }
+            self.input_schema = Some(Arc::new(BatchSchema::new(fields)));
+        }
+        Some((saved_groups, saved_inputs, saved_schema))
     }
 
-    pub(crate) fn restore_direct_input_columns(&mut self, saved: (Vec<usize>, Vec<usize>)) {
+    pub(crate) fn restore_direct_input_columns(
+        &mut self,
+        saved: (Vec<usize>, Vec<usize>, Option<Arc<BatchSchema>>),
+    ) {
         self.group_columns = saved.0;
+        self.input_schema = saved.2;
         for (spec, input) in self.aggs.iter_mut().zip(saved.1) {
             spec.input_column = input;
         }
@@ -599,7 +630,7 @@ impl HashAggregateCore {
                         for &build_row in build_rows {
                             update_direct_state_from_column(
                                 state,
-                                spec.func,
+                                spec,
                                 values,
                                 build_row as usize,
                             )?;
@@ -623,7 +654,10 @@ impl HashAggregateCore {
                         }
                     } else {
                         let value = values.value_at(probe_row);
-                        state.update_repeated_ref(spec.func, &value, repetitions)?;
+                        crate::engine::expr::with_optional_compare_collation(
+                            spec.comparison_collation,
+                            || state.update_repeated_ref(spec.func, &value, repetitions),
+                        )?;
                     }
                 }
             }
@@ -886,7 +920,7 @@ impl HashAggregateCore {
                             state.update_count_star_repeated(1);
                         }
                     } else {
-                        update_direct_state_from_column(state, spec.func, values, build_row)?;
+                        update_direct_state_from_column(state, spec, values, build_row)?;
                     }
                 }
                 Some(DirectJoinColumn::Probe(column)) => {
@@ -902,7 +936,7 @@ impl HashAggregateCore {
                                 state.update_count_star_repeated(1);
                             }
                         } else {
-                            update_direct_state_from_column(state, spec.func, values, probe_row)?;
+                            update_direct_state_from_column(state, spec, values, probe_row)?;
                         }
                     } else {
                         state.update_ref(spec.func, &Value::Null)?;
@@ -982,12 +1016,7 @@ impl HashAggregateCore {
                         state.update_count_star_repeated(count);
                     } else {
                         for &row in build_rows {
-                            update_direct_state_from_column(
-                                state,
-                                spec.func,
-                                values,
-                                row as usize,
-                            )?;
+                            update_direct_state_from_column(state, spec, values, row as usize)?;
                         }
                     }
                 }
@@ -1004,7 +1033,10 @@ impl HashAggregateCore {
                         }
                     } else {
                         let value = values.value_at(probe_row);
-                        state.update_repeated_ref(spec.func, &value, build_rows.len())?;
+                        crate::engine::expr::with_optional_compare_collation(
+                            spec.comparison_collation,
+                            || state.update_repeated_ref(spec.func, &value, build_rows.len()),
+                        )?;
                     }
                 }
             }

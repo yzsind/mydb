@@ -335,7 +335,7 @@ MyDB consolidates OLTP and OLAP in one engine — from concurrent point lookups 
 | **Automatic scan reduction** | Combines zone maps, partition pruning, predicate pushdown, projection pruning, and covering indexes. |
 | **Unified memory management** | Coordinates the buffer pool, caches, and executor budgets; sort and hash-join operators spill to disk. |
 
-Query capabilities include CTEs, recursive CTEs, subquery decorrelation, set operations, window functions, and `ROLLUP` / `CUBE` / `GROUPING SETS`. See [optimizer and operators](docs/optimizer-and-operators.md), [executor](docs/executor.md), and [MVCC and locking](docs/mvcc-and-locking.md).
+Query capabilities include CTEs, recursive CTEs, subquery decorrelation, set operations, window functions, and `ROLLUP` / `CUBE` / `GROUPING SETS`. See [optimizer and operators](docs/optimizer-and-operators.md), and [MVCC and locking](docs/mvcc-and-locking.md).
 
 ## MySQL compatible
 
@@ -379,7 +379,7 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 | [AI model calls](docs/ai.md) / [Hybrid search](docs/hybrid-search.md) | Model setup, embeddings, generation, permissions, and retrieval fusion |
 | [SQL statements](docs/statements/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
 | [Configuration guide](docs/configuration.md) / [Config template](mydb.cnf.example) | Startup options, environment variables, and runtime settings |
-| [Storage format](docs/storage-format.md) | Data directory, pages, indexes, logs, and recovery |
+| [Data directory and recovery](docs/storage-format.md) | File roles, format compatibility, durability, and crash recovery |
 
 Product documentation under `docs/` is written in English. When documentation
 and behavior disagree, the source code and tests are authoritative; the

@@ -252,6 +252,50 @@ pub(in crate::engine::executor::select) fn compile_index_lookup_plan(
         // whether all their value expressions are constant (used by WS-N4).
         let mut range_consumed_idx: Vec<usize> = Vec::new();
         let mut all_bounds_constant = true;
+        let ordered_between_domain = !matches!(
+            spec.target,
+            crate::storage::ParamTarget::String
+                | crate::storage::ParamTarget::CollatedString { .. }
+                | crate::storage::ParamTarget::CharString
+                | crate::storage::ParamTarget::CollatedCharString { .. }
+                | crate::storage::ParamTarget::Bytes
+        );
+        for c in &conjuncts {
+            if !ordered_between_domain {
+                continue;
+            }
+            if let Expr::Between {
+                expr: value,
+                low,
+                high,
+                negated: false,
+            } = c
+            {
+                let mut add = |candidate: &Expr, lower: bool| {
+                    if expr_reads_plan_table(candidate, right_table) {
+                        return;
+                    }
+                    let bound = if lower { &mut spec.low } else { &mut spec.high };
+                    if bound.is_none() {
+                        all_bounds_constant &= expr_is_constant(candidate);
+                        *bound = Some((candidate.clone(), true));
+                    }
+                };
+                if matches_part(value) {
+                    add(low, true);
+                    add(high, false);
+                } else if !expr_reads_plan_table(value, right_table) {
+                    if matches_part(low) {
+                        add(value, false);
+                    }
+                    if matches_part(high) {
+                        add(value, true);
+                    }
+                }
+                // BETWEEN is retained as a residual, including its NULL and
+                // three-operand type-resolution semantics.
+            }
+        }
         for (i, c) in conjuncts.iter().enumerate() {
             if consumed[i] {
                 continue;
@@ -317,7 +361,7 @@ pub(in crate::engine::executor::select) fn compile_index_lookup_plan(
             // admits the batched path. Cost: losing the range's "stop the scan at
             // the upper bound" fast path on the index, in exchange for multi-key
             // lookup amortization + outer parallelism + bloom + narrow-column filter pass (a net win for typical Q3/Q19 shapes). Fall back via `MYDB_INLJ_BATCH_RANGE_PROMOTE=off`.
-            if all_bounds_constant && inlj_batch_range_promote_enabled() {
+            if all_bounds_constant && !eq_exprs.is_empty() && inlj_batch_range_promote_enabled() {
                 for idx in &range_consumed_idx {
                     consumed[*idx] = false;
                 }
@@ -1483,11 +1527,14 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
                 }
                 continue;
             }
-            for (key, _row_id) in entries.iter() {
-                let right_row = covering_projector
+            for (key, row_id) in entries.iter() {
+                let Some(right_row) = covering_projector
                     .as_ref()
                     .expect("covering path should have an index-entry projector")
-                    .project(key);
+                    .project_visible(db, txn, *row_id, key, None)?
+                else {
+                    continue;
+                };
                 if right_only_residual
                     .as_ref()
                     .map(|residual| {
@@ -2170,8 +2217,10 @@ pub(super) fn execute_batched_inlj_covering(
     for (left_idx, left_row) in left_rows.iter().enumerate() {
         let mut matched = false;
         for &entry_idx in &by_left[left_idx] {
-            let (key, _row_id) = &entries[entry_idx];
-            let right_row = projector.project(key);
+            let (key, row_id) = &entries[entry_idx];
+            let Some(right_row) = projector.project_visible(db, txn, *row_id, key, None)? else {
+                continue;
+            };
             if right_only_residual
                 .map(|residual| eval_plan_bool(residual, &right_row))
                 .transpose()?

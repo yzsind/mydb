@@ -60,7 +60,10 @@ impl LoginAccount {
         if account.account_locked {
             return Err(crate::mysql::errors::error(
                 crate::mysql::errors::ER_ACCOUNT_HAS_BEEN_LOCKED,
-                format!("Access denied for user '{}': account is locked", username),
+                format!(
+                    "Access denied for user '{}'@'{}'. Account is locked.",
+                    username, request.host,
+                ),
             ));
         }
         if let Some(until) = auth::active_login_lock(account, current_time_ms()) {

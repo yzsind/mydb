@@ -37,6 +37,8 @@ NULL	1
 
 - GROUPING tests a super-aggregate marker, not whether the displayed value is NULL. Its arguments must correspond to grouping expressions.
 
+- With multiple arguments, the rightmost argument contributes bit 0. GROUPING distinguishes super-aggregate NULL markers from ordinary data NULL. Each argument must match a grouping expression.
+
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAYAGG`](json_arrayagg.md), [`JSON_OBJECTAGG`](json_objectagg.md), [`GROUP_CONCAT`](group_concat.md), [`ST_COLLECT`](st_collect.md).

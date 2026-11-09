@@ -19,6 +19,12 @@ Changes the password of the current account or a specified account, supporting o
 - RETAIN CURRENT PASSWORD keeps the old hash as a secondary credential, enabling uninterrupted rotation.
 - TO RANDOM generates a credential securely and returns it via the result; insufficient privileges or an unmet policy returns a clear error. CREATE/ALTER USER use the different spelling IDENTIFIED BY RANDOM PASSWORD.
 
+## Privileges and Result Details
+
+Self-service changes need no CREATE USER grant, but changing another account requires it. Retaining a secondary password checks APPLICATION_PASSWORD_ADMIN, and protected system accounts require SYSTEM_USER authority. Password policy/current-password requirements still apply. SET PASSWORD is an implicit-commit account operation.
+
+TO RANDOM returns user, host, generated password and auth_factor as described in [CREATE USER](create-user.md#privileges-and-result-details). It does not reveal an old password. Existing API keys are not deleted by password rotation. Use ALTER USER ... DISCARD OLD PASSWORD to finish dual-password rotation.
+
 ## Examples
 
 ```sql

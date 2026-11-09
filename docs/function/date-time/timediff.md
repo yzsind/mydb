@@ -14,12 +14,12 @@ TIMEDIFF(expr1, expr2)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr1` | Yes | Any SQL expression | The 1st argument; the meaning is determined by the function syntax and description |
-| `expr2` | Yes | Any SQL expression | The 2nd argument; the meaning is determined by the function syntax and description |
+| `expr1` | Yes | TIME/DATETIME or matching text | First time/datetime operand. |
+| `expr2` | Yes | Compatible TIME/DATETIME or matching text | Second operand; result is expr1 minus expr2. |
 
 ## Return Value
 
-Returns a TIME value, preserving the applicable fractional precision. SQL NULL input returns NULL; invalid or out-of-range times follow the temporal-conversion rules.
+Returns a signed TIME difference expr1 minus expr2. Both operands must be interpretable in a compatible time or datetime domain. Overflow is limited by the TIME range and records the applicable warning. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -35,8 +35,8 @@ Result:
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DATE_ADD`](date_add.md), [`DATE_SUB`](date_sub.md), [`ADDTIME`](addtime.md), [`SUBTIME`](subtime.md).

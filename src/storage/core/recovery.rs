@@ -1313,7 +1313,7 @@ fn apply_redo_record_inner(
             state.skipped_index_redo_paths.remove(path);
             invalidate_recovery_page_io(data_dir, path);
             if let Err(err) = fs::remove_file(data_dir.join(path)) {
-                if path.ends_with(".zm") && err.kind() != std::io::ErrorKind::NotFound {
+                if err.kind() != std::io::ErrorKind::NotFound {
                     return Err(io_err(err));
                 }
             }
@@ -3070,6 +3070,19 @@ mod zone_map_physical_redo_tests {
 #[cfg(test)]
 mod round2_recovery_tests {
     use super::*;
+
+    #[test]
+    fn txn_audit_file_delete_redo_reports_non_zone_map_unlink_failure() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir=tempfile::tempdir_in("/tmp/mydb").unwrap();
+        fs::create_dir(dir.path().join("blocked.heap")).unwrap();
+        let mut log=LogManager::open(dir.path()).unwrap();
+        log.append(0,WalPayload::FileDelete{path:"blocked.heap".into(),before:vec![]}).unwrap();
+        log.flush().unwrap();
+        drop(log);
+        let error=recover_from_wal(dir.path(),DurabilityMode::Strict).err().unwrap();
+        assert!(error.message().contains("blocked.heap"));
+    }
 
     #[test]
     fn round2_interleaved_loser_page_images_undo_in_wal_order() {

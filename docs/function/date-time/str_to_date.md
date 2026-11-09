@@ -14,12 +14,12 @@ STR_TO_DATE(str, format)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `format` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `format` | Yes | String | Format string; see the category format-specifier table. |
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns DATE, TIME or DATETIME according to the date/time fields present in format. Text that cannot be parsed returns NULL with the applicable temporal diagnostic. Incomplete/zero fields and strict write contexts obey SQL mode. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -31,8 +31,10 @@ Result: 2026-08-30
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [format specifiers](README.md#format-specifiers) and [predefined formats](README.md#predefined-formats). A SQL NULL format argument returns NULL.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DATE_FORMAT`](date_format.md), [`TIME_FORMAT`](time_format.md), [`GET_FORMAT`](get_format.md).

@@ -198,6 +198,13 @@ necessary fallbacks, and pre-commit fsync overhead. `strict` mode provides the
 full commit crash-recovery guarantee; `relaxed`/`memory` still inherit their
 respective weaker durability semantics.
 
+On macOS, the default WAL sync method is `fsync`, including in `strict` mode.
+It protects against process crashes but does not force the device write cache
+to stable media on power loss. Set `MYDB_WAL_SYNC_METHOD=fullfsync` (or
+`SET GLOBAL mydb_wal_sync_method='fullfsync'`) when that stronger guarantee is
+required. This stronger flush can increase commit latency substantially. Linux
+defaults to `fdatasync`; storage hardware must honor the selected flush method.
+
 External XA coordinators that require durable PREPARE acknowledgements must use
 `durability=strict`. In `relaxed` mode, XA PREPARE drains WAL to the OS page cache
 but does not require fsync; a power loss can erase an acknowledged prepare.
@@ -616,7 +623,7 @@ placed after the leading keyword. Page range scans, sort double buffering, page
 task queues, encoding buffers, and the 4 MiB per-worker stacks are all charged to
 `StorageScratch` by capacity; on insufficient budget the parallelism is lowered
 or spills, and 1037/HY001 is returned if even the minimum work area cannot be
-obtained. See [`hints.md`](hints.md#63-b-tree-index-creation) for details.
+obtained. See [`hints.md`](hints.md#63-b-tree-and-fulltext-index-creation) for details.
 Historical validation for `ALTER TABLE ... ADD FOREIGN KEY` also uses these two
 environment variables, requesting 2 workers by default. The covering-index path
 shards and merges by foreign key prefix; under concurrent writes, snapshot
@@ -812,8 +819,8 @@ Zone Map shared cache pages, rebuild scratch, and background workers are likewis
 governed by the unified memory governor; when metadata is untrusted or corrupted,
 the budget is short, or a predicate cannot prune safely, the executor keeps the
 original row predicate and falls back to an ordinary scan without sacrificing
-result correctness. See [`storage-format.md`](storage-format.md) for the
-persistent format and recovery procedures.
+result correctness. See [`storage-format.md`](storage-format.md) for persistent
+file roles and recovery boundaries.
 
 ### Zone Map Maintenance and Diagnostics Supplement
 
@@ -1288,6 +1295,16 @@ session values. `SET SESSION ... = DEFAULT` takes the current global value, and
 `SET GLOBAL ... = DEFAULT` restores the built-in default. The SESSION values of
 `max_allowed_packet`, `net_buffer_length`, and `max_user_connections` are
 read-only, preventing session writes from polluting the globals.
+
+Incoming packet admission consults the live GLOBAL `max_allowed_packet`, even
+for existing connections; `@@SESSION.max_allowed_packet` remains its inherited
+snapshot. This lets an operator change the inbound resource ceiling without
+reconnecting every client.
+
+`back_log` and `open_files_limit` are read-only startup settings and report the
+effective listener backlog and operating-system file limit. `lc_messages`
+currently accepts only `en_US`; other message locales return an unsupported
+feature error rather than changing only the reported value.
 
 An unknown system variable returns 1193 by default. When compatibility with
 lenient clients is genuinely needed, `MYDB_SYSVAR_UNKNOWN=warn` can be set

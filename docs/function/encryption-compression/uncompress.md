@@ -14,11 +14,11 @@ UNCOMPRESS(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | String or binary string; convertible scalar where accepted | Input bytes/text; numeric scalars are converted to their display bytes. |
 
 ## Return Value
 
-Uncompresses data produced by `COMPRESS`. The return type is determined by the function semantics and the input types.
+Returns the original binary bytes for a valid COMPRESS payload, empty bytes for empty input, or NULL for SQL NULL/corrupt/oversized payloads. Corrupt streams produce warning 1259; an advertised size above 64 MiB produces the decompression-size diagnostic.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: mydb
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`COMPRESS`](compress.md), [`UNCOMPRESSED_LENGTH`](uncompressed_length.md).

@@ -30,8 +30,8 @@ For example: `8.0.46-mydb-0.2.0-20260928`. `@@version` and the protocol handshak
 ## Notes
 
 - The version string of a given build artifact stays constant; it does not change with server startup or query date.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`VERSION_MAJOR`](version_major.md), [`VERSION_MINOR`](version_minor.md), [`VERSION_PATCH`](version_patch.md), [`ICU_VERSION`](icu_version.md).

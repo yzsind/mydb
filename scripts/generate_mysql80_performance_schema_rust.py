@@ -15,7 +15,7 @@ from _mysql80_metadata import system_column, render_column_metadata_lookup
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
-FIXTURE = ROOT / "docs/fixtures/mysql80-performance-schema-8.0.46.json"
+FIXTURE = ROOT / "tests/fixtures/mysql80/mysql80-performance-schema-8.0.46.json"
 OUTPUT = ROOT / "src/engine/performance_schema_mysql80_generated.rs"
 
 

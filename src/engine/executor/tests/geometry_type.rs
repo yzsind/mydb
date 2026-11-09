@@ -369,7 +369,7 @@ fn constructors_and_format() {
     // ST_AsGeoJSON yields a JSON document.
     assert_eq!(
         scalar(&engine, "ST_AsGeoJSON(ST_GeomFromText('POINT(1 2)'))"),
-        r#"{"type": "Point", "coordinates": [1, 2]}"#
+        r#"{"type": "Point", "coordinates": [1.0, 2.0]}"#
     );
     // Typed constructor enforces the geometry type.
     assert!(engine

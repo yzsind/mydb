@@ -1304,7 +1304,7 @@ mod tests {
     #[test]
     fn mysql8046_fixture_locks_scope_and_pfs_command_policy() {
         let fixture: serde_json::Value = serde_json::from_str(include_str!(
-            "../../docs/fixtures/mysql80-show-status-8.0.46.json"
+            "../../tests/fixtures/mysql80/mysql80-show-status-8.0.46.json"
         ))
         .unwrap();
         assert_eq!(fixture["oracle_mysql_version"], "8.0.46");

@@ -1020,7 +1020,9 @@ impl Database {
     }
 
     #[cfg(test)]
-    pub(crate) fn install_online_index_long_lived_wait_test_hook(&self) -> Arc<DdlBackfillTestHook> {
+    pub(crate) fn install_online_index_long_lived_wait_test_hook(
+        &self,
+    ) -> Arc<DdlBackfillTestHook> {
         let hook = Arc::new(DdlBackfillTestHook::new());
         *self.online_index_long_lived_wait_test_hook.lock().unwrap() = Some(hook.clone());
         hook
@@ -1037,16 +1039,25 @@ impl Database {
         let _timer = OnlineIndexTimer(&ONLINE_INDEX_BARRIER_WAIT_US, Instant::now());
         let started = Instant::now();
         let key = MdlObjectKey::table(&table.database, &table.name);
+        let mut attempted = false;
         loop {
             if !cleanup {
                 self.ensure_operational()?;
                 crate::engine::cancel::check_cancelled()?;
                 check()?;
             }
-            if !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout() {
-                return Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
-                    "online index build timed out waiting for metadata lock"));
+            if attempted
+                && !cleanup
+                && started.elapsed() >= crate::storage::txn::metadata_wait_timeout()
+            {
+                return Err(error(
+                    crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                    "online index build timed out waiting for metadata lock",
+                ));
             }
+            // A zero timeout forbids waiting, but still permits an
+            // uncontended first acquisition.
+            attempted = true;
             match self.acquire_mdl(
                 owner,
                 Some(owner),
@@ -1059,7 +1070,14 @@ impl Database {
             ) {
                 Ok(()) => return Ok(()),
                 Err(err) if is_lock_wait_pending_error(&err) => {
-                    if self.mdl.has_long_lived_blocker(&key,owner,mode) {
+                    if !cleanup && started.elapsed() >= crate::storage::txn::metadata_wait_timeout()
+                    {
+                        return Err(error(
+                            crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                            "online index build timed out waiting for metadata lock",
+                        ));
+                    }
+                    if self.mdl.has_long_lived_blocker(&key, owner, mode) {
                         // Publish the initial wait, then withdraw the ticket
                         // for the holder's entire remaining lifetime. Repeated
                         // short fence/yield cycles would starve unrelated DML.
@@ -1068,18 +1086,26 @@ impl Database {
                         self.notify_non_row_lock_waiters();
                         #[cfg(test)]
                         {
-                            let hook = self.online_index_long_lived_wait_test_hook.lock().unwrap().take();
+                            let hook = self
+                                .online_index_long_lived_wait_test_hook
+                                .lock()
+                                .unwrap()
+                                .take();
                             if let Some(hook) = hook {
                                 hook.pause();
                             }
                         }
-                        while self.mdl.has_long_lived_blocker(&key,owner,mode) {
+                        while self.mdl.has_long_lived_blocker(&key, owner, mode) {
                             if !cleanup {
                                 self.ensure_operational()?;
                                 crate::engine::cancel::check_cancelled()?;
                                 check()?;
-                                if started.elapsed()>=crate::storage::txn::metadata_wait_timeout() {
-                                    return Err(error(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,"online index build timed out waiting for metadata lock"));
+                                if started.elapsed() >= crate::storage::txn::metadata_wait_timeout()
+                                {
+                                    return Err(error(
+                                        crate::error::catalog::ER_LOCK_WAIT_TIMEOUT,
+                                        "online index build timed out waiting for metadata lock",
+                                    ));
                                 }
                             }
                             self.wait_for_ddl_signal(Duration::from_millis(10))?;
@@ -1376,17 +1402,26 @@ impl Database {
             ));
         }
         if target.duplicate_key_groups != 0 {
-            return Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!(
-                    "duplicate entry for key '{}'",
-                    if target.index.primary {
-                        "PRIMARY"
-                    } else {
-                        &target.index.name
+            // Recover the offending value only on the error path; normal
+            // online builds retain their bounded streaming validation state.
+            let file = target.file.as_ref().expect("validated index file");
+            let mut resume = None;
+            let mut previous = None;
+            loop {
+                let entries = file.range_entries_chunk(None, None, resume.as_ref(), 4096)?;
+                if entries.is_empty() {
+                    break;
+                }
+                for (key, _) in &entries {
+                    if !key.contains_null() && previous.as_ref() == Some(key) {
+                        return Err(duplicate_entry_error_for_index(&target.index.name, key));
                     }
-                ),
-            ));
+                    previous = Some(key.clone());
+                }
+                resume = entries.last().cloned();
+            }
+            return Err(crate::error::catalog::ER_GET_ERRNO
+                .error("online index duplicate count disagrees with physical entries"));
         }
         Ok(())
     }

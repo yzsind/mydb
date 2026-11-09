@@ -4476,21 +4476,20 @@ fn hint_force_index_prefers_index_over_seqscan() {
 }
 
 #[test]
-fn hint_invalid_index_name_does_not_error() {
-    let dir = tempfile::tempdir().unwrap();
+fn hint_invalid_index_name_returns_clear_error() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
-
     engine
         .execute("CREATE TABLE t (id INT PRIMARY KEY, a INT)")
         .unwrap();
-    engine.execute("INSERT INTO t VALUES (1, 10)").unwrap();
-
-    // USE INDEX with a nonexistent index should not error, just fall back
-    let result = engine.execute("SELECT * FROM t USE INDEX (nonexistent) WHERE id = 1");
-    assert!(
-        result.is_ok(),
-        "invalid hint index name should not cause error"
-    );
+    for hint in ["USE", "FORCE", "IGNORE"] {
+        let err = engine
+            .execute(&format!(
+                "SELECT * FROM t {hint} INDEX (nonexistent) WHERE id=1"
+            ))
+            .unwrap_err();
+        assert_eq!(err.code(), 1176);
+    }
 }
 
 #[test]

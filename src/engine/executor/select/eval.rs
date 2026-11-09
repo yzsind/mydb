@@ -77,9 +77,91 @@ fn current_subquery_frame() -> Option<Rc<SubqueryFrame>> {
 
 pub(crate) fn current_scalar_subquery_type(
     select: &Select,
+    outer: &crate::engine::expr_type::TypeContext<'_>,
 ) -> Option<crate::engine::expr_type::ExprType> {
-    let frame = current_subquery_frame()?;
-    let columns = super::describe_select_columns(&frame.db, select).ok()?;
+    if let Some(frame) = current_subquery_frame() {
+        return scalar_subquery_type_with_db(&frame.db, select, outer);
+    }
+    // PREPARE and CREATE VIEW bind metadata without an execution frame.
+    // Their statement scope still provides the authorized database handle;
+    // describing a subquery never evaluates it or opens its input rows.
+    let db = crate::engine::expr::current_expression_database()?;
+    scalar_subquery_type_with_db(&db, select, outer)
+}
+
+pub(super) fn scalar_subquery_type_with_db(
+    db: &Database,
+    select: &Select,
+    outer: &crate::engine::expr_type::TypeContext<'_>,
+) -> Option<crate::engine::expr_type::ExprType> {
+    if let [SelectItem::Expr { expr, .. }] = select.projection.as_slice() {
+        // Independent blocks retain their ordinary metadata path. For a
+        // correlated projection, infer with local columns first, then the
+        // enclosing descriptor resolver. An unresolved local name must not
+        // erase an exact outer DECIMAL or its string collation.
+        let mut potential_outer = false;
+        crate::parser::visit::inspect_value_expr(
+            expr,
+            |node| {
+                potential_outer |= (outer.resolve_column)(node).is_some();
+                !matches!(node, Expr::Subquery(_) | Expr::Exists { .. })
+            },
+            |_| {},
+        );
+        if potential_outer || crate::parser::visit::value_expr_contains_subquery(expr) {
+            let (local_names, local_tables) = inner_select_scope(db, select);
+            let mut source = select.clone();
+            source.projection = vec![SelectItem::Wildcard];
+            source.selection = None;
+            source.group_by.clear();
+            source.grouping_sets.clear();
+            source.having = None;
+            source.order_by.clear();
+            source.limit = None;
+            source.offset = None;
+            let columns = if source.from.is_empty() && source.table.is_none() {
+                Vec::new()
+            } else {
+                super::describe_select_columns(db, &source).ok()?
+            };
+            let resolve = |node: &Expr| {
+                let (qualifier, name) = match node {
+                    Expr::Identifier(name) => (None, name.as_str()),
+                    Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                        Some(parts[parts.len() - 2].as_str()),
+                        parts.last()?.as_str(),
+                    ),
+                    // The enclosing row may expose a finalized aggregate
+                    // descriptor even after dropping its argument fields.
+                    Expr::Function { name, .. } if planner::is_aggregate_function(name) => {
+                        return aggregate_arguments_are_outer(node, &local_names, &local_tables)
+                            .then(|| (outer.resolve_column)(node))
+                            .flatten();
+                    }
+                    _ => return None,
+                };
+                let mut local = columns.iter().filter(|column| {
+                    column.name.eq_ignore_ascii_case(name)
+                        && qualifier.is_none_or(|q| column.source.table.eq_ignore_ascii_case(q))
+                });
+                if let Some(column) = local.next() {
+                    return local.next().is_none().then(|| {
+                        crate::engine::expr_type::ExprType::from_column_type(
+                            column.column_type,
+                            &column.source,
+                        )
+                    });
+                }
+                (outer.resolve_column)(node)
+            };
+            let context = crate::engine::expr_type::TypeContext {
+                resolve_column: &resolve,
+                ..*outer
+            };
+            return Some(crate::engine::expr_type::infer_expr_type(expr, &context));
+        }
+    }
+    let columns = super::describe_select_columns(db, select).ok()?;
     let column = columns.first()?;
     Some(crate::engine::expr_type::ExprType::from_column_type(
         column.column_type,
@@ -197,6 +279,17 @@ pub(super) fn input_schema_for_plan_row(row: &PlanRow) -> crate::engine::expr_pr
     }
     let mut schema =
         crate::engine::expr_program::InputSchema::new_with_bound_types(columns, bound_types);
+    schema.mark_numeric_display_columns(row.fields.iter().enumerate().filter_map(
+        |(index, field)| {
+            (field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0).then_some((
+                index,
+                crate::mysql::protocol::numeric_display_width(
+                    field.column_type,
+                    field.source.length,
+                ),
+            ))
+        },
+    ));
     schema.mark_silent_string_columns(row.fields.iter().enumerate().filter_map(
         |(index, field)| {
             plan_expr_uses_silent_implicit_string_conversion(
@@ -712,9 +805,20 @@ fn eval_plan_in_list(
     let collation_id = plan_in_list_collation(expr, list, row);
     crate::engine::expr::with_constant_in_warning_dedup(list, || {
         crate::engine::expr::with_compare_collation(collation_id, || {
-            crate::engine::expr::eval_in_list(value, negated, || {
-                iter.next().map(&mut eval).transpose()
-            })
+            crate::engine::expr::eval_in_list_compared(
+                value,
+                negated,
+                || iter.next().map(&mut eval).transpose(),
+                |value, item, index| {
+                    crate::engine::expr::with_numeric_comparison_context(
+                        expr,
+                        &list[index],
+                        value,
+                        item,
+                        || crate::engine::expr::compare_nullable_values(value, item),
+                    )
+                },
+            )
         })
     })
 }
@@ -746,7 +850,18 @@ fn eval_plan_between(
     let high_value = eval(high)?;
     let collation = early_collation.unwrap_or_else(|| plan_between_collation(expr, low, high, row));
     crate::engine::expr::with_compare_collation(collation, || {
-        crate::engine::expr::eval_between(&value, &low_value, &high_value, negated)
+        crate::engine::expr::eval_between_with_provenance(
+            &value,
+            &low_value,
+            &high_value,
+            negated,
+            [
+                crate::engine::expr::ComparisonProvenance::from_exprs(expr, low)
+                    .with_temporal_constant_context(expr, low),
+                crate::engine::expr::ComparisonProvenance::from_exprs(expr, high)
+                    .with_temporal_constant_context(expr, high),
+            ],
+        )
     })
 }
 
@@ -758,8 +873,12 @@ fn eval_plan_like(
     row: &PlanRow,
     mut eval: impl FnMut(&Expr) -> Result<Value, QueryError>,
 ) -> Result<Value, QueryError> {
-    let value = eval(expr)?;
-    let pattern_value = eval(pattern)?;
+    let value = crate::engine::expr::string_context_value(eval(expr)?, || {
+        super::plan::plan_bound_expr_type(expr, row)
+    })?;
+    let pattern_value = crate::engine::expr::string_context_value(eval(pattern)?, || {
+        super::plan::plan_bound_expr_type(pattern, row)
+    })?;
     let info = plan_operand_collation(&[expr, pattern], row, "like")
         .and_then(crate::charset::resolve_collation_id);
     Ok(crate::engine::expr::eval_like_values_with_collation(
@@ -813,7 +932,13 @@ fn eval_plan_structural_expr(
             conditions,
             results,
             else_result,
-        } => eval_case(operand, conditions, results, else_result, eval),
+        } => {
+            let value = eval_case(operand, conditions, results, else_result, eval)?;
+            crate::engine::expr::coerce_result_to_expr_type(
+                value,
+                super::plan::plan_bound_expr_type(expr, row),
+            )
+        }
         _ => unreachable!("structural expression dispatch"),
     }
 }
@@ -860,6 +985,9 @@ fn eval_plan_scalar_function(
     if name.eq_ignore_ascii_case("CAST") {
         if let Some(descriptor) = typed_json_cast_source(args, row) {
             let value = eval(&args[0])?;
+            if matches!(value, Value::Null) {
+                return Ok(Value::Null);
+            }
             return Ok(Value::Json(crate::engine::json::scalar_from_typed_value(
                 &value,
                 &descriptor,
@@ -898,20 +1026,37 @@ fn eval_plan_scalar_function(
     let mut evaluate = || {
         eval_function(name, args, |arg| {
             let value = eval(arg)?;
+            let value = crate::engine::expr::function_argument_with_json_source(
+                name,
+                args,
+                arg,
+                value,
+                |arg| super::plan::plan_bound_expr_type(arg, row),
+            );
+            let value = crate::engine::expr::function_argument_with_temporal_string(
+                name,
+                args,
+                arg,
+                value,
+                |arg| super::plan::plan_bound_expr_type(arg, row),
+            )?;
             function_arg_with_source_octets(name, arg, row, value)
         })
     };
-    if matches!(
+    let value = if matches!(
         name.to_ascii_uppercase().as_str(),
         "ABS" | "CEIL" | "CEILING" | "FLOOR" | "ROUND" | "TRUNCATE"
     ) && args
         .iter()
         .any(|arg| plan_expr_uses_silent_implicit_string_conversion(arg, row))
     {
-        crate::engine::expr::with_suppressed_expression_warnings(evaluate)
+        crate::engine::expr::with_suppressed_expression_warnings(evaluate)?
     } else {
-        evaluate()
-    }
+        evaluate()?
+    };
+    crate::engine::expr::coerce_null_selection_result(name, args, value, |arg| {
+        super::plan::plan_bound_expr_type(arg, row)
+    })
 }
 
 #[inline(never)]
@@ -1155,6 +1300,33 @@ fn function_arg_with_source_octets(
     row: &PlanRow,
     value: Value,
 ) -> Result<Value, QueryError> {
+    let value = if crate::engine::expr::function_uses_numeric_display(function_name) {
+        let field = match expr {
+            Expr::Identifier(name) => resolve_plan_field(row, None, name).ok(),
+            Expr::CompoundIdentifier(parts) => parts.last().and_then(|name| {
+                resolve_plan_field(
+                    row,
+                    (parts.len() >= 2).then(|| parts[parts.len() - 2].as_str()),
+                    name,
+                )
+                .ok()
+            }),
+            _ => None,
+        };
+        if let Some(field) =
+            field.filter(|field| field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0)
+        {
+            let width = crate::mysql::protocol::numeric_display_width(
+                field.column_type,
+                field.source.length,
+            );
+            crate::engine::expr::format_zerofill_value(value, width)
+        } else {
+            value
+        }
+    } else {
+        value
+    };
     if crate::engine::expr::is_charset_octet_function(function_name) {
         if let Some(collation) = plan_expr_collation(expr, row) {
             return crate::engine::expr::value_in_charset_octets(value, collation.charset);
@@ -1505,9 +1677,17 @@ struct CachedSubqueryPlan {
 #[derive(Clone)]
 struct OuterBindingSpec {
     param_index: usize,
-    qualifier: Option<String>,
-    column: String,
+    source: OuterBindingSource,
     remainder: Option<i64>,
+}
+
+#[derive(Clone)]
+enum OuterBindingSource {
+    Column {
+        qualifier: Option<String>,
+        column: String,
+    },
+    Aggregate(u64),
 }
 
 /// Result of preparing a subquery call. `Cached` means we have a
@@ -1842,7 +2022,14 @@ fn eval_plan_expr_with_db_inner(
             } else {
                 eval_plan_expr_with_db(db, txn, left, row, eval_ctx)?
             };
-            match right {
+            let subquery_collation = match right {
+                QuantifiedComparisonRight::Subquery(subquery) => {
+                    let right_expr = Expr::Subquery(subquery.clone());
+                    plan_operand_collation(&[left, &right_expr], row, "comparison")
+                }
+                _ => plan_expr_collation(left, row).map(|info| info.id),
+            };
+            crate::engine::expr::with_compare_collation(subquery_collation, || match right {
                 QuantifiedComparisonRight::Subquery(subquery) => {
                     let sub_ptr = subquery.as_ref() as *const Select as usize;
                     if eval_ctx.uncorrelated_subqueries.contains(&sub_ptr) {
@@ -1933,7 +2120,7 @@ fn eval_plan_expr_with_db_inner(
                         },
                     )
                 }
-            }
+            })
         }
         Expr::Subquery(subquery) => {
             let sub_ptr = subquery.as_ref() as *const Select as usize;
@@ -2105,6 +2292,12 @@ fn eval_plan_expr_with_db_inner(
                     &mut right_value,
                 );
             } else if crate::parser::boolean::is_comparison!(*op) {
+                crate::engine::expr::coerce_json_boolean_comparison(
+                    left,
+                    right,
+                    &mut left_value,
+                    &mut right_value,
+                );
                 if crate::engine::expr::expr_is_numeric_hexbit_literal(left)
                     && crate::engine::expr::value_is_numeric(&right_value)
                 {
@@ -2142,9 +2335,18 @@ fn eval_plan_expr_with_db_inner(
                     value,
                     *op == BinaryOp::Sub
                         && (left_metadata.result_unsigned || right_metadata.result_unsigned),
+                    *op == BinaryOp::Sub
+                        && left_metadata.result_unsigned
+                        && right_metadata.result_unsigned,
                 );
             }
             if crate::parser::boolean::is_comparison!(*op) {
+                crate::engine::expr::coerce_json_boolean_comparison(
+                    left,
+                    right,
+                    &mut left_value,
+                    &mut right_value,
+                );
                 let collation_id = eval_ctx.binary_collation_id(expr, left, right, row);
                 let evaluate = || {
                     crate::engine::expr::with_numeric_comparison_context(
@@ -2331,6 +2533,12 @@ fn eval_aggregate_expr_inner(
                 eval_aggregate_expr(right, group, row)?
             };
             if crate::parser::boolean::is_comparison!(*op) {
+                crate::engine::expr::coerce_json_boolean_comparison(
+                    left,
+                    right,
+                    &mut left_value,
+                    &mut right_value,
+                );
                 let collation_id = plan_binary_collation_id(left, right, row);
                 let evaluate = || {
                     crate::engine::expr::with_numeric_comparison_context(
@@ -2456,7 +2664,18 @@ fn eval_aggregate_expr_inner(
                     .next();
                 let values = args
                     .iter()
-                    .map(|arg| eval_aggregate_expr(arg, group, row))
+                    .map(|arg| {
+                        let value = eval_aggregate_expr(arg, group, row)?;
+                        crate::engine::expr::function_argument_with_temporal_string(
+                            name,
+                            args,
+                            arg,
+                            value,
+                            |arg| {
+                                super::plan::plan_bound_expr_type(arg, group.first().unwrap_or(row))
+                            },
+                        )
+                    })
                     .collect::<Result<Vec<_>, _>>()?;
                 if let Some(target) = target.filter(|target| target.charset != "binary") {
                     for value in &values {
@@ -2496,9 +2715,26 @@ fn eval_aggregate_expr_inner(
             } else {
                 args
             };
-            eval_function(name, args, |arg| {
+            let value = eval_function(name, args, |arg| {
                 let value = eval_aggregate_expr(arg, group, row)?;
+                let value = crate::engine::expr::function_argument_with_json_source(
+                    name,
+                    args,
+                    arg,
+                    value,
+                    |arg| super::plan::plan_bound_expr_type(arg, source_row),
+                );
+                let value = crate::engine::expr::function_argument_with_temporal_string(
+                    name,
+                    args,
+                    arg,
+                    value,
+                    |arg| super::plan::plan_bound_expr_type(arg, source_row),
+                )?;
                 function_arg_with_source_octets(name, arg, row, value)
+            })?;
+            crate::engine::expr::coerce_null_selection_result(name, args, value, |arg| {
+                super::plan::plan_bound_expr_type(arg, source_row)
             })
         }
         Expr::Subquery(subquery)
@@ -2892,14 +3128,14 @@ pub(super) fn eval_plan_binary_legacy(
         return Ok(v);
     }
     let comparison = crate::parser::boolean::is_comparison!(op);
-    let left_value = if comparison {
+    let mut left_value = if comparison {
         crate::engine::expr::exact_decimal_comparison_literal(left)
             .map(Ok)
             .unwrap_or_else(|| eval_plan_expr_legacy(left, row))?
     } else {
         eval_plan_expr_legacy(left, row)?
     };
-    let right_value = if comparison {
+    let mut right_value = if comparison {
         crate::engine::expr::exact_decimal_comparison_literal(right)
             .map(Ok)
             .unwrap_or_else(|| eval_plan_expr_legacy(right, row))?
@@ -2907,6 +3143,12 @@ pub(super) fn eval_plan_binary_legacy(
         eval_plan_expr_legacy(right, row)?
     };
     if comparison {
+        crate::engine::expr::coerce_json_boolean_comparison(
+            left,
+            right,
+            &mut left_value,
+            &mut right_value,
+        );
         let collation_id = plan_binary_collation_id(left, right, row);
         let evaluate = || {
             crate::engine::expr::with_numeric_comparison_context(
@@ -2953,6 +3195,9 @@ pub(super) fn eval_plan_binary_legacy(
             value,
             op == BinaryOp::Sub
                 && (plan_expr_result_unsigned(left, row) || plan_expr_result_unsigned(right, row)),
+            op == BinaryOp::Sub
+                && plan_expr_result_unsigned(left, row)
+                && plan_expr_result_unsigned(right, row),
         );
     }
     if op == BinaryOp::IntDiv {
@@ -3448,7 +3693,6 @@ fn plan_in_list_collation(expr: &Expr, list: &[Expr], row: &PlanRow) -> Option<u
     let operands = std::iter::once(expr).chain(list.iter()).collect::<Vec<_>>();
     plan_operand_collation(&operands, row, "in")
 }
-
 fn plan_between_collation(expr: &Expr, low: &Expr, high: &Expr, row: &PlanRow) -> Option<u16> {
     plan_operand_collation(&[expr, low, high], row, "between")
 }
@@ -3468,6 +3712,31 @@ fn plan_operand_collation(operands: &[&Expr], row: &PlanRow, operation: &str) ->
         )
     }
 
+    let descriptors = operands
+        .iter()
+        .map(|expr| {
+            if let Expr::Subquery(query) = expr {
+                if let Some(frame) = current_subquery_frame() {
+                    if let Ok(columns) = super::describe_select_columns(&frame.db, query) {
+                        if let Some(column) = columns.first() {
+                            return crate::engine::expr_type::ExprType::from_column_type(
+                                column.column_type,
+                                &column.source,
+                            );
+                        }
+                    }
+                }
+            }
+            super::plan::plan_bound_expr_type(expr, row)
+        })
+        .collect::<Vec<_>>();
+    if let Some(descriptor) = descriptors.into_iter().reduce(|left, right| {
+        crate::engine::expr_type::checked_branch_types(left, right).unwrap_or(left)
+    }) {
+        if descriptor.collation_id.is_some() {
+            return descriptor.collation_id;
+        }
+    }
     // Explicit COLLATE in the AST is stronger than a row field's implicit
     // collation. For ordinary `column op literal`, keep preferring the field
     // metadata; only fall back to the static expression aggregation when no
@@ -3492,52 +3761,30 @@ fn plan_operand_collation(operands: &[&Expr], row: &PlanRow, operation: &str) ->
 fn typed_json_cast_source(
     args: &[Expr],
     row: &PlanRow,
-) -> Option<crate::engine::expr::ExprTypeDescriptor> {
-    if !matches!(
-        args.get(1),
-        Some(Expr::Literal(crate::parser::Literal::String(target)))
-            if target.eq_ignore_ascii_case("JSON")
-    ) {
+) -> Option<crate::engine::expr_type::ExprType> {
+    if !matches!(args.get(1),Some(Expr::Literal(crate::parser::Literal::String(target))) if target.eq_ignore_ascii_case("JSON"))
+    {
         return None;
     }
     let source = args.first()?;
-    let field = match source {
-        Expr::Identifier(name) => resolve_plan_field(row, None, name).ok()?,
-        Expr::CompoundIdentifier(parts) => {
-            let column = parts.last()?;
-            let qualifier = (parts.len() >= 2).then(|| parts[parts.len() - 2].as_str());
-            resolve_plan_field(row, qualifier, column).ok()?
+    let descriptor = super::plan::plan_bound_expr_type(source, row);
+    use crate::engine::expr_type::{ExprTypeKind, StringKind};
+    match descriptor.kind {
+        ExprTypeKind::Bit { .. }
+        | ExprTypeKind::String {
+            kind: StringKind::Binary | StringKind::Blob,
+        } => Some(descriptor),
+        ExprTypeKind::String {
+            kind: StringKind::Enum | StringKind::Set,
+        } if matches!(
+            source,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::GroupKeyRef { .. }
+        ) =>
+        {
+            Some(descriptor)
         }
-        _ => return None,
-    };
-    use crate::engine::expr::{ExprCollation, ExprTypeClass, ExprTypeDescriptor};
-    use crate::mysql::protocol::{ENUM_FLAG, NOT_NULL_FLAG, SET_FLAG};
-    let class = if field.meta.source.flags & ENUM_FLAG != 0 {
-        ExprTypeClass::Enum
-    } else if field.meta.source.flags & SET_FLAG != 0 {
-        ExprTypeClass::Set
-    } else {
-        match field.meta.column_type {
-            ColumnType::Bit { bits } => ExprTypeClass::Bit { bits },
-            ColumnType::Blob => ExprTypeClass::BinaryString,
-            _ => return None,
-        }
-    };
-    let collation = field
-        .meta
-        .source
-        .collation_id
-        .and_then(crate::charset::resolve_collation_id)
-        .map(|info| ExprCollation {
-            charset: info.charset,
-            collation_id: info.id,
-            coercibility: 2,
-        });
-    Some(ExprTypeDescriptor {
-        class,
-        collation,
-        nullable: field.meta.source.flags & NOT_NULL_FLAG == 0,
-    })
+        _ => None,
+    }
 }
 
 pub(super) fn resolve_plan_field<'a>(
@@ -4199,14 +4446,13 @@ fn fold_legacy_nested_scalar_constants_expr(
                     "Subquery returns more than 1 row",
                 ));
             }
-            *expr = Expr::BoundValue(
-                result
-                    .rows
-                    .first()
-                    .and_then(|row| row.first())
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            );
+            let value = result
+                .rows
+                .first()
+                .and_then(|row| row.first())
+                .cloned()
+                .unwrap_or(Value::Null);
+            *expr = bind_scalar_result(value, &result.columns[0]);
         }
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)
@@ -4366,6 +4612,28 @@ fn source_free_scalar_wrapper_expr(select: &Select) -> Option<&Expr> {
     (!crate::planner::has_aggregate_expr(expr)).then_some(expr)
 }
 
+fn bind_scalar_result(value: Value, column: &Column) -> Expr {
+    let descriptor =
+        crate::engine::expr_type::ExprType::from_column_type(column.column_type, &column.source);
+    if matches!(value, Value::String(_) | Value::SmallString(_)) {
+        if let Some(info) = descriptor
+            .collation_id
+            .and_then(crate::charset::resolve_collation_id)
+        {
+            return Expr::Function {
+                name: "__COLLATED_CONST".into(),
+                args: vec![
+                    Expr::BoundValue(value),
+                    Expr::Literal(Literal::String(info.name.into())),
+                    Expr::Literal(Literal::Int(i64::from(descriptor.coercibility))),
+                ],
+                distinct: false,
+            };
+        }
+    }
+    Expr::BoundValue(value)
+}
+
 pub(super) fn resolve_batch_constant_scalar_subqueries(
     db: &Arc<Database>,
     txn: TxnView,
@@ -4414,7 +4682,7 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                     .and_then(|row| row.first())
                     .cloned()
                     .unwrap_or(Value::Null);
-                *expr = Expr::BoundValue(value);
+                *expr = bind_scalar_result(value, &result.columns[0]);
             }
             Expr::Unary { expr, .. }
             | Expr::IsNull(expr)
@@ -4822,13 +5090,21 @@ fn execute_subquery_call(
     let run = || -> Result<QueryResponse, QueryError> {
         match call {
             SubqueryCall::Cached { cached, params, .. } => {
-                crate::engine::params::with_params(params, || {
-                    super::plan::execute_compiled_select(
-                        db,
-                        txn,
-                        &cached.parametric_stmt,
-                        &cached.compiled,
-                    )
+                let internal_start = cached
+                    .bindings
+                    .iter()
+                    .map(|binding| binding.param_index)
+                    .min()
+                    .unwrap_or(usize::MAX);
+                crate::engine::params::with_internal_param_start(internal_start, || {
+                    crate::engine::params::with_params(params, || {
+                        super::plan::execute_compiled_select(
+                            db,
+                            txn,
+                            &cached.parametric_stmt,
+                            &cached.compiled,
+                        )
+                    })
                 })
             }
             SubqueryCall::Legacy { bound, .. } => {
@@ -4845,7 +5121,7 @@ fn execute_subquery_call(
     // need a materialised row set so they can iterate / index. The
     // underlying SELECT may now run on the streaming path; collapse
     // the cursor here once so every call site stays index-friendly.
-    response.materialize()
+    response.materialize_preserving_precision()
 }
 
 fn collect_outer_params(
@@ -4855,14 +5131,26 @@ fn collect_outer_params(
     let mut params = crate::engine::params::snapshot_current_params().unwrap_or_default();
     let mut keys = Vec::with_capacity(bindings.len());
     for spec in bindings {
-        let field = resolve_plan_field(outer_row, spec.qualifier.as_deref(), &spec.column)?;
+        let source = match &spec.source {
+            OuterBindingSource::Column { qualifier, column } => {
+                &resolve_plan_field(outer_row, qualifier.as_deref(), column)?.value
+            }
+            OuterBindingSource::Aggregate(key) => outer_row
+                .agg_values
+                .as_ref()
+                .and_then(|values| values.get(key))
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_UNKNOWN_ERROR,
+                        "Outer aggregate result is unavailable",
+                    )
+                })?,
+        };
         let value = match spec.remainder {
-            Some(divisor) => crate::engine::expr::eval_arithmetic(
-                &field.value,
-                BinaryOp::Mod,
-                &Value::Int(divisor),
-            )?,
-            None => (field.value).clone(),
+            Some(divisor) => {
+                crate::engine::expr::eval_arithmetic(source, BinaryOp::Mod, &Value::Int(divisor))?
+            }
+            None => source.clone(),
         };
         keys.push(ValueKey::from_with_collation(
             &value,
@@ -4931,7 +5219,7 @@ pub(in crate::engine::executor) fn execute_independent_scalar(
     plan: &crate::engine::cache::RuntimeScalarSubqueryPlan,
 ) -> Result<Value, QueryError> {
     let response = super::plan::execute_compiled_select(db, txn, &plan.select, &plan.compiled)?
-        .materialize()?;
+        .materialize_preserving_precision()?;
     let (columns, rows) = match response {
         QueryResponse::ResultSet(result) => (result.columns.len(), result.rows),
         QueryResponse::SharedResultSet(result) => (result.columns.len(), result.rows),
@@ -5047,6 +5335,7 @@ fn try_build_cached_subquery_plan(
     let mut bindings: Vec<OuterBindingSpec> = Vec::new();
     if !substitute_outer_in_select_placeholders(
         &mut sub,
+        outer_row,
         &inner_cols,
         &inner_tables,
         &mut next_param_index,
@@ -5060,8 +5349,10 @@ fn try_build_cached_subquery_plan(
         .iter_mut()
         .filter(|binding| binding.remainder.is_some())
     {
-        let field =
-            resolve_plan_field(outer_row, binding.qualifier.as_deref(), &binding.column).ok()?;
+        let OuterBindingSource::Column { qualifier, column } = &binding.source else {
+            continue;
+        };
+        let field = resolve_plan_field(outer_row, qualifier.as_deref(), column).ok()?;
         if !matches!(
             field.column_type,
             ColumnType::Tiny
@@ -5144,10 +5435,15 @@ fn bind_outer_placeholder_collations(
     let collated: HashMap<usize, Expr> = bindings
         .iter()
         .filter_map(|binding| {
-            let field =
-                resolve_plan_field(outer_row, binding.qualifier.as_deref(), &binding.column)
-                    .ok()?;
-            let bound = bound_outer_field(field);
+            let bound = match &binding.source {
+                OuterBindingSource::Column { qualifier, column } => {
+                    let field = resolve_plan_field(outer_row, qualifier.as_deref(), column).ok()?;
+                    bound_outer_field(field)
+                }
+                OuterBindingSource::Aggregate(key) => {
+                    bound_outer_aggregate(Expr::Placeholder(binding.param_index), outer_row, *key)
+                }
+            };
             matches!(bound, Expr::Function { .. }).then(|| {
                 let Expr::Function {
                     name,
@@ -5251,6 +5547,7 @@ fn next_placeholder_index_in_select(select: &Select) -> usize {
 /// lifted.
 fn substitute_outer_in_select_placeholders(
     select: &mut Select,
+    outer_row: &PlanRow,
     inner_cols: &HashSet<String>,
     inner_tables: &InnerSelectTables,
     next_param_index: &mut usize,
@@ -5262,6 +5559,7 @@ fn substitute_outer_in_select_placeholders(
         if let SelectItem::Expr { expr, .. } = item {
             found |= substitute_outer_in_expr_placeholders(
                 expr,
+                outer_row,
                 inner_cols,
                 inner_tables,
                 next_param_index,
@@ -5272,6 +5570,7 @@ fn substitute_outer_in_select_placeholders(
     if let Some(json_table) = &mut select.json_table {
         found |= substitute_outer_in_expr_placeholders(
             &mut json_table.expr,
+            outer_row,
             inner_cols,
             inner_tables,
             next_param_index,
@@ -5281,6 +5580,7 @@ fn substitute_outer_in_select_placeholders(
     if let Some(selection) = &mut select.selection {
         found |= substitute_outer_in_expr_placeholders(
             selection,
+            outer_row,
             inner_cols,
             inner_tables,
             next_param_index,
@@ -5290,6 +5590,7 @@ fn substitute_outer_in_select_placeholders(
     if let Some(having) = &mut select.having {
         found |= substitute_outer_in_expr_placeholders(
             having,
+            outer_row,
             &output_cols,
             inner_tables,
             next_param_index,
@@ -5300,6 +5601,7 @@ fn substitute_outer_in_select_placeholders(
         if let Some(condition) = &mut join.condition {
             found |= substitute_outer_in_expr_placeholders(
                 condition,
+                outer_row,
                 inner_cols,
                 inner_tables,
                 next_param_index,
@@ -5310,6 +5612,7 @@ fn substitute_outer_in_select_placeholders(
     for expr in &mut select.group_by {
         found |= substitute_outer_in_expr_placeholders(
             expr,
+            outer_row,
             &output_cols,
             inner_tables,
             next_param_index,
@@ -5319,6 +5622,7 @@ fn substitute_outer_in_select_placeholders(
     for order in &mut select.order_by {
         found |= substitute_outer_in_expr_placeholders(
             &mut order.expr,
+            outer_row,
             &output_cols,
             inner_tables,
             next_param_index,
@@ -5333,6 +5637,7 @@ fn substitute_outer_in_select_placeholders(
         {
             found |= substitute_outer_in_expr_placeholders(
                 expr,
+                outer_row,
                 inner_cols,
                 inner_tables,
                 next_param_index,
@@ -5345,12 +5650,38 @@ fn substitute_outer_in_select_placeholders(
 
 fn substitute_outer_in_expr_placeholders(
     expr: &mut Expr,
+    outer_row: &PlanRow,
     inner_cols: &HashSet<String>,
     inner_tables: &InnerSelectTables,
     next_param_index: &mut usize,
     bindings: &mut Vec<OuterBindingSpec>,
 ) -> bool {
+    if let Some(key) = outer_aggregate_cache_key(expr, outer_row, inner_cols, inner_tables) {
+        let param_index = *next_param_index;
+        *next_param_index += 1;
+        bindings.push(OuterBindingSpec {
+            param_index,
+            source: OuterBindingSource::Aggregate(key),
+            remainder: None,
+        });
+        *expr = Expr::Placeholder(param_index);
+        return true;
+    }
     match expr {
+        Expr::GroupKeyRef { index, .. } => {
+            let param_index = *next_param_index;
+            *next_param_index += 1;
+            bindings.push(OuterBindingSpec {
+                param_index,
+                source: OuterBindingSource::Column {
+                    qualifier: Some("$group".into()),
+                    column: format!("group_{index}"),
+                },
+                remainder: None,
+            });
+            *expr = Expr::Placeholder(param_index);
+            true
+        }
         Expr::Identifier(name) => {
             let lower = name.to_ascii_lowercase();
             if !inner_cols.contains(&lower) {
@@ -5358,8 +5689,10 @@ fn substitute_outer_in_expr_placeholders(
                 *next_param_index += 1;
                 bindings.push(OuterBindingSpec {
                     param_index: idx,
-                    qualifier: None,
-                    column: name.clone(),
+                    source: OuterBindingSource::Column {
+                        qualifier: None,
+                        column: name.clone(),
+                    },
                     remainder: None,
                 });
                 *expr = Expr::Placeholder(idx);
@@ -5375,8 +5708,10 @@ fn substitute_outer_in_expr_placeholders(
                 *next_param_index += 1;
                 bindings.push(OuterBindingSpec {
                     param_index: idx,
-                    qualifier: Some(table),
-                    column: col,
+                    source: OuterBindingSource::Column {
+                        qualifier: Some(table),
+                        column: col,
+                    },
                     remainder: None,
                 });
                 *expr = Expr::Placeholder(idx);
@@ -5394,6 +5729,7 @@ fn substitute_outer_in_expr_placeholders(
             crate::parser::visit::for_each_expr_child_mut(expr, |child| {
                 found |= substitute_outer_in_expr_placeholders(
                     child,
+                    outer_row,
                     inner_cols,
                     inner_tables,
                     next_param_index,
@@ -5417,7 +5753,9 @@ fn substitute_outer_in_expr_placeholders(
                 {
                     if *divisor > 0 {
                         if let Some(binding) = bindings.iter_mut().find(|binding| {
-                            binding.param_index == *index && binding.remainder.is_none()
+                            binding.param_index == *index
+                                && binding.remainder.is_none()
+                                && matches!(binding.source, OuterBindingSource::Column { .. })
                         }) {
                             binding.remainder = Some(*divisor);
                             *expr = Expr::Placeholder(*index);
@@ -5467,7 +5805,7 @@ fn inner_has_qualified_column(tables: &InnerSelectTables, qualifier: &str, colum
     })
 }
 
-fn inner_select_scope(db: &Arc<Database>, select: &Select) -> (HashSet<String>, InnerSelectTables) {
+fn inner_select_scope(db: &Database, select: &Select) -> (HashSet<String>, InnerSelectTables) {
     let mut columns = HashSet::new();
     let mut tables = Vec::with_capacity(select.from.len() + select.joins.len());
     for (table, derived) in select
@@ -5737,18 +6075,105 @@ fn bound_outer_field(field: &PlanField) -> Expr {
             .collation_id
             .and_then(crate::charset::resolve_collation_id)
         {
+            let mut args = vec![
+                value,
+                Expr::Literal(Literal::String(collation.name.into())),
+                Expr::Literal(Literal::Int(2)),
+            ];
+            let flags = field.source.flags
+                & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG);
+            if flags != 0 {
+                if let Some(members) = &field.source.enum_set_values {
+                    args.push(Expr::Literal(Literal::Int(i64::from(flags))));
+                    args.extend(
+                        members
+                            .iter()
+                            .cloned()
+                            .map(|member| Expr::Literal(Literal::String(member))),
+                    );
+                }
+            }
             return Expr::Function {
                 name: "__COLLATED_CONST".into(),
-                args: vec![
-                    value,
-                    Expr::Literal(Literal::String(collation.name.into())),
-                    Expr::Literal(Literal::Int(2)),
-                ],
+                args,
                 distinct: false,
             };
         }
     }
     value
+}
+
+fn bound_outer_aggregate(value: Expr, row: &PlanRow, key: u64) -> Expr {
+    if let Some(collation) = row
+        .schema
+        .aggregate_type(key)
+        .and_then(|ty| ty.collation_id)
+        .and_then(crate::charset::resolve_collation_id)
+    {
+        return Expr::Function {
+            name: "__COLLATED_CONST".into(),
+            args: vec![
+                value,
+                Expr::Literal(Literal::String(collation.name.into())),
+                Expr::Literal(Literal::Int(2)),
+            ],
+            distinct: false,
+        };
+    }
+    value
+}
+
+fn aggregate_arguments_are_outer(
+    expr: &Expr,
+    inner_cols: &HashSet<String>,
+    inner_tables: &InnerSelectTables,
+) -> bool {
+    if !matches!(expr, Expr::Function { name, .. } if planner::is_aggregate_function(name)) {
+        return false;
+    }
+    let mut references = 0usize;
+    let mut outer_only = true;
+    crate::parser::visit::inspect_value_expr(
+        expr,
+        |node| {
+            match node {
+                Expr::Identifier(name) => {
+                    references += 1;
+                    outer_only &= !inner_cols.contains(&name.to_ascii_lowercase());
+                }
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+                    references += 1;
+                    outer_only &= !inner_has_qualified_column(
+                        inner_tables,
+                        &parts[parts.len() - 2],
+                        parts.last().unwrap(),
+                    );
+                }
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                    outer_only = false;
+                    return false;
+                }
+                _ => {}
+            }
+            true
+        },
+        |_| {},
+    );
+    outer_only && references > 0
+}
+
+fn outer_aggregate_cache_key(
+    expr: &Expr,
+    outer_row: &PlanRow,
+    inner_cols: &HashSet<String>,
+    inner_tables: &InnerSelectTables,
+) -> Option<u64> {
+    let values = outer_row.agg_values.as_ref()?;
+    if !aggregate_arguments_are_outer(expr, inner_cols, inner_tables) {
+        return None;
+    }
+    let key = super::aggregate::aggregate_key(expr);
+    values.contains_key(&key).then_some(key)
 }
 
 fn substitute_outer_in_expr(
@@ -5758,49 +6183,23 @@ fn substitute_outer_in_expr(
     inner_cols: &HashSet<String>,
     inner_tables: &InnerSelectTables,
 ) -> bool {
-    if matches!(expr, Expr::Function { name, .. } if planner::is_aggregate_function(name)) {
-        let mut references = 0usize;
-        let mut outer_only = true;
-        crate::parser::visit::inspect_value_expr(
-            expr,
-            |node| {
-                match node {
-                    Expr::Identifier(name) => {
-                        references += 1;
-                        outer_only &= !inner_cols.contains(&name.to_ascii_lowercase());
-                    }
-                    Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
-                        references += 1;
-                        outer_only &= !inner_has_qualified_column(
-                            inner_tables,
-                            &parts[parts.len() - 2],
-                            parts.last().unwrap(),
-                        );
-                    }
-                    Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                        outer_only = false;
-                        return false;
-                    }
-                    _ => {}
-                }
-                true
-            },
-            |_| {},
-        );
-        if outer_only && references > 0 {
-            if let Some(value) = outer_row
-                .agg_values
-                .as_ref()
-                .and_then(|values| values.get(&super::aggregate::aggregate_key(expr)))
-                .cloned()
-            {
-                push_outer_binding(&value);
-                *expr = Expr::BoundValue(value);
-                return true;
-            }
-        }
+    if let Some(key) = outer_aggregate_cache_key(expr, outer_row, inner_cols, inner_tables) {
+        let value = outer_row.agg_values.as_ref().unwrap()[&key].clone();
+        push_outer_binding(&value);
+        *expr = bound_outer_aggregate(Expr::BoundValue(value), outer_row, key);
+        return true;
     }
     match expr {
+        Expr::GroupKeyRef { index, .. } => {
+            if let Ok(field) =
+                resolve_plan_field(outer_row, Some("$group"), &format!("group_{index}"))
+            {
+                push_outer_binding(&field.value);
+                *expr = bound_outer_field(field);
+                return true;
+            }
+            false
+        }
         Expr::Identifier(name) => {
             let lower = name.to_ascii_lowercase();
             if !inner_cols.contains(&lower) {
@@ -6019,13 +6418,7 @@ pub(crate) fn aggregate_argument_semantic_type(
     argument: Option<&Expr>,
     resolved: Option<ColumnType>,
 ) -> Option<ColumnType> {
-    if argument.is_some_and(is_conditional_computed_year_domain) {
-        // YEAR() is an ordinary integer scalar, but once wrapped in a
-        // conditional expression MySQL's AVG resolver uses the approximate
-        // numeric lane. This is observably different from AVG(year_column),
-        // which retains the native YEAR domain.
-        Some(ColumnType::Double)
-    } else if argument.is_some_and(is_direct_computed_year_domain) {
+    if argument.is_some_and(is_direct_computed_year_domain) {
         // YEAR(date) is an ordinary signed integer expression, not a native
         // YEAR column. AVG therefore applies div_precision_increment and
         // returns DECIMAL(...,4) under the default session setting.
@@ -6040,33 +6433,6 @@ fn is_direct_computed_year_domain(expr: &Expr) -> bool {
         Expr::Function { name, .. } if name.eq_ignore_ascii_case("YEAR") => true,
         Expr::GroupKeyRef { expr, .. } | Expr::Unary { expr, .. } => {
             is_direct_computed_year_domain(expr)
-        }
-        _ => false,
-    }
-}
-
-fn is_conditional_computed_year_domain(expr: &Expr) -> bool {
-    match expr {
-        Expr::Function { name, args, .. }
-            if matches!(
-                name.to_ascii_uppercase().as_str(),
-                "NULLIF" | "IF" | "IFNULL" | "COALESCE"
-            ) =>
-        {
-            args.iter().any(is_direct_computed_year_domain)
-        }
-        Expr::Case {
-            results,
-            else_result,
-            ..
-        } => {
-            results.iter().any(is_direct_computed_year_domain)
-                || else_result
-                    .as_deref()
-                    .is_some_and(is_direct_computed_year_domain)
-        }
-        Expr::GroupKeyRef { expr, .. } | Expr::Unary { expr, .. } => {
-            is_conditional_computed_year_domain(expr)
         }
         _ => false,
     }
@@ -6110,6 +6476,27 @@ fn coerce_aggregate_result_for_expr(
     let Expr::Function { name, args, .. } = expr else {
         return Ok(value);
     };
+    if (name.eq_ignore_ascii_case("SUM") || name.eq_ignore_ascii_case("AVG"))
+        && args.first().is_some_and(|arg| {
+            matches!(
+                direct_argument_source_type(arg, row)
+                    .unwrap_or_else(|| super::plan::plan_bound_expr_type(arg, row).column_type()),
+                ColumnType::Date
+                    | ColumnType::Time
+                    | ColumnType::DateTime
+                    | ColumnType::Timestamp
+                    | ColumnType::Year
+            )
+        })
+    {
+        if let ColumnType::Decimal { scale, .. } =
+            super::plan::plan_bound_expr_type(expr, row).column_type()
+        {
+            return Ok(super::aggregate::exact_aggregate_value_at_scale(
+                value, scale,
+            ));
+        }
+    }
     if name.eq_ignore_ascii_case("SUM") {
         if let (Some(scale), Value::Double(value)) = (
             args.first()
@@ -6145,27 +6532,6 @@ fn coerce_aggregate_result_for_expr(
                 as usize;
             return Ok(Value::Decimal(format!("{value:.scale$}")));
         }
-    }
-    if name.eq_ignore_ascii_case("AVG")
-        && args
-            .first()
-            .is_some_and(is_conditional_computed_year_domain)
-    {
-        return Ok(match value {
-            Value::Null => Value::Null,
-            value => Value::Double(crate::engine::expr::numeric(&value)?),
-        });
-    }
-    if name.eq_ignore_ascii_case("AVG")
-        && args.first().is_some_and(|arg| {
-            direct_argument_source_type(arg, row) == Some(ColumnType::Year)
-                || plan_expr_result_type(arg, row).ok() == Some(ColumnType::Year)
-        })
-    {
-        return Ok(match value {
-            Value::Null => Value::Null,
-            value => Value::Decimal(format!("{:.0}", crate::engine::expr::numeric(&value)?)),
-        });
     }
     if matches!(name.to_ascii_uppercase().as_str(), "MIN" | "MAX") {
         if let Value::Year(year) = value {

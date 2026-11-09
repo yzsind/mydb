@@ -147,6 +147,7 @@ pub(in crate::engine::executor::select) fn window_partition_input_stream<'a>(
         .partition_by
         .iter()
         .map(|expr| OrderBy {
+            names_bound: false,
             expr: expr.clone(),
             asc: true,
             nulls_first: None,
@@ -185,6 +186,7 @@ pub(in crate::engine::executor::select) fn window_partition_input_stream<'a>(
         db.data_dir(),
         Box::new(partitions),
         &[OrderBy {
+            names_bound: false,
             expr: Expr::Identifier(ordinal_name),
             asc: true,
             nulls_first: None,
@@ -978,6 +980,7 @@ pub(super) fn window_group_values_spilled(
         .partition_by
         .iter()
         .map(|e| OrderBy {
+            names_bound: false,
             expr: e.clone(),
             asc: true,
             nulls_first: None,

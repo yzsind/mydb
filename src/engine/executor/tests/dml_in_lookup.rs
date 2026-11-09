@@ -212,7 +212,7 @@ fn dml_in_lookup_binds_then_sorts_and_deduplicates_parameters() {
 }
 
 #[test]
-fn dml_in_lookup_lossy_numeric_comparison_keeps_all_matches() {
+fn dml_in_lookup_integer_constant_comparison_keeps_precision() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
@@ -228,7 +228,11 @@ fn dml_in_lookup_lossy_numeric_comparison_keeps_all_matches() {
         negated: false,
     };
     assert!(crate::planner::write_in_index_access(&table, &predicate).is_none());
-    affected(&engine, "DELETE FROM t WHERE id IN (9007199254740992e0)", 2);
+    affected(&engine, "DELETE FROM t WHERE id IN (9007199254740992e0)", 1);
+    assert_eq!(
+        rows(engine.execute("SELECT id FROM t ORDER BY id").unwrap()),
+        vec![vec![Value::Int(7)], vec![Value::Int(9007199254740993)]]
+    );
 }
 
 #[test]

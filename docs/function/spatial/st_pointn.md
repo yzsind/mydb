@@ -19,7 +19,7 @@ ST_POINTN(geometry, n)
 
 ## Return Value
 
-Returns a GEOMETRY value; returns `NULL` when any required argument is `NULL`.
+Returns the one-based point of a LineString, preserving SRID. SQL NULL, an inapplicable type, or an out-of-range/nonpositive position returns NULL.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: `POINT(2 2)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_STARTPOINT`](st_startpoint.md), [`ST_ENDPOINT`](st_endpoint.md), [`ST_NUMPOINTS`](st_numpoints.md).

@@ -12,8 +12,12 @@ Creates or replaces a named savepoint within the current transaction.
 
 ## Behavior and Limitations
 
-- Must be inside an active transaction. Reusing a name moves the savepoint to the current position.
+- With autocommit enabled and no active explicit or implicit transaction, the statement returns OK without creating a savepoint; a later ROLLBACK TO or RELEASE then returns 1305. In a transaction, reusing a name moves the savepoint to the current position.
 - A savepoint records an undo boundary; it neither commits the transaction nor releases previously held locks.
+
+## Transaction and Error Details
+
+With autocommit=0, a SAVEPOINT can start the session's implicit transaction lazily. Within a live transaction the name identifies a data-undo and RLS LOCAL context boundary. Savepoints disappear on full commit/rollback. They do not reverse successful temporary DDL or consumed sequence values.
 
 ## Examples
 

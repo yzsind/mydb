@@ -311,7 +311,7 @@ fn returning_column_names_preserve_image_qualifiers_and_explicit_aliases() {
 }
 
 #[test]
-fn self_join_multi_update_writes_each_physical_row_once_in_table_order() {
+fn self_join_multi_update_writes_once_with_last_assignment_value() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
@@ -335,7 +335,7 @@ fn self_join_multi_update_writes_each_physical_row_once_in_table_order() {
             vec![vec![Value::Int(1)]]
         );
     }
-    assert_eq!(rows(&engine, "SELECT v FROM t"), vec![vec![Value::Int(4)]]);
+    assert_eq!(rows(&engine, "SELECT v FROM t"), vec![vec![Value::Int(40)]]);
 }
 
 #[test]
@@ -606,7 +606,7 @@ fn load_xml_rejects_invalid_utf8_before_any_write() {
 }
 
 #[test]
-fn self_join_update_merges_disjoint_columns_and_first_alias_owns_conflicts() {
+fn self_join_update_merges_disjoint_columns_and_last_assignment_owns_conflicts() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
@@ -624,8 +624,8 @@ fn self_join_update_merges_disjoint_columns_and_first_alias_owns_conflicts() {
     assert_eq!(
         rows(&engine, "SELECT x,y FROM t ORDER BY id"),
         vec![
-            vec![Value::Int(1), Value::Int(10)],
-            vec![Value::Int(1), Value::Int(10)]
+            vec![Value::Int(10), Value::Int(10)],
+            vec![Value::Int(10), Value::Int(10)]
         ]
     );
 }

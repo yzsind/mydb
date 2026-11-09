@@ -22,8 +22,14 @@ Inserts a new row; on a primary-key or unique-key conflict, it first deletes all
 - Requires the INSERT and DELETE privileges on the target table, and fires DELETE/INSERT-related triggers and foreign key actions.
 - There may be more than one conflicting old row; affected rows typically includes both the deleted and inserted counts.
 - Columns that are not provided are handled as a newly inserted row and do not inherit the old row's values.
-- RETURNING returns NEW by default; OLD/NEW can be referenced explicitly.
+- RETURNING returns NEW by default. OLD is always SQL NULL for REPLACE because one new row can replace several conflicting old rows; NEW is the final inserted image.
 - `DELAYED` is compatibility syntax and produces a deprecation or not-implemented warning.
+
+## Privileges, Results, and Boundaries
+
+Each new row can delete several conflicting rows across unique keys. The affected count is inserted plus deleted rows. It does not retain old defaults or old auto-increment values unless explicitly supplied. DELETE/INSERT triggers and FK actions execute under that replacement's statement transaction. A projection/constraint error rolls back the entire statement, including deletions.
+
+OLD is NULL in RETURNING even when a conflict occurred. Indirect FK-cascade rows are not returned. Partition selection uses the target table's routing rules; rows outside an explicit PARTITION set cannot be silently redirected. See [row-image definitions](../../dml-returning.md).
 
 ## Examples
 

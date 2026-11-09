@@ -3,6 +3,36 @@
 use super::*;
 mod fixed;
 
+thread_local! {
+    // Query-expression domains apply through set nodes and their ordering /
+    // LIMIT wrappers, but never through a leaf SELECT's query boundary.
+    static SET_DOMAINS: std::cell::RefCell<std::collections::HashMap<usize, Arc<BatchSchema>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn install_set_domains(plan: &PhysicalPlan, schema: Arc<BatchSchema>) {
+    match plan {
+        PhysicalPlan::SetOp { left, right, .. } => {
+            SET_DOMAINS.with(|domains| {
+                domains
+                    .borrow_mut()
+                    .insert(plan as *const _ as usize, schema.clone());
+            });
+            install_set_domains(left, schema.clone());
+            install_set_domains(right, schema);
+        }
+        PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::ParallelSort { input, .. }
+        | PhysicalPlan::IncrementalSort { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::TopK { input, .. }
+        | PhysicalPlan::ParallelTopK { input, .. }
+        | PhysicalPlan::TopWindow { input, .. }
+        | PhysicalPlan::Exchange { input, .. }
+        | PhysicalPlan::Materialize { input, .. } => install_set_domains(input, schema),
+        _ => {}
+    }
+}
+
 pub(super) struct ChargedMaterializedBatchOperator {
     pub(super) inner: MaterializedBatchOperator,
     pub(super) _charge: crate::engine::executor::mem_budget::ScopedCharge,
@@ -438,6 +468,27 @@ pub(super) fn try_build_setop_batch<'a>(
     txn: TxnView,
     plan: &'a PhysicalPlan,
 ) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    struct Restore(Option<std::collections::HashMap<usize, Arc<BatchSchema>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(old) = self.0.take() {
+                SET_DOMAINS.with(|domains| *domains.borrow_mut() = old);
+            }
+        }
+    }
+    let inherited =
+        SET_DOMAINS.with(|domains| domains.borrow().contains_key(&(plan as *const _ as usize)));
+    let _restore = if inherited {
+        Restore(None)
+    } else {
+        let Some(template) = preflight_query_output_template(plan)? else {
+            return Ok(None);
+        };
+        let old = SET_DOMAINS.with(|domains| std::mem::take(&mut *domains.borrow_mut()));
+        let guard = Restore(Some(old));
+        install_set_domains(plan, template_to_batch_schema(&template));
+        guard
+    };
     crate::util::stack::with_stack(
         crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
         || try_build_setop_batch_checked(db, txn, plan),
@@ -481,7 +532,17 @@ fn try_build_setop_batch_checked<'a>(
                 .collect::<Vec<_>>()
         );
     }
-    let template = unify_setop_templates(left_input.template, right_input.template)?;
+    let mut template = unify_setop_templates(left_input.template, right_input.template)?;
+    let domain =
+        SET_DOMAINS.with(|domains| domains.borrow().get(&(plan as *const _ as usize)).cloned());
+    if let Some(domain) = domain {
+        for (field, target) in template.iter_mut().zip(domain.fields()) {
+            let mut meta = (*field.meta).clone();
+            meta.column_type = target.column_type;
+            meta.source = target.source.clone();
+            field.meta = super::super::plan::intern_col_meta(meta);
+        }
+    }
     let schema = template_to_batch_schema(&template);
     Ok(Some(VecBatchInput {
         stream: Box::new(SetOpBatchOperator {

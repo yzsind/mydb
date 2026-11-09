@@ -332,6 +332,9 @@ impl<'a> InsertCursor<'a> {
     /// Parse a (possibly schema-qualified) table name into `a` / `a.b`.
     fn parse_object_name(&mut self) -> Option<String> {
         let mut name = self.parse_ident()?;
+        if name.contains('.') {
+            return None;
+        }
         loop {
             let save = self.i;
             self.skip_ws();
@@ -339,6 +342,9 @@ impl<'a> InsertCursor<'a> {
                 self.i += 1;
                 self.skip_ws();
                 let part = self.parse_ident()?;
+                if part.contains('.') {
+                    return None;
+                }
                 name.push('.');
                 name.push_str(&part);
             } else {
@@ -1584,13 +1590,20 @@ impl<'a> LoadDataParser<'a> {
         if self.peek_byte() == Some(b'`') {
             self.pos += 1;
             let start = self.pos;
-            while self.pos < self.bytes.len() && self.bytes[self.pos] != b'`' {
+            while self.pos < self.bytes.len() {
+                if self.bytes[self.pos] == b'`' {
+                    if self.bytes.get(self.pos + 1) == Some(&b'`') {
+                        self.pos += 2;
+                        continue;
+                    }
+                    break;
+                }
                 self.pos += 1;
             }
             if self.pos >= self.bytes.len() {
                 return Err("unterminated backtick identifier".to_string());
             }
-            let name = self.sql[start..self.pos].to_string();
+            let name = self.sql[start..self.pos].replace("``", "`");
             self.pos += 1;
             Ok(name)
         } else {
@@ -1892,6 +1905,9 @@ fn parse_admin_object_name_list(sql: &str) -> Option<Vec<String>> {
             SqlTokenKind::QuotedIdentifier => cursor.decoded_quoted_text(&first)?,
             _ => return None,
         };
+        if name.contains('.') {
+            return None;
+        }
         loop {
             let is_dot = cursor
                 .peek()
@@ -1907,6 +1923,9 @@ fn parse_admin_object_name_list(sql: &str) -> Option<Vec<String>> {
                 SqlTokenKind::QuotedIdentifier => cursor.decoded_quoted_text(&part)?,
                 _ => return None,
             };
+            if part.contains('.') {
+                return None;
+            }
             name.push('.');
             name.push_str(&part);
         }
@@ -4814,6 +4833,11 @@ fn parse_routine_param(sql: &str, kind: RoutineKind) -> Result<RoutineParam, Par
             "routine parameter requires a data type",
         ));
     }
+    if top_level_keyword_pos(&data_type_sql, "DEFAULT").is_some() {
+        return Err(parse_error_at_zero(
+            "routine parameters do not support DEFAULT values",
+        ));
+    }
     let (data_type, unsigned) = parse_routine_data_type(&data_type_sql)?;
     Ok(RoutineParam {
         name: unquote_identifier(name),
@@ -4825,6 +4849,27 @@ fn parse_routine_param(sql: &str, kind: RoutineKind) -> Result<RoutineParam, Par
 }
 
 fn parse_routine_data_type(sql: &str) -> Result<(DataType, bool), ParseError> {
+    // Column conversion supplies legacy default widths. Routine declarations
+    // must validate the explicit type before that conversion loses the syntax.
+    let dialect = MydbDialect::default();
+    let mut parser = SqlParser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|err| ParseError::from_sqlparser(sql, err))?;
+    let declared = parser
+        .parse_data_type()
+        .map_err(|err| ParseError::from_sqlparser(sql, err))?;
+    if matches!(
+        declared,
+        SqlDataType::Varchar(None)
+            | SqlDataType::Nvarchar(None)
+            | SqlDataType::CharacterVarying(None)
+            | SqlDataType::CharVarying(None)
+            | SqlDataType::Varbinary(None)
+    ) {
+        return Err(parse_error_at_zero(
+            "variable-length routine data types require a length",
+        ));
+    }
     let ddl = format!("CREATE TABLE __mydb_routine_type (x {sql})");
     let statement = parse_statement(&ddl)?;
     let Statement::CreateTable(table) = statement else {
@@ -5762,6 +5807,14 @@ fn parse_routine_object_name(sql: &str, idx: usize) -> Result<(String, usize), P
     }
     if idx == start {
         return Err(parse_error_at_zero("expected routine name"));
+    }
+    if split_top_level(&sql[start..idx], '.')
+        .iter()
+        .any(|part| unquote_identifier(part.trim()).contains('.'))
+    {
+        return Err(parse_error_at_zero(
+            "Dots inside quoted object identifiers are not supported",
+        ));
     }
     Ok((normalize_object_name_sql(&sql[start..idx]), idx))
 }

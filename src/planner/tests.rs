@@ -535,7 +535,6 @@ fn vector_audit_folded_query_values_preserve_text_and_binary_domains() {
         for value in [
             Value::String(text.into()),
             Value::SmallString(crate::types::SmallStringBuf::from_slice(text.as_bytes())),
-            Value::Bytes(text.as_bytes().to_vec()),
         ] {
             assert!(value_to_vector_bytes(&value).is_none(), "{value:?}");
         }
@@ -548,7 +547,12 @@ fn vector_audit_folded_query_values_preserve_text_and_binary_domains() {
     ] {
         assert_eq!(value_to_vector_bytes(&value), Some(vector.clone()));
     }
-    assert!(value_to_vector_bytes(&Value::Bytes(vector.payload)).is_none());
+    assert_eq!(
+        value_to_vector_bytes(&Value::Bytes(vector.payload.clone())),
+        Some(vector)
+    );
+    assert!(value_to_vector_bytes(&Value::Bytes(vec![0, 1, 2])).is_none());
+    assert!(value_to_vector_bytes(&Value::Bytes(f32::NAN.to_le_bytes().to_vec())).is_none());
 }
 
 #[test]
@@ -572,6 +576,7 @@ fn sqlproc_sus_streaming_group_contiguity_does_not_imply_order() {
     assert!(!plan_satisfies_order_by(
         &plan,
         &[OrderBy {
+            names_bound: false,
             expr: key,
             asc: true,
             nulls_first: None

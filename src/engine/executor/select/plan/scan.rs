@@ -1180,16 +1180,19 @@ pub(in crate::engine::executor::select) enum CteRowPredicate {
         op: BinaryOp,
         value: Value,
         flipped: bool,
+        provenance: crate::engine::expr::ComparisonProvenance,
     },
     InList {
         col: usize,
         values: Vec<Value>,
+        provenance: Vec<crate::engine::expr::ComparisonProvenance>,
         negated: bool,
     },
     Between {
         col: usize,
         low: Value,
         high: Value,
+        provenance: [crate::engine::expr::ComparisonProvenance; 2],
         negated: bool,
     },
     /// Evaluate the inner column predicate under the column's collation:
@@ -1253,6 +1256,10 @@ pub(in crate::engine::executor::select) fn compile_cte_row_predicate(
                         op: *op,
                         value,
                         flipped: false,
+                        provenance: crate::engine::expr::ComparisonProvenance::from_exprs(
+                            left, right,
+                        )
+                        .with_temporal_constant_context(left, right),
                     };
                     return Some(collated_cte_leaf(columns, col, cmp));
                 }
@@ -1264,6 +1271,10 @@ pub(in crate::engine::executor::select) fn compile_cte_row_predicate(
                         op: *op,
                         value,
                         flipped: true,
+                        provenance: crate::engine::expr::ComparisonProvenance::from_exprs(
+                            right, left,
+                        )
+                        .with_temporal_constant_context(right, left),
                     };
                     return Some(collated_cte_leaf(columns, col, cmp));
                 }
@@ -1283,6 +1294,13 @@ pub(in crate::engine::executor::select) fn compile_cte_row_predicate(
             let in_list = CteRowPredicate::InList {
                 col,
                 values,
+                provenance: list
+                    .iter()
+                    .map(|item| {
+                        crate::engine::expr::ComparisonProvenance::from_exprs(expr, item)
+                            .with_temporal_constant_context(expr, item)
+                    })
+                    .collect(),
                 negated: *negated,
             };
             Some(collated_cte_leaf(columns, col, in_list))
@@ -1298,6 +1316,12 @@ pub(in crate::engine::executor::select) fn compile_cte_row_predicate(
                 col,
                 low: crate::engine::expr::expr_literal_value(low)?,
                 high: crate::engine::expr::expr_literal_value(high)?,
+                provenance: [
+                    crate::engine::expr::ComparisonProvenance::from_exprs(expr, low)
+                        .with_temporal_constant_context(expr, low),
+                    crate::engine::expr::ComparisonProvenance::from_exprs(expr, high)
+                        .with_temporal_constant_context(expr, high),
+                ],
                 negated: *negated,
             };
             Some(collated_cte_leaf(columns, col, between))
@@ -1337,18 +1361,34 @@ pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
             op,
             value,
             flipped,
-        } => eval_cte_row_cmp(row.get(*col).unwrap_or(&Value::Null), *op, value, *flipped),
+            provenance,
+        } => {
+            let left = row.get(*col).unwrap_or(&Value::Null);
+            crate::engine::expr::with_numeric_comparison_context_from_provenance(
+                *provenance,
+                left,
+                value,
+                || eval_cte_row_cmp(left, *op, value, *flipped),
+            )
+        }
         CteRowPredicate::InList {
             col,
             values,
+            provenance,
             negated,
         } => {
             let value = row.get(*col).unwrap_or(&Value::Null);
             let mut found = false;
             let mut has_null = false;
             if !matches!(value, Value::Null) {
-                for item in values {
-                    let comparison = crate::engine::expr::compare_nullable_values(value, item)?;
+                for (item, provenance) in values.iter().zip(provenance) {
+                    let comparison =
+                        crate::engine::expr::with_numeric_comparison_context_from_provenance(
+                            *provenance,
+                            value,
+                            item,
+                            || crate::engine::expr::compare_nullable_values(value, item),
+                        )?;
                     has_null |= comparison.is_none();
                     if comparison == Some(std::cmp::Ordering::Equal) {
                         found = true;
@@ -1366,11 +1406,18 @@ pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
             col,
             low,
             high,
+            provenance,
             negated,
         } => {
             let value = row.get(*col).unwrap_or(&Value::Null);
-            crate::engine::expr::eval_between_truth(value, low, high, *negated)
-                .map(|value| value.unwrap_or(false))
+            crate::engine::expr::eval_between_with_provenance(
+                value,
+                low,
+                high,
+                *negated,
+                *provenance,
+            )
+            .map(|value| crate::engine::expr::truthy(&value))
         }
         CteRowPredicate::Collated(id, inner) => {
             crate::engine::expr::with_compare_collation(Some(*id), || {
@@ -2377,11 +2424,23 @@ pub(in crate::engine::executor::select) fn append_plan_table_entry_refs_chunk(
                 txn,
             )
         })?;
-    for ((key, _row_id), visible) in entries.iter().zip(visible_mask.into_iter()) {
+    let float_rows = projector.prepare_float_rows(
+        db,
+        txn,
+        entries
+            .iter()
+            .zip(visible_mask.iter())
+            .filter_map(|((key, id), visible)| (*visible).then_some((*key, *id))),
+        || Ok(heap.clone()),
+    )?;
+    for ((key, row_id), visible) in entries.iter().zip(visible_mask.into_iter()) {
         if !visible {
             continue;
         }
-        let row = projector.project(key);
+        let Some(row) = projector.project_visible(db, txn, *row_id, key, float_rows.as_ref())?
+        else {
+            continue;
+        };
         if eval_covering_filter(db, txn, filter, &row, eval_ctx, &mut compiled_filter)? {
             rows.push(row);
         }
@@ -2474,11 +2533,23 @@ pub(super) fn read_plan_table_entries_with_heap_and_bound(
             txn,
         )?,
     };
-    for ((key, _row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
+    let float_rows = projector.prepare_float_rows(
+        db,
+        txn,
+        entries
+            .iter()
+            .zip(visible_mask.iter())
+            .filter_map(|((key, id), visible)| (*visible).then_some((key, *id))),
+        || Ok(heap.clone()),
+    )?;
+    for ((key, row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
         if !visible {
             continue;
         }
-        let row = projector.project(&key);
+        let Some(row) = projector.project_visible(db, txn, row_id, &key, float_rows.as_ref())?
+        else {
+            continue;
+        };
         if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
             rows.push(row);
         }
@@ -2529,6 +2600,15 @@ pub(super) fn read_plan_table_entries_streamed(
             entries,
             txn,
         )?;
+        let float_rows = projector.prepare_float_rows(
+            db,
+            txn,
+            entries
+                .iter()
+                .zip(visible_mask.iter())
+                .filter_map(|((key, id), visible)| (*visible).then_some((*key, *id))),
+            || Ok(heap.clone()),
+        )?;
         for ((key, row_id), visible) in entries.iter().zip(visible_mask.into_iter()) {
             if !visible {
                 continue;
@@ -2536,7 +2616,11 @@ pub(super) fn read_plan_table_entries_streamed(
             if seen.as_mut().is_some_and(|seen| !seen.insert(*row_id)) {
                 continue;
             }
-            let row = projector.project(key);
+            let Some(row) =
+                projector.project_visible(db, txn, *row_id, key, float_rows.as_ref())?
+            else {
+                continue;
+            };
             if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
                 rows.push(row);
             }
@@ -2621,14 +2705,16 @@ pub(super) fn read_plan_table_entries_limited_with_heap(
         &entries,
         txn,
     )?;
-    for ((key, _row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
+    for ((key, row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
         if rows.len() >= max_rows {
             break;
         }
         if !visible {
             continue;
         }
-        let row = projector.project(&key);
+        let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? else {
+            continue;
+        };
         if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
             rows.push(row);
         }
@@ -2820,7 +2906,7 @@ pub(super) fn read_plan_table_entries_windowed(
             &entries,
             txn,
         )?;
-        for ((key, _row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
+        for ((key, row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
             if !visible {
                 continue;
             }
@@ -2829,9 +2915,13 @@ pub(super) fn read_plan_table_entries_windowed(
                     skip -= 1;
                     continue;
                 }
-                rows.push(projector.project(&key));
+                if let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? {
+                    rows.push(row);
+                }
             } else {
-                let row = projector.project(&key);
+                let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? else {
+                    continue;
+                };
                 if !eval_covering_filter(
                     db,
                     txn,
@@ -3073,7 +3163,11 @@ pub(super) fn filtered_index_min_max_value(
     )?;
     Ok(rows
         .first()
-        .and_then(|row| row.fields.get(col_idx))
+        .and_then(|row| {
+            row.fields
+                .iter()
+                .find(|field| field.column.eq_ignore_ascii_case(col))
+        })
         .map(|field| field.value.clone())
         .unwrap_or(Value::Null))
 }
@@ -3105,6 +3199,7 @@ pub(in crate::engine::executor::select) struct CoveringIndexAggregateSpec {
     pub(super) slot_fixed_scales: Vec<Option<u8>>,
     pub(super) group_inputs: Vec<CoveringAggInput>,
     pub(super) group_table_indices: Vec<usize>,
+    float_restorer: IndexFloatValueRestorer,
 }
 
 pub(in crate::engine::executor::select) fn execute_covering_index_aggregate(
@@ -3248,7 +3343,22 @@ pub(in crate::engine::executor::select) fn build_covering_index_aggregate_spec(
             slot_fixed_scales.push(scale);
         }
     }
+    let mut float_restorer = IndexFloatValueRestorer::new(table, index, None);
+    float_restorer.positions.retain(|(position, _)| {
+        group_inputs.iter().any(
+            |input| matches!(input,CoveringAggInput::Column { key_pos,.. } if key_pos==position),
+        ) || slots.iter().zip(&slot_inputs).any(|(slot, input)| {
+            !matches!(
+                slot.kind(),
+                Some(
+                    super::aggregate::AggregateKind::Count
+                        | super::aggregate::AggregateKind::CountDistinct
+                )
+            ) && matches!(input,CoveringAggInput::Column { key_pos,.. } if key_pos==position)
+        })
+    });
     Ok(CoveringIndexAggregateSpec {
+        float_restorer,
         slots,
         slot_inputs,
         slot_fixed_scales,
@@ -3311,7 +3421,7 @@ pub(in crate::engine::executor::select) fn scan_covering_index_aggregate_leaf_id
                             txn,
                         )
                     })?;
-                state.consume(spec, entries, &visible)
+                state.consume(spec, entries, &visible, db, txn)
             },
         )?;
         if complete {
@@ -3401,6 +3511,8 @@ impl CoveringStreamingState {
         spec: &CoveringIndexAggregateSpec,
         entries: &[(&IndexKey, RowId)],
         visible: &[bool],
+        db: &Database,
+        txn: TxnView,
     ) -> Result<(), QueryError> {
         let visible_count = visible.iter().filter(|visible| **visible).count();
         self.native_rows = self.native_rows.saturating_add(visible_count as u64);
@@ -3426,18 +3538,34 @@ impl CoveringStreamingState {
                     key_values: Vec::new(),
                     accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
                 });
-            for ((key, _row_id), is_visible) in entries.iter().zip(visible.iter()) {
+            for ((key, row_id), is_visible) in entries.iter().zip(visible.iter()) {
                 if *is_visible {
-                    update_covering_state(spec, key, state)?;
+                    if !spec.float_restorer.needs_restore(key) {
+                        update_covering_state(spec, key, state)?;
+                        continue;
+                    }
+                    let Some(key) = spec.float_restorer.key_for_row(db, txn, *row_id, key)? else {
+                        continue;
+                    };
+                    update_covering_state(spec, &key, state)?;
                 }
             }
             return Ok(());
         }
-        for ((key, _row_id), is_visible) in entries.iter().zip(visible.iter()) {
+        for ((key, row_id), is_visible) in entries.iter().zip(visible.iter()) {
             if !*is_visible {
                 continue;
             }
-            let key: &IndexKey = *key;
+            let restored;
+            let key: &IndexKey = if spec.float_restorer.needs_restore(key) {
+                let Some(value) = spec.float_restorer.key_for_row(db, txn, *row_id, key)? else {
+                    continue;
+                };
+                restored = value;
+                &restored
+            } else {
+                *key
+            };
             // Hot loop: build the per-row group_key once and reuse it
             // for both the streaming compare path and the hash insert
             // path. The Vec allocation here is the same as the legacy
@@ -3710,7 +3838,7 @@ pub(in crate::engine::executor::select) fn scan_covering_index_aggregate_page_ra
                         txn,
                     )
                 })?;
-            state.consume(spec, entries, &visible)
+            state.consume(spec, entries, &visible, db, txn)
         },
     )?;
     Ok(state.finish(spec))
@@ -3929,6 +4057,8 @@ pub(super) fn index_min_max_value(
                 format!("MIN/MAX pushdown column {col} missing on table"),
             )
         })?;
+    let projected_column = table.schema.column_index(col)?;
+    let float_restorer = IndexFloatValueRestorer::new(table, index, Some(&[projected_column]));
     const CHUNK: usize = 256;
     let heap = db.cached_heap_handle(table.schema.id)?;
     if reverse {
@@ -3943,6 +4073,16 @@ pub(super) fn index_min_max_value(
                 if !db.is_index_entry_version_visible(&table.schema, index, key, *row_id, txn)? {
                     continue;
                 }
+                let restored;
+                let key = if float_restorer.needs_restore(key) {
+                    let Some(value) = float_restorer.key_for_row(db, txn, *row_id, key)? else {
+                        continue;
+                    };
+                    restored = value;
+                    &restored
+                } else {
+                    key
+                };
                 if let Some(part) = key.0.get(col_idx) {
                     let v = part.to_value(&table_col.data_type);
                     if !matches!(v, Value::Null) {
@@ -3965,10 +4105,20 @@ pub(super) fn index_min_max_value(
                 &chunk,
                 txn,
             )?;
-            for ((key, _row_id), visible) in chunk.into_iter().zip(visible_mask.into_iter()) {
+            for ((key, row_id), visible) in chunk.into_iter().zip(visible_mask.into_iter()) {
                 if !visible {
                     continue;
                 }
+                let restored;
+                let key = if float_restorer.needs_restore(&key) {
+                    let Some(value) = float_restorer.key_for_row(db, txn, row_id, &key)? else {
+                        continue;
+                    };
+                    restored = value;
+                    &restored
+                } else {
+                    &key
+                };
                 if let Some(part) = key.0.get(col_idx) {
                     let v = part.to_value(&table_col.data_type);
                     if !matches!(v, Value::Null) {
@@ -3980,7 +4130,264 @@ pub(super) fn index_min_max_value(
     }
 }
 
+/// Equality-normalized float keys omit the sign of zero. Recover only those
+/// projected cells from the visible heap version; other keys stay index-only.
+pub(super) struct IndexFloatValueRestorer {
+    schema: Arc<TableSchema>,
+    positions: Vec<(usize, usize)>,
+}
+
+enum FloatRestoreRows {
+    Ordered {
+        rows: Vec<(RowId, Vec<Value>)>,
+        cursor: std::cell::Cell<usize>,
+        reverse: bool,
+    },
+    Scattered(crate::util::fast_hash::AhHashMap<RowId, Vec<Value>>),
+}
+
+impl FloatRestoreRows {
+    fn get(&self, id: RowId) -> Option<&[Value]> {
+        match self {
+            Self::Scattered(rows) => rows.get(&id).map(Vec::as_slice),
+            Self::Ordered {
+                rows,
+                cursor,
+                reverse,
+            } => {
+                let current = cursor.get();
+                let position = if rows.get(current).is_some_and(|(row, _)| *row == id) {
+                    current
+                } else {
+                    rows.binary_search_by_key(&id, |(row, _)| *row).ok()?
+                };
+                cursor.set(if *reverse {
+                    position.saturating_sub(1)
+                } else {
+                    position + 1
+                });
+                Some(rows[position].1.as_slice())
+            }
+        }
+    }
+}
+
+pub(crate) struct IndexFloatRestoreBatch {
+    values: FloatRestoreRows,
+    positions: Vec<usize>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl IndexFloatValueRestorer {
+    fn new(table: &PlanTable, index: &IndexSchema, projection: Option<&[usize]>) -> Self {
+        let positions = index
+            .effective_columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(key_pos, name)| {
+                let column = table.schema.column_index(name).ok()?;
+                (matches!(
+                    table.schema.columns[column].data_type,
+                    DataTypeKind::Float { .. } | DataTypeKind::Double { .. }
+                ) && projection.is_none_or(|columns| columns.contains(&column)))
+                .then_some((key_pos, column))
+            })
+            .collect();
+        Self {
+            schema: Arc::clone(&table.schema),
+            positions,
+        }
+    }
+
+    #[inline]
+    fn needs_restore(&self, key: &IndexKey) -> bool {
+        self.positions.iter().any(|(position, _)| {
+            matches!(
+                key.0.get(*position),
+                Some(KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000))
+            )
+        })
+    }
+
+    fn key_for_row<'a>(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        row_id: RowId,
+        key: &'a IndexKey,
+    ) -> Result<Option<std::borrow::Cow<'a, IndexKey>>, QueryError> {
+        let zero_positions: smallvec::SmallVec<[(usize, usize); 4]> = self
+            .positions
+            .iter()
+            .copied()
+            .filter(|(position, _)| {
+                matches!(
+                    key.0.get(*position),
+                    Some(KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000))
+                )
+            })
+            .collect();
+        if zero_positions.is_empty() {
+            return Ok(Some(std::borrow::Cow::Borrowed(key)));
+        }
+        let columns: smallvec::SmallVec<[usize; 4]> =
+            zero_positions.iter().map(|(_, column)| *column).collect();
+        let Some(values) = db.read_row_columns(&self.schema, row_id, txn, &columns)? else {
+            return Ok(None);
+        };
+        crate::engine::executor::select::analyze_stats::add_range_scan_work(0, 1, 1);
+        Ok(Self::restore_values(
+            key,
+            zero_positions
+                .iter()
+                .map(|(position, _)| *position)
+                .zip(values.iter()),
+        ))
+    }
+
+    fn restore_values<'key, 'value>(
+        key: &'key IndexKey,
+        values: impl Iterator<Item = (usize, &'value Value)>,
+    ) -> Option<std::borrow::Cow<'key, IndexKey>> {
+        let mut restored: Option<IndexKey> = None;
+        for (position, value) in values {
+            if !matches!(
+                key.0.get(position),
+                Some(KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000))
+            ) {
+                continue;
+            }
+            let part = match value {
+                Value::Float(value) if *value == 0.0 => {
+                    KeyPart::Float32(crate::util::ordered_float::f32_to_order_u32(*value))
+                }
+                Value::Double(value) if *value == 0.0 => {
+                    KeyPart::Float64(crate::util::ordered_float::f64_to_order_u64(*value))
+                }
+                _ => return None,
+            };
+            if key.0.get(position) != Some(&part) {
+                restored.get_or_insert_with(|| key.clone()).0[position] = part;
+            }
+        }
+        Some(match restored {
+            Some(key) => std::borrow::Cow::Owned(key),
+            None => std::borrow::Cow::Borrowed(key),
+        })
+    }
+
+    fn key_for_batch_row<'a>(
+        &self,
+        row_id: RowId,
+        key: &'a IndexKey,
+        batch: &IndexFloatRestoreBatch,
+    ) -> Option<std::borrow::Cow<'a, IndexKey>> {
+        let values = batch.values.get(row_id)?;
+        Self::restore_values(key, batch.positions.iter().copied().zip(values.iter()))
+    }
+
+    fn prepare_batch<'a>(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        entries: impl Iterator<Item = (&'a IndexKey, RowId)> + Clone,
+        heap: impl FnOnce() -> Result<HeapHandle, QueryError>,
+    ) -> Result<Option<IndexFloatRestoreBatch>, QueryError> {
+        if self.positions.is_empty() {
+            return Ok(None);
+        }
+        let count = entries
+            .clone()
+            .filter(|(key, _)| self.needs_restore(key))
+            .count();
+        if count < 8 {
+            return Ok(None);
+        }
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        // Optional admission must not latch terminal query OOM on refusal.
+        let Some(mut charge) = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::StorageScratch,
+            self.positions.len().saturating_mul(64),
+        ) else {
+            return Ok(None);
+        };
+        let selected: Vec<(usize, usize)> = self
+            .positions
+            .iter()
+            .copied()
+            .filter(|(position, _)| {
+                entries.clone().any(|(key, _)| {
+                    matches!(
+                        key.0.get(*position),
+                        Some(
+                            KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000)
+                        )
+                    )
+                })
+            })
+            .collect();
+        let bytes_per_row = 128usize.saturating_add(
+            selected
+                .len()
+                .saturating_mul(2 * std::mem::size_of::<Value>()),
+        );
+        let Some(mut rows_charge) = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::StorageScratch,
+            count.saturating_mul(bytes_per_row),
+        ) else {
+            return Ok(None);
+        };
+        charge.absorb(&mut rows_charge);
+        let mut ids: Vec<RowId> = entries
+            .filter_map(|(key, id)| self.needs_restore(key).then_some(id))
+            .collect();
+        let ascending = ids.windows(2).all(|pair| pair[0] <= pair[1]);
+        let descending = !ascending && ids.windows(2).all(|pair| pair[0] >= pair[1]);
+        ids.sort_unstable();
+        ids.dedup();
+        let columns: Vec<usize> = selected.iter().map(|(_, column)| *column).collect();
+        let mut values =
+            db.read_row_columns_many_with_handle(&heap()?, &self.schema, &ids, txn, &columns)?;
+        let page_probes = 1 + ids
+            .windows(2)
+            .filter(|pair| pair[0].page_id != pair[1].page_id)
+            .count();
+        crate::engine::executor::select::analyze_stats::add_range_scan_work(
+            0,
+            values.len() as u64,
+            page_probes as u64,
+        );
+        let values = if ascending || descending {
+            // Current-version hits and old-version fallbacks can arrive in
+            // separate runs. Restore RowId order before cursor lookups.
+            if !values.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+                values.sort_unstable_by_key(|(id, _)| *id);
+            }
+            let cursor = std::cell::Cell::new(if descending {
+                values.len().saturating_sub(1)
+            } else {
+                0
+            });
+            FloatRestoreRows::Ordered {
+                rows: values,
+                cursor,
+                reverse: descending,
+            }
+        } else {
+            FloatRestoreRows::Scattered(values.into_iter().collect())
+        };
+        Ok(Some(IndexFloatRestoreBatch {
+            values,
+            positions: selected.iter().map(|(position, _)| *position).collect(),
+            _charge: charge,
+        }))
+    }
+}
+
 pub(crate) struct IndexEntryProjector {
+    float_restorer: IndexFloatValueRestorer,
     pub(super) metas: Vec<ColMetaRef>,
     pub(super) key_positions: Vec<Option<usize>>,
     pub(super) data_types: Vec<DataTypeKind>,
@@ -4003,6 +4410,7 @@ impl IndexEntryProjector {
         let columns: Vec<usize> = projection
             .map(|p| p.to_vec())
             .unwrap_or_else(|| logical_visible_column_indices(&table.schema));
+        let float_restorer = IndexFloatValueRestorer::new(table, index, Some(&columns));
         let mut metas = Vec::with_capacity(columns.len());
         let mut key_positions = Vec::with_capacity(columns.len());
         let mut data_types = Vec::with_capacity(columns.len());
@@ -4015,6 +4423,7 @@ impl IndexEntryProjector {
             metas.push(intern_col_meta(ColMeta::from_table(table, col_idx)));
         }
         Self {
+            float_restorer,
             metas,
             key_positions,
             data_types,
@@ -4040,6 +4449,58 @@ impl IndexEntryProjector {
             return None;
         }
         self.key_positions.first().copied().flatten()
+    }
+
+    pub(crate) fn prepare_float_rows<'a>(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        entries: impl Iterator<Item = (&'a IndexKey, RowId)> + Clone,
+        heap: impl FnOnce() -> Result<HeapHandle, QueryError>,
+    ) -> Result<Option<IndexFloatRestoreBatch>, QueryError> {
+        self.float_restorer.prepare_batch(db, txn, entries, heap)
+    }
+
+    pub(in crate::engine::executor::select) fn project_visible(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        row_id: RowId,
+        key: &IndexKey,
+        batch: Option<&IndexFloatRestoreBatch>,
+    ) -> Result<Option<PlanRow>, QueryError> {
+        if !self.float_restorer.needs_restore(key) {
+            return Ok(Some(self.project(key)));
+        }
+        let key = match batch {
+            Some(batch) => self.float_restorer.key_for_batch_row(row_id, key, batch),
+            None => self.float_restorer.key_for_row(db, txn, row_id, key)?,
+        };
+        Ok(key.map(|key| self.project(&key)))
+    }
+
+    pub(crate) fn append_visible_to_accumulators(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        row_id: RowId,
+        key: &IndexKey,
+        batch: Option<&IndexFloatRestoreBatch>,
+        accumulators: &mut [crate::engine::executor::vec::batch::ColumnAccumulator],
+    ) -> Result<bool, QueryError> {
+        if !self.float_restorer.needs_restore(key) {
+            self.append_to_accumulators(key, accumulators);
+            return Ok(true);
+        }
+        let key = match batch {
+            Some(batch) => self.float_restorer.key_for_batch_row(row_id, key, batch),
+            None => self.float_restorer.key_for_row(db, txn, row_id, key)?,
+        };
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        self.append_to_accumulators(&key, accumulators);
+        Ok(true)
     }
 
     pub(in crate::engine::executor::select) fn project(&self, key: &IndexKey) -> PlanRow {
@@ -5439,7 +5900,7 @@ pub(super) fn execute_spatial_scan(
             if matches!(value, Value::Null) {
                 return Ok(Vec::new());
             }
-            let Value::Geometry(bytes) = value else {
+            let (Value::Geometry(bytes) | Value::Bytes(bytes)) = value else {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_GIS_INVALID_DATA,
                     "Invalid GIS data provided to the spatial index probe.",

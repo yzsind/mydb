@@ -652,21 +652,20 @@ pub(super) fn try_execute_ordered_index_distinct_topk(
                 &entries,
                 txn,
             )?;
-            entries
-                .into_iter()
-                .zip(visible)
-                .filter_map(|((key, row_id), visible)| {
-                    if !visible
-                        || seen_row_ids
-                            .as_mut()
-                            .is_some_and(|seen| !seen.insert(row_id))
-                    {
-                        None
-                    } else {
-                        Some(projector.project(&key))
-                    }
-                })
-                .collect::<Vec<_>>()
+            let mut candidates = Vec::with_capacity(entries.len());
+            for ((key, row_id), visible) in entries.into_iter().zip(visible) {
+                if !visible
+                    || seen_row_ids
+                        .as_mut()
+                        .is_some_and(|seen| !seen.insert(row_id))
+                {
+                    continue;
+                }
+                if let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? {
+                    candidates.push(row);
+                }
+            }
+            candidates
         } else {
             let entries = cursor.next_chunk(CHUNK)?;
             if entries.is_empty() {

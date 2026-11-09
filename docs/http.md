@@ -2,8 +2,9 @@
 
 mydb can call HTTP and HTTPS endpoints from SQL expressions. These functions
 return native JSON and require the global `HTTP_USE` privilege. HTTP calls are
-enabled by default and can reach public networks, private networks, loopback,
-and link-local addresses unless an administrator supplies an explicit policy.
+enabled by default. Without an explicit egress policy, public destinations are
+permitted, while loopback, private, link-local and other reserved destinations
+are denied. Private services require an explicit origin and IP-network allowance.
 
 ```sql
 GRANT HTTP_USE ON *.* TO 'integration'@'localhost';

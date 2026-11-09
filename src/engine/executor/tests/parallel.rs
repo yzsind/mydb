@@ -2537,6 +2537,7 @@ fn execution_context_carries_rollup_window_topk_hint_to_worker() {
     let hint = crate::engine::executor::select::plan::RollupWindowTopKHint {
         partition_by: vec![crate::parser::Expr::Identifier("g".into())],
         order_by: vec![crate::parser::OrderBy {
+            names_bound: false,
             expr: crate::parser::Expr::Identifier("s".into()),
             asc: false,
             nulls_first: None,

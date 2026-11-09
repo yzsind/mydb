@@ -14,7 +14,7 @@ SHA2(str, hash_length)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
 | `hash_length` | Yes | Integer | Digest bits: 224, 256, 384 or 512; 0 means 256; unsupported lengths return NULL |
 
 ## Return Value
@@ -35,8 +35,8 @@ b50d3038fdd554ed9b9d694bc52f73d9899d2576ed6d48899402b5923284edf1
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MD5`](md5.md), [`SHA1`](sha1.md).

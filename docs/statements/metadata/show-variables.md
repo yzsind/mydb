@@ -17,6 +17,12 @@ Shows session or global system variables.
 - SESSION is the default; LOCAL is a synonym scope for SESSION.
 - Values come from the unified sysvar registry/backend; sensitive values are handled according to privileges and display policy.
 
+## Result and Visibility Details
+
+LIKE matches Variable_name; WHERE evaluates displayed strings. SESSION is the default and LOCAL is its synonym. This view reports values, not whether a variable is writable in that scope. SET validates mutability and scope separately; see the system-variable registry reference in configuration.
+
+See [ordered columns and wire types](result-columns.md#show-variables). Reading this metadata does not itself commit user DML.
+
 ## Examples
 
 ```sql

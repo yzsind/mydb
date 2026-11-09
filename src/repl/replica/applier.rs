@@ -345,14 +345,14 @@ impl Applier {
                 .any(|(frame, _)| payload_contains_commit(&frame.payload));
         let sync_target = {
             let mut log = self.log.lock();
-            for (frame, offset) in &decoded {
+            for (frame, offset) in &mut decoded {
                 if frame.header.lsn < self.local_wal_next {
                     continue;
                 }
-                // One clone per frame (down from two): append consumes
-                // an owned payload, the online-apply pass below reuses
-                // the decoded original.
-                log.append_replication_frame(
+                // Reuse the decoded payload for online apply. Native append
+                // removes foreign binlog references in place, avoiding a
+                // second owned copy of a potentially wide transaction batch.
+                log.append_physical_replication_frame(
                     &chunk.bytes[*offset..*offset + frame.frame_len],
                     frame,
                 )?;

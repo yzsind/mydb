@@ -1354,6 +1354,7 @@ impl Database {
             stats.explicit_histograms = table.stats.explicit_histograms.clone();
             let mut candidate = (*table).clone();
             candidate.stats = stats;
+            candidate.bind_statistics_definitions();
             self.publish_stats_candidate_checked(&table, candidate, !is_explicit_analyze)
         })();
         match publication {
@@ -1912,6 +1913,7 @@ impl Database {
             .collect();
 
         let stats = TableStats {
+            definition_bindings: Default::default(),
             analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count,
@@ -2661,6 +2663,7 @@ impl Database {
         }
 
         Ok(TableStats {
+            definition_bindings: Default::default(),
             analyze_revision: 0,
             explicit_histograms: std::collections::BTreeMap::new(),
             row_count: live_rows.len() as u64,

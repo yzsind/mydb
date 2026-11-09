@@ -14,7 +14,7 @@ WEEKOFYEAR(date [, mode])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `date` | Yes | date, time, datetime, or the corresponding text/numeric value | The 1st argument; the meaning is determined by the function syntax and description |
+| `date` | Yes | date, time, datetime, or the corresponding text/numeric value | Date or datetime to process. |
 | `mode` | No | Compatibility argument | Evaluated, but the calculation always uses mode 3; a supplied SQL NULL returns NULL |
 
 ## Return Value
@@ -35,8 +35,10 @@ Result:
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [week modes](README.md#week-modes) for the first-day/first-week rules and cross-year behavior.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DAYOFWEEK`](dayofweek.md), [`WEEKDAY`](weekday.md), [`WEEK`](week.md), [`YEARWEEK`](yearweek.md).

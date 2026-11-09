@@ -41,6 +41,13 @@ pub(crate) fn default_database_name() -> String {
 }
 
 pub fn table_key(database: &str, table: &str) -> String {
+    if database.contains('.') || table.contains('.') {
+        let database = normalize_name(database);
+        let table = normalize_name(table);
+        // NUL cannot appear in SQL identifiers. A byte length keeps the two
+        // components injective without reinterpreting literal quote characters.
+        return format!("\0{}:{database}{table}", database.len());
+    }
     if is_already_normalized(database) && is_already_normalized(table) {
         let mut key = String::with_capacity(database.len() + 1 + table.len());
         key.push_str(database);
@@ -70,6 +77,10 @@ pub fn event_key(database: &str, name: &str) -> String {
 }
 
 pub(crate) fn normalize_table_key(current_database: &str, name: &str) -> String {
+    if name.starts_with('\0') || current_database.contains('.') {
+        let (database, table) = split_table_name(current_database, name);
+        return table_key(&database, &table);
+    }
     if let Some(dot) = name.find('.') {
         let db = &name[..dot];
         let tbl = &name[dot + 1..];
@@ -90,6 +101,17 @@ pub(crate) fn normalize_table_key(current_database: &str, name: &str) -> String 
 }
 
 pub fn split_table_name(current_database: &str, name: &str) -> (String, String) {
+    if let Some(encoded) = name.strip_prefix('\0') {
+        if let Some((length, components)) = encoded.split_once(':') {
+            if let Ok(length) = length.parse::<usize>() {
+                if let (Some(database), Some(table)) =
+                    (components.get(..length), components.get(length..))
+                {
+                    return (normalize_name(database), normalize_name(table));
+                }
+            }
+        }
+    }
     let mut parts = name
         .split('.')
         .map(str::trim)
@@ -547,4 +569,27 @@ pub(crate) fn migrate_catalog(mut catalog: Catalog) -> Catalog {
     super::schema::build_fk_runtime(&mut catalog);
     catalog.version = CATALOG_VERSION;
     catalog
+}
+
+#[cfg(test)]
+mod report1107_tests {
+    use super::*;
+    #[test]
+    fn catalog_keys_preserve_identifier_boundaries() {
+        for (database, table) in [
+            ("d.e", "f"),
+            ("d", "e.f"),
+            ("d`e", "f.g"),
+            ("d`e", "f"),
+            ("d", "f"),
+        ] {
+            let key = table_key(database, table);
+            assert_eq!(
+                split_table_name("test", &key),
+                (database.to_string(), table.to_string())
+            );
+            assert_eq!(normalize_table_key("test", &key), key);
+        }
+        assert_ne!(table_key("d.e", "f"), table_key("d", "e.f"));
+    }
 }

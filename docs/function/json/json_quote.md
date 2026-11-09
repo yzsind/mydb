@@ -34,4 +34,4 @@ Result: "mydb"
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAY`](json_array.md), [`JSON_OBJECT`](json_object.md), [`JSON_UNQUOTE`](json_unquote.md).

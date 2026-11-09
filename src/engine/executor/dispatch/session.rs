@@ -151,7 +151,10 @@ pub(in crate::engine::executor) fn apply_sql_select_limit(
     stmt: &mut crate::parser::Select,
 ) {
     let cap = session.sysvars.sql_select_limit;
-    if cap == u64::MAX || stmt.limit.is_some() {
+    if cap == u64::MAX
+        || stmt.limit.is_some()
+        || crate::engine::executor::cte::cte_materialization_active()
+    {
         return;
     }
     // `LimitValue::Rows` stores a `usize`; clamp to its range.

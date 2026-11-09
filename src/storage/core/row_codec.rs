@@ -4162,23 +4162,7 @@ fn put_fixed_through_sink<S: RowDecodeSink>(
         OP_YEAR => sink.put_year(dest, bytes[0]),
         OP_TIME => sink.put_time(dest, read_signed_le_width(bytes)? * temporal_quantum(scale)),
         OP_DATETIME => sink.put_datetime(dest, decode_datetime_micros(bytes, scale)?),
-        OP_TIMESTAMP => {
-            let width = bytes.len();
-            let mut buf = [0u8; 8];
-            buf[..width].copy_from_slice(bytes);
-            if bytes[width - 1] & 0x80 != 0 {
-                for byte in &mut buf[width..] {
-                    *byte = 0xff;
-                }
-            }
-            let stored = i64::from_le_bytes(buf);
-            let micros = if stored == signed_min_for_width(width) {
-                ZERO_DATETIME_SENTINEL
-            } else {
-                stored * temporal_quantum(scale)
-            };
-            sink.put_timestamp(dest, micros);
-        }
+        OP_TIMESTAMP => sink.put_timestamp(dest, decode_datetime_micros(bytes, scale)?),
         OP_FIXED_BYTES => sink.put_bytes(dest, bytes),
         OP_VECTOR_FIXED => sink.put_vector(dest, bytes),
         _ => sink.put_null(dest),
@@ -4861,16 +4845,7 @@ fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, Query
             read_signed_le_width(input)? * temporal_quantum(*fsp),
         )),
         ColumnKind::DateTime { fsp } => Ok(Value::DateTime(decode_datetime_micros(input, *fsp)?)),
-        ColumnKind::Timestamp { fsp } => {
-            let stored = read_signed_le_width(input)?;
-            Ok(Value::Timestamp(
-                if stored == signed_min_for_width(input.len()) {
-                    ZERO_DATETIME_SENTINEL
-                } else {
-                    stored * temporal_quantum(*fsp)
-                },
-            ))
-        }
+        ColumnKind::Timestamp { fsp } => Ok(Value::Timestamp(decode_datetime_micros(input, *fsp)?)),
         ColumnKind::Year => Ok(Value::Year(input[0])),
         ColumnKind::FixedBytes { .. } => Ok(Value::Bytes(input.to_vec())),
         ColumnKind::Bit { .. } => {
@@ -5520,7 +5495,7 @@ fn value_to_string_bytes(v: &Value) -> Vec<u8> {
         Value::Double(x) => x.to_string().into_bytes(),
         Value::Null => Vec::new(),
         Value::Json(b) => crate::engine::json::unquote_text(b).into_bytes(),
-        Value::Geometry(b) => crate::engine::geo::to_text(b).into_bytes(),
+        Value::Geometry(b) => b.clone(),
         Value::Vector(b) => crate::engine::vector::to_text(b).into_bytes(),
         Value::DecimalCompact(..)
         | Value::Decimal128(..)
@@ -6857,11 +6832,18 @@ fn parse_year(s: &str) -> Result<u8, QueryError> {
     crate::util::temporal::year_byte_from_int(v)
 }
 
-// Keep the storage codec's internal exports while sharing the bit transform
-// with ORDER BY key encoding. Callers own signed-zero and NaN policy.
-pub(crate) use crate::util::ordered_float::{
-    f32_from_order_u32, f32_to_order_u32, f64_from_order_u64, f64_to_order_u64,
-};
+pub(crate) use crate::util::ordered_float::{f32_from_order_u32, f64_from_order_u64};
+
+// SQL equality identifies both signed zeros, including every stored/probe key.
+#[inline]
+pub(crate) fn f32_to_order_u32(value: f32) -> u32 {
+    crate::util::ordered_float::f32_to_order_u32(if value == 0.0 { 0.0 } else { value })
+}
+
+#[inline]
+pub(crate) fn f64_to_order_u64(value: f64) -> u64 {
+    crate::util::ordered_float::f64_to_order_u64(if value == 0.0 { 0.0 } else { value })
+}
 
 /// Test-only convenience: a codec capable of round-tripping rows that
 /// look like `[BigInt, VarString, VarString, ...]` (up to 16 columns).
@@ -6899,6 +6881,17 @@ pub(crate) fn test_default_codec() -> std::sync::Arc<RowCodec> {
 #[cfg(test)]
 mod row_codec_tests {
     use super::*;
+
+    #[test]
+    fn final_1107_tagged_timestamp_fixed_codec_roundtrip() {
+        for fsp in 0..=6 {
+            let kind=ColumnKind::Timestamp {fsp};
+            let value=Value::Timestamp(crate::types::encode_tagged_datetime(2024,0,0,0,0,0,0).unwrap());
+            let mut bytes=vec![0;fixed_width_for_kind(&kind).unwrap()];
+            encode_fixed_for_kind(&kind,&value,&mut bytes).unwrap();
+            assert_eq!(decode_fixed_for_kind(&kind,&bytes).unwrap(),value,"fsp={fsp}");
+        }
+    }
 
     fn round_trip(values: Vec<Value>) {
         let mut buf = Vec::new();
@@ -7604,7 +7597,7 @@ mod row_codec_tests {
         ] {
             let enc = f32_to_order_u32(v);
             let dec = f32_from_order_u32(enc);
-            assert_eq!(dec.to_bits(), v.to_bits());
+            assert_eq!(dec.to_bits(), if v == 0.0 { 0 } else { v.to_bits() });
         }
         // Order preservation: encode(-1.5) < encode(-0.5) < encode(0.5) < encode(1.5).
         let neg_big = f32_to_order_u32(-1.5);

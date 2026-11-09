@@ -43,6 +43,13 @@ use super::sublink::{
 /// nothing to do (the LEFT JOIN's derived no longer contains an
 /// `Expr::Subquery`).
 pub fn decorrelate_scalar_subqueries(db: &Database, select: &mut Select) -> usize {
+    if select.group_by_modifier != crate::parser::GroupByModifier::None
+        || !select.grouping_sets.is_empty()
+    {
+        // Correlation consumes the emitted group key, including NULL subtotal
+        // keys. A join below aggregation cannot preserve that scope.
+        return 0;
+    }
     // Validate the original correlated references before lifting them out of
     // a grouped query. Derived inputs later become CTE scans and lose their
     // grouping-key provenance, so preserve the proven group-constant result
@@ -164,6 +171,19 @@ fn try_rewrite_scalar(state: &mut RewriteState, expr: &mut Expr) -> bool {
     if info.equality_pairs.is_empty() {
         return false;
     }
+    let inner_sources = collect_outer_base_sources(sub_box);
+    if !info.equality_pairs.iter().all(|pair| {
+        let outer_expr = match &pair.outer.qualifier {
+            Some(q) => Expr::CompoundIdentifier(vec![q.clone(), pair.outer.column.clone()]),
+            None => Expr::Identifier(pair.outer.column.clone()),
+        };
+        let inner = super::column_comparison_domain(state.db, &inner_sources, &pair.inner_expr);
+        inner.is_some()
+            && inner == super::column_comparison_domain(state.db, &state.outer_sources, &outer_expr)
+    }) {
+        return false;
+    }
+
     if sub_box.projection.len() != 1 {
         return false;
     }
@@ -204,6 +224,21 @@ fn try_rewrite_scalar(state: &mut RewriteState, expr: &mut Expr) -> bool {
         Some(r) => r,
         None => return false,
     };
+    // A source may already have been lowered to a synthetic CTE relation
+    // whose output names are unavailable to the syntactic scope collector.
+    // Never publish a standalone aggregate with unresolved residual outer
+    // references; the Apply evaluator can still bind the original subquery.
+    if rewrite
+        .derived_join
+        .derived
+        .as_ref()
+        .and_then(SubQuery::as_select)
+        .is_none_or(|body| {
+            crate::planner::validate_select_column_references(state.db, body).is_err()
+        })
+    {
+        return false;
+    }
     add_outer_key_domain(state, &info.equality_pairs, id, &mut rewrite.derived_join);
     *expr = if state.aggregate_replacements {
         Expr::Function {
@@ -483,11 +518,10 @@ fn correlated_ref_matches_source(
 }
 
 fn source_matches_qualifier(source: &TableRef, qualifier: &str) -> bool {
-    source
-        .alias
-        .as_deref()
-        .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
-        || source.name.eq_ignore_ascii_case(qualifier)
+    if let Some(alias) = &source.alias {
+        return alias.eq_ignore_ascii_case(qualifier);
+    }
+    source.name.eq_ignore_ascii_case(qualifier)
         || source
             .name
             .rsplit('.')
@@ -878,6 +912,10 @@ fn is_decorrelatable_inner(expr: &Expr, saw_aggregate: bool) -> bool {
             // already rejected by `info.aggregate_in_projection`, but
             // be defensive.
             !saw_aggregate
+                && !matches!(
+                    name.to_ascii_uppercase().as_str(),
+                    "BIT_AND" | "BIT_OR" | "BIT_XOR"
+                )
         }
         Expr::Binary { left, op, right } => {
             use crate::parser::BinaryOp::*;

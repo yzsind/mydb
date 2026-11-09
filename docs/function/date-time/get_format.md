@@ -19,7 +19,7 @@ GET_FORMAT(type, locale)
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns one of the predefined format strings in the category table, or NULL for an unknown style. The style selects a pattern, not lc_time_names or a time zone. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -31,8 +31,10 @@ Result: %m.%d.%Y
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [format specifiers](README.md#format-specifiers) and [predefined formats](README.md#predefined-formats). A SQL NULL format argument returns NULL.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DATE_FORMAT`](date_format.md), [`TIME_FORMAT`](time_format.md), [`STR_TO_DATE`](str_to_date.md).

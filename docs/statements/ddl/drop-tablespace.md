@@ -13,7 +13,7 @@ mydb does not currently support TABLESPACE; valid statements return error 1235. 
 
 ## Behavior and Limitations
 
-- Valid statements uniformly return 1235 (ER_NOT_SUPPORTED_YET), including the case where the target name does not exist.
+- With sufficient statement privileges, recognized valid forms return 1235 (ER_NOT_SUPPORTED_YET), including a nonexistent target. Authentication/authorization errors can precede that unsupported error.
 - No names, attributes, or dedicated catalog views are registered; no compatibility success or warnings are produced.
 - Syntax errors still return parse errors.
 
@@ -28,4 +28,4 @@ DROP UNDO TABLESPACE undo_1;
 
 - [DDL category index](README.md)
 - [Syntax notation](../syntax-conventions.md)
-- [SHOW CREATE TABLE](../metadata/show-create-table.md)
+- [Support and compatibility status](../README.md#support-and-compatibility-status)

@@ -17,6 +17,10 @@ Evaluates one or more expressions and discards the results; it is well suited to
 - Expression, privilege, or memory errors terminate the statement; ordinary computed values are not sent to the client.
 - Cannot contain FROM, WHERE, or a query projection; use SELECT when data must be read.
 
+## Privileges, Results, and Boundaries
+
+Returns OK, with expression warnings in the session diagnostics area. Scalar subqueries inside expressions can read data and need source SELECT privileges even though DO has no FROM clause. Called routines/functions retain their own privileges and side effects. A user variable, sequence value, named lock or remote operation is not restored by ordinary ROLLBACK.
+
 ## Examples
 
 ```sql

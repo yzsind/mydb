@@ -151,12 +151,16 @@ fn bump_load_data_rows(db: &Database, n: u64) {
 // (IGNORE duplicate/constraint). All are reset at the top of every
 // `execute_load_data` and materialised into the info trailer at the end.
 thread_local! {
+    static LOAD_DIAGNOSTIC_ROW: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static LOAD_INPUT_ROWS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LOAD_RECORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LOAD_DELETED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LOAD_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 fn reset_load_counters() {
+    LOAD_DIAGNOSTIC_ROW.with(|row| row.set(0));
+    LOAD_INPUT_ROWS.with(|row| row.set(0));
     LOAD_RECORDS.with(|c| c.set(0));
     LOAD_DELETED.with(|c| c.set(0));
     LOAD_SKIPPED.with(|c| c.set(0));
@@ -277,6 +281,12 @@ pub(super) fn execute_load_data_with_reader(
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             "LOAD DATA requires a nonempty line terminator",
+        ));
+    }
+    if !stmt.is_xml && stmt.field_terminated_by.is_empty() && stmt.field_enclosed_by.is_none() {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "LOAD DATA fixed-row format is not supported",
         ));
     }
     let _warning_scope = crate::engine::api::StatementWarningSinkScope::enter();
@@ -797,6 +807,7 @@ fn execute_load_data_general(
             add_load_records(source_rows.len() as u64);
             for source in source_rows {
                 row_index += 1;
+                LOAD_DIAGNOSTIC_ROW.with(|row| row.set(row_index as u64));
                 crate::engine::cancel::check_cancelled()?;
                 // Build a full-width row seeded with column defaults.
                 let mut row: Vec<Value> = table
@@ -823,21 +834,13 @@ fn execute_load_data_general(
                 } else {
                     // Positional binding for DATA. G11 — column-count mismatch.
                     let field_count = source.len();
-                    if field_count < num_targets {
-                        crate::engine::api::push_statement_warning(
-                            crate::error::ConditionLevel::Warning,
-                            crate::error::catalog::ER_WARN_TOO_FEW_RECORDS,
-                            format!("Row {row_index} doesn't contain data for all columns"),
-                        );
-                    } else if field_count > num_targets {
-                        crate::engine::api::push_statement_warning(
-                            crate::error::ConditionLevel::Warning,
-                            crate::error::catalog::ER_WARN_TOO_MANY_RECORDS,
-                            format!(
-                        "Row {row_index} was truncated; it contained more data than there were \
-                         input columns"
-                    ),
-                        );
+                    if field_count > num_targets
+                        || (field_count < num_targets
+                            && targets[field_count..]
+                                .iter()
+                                .any(|target| matches!(target, LoadTarget::Column(_))))
+                    {
+                        warn_load_field_count(field_count, num_targets)?;
                     }
                     let mut fields = source.into_iter();
                     for target in targets {
@@ -1263,13 +1266,17 @@ fn read_general_data_rows(
         // Covers field vectors, byte copies and the row-list backing storage,
         // even for empty records and one-byte empty fields.
         charge.try_grow(actual.len().max(1).saturating_mul(128))?;
-        rows.push(
-            parser
-                .parse_row_raw(actual)
-                .into_iter()
-                .map(|v| (None, v))
-                .collect(),
-        );
+        let mut fields = parser.parse_row_raw(actual);
+        if fields.len() == num_fields + 1
+            && fields
+                .last()
+                .is_some_and(|field| field.as_ref().is_some_and(Vec::is_empty))
+            && !parser.field_terminator.is_empty()
+            && actual.ends_with(&parser.field_terminator)
+        {
+            fields.pop();
+        }
+        rows.push(fields.into_iter().map(|value| (None, value)).collect());
         if bytes >= 64 * 1024 {
             return Ok((rows, charge, false));
         }
@@ -2121,6 +2128,8 @@ fn ignore_load_can_replay(err: &QueryError) -> bool {
             crate::error::catalog::ER_OUT_OF_RESOURCES,
             crate::error::catalog::ER_BAD_NULL_ERROR,
             crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE,
+            crate::error::catalog::ER_WARN_TOO_FEW_RECORDS,
+            crate::error::catalog::ER_WARN_TOO_MANY_RECORDS,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
             crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
@@ -2220,6 +2229,43 @@ fn execute_load_data_ignore_parallel(
 
 #[allow(clippy::too_many_arguments)]
 fn execute_load_data_fast_parallel(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    table_name: &str,
+    table: &TableSchema,
+    column_indexes: &[usize],
+    full_width_identity: bool,
+    coercion_plan: &[CoercionOp],
+    format: FastLoadDataFormat,
+    reader: &mut BufReader<Box<dyn Read>>,
+    num_fields: usize,
+    degree: usize,
+    partition_filter: Option<&[u64]>,
+    use_shadow_generation: bool,
+    ignore_trial: bool,
+) -> Result<QueryResponse, QueryError> {
+    super::tx::execute_in_transaction_with_session(db, session, |db, session, _txn| {
+        execute_load_data_fast_parallel_inner(
+            db,
+            session,
+            table_name,
+            table,
+            column_indexes,
+            full_width_identity,
+            coercion_plan,
+            format,
+            reader,
+            num_fields,
+            degree,
+            partition_filter,
+            use_shadow_generation,
+            ignore_trial,
+        )
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_load_data_fast_parallel_inner(
     db: &Arc<Database>,
     session: &mut SessionContext,
     table_name: &str,
@@ -2527,7 +2573,9 @@ fn execute_load_data_fast_parallel(
                     });
                     let mut direct_decode_rows = 0u64;
                     let mut direct_decode_fallback_rows = 0u64;
-                    for line in raw_batch.lines() {
+                    for (offset, line) in raw_batch.lines().enumerate() {
+                        LOAD_DIAGNOSTIC_ROW
+                            .with(|row| row.set(raw_batch.first_row + offset as u64));
                         row_scratch.clear();
                         let direct_payload = match direct_program {
                             Some(program) => program.decode_encode(
@@ -3618,6 +3666,7 @@ impl LoadDataPreparedBatch {
 struct RawLoadDataBatch {
     data: Vec<u8>,
     lines: Vec<(usize, usize)>,
+    first_row: u64,
     memory_charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
 }
 
@@ -3626,6 +3675,7 @@ impl RawLoadDataBatch {
         Self {
             data: Vec::with_capacity(data_bytes),
             lines: Vec::with_capacity(rows),
+            first_row: 0,
             memory_charge: None,
         }
     }
@@ -3966,6 +4016,10 @@ fn execute_load_data_with_conflict(
                             Ok(_) => {}
                             Err(e2) if ignore && e2.is(crate::error::catalog::ER_DUP_ENTRY) => {
                                 add_load_skipped(1);
+                                crate::engine::api::push_statement_condition(
+                                    crate::error::ConditionLevel::Warning,
+                                    &e2,
+                                );
                             }
                             Err(e2)
                                 if ignore
@@ -4376,7 +4430,7 @@ impl CompiledLoadRowProgram {
         let mut payload = self.payload_encoder.begin_row(txn_id, line.len());
         let mut field_idx = 0usize;
         let mut truncation_warnings = 0usize;
-        let mut empty_number_warnings = 0usize;
+        let mut empty_number_warnings = smallvec::SmallVec::<[&str; 4]>::new();
         let mut start = 0usize;
         // Most rows contain no escapes. Reuse one delimiter iterator for the
         // whole row instead of restarting the two-byte search for every field.
@@ -4468,7 +4522,9 @@ impl CompiledLoadRowProgram {
                         parse_decimal_compact_parts_fast(field, *scale)
                     {
                         truncation_warnings += usize::from(discarded);
-                        empty_number_warnings += usize::from(trim_ascii_bytes(field).is_empty());
+                        if trim_ascii_bytes(field).is_empty() {
+                            empty_number_warnings.push(column);
+                        }
                         validate_decimal_compact_parts(
                             magnitude,
                             value_scale,
@@ -4592,8 +4648,8 @@ impl CompiledLoadRowProgram {
         if field_idx != self.num_fields {
             return Ok(None);
         }
-        if start <= line.len() {
-            warn_load_field_count(self.num_fields + 1, self.num_fields);
+        if start < line.len() {
+            warn_load_field_count(self.num_fields + 1, self.num_fields)?;
         }
         for (plan, keys) in self.prepared_indexes.iter().zip(per_index_keys) {
             match (plan, keys) {
@@ -4620,8 +4676,8 @@ impl CompiledLoadRowProgram {
         for _ in 0..truncation_warnings {
             warn_load_decimal_scale();
         }
-        for _ in 0..empty_number_warnings {
-            warn_load_empty_number();
+        for column in empty_number_warnings {
+            warn_load_empty_number("decimal", column)?;
         }
         Ok(Some(payload))
     }
@@ -4793,6 +4849,11 @@ fn parse_raw_chunk_fast(
     if observed != 0 {
         *data_capacity_hint = observed.saturating_add(observed / 4);
     }
+    rows.first_row = LOAD_INPUT_ROWS.with(|input| {
+        let previous = input.get().max(LOAD_DIAGNOSTIC_ROW.with(|row| row.get()));
+        input.set(previous + rows.len() as u64);
+        previous + 1
+    });
     Ok((rows.with_memory_charge(db)?, eof))
 }
 
@@ -4822,6 +4883,7 @@ fn parse_row_fast_single_byte(
     coercion_plan: &[CoercionOp],
     num_fields: usize,
 ) -> Result<Vec<Value>, QueryError> {
+    LOAD_DIAGNOSTIC_ROW.with(|row| row.set(row.get() + 1));
     let mut values = Vec::with_capacity(num_fields);
     parse_row_fast_single_byte_into(line, format, coercion_plan, num_fields, &mut values)?;
     Ok(values)
@@ -4845,7 +4907,7 @@ fn parse_row_fast_single_byte_into(
 
     for field_idx in 0..num_fields {
         if pos > line.len() {
-            warn_load_field_count(field_idx, num_fields);
+            warn_load_field_count(field_idx, num_fields)?;
             return Ok(());
         }
 
@@ -4897,29 +4959,49 @@ fn parse_row_fast_single_byte_into(
             pos = line.len() + 1;
         }
     }
-    if pos <= line.len() {
-        warn_load_field_count(num_fields + 1, num_fields);
+    if pos < line.len() {
+        warn_load_field_count(num_fields + 1, num_fields)?;
     }
 
     Ok(())
 }
 
-fn warn_load_field_count(actual: usize, expected: usize) {
-    if actual != expected {
-        crate::engine::api::push_static_statement_warning(
-            crate::error::ConditionLevel::Warning,
-            if actual < expected {
-                crate::error::catalog::ER_WARN_TOO_FEW_RECORDS
-            } else {
-                crate::error::catalog::ER_WARN_TOO_MANY_RECORDS
-            },
-            if actual < expected {
-                "Row doesn't contain data for all columns"
-            } else {
-                "Row contained more data than input columns"
-            },
-        );
+#[cold]
+fn publish_load_conversion_condition(
+    spec: crate::error::ErrorSpec,
+    message: String,
+) -> Result<(), QueryError> {
+    if load_is_strict() && !LOAD_DECODE_POLICY.with(|policy| policy.get().0) {
+        return Err(spec.error(message));
     }
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        spec,
+        message,
+    );
+    Ok(())
+}
+
+#[inline]
+fn warn_load_field_count(actual: usize, expected: usize) -> Result<(), QueryError> {
+    if actual == expected {
+        return Ok(());
+    }
+    let row = LOAD_DIAGNOSTIC_ROW.with(|row| row.get().max(1));
+    let (spec, message) = if actual < expected {
+        (
+            crate::error::catalog::ER_WARN_TOO_FEW_RECORDS,
+            format!("Row {row} doesn't contain data for all columns"),
+        )
+    } else {
+        (
+            crate::error::catalog::ER_WARN_TOO_MANY_RECORDS,
+            format!(
+                "Row {row} was truncated; it contained more data than there were input columns"
+            ),
+        )
+    };
+    publish_load_conversion_condition(spec, message)
 }
 
 fn unescape_field(field: &[u8]) -> Vec<u8> {
@@ -5019,7 +5101,7 @@ fn coerce_field_borrowed_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<V
         } => {
             if precision.is_some_and(|precision| precision <= 18) {
                 checked_decimal_load_value(
-                    parse_decimal_compact_value(field_bytes, *scale)?,
+                    parse_decimal_compact_value(field_bytes, *scale, column)?,
                     *precision,
                     scale.unwrap_or(0),
                     *unsigned,
@@ -5205,6 +5287,7 @@ fn read_load_record(
     let mut field_start = true;
     let mut escaped = false;
     let mut quote_pending = false;
+    let mut quote_end = 0usize;
     let mut multibyte_state = 0u8;
     let shared_terminator = parser.field_terminator == parser.line_terminator;
     let mut fields = 1usize;
@@ -5312,11 +5395,28 @@ fn read_load_record(
                 continue;
             }
             if quote_pending {
-                quote_pending = false;
-                if parser.enclosed_by == Some(byte) {
+                let suffix = &out[quote_end..];
+                if suffix.len() == 1 && parser.enclosed_by == Some(byte) {
+                    quote_pending = false;
                     continue;
                 }
-                quoted = false;
+                let field_end =
+                    !parser.field_terminator.is_empty() && suffix == parser.field_terminator;
+                let line_end =
+                    !parser.line_terminator.is_empty() && suffix == parser.line_terminator;
+                if field_end || line_end {
+                    quote_pending = false;
+                    quoted = false;
+                } else if (!parser.field_terminator.is_empty()
+                    && parser.field_terminator.starts_with(suffix))
+                    || parser.line_terminator.starts_with(suffix)
+                {
+                    // A delimiter may straddle input-buffer boundaries.
+                    continue;
+                } else {
+                    // An enclosure followed by ordinary bytes is field data.
+                    quote_pending = false;
+                }
             }
             if parser.input_charset.lead(byte) {
                 multibyte_state = 1;
@@ -5331,6 +5431,7 @@ fn read_load_record(
             if quoted {
                 if parser.enclosed_by == Some(byte) {
                     quote_pending = true;
+                    quote_end = out.len();
                 }
                 continue;
             }
@@ -5387,6 +5488,7 @@ fn parse_line_into_rows(
     } else {
         line_bytes
     };
+    LOAD_DIAGNOSTIC_ROW.with(|row| row.set(row.get() + 1));
     let row = parser.parse_row(actual_line, coercion_plan, num_fields)?;
     rows.push(row);
     Ok(())
@@ -5509,8 +5611,17 @@ impl FieldParser {
         coercion_plan: &[CoercionOp],
         num_fields: usize,
     ) -> Result<Vec<Value>, QueryError> {
-        let fields = self.parse_row_raw(line);
-        warn_load_field_count(fields.len(), num_fields);
+        let mut fields = self.parse_row_raw(line);
+        if fields.len() == num_fields + 1
+            && fields
+                .last()
+                .is_some_and(|field| field.as_ref().is_some_and(Vec::is_empty))
+            && !self.field_terminator.is_empty()
+            && line.ends_with(&self.field_terminator)
+        {
+            fields.pop();
+        }
+        warn_load_field_count(fields.len(), num_fields)?;
         (0..num_fields.min(fields.len()))
             .map(|i| match fields.get(i).and_then(|v| v.as_deref()) {
                 None => Ok(Value::Null),
@@ -5726,8 +5837,10 @@ impl FieldParser {
                 if pos < line.len() && line[pos] == enc {
                     out.push(enc);
                     pos += 1;
-                } else {
+                } else if pos == line.len() || (!ft.is_empty() && line[pos..].starts_with(ft)) {
                     break;
+                } else {
+                    out.push(enc);
                 }
             } else if self.escaped_by == Some(line[pos]) && pos + 1 < line.len() {
                 pos += 1;
@@ -5778,8 +5891,12 @@ enum CoercionOp {
         max: u64,
         column: String,
     },
-    FloatF32,
-    FloatF64,
+    FloatF32 {
+        column: String,
+    },
+    FloatF64 {
+        column: String,
+    },
     Decimal {
         precision: Option<u8>,
         scale: Option<u8>,
@@ -5836,8 +5953,12 @@ fn build_coercion_plan(table: &TableSchema, column_indexes: &[usize]) -> Vec<Coe
                 // BOOL is a pure alias for signed TINYINT — load as a
                 // signed integer, no 0/1 truthy clamp (issue #59).
                 DataTypeKind::Bool => integer_coercion_op(col),
-                DataTypeKind::Float { .. } => CoercionOp::FloatF32,
-                DataTypeKind::Double { .. } => CoercionOp::FloatF64,
+                DataTypeKind::Float { .. } => CoercionOp::FloatF32 {
+                    column: col.name.clone(),
+                },
+                DataTypeKind::Double { .. } => CoercionOp::FloatF64 {
+                    column: col.name.clone(),
+                },
                 DataTypeKind::Decimal { precision, scale } => CoercionOp::Decimal {
                     precision: *precision,
                     scale: *scale,
@@ -6092,7 +6213,11 @@ fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
     bytes
 }
 
-fn parse_decimal_compact_value(field_bytes: &[u8], scale: Option<u8>) -> Result<Value, QueryError> {
+fn parse_decimal_compact_value(
+    field_bytes: &[u8],
+    scale: Option<u8>,
+    column: &str,
+) -> Result<Value, QueryError> {
     if let Some((magnitude, scale, discarded)) =
         parse_decimal_compact_parts_fast(field_bytes, scale)
     {
@@ -6100,7 +6225,7 @@ fn parse_decimal_compact_value(field_bytes: &[u8], scale: Option<u8>) -> Result<
             warn_load_decimal_scale();
         }
         if trim_ascii_bytes(field_bytes).is_empty() {
-            warn_load_empty_number();
+            warn_load_empty_number("decimal", column)?;
         }
         return Ok(Value::DecimalCompact(magnitude, scale));
     }
@@ -6123,12 +6248,13 @@ fn round_load_decimal_text(text: &str, scale: u8) -> Option<String> {
     Some(rounded)
 }
 
-fn warn_load_empty_number() {
-    crate::engine::api::push_statement_warning(
-        crate::error::ConditionLevel::Warning,
+#[cold]
+fn warn_load_empty_number(kind: &str, column: &str) -> Result<(), QueryError> {
+    let row = LOAD_DIAGNOSTIC_ROW.with(|row| row.get().max(1));
+    publish_load_conversion_condition(
         crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-        "Empty numeric field converted to zero in LOAD DATA",
-    );
+        format!("Incorrect {kind} value: '' for column '{column}' at row {row}"),
+    )
 }
 
 fn warn_load_decimal_scale() {
@@ -6385,17 +6511,16 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
             let s = load_utf8(field_bytes)?;
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                warn_load_empty_number();
+                warn_load_empty_number("integer", column)?;
                 return checked_signed_load_value(0, *min, *max, column);
             }
-            if let Some(dot) = trimmed.find('.') {
-                if let Ok(f) = trimmed.parse::<f64>() {
-                    let _ = dot;
-                    if f.fract() != 0.0 {
-                        warn_load_decimal_scale();
-                    }
-                    return checked_signed_load_value(f as i64, *min, *max, column);
-                }
+            if trimmed.contains(['.', 'e', 'E']) {
+                let rounded = crate::util::decimal::rescale_decimal_big_str(trimmed, 0)
+                    .ok_or_else(|| load_out_of_range(column))?;
+                let value = rounded
+                    .parse::<i64>()
+                    .map_err(|_| load_out_of_range(column))?;
+                return checked_signed_load_value(value, *min, *max, column);
             }
             let value = trimmed.parse::<i64>().map_err(|_| {
                 error(
@@ -6412,8 +6537,16 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
             let s = load_utf8(field_bytes)?;
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                warn_load_empty_number();
+                warn_load_empty_number("integer", column)?;
                 return checked_unsigned_load_value(0, *max, column);
+            }
+            if trimmed.contains(['.', 'e', 'E']) {
+                let rounded = crate::util::decimal::rescale_decimal_big_str(trimmed, 0)
+                    .ok_or_else(|| load_out_of_range(column))?;
+                let value = rounded
+                    .parse::<u64>()
+                    .map_err(|_| load_out_of_range(column))?;
+                return checked_unsigned_load_value(value, *max, column);
             }
             let value = trimmed.parse::<u64>().map_err(|_| {
                 error(
@@ -6423,11 +6556,11 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
             })?;
             checked_unsigned_load_value(value, *max, column)
         }
-        CoercionOp::FloatF32 => {
+        CoercionOp::FloatF32 { column } => {
             let s = load_utf8(field_bytes)?;
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                warn_load_empty_number();
+                warn_load_empty_number("float", column)?;
                 return Ok(Value::Float(0.0));
             }
             trimmed.parse::<f32>().map(Value::Float).map_err(|_| {
@@ -6437,11 +6570,11 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
                 )
             })
         }
-        CoercionOp::FloatF64 => {
+        CoercionOp::FloatF64 { column } => {
             let s = load_utf8(field_bytes)?;
             let trimmed = s.trim();
             if trimmed.is_empty() {
-                warn_load_empty_number();
+                warn_load_empty_number("double", column)?;
                 return Ok(Value::Double(0.0));
             }
             trimmed.parse::<f64>().map(Value::Double).map_err(|_| {
@@ -6457,9 +6590,15 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
             unsigned,
             column,
         } => {
+            if trim_ascii_bytes(field_bytes).is_empty()
+                && !precision.is_some_and(|precision| precision <= 18)
+            {
+                warn_load_empty_number("decimal", column)?;
+                return Ok(Value::Decimal("0".to_string()));
+            }
             if precision.is_some_and(|precision| precision <= 18) {
                 checked_decimal_load_value(
-                    parse_decimal_compact_value(field_bytes, *scale)?,
+                    parse_decimal_compact_value(field_bytes, *scale, column)?,
                     *precision,
                     scale.unwrap_or(0),
                     *unsigned,
@@ -6693,6 +6832,38 @@ mod tests {
     }
 
     #[test]
+    fn audit1108_enclosures_close_only_before_complete_delimiters() {
+        for separator in [",", "||", "|!", "é"] {
+            let mut parser = audit_parser();
+            parser.field_terminator = separator.as_bytes().to_vec();
+            let input = format!("1{separator}\"b\"x{separator}zz\n2{separator}\"c\"\n");
+            for capacity in 1..20 {
+                let mut reader = BufReader::with_capacity(capacity, input.as_bytes());
+                let mut record = Vec::new();
+                assert!(read_load_record(&mut reader, &parser, &mut record, 2).unwrap());
+                assert_eq!(
+                    parser.parse_row_raw(&record),
+                    vec![
+                        Some(b"1".to_vec()),
+                        Some(format!("b\"x{separator}zz\n2{separator}\"c").into_bytes())
+                    ],
+                    "{separator} capacity {capacity}"
+                );
+                assert!(!read_load_record(&mut reader, &parser, &mut record, 2).unwrap());
+            }
+        }
+        let mut parser = audit_parser();
+        parser.field_terminator = b"||".to_vec();
+        let mut reader = BufReader::with_capacity(1, b"1||\"b\"|x\n2||\"c\"\n".as_slice());
+        let mut record = Vec::new();
+        assert!(read_load_record(&mut reader, &parser, &mut record, 2).unwrap());
+        assert_eq!(
+            parser.parse_row_raw(&record),
+            vec![Some(b"1".to_vec()), Some(b"b\"|x\n2||\"c".to_vec())]
+        );
+    }
+
+    #[test]
     fn audit_records_survive_every_buffer_boundary() {
         let parser = audit_parser();
         let input = b"abc,def\n\"a\nb\",2\n\"a\"\"b\",3\n\"a\\\"b\",4\n\nlast,";
@@ -6756,7 +6927,7 @@ mod tests {
             ("1.234", 2, 123),
         ] {
             assert_eq!(
-                parse_decimal_compact_value(input.as_bytes(), Some(scale)).unwrap(),
+                parse_decimal_compact_value(input.as_bytes(), Some(scale), "").unwrap(),
                 Value::DecimalCompact(magnitude, scale)
             );
             assert_eq!(
@@ -6783,7 +6954,7 @@ mod tests {
         std::fs::write(&path, b"1\n2,\n\n3,x,extra\n").unwrap();
         engine
             .execute(&format!(
-                "LOAD DATA INFILE '{}' INTO TABLE audit_fields FIELDS TERMINATED BY ','",
+                "LOAD DATA INFILE '{}' IGNORE INTO TABLE audit_fields FIELDS TERMINATED BY ','",
                 crate::util::file::sql_path(&path)
             ))
             .unwrap();
@@ -6805,13 +6976,13 @@ mod tests {
     }
 
     #[test]
-    fn parallel_load_preserves_every_extra_field_warning() {
+    fn parallel_load_preserves_every_decimal_scale_warning() {
         let (engine, tmp) = setup_engine();
         engine
-            .execute("CREATE TABLE warning_rows (id INT PRIMARY KEY)")
+            .execute("CREATE TABLE warning_rows (id INT PRIMARY KEY,d DECIMAL(4,2))")
             .unwrap();
         let path = tmp.path().join("warnings.tbl");
-        let input: String = (0..5003).map(|id| format!("{id}|\n")).collect();
+        let input: String = (0..5003).map(|id| format!("{id}|1.239\n")).collect();
         std::fs::write(&path, input).unwrap();
         let mut session = SessionContext::default();
         engine
@@ -6836,11 +7007,8 @@ mod tests {
         };
         assert_eq!(warnings.rows.len(), 5003);
         for row in warnings.rows {
-            assert_eq!(row[1].to_display_string(), "1262");
-            assert_eq!(
-                row[2].to_display_string(),
-                "Row contained more data than input columns"
-            );
+            assert_eq!(row[1].to_display_string(), "1265");
+            assert_eq!(row[2].to_display_string(), "Data truncated in LOAD DATA");
         }
     }
 
@@ -7124,7 +7292,7 @@ mod tests {
             (b"1.2345".as_slice(), 2),
         ] {
             assert_eq!(
-                parse_decimal_compact_value(input, Some(scale)).unwrap(),
+                parse_decimal_compact_value(input, Some(scale), "").unwrap(),
                 parse_decimal_compact_value_wide(input, Some(scale)).unwrap(),
                 "input={:?} scale={scale}",
                 String::from_utf8_lossy(input),
@@ -7285,6 +7453,7 @@ mod tests {
 
     #[test]
     fn test_fast_single_byte_pipe_matches_generic_parser() {
+        let _policy = LoadDecodePolicyGuard::new(true);
         let parser = FieldParser {
             input_charset: LoadLegacyCharset::None,
             field_terminator: b"|".to_vec(),
@@ -8741,14 +8910,18 @@ mod tests {
             // Escaped newlines merge some physical lines; retain enough
             // logical records to exercise the parallel decoder as well.
             for id in 0..2 * PARALLEL_MIN_ROWS + 257 {
-                let fields = match if case == "ascii" { id % 2 } else { id % 7 } {
+                let fields = match if matches!(case, "ascii" | "raw") {
+                    id % 2
+                } else {
+                    id % 7
+                } {
                     0 => format!("plain{delimiter}{}", "wide text ".repeat(24)),
                     1 => format!("{delimiter}"),
                     2 => format!("中文é{delimiter}end{delimiter}"),
                     3 => format!("escaped{escape}{delimiter}field{delimiter}tail{escape}{escape}"),
                     4 => format!("\\N{delimiter}nullable"),
-                    5 => "missing final field".to_owned(),
-                    _ => format!("plain{delimiter}trailing{escape}"),
+                    5 => format!("empty final field{delimiter}"),
+                    _ => format!("plain{delimiter}trailing{escape}\ncontinued"),
                 };
                 input.push_str(&format!("{id}{delimiter}{fields}\n"));
             }

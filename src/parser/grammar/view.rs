@@ -48,13 +48,7 @@ pub(in crate::parser) fn parse_view_statement(sql: &str) -> Result<Option<Statem
             1
         } else if cursor.keyword(b"DEFINER")? {
             cursor.expect_symbol(b'=')?;
-            if cursor.keyword(b"CURRENT_USER")? {
-                if cursor.symbol(b'(')? {
-                    cursor.expect_symbol(b')')?;
-                }
-            } else {
-                definer = Some(cursor.account()?);
-            }
+            definer = Some(super::privileges::account(&mut cursor)?);
             2
         } else if cursor.keyword(b"SQL")? {
             cursor.expect_keyword(b"SECURITY")?;

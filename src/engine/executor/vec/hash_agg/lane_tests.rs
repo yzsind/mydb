@@ -3,6 +3,264 @@
 use super::*;
 
 #[test]
+fn final_1107_lane_fallback_retains_prior_spills_nulls_and_unsigned_domain() {
+    for dictionary in [false, true] {
+        for spill_first in [false, true] {
+            let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let schema = Arc::new(BatchSchema::new(vec![
+                BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "k".into(),
+                    column_type: ColumnType::LongLong,
+                    source: Default::default(),
+                },
+                BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "label".into(),
+                    column_type: ColumnType::VarString,
+                    source: Default::default(),
+                },
+            ]));
+            let groups = if dictionary { vec![0, 1] } else { vec![0] };
+            let specs = vec![AggregateSpec {
+                comparison_collation: None,
+                func: AggregateKind::CountStar,
+                input_column: 0,
+            }];
+            let shared = Arc::new(SharedHashAggSpill::new(
+                root.path().to_path_buf(),
+                schema.clone(),
+                &groups,
+                specs.clone(),
+            ));
+            let mut actual = HashAggregateCore::with_budget(
+                groups.clone(),
+                specs.clone(),
+                schema.clone(),
+                Arc::new(MemBudget::new(128 * 1024 * 1024)),
+                root.path(),
+            );
+            if dictionary {
+                actual = actual.with_shared_spill(shared.clone());
+            }
+            let mut oracle = HashAggregateCore::new(groups, specs.clone());
+            oracle.fixed_width_probed = true;
+            oracle.packed64_probed = true;
+            oracle.dense_i64_probed = true;
+            oracle.dictionary_probed = true;
+            for step in 0..3 {
+                let keys = if step == 0 {
+                    ColumnVector::from_values(vec![
+                        Value::Int(-1),
+                        Value::Int(1),
+                        Value::Int(1),
+                        Value::Null,
+                    ])
+                } else {
+                    ColumnVector::Generic {
+                        values: vec![
+                            Value::UInt(u64::MAX),
+                            Value::UInt(1),
+                            Value::UInt(2),
+                            Value::Null,
+                        ],
+                    }
+                };
+                let batch = Batch::new(
+                    schema.clone(),
+                    vec![
+                        keys,
+                        ColumnVector::from_values(vec![Value::String("label".into()); 4]),
+                    ],
+                );
+                actual.consume_batch(&batch).unwrap();
+                oracle.consume_batch(&batch).unwrap();
+                if step == 0 && spill_first {
+                    if dictionary {
+                        assert!(actual.dictionary_count.is_some());
+                        actual.do_spill_dictionary_count().unwrap();
+                    } else {
+                        assert!(actual.fixed_width.is_some());
+                        actual.do_spill_fixed_width().unwrap();
+                    }
+                }
+            }
+            let result = if dictionary {
+                merge_worker_partition_snapshots(
+                    vec![
+                        (0..NUM_PARTITIONS)
+                            .map(|p| actual.take_partition_merged_snapshot(p).unwrap())
+                            .collect(),
+                        shared.partition_snapshots().unwrap(),
+                    ],
+                    &specs,
+                )
+                .unwrap()
+            } else {
+                actual.finalize().unwrap()
+            };
+            let canonical = |rows: Vec<Vec<Value>>| {
+                let mut rows: Vec<Vec<String>> = rows
+                    .iter()
+                    .map(|r| r.iter().map(Value::to_display_string).collect())
+                    .collect();
+                rows.sort();
+                rows
+            };
+            assert_eq!(
+                canonical(result),
+                canonical(oracle.finalize().unwrap()),
+                "dictionary={dictionary} spill_first={spill_first}"
+            );
+        }
+    }
+}
+
+#[test]
+fn final_1107_dictionary_group_lane_drift_preserves_prefix() {
+    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let schema = Arc::new(BatchSchema::new(vec![
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "label".into(),
+            column_type: ColumnType::VarString,
+            source: Default::default(),
+        },
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "k".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        },
+    ]));
+    let specs = vec![AggregateSpec {
+        comparison_collation: None,
+        func: AggregateKind::CountStar,
+        input_column: 0,
+    }];
+    let shared = Arc::new(SharedHashAggSpill::new(
+        root.path().to_path_buf(),
+        schema.clone(),
+        &[0, 1],
+        specs.clone(),
+    ));
+    let mut worker = HashAggregateCore::with_budget(
+        vec![0, 1],
+        specs.clone(),
+        schema.clone(),
+        Arc::new(MemBudget::new(128 * 1024 * 1024)),
+        root.path(),
+    )
+    .with_shared_spill(shared.clone());
+    let mut oracle = HashAggregateCore::new(vec![0, 1], specs.clone());
+    for generic in [false, true] {
+        let values = vec![Value::Int(1); 128];
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(vec![Value::String("label".into()); 128]),
+                if generic {
+                    ColumnVector::Generic { values }
+                } else {
+                    ColumnVector::from_values(values)
+                },
+            ],
+        );
+        oracle.consume_batch(&batch).unwrap();
+        worker.consume_batch(&batch).unwrap();
+        if !generic {
+            assert!(worker.dictionary_count.is_some());
+        }
+    }
+    let actual = merge_worker_partition_snapshots(
+        vec![
+            (0..NUM_PARTITIONS)
+                .map(|p| worker.take_partition_merged_snapshot(p).unwrap())
+                .collect(),
+            shared.partition_snapshots().unwrap(),
+        ],
+        &specs,
+    )
+    .unwrap();
+    assert_eq!(actual, oracle.finalize().unwrap());
+}
+
+#[test]
+fn final_1107_fixed_width_group_lane_drift_preserves_prefix() {
+    let schema = Arc::new(BatchSchema::new(vec![
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "k".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        },
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "v".into(),
+            column_type: ColumnType::Decimal {
+                precision: 20,
+                scale: 2,
+            },
+            source: Default::default(),
+        },
+    ]));
+    for generic in [false, true] {
+        for func in [AggregateKind::CountStar, AggregateKind::Sum] {
+            let mut core = HashAggregateCore::new(
+                vec![0],
+                vec![AggregateSpec {
+                    comparison_collation: None,
+                    func,
+                    input_column: 1,
+                }],
+            );
+            let first = Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(vec![Value::Int(1), Value::Int(1)]),
+                    ColumnVector::from_values(vec![Value::DecimalCompact(100, 2); 2]),
+                ],
+            );
+            core.consume_batch(&first).unwrap();
+            assert!(core.fixed_width.is_some());
+            let keys = if generic {
+                ColumnVector::Generic {
+                    values: vec![Value::Int(1), Value::Int(2)],
+                }
+            } else {
+                ColumnVector::from_values(vec![Value::UInt(1), Value::UInt(2)])
+            };
+            let second = Batch::new(
+                schema.clone(),
+                vec![
+                    keys,
+                    ColumnVector::from_values(vec![Value::DecimalCompact(100, 2); 2]),
+                ],
+            );
+            core.consume_batch(&second).unwrap();
+            let mut rows = core.finalize().unwrap();
+            rows.sort_by_key(|r| r[0].to_display_string());
+            let rows: Vec<Vec<String>> = rows
+                .iter()
+                .map(|r| r.iter().map(Value::to_display_string).collect())
+                .collect();
+            let expected = if func == AggregateKind::CountStar {
+                [vec!["1", "3"], vec!["2", "1"]]
+            } else {
+                [vec!["1", "3.00"], vec!["2", "1.00"]]
+            };
+            assert_eq!(rows, expected, "generic={generic} func={func:?}");
+        }
+    }
+}
+
+#[test]
 fn aggregate_lane_dispatch_matches_row_updates_for_all_native_families() {
     let kinds = [
         AggregateKind::CountStar,

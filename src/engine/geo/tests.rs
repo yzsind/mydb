@@ -37,7 +37,7 @@ fn wkb_internal_roundtrip_with_srid() {
     assert_eq!(parsed.srid, 4326);
     assert_eq!(parsed.geom, Geom::Point(Coord { x: 3.0, y: 4.0 }));
     // Re-encode is byte-stable.
-    assert_eq!(write_geometry(&parsed), internal);
+    assert_eq!(write_geometry(&parsed).unwrap(), internal);
     assert_eq!(to_text(&internal), "POINT(3 4)");
 }
 

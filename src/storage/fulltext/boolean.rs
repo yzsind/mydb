@@ -167,7 +167,7 @@ pub fn parse_boolean_query(
             return Err(malformed());
         }
         if let Some(stripped) = word.strip_suffix('*') {
-            let prefix = stripped.to_lowercase();
+            let prefix = tokenizer.normalize_word(stripped);
             if !prefix.is_empty() {
                 clauses.push(BoolClause {
                     occur,

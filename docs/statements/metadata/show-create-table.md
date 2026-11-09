@@ -13,9 +13,15 @@ Returns the canonical DDL to recreate a table, temporary table, or view.
 
 ## Behavior, Privileges, and Results
 
-- Table output includes columns, constraints, indexes, partitions, and saved table options; compatibility metadata is echoed verbatim.
+- Table output includes columns, constraints, indexes, partitions, and saved table options; saved compatibility metadata is rendered in normalized DDL.
 - View output includes algorithm, definer, SQL SECURITY, column names, and check option.
 - Requires the privilege to view the object definition.
+
+## Result and Visibility Details
+
+Requires SELECT on the resolved object. Definitions are normalized and quoted; saved options are rendered as catalog DDL, not original input text. Views have the distinct four-column SHOW CREATE VIEW shape. Session temporary tables take precedence for table lookup; data is not copied by this statement.
+
+See [ordered columns and wire types](result-columns.md#show-create-table). Reading this metadata does not itself commit user DML.
 
 ## Examples
 

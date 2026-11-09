@@ -7,14 +7,14 @@ Aggregates geometries in the group into a geometry collection.
 ## Syntax
 
 ```sql
-ST_COLLECT(expr)
+ST_COLLECT([DISTINCT] expr)
 ```
 
 ## Parameters
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | Any SQL expression | The 1st argument; the expression to evaluate |
+| `expr` | Yes | Any SQL expression | Expression to evaluate. |
 
 ## Return Value
 
@@ -34,4 +34,4 @@ Result: `MULTIPOINT(1 2,2 3)`.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_ARRAYAGG`](json_arrayagg.md), [`JSON_OBJECTAGG`](json_objectagg.md), [`GROUP_CONCAT`](group_concat.md), [`GROUPING`](grouping.md).

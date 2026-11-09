@@ -998,6 +998,7 @@ fn ordered_limited_dml_uses_index_order_without_materializing_all_matches() {
         &table,
         Some(&selection),
         &[OrderBy {
+            names_bound: false,
             expr: Expr::Identifier("no_o_id".into()),
             asc: true,
             nulls_first: None,

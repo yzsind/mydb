@@ -17,6 +17,10 @@ Reads the next row, or the next N rows, from a session-level SQL cursor.
 - Reaching the end returns an empty result; an unknown or already closed cursor returns an error.
 - Each FETCH continues the original cursor's snapshot and result schema.
 
+## Context, Errors, and Lifecycle
+
+Count must be at least 1 and within the unsigned 64-bit parser range; FETCH 0 returns 1064. Large counts remain upper bounds subject to memory admission, not immediate allocations of that count. Output columns are the original query columns, including on an empty exhausted result. Unknown/closed cursor is 1326. COMMIT can occur between fetches without closing this session cursor.
+
 ## Examples
 
 ```sql

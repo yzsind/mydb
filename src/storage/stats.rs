@@ -133,6 +133,10 @@ fn histogram_min_distinct() -> usize {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableStats {
+    /// Runtime binding to the definitions sampled by ANALYZE. Rebuilt on DD
+    /// load; structural DDL compares it before retaining name-keyed statistics.
+    #[serde(skip)]
+    pub(crate) definition_bindings: BTreeMap<String, Vec<u8>>,
     /// Advances only when an ANALYZE folds population/modification baselines.
     #[serde(default)]
     pub analyze_revision: u64,
@@ -344,6 +348,7 @@ pub struct ConditionalKeyDomainEntry {
 impl TableStats {
     pub(crate) fn empty() -> Self {
         Self {
+            definition_bindings: BTreeMap::new(),
             analyze_revision: 0,
             explicit_histograms: BTreeMap::new(),
             row_count: 0,
@@ -1671,7 +1676,7 @@ impl TimeAlignment {
         let TimeAlignment::Step(step) = self;
         // Euclidean-style floor so negative values (pre-epoch DATETIME,
         // pre-1970 DATE) align consistently.
-        value.div_euclid(step) * step
+        value.div_euclid(step).saturating_mul(step)
     }
 }
 

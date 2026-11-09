@@ -19,7 +19,7 @@ expr COLLATE collation_name
 
 ## Return Value
 
-Explicitly assigns a collation to an expression. The return type is determined by the function semantics and the input types.
+Returns the expression with an explicit collation and coercibility 0, preserving SQL NULL. The collation must belong to the expression character set; incompatible assignments raise 1253. This is expression syntax, not a two-argument SQL function.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 0
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CAST`](cast.md), [`CONVERT_USING`](convert_using.md).

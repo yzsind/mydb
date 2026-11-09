@@ -14,11 +14,11 @@ KEYRING_KEY_LENGTH(key_id)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `key_id` | Yes | String | The 1st argument; the unique key identifier in the keyring |
+| `key_id` | Yes | String | Nonempty process-global key identifier, at most 255 bytes. |
 
 ## Return Value
 
-Returns the length of the specified key in the keyring. The return type is determined by the function semantics and the input types.
+Returns the stored data length in bits, not bytes, or NULL for a missing key/SQL NULL argument. Text conversion during STORE can make this differ from the original binary input length.
 
 ## Examples
 
@@ -26,14 +26,20 @@ Returns the length of the specified key in the keyring. The return type is deter
 SELECT KEYRING_KEY_LENGTH('missing-docs-demo-key');
 ```
 
-Result: returns NULL when the key does not exist.
+Result:
+
+```text
+NULL
+```
+
+Assumes this temporary example ID is absent from the process-global map.
 
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
-- Requires an available keyring backend and the corresponding privileges; examples must not contain real production keys.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+- Read [current keyring limitations](README.md#current-keyring-limitations) before using this compatibility API. It has no per-account isolation and does not preserve arbitrary non-UTF-8 key bytes.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`KEYRING_KEY_GENERATE`](keyring_key_generate.md), [`KEYRING_KEY_STORE`](keyring_key_store.md), [`KEYRING_KEY_FETCH`](keyring_key_fetch.md), [`KEYRING_KEY_REMOVE`](keyring_key_remove.md).

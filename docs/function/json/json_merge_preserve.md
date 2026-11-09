@@ -19,7 +19,7 @@ JSON_MERGE_PRESERVE(json_doc, json_doc [, json_doc] ...)
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns JSON after merging documents left to right. Object conflicts preserve values in arrays; arrays concatenate and scalars can be wrapped into arrays. A SQL NULL document argument returns SQL NULL.
 
 ## Examples
 
@@ -31,7 +31,7 @@ Result: {"a": [1, 2]}
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 - `JSON_MERGE` is a deprecated alias; new SQL should use this function name.
 
 ## Related Functions

@@ -16,7 +16,7 @@ This function takes no arguments.
 
 ## Return Value
 
-Generates a UUID in the standard text format. The return type is determined by the function semantics and the input type.
+Returns a newly generated version-1 UUID as hyphenated text. Each evaluation can differ; this is not an authorization secret or a source of cryptographic random bytes.
 
 ## Examples
 
@@ -29,8 +29,8 @@ Result: returns a standard UUID text string; the result may differ on each call.
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`UUID_SHORT`](uuid_short.md), [`UUID_TO_BIN`](uuid_to_bin.md), [`BIN_TO_UUID`](bin_to_uuid.md), [`IS_UUID`](is_uuid.md).

@@ -7,18 +7,18 @@ Extracts the table name from a server-internal file name.
 ## Syntax
 
 ```sql
-EXTRACT_TABLE_FROM_FILE_NAME(value)
+EXTRACT_TABLE_FROM_FILE_NAME(file_name)
 ```
 
 ## Parameters
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `file_name` | Yes | String | Filesystem-style path, not a numeric argument or a JSON path. |
 
 ## Return Value
 
-Extracts the table name from a server-internal file name. The return type is determined by the function semantics and the input type.
+Returns the final filename without its extension as text. SQL NULL returns NULL. Both slash styles are recognized; this helper parses text and does not verify that a server table/file exists.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: t
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FORMAT_PATH`](format_path.md), [`EXTRACT_SCHEMA_FROM_FILE_NAME`](extract_schema_from_file_name.md).

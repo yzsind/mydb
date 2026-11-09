@@ -18,7 +18,7 @@ ST_ISSIMPLE(geometry)
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 when the geometry satisfies the implemented simplicity rules, 0 otherwise, or SQL NULL for SQL NULL input. Polygon simplicity is separate from polygon validity; use ST_ISVALID to check the latter.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 1
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_ISVALID`](st_isvalid.md), [`ST_VALIDATE`](st_validate.md), [`ST_ISCLOSED`](st_isclosed.md), [`ST_ISEMPTY`](st_isempty.md).

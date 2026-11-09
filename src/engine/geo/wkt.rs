@@ -290,9 +290,14 @@ impl<'a> WktParser<'a> {
     /// MULTIPOINT accepts both `(1 2, 3 4)` and `((1 2),(3 4))`.
     fn parse_multipoint_body(&mut self) -> Result<Vec<Coord>, QueryError> {
         let mut out = Vec::new();
+        self.skip_ws();
+        let member_parenthesized = self.peek() == Some(b'(');
         loop {
             self.skip_ws();
             let parenthesized = self.peek() == Some(b'(');
+            if parenthesized != member_parenthesized {
+                return Err(invalid_wkt("inconsistent multipoint member parentheses"));
+            }
             if parenthesized {
                 self.pos += 1;
             }
@@ -320,14 +325,24 @@ impl<'a> WktParser<'a> {
 fn push_num(out: &mut String, v: f64) {
     use std::fmt::Write;
     if v == 0.0 {
-        // Avoid "-0".
+        if v.is_sign_negative() {
+            out.push('-');
+        }
         out.push('0');
-    } else if v.abs() <= (1u64 << 53) as f64 && v.trunc() == v {
-        // Integer coordinates have the same Display spelling. Avoid the
-        // floating-point shortest-decimal converter for this exact domain.
+    } else if v.abs() < 1e15 && v.trunc() == v {
+        // Small integer coordinates need neither a decimal converter nor
+        // exponent normalization and are exactly representable as i64.
         out.push_str(itoa::Buffer::new().format(v as i64));
     } else {
-        let _ = write!(out, "{v}");
+        // Display is already the shortest round-trip fixed spelling. Keep
+        // that fast path for ordinary coordinates and use the standard
+        // shortest scientific formatter only outside the fixed-text range.
+        // Large fractional values keep their shorter fixed spelling.
+        if (v.abs() >= 1e15 && v.trunc() == v) || v.abs() < 1e-15 {
+            let _ = write!(out, "{v:e}");
+        } else {
+            let _ = write!(out, "{v}");
+        }
     }
 }
 
@@ -393,7 +408,7 @@ fn write_into(out: &mut String, geom: &Geom) {
             if ps.is_empty() {
                 out.push_str(" EMPTY");
             } else {
-                // MySQL renders MULTIPOINT members without inner parens.
+                // Use the compact OGC MULTIPOINT spelling.
                 push_seq(out, ps);
             }
         }
@@ -485,7 +500,21 @@ mod formatting_tests {
     }
 
     #[test]
-    fn coordinate_formatting_keeps_the_original_shortest_decimal_spelling() {
+    fn coordinate_formatting_is_compact_and_preserves_coordinate_bits() {
+        for (value, expected) in [
+            (0.0, "0"),
+            (-0.0, "-0"),
+            (1e14, "100000000000000"),
+            (1e15, "1e15"),
+            (1e-15, "0.000000000000001"),
+            (1e-16, "1e-16"),
+            (1e300, "1e300"),
+            (-1e-300, "-1e-300"),
+        ] {
+            let mut actual = String::new();
+            push_num(&mut actual, value);
+            assert_eq!(actual, expected);
+        }
         let mut numbers = vec![
             0.0,
             -0.0,
@@ -510,14 +539,17 @@ mod formatting_tests {
             numbers.push(f64::from_bits(seed));
         }
         for value in numbers {
-            let expected = if value == 0.0 {
-                "0".into()
-            } else {
-                value.to_string()
-            };
             let mut actual = String::new();
             push_num(&mut actual, value);
-            assert_eq!(actual, expected, "{:016x}", value.to_bits());
+            let decoded = actual.parse::<f64>().unwrap();
+            if value.is_nan() {
+                assert!(decoded.is_nan());
+            } else {
+                assert_eq!(decoded.to_bits(), value.to_bits(), "{actual}");
+            }
+            // Fixed notation down to 1e-15 can need fourteen leading
+            // fractional zeros, seventeen significant digits and a sign.
+            assert!(actual.len() <= 34, "{actual}");
         }
     }
 }

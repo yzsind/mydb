@@ -402,7 +402,19 @@ pub(super) fn hash_agg_output_preflight_for_template(
                 slot.name.to_ascii_uppercase().as_str(),
                 "BIT_AND" | "BIT_OR" | "BIT_XOR"
             );
-            let descriptor = bit_aggregate.then(|| {
+            let temporal_aggregate =
+                matches!(slot.name.to_ascii_uppercase().as_str(), "SUM" | "AVG")
+                    && matches!(
+                        arg_type,
+                        Some(
+                            ColumnType::Date
+                                | ColumnType::DateTime
+                                | ColumnType::Timestamp
+                                | ColumnType::Time
+                                | ColumnType::Year
+                        )
+                    );
+            let descriptor = (bit_aggregate || temporal_aggregate).then(|| {
                 let argument = arg_type.map(|kind| {
                     crate::engine::expr_type::ExprType::from_column_type(kind, &arg_source)
                 });
@@ -1046,6 +1058,16 @@ pub(in crate::engine::executor::select) fn decimal_value_at_scale(
             Err(_) => Value::Decimal128(magnitude, scale),
         }
     }
+    fn bounded_scale(text: &str, requested: u8) -> u8 {
+        let integer = text
+            .trim_start_matches(['-', '+'])
+            .split('.')
+            .next()
+            .unwrap_or("");
+        let digits = integer.trim_start_matches('0').len().max(1);
+        let words = usize::from(crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION) / 9;
+        requested.min((words.saturating_sub(digits.div_ceil(9)) * 9) as u8)
+    }
     match value {
         Value::Null => Value::Null,
         Value::DecimalCompact(magnitude, scale) => {
@@ -1058,17 +1080,18 @@ pub(in crate::engine::executor::select) fn decimal_value_at_scale(
                 .map(|magnitude| from_magnitude(magnitude, target_scale))
                 .unwrap_or(Value::Decimal128(magnitude, scale))
         }
-        Value::DecimalWide(value) => crate::util::decimal::rescale_decimal_big_str(
-            &Value::DecimalWide(value.clone()).to_display_string(),
-            target_scale,
+        Value::DecimalWide(value) => {
+            let text = Value::DecimalWide(value.clone()).to_display_string();
+            crate::util::decimal::rescale_decimal_big_str(&text, bounded_scale(&text, target_scale))
+                .map(Value::Decimal)
+                .unwrap_or(Value::DecimalWide(value))
+        }
+        Value::Decimal(value) => crate::util::decimal::rescale_decimal_big_str(
+            &value,
+            bounded_scale(&value, target_scale),
         )
         .map(Value::Decimal)
-        .unwrap_or(Value::DecimalWide(value)),
-        Value::Decimal(value) => {
-            crate::util::decimal::rescale_decimal_big_str(&value, target_scale)
-                .map(Value::Decimal)
-                .unwrap_or(Value::Decimal(value))
-        }
+        .unwrap_or(Value::Decimal(value)),
         Value::Int(value) => crate::util::decimal::pow10_i128(u32::from(target_scale))
             .and_then(|factor| i128::from(value).checked_mul(factor))
             .map(|magnitude| from_magnitude(magnitude, target_scale))
@@ -1140,9 +1163,15 @@ pub(super) fn semantic_aggregate_argument_type(
         agg_values: None,
         schema: PlanRow::empty_schema(),
     };
-    let resolved = crate::engine::executor::select::eval::plan_expr_result_type(argument, &sample)
-        .ok()
-        .or(fallback);
+    let descriptor = super::super::plan::plan_bound_expr_type(argument, &sample);
+    let resolved = if matches!(
+        descriptor.kind,
+        crate::engine::expr_type::ExprTypeKind::Unknown
+    ) {
+        fallback
+    } else {
+        Some(descriptor.column_type())
+    };
     crate::engine::executor::select::eval::aggregate_argument_semantic_type(
         Some(argument),
         resolved,
@@ -1807,6 +1836,12 @@ pub(super) fn build_scalar_aggregate_kernel_stream<'a>(
                 private_fields.get(column - template.len())
             }
         });
+        if matches!(slot.name.to_ascii_uppercase().as_str(), "MIN" | "MAX")
+            && arg_type == Some(ColumnType::Geometry)
+        {
+            return Err(crate::error::catalog::ER_WRONG_ARGUMENTS
+                .error(format!("Incorrect arguments to {}", slot.name)));
+        }
         let fixed_output_scale = input_field.and_then(|field| {
             if !matches!(field.column_type, ColumnType::Float | ColumnType::Double) {
                 return None;
@@ -1827,8 +1862,15 @@ pub(super) fn build_scalar_aggregate_kernel_stream<'a>(
             table: "__agg".into(),
             alias: None,
             name: format!("a{slot_index}"),
-            column_type: crate::engine::executor::select::eval::aggregate_function_result_type(
-                &slot.name, arg_type,
+            column_type: slot.kind().map_or_else(
+                || {
+                    crate::engine::executor::select::eval::aggregate_function_result_type(
+                        &slot.name, arg_type,
+                    )
+                },
+                |kind| {
+                    kind.result_type_with_source(arg_type, input_field.map(|field| &field.source))
+                },
             ),
             source: if slot.name.eq_ignore_ascii_case("GROUP_CONCAT")
                 || matches!(
@@ -1855,7 +1897,13 @@ pub(super) fn build_scalar_aggregate_kernel_stream<'a>(
                 "MIN" | "MAX" | "__HIDDEN_FIRST_VALUE"
             ) {
                 input_field
-                    .map(|field| field.source.clone().nullable_aggregate())
+                    .map(|field| {
+                        if slot.name.eq_ignore_ascii_case("__HIDDEN_FIRST_VALUE") {
+                            field.source.clone().nullable_field()
+                        } else {
+                            field.source.clone().nullable_aggregate()
+                        }
+                    })
                     .unwrap_or_default()
             } else {
                 crate::types::ColumnSource::default()
@@ -2289,9 +2337,10 @@ pub(super) fn build_hash_agg_output_schema(
     for (i, spec) in aggs.iter().enumerate() {
         use crate::engine::executor::vec::hash_agg::AggregateKind;
         let input_field = input_schema.fields().get(spec.input_column);
-        let column_type = spec
-            .func
-            .result_type(input_field.map(|field| field.column_type));
+        let column_type = spec.func.result_type_with_source(
+            input_field.map(|field| field.column_type),
+            input_field.map(|field| &field.source),
+        );
         let mut source = if matches!(spec.func, AggregateKind::Min | AggregateKind::Max) {
             input_field
                 .map(|field| field.source.clone().nullable_aggregate())
@@ -2339,7 +2388,7 @@ pub(in crate::engine::executor::select) fn try_vec_hash_aggregate(
         group_template,
         agg_keys,
         aggregates: _,
-        schema: _,
+        schema,
         mut metrics,
         having_applied: _,
     }) = build_vec_hash_agg_stream(db, txn, upstream, group_by, having, aggregates)?
@@ -2353,6 +2402,18 @@ pub(in crate::engine::executor::select) fn try_vec_hash_aggregate(
     // `eval::eval_aggregate_expr` → `aggregate_key(expr)`.
     let n_group = group_template.len();
     let n_agg = agg_keys.len();
+    let row_schema = super::super::row_schema::RowSchema::from_fields_with_aggregate_types(
+        &group_template,
+        agg_keys
+            .iter()
+            .copied()
+            .zip(schema.fields().iter().skip(n_group).map(|field| {
+                crate::engine::expr_type::ExprType::from_column_type(
+                    field.column_type,
+                    &field.source,
+                )
+            })),
+    );
 
     let mut out = Vec::new();
     while let Some(batch) = stream.next_batch()? {
@@ -2385,7 +2446,7 @@ pub(in crate::engine::executor::select) fn try_vec_hash_aggregate(
                 // raw group-iteration order instead).
                 group: Some(Vec::new()),
                 agg_values: Some(Arc::new(cache)),
-                schema: PlanRow::empty_schema(),
+                schema: row_schema.clone().into(),
             });
         }
     }
@@ -2474,6 +2535,14 @@ pub(super) fn translate_aggregate_extended(
         } => (name.to_ascii_uppercase(), args, *distinct),
         _ => return None,
     };
+    if matches!(name.as_str(), "MIN" | "MAX")
+        && args.first().is_some_and(|arg| {
+            expr_column_index_in_template(arg, template)
+                .is_some_and(|column| template[column].column_type == ColumnType::Geometry)
+        })
+    {
+        return None;
+    }
     if distinct {
         // COUNT/SUM/AVG(DISTINCT) → the vec dedup variants. Anything else
         // was already filtered by `aggregate_static_ok`, but guard here
@@ -2514,11 +2583,13 @@ pub(super) fn translate_aggregate_extended(
             return Some((
                 func,
                 AggInputSpec::Column(col),
-                func.result_type(argument_type),
+                func.result_type_with_source(argument_type, Some(&template[col].source)),
             ));
         }
         let program = expr_batch::compile_for_batch(&args[0], batch_schema).ok()??;
         let descriptor = program.result_type();
+        let mut argument_source = crate::types::ColumnSource::default();
+        descriptor.apply_to_source(&mut argument_source);
         let argument_type = (!matches!(
             descriptor.kind,
             crate::engine::expr_type::ExprTypeKind::Unknown
@@ -2528,7 +2599,7 @@ pub(super) fn translate_aggregate_extended(
         return Some((
             func,
             AggInputSpec::Expr(program),
-            func.result_type(argument_type),
+            func.result_type_with_source(argument_type, Some(&argument_source)),
         ));
     }
     let count_star = name == "COUNT" && matches!(args.as_slice(), [Expr::Wildcard]);
@@ -2564,7 +2635,7 @@ pub(super) fn translate_aggregate_extended(
             | vec_hash_agg::AggregateKind::VarSamp
             | vec_hash_agg::AggregateKind::StddevPop
             | vec_hash_agg::AggregateKind::StddevSamp => ColumnType::Double,
-            _ => func.result_type(semantic_type),
+            _ => func.result_type_with_source(semantic_type, Some(&template[col].source)),
         };
         return Some((func, AggInputSpec::Column(col), result_type));
     }
@@ -2593,16 +2664,17 @@ pub(super) fn translate_aggregate_extended(
         | vec_hash_agg::AggregateKind::StddevSamp => ColumnType::Double,
         _ => {
             let descriptor = program.result_type();
+            let mut argument_source = crate::types::ColumnSource::default();
+            descriptor.apply_to_source(&mut argument_source);
             let physical_type = (!matches!(
                 descriptor.kind,
                 crate::engine::expr_type::ExprTypeKind::Unknown
             ))
             .then(|| descriptor.column_type());
-            func.result_type(semantic_aggregate_argument_type(
-                &args[0],
-                template,
-                physical_type,
-            ))
+            func.result_type_with_source(
+                semantic_aggregate_argument_type(&args[0], template, physical_type),
+                Some(&argument_source),
+            )
         }
     };
     Some((func, AggInputSpec::Expr(program), result_type))

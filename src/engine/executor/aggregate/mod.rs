@@ -530,7 +530,15 @@ impl AggregateState {
     ) -> Result<(), crate::types::QueryError> {
         if kind.is_distinct() {
             if !matches!(value, Value::Null) {
-                self.distinct_insert(value.clone());
+                let value = if matches!(
+                    kind,
+                    AggregateKind::SumDistinct | AggregateKind::AvgDistinct
+                ) {
+                    crate::engine::executor::select::aggregate::numeric_distinct_value(value)?
+                } else {
+                    std::borrow::Cow::Borrowed(value)
+                };
+                self.distinct_insert(value.into_owned());
             }
             return Ok(());
         }
@@ -548,7 +556,7 @@ impl AggregateState {
             AggregateKind::Min => update_minmax(&mut self.min, value, true)?,
             AggregateKind::Max => update_minmax(&mut self.max, value, false)?,
             AggregateKind::BitAnd | AggregateKind::BitOr | AggregateKind::BitXor => {
-                let bits = crate::engine::expr::int_value(value)? as u64;
+                let bits = crate::engine::expr::bit_aggregate_int_value(value)?;
                 update_bit(self.extra_mut(), kind, bits);
             }
             AggregateKind::VarPop

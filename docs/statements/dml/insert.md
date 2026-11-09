@@ -14,6 +14,7 @@ Inserts rows into a table or an updatable view. Supports VALUES, SET, INSERT SEL
              [ [ 'AS' ] <identifier> [ '(' <identifier-list> ')' ] ]
              ( [ '(' <identifier-list> ')' ] <insert-source>
              | 'SET' <assignment> { ',' <assignment> } )
+             [ 'AS' <identifier> [ '(' <identifier-list> ')' ] ]
              [ 'ON DUPLICATE KEY UPDATE' <assignment>
                { ',' <assignment> } ]
              [ <returning-clause> ]
@@ -36,6 +37,22 @@ Inserts rows into a table or an updatable view. Supports VALUES, SET, INSERT SEL
 - `DELAYED` is accepted only for compatibility and produces a warning; no asynchronous insert queue is created.
 - RETURNING observes NEW by default; explicit OLD/NEW can compare values before and after a conflict update. Forms that actually modify multiple target tables return 1235.
 - Writes are subject to transactions, foreign keys, CHECK, triggers, generated columns, partition routing, binlog, and unified memory governance.
+
+## Privileges, Results, and Boundaries
+
+Requires INSERT on target, source SELECT for INSERT SELECT or expression subqueries, UPDATE for a conflict-update clause, and SELECT for read target columns/RETURNING. LOW_PRIORITY and HIGH_PRIORITY are accepted priority compatibility forms; they do not select a different native insert queue. DELAYED emits warning 1287.
+
+The alias after the table names the target. `VALUES (...) AS incoming(c1,c2)` names the incoming row and its columns for conflict updates; its column-alias count must match. Omitted columns use defaults; an empty VALUES row requests defaults for all columns. Explicit generated-column values are restricted to DEFAULT.
+
+ODKU reports 1 for a new row, 2 for a changed conflict row and 0 for a no-op (CLIENT_FOUND_ROWS makes that no-op 1). Auto-increment/last-insert state and warnings remain separate. Prefer an incoming-row alias to legacy VALUES(column):
+
+```sql
+INSERT INTO counter(id,value) VALUES(1,5) AS incoming
+ON DUPLICATE KEY UPDATE value=incoming.value
+RETURNING OLD.value,NEW.value;
+```
+
+See [RETURNING row images and rollback](../../dml-returning.md) and [statement failures](../execution-contracts.md#statement-failure-and-locking).
 
 ## Examples
 

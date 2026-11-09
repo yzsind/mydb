@@ -164,6 +164,7 @@ fn col(name: &str, data_type: DataTypeKind, nullable: bool) -> ColumnSchema {
         nullable,
         unsigned: false,
         zerofill: false,
+        display_width: None,
         invisible: false,
         auto_increment: false,
         default: None,
@@ -411,6 +412,7 @@ fn columns_table() -> TableSchema {
                 true,
             ),
             ucol("not_null_from_scn", DataTypeKind::BigInt, false),
+            ucol("display_width", DataTypeKind::Int, true),
         ],
     )
 }
@@ -595,6 +597,7 @@ fn views_table() -> TableSchema {
                 true,
             ),
             col("query_json", DataTypeKind::Text { max_len: u32::MAX }, true),
+            ucol("created_ms", DataTypeKind::BigInt, false),
         ],
     )
 }
@@ -1388,6 +1391,9 @@ fn push_table_rows(
             bv(col.invisible),
             jsonv(&col.read_backfill_default),
             uv(col.not_null_from_scn),
+            col.display_width
+                .map(|width| uv(u64::from(width)))
+                .unwrap_or(Value::Null),
         ]);
     }
     for (idx_pos, index) in table.indexes.iter().enumerate() {
@@ -1982,7 +1988,20 @@ fn catalog_from_dd_rows_with_auth(
         }
         validate_persisted_layouts(&table)?;
         table.build_column_index();
-        table.stats = super::stats_store::load(set, &table)?;
+        table.stats = match super::stats_store::load(set, &table) {
+            Ok(stats) => stats,
+            Err(err) if err.message() == "corrupt optimizer statistics object" => {
+                eprintln!(
+                    "Discarding corrupt optimizer statistics for {}.{}: {err}",
+                    table.database, table.name
+                );
+                let mut stats = super::stats::TableStats::empty();
+                stats.analyzed_at_unix_ms = None;
+                stats
+            }
+            Err(err) => return Err(err),
+        };
+        table.bind_statistics_definitions();
         tables.insert(table_key(&database, &name), Arc::new(table));
     }
 
@@ -2274,6 +2293,11 @@ fn reconstruct_column(r: &[Value]) -> Result<ColumnSchema, crate::types::QueryEr
         generated_stored: r_bool(r, 18),
         generated_column_names: r_json::<Vec<String>>(r, 19)?,
         zerofill: r_bool(r, 20),
+        display_width: r.get(24).and_then(|value| match value {
+            Value::UInt(width) => u16::try_from(*width).ok(),
+            Value::Int(width) => u16::try_from(*width).ok(),
+            _ => None,
+        }),
         invisible: r_bool(r, 21),
         generated_expr_ast: None,
         generated_program: None,
@@ -2401,6 +2425,7 @@ fn view_row(v: &ViewSchema) -> Vec<Value> {
             .as_ref()
             .map(|query| sv(query.encoded()))
             .unwrap_or(Value::Null),
+        uv(v.created_ms),
     ]
 }
 fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError> {
@@ -2458,6 +2483,7 @@ fn reconstruct_view(r: &[Value]) -> Result<ViewSchema, crate::types::QueryError>
         schema_version: r_u64(r, 15),
         // Missing in DD heaps written before this column → empty (raw echo).
         definition_normalized: r_str(r, 16),
+        created_ms: r_u64(r, 18),
         query,
     })
 }
@@ -2813,12 +2839,38 @@ mod tests {
     }
 
     #[test]
+    fn report1107_corrupt_optional_statistics_do_not_hide_table_schema() {
+        let catalog = sample_catalog();
+        let mut rows = catalog_to_dd_rows(&catalog).unwrap();
+        let table_id = catalog.tables["test.t"].id;
+        let column_id = catalog.tables["test.t"].columns[0].column_id;
+        rows.column_stats.push(vec![
+            Value::UInt(table_id),
+            Value::UInt(0),
+            Value::UInt(column_id as u64),
+            Value::UInt(1),
+            Value::UInt(0),
+            Value::UInt(1),
+            Value::Null,
+            Value::Bytes(b"damaged statistics".to_vec()),
+        ]);
+        let rebuilt = catalog_from_dd_rows(&rows).unwrap();
+        assert_eq!(
+            rebuilt.tables["test.t"].columns.len(),
+            catalog.tables["test.t"].columns.len()
+        );
+        assert!(rebuilt.tables["test.t"].stats.columns.is_empty());
+        assert!(rebuilt.tables["test.t"].stats.analyzed_at_unix_ms.is_none());
+    }
+
+    #[test]
     fn audit_fulltext_config_roundtrip() {
         let mut catalog = sample_catalog();
         let table = std::sync::Arc::make_mut(catalog.tables.get_mut("test.t").unwrap());
         let idx = &mut table.indexes[1];
         idx.index_type = "FULLTEXT".into();
         idx.fulltext = Some(crate::storage::schema::FulltextMeta {
+            collation_id: None,
             parser: "ngram".into(),
             ngram_size: Some(2),
             min_token_size: Some(4),
@@ -3162,6 +3214,7 @@ mod tests {
                 character_set_client: crate::charset::DEFAULT_CHARSET.to_string(),
                 collation_connection: crate::charset::DEFAULT_COLLATION.to_string(),
                 definition_normalized: String::new(),
+                created_ms: 0,
             },
         );
         catalog.routines.insert(

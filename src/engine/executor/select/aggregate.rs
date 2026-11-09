@@ -203,8 +203,8 @@ impl AggregateKind {
             ("SUM", true, false) => Self::SumDistinct,
             ("AVG", false, false) => Self::Avg,
             ("AVG", true, false) => Self::AvgDistinct,
-            ("MIN", false, false) => Self::Min,
-            ("MAX", false, false) => Self::Max,
+            ("MIN", _, false) => Self::Min,
+            ("MAX", _, false) => Self::Max,
             ("BIT_AND", false, false) => Self::BitAnd,
             ("BIT_OR", false, false) => Self::BitOr,
             ("BIT_XOR", false, false) => Self::BitXor,
@@ -216,7 +216,11 @@ impl AggregateKind {
         })
     }
 
-    pub(crate) fn result_type(self, arg_type: Option<ColumnType>) -> ColumnType {
+    pub(crate) fn result_type_with_source(
+        self,
+        arg_type: Option<ColumnType>,
+        source: Option<&crate::types::ColumnSource>,
+    ) -> ColumnType {
         let legacy_name = match self {
             Self::CountStar | Self::Count | Self::CountDistinct => "COUNT",
             Self::Sum | Self::SumDistinct => "SUM",
@@ -228,6 +232,33 @@ impl AggregateKind {
                 return ColumnType::Double;
             }
         };
+        if matches!(
+            self,
+            Self::Sum | Self::Avg | Self::SumDistinct | Self::AvgDistinct
+        ) && matches!(
+            arg_type,
+            Some(
+                ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp | ColumnType::Time
+            )
+        ) {
+            let default_source = crate::types::ColumnSource::default();
+            let argument = arg_type.map(|kind| {
+                crate::engine::expr_type::ExprType::from_column_type(
+                    kind,
+                    source.unwrap_or(&default_source),
+                )
+            });
+            let no_column = |_: &Expr| None;
+            let no_param = |_: usize| None;
+            let context =
+                crate::engine::expr_type::TypeContext::context_free(&no_column, &no_param);
+            return crate::engine::expr_type::aggregate_result_type(
+                legacy_name,
+                argument,
+                &context,
+            )
+            .column_type();
+        }
         super::aggregate_function_result_type(legacy_name, arg_type)
     }
 
@@ -302,7 +333,7 @@ impl AggregateSlot {
                 if upper == "JSON_OBJECTAGG" && args.len() == 2 {
                     slot_args = vec![Expr::Function {
                         name: "JSON_ARRAY".to_string(),
-                        args: args.clone(),
+                        args: vec![json_objectagg_key_expr(&args[0]), args[1].clone()],
                         distinct: false,
                     }];
                 }
@@ -372,21 +403,25 @@ impl AggregateSlot {
                     None
                 };
                 // GROUP_CONCAT evaluates its value argument in string context.
-                // Reuse CONCAT's context-aware conversion so BIT(M) becomes
-                // its fixed-width big-endian byte representation while normal
-                // numeric values become decimal text. This wrapper is applied
-                // once at slot construction and therefore reaches every
-                // aggregate execution path (row, compiled and parallel).
+                // BIT fields use decimal text here; explicit CONCAT(BIT) keeps
+                // binary string semantics. Bind this once for every execution path.
                 if upper == "GROUP_CONCAT" {
                     if let Some(value_arg) = slot_args.first_mut() {
                         *value_arg = Expr::Function {
-                            name: "CONCAT".to_string(),
+                            name: "__GROUP_CONCAT_VALUE".to_string(),
                             args: vec![value_arg.clone()],
                             distinct: false,
                         };
                     }
                 }
-                if upper == "GROUP_CONCAT" && *distinct {
+                if upper == "JSON_ARRAYAGG" {
+                    if let Some(value_arg) = slot_args.first_mut() {
+                        *value_arg = json_aggregate_value_expr(value_arg);
+                    }
+                }
+                if upper == "GROUP_CONCAT" && *distinct && !order_by.last().is_some_and(|key| {
+                    matches!(&key.expr, Expr::Function { args, .. } if matches!(args.first(), Some(Expr::Function { name, .. }) if name == "__DISTINCT_TUPLE"))
+                }) {
                     if let Some(value) = slot_args.first() {
                         // Carry the comparison key separately from the displayed
                         // text through every ordered-feed and partial-merge path.
@@ -512,6 +547,27 @@ impl AggregateSlot {
             keys.push(eval(&key.expr)?);
         }
         Ok(keys)
+    }
+}
+
+/// Member names use SQL string conversion; JSON values retain their JSON
+/// text and SQL predicates retain their numeric string representation.
+pub(crate) fn json_objectagg_key_expr(expr: &Expr) -> Expr {
+    Expr::Function {
+        name: "CAST".into(),
+        args: vec![
+            expr.clone(),
+            Expr::Literal(crate::parser::Literal::String("CHAR".into())),
+        ],
+        distinct: false,
+    }
+}
+
+pub(crate) fn json_aggregate_value_expr(expr: &Expr) -> Expr {
+    Expr::Function {
+        name: "__JSON_AGG_VALUE".into(),
+        args: vec![expr.clone()],
+        distinct: false,
     }
 }
 
@@ -909,7 +965,7 @@ impl Accumulator for SpatialCollectAcc {
             ),
             _ => Geom::GeometryCollection(geometries),
         };
-        Ok(Value::Geometry(write_geometry(&Geometry::new(srid, geom))))
+        Ok(Value::Geometry(write_geometry(&Geometry::new(srid, geom))?))
     }
 
     fn heap_bytes(&self) -> usize {
@@ -1281,6 +1337,17 @@ pub(crate) fn accumulate_numeric_state(
     if matches!(value, Value::Null) {
         return Ok(());
     }
+    if matches!(
+        value,
+        Value::Date(_) | Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::Year(_)
+    ) {
+        let mut number =
+            crate::engine::expr::temporal_exact_number(value)?.expect("temporal number");
+        if !matches!(value, Value::Date(_) | Value::Year(_)) {
+            number = exact_aggregate_value_at_scale(number, 6);
+        }
+        return accumulate_numeric_state(state, &number);
+    }
     // Hot path: state has already been bootstrapped to Exact. Mutate in
     // place — skips the `mem::replace` round-trip and the enum
     // re-construction. Falls through to the slow path on overflow / a
@@ -1330,6 +1397,17 @@ pub(crate) fn subtract_numeric_state(
 ) -> Result<(), QueryError> {
     if matches!(value, Value::Null) {
         return Ok(());
+    }
+    if matches!(
+        value,
+        Value::Date(_) | Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::Year(_)
+    ) {
+        let mut number =
+            crate::engine::expr::temporal_exact_number(value)?.expect("temporal number");
+        if !matches!(value, Value::Date(_) | Value::Year(_)) {
+            number = exact_aggregate_value_at_scale(number, 6);
+        }
+        return subtract_numeric_state(state, &number);
     }
     if let NumericAggState::Exact(acc) = state {
         if let Some(exact) = value.exact_decimal() {
@@ -1461,6 +1539,15 @@ pub(crate) fn numeric_state_to_f64(state: &NumericAggState) -> f64 {
     }
 }
 
+pub(crate) fn exact_aggregate_value_at_scale(value: Value, scale: u8) -> Value {
+    match value.exact_decimal() {
+        Some(exact) => {
+            Value::from_exact_decimal(crate::util::decimal::rescale_exact(exact, scale, true))
+        }
+        None => value,
+    }
+}
+
 /// Borrow a bounded exact subtotal without cloning arbitrary-precision data.
 pub(crate) fn numeric_state_compact_parts(state: &NumericAggState) -> Option<(i128, u8)> {
     match state {
@@ -1512,16 +1599,41 @@ pub(crate) fn finalize_avg_value(state: &NumericAggState, n: u64) -> Value {
     if let NumericAggState::Exact(acc) = state {
         if let Some(total) = acc.exact_value() {
             let incr = crate::engine::expr::session_div_precision_increment();
-            let target_scale = (acc.scale as u32 + incr as u32)
+            let mut target_scale = (acc.scale as u32 + incr as u32)
                 .min(crate::util::decimal::MAX_DECIMAL_SCALE as u32)
                 as u8;
+            let mut rounding = crate::util::decimal::DecimalRoundingMode::HalfAwayFromZero;
+            if let crate::util::decimal::ExactDecimal::Big(magnitude, scale) = &total {
+                // A cheap upper bound avoids extra division/string work for
+                // wide inputs whose integer and guard digits already fit.
+                let integer_bound = (magnitude.bits().saturating_mul(30_103) / 100_000 + 1)
+                    .saturating_sub(u64::from(*scale));
+                let words = u64::from(crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION) / 9;
+                if integer_bound.div_ceil(9) + (u64::from(target_scale) + 1).div_ceil(9) > words {
+                    use num_traits::Signed;
+                    // Reserve complete integer words before fractional words.
+                    // With no guard word left, MySQL truncates at the boundary.
+                    let divisor = num_bigint::BigInt::from(n)
+                        * num_bigint::BigInt::from(10u8).pow(u32::from(*scale));
+                    let integer_digits = (magnitude.abs() / divisor).to_str_radix(10).len();
+                    let fractional_capacity =
+                        (words as usize).saturating_sub(integer_digits.div_ceil(9)) * 9;
+                    if usize::from(target_scale) >= fractional_capacity {
+                        target_scale = fractional_capacity as u8;
+                        rounding = crate::util::decimal::DecimalRoundingMode::Truncate;
+                    }
+                }
+            }
             let divisor = crate::util::decimal::ExactDecimal::from_big(n.into(), 0);
             let context = crate::util::decimal::DecimalContext {
-                result: Some(crate::util::decimal::DecimalResultSpec::new(
-                    65,
-                    target_scale,
-                )),
+                // AVG can retain 65 integer digits plus its extra fractional
+                // scale. Do not apply a persisted-column precision cap here.
+                result: Some(crate::util::decimal::DecimalResultSpec {
+                    precision: crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
+                    scale: target_scale,
+                }),
                 div_precision_increment: incr,
+                rounding,
                 ..Default::default()
             };
             if let Ok(Some(result)) = crate::util::decimal::exact_binary(
@@ -2122,6 +2234,11 @@ impl Accumulator for MinMaxAcc {
     }
 
     fn update(&mut self, value: Value) -> Result<(), QueryError> {
+        if matches!(value, Value::Geometry(_)) {
+            return Err(
+                crate::error::catalog::ER_WRONG_ARGUMENTS.error("Incorrect arguments to MIN/MAX")
+            );
+        }
         if matches!(value, Value::Null) {
             return Ok(());
         }
@@ -2386,9 +2503,10 @@ struct GroupConcatPart {
     binary: bool,
 }
 
-#[derive(Clone)]
 struct GroupConcatAcc {
     parts: Vec<GroupConcatPart>,
+    parts_heap_bytes: usize,
+    seen_heap_bytes: usize,
     logical_len: usize,
     next_ordinal: u64,
     retained_units: usize,
@@ -2416,6 +2534,39 @@ struct GroupConcatAcc {
     truncated: bool,
 }
 
+impl GroupConcatPart {
+    fn heap_bytes(&self) -> usize {
+        use crate::engine::executor::memory_footprint::AllocatedBytes;
+        self.bytes
+            .capacity()
+            .saturating_add(self.sort_keys.allocated_bytes())
+            .saturating_add(self.distinct_key.as_ref().map_or(0, Vec::capacity))
+    }
+}
+
+impl Clone for GroupConcatAcc {
+    fn clone(&self) -> Self {
+        let parts = self.parts.clone();
+        let seen = self.seen.clone();
+        Self {
+            parts_heap_bytes: parts.iter().map(GroupConcatPart::heap_bytes).sum(),
+            seen_heap_bytes: seen.iter().map(Vec::capacity).sum(),
+            parts,
+            seen,
+            logical_len: self.logical_len,
+            next_ordinal: self.next_ordinal,
+            retained_units: self.retained_units,
+            pending_error: self.pending_error.clone(),
+            distinct: self.distinct,
+            separator: self.separator.clone(),
+            binary_result: self.binary_result,
+            order_fields: self.order_fields.clone(),
+            max_len_bytes: self.max_len_bytes,
+            truncated: self.truncated,
+        }
+    }
+}
+
 impl GroupConcatAcc {
     fn new(
         distinct: bool,
@@ -2425,6 +2576,8 @@ impl GroupConcatAcc {
     ) -> Self {
         Self {
             parts: Vec::new(),
+            parts_heap_bytes: 0,
+            seen_heap_bytes: 0,
             logical_len: 0,
             next_ordinal: 0,
             retained_units: 0,
@@ -2513,9 +2666,12 @@ impl GroupConcatAcc {
             _ => Self::distinct_key(&bytes, binary),
         });
         if let Some(key) = &distinct_key {
-            if !self.seen.insert(key.clone()) {
+            let retained_key = key.clone();
+            let bytes = retained_key.capacity();
+            if !self.seen.insert(retained_key) {
                 return Ok(());
             }
+            self.seen_heap_bytes = self.seen_heap_bytes.saturating_add(bytes);
         }
         self.binary_result |= binary;
         if self.next_ordinal > 0 {
@@ -2542,10 +2698,14 @@ impl GroupConcatAcc {
                 });
             }
             let out = &mut self.parts[0].bytes;
+            let previous_capacity = out.capacity();
             if ordinal > 0 {
                 Self::append_prefix(out, &self.separator, self.max_len_bytes)?;
             }
             Self::append_prefix(out, &bytes, self.max_len_bytes)?;
+            self.parts_heap_bytes = self
+                .parts_heap_bytes
+                .saturating_add(out.capacity() - previous_capacity);
             return Ok(());
         }
         if !self.distinct
@@ -2562,6 +2722,7 @@ impl GroupConcatAcc {
         };
         if self.distinct {
             self.reserve_part()?;
+            self.parts_heap_bytes = self.parts_heap_bytes.saturating_add(part.heap_bytes());
             self.parts.push(part);
             return Ok(());
         }
@@ -2590,6 +2751,7 @@ impl GroupConcatAcc {
             .retained_units
             .saturating_add(part.bytes.len())
             .saturating_add(self.separator.len());
+        self.parts_heap_bytes = self.parts_heap_bytes.saturating_add(part.heap_bytes());
         self.parts.push(part);
         let mut child = self.parts.len() - 1;
         while child > 0 {
@@ -2616,7 +2778,8 @@ impl GroupConcatAcc {
                 break;
             }
             self.retained_units = self.retained_units.saturating_sub(worst_units);
-            self.parts.swap_remove(0);
+            let removed = self.parts.swap_remove(0);
+            self.parts_heap_bytes = self.parts_heap_bytes.saturating_sub(removed.heap_bytes());
             let mut parent = 0;
             while parent * 2 + 1 < self.parts.len() {
                 let left = parent * 2 + 1;
@@ -2652,7 +2815,7 @@ impl Accumulator for GroupConcatAcc {
             return Ok(());
         }
         let (bytes, binary) = match value {
-            Value::Bytes(bytes) => (bytes, true),
+            Value::Bytes(bytes) | Value::Geometry(bytes) => (bytes, true),
             Value::String(text) => (text.into_bytes(), false),
             other => (value_to_string(&other).into_bytes(), false),
         };
@@ -2663,7 +2826,7 @@ impl Accumulator for GroupConcatAcc {
             return Ok(());
         }
         let (bytes, binary) = match value {
-            Value::Bytes(bytes) => (bytes, true),
+            Value::Bytes(bytes) | Value::Geometry(bytes) => (bytes, true),
             Value::String(text) => (text.into_bytes(), false),
             other => (value_to_string(&other).into_bytes(), false),
         };
@@ -2746,10 +2909,10 @@ impl Accumulator for GroupConcatAcc {
         }
     }
     fn heap_bytes(&self) -> usize {
-        use crate::engine::executor::memory_footprint::AllocatedBytes;
         self.parts
             .capacity()
             .saturating_mul(std::mem::size_of::<GroupConcatPart>())
+            .saturating_add(self.parts_heap_bytes)
             .saturating_add(self.separator.capacity())
             .saturating_add(
                 self.order_fields
@@ -2757,32 +2920,11 @@ impl Accumulator for GroupConcatAcc {
                     .saturating_mul(std::mem::size_of::<SortField>()),
             )
             .saturating_add(
-                self.parts
-                    .iter()
-                    .map(|part| {
-                        part.bytes
-                            .capacity()
-                            .saturating_add(
-                                part.sort_keys
-                                    .capacity()
-                                    .saturating_mul(std::mem::size_of::<Value>()),
-                            )
-                            .saturating_add(
-                                part.sort_keys
-                                    .iter()
-                                    .map(AllocatedBytes::allocated_bytes)
-                                    .sum::<usize>(),
-                            )
-                            .saturating_add(part.distinct_key.as_ref().map_or(0, Vec::capacity))
-                    })
-                    .sum::<usize>(),
-            )
-            .saturating_add(
                 self.seen
                     .capacity()
                     .saturating_mul(std::mem::size_of::<Vec<u8>>() + 8),
             )
-            .saturating_add(self.seen.iter().map(Vec::capacity).sum::<usize>())
+            .saturating_add(self.seen_heap_bytes)
     }
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
@@ -2818,9 +2960,11 @@ impl Accumulator for GroupConcatAcc {
                     .distinct_key
                     .clone()
                     .unwrap_or_else(|| Self::distinct_key(&part.bytes, part.binary));
+                let bytes = key.capacity();
                 if !self.seen.insert(key) {
                     continue;
                 }
+                self.seen_heap_bytes = self.seen_heap_bytes.saturating_add(bytes);
                 let mut part = part;
                 part.ordinal = self.next_ordinal;
                 self.next_ordinal = self.next_ordinal.saturating_add(1);
@@ -2828,6 +2972,7 @@ impl Accumulator for GroupConcatAcc {
                     self.pending_error = Some(error);
                     return;
                 }
+                self.parts_heap_bytes = self.parts_heap_bytes.saturating_add(part.heap_bytes());
                 self.parts.push(part);
             } else if let Err(error) = self.push_part(part.bytes, part.binary, part.sort_keys) {
                 self.pending_error = Some(error);
@@ -2955,7 +3100,10 @@ impl JsonArrayAggAcc {
     fn push_entry(&mut self, value: Value, sort_keys: Vec<Value>) {
         // Keep each element in JSONB form. A serde round-trip loses MySQL's
         // DATE/TIME/DATETIME/DECIMAL/OPAQUE scalar tags.
-        let json = value_to_jsonb_typed(&value, self.boolean);
+        let json = match value {
+            Value::Json(bytes) => bytes,
+            value => value_to_jsonb_typed(&value, self.boolean),
+        };
         use crate::engine::executor::memory_footprint::AllocatedBytes;
         let byte_cost = json
             .capacity()
@@ -3238,6 +3386,23 @@ impl Accumulator for VarianceAcc {
     }
 }
 
+/// Convert character inputs before numeric DISTINCT builds its equality keys.
+pub(crate) fn numeric_distinct_value(
+    value: &Value,
+) -> Result<std::borrow::Cow<'_, Value>, QueryError> {
+    if matches!(
+        value,
+        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+    ) {
+        let numeric = crate::engine::expr::with_distinct_aggregate_numeric_conversion(|| {
+            crate::engine::expr::numeric(value)
+        })?;
+        Ok(std::borrow::Cow::Owned(Value::Double(numeric)))
+    } else {
+        Ok(std::borrow::Cow::Borrowed(value))
+    }
+}
+
 /// Wrap a numeric accumulator to dedupe inputs first (DISTINCT).
 ///
 /// The inner accumulator is **not** fed incrementally. Instead every distinct
@@ -3304,6 +3469,11 @@ impl<A: Accumulator + Clone> Accumulator for DistinctReducer<A> {
         if matches!(value, Value::Null) {
             return Ok(());
         }
+        let converted = numeric_distinct_value(&value)?;
+        let value = match converted {
+            std::borrow::Cow::Owned(value) => value,
+            std::borrow::Cow::Borrowed(_) => value,
+        };
         let key = ValueKey::from(&value);
         self.insert(key, value)?;
         Ok(())
@@ -3312,6 +3482,8 @@ impl<A: Accumulator + Clone> Accumulator for DistinctReducer<A> {
         if matches!(value, Value::Null) {
             return Ok(());
         }
+        let converted = numeric_distinct_value(value)?;
+        let value = converted.as_ref();
         let key = ValueKey::from(value);
         if !self.seen.contains_key(&key) {
             let copy = crate::engine::executor::mem_budget::try_clone_value(
@@ -4012,14 +4184,14 @@ mod retained_state_memory_tests {
     }
 
     #[test]
-    fn scalar_distinct_reducer_counts_key_and_original_representative() {
+    fn scalar_numeric_distinct_reducer_retains_converted_values() {
         let mut acc = DistinctReducer::new(SumAcc::default());
         acc.update(Value::Bytes(vec![b'1'; 64 * 1024])).unwrap();
         assert!(
-            acc.heap_bytes() >= 128 * 1024,
-            "DISTINCT reducer omitted the key or representative: {}",
-            acc.heap_bytes()
+            acc.heap_bytes() < 1024,
+            "numeric DISTINCT retained the source string"
         );
+        assert!(matches!(acc.seen.values().next(), Some(Value::Double(_))));
     }
 
     #[test]

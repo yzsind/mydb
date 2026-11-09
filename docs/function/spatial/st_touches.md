@@ -19,20 +19,25 @@ ST_TOUCHES(geometry1, geometry2)
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; returns `NULL` when the spatial input is `NULL`.
+Returns integer 1/0 when the touching relation holds/does not hold for an applicable geometry combination. SQL NULL, empty/inapplicable combinations such as Point/Point can return SQL NULL. Both geometries must have the same SRID.
 
 ## Examples
 
 ```sql
-SELECT ST_TOUCHES(ST_GEOMFROMTEXT('POINT(1 2)'), ST_GEOMFROMTEXT('POINT(2 3)'));
+SELECT ST_TOUCHES(ST_GEOMFROMTEXT('LINESTRING(0 0,1 1)'),ST_GEOMFROMTEXT('LINESTRING(1 1,2 0)')),
+       ST_TOUCHES(POINT(1,2),POINT(2,3));
 ```
 
-Result: returns 0 or 1, indicating whether the spatial relationship holds.
+Result:
+
+```text
+1	NULL
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_CONTAINS`](st_contains.md), [`ST_WITHIN`](st_within.md), [`ST_CROSSES`](st_crosses.md), [`ST_INTERSECTS`](st_intersects.md).

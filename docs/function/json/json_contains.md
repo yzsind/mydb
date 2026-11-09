@@ -14,13 +14,13 @@ JSON_CONTAINS(target, candidate [, path])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `target` | Yes | JSON document or JSON path/scalar | The 1st argument; the meaning is determined by the function syntax and description |
-| `candidate` | Yes | JSON document or JSON path/scalar | The 2nd argument; the meaning is determined by the function syntax and description |
-| `path` | No | string | The 3rd argument; a JSON path expression |
+| `target` | Yes | JSON document or valid JSON text | Document whose containment is tested. |
+| `candidate` | Yes | JSON document or valid JSON text | Candidate JSON value; JSON string/number types are distinct. |
+| `path` | No | Single-location JSON path | Optional subtree; a missing path returns SQL NULL. |
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 when candidate is contained by target at the optional path, 0 when it is not contained, or SQL NULL for NULL arguments or an unmatched optional path. Comparisons preserve JSON types; a string is not coerced to a number.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: 1
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_CONTAINS_PATH`](json_contains_path.md), [`JSON_OVERLAPS`](json_overlaps.md), [`JSON_SEARCH`](json_search.md).

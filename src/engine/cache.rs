@@ -1954,6 +1954,7 @@ mod tests {
             foreign_keys: Vec::new(),
             fk_referenced_by: Vec::new(),
             stats: crate::storage::TableStats {
+                definition_bindings: Default::default(),
                 analyze_revision: 0,
                 explicit_histograms: std::collections::BTreeMap::new(),
                 row_count: 0,

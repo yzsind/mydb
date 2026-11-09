@@ -8,6 +8,7 @@ Subtracts an interval from a date or datetime; an alias of `DATE_SUB`. This func
 
 ```sql
 SUBDATE(date, INTERVAL expr unit)
+SUBDATE(date, days)
 ```
 
 ## Parameters and Return Value
@@ -25,3 +26,9 @@ Result: 2026-08-29
 ## Related Functions
 
 - [`DATE_SUB`](date_sub.md): the primary function with full documentation.
+
+## Notes
+
+- The two-argument numeric form interprets days as a signed day count. It is an additional form beyond the INTERVAL syntax of the primary function.
+
+- The two-argument numeric form interprets days as a signed day count. It is an additional form beyond the INTERVAL syntax of the primary function.

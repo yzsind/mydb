@@ -7,18 +7,18 @@ Returns a supplied connection identity through the compatibility helper.
 ## Syntax
 
 ```sql
-PS_THREAD_ID([connection_id])
+PS_THREAD_ID(connection_id)
 ```
 
 ## Parameters
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `connection_id` | No | Integer | The 1st argument; the meaning is determined by the function syntax and description |
+| `connection_id` | Yes | Integer | Target connection ID; unknown/invalid IDs return NULL. |
 
 ## Return Value
 
-With no argument, returns the current connection ID. With one non-NULL argument, converts it numerically to an unsigned integer; NULL returns NULL. This is an identity/conversion helper, not an arbitrary live-thread registry lookup.
+Returns the supplied ID as an unsigned integer when it identifies a live registered connection, or SQL NULL for an unknown/out-of-range ID or SQL NULL input. Exactly one argument is required. In this implementation the returned thread identity equals the connection ID.
 
 ## Examples
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CONNECTION_ID`](connection_id.md), [`PS_CURRENT_THREAD_ID`](ps_current_thread_id.md), [`PS_THREAD_ACCOUNT`](ps_thread_account.md).

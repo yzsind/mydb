@@ -44,6 +44,8 @@ Result:
 
 HAMMING counts XOR bits. JACCARD is `1 - popcount(a AND b)/popcount(a OR b)` and returns zero for two all-zero vectors. These metrics require BINARY operands.
 
+- See [native datatype limits](README.md#native-datatype-limits) for maximum dimensions, precision and wire/payload representation. Arity is checked before SQL NULL propagation.
+
 ## Related Functions
 
 [`VEC_DISTANCE`](vec_distance.md): the alias of this function.

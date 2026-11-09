@@ -10,23 +10,18 @@ use super::types::*;
 
 fn invalid_geojson(detail: &str) -> QueryError {
     geo_err(
-        crate::error::catalog::ER_GIS_INVALID_DATA,
+        crate::error::catalog::ER_INVALID_GEOJSON_UNSPECIFIED,
         format!("Invalid GeoJSON data provided ({detail})."),
     )
 }
 
 // --- output ---
 
-/// Render a numeric coordinate, preferring an integer JSON token when the
-/// value is integral (matching MySQL's `[1, 1]` rather than `[1.0, 1.0]`).
+/// Coordinates are JSON doubles, including integral coordinate values.
 fn num(v: f64) -> J {
-    if v.fract() == 0.0 && v.abs() < 9.0e15 {
-        J::from(v as i64)
-    } else {
-        serde_json::Number::from_f64(v)
-            .map(J::Number)
-            .unwrap_or(J::Null)
-    }
+    serde_json::Number::from_f64(v)
+        .map(J::Number)
+        .unwrap_or(J::Null)
 }
 
 fn coord_json(c: Coord) -> J {
@@ -41,7 +36,7 @@ fn rings_json(rings: &[Vec<Coord>]) -> J {
     J::Array(rings.iter().map(|r| seq_json(r)).collect())
 }
 
-fn geom_json(geom: &Geom) -> J {
+pub(super) fn geom_json(geom: &Geom) -> J {
     match geom {
         Geom::Point(c) => json!({"type": "Point", "coordinates": coord_json(*c)}),
         Geom::LineString(cs) => json!({"type": "LineString", "coordinates": seq_json(cs)}),
@@ -60,6 +55,7 @@ fn geom_json(geom: &Geom) -> J {
 }
 
 /// `ST_AsGeoJSON` output (compact form).
+#[cfg(test)]
 pub(crate) fn to_geojson(geom: &Geom) -> String {
     geom_json(geom).to_string()
 }
@@ -98,9 +94,13 @@ fn parse_rings(v: &J) -> Result<Vec<Vec<Coord>>, QueryError> {
         .collect()
 }
 
-fn parse_geom(v: &J, depth: u32) -> Result<Geom, QueryError> {
+fn parse_geom(v: &J, depth: u32, allow_feature: bool) -> Result<Option<Geom>, QueryError> {
     if depth > 32 {
         return Err(invalid_geojson("nesting too deep"));
+    }
+    if depth > 0 && v.get("crs").is_some_and(|value| !value.is_null()) {
+        return Err(crate::error::catalog::ER_INVALID_GEOJSON_CRS_NOT_TOP_LEVEL
+            .error("Member 'crs' must be specified in the top level GeoJSON object."));
     }
     let ty = v
         .get("type")
@@ -110,40 +110,72 @@ fn parse_geom(v: &J, depth: u32) -> Result<Geom, QueryError> {
         v.get("coordinates")
             .ok_or_else(|| invalid_geojson("missing coordinates"))
     };
-    match ty {
-        "Point" => Ok(Geom::Point(parse_coord(coords()?)?)),
-        "LineString" => Ok(Geom::LineString(parse_seq(coords()?)?)),
-        "Polygon" => Ok(Geom::Polygon(parse_rings(coords()?)?)),
-        "MultiPoint" => Ok(Geom::MultiPoint(parse_seq(coords()?)?)),
+    let geom = match ty {
+        "Feature" | "FeatureCollection" if !allow_feature => {
+            return Err(invalid_geojson("expected a geometry object"));
+        }
+        "Feature" => {
+            let properties = v.get("properties").ok_or_else(|| {
+                crate::error::catalog::ER_INVALID_GEOJSON_MISSING_MEMBER
+                    .error("Invalid GeoJSON data: missing required member 'properties'.")
+            })?;
+            if !properties.is_object() && !properties.is_null() {
+                return Err(invalid_geojson(
+                    "Feature properties must be an object or null",
+                ));
+            }
+            let geometry = v
+                .get("geometry")
+                .ok_or_else(|| invalid_geojson("missing geometry"))?;
+            if geometry.is_null() {
+                return Ok(None);
+            }
+            return parse_geom(geometry, depth + 1, false);
+        }
+        "FeatureCollection" | "GeometryCollection" => {
+            let member = if ty == "FeatureCollection" {
+                "features"
+            } else {
+                "geometries"
+            };
+            let arr = v
+                .get(member)
+                .and_then(J::as_array)
+                .ok_or_else(|| invalid_geojson("missing collection array"))?;
+            let mut geometries = Vec::with_capacity(arr.len());
+            for item in arr {
+                if ty == "FeatureCollection"
+                    && item.get("type").and_then(J::as_str) != Some("Feature")
+                {
+                    return Err(invalid_geojson(
+                        "FeatureCollection members must be Features",
+                    ));
+                }
+                if let Some(geometry) = parse_geom(item, depth + 1, ty == "FeatureCollection")? {
+                    geometries.push(geometry);
+                }
+            }
+            Geom::GeometryCollection(geometries)
+        }
+        "Point" => Geom::Point(parse_coord(coords()?)?),
+        "LineString" => Geom::LineString(parse_seq(coords()?)?),
+        "Polygon" => Geom::Polygon(parse_rings(coords()?)?),
+        "MultiPoint" => Geom::MultiPoint(parse_seq(coords()?)?),
         "MultiLineString" => {
             let arr = coords()?
                 .as_array()
                 .ok_or_else(|| invalid_geojson("MultiLineString coordinates"))?;
-            Ok(Geom::MultiLineString(
-                arr.iter().map(parse_seq).collect::<Result<_, _>>()?,
-            ))
+            Geom::MultiLineString(arr.iter().map(parse_seq).collect::<Result<_, _>>()?)
         }
         "MultiPolygon" => {
             let arr = coords()?
                 .as_array()
                 .ok_or_else(|| invalid_geojson("MultiPolygon coordinates"))?;
-            Ok(Geom::MultiPolygon(
-                arr.iter().map(parse_rings).collect::<Result<_, _>>()?,
-            ))
+            Geom::MultiPolygon(arr.iter().map(parse_rings).collect::<Result<_, _>>()?)
         }
-        "GeometryCollection" => {
-            let arr = v
-                .get("geometries")
-                .and_then(|g| g.as_array())
-                .ok_or_else(|| invalid_geojson("GeometryCollection geometries"))?;
-            Ok(Geom::GeometryCollection(
-                arr.iter()
-                    .map(|g| parse_geom(g, depth + 1))
-                    .collect::<Result<_, _>>()?,
-            ))
-        }
-        other => Err(invalid_geojson(&format!("unknown geometry type {other}"))),
-    }
+        other => return Err(invalid_geojson(&format!("unknown geometry type {other}"))),
+    };
+    Ok(Some(geom))
 }
 
 /// `ST_GeomFromGeoJSON` input. `srid` is applied to the result (MySQL defaults
@@ -153,17 +185,29 @@ pub(crate) fn from_geojson(text: &str, srid: u32) -> Result<Geometry, QueryError
     from_geojson_options(text, srid, true)
 }
 
+#[cfg(test)]
 pub(crate) fn from_geojson_options(
     text: &str,
     srid: u32,
     strip_extra: bool,
 ) -> Result<Geometry, QueryError> {
+    from_geojson_sql(text, Some(srid), strip_extra)?
+        .ok_or_else(|| invalid_geojson("null feature geometry"))
+}
+
+pub(crate) fn from_geojson_sql(
+    text: &str,
+    explicit_srid: Option<u32>,
+    strip_extra: bool,
+) -> Result<Option<Geometry>, QueryError> {
+    let value: J = serde_json::from_str(text).map_err(|_| invalid_geojson("invalid JSON"))?;
     if !strip_extra {
         fn check(value: &J) -> Result<(), QueryError> {
             match value {
                 J::Array(values) => {
                     if values.first().is_some_and(J::is_number) && values.len() > 2 {
-                        return Err(invalid_geojson("coordinates have more than two dimensions"));
+                        return Err(crate::error::catalog::ER_DIMENSION_UNSUPPORTED
+                            .error("GeoJSON coordinates have more than two dimensions."));
                     }
                     for value in values {
                         check(value)?;
@@ -180,15 +224,38 @@ pub(crate) fn from_geojson_options(
             }
             Ok(())
         }
-        let value: J = serde_json::from_str(text).map_err(|_| invalid_geojson("invalid JSON"))?;
         check(&value)?;
     }
-    from_geojson_impl(text, srid)
-}
-
-fn from_geojson_impl(text: &str, srid: u32) -> Result<Geometry, QueryError> {
-    let v: J = serde_json::from_str(text).map_err(|_| invalid_geojson("not valid JSON"))?;
-    let geom = parse_geom(&v, 0)?;
+    let srid = match explicit_srid {
+        Some(srid) => srid,
+        None => match value.get("crs").filter(|value| !value.is_null()) {
+            None => 4326,
+            Some(crs) => {
+                if crs.get("type").and_then(J::as_str) != Some("name") {
+                    return Err(invalid_geojson("unsupported CRS type"));
+                }
+                let name = crs
+                    .get("properties")
+                    .and_then(|p| p.get("name"))
+                    .and_then(J::as_str)
+                    .ok_or_else(|| invalid_geojson("missing CRS name"))?;
+                if name == "urn:ogc:def:crs:OGC:1.3:CRS84" {
+                    4326
+                } else {
+                    let code = name
+                        .strip_prefix("EPSG:")
+                        .or_else(|| name.strip_prefix("urn:ogc:def:crs:EPSG::"))
+                        .filter(|code| !code.is_empty() && code.bytes().all(|b| b.is_ascii_digit()))
+                        .ok_or_else(|| invalid_geojson("unsupported CRS name"))?;
+                    code.parse()
+                        .map_err(|_| invalid_geojson("invalid CRS identifier"))?
+                }
+            }
+        },
+    };
+    let Some(geom) = parse_geom(&value, 0, true)? else {
+        return Ok(None);
+    };
     super::validate_shape(&geom)?;
-    Ok(Geometry::new(srid, geom))
+    Ok(Some(Geometry::new(srid, geom)))
 }

@@ -15,7 +15,7 @@ BIT_XOR(expr) OVER (window_spec)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr` | Yes | Any SQL expression | The 1st argument; the expression to evaluate |
+| `expr` | Yes | Any SQL expression | Expression to evaluate. |
 
 ## Return Value
 
@@ -44,8 +44,10 @@ Results: 0, then 0.
 
 - Hex/bit literals select numeric evaluation unless an explicit binary type establishes byte semantics. Use CAST(... AS BINARY(n)) or a typed binary column when the aggregate must operate on bytes; operands must have equal byte lengths.
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
+
+- Binary evaluation requires equal byte lengths; incompatible lengths raise a bitwise-operand error. Numeric empty/all-NULL neutral values differ from typed-binary neutral bytes. Explicitly establish a binary input domain when bytewise aggregation is intended.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`BIT_AND`](bit_and.md), [`BIT_OR`](bit_or.md).

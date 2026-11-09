@@ -8,6 +8,7 @@ Returns the population variance; also usable as a window aggregate function; an 
 
 ```sql
 VARIANCE(expr)
+VARIANCE(expr) OVER (window_spec)
 ```
 
 ## Parameters and Return Value

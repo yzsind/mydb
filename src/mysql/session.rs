@@ -181,6 +181,7 @@ pub struct Session<E: QueryEngine> {
     /// True after an account connection quota has been charged. Every exit
     /// path must clear it through engine session cleanup exactly once.
     authenticated: bool,
+    audit_connected: bool,
     /// Configured ordinary-connection limit when this session occupied one of
     /// the administrator-reserved slots. Authentication must require
     /// CONNECTION_ADMIN before the final handshake OK is sent.
@@ -582,6 +583,14 @@ impl<E: QueryEngine> Drop for Session<E> {
             }
         }
         self.recover_parked_context();
+        if self.audit_connected {
+            crate::engine::audit_log::record_disconnect(
+                &self.context.user,
+                &self.context.host,
+                self.connection_id,
+            );
+            self.audit_connected = false;
+        }
         if std::thread::panicking() {
             if self.authenticated {
                 crate::mysql::connection_manager::record_aborted_client();
@@ -1315,6 +1324,7 @@ where
             kill_flag: Arc::new(AtomicBool::new(false)),
             capabilities: NegotiatedCapabilities::default(),
             authenticated: false,
+            audit_connected: false,
             admin_connection_limit: None,
             normal_close: false,
             context: Box::new(context),
@@ -1378,7 +1388,16 @@ where
         } } => result,
         };
         match handshake_result {
-            Ok(()) => record_handshake_success(),
+            Ok(()) => {
+                record_handshake_success();
+                crate::engine::audit_log::record_connect(
+                    &self.context.user,
+                    &self.context.host,
+                    self.connection_id,
+                    None,
+                );
+                self.audit_connected = true;
+            }
             Err(err) => {
                 record_handshake_failure();
                 if self.authenticated {
@@ -1647,11 +1666,19 @@ where
                     handshake.capability_flags,
                     server_capabilities(self.tls_acceptor.is_some()),
                 );
+                self.context.client_found_rows =
+                    self.client_capabilities() & CLIENT_FOUND_ROWS != 0;
                 let handshake_collation = match crate::charset::resolve_collation_id_checked(
                     handshake.character_set as u16,
                 ) {
                     Ok(collation) => collation,
                     Err(err) => {
+                        crate::engine::audit_log::record_connect(
+                            &handshake.username,
+                            &self.peer_addr.ip().to_string(),
+                            self.connection_id,
+                            Some(&err),
+                        );
                         self.write_error_packet(response.sequence_id.wrapping_add(1), &err)
                             .await?;
                         return Err(io::Error::new(io::ErrorKind::InvalidData, err.message()));
@@ -1735,6 +1762,12 @@ where
                 {
                     Ok(outcome) => outcome,
                     Err(err) => {
+                        crate::engine::audit_log::record_connect(
+                            &handshake.username,
+                            &client_host,
+                            self.connection_id,
+                            Some(&err),
+                        );
                         self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
                             .await?;
                         return Err(io::Error::new(
@@ -2907,6 +2940,7 @@ where
         let mut context = SessionContext::default();
         context.current_database.clear();
         context.connection_id = self.connection_id;
+        context.client_found_rows = self.client_capabilities() & CLIENT_FOUND_ROWS != 0;
         context.host = client_host.clone();
         context.ssl_cipher = self.context.ssl_cipher.clone();
         context.ssl_version = self.context.ssl_version.clone();
@@ -3151,7 +3185,7 @@ where
                 return Ok(());
             }
         };
-        let manager = match crate::binlog::require_manager() {
+        let manager = match crate::binlog::require_dump_manager() {
             Ok(manager) => manager,
             Err(err) => {
                 self.write_error_packet(self.command_response_sequence, &err)
@@ -3199,7 +3233,7 @@ where
                 return Ok(());
             }
         };
-        let manager = match crate::binlog::require_manager() {
+        let manager = match crate::binlog::require_dump_manager() {
             Ok(manager) => manager,
             Err(err) => {
                 self.write_error_packet(self.command_response_sequence, &err)
@@ -8100,13 +8134,71 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
             let mode = crate::sql_lex::SqlLexMode::from_parser_bits(
                 crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode),
             );
+            // Expand executable comment delimiters before collecting adjacent
+            // literals, including suffixes inside an active comment body.
+            let mut expanded = None;
+            if has_quoted_charset_introducer(bytes) && memchr::memmem::find(bytes, b"/*!").is_some()
+            {
+                for segment in
+                    crate::sql_lex::segments_bytes(bytes, mode, crate::parser::MYSQL_VERSION_ID)
+                {
+                    let segment = segment.map_err(|err| {
+                        error(crate::error::catalog::ER_PARSE_ERROR, err.to_string())
+                    })?;
+                    if let crate::sql_lex::SqlSegmentKind::ExecutableComment {
+                        active, body, ..
+                    } = segment.kind
+                    {
+                        let output = expanded.get_or_insert_with(|| bytes.to_vec());
+                        let ranges = if active {
+                            vec![segment.range.start..body.start, body.end..segment.range.end]
+                        } else {
+                            vec![segment.range]
+                        };
+                        for range in ranges {
+                            for byte in &mut output[range] {
+                                if !matches!(*byte, b'\r' | b'\n') {
+                                    *byte = b' ';
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(expanded) = expanded {
+                let mut sql = decode_session_sql(session, &expanded)?;
+                if let Ok(original) = decoded {
+                    crate::parser::preserve_decoded_projection_labels(
+                        &original,
+                        &mut sql,
+                        crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode),
+                    );
+                }
+                return Ok(sql);
+            }
             let mut sql = String::new();
+            let mut pending_hex = None;
             for segment in
                 crate::sql_lex::segments_bytes(bytes, mode, crate::parser::MYSQL_VERSION_ID)
             {
                 let segment = segment
                     .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))?;
                 let raw = &bytes[segment.range.clone()];
+                let string_literal = matches!(segment.kind, crate::sql_lex::SqlSegmentKind::Quoted { quote }
+                    if quote == b'\'' || (quote == b'"' && !mode.ansi_quotes));
+                let concatenating = string_literal && pending_hex.is_some();
+                if !string_literal
+                    && !matches!(
+                        segment.kind,
+                        crate::sql_lex::SqlSegmentKind::BlockComment
+                            | crate::sql_lex::SqlSegmentKind::LineComment
+                            | crate::sql_lex::SqlSegmentKind::OptimizerHint
+                    )
+                    && !(matches!(segment.kind, crate::sql_lex::SqlSegmentKind::Code)
+                        && raw.iter().all(u8::is_ascii_whitespace))
+                {
+                    pending_hex = None;
+                }
                 let introducer = matches!(segment.kind, crate::sql_lex::SqlSegmentKind::Quoted { quote }
                     if quote == b'\'' || (quote == b'"' && !mode.ansi_quotes))
                     && {
@@ -8119,7 +8211,7 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                             .strip_prefix('_')
                             .is_some_and(|name| crate::charset::resolve_charset(name).is_ok())
                     };
-                if !introducer {
+                if !introducer && !concatenating {
                     if let Ok(text) =
                         crate::charset::decode_bytes(&session.character_set_client, raw)
                     {
@@ -8133,18 +8225,22 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                     {
                         // The parser accepts UTF-8 source; represent raw literal
                         // octets as a hex literal without transcoding their value.
-                        let trimmed = sql.trim_end();
-                        if trimmed
-                            .as_bytes()
-                            .get(trimmed.len().saturating_sub(7)..)
-                            .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b"_binary"))
-                        {
-                            sql.truncate(trimmed.len() - 7);
+                        if concatenating {
+                            sql.truncate(pending_hex.expect("adjacent raw literal"));
+                        } else {
+                            let trimmed = sql.trim_end();
+                            if trimmed
+                                .as_bytes()
+                                .get(trimmed.len().saturating_sub(7)..)
+                                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b"_binary"))
+                            {
+                                sql.truncate(trimmed.len() - 7);
+                            }
+                            if introducer && !sql.ends_with(char::is_whitespace) {
+                                sql.push(' ');
+                            }
+                            sql.push_str("X'");
                         }
-                        if introducer && !sql.ends_with(char::is_whitespace) {
-                            sql.push(' ');
-                        }
-                        sql.push_str("X'");
                         let mut pos = 1;
                         while pos + 1 < raw.len() {
                             let mut byte = raw[pos];
@@ -8175,6 +8271,7 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                             sql.push(HEX[(byte >> 4) as usize] as char);
                             sql.push(HEX[(byte & 15) as usize] as char);
                         }
+                        pending_hex = Some(sql.len());
                         sql.push('\'');
                     }
                     crate::sql_lex::SqlSegmentKind::ExecutableComment {
@@ -10737,7 +10834,7 @@ mod tests {
         for _ in 0..4 {
             session
                 .handle_single_query(
-                    "SELECT COUNT(*) FROM temporal_literal_cache WHERE dt='0000-00-00'".into(),
+                    "SELECT COUNT(*) FROM temporal_literal_cache WHERE dt='2020-13-01'".into(),
                 )
                 .await
                 .unwrap();
@@ -12318,6 +12415,40 @@ mod tests {
                 panic!("string literal")
             };
             assert_eq!(actual, value);
+        }
+    }
+
+    #[test]
+    fn release_followup_fallback_binding_preserves_non_utf8_bytes() {
+        for no_backslash_escapes in [false, true] {
+            let mode = crate::sql_lex::SqlLexMode {
+                no_backslash_escapes,
+                ..Default::default()
+            };
+            let bound = bind_sql_params(
+                "SELECT HEX(?)",
+                &[StmtParamValue::Bytes(vec![0xff, 0, 0xfe, 39, 92])],
+                mode,
+            )
+            .unwrap();
+            let bits = if no_backslash_escapes {
+                crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES
+            } else {
+                0
+            };
+            let _mode = crate::parser::ParserSqlModeGuard::activate(bits);
+            let Statement::Select(select) = crate::parser::parse_statement(&bound).unwrap() else {
+                panic!()
+            };
+            let crate::parser::SelectItem::Expr { expr, .. } = &select.projection[0] else {
+                panic!()
+            };
+            assert_eq!(
+                crate::engine::expr::eval_const(expr)
+                    .unwrap()
+                    .to_display_string(),
+                "FF00FE275C"
+            );
         }
     }
 
@@ -14713,6 +14844,36 @@ mod stream_tests;
 #[cfg(test)]
 mod release_audit_sql_tests {
     use super::*;
+
+    #[test]
+    fn audit1108_introducer_adjacent_literals_keep_all_raw_octets() {
+        let mut session = SessionContext::default();
+        for (sql, expected) in [
+            ("SELECT _utf8mb4'a' 'b'", "_utf8mb4 X'6162'"),
+            (
+                "SELECT _utf8mb4'a' /* gap */ 'b' 'c' AS x",
+                "_utf8mb4 X'616263'",
+            ),
+            ("SELECT _utf8mb4'a' /*! 'b' */ 'c'", "_utf8mb4 X'616263'"),
+            (
+                "SELECT _utf8mb4'a' /*!999999 'bad' */ 'b'",
+                "_utf8mb4 X'6162'",
+            ),
+            ("SELECT _latin1'a' '中'", "_latin1 X'61e4b8ad'"),
+            ("SELECT _binary'a' '\\0'", "X'6100'"),
+            ("INSERT INTO t VALUES(_utf8mb4'a' 'b')", "_utf8mb4 X'6162'"),
+        ] {
+            let decoded = decode_session_sql(&session, sql.as_bytes()).unwrap();
+            assert!(decoded.contains(expected), "{sql}: {decoded}");
+            crate::parser::parse_statement(&decoded).unwrap();
+        }
+        session.sql_mode = "NO_BACKSLASH_ESCAPES".into();
+        let decoded = decode_session_sql(&session, br"SELECT _binary'a' '\0'").unwrap();
+        assert!(decoded.contains("X'615c30'"), "{decoded}");
+        session.character_set_client = "latin1".into();
+        let decoded = decode_session_sql(&session, b"SELECT _utf8mb4'\xc3\xa9' 'x'").unwrap();
+        assert!(decoded.contains("_utf8mb4 X'c3a978'"), "{decoded}");
+    }
 
     #[test]
     fn release_audit_introducer_expression_labels_keep_source_spelling() {

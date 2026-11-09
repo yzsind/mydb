@@ -183,7 +183,7 @@ pub(crate) fn evaluate_subquery_policy(
     expression: &Expr,
     values: &[Value],
 ) -> Result<bool, QueryError> {
-    let handle = crate::engine::expr::row_security_database()
+    let handle = crate::engine::expr::current_expression_database()
         .filter(|handle| std::ptr::eq(handle.as_ref(), db))
         .ok_or_else(|| {
             crate::engine::rls::violation("Policy subquery requires a statement execution context")
