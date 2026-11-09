@@ -194,7 +194,7 @@ verification details, Windows limitations, and distribution scope.
 
 ## Architecture
 
-![MyDB architecture: protocol, SQL engine, unified memory management, storage engine, transactions, backup and recovery, primary-replica HA, sessions, security, and metadata; highlighting the optimizer, executor, heap tables, Zone Map, HNSW, online DDL, unified memory management, and directly queryable backups](assets/mydb-architecture.svg)
+![MyDB product architecture: MySQL, optional REST SQL and MCP access; shared SQL engine with online DDL, hybrid retrieval and external AI model calls; native heap storage, Zone Maps, HNSW and IVF; MVCC transactions and time travel; unified memory, sessions, security and metadata; queryable backups, native WAL replication and MySQL ROW/FULL binlog integration](assets/mydb-architecture.svg)
 
 ## REST SQL
 
