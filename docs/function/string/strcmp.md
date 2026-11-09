@@ -14,29 +14,29 @@ STRCMP(str1, str2)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str1` | Yes | String | The 1st argument; the meaning is determined by the function syntax and description |
-| `str2` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `str1` | Yes | String | First string. |
+| `str2` | Yes | String | Second string. |
 
 ## Return Value
 
-Returns an integer computed from the input string(s). SQL NULL arguments return NULL; character-versus-byte interpretation follows the function definition and input type.
+Returns integer -1, 0, or 1 according to the resolved string comparison/collation, or SQL NULL for NULL input.
 
 ## Examples
 
 ```sql
-SELECT STRCMP('mydb', 'mydb');
+SELECT STRCMP('a','b'), STRCMP('b','a'), STRCMP('a','a');
 ```
 
 Result:
 
 ```text
-0
+-1	1	0
 ```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LOCATE`](locate.md), [`INSTR`](instr.md), [`POSITION`](position.md), [`FIND_IN_SET`](find_in_set.md).

@@ -3663,6 +3663,7 @@ mod tests {
             )])
         };
         let order = vec![OrderBy {
+            names_bound: false,
             expr: Expr::Identifier("s".into()),
             asc: true,
             nulls_first: None,

@@ -14,11 +14,11 @@ COLLATION(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | Any expression | Expression whose collation is inspected; numeric and binary values use binary. |
 
 ## Return Value
 
-Returns a collation name as text; numeric input has collation `binary`.
+Returns a collation name as text. Numeric values, binary strings and SQL NULL have collation binary.
 
 ## Examples
 
@@ -34,8 +34,8 @@ binary
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CHARSET`](charset.md), [`COERCIBILITY`](coercibility.md), [`WEIGHT_STRING`](weight_string.md).

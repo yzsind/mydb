@@ -8,6 +8,7 @@ Adds an interval to a date or datetime; an alias of `DATE_ADD`. This function sh
 
 ```sql
 ADDDATE(date, INTERVAL expr unit)
+ADDDATE(date, days)
 ```
 
 ## Parameters and Return Value
@@ -25,3 +26,9 @@ Result: 2026-08-31
 ## Related Functions
 
 - [`DATE_ADD`](date_add.md): the primary function with full documentation.
+
+## Notes
+
+- The two-argument numeric form interprets days as a signed day count. It is an additional form beyond the INTERVAL syntax of the primary function.
+
+- The two-argument numeric form interprets days as a signed day count. It is an additional form beyond the INTERVAL syntax of the primary function.

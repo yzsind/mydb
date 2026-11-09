@@ -39,23 +39,34 @@ fn chained_union_all(
             "the used SELECT statements have a different number of columns",
         ));
     }
+    let left_sources = lcols.clone();
+    let right_sources = rcols.clone();
     unify_setop_declared_column_metadata(&mut lcols, &mut rcols)?;
-    let columns: Vec<_> = lcols
-        .iter()
-        .enumerate()
-        .filter(|(_, col)| col.column_type == ColumnType::Vector)
-        .map(|(i, col)| (i, col.clone()))
-        .collect();
-    let chained: Box<dyn crate::engine::api::ResultCursor> =
-        Box::new(crate::engine::api::ChainedCursor::new(vec![lcur, rcur]));
-    let cursor = if columns.is_empty() {
-        chained
-    } else {
-        Box::new(VectorDomainCursor {
-            inner: chained,
-            columns,
-        })
+    let bind = |inner, sources: &[Column]| -> Box<dyn crate::engine::api::ResultCursor> {
+        let columns: Vec<_> = lcols
+            .iter()
+            .zip(sources)
+            .enumerate()
+            .filter(|(_, (target, source))| {
+                target.column_type == ColumnType::Vector
+                    || (matches!(target.column_type, ColumnType::VarString | ColumnType::Blob)
+                        && matches!(
+                            source.column_type,
+                            ColumnType::Time | ColumnType::DateTime | ColumnType::Timestamp
+                        ))
+            })
+            .map(|(i, (target, source))| (i, target.clone(), source.source.clone()))
+            .collect();
+        if columns.is_empty() {
+            inner
+        } else {
+            Box::new(SetOpDomainCursor { inner, columns })
+        }
     };
+    let cursor = Box::new(crate::engine::api::ChainedCursor::new(vec![
+        bind(lcur, &left_sources),
+        bind(rcur, &right_sources),
+    ]));
     Ok(QueryResponse::StreamingResultSet(StreamingResultSet {
         columns: lcols,
         found_rows: None,
@@ -64,18 +75,18 @@ fn chained_union_all(
 }
 
 #[derive(Debug)]
-struct VectorDomainCursor {
+struct SetOpDomainCursor {
     inner: Box<dyn crate::engine::api::ResultCursor>,
-    columns: Vec<(usize, Column)>,
+    columns: Vec<(usize, Column, crate::types::ColumnSource)>,
 }
-impl crate::engine::api::ResultCursor for VectorDomainCursor {
+impl crate::engine::api::ResultCursor for SetOpDomainCursor {
     fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
         let Some(mut row) = self.inner.next_row()? else {
             return Ok(None);
         };
-        for (i, col) in &self.columns {
+        for (i, col, source) in &self.columns {
             let value = std::mem::replace(&mut row[*i], Value::Null);
-            row[*i] = coerce_setop_value(value, col.column_type, &col.source)?;
+            row[*i] = coerce_setop_value_from(value, Some(source), col.column_type, &col.source)?;
         }
         Ok(Some(row))
     }
@@ -351,7 +362,38 @@ pub(crate) fn unify_setop_declared_column_metadata(
             right_column.column_type,
             &right_column.source,
         );
-        let descriptor = crate::engine::expr_type::checked_branch_types(left_type, right_type)?;
+        let mut descriptor = crate::engine::expr_type::checked_branch_types(left_type, right_type)?;
+        if let crate::engine::expr_type::ExprTypeKind::String { kind } = descriptor.kind {
+            let mb = if matches!(
+                kind,
+                crate::engine::expr_type::StringKind::Binary
+                    | crate::engine::expr_type::StringKind::Blob
+            ) {
+                1
+            } else {
+                descriptor
+                    .collation_id
+                    .and_then(crate::charset::resolve_collation_id)
+                    .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+                    .map_or_else(crate::engine::expr::connection_charset_max_len, |charset| {
+                        charset.max_len
+                    })
+            };
+            for input in [left_type, right_type] {
+                if let crate::engine::expr_type::ExprTypeKind::Temporal { kind, fsp } = input.kind {
+                    let chars = match kind {
+                        crate::engine::expr_type::TemporalKind::Date => 10,
+                        crate::engine::expr_type::TemporalKind::Time => {
+                            10 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 }
+                        }
+                        _ => 19 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
+                    };
+                    descriptor.max_octets = descriptor
+                        .max_octets
+                        .map(|old| old.max(chars * u32::from(mb)));
+                }
+            }
+        }
         let wire_type = (left_column.source.wire_type == right_column.source.wire_type)
             .then_some(left_column.source.wire_type)
             .flatten();
@@ -377,6 +419,14 @@ pub(in crate::engine::executor) fn coerce_setop_value_from(
     target: &crate::types::ColumnSource,
 ) -> Result<Value, QueryError> {
     if matches!(column_type, ColumnType::VarString | ColumnType::Blob) {
+        if matches!(
+            value,
+            Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_)
+        ) {
+            if let Some(fsp) = source.and_then(|source| source.decimals) {
+                value = crate::engine::expr::temporal_string_value(value, fsp)?;
+            }
+        }
         if target.collation_id == Some(crate::charset::BINARY_COLLATION_ID) {
             if let Some(info) = source
                 .and_then(|source| source.collation_id)
@@ -458,6 +508,25 @@ pub(in crate::engine::executor) fn coerce_setop_value(
                 unreachable!()
             };
             Value::Int(if year == 0 { 0 } else { 1900 + i64::from(year) })
+        }
+        ColumnType::Tiny
+        | ColumnType::Short
+        | ColumnType::MediumInt
+        | ColumnType::Long
+        | ColumnType::LongLong
+            if matches!(value, Value::Int(_) | Value::UInt(_)) =>
+        {
+            if source.flags & crate::mysql::protocol::UNSIGNED_FLAG != 0 {
+                match value {
+                    Value::Int(n) if n >= 0 => Value::UInt(n as u64),
+                    other => other,
+                }
+            } else {
+                match value {
+                    Value::UInt(n) if n <= i64::MAX as u64 => Value::Int(n as i64),
+                    other => other,
+                }
+            }
         }
         ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp => {
             crate::engine::expr::coerce_result_to_expr_type(

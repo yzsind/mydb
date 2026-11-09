@@ -496,7 +496,7 @@ fn sqlaudit_load_identical_delimiters_respects_target_count() {
     ] {
         std::fs::write(&file, data).unwrap();
         engine.execute("DELETE FROM t").unwrap();
-        engine.execute(&format!("LOAD DATA INFILE '{}' INTO TABLE t FIELDS TERMINATED BY '{separator}' ENCLOSED BY '\"' LINES TERMINATED BY '{separator}'",crate::util::file::sql_path(&file))).unwrap();
+        engine.execute(&format!("LOAD DATA INFILE '{}' IGNORE INTO TABLE t FIELDS TERMINATED BY '{separator}' ENCLOSED BY '\"' LINES TERMINATED BY '{separator}'",crate::util::file::sql_path(&file))).unwrap();
         assert_eq!(rows(&engine, "SELECT a,b FROM t"), expected, "{data}");
     }
 }

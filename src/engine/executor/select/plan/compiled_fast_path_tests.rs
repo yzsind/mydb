@@ -235,6 +235,7 @@ fn exec_audit_cte_in_null_truth_table() {
             let pred = CteRowPredicate::InList {
                 col: 0,
                 values: vec![Value::Int(2), Value::Null],
+                provenance: vec![crate::engine::expr::ComparisonProvenance::default(); 2],
                 negated,
             };
             assert_eq!(eval_cte_row_predicate(&pred, &[value]).unwrap(), expected);
@@ -242,6 +243,7 @@ fn exec_audit_cte_in_null_truth_table() {
         let pred = CteRowPredicate::InList {
             col: 0,
             values: vec![Value::Int(2)],
+            provenance: vec![crate::engine::expr::ComparisonProvenance::default()],
             negated,
         };
         assert!(!eval_cte_row_predicate(&pred, &[Value::Null]).unwrap());
@@ -528,6 +530,7 @@ fn col(name: &str, data_type: DataTypeKind, pos: usize) -> ColumnSchema {
         unsigned: false,
         invisible: false,
         zerofill: false,
+        display_width: None,
         auto_increment: false,
         default: None,
         read_backfill_default: None,

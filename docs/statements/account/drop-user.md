@@ -17,6 +17,10 @@ Atomically drops one or more accounts and their direct grants.
 - IF EXISTS turns missing accounts into a 3162 Note.
 - Dropping an account does not automatically drop the ordinary database objects it owns; definer dependencies are handled according to object rules.
 
+## Privileges and Result Details
+
+Requires CREATE USER and, for protected system accounts, SYSTEM_USER. It implicitly commits preceding user DML. The entire target list is validated before catalog removal, including mandatory-role, policy and definer dependency restrictions. Grants/default-role edges and owned API keys are cleaned up; already stored business objects are not deleted. Revoking credentials is not a way to roll back prior committed work.
+
 ## Examples
 
 ```sql

@@ -15,6 +15,10 @@ Drops the retention slot of the specified replica UUID on the native master.
 - A connected replica cannot be dropped; it must be isolated/stopped first.
 - Dropping removes the slot's protection of WAL retention; an unknown UUID returns an explicit error.
 
+## Privileges, Results, and Operational Details
+
+Requires SYSTEM_VARIABLES_ADMIN on the native master. Stop/isolate a connected receiver first; do not confuse a disconnected Active slot with an Invalidated/Abandoned slot. Deletion removes the retention identity and does not wait for a stale replica to receive WAL. Rejoining after required history is reclaimed needs a supported seed/resume boundary; it cannot revive deleted WAL by reusing a UUID.
+
 ## Examples
 
 ```sql

@@ -9,3 +9,5 @@
 | [EXPLAIN FOR CONNECTION](explain-for-connection.md) | Shows the plan another connection is currently executing |
 | [DESCRIBE](describe.md) | Returns the column definitions of a table |
 | [DO](do.md) | Evaluates expressions and discards the results |
+
+Clause guides: [TABLE/VALUES, joins, grouping and CTEs](select.md#syntax), [sampling](select.md#table-sampling), [historical reads](../../mysql80-compatibility.md#time-travel-queries), [window functions](../../function/aggregate-window/README.md), [locks and isolation](../../mvcc-and-locking.md). EXPLAIN ANALYZE executes its target, including writes. Use the [shared example schema](../examples.md).

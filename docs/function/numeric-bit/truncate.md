@@ -14,29 +14,29 @@ TRUNCATE(number, decimals)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `number` | Yes | Numeric or integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `decimals` | Yes | Numeric or integer | The 2nd argument; the number of decimal places to keep or process |
+| `number` | Yes | Numeric expression | Numeric operand; strings use numeric conversion. |
+| `decimals` | Yes | Numeric expression | Decimal places; a negative value operates to the left of the decimal point. |
 
 ## Return Value
 
-Returns a rounded or truncated numeric value in the derived exact/approximate input domain; SQL NULL input returns NULL. ROUND/FLOOR/TRUNCATE differ in direction and decimal-place handling; the example uses exact integer input.
+Returns the number with digits discarded toward zero at the requested decimal position. Negative decimals discard digits to the left of the decimal point. SQL NULL returns NULL; this operation does not round a half value upward.
 
 ## Examples
 
 ```sql
-SELECT TRUNCATE(2, 2);
+SELECT TRUNCATE(12.59,1), TRUNCATE(-12.59,1), TRUNCATE(129,-1);
 ```
 
 Result:
 
 ```text
-2
+12.5	-12.5	120
 ```
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ABS`](abs.md), [`SIGN`](sign.md), [`CEIL`](ceil.md), [`FLOOR`](floor.md).

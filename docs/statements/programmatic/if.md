@@ -18,6 +18,10 @@ Executes stored program statement branches conditionally.
 - Conditions use SQL three-valued logic; TRUE enters the branch, FALSE/NULL continue matching.
 - Only the first matching branch executes.
 
+## Context, Errors, and Lifecycle
+
+This is an inner stored-program statement, not the IF(condition,a,b) expression. Conditions convert under SQL truth rules; NULL does not select the branch. ELSEIF is one keyword and nesting requires matching END IF. Place the snippet in a procedure/function/trigger/event body with its variables declared first. See [body contexts](README.md#execution-contexts).
+
 ## Examples
 
 ```sql

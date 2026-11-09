@@ -18,7 +18,7 @@ ST_ISCLOSED(geometry)
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 for a closed LineString/MultiLineString, 0 when a linear input is not closed, or SQL NULL for SQL NULL/inapplicable geometry types such as POINT.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 0
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_ISVALID`](st_isvalid.md), [`ST_VALIDATE`](st_validate.md), [`ST_ISSIMPLE`](st_issimple.md), [`ST_ISEMPTY`](st_isempty.md).

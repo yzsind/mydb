@@ -260,13 +260,13 @@ fn encode_document(text: &str, dom: &serde_json::Value) -> Result<Vec<u8>, Query
                 jsonb::write_text_scalar(jsonb::T_DECIMAL, text, &mut out);
                 Ok(out)
             }
-            _ => Ok(from_serde(&parse_dom(text, invalid)?)),
+            _ => Ok(jsonb::encode_text_dom(&parse_dom(text, invalid)?)),
         }
     }
     if has_wide_integer(text) {
         encode_raw(text)
     } else {
-        Ok(from_serde(dom))
+        Ok(jsonb::encode_text_dom(dom))
     }
 }
 
@@ -465,26 +465,90 @@ pub(crate) fn coerce_f64(jsonb: &[u8]) -> f64 {
     }
 }
 
-/// Integer coercion of a JSON document (`CAST(json AS SIGNED)` style),
-/// truncating toward zero like MySQL.
-pub(crate) fn coerce_i64(jsonb: &[u8]) -> i64 {
-    match JsonbRef::new(jsonb) {
-        Ok(r) => {
-            if let Some(i) = r.as_i64() {
-                i
-            } else if let Some(unsigned) = r.as_u64() {
-                unsigned as i64
-            } else if let Some(f) = r.as_f64() {
-                f as i64
-            } else if let Some(s) = r.as_str() {
-                s.trim().parse().unwrap_or(0)
-            } else if let Some(b) = r.as_bool() {
-                i64::from(b)
-            } else {
-                0
+/// Preserve the scalar numeric domain before SQL integer conversion. A dirty
+/// JSON string returns its integer prefix plus an invalid flag, so SELECT can
+/// warn while strict column assignment rejects the same conversion.
+pub(crate) fn integer_input(jsonb: &[u8]) -> Result<(crate::types::Value, bool), QueryError> {
+    use crate::types::Value;
+    let node = JsonbRef::new(jsonb)?;
+    let value = match node.json_type() {
+        JsonType::Integer => Value::Int(node.as_i64().unwrap_or_default()),
+        JsonType::UnsignedInteger => Value::UInt(node.as_u64().unwrap_or_default()),
+        JsonType::Double => Value::Double(node.as_f64().unwrap_or_default()),
+        JsonType::Decimal => match node.exact_number() {
+            Some((number, scale)) => Value::Decimal128(number, scale),
+            None => Value::Decimal(node.number_text().unwrap_or_default()),
+        },
+        JsonType::Boolean => Value::Int(i64::from(node.as_bool().unwrap_or_default())),
+        JsonType::String => {
+            let text = node.as_str().unwrap_or_default();
+            let trimmed = text.trim();
+            let digits = trimmed.strip_prefix(['+', '-']).unwrap_or(trimmed);
+            let parsed = crate::util::decimal::parse_lenient_int(text);
+            if !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit()) {
+                let value = if parsed.clean {
+                    if let Ok(number) = i64::try_from(parsed.value) {
+                        Value::Int(number)
+                    } else if let Ok(number) = u64::try_from(parsed.value) {
+                        Value::UInt(number)
+                    } else {
+                        Value::String(trimmed.to_owned())
+                    }
+                } else {
+                    // An integer spelling may exceed i128; retain the text
+                    // for the exact overflow and signed CAST policies.
+                    Value::String(trimmed.to_owned())
+                };
+                return Ok((value, trimmed != text));
             }
+            return Ok((Value::Decimal128(parsed.value, 0), true));
         }
-        Err(_) => 0,
+        _ => return Ok((Value::Int(0), true)),
+    };
+    Ok((value, false))
+}
+
+/// Lossy integer-context coercion for storage codecs and numeric consumers.
+/// Approximate JSON numbers round ties to even; exact decimals stay exact.
+pub(crate) fn coerce_i64(jsonb: &[u8]) -> i64 {
+    use crate::types::Value;
+    let Ok((value, _)) = integer_input(jsonb) else {
+        return 0;
+    };
+    match value {
+        Value::Int(number) => number,
+        Value::UInt(number) => number as i64,
+        Value::Double(number) => number.round_ties_even() as i64,
+        Value::String(text) => crate::util::decimal::parse_lenient_int(&text)
+            .value
+            .clamp(i128::from(i64::MIN), i128::from(i64::MAX))
+            as i64,
+        Value::Decimal128(number, scale) => {
+            crate::util::decimal::rescale_round_i128(number, scale, 0)
+                .unwrap_or(if number < 0 { i128::MIN } else { i128::MAX })
+                .clamp(i128::from(i64::MIN), i128::from(i64::MAX)) as i64
+        }
+        Value::Decimal(text) => {
+            use num_traits::{Signed, ToPrimitive};
+            let Some((magnitude, scale)) = crate::util::decimal::parse_exact_decimal_big(&text)
+            else {
+                return 0;
+            };
+            let (number, _) = crate::util::decimal::rescale_exact(
+                crate::util::decimal::ExactDecimal::from_big(magnitude, scale),
+                0,
+                true,
+            )
+            .into_big_parts();
+            number.to_i64().unwrap_or_else(|| {
+                if number.is_negative() {
+                    i64::MIN
+                } else {
+                    i64::MAX
+                }
+            })
+        }
+        _ => 0,
     }
 }
 
@@ -494,6 +558,25 @@ pub(crate) fn coerce_i64(jsonb: &[u8]) -> i64 {
 /// parsed here — that is the caller's choice via [`parse_text`].
 pub(crate) fn scalar_from_value(value: &crate::types::Value) -> Vec<u8> {
     use crate::types::Value;
+    if let Value::Int(number) = value {
+        let mut out = Vec::with_capacity(9);
+        out.push(jsonb::T_I64);
+        out.extend_from_slice(&number.to_le_bytes());
+        return out;
+    }
+    if let Value::UInt(number) = value {
+        let mut out = Vec::with_capacity(9);
+        out.push(jsonb::T_U64);
+        out.extend_from_slice(&number.to_le_bytes());
+        return out;
+    }
+    if let Value::Year(year) = value {
+        return scalar_from_value(&Value::UInt(if *year == 0 {
+            0
+        } else {
+            1900 + u64::from(*year)
+        }));
+    }
     // Decimal and temporal values encode under their own additive tags so the
     // JSON type and full precision survive (JSON_TYPE → DECIMAL / DATE / TIME /
     // DATETIME, matching MySQL). Their layout is a length-prefixed canonical
@@ -505,7 +588,8 @@ pub(crate) fn scalar_from_value(value: &crate::types::Value) -> Vec<u8> {
         | Value::DecimalWide(..) => Some(jsonb::T_DECIMAL),
         Value::Date(_) => Some(jsonb::T_DATE),
         Value::Time(_) => Some(jsonb::T_TIME),
-        Value::DateTime(_) | Value::Timestamp(_) => Some(jsonb::T_DATETIME),
+        Value::DateTime(_) => Some(jsonb::T_DATETIME),
+        Value::Timestamp(_) => Some(jsonb::T_TIMESTAMP),
         _ => None,
     };
     if let Some(tag) = tagged {
@@ -551,7 +635,8 @@ pub(crate) fn scalar_from_value(value: &crate::types::Value) -> Vec<u8> {
             .unwrap_or(serde_json::Value::Null),
         Value::Bytes(b) => return opaque_scalar(15, b),
         Value::Json(b) => return b.clone(),
-        // Everything else (YEAR, geometry, vector, …) becomes a JSON string of
+        Value::Geometry(b) => crate::engine::geo::json_value(b),
+        // Everything else (YEAR, vector, …) becomes a JSON string of
         // its canonical text.
         other => serde_json::Value::String(other.to_display_string()),
     };
@@ -563,25 +648,76 @@ pub(crate) fn scalar_from_value(value: &crate::types::Value) -> Vec<u8> {
 /// display bytes must be wrapped rather than reparsed as a document.
 pub(crate) fn scalar_from_typed_value(
     value: &crate::types::Value,
-    source: &crate::engine::expr::ExprTypeDescriptor,
+    source: &crate::engine::expr_type::ExprType,
 ) -> Vec<u8> {
-    use crate::engine::expr::ExprTypeClass;
-    match source.class {
-        ExprTypeClass::Enum | ExprTypeClass::Set | ExprTypeClass::BinaryString => {
-            scalar_from_value(value)
-        }
-        ExprTypeClass::Bit { .. } => {
+    use crate::engine::expr_type::{ExprTypeKind, StringKind};
+    if matches!(value, crate::types::Value::Null) {
+        return scalar_from_value(value);
+    }
+    match source.kind {
+        ExprTypeKind::String {
+            kind: StringKind::Binary | StringKind::Blob,
+        } => opaque_scalar(
+            source.json_opaque_type.unwrap_or(15),
+            crate::engine::expr::value_bytes_ref(value).as_ref(),
+        ),
+        ExprTypeKind::Bit { bits } => {
             let unsigned = match value {
                 crate::types::Value::UInt(v) => *v,
                 crate::types::Value::Int(v) => *v as u64,
                 other => other.to_display_string().parse::<u64>().unwrap_or(0),
             };
-            let mut out = Vec::with_capacity(9);
-            out.push(jsonb::T_U64);
-            out.extend_from_slice(&unsigned.to_le_bytes());
-            out
+            let bytes = unsigned.to_be_bytes();
+            let width = usize::from(bits.div_ceil(8)).min(bytes.len());
+            opaque_scalar(16, &bytes[bytes.len() - width..])
         }
         _ => scalar_from_value(value),
+    }
+}
+
+/// Compact bound conversion carried by compiled JSON value arguments.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum SqlScalarSource {
+    Bit(u8),
+    Binary(u8),
+}
+
+impl SqlScalarSource {
+    pub(crate) fn for_type(source: &crate::engine::expr_type::ExprType) -> Option<Self> {
+        use crate::engine::expr_type::{ExprTypeKind, StringKind};
+        match source.kind {
+            ExprTypeKind::Bit { bits } => Some(Self::Bit(bits)),
+            ExprTypeKind::String {
+                kind: StringKind::Binary | StringKind::Blob,
+            } => {
+                // Only catalog/derived fields carry a declared opaque type.
+                // Runtime bytes and computed binary strings keep type15.
+                let ty = source.json_opaque_type.unwrap_or(15);
+                (ty != 15).then_some(Self::Binary(ty))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn encode(self, value: crate::types::Value) -> Vec<u8> {
+        use crate::types::Value;
+        match value {
+            Value::Null => return vec![jsonb::T_NULL],
+            Value::Json(bytes) => return bytes,
+            _ => {}
+        }
+        match self {
+            Self::Bit(bits) => {
+                let source = crate::engine::expr_type::ExprType::new(
+                    crate::engine::expr_type::ExprTypeKind::Bit { bits },
+                    true,
+                );
+                scalar_from_typed_value(&value, &source)
+            }
+            Self::Binary(ty) => {
+                opaque_scalar(ty, crate::engine::expr::value_bytes_ref(&value).as_ref())
+            }
+        }
     }
 }
 
@@ -685,11 +821,7 @@ impl Primitive<'_> {
                 out.extend_from_slice(&n.to_le_bytes());
             }
             Self::UInt(n) => {
-                out.push(if n <= i64::MAX as u64 {
-                    jsonb::T_I64
-                } else {
-                    jsonb::T_U64
-                });
+                out.push(jsonb::T_U64);
                 out.extend_from_slice(&n.to_le_bytes());
             }
             Self::Text(s) => append_string_node(s, out),

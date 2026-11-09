@@ -19,7 +19,7 @@ JSON_OVERLAPS(json_doc1, json_doc2)
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 for a common array element, complete object key/value pair, or equal scalar; otherwise 0. SQL NULL returns NULL. Types are compared as JSON values, without string-to-number coercion.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 1
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_CONTAINS`](json_contains.md), [`JSON_CONTAINS_PATH`](json_contains_path.md), [`JSON_SEARCH`](json_search.md).

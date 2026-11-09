@@ -14,11 +14,11 @@ IS_IPV6(ip_text)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `ip_text` | Yes | String | The 1st argument; the IPv4 or IPv6 text address |
+| `ip_text` | Yes | String | IPv4 or IPv6 address text. |
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 for a valid IPv6 address literal, 0 otherwise. SQL NULL returns SQL NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 1
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`INET6_ATON`](inet6_aton.md), [`INET6_NTOA`](inet6_ntoa.md), [`IS_IPV4_COMPAT`](is_ipv4_compat.md), [`IS_IPV4_MAPPED`](is_ipv4_mapped.md).

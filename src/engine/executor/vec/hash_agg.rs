@@ -1368,19 +1368,34 @@ impl DictionaryGroupEncoder {
     fn accepts_batch_lanes(&self, batch: &Batch) -> bool {
         self.columns.iter().all(|key| match &key.source {
             DictionaryColumnSource::Utf8 { column, .. } => {
-                matches!(batch.columns()[*column], ColumnVector::Utf8 { .. })
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::Utf8 { .. } | ColumnVector::Null { .. }
+                )
             }
             DictionaryColumnSource::I64 { column, .. } => {
-                matches!(batch.columns()[*column], ColumnVector::I64 { .. })
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::I64 { .. } | ColumnVector::Null { .. }
+                )
             }
             DictionaryColumnSource::U64 { column, .. } => {
-                matches!(batch.columns()[*column], ColumnVector::U64 { .. })
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::U64 { .. } | ColumnVector::Null { .. }
+                )
             }
             DictionaryColumnSource::Date32 { column, .. } => {
-                matches!(batch.columns()[*column], ColumnVector::Date32 { .. })
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::Date32 { .. } | ColumnVector::Null { .. }
+                )
             }
             DictionaryColumnSource::Bool { column } => {
-                matches!(batch.columns()[*column], ColumnVector::Bool { .. })
+                matches!(
+                    batch.columns()[*column],
+                    ColumnVector::Bool { .. } | ColumnVector::Null { .. }
+                )
             }
         })
     }
@@ -1478,6 +1493,39 @@ impl DictionaryGroupEncoder {
                     32,
                 ),
                 ColumnVector::Bool { .. } => (DictionaryColumnSource::Bool { column }, 1),
+                ColumnVector::Null { .. } => match batch.schema().fields().get(column)?.column_type
+                {
+                    ColumnType::Date => (
+                        DictionaryColumnSource::Date32 {
+                            column,
+                            values: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+                            raw_values: Vec::new(),
+                            merge_tokens: Vec::new(),
+                        },
+                        32,
+                    ),
+                    ColumnType::Tiny
+                    | ColumnType::Short
+                    | ColumnType::MediumInt
+                    | ColumnType::Long
+                    | ColumnType::LongLong
+                        if batch.schema().fields()[column].source.flags
+                            & crate::mysql::protocol::UNSIGNED_FLAG
+                            == 0 =>
+                    {
+                        (
+                            DictionaryColumnSource::I64 {
+                                column,
+                                values: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+                                dense_tokens: Some(DenseI64TokenCache::new()),
+                                raw_values: Vec::new(),
+                                merge_tokens: Vec::new(),
+                            },
+                            64,
+                        )
+                    }
+                    _ => return None,
+                },
                 _ => return None,
             };
             sources.push(source);
@@ -1721,236 +1769,265 @@ impl DictionaryGroupEncoder {
         for (position, column) in self.columns.iter_mut().enumerate() {
             let direct = column.direct;
             let token_mask = column.token_mask;
-            let (value_bits, component_hash, is_null) = match &mut column.source {
-                DictionaryColumnSource::Utf8 {
-                    column,
-                    raw_to_token,
-                    canonical_to_token,
-                    canonical_keys,
-                    raw_values,
-                    raw_value_heap_bytes,
-                    canonical_key_capacity_bytes,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if vector.is_null(row) {
-                        if MATERIALIZE {
-                            scratch.push(0);
-                        }
-                        if RETAIN_RAW {
-                            self.current_raw_tokens.push(0);
-                        }
-                        (0, NULL_HASH, true)
-                    } else {
-                        let ColumnVector::Utf8 { offsets, data, .. } = vector else {
-                            return None;
-                        };
-                        let raw = &data[offsets[row] as usize..offsets[row + 1] as usize];
-                        let token = if let Some(token) = raw_to_token.get(raw, raw_values) {
-                            if MATERIALIZE {
-                                let canonical = canonical_keys.get(token.local as usize - 1)?;
-                                scratch.extend_from_slice(canonical);
-                            }
-                            token
-                        } else {
-                            let canonical_start = scratch.len();
-                            super::key_encode::encode_from_column_row_with_collation(
-                                vector,
-                                row,
-                                batch.schema().fields()[*column].source.collation_id,
-                                scratch,
-                            );
-                            let canonical = &scratch[canonical_start..];
-                            let token = if let Some(&token) = canonical_to_token.get(canonical) {
-                                token
-                            } else {
-                                let local = u32::try_from(canonical_to_token.len())
-                                    .ok()?
-                                    .checked_add(1)?;
-                                let token = DictionaryToken {
-                                    local,
-                                    // Retain one representative spelling per
-                                    // exact collation class, not one per raw
-                                    // spelling. Equality remains byte-exact on
-                                    // the canonical key.
-                                    raw_local: local,
-                                    stable_hash: super::key_encode::fxhash(canonical),
-                                };
-                                let canonical_key: Arc<[u8]> = Arc::from(canonical);
-                                *canonical_key_capacity_bytes = (*canonical_key_capacity_bytes)
-                                    .saturating_add(
-                                        canonical_key.len().saturating_add(ARC_SLICE_HEADER_BYTES),
-                                    );
-                                canonical_to_token.insert(canonical_key.clone(), token);
-                                canonical_keys.push(canonical_key);
-                                // ColumnVector::Utf8 guarantees valid UTF-8;
-                                // avoid constructing a temporary Value just
-                                // to retain its String.
-                                let text = unsafe { std::str::from_utf8_unchecked(raw) };
-                                let raw_value = Box::<str>::from(text);
-                                *raw_value_heap_bytes =
-                                    raw_value_heap_bytes.saturating_add(text.len());
-                                raw_values.push(raw_value);
-                                token
-                            };
-                            raw_to_token.insert(raw, token);
-                            token
-                        };
-                        if RETAIN_RAW {
-                            self.current_raw_tokens.push(token.raw_local);
-                        }
-                        if token.local > token_mask {
-                            return None;
-                        }
-                        (u128::from(token.local), token.stable_hash, false)
-                    }
-                }
-                DictionaryColumnSource::I64 {
-                    column,
-                    values,
-                    dense_tokens,
-                    raw_values,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::I64 { data, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null { 0 } else { data[row] as u64 as u128 };
-                    let encoded = if direct || null {
-                        raw
-                    } else {
-                        u128::from(
-                            dictionary_i64_token(values, dense_tokens, raw_values, data[row], raw)?
-                                .local,
-                        )
-                    };
-                    if encoded > u128::from(token_mask) && !direct {
-                        return None;
-                    }
-                    (
-                        encoded,
-                        if null { NULL_HASH } else { fx_mix_u128(raw) },
-                        null,
-                    )
-                }
-                DictionaryColumnSource::U64 {
-                    column,
-                    values,
-                    raw_values,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::U64 { data, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null { 0 } else { data[row] as u128 };
-                    let encoded = if direct || null {
-                        raw
-                    } else {
-                        u128::from(
-                            dictionary_primitive_token(
-                                values,
-                                raw_values,
-                                data[row],
-                                fx_mix_u128(raw),
-                            )?
-                            .local,
-                        )
-                    };
-                    if encoded > u128::from(token_mask) && !direct {
-                        return None;
-                    }
-                    (
-                        encoded,
-                        if null { NULL_HASH } else { fx_mix_u128(raw) },
-                        null,
-                    )
-                }
-                DictionaryColumnSource::Date32 {
-                    column,
-                    values,
-                    raw_values,
-                    ..
-                } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::Date32 { data, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null { 0 } else { data[row] as u32 as u128 };
-                    let encoded = if direct || null {
-                        raw
-                    } else {
-                        u128::from(
-                            dictionary_primitive_token(
-                                values,
-                                raw_values,
-                                data[row],
-                                fx_mix_u128(raw),
-                            )?
-                            .local,
-                        )
-                    };
-                    if encoded > u128::from(token_mask) && !direct {
-                        return None;
-                    }
-                    (
-                        encoded,
-                        if null { NULL_HASH } else { fx_mix_u128(raw) },
-                        null,
-                    )
-                }
-                DictionaryColumnSource::Bool { column } => {
-                    let vector = batch.columns().get(*column)?;
-                    if MATERIALIZE {
-                        super::key_encode::encode_from_column_row_with_collation(
-                            vector,
-                            row,
-                            batch.schema().fields()[*column].source.collation_id,
-                            scratch,
-                        );
-                    }
-                    let ColumnVector::Bool { values, .. } = vector else {
-                        return None;
-                    };
-                    let null = vector.is_null(row);
-                    let raw = if null {
-                        0
-                    } else if direct {
-                        u128::from(values.get(row))
-                    } else {
-                        1 + u128::from(values.get(row))
-                    };
-                    (raw, if null { NULL_HASH } else { fx_mix_u128(raw) }, null)
-                }
+            let source_column = match &column.source {
+                DictionaryColumnSource::Utf8 { column, .. }
+                | DictionaryColumnSource::I64 { column, .. }
+                | DictionaryColumnSource::U64 { column, .. }
+                | DictionaryColumnSource::Date32 { column, .. }
+                | DictionaryColumnSource::Bool { column } => *column,
             };
+            let (value_bits, component_hash, is_null) =
+                if matches!(batch.columns()[source_column], ColumnVector::Null { .. }) {
+                    if MATERIALIZE {
+                        scratch.push(0);
+                    }
+                    if RETAIN_RAW && matches!(column.source, DictionaryColumnSource::Utf8 { .. }) {
+                        self.current_raw_tokens.push(0);
+                    }
+                    (0, NULL_HASH, true)
+                } else {
+                    match &mut column.source {
+                        DictionaryColumnSource::Utf8 {
+                            column,
+                            raw_to_token,
+                            canonical_to_token,
+                            canonical_keys,
+                            raw_values,
+                            raw_value_heap_bytes,
+                            canonical_key_capacity_bytes,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if vector.is_null(row) {
+                                if MATERIALIZE {
+                                    scratch.push(0);
+                                }
+                                if RETAIN_RAW {
+                                    self.current_raw_tokens.push(0);
+                                }
+                                (0, NULL_HASH, true)
+                            } else {
+                                let ColumnVector::Utf8 { offsets, data, .. } = vector else {
+                                    return None;
+                                };
+                                let raw = &data[offsets[row] as usize..offsets[row + 1] as usize];
+                                let token = if let Some(token) = raw_to_token.get(raw, raw_values) {
+                                    if MATERIALIZE {
+                                        let canonical =
+                                            canonical_keys.get(token.local as usize - 1)?;
+                                        scratch.extend_from_slice(canonical);
+                                    }
+                                    token
+                                } else {
+                                    let canonical_start = scratch.len();
+                                    super::key_encode::encode_from_column_row_with_collation(
+                                        vector,
+                                        row,
+                                        batch.schema().fields()[*column].source.collation_id,
+                                        scratch,
+                                    );
+                                    let canonical = &scratch[canonical_start..];
+                                    let token = if let Some(&token) =
+                                        canonical_to_token.get(canonical)
+                                    {
+                                        token
+                                    } else {
+                                        let local = u32::try_from(canonical_to_token.len())
+                                            .ok()?
+                                            .checked_add(1)?;
+                                        let token = DictionaryToken {
+                                            local,
+                                            // Retain one representative spelling per
+                                            // exact collation class, not one per raw
+                                            // spelling. Equality remains byte-exact on
+                                            // the canonical key.
+                                            raw_local: local,
+                                            stable_hash: super::key_encode::fxhash(canonical),
+                                        };
+                                        let canonical_key: Arc<[u8]> = Arc::from(canonical);
+                                        *canonical_key_capacity_bytes =
+                                            (*canonical_key_capacity_bytes).saturating_add(
+                                                canonical_key
+                                                    .len()
+                                                    .saturating_add(ARC_SLICE_HEADER_BYTES),
+                                            );
+                                        canonical_to_token.insert(canonical_key.clone(), token);
+                                        canonical_keys.push(canonical_key);
+                                        // ColumnVector::Utf8 guarantees valid UTF-8;
+                                        // avoid constructing a temporary Value just
+                                        // to retain its String.
+                                        let text = unsafe { std::str::from_utf8_unchecked(raw) };
+                                        let raw_value = Box::<str>::from(text);
+                                        *raw_value_heap_bytes =
+                                            raw_value_heap_bytes.saturating_add(text.len());
+                                        raw_values.push(raw_value);
+                                        token
+                                    };
+                                    raw_to_token.insert(raw, token);
+                                    token
+                                };
+                                if RETAIN_RAW {
+                                    self.current_raw_tokens.push(token.raw_local);
+                                }
+                                if token.local > token_mask {
+                                    return None;
+                                }
+                                (u128::from(token.local), token.stable_hash, false)
+                            }
+                        }
+                        DictionaryColumnSource::I64 {
+                            column,
+                            values,
+                            dense_tokens,
+                            raw_values,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::I64 { data, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null { 0 } else { data[row] as u64 as u128 };
+                            let encoded = if direct || null {
+                                raw
+                            } else {
+                                u128::from(
+                                    dictionary_i64_token(
+                                        values,
+                                        dense_tokens,
+                                        raw_values,
+                                        data[row],
+                                        raw,
+                                    )?
+                                    .local,
+                                )
+                            };
+                            if encoded > u128::from(token_mask) && !direct {
+                                return None;
+                            }
+                            (
+                                encoded,
+                                if null { NULL_HASH } else { fx_mix_u128(raw) },
+                                null,
+                            )
+                        }
+                        DictionaryColumnSource::U64 {
+                            column,
+                            values,
+                            raw_values,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::U64 { data, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null { 0 } else { data[row] as u128 };
+                            let encoded = if direct || null {
+                                raw
+                            } else {
+                                u128::from(
+                                    dictionary_primitive_token(
+                                        values,
+                                        raw_values,
+                                        data[row],
+                                        fx_mix_u128(raw),
+                                    )?
+                                    .local,
+                                )
+                            };
+                            if encoded > u128::from(token_mask) && !direct {
+                                return None;
+                            }
+                            (
+                                encoded,
+                                if null { NULL_HASH } else { fx_mix_u128(raw) },
+                                null,
+                            )
+                        }
+                        DictionaryColumnSource::Date32 {
+                            column,
+                            values,
+                            raw_values,
+                            ..
+                        } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::Date32 { data, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null { 0 } else { data[row] as u32 as u128 };
+                            let encoded = if direct || null {
+                                raw
+                            } else {
+                                u128::from(
+                                    dictionary_primitive_token(
+                                        values,
+                                        raw_values,
+                                        data[row],
+                                        fx_mix_u128(raw),
+                                    )?
+                                    .local,
+                                )
+                            };
+                            if encoded > u128::from(token_mask) && !direct {
+                                return None;
+                            }
+                            (
+                                encoded,
+                                if null { NULL_HASH } else { fx_mix_u128(raw) },
+                                null,
+                            )
+                        }
+                        DictionaryColumnSource::Bool { column } => {
+                            let vector = batch.columns().get(*column)?;
+                            if MATERIALIZE {
+                                super::key_encode::encode_from_column_row_with_collation(
+                                    vector,
+                                    row,
+                                    batch.schema().fields()[*column].source.collation_id,
+                                    scratch,
+                                );
+                            }
+                            let ColumnVector::Bool { values, .. } = vector else {
+                                return None;
+                            };
+                            let null = vector.is_null(row);
+                            let raw = if null {
+                                0
+                            } else if direct {
+                                u128::from(values.get(row))
+                            } else {
+                                1 + u128::from(values.get(row))
+                            };
+                            (raw, if null { NULL_HASH } else { fx_mix_u128(raw) }, null)
+                        }
+                    }
+                };
             key |= value_bits << column.shift;
             if direct && is_null {
                 key |= 1u128 << column.null_bit;
@@ -3633,7 +3710,7 @@ impl Packed64Encoder {
         let mut key: u128 = 0;
         for col in cols {
             let cv = &batch.columns()[col.col_idx];
-            let is_null = cv.nulls().map(|b| !b.get(row)).unwrap_or(false);
+            let is_null = cv.is_null(row);
             if is_null {
                 key |= 1u128 << col.null_bit_shift;
                 continue;
@@ -4656,8 +4733,13 @@ impl FixedWidthStateArena {
                         self.state_mut(group, slot)
                             .update_decimal_parts(data[row], scale)?;
                     } else {
-                        self.state_mut(group, slot)
-                            .update_ref(&column.value_at(row))?;
+                        crate::engine::expr::with_optional_compare_collation(
+                            spec.comparison_collation,
+                            || {
+                                self.state_mut(group, slot)
+                                    .update_ref(&column.value_at(row))
+                            },
+                        )?;
                     }
                 }
                 continue;
@@ -4712,8 +4794,13 @@ impl FixedWidthStateArena {
             self.state_mut(group, slot)
                 .update_decimal_parts(data[row], scale)?;
         } else {
-            self.state_mut(group, slot)
-                .update_ref(&column.value_at(row))?;
+            crate::engine::expr::with_optional_compare_collation(
+                spec.comparison_collation,
+                || {
+                    self.state_mut(group, slot)
+                        .update_ref(&column.value_at(row))
+                },
+            )?;
         }
         Ok(())
     }
@@ -5446,9 +5533,10 @@ pub(crate) fn aggregate_output_schema(
     }
     for (i, spec) in aggs.iter().enumerate() {
         let input_field = input_schema.and_then(|schema| schema.fields().get(spec.input_column));
-        let column_type = spec
-            .func
-            .result_type(input_field.map(|field| field.column_type));
+        let column_type = spec.func.result_type_with_source(
+            input_field.map(|field| field.column_type),
+            input_field.map(|field| &field.source),
+        );
         let mut source = if matches!(spec.func, AggregateKind::Min | AggregateKind::Max) {
             input_field
                 .map(|field| field.source.clone().nullable_aggregate())
@@ -6353,6 +6441,7 @@ impl HashAggregateCore {
         spill_root: PathBuf,
     ) {
         self.bind_comparison_domains(&input_schema);
+        self.bind_partition_domain(&input_schema);
         let spill_schema = build_spill_schema(&input_schema, &self.group_columns, &self.aggs);
         self.group_key_program = crate::engine::executor::hash_aggregate::GroupKeyProgram::compile(
             &self.group_columns,
@@ -6413,9 +6502,54 @@ impl HashAggregateCore {
         }
     }
 
+    fn bind_partition_domain(&mut self, schema: &BatchSchema) {
+        // Workers may see an all-NULL lane first and choose different
+        // kernels. Partition routing must follow the declared key domain.
+        if !self.group_columns.is_empty()
+            && self
+                .aggs
+                .iter()
+                .all(|spec| matches!(spec.func, AggregateKind::CountStar | AggregateKind::Count))
+        {
+            let kinds: Option<Vec<_>> = self
+                .group_columns
+                .iter()
+                .map(|column| {
+                    Some(match schema.fields().get(*column)?.column_type {
+                        ColumnType::VarString => DictionaryHashKind::Text,
+                        ColumnType::Date => DictionaryHashKind::Date,
+                        ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong => {
+                            if schema.fields()[*column].source.flags
+                                & crate::mysql::protocol::UNSIGNED_FLAG
+                                != 0
+                            {
+                                DictionaryHashKind::Unsigned
+                            } else {
+                                DictionaryHashKind::Signed
+                            }
+                        }
+                        _ => return None,
+                    })
+                })
+                .collect();
+            if let Some(kinds) = kinds.filter(|kinds| {
+                kinds
+                    .iter()
+                    .any(|kind| matches!(kind, DictionaryHashKind::Text))
+            }) {
+                self.compact_partition_hash = Some(CompactPartitionHash::Dictionary(kinds));
+            }
+        }
+    }
+
     pub fn set_input_schema(&mut self, schema: Arc<BatchSchema>) {
         if self.input_schema.is_none() {
             self.bind_comparison_domains(&schema);
+            self.bind_partition_domain(&schema);
             let spill_schema = build_spill_schema(&schema, &self.group_columns, &self.aggs);
             self.group_key_program =
                 crate::engine::executor::hash_aggregate::GroupKeyProgram::compile(
@@ -10121,14 +10255,19 @@ fn update_state_from_lane_impl<const SELECTED: bool>(
 ) -> Result<(), QueryError> {
     let selection = SELECTED.then_some(rows);
     if spec.func.uses_distinct_state() {
-        for_lane_rows(col.len(), selection, |row| {
+        for index in 0..if SELECTED { rows.len() } else { col.len() } {
+            let row = if SELECTED {
+                rows[index] as usize
+            } else {
+                index
+            };
             if !col.is_null(row)
                 && (!matches!(spec.func, AggregateKind::CountDistinct)
                     || !count_distinct_key_from_lane(state, col, row))
             {
-                distinct_insert_from_lane(state, col, row);
+                distinct_insert_from_lane(state, col, row, spec.func)?;
             }
-        });
+        }
         return Ok(());
     }
     if spec.func.uses_extra() {
@@ -10339,7 +10478,12 @@ fn update_extra_from_typed_lane(
 /// `ColumnVector::value_at` dispatcher. Variable-width values still use the
 /// owning fallback because the dedup table must retain the winning value.
 #[inline]
-fn distinct_insert_from_lane(state: &mut AggState, col: &ColumnVector, row: usize) {
+fn distinct_insert_from_lane(
+    state: &mut AggState,
+    col: &ColumnVector,
+    row: usize,
+    kind: AggregateKind,
+) -> Result<(), QueryError> {
     let value = match col {
         ColumnVector::I64 { data, .. } => Value::Int(data[row]),
         ColumnVector::U64 { data, .. } => Value::UInt(data[row]),
@@ -10351,7 +10495,20 @@ fn distinct_insert_from_lane(state: &mut AggState, col: &ColumnVector, row: usiz
         ColumnVector::Decimal128 { data, scale, .. } => Value::Decimal128(data[row], *scale),
         _ => col.value_at(row),
     };
+    let converted = if matches!(
+        kind,
+        AggregateKind::SumDistinct | AggregateKind::AvgDistinct
+    ) {
+        crate::engine::executor::select::aggregate::numeric_distinct_value(&value)?
+    } else {
+        std::borrow::Cow::Borrowed(&value)
+    };
+    let value = match converted {
+        std::borrow::Cow::Owned(value) => value,
+        std::borrow::Cow::Borrowed(_) => value,
+    };
     state.distinct_insert(value);
+    Ok(())
 }
 
 /// COUNT(DISTINCT text/binary) receives a canonical byte lane from
@@ -10380,7 +10537,7 @@ fn update_extra_with_value(
     value: &Value,
 ) -> Result<(), QueryError> {
     if func.is_bit() {
-        let n = crate::engine::expr::int_value(value)? as u64;
+        let n = crate::engine::expr::bit_aggregate_int_value(value)?;
         bit_update(state.extra_mut(), func, n);
         return Ok(());
     }
@@ -10401,7 +10558,7 @@ fn update_state(
             if !matches!(spec.func, AggregateKind::CountDistinct)
                 || !count_distinct_key_from_lane(state, col, row)
             {
-                distinct_insert_from_lane(state, col, row);
+                distinct_insert_from_lane(state, col, row, spec.func)?;
             }
         }
         return Ok(());

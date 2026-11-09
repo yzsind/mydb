@@ -31,3 +31,51 @@
 | [`JSON_UNQUOTE`](json_unquote.md) | Removes JSON string quoting and processes escape sequences. |
 | [`JSON_VALID`](json_valid.md) | Determines whether the input is a valid JSON document. |
 | [`JSON_VALUE`](json_value.md) | Extracts and converts a scalar value from a JSON path. |
+
+
+## JSON values and paths
+
+Native JSON and valid JSON text are accepted by document arguments. SQL NULL is
+not the same as JSON null or the text NULL. Constructors turn SQL NULL values into
+JSON null; a NULL document or NULL path generally returns SQL NULL. JSON_VALID is
+a validator and returns 0 for invalid document text; ordinary document operations
+report invalid JSON. It does not treat an arbitrary non-string SQL scalar as JSON
+text. Typed SQL numeric/temporal values in constructors keep their JSON scalar types.
+
+| Path form | Example |
+| --- | --- |
+| Root | $ |
+| Object member | $.name or $."member with spaces" |
+| Array element | $[0] (zero-based), $[last], $[last-1] |
+| Member/element wildcard | $.* or $[*] |
+| Recursive descent | $**.name |
+| Array range | $[1 to 3] |
+
+Extraction can return multiple matches and wraps them as an array. Mutation paths
+must identify an eligible single location and reject wildcard/range forms. Function
+restrictions are independent of whether a path is syntactically valid: CONTAINS,
+KEYS and LENGTH do not accept every multi-match extraction path. JSON_VALUE requires
+a constant scalar-selection path. A missing path is distinct from an invalid path.
+
+Multiple mutation path/value pairs are applied left to right; an earlier array
+insertion/removal can change later positions. Inserting into a missing parent does
+not create an entire object chain. SQL string values are JSON strings unless they
+are parsed as JSON explicitly. JSON text parsing and result construction enforce
+nesting and governed-memory limits; oversized/deep input raises a diagnostic.
+
+| Operation | Missing path / special value |
+| --- | --- |
+| JSON_EXTRACT | SQL NULL when nothing matches |
+| JSON_INSERT | Add an eligible missing member; preserve existing values |
+| JSON_REPLACE | Ignore missing paths |
+| JSON_SET | Replace existing or add eligible missing member/array position |
+| JSON_REMOVE | Ignore a missing member; root removal is invalid |
+| JSON_ARRAY_APPEND | Wrap selected scalar when necessary; ignore unmatched paths |
+| JSON_ARRAY_INSERT | Insert before an array position; out-of-range positions append |
+| JSON_MERGE_PATCH | JSON null in an object patch deletes that key; arrays replace |
+| JSON_MERGE_PRESERVE | Preserve conflicting values by array wrapping/concatenation |
+
+JSON_STORAGE_SIZE reports MySQL binary-JSON encoding size, not mydb heap/JSONB
+allocation. JSON_STORAGE_FREE is a compatibility value of zero for valid input;
+it does not measure reusable storage. JSON schemas use the Draft 4 subset supported
+by the validator; see the two schema-function pages for success/failure forms.

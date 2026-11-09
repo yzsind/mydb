@@ -14,12 +14,12 @@ MAKE_SET(bits, str1 [, str2] ...)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `bits` | Yes | Integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `str1 ...` | No, repeatable | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `bits` | Yes | Integer | Bitmap read from bit 0. |
+| `str1 ...` | Yes, repeatable | String or NULL | Candidate strings; NULL candidates are omitted. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns comma-separated selected strings. Bit 0 selects str1, bit 1 selects str2, and so on. NULL candidate strings are skipped, while a NULL bitmap returns NULL. No selected strings returns empty text.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: a,c
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`EXPORT_SET`](export_set.md), [`LIST_ADD`](list_add.md), [`LIST_DROP`](list_drop.md), [`FORMAT`](format.md).

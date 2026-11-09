@@ -886,12 +886,29 @@ pub fn command_err_packet_for_spec(
 }
 
 #[allow(dead_code)]
+/// Shared display conversion for protocol rows and SQL string consumers.
+pub(crate) fn numeric_display_width(column_type: ColumnType, declared: Option<u32>) -> u16 {
+    let width = match column_type {
+        ColumnType::Decimal { precision, scale } => u32::from(precision) + u32::from(scale > 0),
+        _ => declared.unwrap_or(match column_type {
+            ColumnType::Tiny => 3,
+            ColumnType::Short => 5,
+            ColumnType::MediumInt => 8,
+            ColumnType::Long => 10,
+            ColumnType::LongLong => 20,
+            ColumnType::Float => 12,
+            ColumnType::Double => 22,
+            ColumnType::Year => 4,
+            _ => 0,
+        }),
+    };
+    width.min(u32::from(u16::MAX)) as u16
+}
+
 /// Per-result-set ZEROFILL pad widths, or `None` when no projected
 /// column carries `ZEROFILL_FLAG` — the common case, so the per-row
-/// text encode path stays branch-free. Widths follow MySQL's default
-/// display widths for the unsigned integer types (mydb does not
-/// preserve explicit display widths) and `precision (+1 for the dot)`
-/// for DECIMAL.
+/// text encode path stays branch-free. Explicit numeric display widths
+/// are preserved; DECIMAL uses `precision (+1 for the dot)`.
 pub fn zerofill_pad_spec(columns: &[crate::types::Column]) -> Option<Vec<u16>> {
     let mut any = false;
     let spec: Vec<u16> = columns
@@ -900,23 +917,7 @@ pub fn zerofill_pad_spec(columns: &[crate::types::Column]) -> Option<Vec<u16>> {
             if column.source.flags & ZEROFILL_FLAG == 0 {
                 return 0;
             }
-            let width = match column.column_type {
-                crate::types::ColumnType::Tiny => 3,
-                crate::types::ColumnType::Short => 5,
-                crate::types::ColumnType::MediumInt => 8,
-                crate::types::ColumnType::Long => 10,
-                crate::types::ColumnType::LongLong => 20,
-                crate::types::ColumnType::Float => {
-                    column.source.length.unwrap_or(12).min(u32::from(u16::MAX)) as u16
-                }
-                crate::types::ColumnType::Double => {
-                    column.source.length.unwrap_or(22).min(u32::from(u16::MAX)) as u16
-                }
-                crate::types::ColumnType::Decimal { precision, scale } => {
-                    u16::from(precision) + u16::from(scale > 0)
-                }
-                _ => 0,
-            };
+            let width = numeric_display_width(column.column_type, column.source.length);
             if width > 0 {
                 any = true;
             }
@@ -1074,6 +1075,7 @@ pub(crate) fn columnar_text_row_packet_into(
                     charset,
                     column.and_then(|c| c.source.decimals),
                     column.map(|c| c.column_type),
+                    column.is_some_and(|c| c.source.round_decimal_result),
                 )
             };
         }
@@ -1105,6 +1107,7 @@ pub(crate) fn columnar_text_row_packet_into(
                 charset,
                 column.and_then(|c| c.source.decimals),
                 column.map(|c| c.column_type),
+                column.is_some_and(|c| c.source.round_decimal_result),
             ),
             ColumnVector::Bool { values, .. } => {
                 integer!(values.get(row) as i64, values.get(row) as u64)
@@ -1197,6 +1200,7 @@ fn write_text_row<const VECTOR_TEXT: bool>(
             result_charset_for_column(charset, col),
             fsp,
             col_type,
+            col.is_some_and(|c| c.source.round_decimal_result),
         );
     }
 }
@@ -1394,6 +1398,14 @@ pub fn binary_row_packet_into_with_charset(
             continue;
         }
         let column_type = columns.get(idx).map(|column| column.column_type);
+        let shaped = column_type
+            .filter(|_| {
+                columns
+                    .get(idx)
+                    .is_some_and(|c| c.source.round_decimal_result)
+            })
+            .map(|ty| crate::engine::expr::decimal_result_value(value, ty));
+        let value = shaped.as_deref().unwrap_or(value);
         if let Some(integral) = integral_decimal_for_integer_column(column_type, value) {
             // A DECIMAL-typed runtime value under INTEGER metadata must
             // still use the advertised fixed-width integer encoding.
@@ -2505,9 +2517,22 @@ pub fn stmt_param_to_sql(value: &StmtParamValue, no_backslash_escapes: bool) -> 
             let mut buf = ryu::Buffer::new();
             crate::types::ryu_to_mysql_text(buf.format(*value), || value.to_string()).into_owned()
         }
-        StmtParamValue::Bytes(value) => {
-            quote_sql_string(&String::from_utf8_lossy(value), no_backslash_escapes)
-        }
+        StmtParamValue::Bytes(value) => match std::str::from_utf8(value) {
+            Ok(text) => quote_sql_string(text, no_backslash_escapes),
+            Err(_) => {
+                // The text fallback must preserve arbitrary binary parameters.
+                // Hex literals are lossless in either SQL escaping mode.
+                const HEX: &[u8; 16] = b"0123456789ABCDEF";
+                let mut out = String::with_capacity(value.len() * 2 + 3);
+                out.push_str("X'");
+                for byte in value {
+                    out.push(HEX[(byte >> 4) as usize] as char);
+                    out.push(HEX[(byte & 15) as usize] as char);
+                }
+                out.push('\'');
+                out
+            }
+        },
         StmtParamValue::String(value) => quote_sql_string(value, no_backslash_escapes),
         // SQL literal-rewriting path only used for unrecognised
         // statements (rare). Emit the canonical decimal form.
@@ -2611,7 +2636,12 @@ fn write_text_value(
     charset: Option<&'static crate::charset::CharsetInfo>,
     fsp: Option<u8>,
     col_type: Option<ColumnType>,
+    round_decimal: bool,
 ) {
+    let shaped = col_type
+        .filter(|_| round_decimal)
+        .map(|ty| crate::engine::expr::decimal_result_value(value, ty));
+    let value = shaped.as_deref().unwrap_or(value);
     if matches!(col_type, Some(ColumnType::Float)) {
         if let Value::Double(value) = value {
             return write_text_value_inner(payload, &Value::Float(*value as f32), charset, fsp);

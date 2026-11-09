@@ -14,11 +14,11 @@ MASK_PAN_RELAXED(str)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
 
 ## Return Value
 
-Masks digits according to relaxed payment card number rules. The return type is determined by the function semantics and the input types.
+Returns text retaining the first six and last four characters, masking the middle. Inputs of at most ten characters are unchanged; SQL NULL returns NULL. No payment-card validation is performed.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 123456XXXXXX3456
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MASK_INNER`](mask_inner.md), [`MASK_OUTER`](mask_outer.md), [`MASK_PAN`](mask_pan.md), [`MASK_SSN`](mask_ssn.md).

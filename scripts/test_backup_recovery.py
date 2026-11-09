@@ -235,12 +235,15 @@ def bench(c, count=3000):
     return {'transactions':count,'seconds':elapsed,'tps':count/elapsed,
             'p95_ms':ordered[int((count-1)*.95)]*1000,'p99_ms':ordered[int((count-1)*.99)]*1000}
 
-def capture_retry(error):
-    # ER_OPTION_PREVENTS_STATEMENT also covers permanent write restrictions.
-    return error.errno == 1205 or (error.errno == 1290 and error.msg in (
-        'new writes are paused while physical backup drains active writers; retry',
-        'write blocked by capture admission barrier; retry after physical backup capture',
-    ))
+def capture_admission_retry(error):
+    """Retry temporary capture barriers, without masking other 1290 failures."""
+    return error.errno == 1205 or (
+        error.errno == 1290 and error.msg in (
+            'new writes are paused while physical backup drains active writers; retry',
+            'write blocked by capture admission barrier; retry after physical backup capture',
+        )
+    )
+
 
 def measure_while(c, operation):
     active=threading.Event();active.set();result={};samples=[];retries=0
@@ -255,11 +258,12 @@ def measure_while(c, operation):
             tick=time.perf_counter()
             try:sql(c,f'UPDATE probe SET v=v+1 WHERE id={1+n%2}')
             except mysql.connector.Error as error:
-                if capture_retry(error):
+                if capture_admission_retry(error):
                     retries+=1;time.sleep(.001);continue
                 raise
             samples.append(time.perf_counter()-tick);n+=1
-    finally:worker.join()
+    finally:
+        worker.join()
     elapsed=time.perf_counter()-began;assert 'error' not in result,result
     metric=latency_summary(samples,elapsed);metric['admission_retries']=retries;metric['operation_seconds']=result['seconds'];return metric,result['value']
 
@@ -345,7 +349,7 @@ def scenario(binary, cli, root, rows, pairs, encrypted):
                     writer_samples.append(time.perf_counter()-began)
                 except mysql.connector.Error as error:
                     sql(w,'ROLLBACK')
-                    if capture_retry(error):
+                    if capture_admission_retry(error):
                         n-=1
                         time.sleep(.001)
                         continue

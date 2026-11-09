@@ -85,6 +85,64 @@ class CaptureAdmissionTests(unittest.TestCase):
                 self.assertRaisesRegex(AssertionError, 'backup failed'):
             recovery.measure_while(None, operation)
 
+    barriers = [
+        'new writes are paused while physical backup drains active writers; retry',
+        'write blocked by capture admission barrier; retry after physical backup capture',
+    ]
+
+    def test_concurrent_measurement_retries_temporary_admission_errors(self):
+        for code, message in [(1205, 'capture admission wait timed out'),
+                              *[(1290, message) for message in self.barriers]]:
+            with self.subTest(code=code, message=message):
+                release = threading.Event()
+
+                def operation():
+                    if not release.wait(timeout=5):
+                        raise TimeoutError('concurrent write did not resume')
+                    return 'backup completed'
+
+                calls = []
+
+                def write(connection, statement):
+                    calls.append(statement)
+                    if len(calls) == 1:
+                        raise recovery.mysql.connector.DatabaseError(message, errno=code)
+                    release.set()
+
+                try:
+                    with patch.object(recovery, 'sql', side_effect=write):
+                        metrics, result = recovery.measure_while(None, operation)
+                finally:
+                    release.set()
+                self.assertEqual(result, 'backup completed')
+                self.assertEqual(metrics['admission_retries'], 1)
+                self.assertGreaterEqual(metrics['transactions'], 1)
+                self.assertEqual(calls[0], calls[1])
+
+    def test_unrelated_write_errors_propagate_after_operation_finishes(self):
+        for code, message in [(1290, 'server is running with --read-only'),
+                              (1290, 'unrelated capture failure'),
+                              (1064, self.barriers[1])]:
+            with self.subTest(code=code, message=message):
+                release = threading.Event()
+                finished = threading.Event()
+                error = recovery.mysql.connector.DatabaseError(message, errno=code)
+
+                def operation():
+                    if not release.wait(timeout=5):
+                        raise TimeoutError('write error was not observed')
+                    finished.set()
+
+                def write(connection, statement):
+                    release.set()
+                    raise error
+
+                with patch.object(recovery, 'sql', side_effect=write), \
+                        self.assertRaises(recovery.mysql.connector.Error) as caught:
+                    recovery.measure_while(None, operation)
+                self.assertIs(caught.exception, error)
+                self.assertTrue(finished.is_set())
+
 
 def frame(lsn, txn, kind, payload, source_time):
     header = struct.pack('<IIQQQHHQ', 0x4d57414c, len(payload), lsn, 0,

@@ -14,12 +14,12 @@ CONCAT(str1 [, str2 [, ...]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str1` | Yes | String | The 1st argument; the meaning is determined by the function syntax and description |
-| `str2 ...` | No, repeatable | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `str1` | Yes | String | First string. |
+| `str2 ...` | No, repeatable | String | Additional strings, in argument order. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns concatenated text, or binary bytes when binary input determines the result domain. Any SQL NULL argument returns NULL. Empty strings contribute no bytes; numeric arguments are converted to text.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: mydb
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CONCAT_WS`](concat_ws.md), [`REPEAT`](repeat.md), [`SPACE`](space.md).

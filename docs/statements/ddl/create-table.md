@@ -30,6 +30,49 @@ Creates a persistent table or a session temporary table, defining columns, const
 - Functional string indexes preserve the expression result collation fixed at creation. Numeric keys preserve DECIMAL precision and scale. Expressions referencing TIMESTAMP are maintained but excluded from query access and ordering because their result may depend on the reader's time zone; FORCE INDEX does not bypass this restriction.
 - Long-lived indexes and table data go into the unified storage and memory governor; once creation succeeds, the data dictionary is the authoritative source of the catalog.
 
+## Definition Elements
+
+```ebnf
+<column-definition> ::= <identifier> <data-type> { <column-option> }
+<column-option> ::= 'NULL' | 'NOT NULL' | 'DEFAULT' <expr>
+                 | 'AUTO_INCREMENT' | 'VISIBLE' | 'INVISIBLE'
+                 | 'COMMENT' <string-literal>
+                 | [ 'CHARACTER SET' <charset> ] 'COLLATE' <collation>
+                 | 'ON UPDATE' <expr>
+                 | [ 'GENERATED ALWAYS' ] 'AS' '(' <expr> ')' [ 'VIRTUAL' | 'STORED' ]
+                 | 'PRIMARY KEY' | 'UNIQUE' [ 'KEY' ] | 'CHECK' '(' <expr> ')'
+<table-constraint> ::= [ 'CONSTRAINT' <identifier> ]
+                      ( 'PRIMARY KEY' '(' <index-key-list> ')'
+                      | 'UNIQUE' [ 'KEY' ] [ <identifier> ] '(' <index-key-list> ')'
+                      | 'CHECK' '(' <expr> ')' [ [ 'NOT' ] 'ENFORCED' ]
+                      | 'FOREIGN KEY' [ <identifier> ] '(' <identifier-list> ')'
+                        'REFERENCES' <qualified-name> '(' <identifier-list> ')'
+                        { 'ON' ( 'DELETE' | 'UPDATE' ) <referential-action> } )
+<referential-action> ::= 'RESTRICT' | 'NO ACTION' | 'CASCADE' | 'SET NULL'
+```
+
+See [index keys and options](create-index.md#index-keys-and-options) for inline INDEX/KEY definitions and [Data Types](../../data-types.md) for legal type/default/generated-expression combinations. Generated/CHECK expressions cannot allocate sequence values or invoke external side effects. Character set can also be specified without COLLATE; each collation must match its charset.
+
+## Table Options
+
+| Option group | Current effect |
+| --- | --- |
+| ENGINE=InnoDB or mydb | The same native engine; unknown names return 1286 |
+| DEFAULT CHARACTER SET / CHARSET / COLLATE | Stored defaults used when deriving columns |
+| AUTO_INCREMENT, COMMENT | Actual counter start/next value and catalog comment |
+| PCTFREE/PCTUSED, Zone Map controls | Native storage/planning options within their validated ranges |
+| ROW_FORMAT, STATS_*, KEY_BLOCK_SIZE, MAX_ROWS and other documented compatibility options | Persisted/echoed metadata; no separate InnoDB physical layout |
+| Named TABLESPACE | Unsupported, 1235; no physical tablespace or name catalog |
+| Partition/subpartition definition | Supported RANGE/LIST/HASH/KEY families and validated actions; see [partitioning](../../mysql80-compatibility.md#partitioning) |
+
+An accepted metadata option must not be interpreted as a new physical layout, encryption guarantee, or lock algorithm. Use [compatibility details](../../mysql80-compatibility.md#table-ddl) for exact retained options.
+
+## Privileges, Transactions, and Dependencies
+
+Persistent CREATE needs CREATE; temporary CREATE needs CREATE TEMPORARY TABLES in the schema. Declared foreign keys also need REFERENCES on their referenced tables. Permanent table DDL implicitly commits. Successful temporary-table DDL has its own transaction boundary but is not undone by a later user ROLLBACK.
+
+Identifiers are limited to 64 characters and tables to 1017 live columns. Duplicate objects return 1050; IF NOT EXISTS preserves the existing object and emits a Note, without validating that it matches the requested shape. Temporary tables shadow persistent names in ordinary object resolution. The session temporary table default is ON COMMIT PRESERVE ROWS; DELETE ROWS and DROP are explicit lifecycle requests.
+
 ## Examples
 
 ```sql

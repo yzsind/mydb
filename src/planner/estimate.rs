@@ -2221,6 +2221,8 @@ pub(super) fn estimate_index_nlj_operator_cost(
             let inc_total = (cost.total - outer_cost.total).max(0.0);
             let inc_cpu = (cost.cpu_units - outer_cost.cpu_units).max(0.0);
             cost.total = outer_cost.total + inc_total / parallel_speedup;
+            cost.startup = outer_cost.startup
+                + (cost.startup - outer_cost.startup).max(0.0) / parallel_speedup;
             cost.cpu_units = outer_cost.cpu_units + inc_cpu / parallel_speedup;
         }
         crate::engine::cbo::trace::event(

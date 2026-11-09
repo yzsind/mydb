@@ -19,6 +19,10 @@ Shows the event frames of a specified channel's relay log.
 - The mydb relay log uses JSON-Lines framing, so Pos/End_log_pos are file offsets within that framing, not MySQL binary relay log offsets.
 - Returns a compatible empty result when the manager is not initialized.
 
+## Privileges, Results, and Operational Details
+
+Requires REPLICATION CLIENT. Columns follow the event listing schema, but Pos/End_log_pos refer to local JSONL byte offsets. Obtain the actual relay filename from SHOW REPLICA STATUS; do not construct it from source binary filenames. FOR CHANNEL selects the relay owner; a no-manager probe returns the canonical empty columns. Use recorded frame boundaries when paginating.
+
 ## Examples
 
 ```sql

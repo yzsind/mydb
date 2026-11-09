@@ -14,9 +14,9 @@ IF(condition, value_if_true, value_if_false)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `condition` | Yes | SQL expression matching the function semantics | The 1st argument; determines which branch is returned |
-| `value_if_true` | Yes | Any SQL expression | The 2nd argument; returned when the condition is true |
-| `value_if_false` | Yes | Any SQL expression | The 3rd argument; returned when the condition is false |
+| `condition` | Yes | Convertible numeric expression | Boolean/numeric condition; SQL NULL selects the false branch. |
+| `value_if_true` | Yes | Any SQL expression | Result expression used when the condition is true. |
+| `value_if_false` | Yes | Any SQL expression | Result expression used when the condition is false. |
 
 ## Return Value
 
@@ -25,19 +25,19 @@ Returns the true branch when the condition is true, otherwise the false branch; 
 ## Examples
 
 ```sql
-SELECT IF('example', 2, 2);
+SELECT IF(1,'yes','no'), IF(0,'yes','no'), IF(NULL,'yes','no');
 ```
 
 Result:
 
 ```text
-2
+yes	no	no
 ```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`COALESCE`](coalesce.md), [`IFNULL`](ifnull.md), [`NULLIF`](nullif.md), [`ISNULL`](isnull.md).

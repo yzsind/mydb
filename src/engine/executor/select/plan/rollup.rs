@@ -1636,6 +1636,7 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_spilled_
     let order_by: Vec<OrderBy> = group_by
         .iter()
         .map(|expr| OrderBy {
+            names_bound: false,
             expr: expr.clone(),
             asc: true,
             nulls_first: None,
@@ -2306,6 +2307,7 @@ mod bounded_rollup_input_tests {
                                 expr: Box::new(groups[0].clone()),
                             }],
                             order_by: vec![OrderBy {
+                                names_bound: false,
                                 expr: expressions[0].clone(),
                                 asc: ascending,
                                 nulls_first: Some(false),
@@ -2428,6 +2430,7 @@ mod bounded_rollup_input_tests {
                         RollupWindowTopKHint {
                             partition_by: Vec::new(),
                             order_by: vec![OrderBy {
+                                names_bound: false,
                                 expr: Expr::Identifier("score".into()),
                                 asc: ascending,
                                 nulls_first: Some(nulls_first),

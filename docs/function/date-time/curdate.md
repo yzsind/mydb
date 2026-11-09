@@ -16,7 +16,7 @@ This function takes no arguments.
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a DATE for the statement-start instant in the session time zone. It has no arguments; use SET timestamp only when a reproducible test clock is needed.
 
 ## Examples
 
@@ -28,7 +28,7 @@ Result: returns the current session date; the exact value varies with the execut
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 

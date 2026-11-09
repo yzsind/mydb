@@ -14,11 +14,11 @@ INET_NTOA(ipv4_number)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `ipv4_number` | Yes | Address, UUID, sequence name, integer, or flag value | The 1st argument; the 32-bit IPv4 integer |
+| `ipv4_number` | Yes | Unsigned 32-bit integer | IPv4 address number in 0..4294967295. |
 
 ## Return Value
 
-Converts an integer IPv4 address to text. The return type is determined by the function semantics and the input type.
+Returns dotted-quad IPv4 text for an unsigned 32-bit address. SQL NULL or an out-of-range number returns NULL with the applicable conversion diagnostic.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 127.0.0.1
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`INET_ATON`](inet_aton.md), [`IS_IPV4`](is_ipv4.md).

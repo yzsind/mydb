@@ -137,8 +137,14 @@ fn aggregate_metadata_preserves_group_order_sources_and_optional_schema() {
             match kind {
                 Min | Max => {
                     assert_eq!(result.column_type, column_type);
-                    let mut nullable = source.clone();
-                    nullable.flags = UNSIGNED_FLAG;
+                    let nullable = ColumnSource {
+                        schema: String::new(),
+                        table: String::new(),
+                        org_table: String::new(),
+                        org_name: String::new(),
+                        flags: UNSIGNED_FLAG,
+                        ..source.clone()
+                    };
                     assert_eq!(result.source, nullable);
                 }
                 BitAnd | BitOr | BitXor => {
@@ -162,5 +168,59 @@ fn aggregate_metadata_preserves_group_order_sources_and_optional_schema() {
         }
         let empty = vec_hash_agg::aggregate_output_schema(Some(input.as_ref()), &[], &[]);
         assert!(empty.fields().is_empty());
+    }
+}
+
+#[test]
+fn aggregate_metadata_preserves_temporal_scales_in_serial_and_parallel() {
+    for column_type in [
+        ColumnType::Date,
+        ColumnType::Time,
+        ColumnType::DateTime,
+        ColumnType::Timestamp,
+    ] {
+        for decimals in [0, 4, 6] {
+            let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "v".into(),
+                column_type,
+                source: crate::types::ColumnSource {
+                    decimals: Some(decimals),
+                    ..Default::default()
+                },
+            }]));
+            let aggs = [
+                AggregateKind::Sum,
+                AggregateKind::Avg,
+                AggregateKind::SumDistinct,
+                AggregateKind::AvgDistinct,
+            ]
+            .map(|func| AggregateSpec {
+                comparison_collation: None,
+                func,
+                input_column: 0,
+            });
+            let parallel = build_hash_agg_output_schema(&schema, &[], &aggs);
+            let mut core = HashAggregateCore::new(Vec::new(), aggs.to_vec());
+            core.consume_batch(&Batch::new(schema, vec![ColumnVector::from_values(vec![])]))
+                .unwrap();
+            let output = core.output_schema();
+            for (i, field) in output.fields().iter().enumerate() {
+                let scale = if column_type == ColumnType::Date {
+                    0
+                } else {
+                    decimals
+                };
+                let scale = scale + if i % 2 == 1 { 4 } else { 0 };
+                assert!(
+                    matches!(field.column_type, ColumnType::Decimal { scale: actual, .. } if actual == scale),
+                    "{column_type:?}({decimals}) {:?}: {:?}",
+                    aggs[i].func,
+                    field.column_type,
+                );
+                assert_eq!(field.column_type, parallel.fields()[i].column_type);
+            }
+        }
     }
 }

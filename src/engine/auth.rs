@@ -2882,7 +2882,10 @@ pub fn account_id(key: &AccountKey) -> String {
 
 pub fn privilege_denied(privilege: &Privilege, scope: &PrivilegeScope) -> QueryError {
     let specific_admin = match privilege {
-        Privilege::Process => true,
+        Privilege::Process
+        | Privilege::CreateUser
+        | Privilege::CreateRole
+        | Privilege::DropRole => true,
         Privilege::Dynamic(name) => {
             name.eq_ignore_ascii_case("SYSTEM_VARIABLES_ADMIN")
                 || name.eq_ignore_ascii_case("PERSIST_RO_VARIABLES_ADMIN")

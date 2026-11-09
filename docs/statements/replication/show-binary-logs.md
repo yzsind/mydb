@@ -12,8 +12,12 @@ Lists available binlog files with their sizes; SHOW MASTER LOGS is an alias.
 
 ## Behavior, Prerequisites, and Limitations
 
-- Results come from the binlog manager's file catalog; when binlog is not enabled, the result is empty or an explicit configuration status is returned.
+- Results come from the binlog manager's file catalog; when binary logging is disabled, execution returns 1235, `binary logging is disabled`.
 - Requires view privileges such as REPLICATION CLIENT.
+
+## Privileges, Results, and Operational Details
+
+Requires REPLICATION CLIENT. Log_name is a source filename, File_size is bytes, Encrypted is currently No. An empty live file set is different from disabled logging (1235). This listing is not proof a replica has consumed a file or that PURGE will preserve its position.
 
 ## Examples
 

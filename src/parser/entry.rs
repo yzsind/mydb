@@ -609,6 +609,11 @@ fn parse_statement_source(
     let head_is = |keyword: &[u8]| {
         head.is_some_and(|head| head.len() == keyword.len() && head.eq_ignore_ascii_case(keyword))
     };
+    if head_is(b"END") {
+        return Err(parse_error_at_zero(
+            "END is only valid inside a stored-program compound statement",
+        ));
+    }
     if head_is(b"SET") {
         let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
         let mut cursor = crate::sql_lex::SqlTokenCursor::new(sql, mode, MYSQL_VERSION_ID);
@@ -954,7 +959,33 @@ impl Dialect for MydbDialect {
                 }
             }
         }
-        let native = super::adapter::parse_high_prefix(parser, PREC_PREFIX)
+        let bit_prefixed = if let Token::Word(word) = &parser.peek_token_ref().token {
+            if word.quote_style.is_none() && word.value.starts_with('_') {
+                if let Token::SingleQuotedByteStringLiteral(bits) =
+                    &parser.peek_nth_token_ref(1).token
+                {
+                    let prefix = sqlparser::ast::Ident::new(word.value.clone());
+                    let value = sqlparser::ast::Value::SingleQuotedByteStringLiteral(bits.clone());
+                    parser.next_token();
+                    let token = parser.next_token();
+                    Some(Ok(SqlExpr::Prefixed {
+                        prefix,
+                        value: Box::new(SqlExpr::Value(sqlparser::ast::ValueWithSpan {
+                            value,
+                            span: token.span,
+                        })),
+                    }))
+                } else {
+                    None
+                }
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let native = bit_prefixed
+            .or_else(|| super::adapter::parse_high_prefix(parser, PREC_PREFIX))
             .or_else(|| super::adapter::parse_cast_prefix(parser, PREC_COLLATE))
             .or_else(|| super::adapter::parse_json_value_prefix(parser))
             .or_else(|| super::adapter::parse_scalar_clause_prefix(parser))
@@ -1127,6 +1158,16 @@ impl Dialect for MydbDialect {
         expr: &SqlExpr,
         precedence: u8,
     ) -> Option<Result<SqlExpr, ParserError>> {
+        if !self.column_option_active.get() && parser.parse_keyword(Keyword::COLLATE) {
+            return Some(
+                parser
+                    .parse_object_name(false)
+                    .map(|collation| SqlExpr::Collate {
+                        expr: Box::new(expr.clone()),
+                        collation,
+                    }),
+            );
+        }
         if let Some(result) = super::adapter::parse_logical_chain(parser, expr, precedence) {
             return Some(result);
         }
@@ -1206,6 +1247,12 @@ impl Dialect for MydbDialect {
         }
         let token = &parser.peek_token_ref().token;
         let precedence = match token {
+            Token::Word(word) if word.keyword == Keyword::COLLATE => {
+                if self.column_option_active.get() {
+                    return Some(Ok(0));
+                }
+                PREC_COLLATE
+            }
             Token::CustomBinaryOperator(_) => PREC_CONCAT,
             Token::Assignment => PREC_ASSIGNMENT,
             Token::Word(ref word) if word.keyword == Keyword::OR => PREC_OR,
@@ -1494,6 +1541,15 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
     let original = sql;
     let result = (|| {
         let (sql, ddl_query_hints, ddl_hint_warnings) = strip_ddl_optimizer_hint(sql)?;
+        // Compatibility rewrites must never interpret quotes inside comments
+        // as literal delimiters. Preserve offsets for diagnostics/source spans.
+        let sql = crate::sql_lex::mask_comments(
+            &sql,
+            crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits()),
+            MYSQL_VERSION_ID,
+            true,
+        )
+        .map_err(|error| parse_lex_error(&sql, error))?;
         let (head_buf, head_len) = extract_first_keyword(&sql);
         let head_kw = &head_buf[..head_len];
         let head_is = |keyword: &[u8]| head_kw == keyword;
@@ -2600,6 +2656,7 @@ pub(super) fn parse_order_by_tail(sql: &str) -> Result<Vec<OrderBy>, ParseError>
             .iter()
             .map(|item| {
                 Ok(OrderBy {
+                    names_bound: false,
                     expr: convert_expr(&item.expr)?,
                     asc: item.options.asc.unwrap_or(true),
                     nulls_first: item.options.nulls_first,

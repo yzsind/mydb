@@ -7,18 +7,18 @@ Returns a string of a given number of spaces.
 ## Syntax
 
 ```sql
-SPACE(str)
+SPACE(count)
 ```
 
 ## Parameters
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
+| `count` | Yes | Integer or convertible number | Number of ASCII spaces; nonpositive values produce empty text. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns a text string containing count ASCII spaces. Nonpositive count returns an empty string; SQL NULL returns NULL. Output beyond the packet limit returns NULL with a warning.
 
 ## Examples
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CONCAT`](concat.md), [`CONCAT_WS`](concat_ws.md), [`REPEAT`](repeat.md).

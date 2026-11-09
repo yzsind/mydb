@@ -2,7 +2,7 @@
 
 ## Description
 
-Validates and normalizes a geometry.
+Checks topological validity. Returns the geometry unchanged when valid, or SQL NULL when invalid; it does not repair or normalize rings.
 
 ## Syntax
 
@@ -18,20 +18,24 @@ ST_VALIDATE(geometry)
 
 ## Return Value
 
-Returns a GEOMETRY value; returns `NULL` when any required argument is `NULL`.
+Returns the unchanged GEOMETRY when topologically valid; SQL NULL input or invalid topology returns NULL. Invalid encodings/SRS inputs still raise an error. It does not reorient rings or repair self-intersections.
 
 ## Examples
 
 ```sql
-SELECT ST_ASTEXT(ST_VALIDATE(ST_GEOMFROMTEXT('POLYGON((0 0, 0 2, 2 2, 0 0))')));
+SELECT ST_ASTEXT(ST_VALIDATE(ST_GEOMFROMTEXT('POLYGON((0 0,2 2,0 2,2 0,0 0))')));
 ```
 
-Result: `POLYGON((0 0,0 2,2 2,0 0))`.
+Result:
+
+```text
+NULL
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_ISVALID`](st_isvalid.md), [`ST_ISSIMPLE`](st_issimple.md), [`ST_ISCLOSED`](st_isclosed.md), [`ST_ISEMPTY`](st_isempty.md).

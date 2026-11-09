@@ -2,7 +2,7 @@
 
 ## Description
 
-Reads the current diagnostics area or the handler stack.
+Reads the current diagnostics area at top level or in a stored program; STACKED reads the active handler condition and is only valid inside a handler.
 
 ## Syntax
 
@@ -18,6 +18,27 @@ Reads the current diagnostics area or the handler stack.
 
 - CURRENT reads the current diagnostics area; STACKED, valid only inside a handler, reads the condition being handled.
 - Condition items support MYSQL_ERRNO, RETURNED_SQLSTATE, MESSAGE_TEXT, and source fields such as catalog/schema/table/column/cursor.
+
+## Diagnostic Items
+
+```ebnf
+<condition-assignment> ::= <routine-target> '=' <condition-item>
+<condition-item> ::= 'MYSQL_ERRNO' | 'RETURNED_SQLSTATE' | 'MESSAGE_TEXT'
+                   | 'CLASS_ORIGIN' | 'SUBCLASS_ORIGIN'
+                   | 'CONSTRAINT_CATALOG' | 'CONSTRAINT_SCHEMA' | 'CONSTRAINT_NAME'
+                   | 'CATALOG_NAME' | 'SCHEMA_NAME' | 'TABLE_NAME'
+                   | 'COLUMN_NAME' | 'CURSOR_NAME'
+```
+
+ROW_COUNT and NUMBER are statement-area items and cannot be requested as CONDITION fields. Condition items require a valid CONDITION number. Unspecified source fields are empty diagnostic strings, not evidence that the corresponding object was checked.
+
+```sql
+GET CURRENT DIAGNOSTICS @rows=ROW_COUNT, @conditions=NUMBER;
+```
+
+## Context, Errors, and Lifecycle
+
+Top-level targets are @user variables. Within a routine, declared local variables are also valid. No global administration privilege is required to read this session's diagnostics. STACKED outside an active handler is 3004; an invalid/nonpositive/out-of-range condition number is 1758. Condition numbers are one-based. Diagnostics themselves do not read another session or execute the failed SQL again.
 
 ## Examples
 

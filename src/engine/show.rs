@@ -204,11 +204,7 @@ pub(crate) fn show_columns(
                 let key = crate::engine::information_schema::column_key(&table, &column.name);
                 let mut row = vec![
                     Value::String(column.name.clone()),
-                    Value::String(mysql_type_name_with_attrs(
-                        &column.data_type,
-                        column.unsigned,
-                        column.zerofill,
-                    )),
+                    Value::String(mysql_column_type_name(column)),
                     Value::String(if column.nullable { "YES" } else { "NO" }.to_string()),
                     Value::String(key.to_string()),
                     column_default_value(column),
@@ -233,6 +229,15 @@ pub(crate) fn show_columns(
         return Ok(QueryResponse::ResultSet(ResultSet { columns, rows }));
     }
     if let Some(view) = db.view_definition(&session.current_database, table_name) {
+        if view.invalid {
+            return Err(crate::storage::error(
+                crate::error::catalog::ER_VIEW_INVALID,
+                format!(
+                    "View '{}.{}' references invalid objects",
+                    view.database, view.name
+                ),
+            ));
+        }
         let mut rows = view
             .columns
             .iter()
@@ -633,7 +638,7 @@ fn base_table_status_row(db: &Database, table: &TableSchema) -> Vec<Value> {
         Value::Int(saturating_i64(stats.data_free)),
         auto_increment,
         mysql_time_value(table.created_ms),
-        mysql_time_value(table.updated_ms),
+        Value::Null,
         Value::Null,
         Value::String(table.collation.clone()),
         Value::Null,
@@ -972,6 +977,15 @@ pub(crate) fn show_create_table(
         }));
     }
     if let Some(view) = db.view_definition(&session.current_database, table_name) {
+        if view.invalid {
+            return Err(crate::storage::error(
+                crate::error::catalog::ER_VIEW_INVALID,
+                format!(
+                    "View '{}.{}' references invalid objects",
+                    view.database, view.name
+                ),
+            ));
+        }
         let required = RequiredPrivilege {
             privilege: Privilege::ShowView,
             scope: PrivilegeScope::Table {
@@ -1532,8 +1546,6 @@ pub(crate) fn create_trigger_sql(trigger: &TriggerSchema) -> String {
     sql.push(' ');
     sql.push_str(trigger.event.as_str());
     sql.push_str(" ON `");
-    sql.push_str(&trigger.table_database.replace('`', "``"));
-    sql.push_str("`.`");
     sql.push_str(&trigger.table_name.replace('`', "``"));
     sql.push_str("` FOR EACH ROW ");
     sql.push_str(&trigger.body_sql);
@@ -1866,6 +1878,21 @@ fn format_float_double(name: &str, precision: Option<u8>, scale: Option<u8>) -> 
     }
 }
 
+pub(crate) fn mysql_column_type_name(column: &crate::storage::ColumnSchema) -> String {
+    let name = mysql_type_name_with_attrs(&column.data_type, column.unsigned, column.zerofill);
+    if column.zerofill && column.data_type.is_integer() {
+        if let Some(width) = column.display_width {
+            let end = name.find(' ').unwrap_or(name.len());
+            return format!(
+                "{}({width}){}",
+                name[..end].split('(').next().unwrap_or(&name[..end]),
+                &name[end..]
+            );
+        }
+    }
+    name
+}
+
 pub(crate) fn mysql_type_name_with_unsigned(data_type: &DataTypeKind, unsigned: bool) -> String {
     mysql_type_name_with_attrs(data_type, unsigned, false)
 }
@@ -1978,7 +2005,11 @@ pub(crate) fn column_default_value(column: &crate::storage::ColumnSchema) -> Val
     // literal rather than the raw (possibly non-printable) bytes.
     if matches!(column.data_type, DataTypeKind::Bit { .. }) {
         if let Some(value) = &column.default {
-            return Value::String(bit_default_sql(value));
+            return if matches!(value, Value::Null) {
+                Value::Null
+            } else {
+                Value::String(bit_default_sql(value))
+            };
         }
     }
     column.default.clone().unwrap_or(Value::Null)
@@ -2013,6 +2044,9 @@ pub(crate) fn column_extra(column: &crate::storage::ColumnSchema) -> String {
 /// big-endian, or `Value::UInt`); we recover the integer and print its
 /// minimal binary form (`0` → `b'0'`), matching `SHOW CREATE TABLE`.
 pub(crate) fn bit_default_sql(value: &Value) -> String {
+    if matches!(value, Value::Null) {
+        return "NULL".to_string();
+    }
     let n: u64 = match value {
         Value::UInt(v) => *v,
         Value::Int(v) => *v as u64,
@@ -2035,6 +2069,19 @@ pub(crate) fn default_value_sql(value: &Value) -> String {
             literal.push('\'');
             literal
         }
+        Value::Timestamp(micros) if *micros != crate::types::ZERO_DATETIME => {
+            let offset = i64::from(crate::engine::expr::session_time_offset_seconds_at(
+                micros.div_euclid(1_000_000),
+            ));
+            escape_sql_string_literal(&value_to_string(&Value::DateTime(
+                micros.saturating_add(offset.saturating_mul(1_000_000)),
+            )))
+        }
+        Value::Date(_)
+        | Value::Time(_)
+        | Value::DateTime(_)
+        | Value::Timestamp(_)
+        | Value::Vector(_) => escape_sql_string_literal(&value_to_string(value)),
         other => value_to_string(other),
     }
 }
@@ -2108,6 +2155,31 @@ fn column_charset_collate_sql(
     out
 }
 
+fn portable_ddl_expr(expr: &Expr) -> String {
+    struct Escape;
+    impl crate::parser::visit::AstVisitorMut for Escape {
+        fn enter_expr(&mut self, expr: &mut Expr) {
+            if let Expr::Literal(crate::parser::Literal::String(text)) = expr {
+                if text.chars().any(|c| c == '\\' || c.is_control()) {
+                    *expr = Expr::Function {
+                        name: "CONVERT_USING".to_string(),
+                        args: vec![
+                            Expr::Literal(crate::parser::Literal::HexBytes(
+                                text.as_bytes().to_vec(),
+                            )),
+                            Expr::Literal(crate::parser::Literal::String("utf8mb4".to_string())),
+                        ],
+                        distinct: false,
+                    };
+                }
+            }
+        }
+    }
+    let mut expr = expr.clone();
+    crate::parser::visit::visit_expr_mut(&mut Escape, &mut expr);
+    crate::parser::expr_to_sql(&expr)
+}
+
 /// Canonical `CREATE TABLE` text for a resolved schema, with no runtime
 /// AUTO_INCREMENT counter. Used to synthesize the DDL event that a
 /// row-based CTAS must write to the binlog *before* its row events, so a
@@ -2125,13 +2197,12 @@ fn create_table_sql_with_auto_increment(
     let mut defs = table
         .iter_visible_columns()
         .map(|(_, column)| {
-            let type_name =
-                mysql_type_name_with_attrs(&column.data_type, column.unsigned, column.zerofill);
+            let type_name = mysql_column_type_name(column);
             let generated_part = column.generated_expr.as_ref().map(|expr| {
                 let expr = column
                     .generated_expr_ast
                     .as_ref()
-                    .map(crate::parser::expr_to_sql)
+                    .map(portable_ddl_expr)
                     .unwrap_or_else(|| expr.clone());
                 format!(
                     " GENERATED ALWAYS AS ({expr}) {}",
@@ -2235,15 +2306,35 @@ fn create_table_sql_with_auto_increment(
         })
         .collect::<Vec<_>>();
     if !table.primary_key.is_empty() {
-        defs.push(format!(
-            "  PRIMARY KEY ({})",
-            table
-                .primary_key
-                .iter()
-                .map(|col| quoted_identifier(col))
-                .collect::<Vec<_>>()
-                .join(", ")
-        ));
+        let primary = table.iter_public_indexes().find(|index| index.primary);
+        let columns = table
+            .primary_key
+            .iter()
+            .enumerate()
+            .map(|(pos, name)| {
+                let name = table
+                    .column_index(name)
+                    .ok()
+                    .map(|i| table.columns[i].name.as_str())
+                    .unwrap_or(name);
+                let prefix = primary
+                    .and_then(|index| index.column_prefix_lengths.get(pos))
+                    .copied()
+                    .flatten()
+                    .map(|length| format!("({length})"))
+                    .unwrap_or_default();
+                let direction = if primary
+                    .is_some_and(|index| index.column_direction(pos) == IndexColumnDirection::Desc)
+                {
+                    " DESC"
+                } else {
+                    ""
+                };
+                format!("{}{prefix}{direction}", quoted_identifier(name))
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        defs.push(format!("  PRIMARY KEY ({columns})"));
     }
     // Building indexes are omitted from SHOW CREATE TABLE: the index
     // is not yet queryable so surfacing it in DDL output would
@@ -2305,7 +2396,16 @@ fn create_table_sql_with_auto_increment(
                         .column_prefix_len(pos)
                         .map(|len| format!("({len})"))
                         .unwrap_or_default();
-                    Ok(format!("{}{prefix}{direction}", quoted_identifier(col)))
+                    Ok(format!(
+                        "{}{prefix}{direction}",
+                        quoted_identifier(
+                            table
+                                .column_index(col)
+                                .ok()
+                                .map(|i| table.columns[i].name.as_str())
+                                .unwrap_or(col)
+                        )
+                    ))
                 }
             })
             .collect::<Result<Vec<_>, QueryError>>()?
@@ -2357,7 +2457,7 @@ fn create_table_sql_with_auto_increment(
             check
                 .expr_ast
                 .as_ref()
-                .map(crate::parser::expr_to_sql)
+                .map(portable_ddl_expr)
                 .unwrap_or_else(|| check.expr.clone()),
             if check.enforced { "" } else { " NOT ENFORCED" }
         ));

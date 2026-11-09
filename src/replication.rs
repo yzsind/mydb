@@ -61,6 +61,7 @@ pub(crate) fn apply_is_idempotent() -> bool {
     SLAVE_EXEC_MODE.load(Ordering::Relaxed) == 1 || RECOVERY_IDEMPOTENT.with(|c| c.get())
 }
 
+#[cfg(test)]
 fn with_recovery_idempotent<T>(f: impl FnOnce() -> T) -> T {
     crate::util::scoped_cell::with_value(&RECOVERY_IDEMPOTENT, true, f)
 }
@@ -1326,6 +1327,9 @@ impl ReplicationManager {
         self.engine
             .database_for_replication()
             .set_replication_property(&replication_property_key("ddl", channel, b""), None)?;
+        self.engine
+            .database_for_replication()
+            .set_replication_property(&replication_property_key("rows", channel, b""), None)?;
         {
             let cfg = runtime
                 .config
@@ -2288,7 +2292,7 @@ impl ChannelRunner {
                         });
                         Ok(None)
                     } else {
-                        self.prepare_row_records(ops, gtid.as_deref())
+                        self.prepare_row_records_at_boundary(ops, gtid.as_deref(), &record)
                     };
                     let commit = match commit_result {
                         Ok(commit) => commit,
@@ -2407,7 +2411,10 @@ impl ChannelRunner {
         let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
         let logical_apply_lease = logical_gate.read_arc();
         let txn = db.begin_txn()?;
-        let result = with_replication_applier(|| apply_ops_to_storage(&self.engine, db, txn, &ops));
+        let result = with_replication_applier(|| {
+            apply_ops_to_storage(&self.engine, db, txn, &ops)?;
+            write_current_row_receipt(db, txn)
+        });
         match result {
             Ok(()) => db.commit_txn_deferred(txn.txn_id).map(|mut commit| {
                 commit.logical_apply_lease = Some(logical_apply_lease);
@@ -3895,7 +3902,10 @@ impl ChannelRunner {
             .collect::<Result<Vec<_>, _>>()?;
         let db = self.engine.database_for_replication();
         let txn = db.begin_txn()?;
-        let result = with_replication_applier(|| apply_ops_to_storage(&self.engine, db, txn, &ops));
+        let result = with_replication_applier(|| {
+            apply_ops_to_storage(&self.engine, db, txn, &ops)?;
+            write_current_row_receipt(db, txn)
+        });
         match result {
             Ok(()) => {
                 db.commit_txn(txn.txn_id)?;
@@ -3930,12 +3940,28 @@ impl ChannelRunner {
             .lock()
             .map_err(|_| relay_lock_error())?
             .durable_offset;
-        // Crash-recovery replay may re-apply a transaction that committed to
-        // storage but whose progress was not yet persisted (or an anonymous
-        // transaction with no GTID to dedup). Force idempotent apply so such
-        // a re-apply is a silent skip instead of a STRICT 1062/1032 that
-        // would wedge recovery.
-        with_recovery_idempotent(|| self.sql_apply_available(len))
+        // Only a receipt committed atomically with row events proves replay.
+        // STRICT failures have no receipt and must fail again after restart.
+        let key = replication_property_key("rows", &self.status_snapshot().channel, b"");
+        let recovered: Option<(String, u64)> = self
+            .engine
+            .database_for_replication()
+            .replication_property(&key)?
+            .map(|value| {
+                serde_json::from_str(&value)
+                    .map_err(|err| io_error("decode row apply receipt", std::io::Error::other(err)))
+            })
+            .transpose()?;
+        struct Guard(Option<(String, u64)>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                RECOVERED_ROW_RECEIPT.with(|slot| {
+                    slot.replace(self.0.take());
+                });
+            }
+        }
+        let _guard = Guard(RECOVERED_ROW_RECEIPT.with(|slot| slot.replace(recovered)));
+        self.sql_apply_available(len)
     }
 
     fn thread_error(err: &QueryError) -> ReplThreadError {
@@ -9586,6 +9612,176 @@ mod tests {
         assert_eq!(persisted.status.relay_log_pos, 91);
         assert_eq!(persisted.status.exec_source_log_pos, 180);
         assert_eq!(persisted.status.source_log_pos, 180);
+    }
+
+    #[test]
+    fn txn_audit_ctas_row_receipt_prevents_strict_duplicate_replay() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let (runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        runner
+            .append_relay(
+                "bin.000001",
+                100,
+                None,
+                &RelayOp::Ddl {
+                    database: "test".into(),
+                    sql: "CREATE TABLE t(id INT PRIMARY KEY)".into(),
+                    session: Default::default(),
+                    transactional: true,
+                    source_ts: 0,
+                },
+            )
+            .unwrap();
+        runner
+            .append_relay(
+                "bin.000001",
+                120,
+                None,
+                &RelayOp::WriteRows {
+                    database: "test".into(),
+                    table: "t".into(),
+                    rows: vec![vec![Value::Int(1)]],
+                },
+            )
+            .unwrap();
+        runner
+            .io_commit_txn(
+                "bin.000001",
+                180,
+                &mut TxnBuffer {
+                    event_count: 2,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let durable = runtime.relay_gate.lock().unwrap().durable_offset;
+        runner.sql_apply_available(durable).unwrap();
+        runtime.status.lock().unwrap().relay_log_pos = 0;
+        runner.replay_relay_tail().unwrap();
+        let QueryResponse::ResultSet(result) = engine
+            .execute("SELECT * FROM t")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+        assert_eq!(runtime.status.lock().unwrap().exec_source_log_pos, 180);
+    }
+
+    #[test]
+    fn txn_audit_strict_relay_replay_never_skips_a_failed_transaction() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE t(id INT PRIMARY KEY,v INT)")
+            .unwrap();
+        engine.execute("INSERT INTO t VALUES(1,10)").unwrap();
+        let (runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        runner
+            .append_relay(
+                "bin.000001",
+                120,
+                None,
+                &RelayOp::WriteRows {
+                    database: "test".into(),
+                    table: "t".into(),
+                    rows: vec![
+                        vec![Value::Int(2), Value::Int(20)],
+                        vec![Value::Int(1), Value::Int(99)],
+                    ],
+                },
+            )
+            .unwrap();
+        runner
+            .io_commit_txn(
+                "bin.000001",
+                180,
+                &mut TxnBuffer {
+                    event_count: 1,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let durable = runtime.relay_gate.lock().unwrap().durable_offset;
+        assert_eq!(
+            runner.sql_apply_available(durable).unwrap_err().code(),
+            1062
+        );
+        for _ in 0..2 {
+            assert_eq!(runner.replay_relay_tail().unwrap_err().code(), 1062);
+            assert_eq!(runtime.status.lock().unwrap().relay_log_pos, 0);
+            let QueryResponse::ResultSet(result) = engine
+                .execute("SELECT * FROM t")
+                .unwrap()
+                .materialize()
+                .unwrap()
+            else {
+                panic!("expected rows")
+            };
+            assert_eq!(result.rows, vec![vec![Value::Int(1), Value::Int(10)]]);
+        }
+    }
+
+    #[test]
+    fn txn_audit_anonymous_relay_receipt_survives_stale_cursor_and_reopen() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        {
+            let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+            engine
+                .execute("CREATE TABLE t(id INT PRIMARY KEY,v INT)")
+                .unwrap();
+            engine.execute("INSERT INTO t VALUES(1,10)").unwrap();
+            let (runtime, runner) = make_split_runner(dir.path(), engine.clone());
+            runner
+                .append_relay(
+                    "bin.000001",
+                    120,
+                    None,
+                    &RelayOp::UpdateRows {
+                        database: "test".into(),
+                        table: "t".into(),
+                        rows: vec![RowUpdate {
+                            before: vec![Value::Int(1), Value::Int(10)],
+                            after: vec![Value::Int(1), Value::Int(11)],
+                        }],
+                    },
+                )
+                .unwrap();
+            runner
+                .io_commit_txn(
+                    "bin.000001",
+                    180,
+                    &mut TxnBuffer {
+                        event_count: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            let durable = runtime.relay_gate.lock().unwrap().durable_offset;
+            runner.sql_apply_available(durable).unwrap();
+            // Model a crash after data commit but before channel cursor fsync.
+        }
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let (runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        runtime.relay_gate.lock().unwrap().durable_offset =
+            truncate_relay_to_last_commit(&relay_log_path(dir.path(), DEFAULT_CHANNEL)).unwrap();
+        runner.replay_relay_tail().unwrap();
+        let QueryResponse::ResultSet(result) = engine
+            .execute("SELECT * FROM t")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(1), Value::Int(11)]]);
+        assert_eq!(runtime.status.lock().unwrap().exec_source_log_pos, 180);
     }
 
     #[test]

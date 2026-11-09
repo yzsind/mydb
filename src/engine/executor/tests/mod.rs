@@ -11,10 +11,14 @@ mod http;
 mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;
+mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;
+mod routine_handler_continuation;
+mod routines_views_triggers_events_1109;
 mod sql_execution_audit_1015;
 mod sql_execution_audit_1027;
+mod sql_execution_audit_1108;
 mod sql_execution_fixes;
 mod subquery_scope_audit;
 mod support;
@@ -22,6 +26,7 @@ mod table_ddl_audit_1012;
 mod table_ddl_audit_1027;
 mod tablesample;
 mod temporal_comparison_consistency;
+mod txn_acid_audit_1108;
 
 use super::*;
 use crate::parser::Assignment;
@@ -544,3 +549,7 @@ mod release_audit_1101;
 mod xml_functions;
 
 mod audit_fixes_1106;
+
+mod table_ddl_audit_1108;
+
+mod exec_optimizer_audit_1108;

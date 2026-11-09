@@ -16,6 +16,10 @@ Shows the current MySQL row binlog file, position, and GTID state; SHOW MASTER S
 - The default build can already serve as a binlog source; an active file status exists only after binlog is enabled/initialized.
 - Returns compatibility columns such as File, Position, Binlog_Do_DB, Binlog_Ignore_DB, and Executed_Gtid_Set.
 
+## Privileges, Results, and Operational Details
+
+Requires REPLICATION CLIENT. All five columns and types are in [status fields](status-fields.md#binlog-and-relay-event-listings). Disabled logging returns 1235 rather than a guaranteed empty status. File/position and Executed_Gtid_Set describe logical source history, not a native WAL backup receipt. The deprecated alias emits a diagnostic.
+
 ## Examples
 
 ```sql

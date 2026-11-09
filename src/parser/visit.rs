@@ -741,7 +741,14 @@ pub(crate) fn try_inspect_value_expr<E>(
 pub(crate) fn value_expr_contains_subquery(expr: &Expr) -> bool {
     if matches!(
         expr,
-        Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
+        Expr::Literal(_)
+            | Expr::BoundValue(_)
+            | Expr::Placeholder(_)
+            | Expr::Identifier(_)
+            | Expr::CompoundIdentifier(_)
+            | Expr::SystemVariable { .. }
+            | Expr::UserVariable(_)
+            | Expr::Wildcard
     ) {
         return false;
     }

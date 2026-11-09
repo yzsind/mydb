@@ -75,6 +75,7 @@ struct PrefixPartitions<'a> {
     plan: &'a PhysicalPlan,
     partition_columns: Vec<usize>,
     argument_columns: Vec<Option<usize>>,
+    temporal_scales: Vec<Option<u8>>,
     states: Vec<WindowPrefixState>,
     previous_key: Vec<u8>,
     key: Vec<u8>,
@@ -157,16 +158,25 @@ impl BatchOperator for PrefixPartitions<'_> {
             self.partition_rows += 1;
             self.peak_partition_rows = self.peak_partition_rows.max(self.partition_rows);
             self.total_rows += 1;
-            for ((state, argument), values) in self
+            for (((state, argument), scale), values) in self
                 .states
                 .iter_mut()
                 .zip(&self.argument_columns)
+                .zip(&self.temporal_scales)
                 .zip(&mut values)
             {
                 state.update(
                     argument.map_or(Value::Null, |column| batch.columns()[column].value_at(row)),
                 )?;
-                values.push(state.value());
+                let value = state.value();
+                values.push(match scale {
+                    Some(scale) => {
+                        crate::engine::executor::select::aggregate::exact_aggregate_value_at_scale(
+                            value, *scale,
+                        )
+                    }
+                    None => value,
+                });
             }
         }
         let indices = indices.iter().map(|&row| row as u32).collect::<Vec<_>>();
@@ -305,6 +315,34 @@ fn prepare_sorted_prefix<'a>(
         argument_columns: windows
             .iter()
             .map(|window| expr_column_index_in_template(&window.args[0], template))
+            .collect(),
+        temporal_scales: windows
+            .iter()
+            .map(|window| {
+                let column = window
+                    .args
+                    .first()
+                    .and_then(|arg| expr_column_index_in_template(arg, template))?;
+                if !matches!(
+                    template[column].column_type,
+                    ColumnType::Date
+                        | ColumnType::Time
+                        | ColumnType::DateTime
+                        | ColumnType::Timestamp
+                        | ColumnType::Year
+                ) {
+                    return None;
+                }
+                if !(window.name.eq_ignore_ascii_case("SUM")
+                    || window.name.eq_ignore_ascii_case("AVG"))
+                {
+                    return None;
+                }
+                match window.output_type {
+                    ColumnType::Decimal { scale, .. } => Some(scale),
+                    _ => None,
+                }
+            })
             .collect(),
         states: windows
             .iter()
@@ -839,6 +877,7 @@ mod tests {
                 }],
                 partition_by: vec![Expr::Identifier("g".into())],
                 order_by: vec![crate::parser::OrderBy {
+                    names_bound: false,
                     expr: Expr::Identifier("t".into()),
                     asc: true,
                     nulls_first: Some(false),

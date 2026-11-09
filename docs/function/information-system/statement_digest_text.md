@@ -14,11 +14,11 @@ STATEMENT_DIGEST_TEXT(sql_text)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `sql_text` | Yes | String | The 1st argument; the SQL text to normalize or format |
+| `sql_text` | Yes | String | SQL text to parse, normalize, or format. |
 
 ## Return Value
 
-Returns the normalized digest text of SQL text. The return type is determined by the function semantics and the input type.
+Returns normalized SQL digest text, replacing values with markers according to the parser's digest rules. SQL NULL returns NULL. Invalid SQL or multiple statements are rejected; the function does not execute the statement.
 
 ## Examples
 
@@ -26,12 +26,16 @@ Returns the normalized digest text of SQL text. The return type is determined by
 SELECT STATEMENT_DIGEST_TEXT('SELECT 1');
 ```
 
-Result: returns the normalized SQL digest text.
+Result:
+
+```text
+SELECT ?
+```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`FORMAT_STATEMENT`](format_statement.md), [`STATEMENT_DIGEST`](statement_digest.md), [`SYS_GET_CONFIG`](sys_get_config.md).

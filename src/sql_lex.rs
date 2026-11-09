@@ -226,10 +226,37 @@ impl Iterator for SqlSegments<'_> {
 
         if b == b'/' && self.bytes.get(start + 1) == Some(&b'*') {
             let mut close = start + 2;
-            while close + 1 < self.bytes.len()
-                && !(self.bytes[close] == b'*' && self.bytes[close + 1] == b'/')
-            {
-                close += 1;
+            let executable = self.bytes.get(start + 2) == Some(&b'!');
+            let active = executable
+                && parse_gate(&self.bytes[start + 3..])
+                    .0
+                    .is_none_or(|version| version <= self.server_version);
+            while close + 1 < self.bytes.len() {
+                if self.bytes[close] == b'*' && self.bytes[close + 1] == b'/' {
+                    break;
+                }
+                if active && matches!(self.bytes[close], b'\'' | b'"' | b'`') {
+                    let quote = self.bytes[close];
+                    let escapes = quote != b'`'
+                        && !(quote == b'"' && self.mode.ansi_quotes)
+                        && !self.mode.no_backslash_escapes;
+                    close += 1;
+                    while close < self.bytes.len() {
+                        if escapes && self.bytes[close] == b'\\' {
+                            close = (close + 2).min(self.bytes.len());
+                        } else if self.bytes[close] == quote {
+                            close += 1;
+                            if self.bytes.get(close) != Some(&quote) {
+                                break;
+                            }
+                            close += 1;
+                        } else {
+                            close += 1;
+                        }
+                    }
+                } else {
+                    close += 1;
+                }
             }
             if close + 1 >= self.bytes.len() {
                 self.pos = self.bytes.len();
@@ -305,7 +332,7 @@ impl<'a> PreparedSql<'a> {
                 && sql
                     .as_bytes()
                     .get(segment.range.start + 2)
-                    .is_some_and(|b| b.is_ascii_control() && !b.is_ascii_whitespace())
+                    .is_none_or(|b| b.is_ascii_control() && !b.is_ascii_whitespace())
             {
                 executable.push(segment);
             } else if matches!(segment.kind, SqlSegmentKind::ExecutableComment { .. }) {

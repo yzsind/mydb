@@ -14,12 +14,12 @@ ST_Y(geometry [, new_value])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `geometry` | Yes | POINT or GEOMETRY | The geometry to read or modify |
-| `new_value` | No | Numeric value or SRID | When provided, returns the modified geometry |
+| `geometry` | Yes | POINT | Point to inspect/modify; longitude/latitude accessors require a geographic SRS. |
+| `new_value` | No | Finite numeric coordinate | New coordinate; setter returns a GEOMETRY rather than a number. |
 
 ## Return Value
 
-Returns a numeric value; returns `NULL` when the spatial input is `NULL`. Setter overloads return the modified geometry.
+With one argument, returns the Y coordinate as DOUBLE; with two, returns a modified POINT GEOMETRY. SQL NULL input returns NULL. Geometry type, geographic-coordinate ranges and SRS requirements are validated.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 2
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_X`](st_x.md), [`ST_LATITUDE`](st_latitude.md), [`ST_LONGITUDE`](st_longitude.md), [`ST_SRID`](st_srid.md).

@@ -163,7 +163,7 @@ pub(crate) fn register(reg: &mut Registry) {
             "innodb_lock_wait_timeout",
             Scope::Both,
             DataType::UInt {
-                min: 1,
+                min: 0,
                 max: 1_073_741_824,
             },
         )
@@ -177,7 +177,7 @@ pub(crate) fn register(reg: &mut Registry) {
             _ => SysVarValue::UInt(crate::engine::api::global_innodb_lock_wait_timeout()),
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            let secs = v.as_u64().unwrap_or(50).clamp(1, 1_073_741_824);
+            let secs = v.as_u64().unwrap_or(50).min(1_073_741_824);
             match ctx.scope {
                 Scope::Global => crate::engine::api::set_global_innodb_lock_wait_timeout(secs),
                 _ => ctx.session.sysvars.innodb_lock_wait_timeout = Some(secs),
@@ -193,7 +193,7 @@ pub(crate) fn register(reg: &mut Registry) {
             "lock_wait_timeout",
             Scope::Both,
             DataType::UInt {
-                min: 1,
+                min: 0,
                 max: 31_536_000,
             },
         )
@@ -207,7 +207,7 @@ pub(crate) fn register(reg: &mut Registry) {
             _ => SysVarValue::UInt(crate::engine::api::global_lock_wait_timeout()),
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            let secs = v.as_u64().unwrap_or(31_536_000).clamp(1, 31_536_000);
+            let secs = v.as_u64().unwrap_or(31_536_000).min(31_536_000);
             match ctx.scope {
                 Scope::Global => crate::engine::api::set_global_lock_wait_timeout(secs),
                 _ => ctx.session.sysvars.lock_wait_timeout = Some(secs),

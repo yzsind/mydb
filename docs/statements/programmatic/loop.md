@@ -14,8 +14,12 @@ Repeats statements unconditionally; typically exited with LEAVE.
 
 ## Behavior and Limitations
 
-- Must be terminated by LEAVE, RETURN, a handler, or an error; otherwise it runs forever.
+- Has no natural completion condition. LEAVE, RETURN, a handler, an error or query cancellation must end execution.
 - ITERATE can jump to the next iteration.
+
+## Context, Errors, and Lifecycle
+
+The body has no implicit exit condition. Use an initialized flag/counter or cursor NOT FOUND handler and a visible label; query cancellation can still end a running loop. The fetch-loop snippet assumes DECLARE/OPEN and a handler; [the complete example](../examples.md#complete-stored-cursor-example) includes setup and cleanup.
 
 ## Examples
 

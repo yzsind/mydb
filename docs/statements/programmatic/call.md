@@ -17,6 +17,12 @@ Invokes a stored procedure with IN/OUT/INOUT arguments and may return multiple r
 - Each SELECT inside the procedure can produce a result set; binary prepared OUT results set SERVER_PS_OUT_PARAMS.
 - Argument count, modes, types, the EXECUTE privilege, and definer/invoker privileges are validated before the call.
 
+## Context, Errors, and Lifecycle
+
+Requires EXECUTE on the procedure; body objects are checked under saved DEFINER/INVOKER security. OUT/INOUT targets must be writable variables/parameters of the execution context. Argument conversion can fail before or during execution; a scalar expression is not an OUT destination.
+
+A procedure can emit several SELECT result sets and a final status. Clients must consume all results, including prepared OUT-parameter results. CALL is not automatically one atomic business transaction: a procedure's successful earlier work or explicit COMMIT can remain after a later error. Use the [caller transaction example](../examples.md#explicit-transaction-around-a-procedure) when the business operation requires grouping.
+
 ## Examples
 
 ```sql

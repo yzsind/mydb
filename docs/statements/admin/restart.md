@@ -17,6 +17,10 @@ Requests a controlled shutdown followed by relaunching the same server executabl
 - `MYDB_RESTART_DISABLE=1`, an unsupported platform, or an unavailable executable returns 3707 before shutdown begins. Use SHUTDOWN and the supervisor's restart procedure when process replacement is managed externally.
 - A failed final checkpoint or shutdown drain prevents relaunch and makes the process exit nonzero. An SQL OK acknowledges the request; verify completion in the server logs and reconnect afterward. See [configuration](../../configuration.md#shutdown-corruption-recovery-and-replication-initialization).
 
+## Privileges, Transaction, and Result Details
+
+The request returns OK before draining/checkpoint/relaunch completes. Reconnect and inspect logs to distinguish request acceptance from successful replacement. Supervisor-managed services can use SHUTDOWN plus their own restart procedure; do not race a second launcher against the data-directory lock. A prepared XA branch remains a recovery responsibility after restart.
+
 ## Examples
 
 ```sql

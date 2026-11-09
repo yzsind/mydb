@@ -13,6 +13,7 @@ fn evaluate(name: &str, values: &[Value], frame: WindowFrame, ordered: bool) -> 
             partition_by: Vec::new(),
             order_by: if ordered {
                 vec![OrderBy {
+                    names_bound: false,
                     expr: Expr::Identifier("id".into()),
                     asc: true,
                     nulls_first: None,

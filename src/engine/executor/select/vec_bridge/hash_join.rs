@@ -2483,11 +2483,28 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         &probe_key_idx,
     )?;
 
-    let full_output_template = if build_is_left {
+    let mut full_output_template = if build_is_left {
         concat_templates(&build_template, &probe_template)
     } else {
         concat_templates(&probe_template, &build_template)
     };
+    let right_start = if build_is_left {
+        build_template.len()
+    } else {
+        probe_template.len()
+    };
+    let mut metadata = full_output_template
+        .iter()
+        .map(|field| (*field.meta).clone())
+        .collect::<Vec<_>>();
+    super::super::plan::mark_outer_join_fields(&mut metadata, right_start, join_type);
+    full_output_template = metadata
+        .into_iter()
+        .map(|meta| PlanField {
+            meta: super::super::plan::intern_col_meta(meta),
+            value: crate::types::Value::Null,
+        })
+        .collect();
     let original_output_template = if build_is_left {
         concat_templates(&build_original_template, &probe_original_template)
     } else {

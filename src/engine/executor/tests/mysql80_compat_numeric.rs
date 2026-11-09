@@ -1494,8 +1494,9 @@ fn conditional_integer_branch_keeps_exact_division_scale() {
             )
             .unwrap(),
     );
-    assert_eq!(result[0][0].to_display_string(), "2001");
-    assert_eq!(result[0][1].to_display_string(), "2001");
+    assert_eq!(result[0][0].to_display_string(), "2001.0000");
+    // Keep the native YEAR average exact, including through NULLIF.
+    assert_eq!(result[0][1].to_display_string(), "2001.0000");
 }
 
 #[test]
@@ -2257,7 +2258,8 @@ fn bit_ignore_distinguishes_binary_width_from_numeric_range() {
             .into_iter()
             .map(|warning| warning.0)
             .collect::<Vec<_>>(),
-        vec![1406, 1406]
+        // Source-domain overflow is diagnosed as well as BIT width overflow.
+        vec![1264, 1406, 1264, 1406]
     );
     assert_eq!(
         rows(
@@ -2300,10 +2302,10 @@ fn bit_ignore_distinguishes_binary_width_from_numeric_range() {
              HEX(GROUP_CONCAT(DISTINCT b ORDER BY b)) FROM tc",
         ),
         vec![
-            Value::String("012C07".into()),
-            Value::String("01FF2C0FFE".into()),
+            Value::String("312C37".into()),
+            Value::String("3531312C34303934".into()),
         ],
-        "explicit GROUP_CONCAT ordering is deterministic and retains BIT octets"
+        "GROUP_CONCAT formats BIT fields as unsigned decimal values"
     );
 }
 

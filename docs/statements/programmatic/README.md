@@ -13,6 +13,18 @@
 | Control flow | [IF](if.md) · [CASE](case.md) · [LOOP](loop.md) · [WHILE](while.md) · [REPEAT](repeat.md) · [LEAVE](leave.md) · [ITERATE](iterate.md) · [RETURN](return.md) |
 | Routine cursors | [OPEN](open.md) · [FETCH](fetch.md) · [CLOSE](close.md) |
 | Conditions and diagnostics | [SIGNAL](signal.md) · [RESIGNAL](resignal.md) · [GET DIAGNOSTICS](get-diagnostics.md) |
-| Client compatibility | [DELIMITER](delimiter.md) |
+| Client directive (not server SQL) | [DELIMITER](delimiter.md) |
 
 Routine bodies may also execute ordinary SELECT, DML, CALL, and permitted transaction statements; these statements follow the privilege, transaction, and error semantics documented in their own pages.
+
+## Execution Contexts
+
+| Context | Supported use and boundary |
+| --- | --- |
+| Top-level SQL | CALL, SQL PREPARE/EXECUTE/DEALLOCATE, session SQL cursors, and GET DIAGNOSTICS with @variable targets |
+| Stored procedure | Local blocks/variables/handlers/cursors, SQL and result sets; permitted transaction commands affect the caller's transaction |
+| Stored function / trigger | Executes within the owning statement; no arbitrary result sets, transaction boundaries, or dynamic SQL |
+| Event | Scheduled body executes with definer privileges; scheduler state controls eligibility |
+| Client script | DELIMITER controls local splitting and must not be sent to the server |
+
+GET CURRENT DIAGNOSTICS can execute at top level as well as in a routine; GET STACKED DIAGNOSTICS needs an active handler. DECLARE/IF/LOOP snippets on inner-statement pages require a surrounding definition. See [complete cursor and transaction examples](../examples.md) and [execution contracts](../execution-contracts.md).

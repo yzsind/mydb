@@ -19,7 +19,7 @@ DATE_SUB(date, INTERVAL expr unit)
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns the temporal value after interval subtraction. A date-only value with a calendar-date interval can remain a DATE; time-bearing units require a time/datetime result. Month arithmetic clamps an unavailable day to the last day of the target month. Invalid/overflowing results produce temporal diagnostics. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -31,7 +31,9 @@ Result: 2026-08-29
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [interval units](README.md#interval-units) for supported units, compound values, and operator restrictions.
 
 ## Related Functions
 

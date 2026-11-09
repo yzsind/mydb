@@ -15,8 +15,12 @@ Drops one or more view definitions.
 ## Behavior and Limitations
 
 - Drops only the view, not the underlying tables or data.
-- Missing objects produce an error or a Note depending on IF EXISTS; dependent views are validated per the current DROP behavior.
+- Missing objects produce an error or a Note depending on IF EXISTS. RESTRICT and CASCADE are currently accepted compatibility spellings with no distinct execution effect: dependent views are not dropped and can become invalid, reporting 1356 when queried. Do not rely on CASCADE for dependency cleanup.
 - Acquires the view metadata lock and invalidates dependent plans.
+
+## Privileges, Transactions, and Dependencies
+
+Requires DROP on each view. Persistent DROP implicitly commits preceding DML and atomically validates the multi-object catalog change. Only view definitions are removed, never base rows. Dependents can remain present but invalid (1356); explicitly drop dependent views if that is intended. RESTRICT/CASCADE does not choose a different dependency algorithm in the current implementation.
 
 ## Examples
 

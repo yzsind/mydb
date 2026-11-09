@@ -19,19 +19,24 @@ FROM_UNIXTIME(unix_timestamp [, format])
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Without format, returns a DATETIME in the session time zone; with format, returns formatted text. Fractional Unix seconds preserve up to six digits. Negative/out-of-range input returns NULL; see the extended upper bound below. SQL NULL in a required input returns NULL.
 
 ## Examples
 
 ```sql
-SELECT FROM_UNIXTIME(0);
+SET SESSION time_zone='+00:00';
+SELECT FROM_UNIXTIME(0), FROM_UNIXTIME(0,'%Y-%m-%d');
 ```
 
-Result: returns the Unix epoch as a datetime in the session time zone.
+Result:
+
+```text
+1970-01-01 00:00:00	1970-01-01
+```
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 - mydb accepts Unix seconds from zero through `253402300799.999999`.
   Use exact decimal or text input to preserve microseconds near year 9999.
   Rounding into year 10000, or a session time-zone conversion beyond calendar
@@ -39,4 +44,4 @@ Result: returns the Unix epoch as a datetime in the session time zone.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`UNIX_TIMESTAMP`](unix_timestamp.md), [`CONVERT_TZ`](convert_tz.md).

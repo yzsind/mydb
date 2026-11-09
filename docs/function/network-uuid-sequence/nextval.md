@@ -14,11 +14,11 @@ NEXTVAL(sequence_name)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `sequence_name` | Yes | String | The 1st argument; the sequence name |
+| `sequence_name` | Yes | String | Sequence name, optionally database-qualified. |
 
 ## Return Value
 
-Obtains and advances the next value of the specified sequence. The return type is determined by the function semantics and the input type.
+Returns a signed BIGINT allocated from the sequence, advances the counter and records the session CURRVAL/LASTVAL state. Allocation is nontransactional; rollback does not return a value to the sequence.
 
 ## Examples
 
@@ -33,9 +33,11 @@ Result: NEXTVAL returns 1 and advances the sequence; the final statement cleans 
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 - Requires a sequence created in advance in the current database, called from a statement with database and session context; the call reads or changes session/sequence state.
+
+- See [sequence state and transactions](README.md#sequence-state-and-transactions) and [Sequences](../../sequences.md) for privileges, session caches, rollback gaps and durability.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`CURRVAL`](currval.md), [`LASTVAL`](lastval.md), [`SETVAL`](setval.md).

@@ -55,9 +55,30 @@ fn cached_limit_validation_rejects_invalid_rebinding() {
         &[Value::Int(1), Value::Int(1)],
         VecMode::Auto,
     );
+    for mode in [VecMode::Auto, VecMode::On] {
+        for limit in [Value::String("2".into()), Value::Bytes(b"2".to_vec())] {
+            assert_eq!(
+                execute(
+                    &engine,
+                    &mut session,
+                    &mut state,
+                    &parsed,
+                    sql,
+                    &[Value::Int(1), limit],
+                    mode,
+                )
+                .rows,
+                vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+            );
+        }
+    }
     for (limit, expected_code) in [
         (Value::Int(-1), 1690),
         (Value::String("invalid".into()), 1210),
+        (Value::Bytes(b"invalid".to_vec()), 1210),
+        (Value::String("".into()), 1210),
+        (Value::String("2abc".into()), 1210),
+        (Value::Double(2.0), 1210),
     ] {
         let params = [Value::Int(1), limit];
         let mut codes = Vec::new();

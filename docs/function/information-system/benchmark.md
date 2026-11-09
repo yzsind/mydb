@@ -14,12 +14,12 @@ BENCHMARK(count, expr)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `count` | Yes | Integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `expr` | Yes | Any SQL expression | The 2nd argument; the expression to evaluate |
+| `count` | Yes | Integer | Repetition count. |
+| `expr` | Yes | Any SQL expression | Expression to evaluate. |
 
 ## Return Value
 
-Repeatedly evaluates an expression a specified number of times and returns 0; used for microbenchmarks. The return type is determined by the function semantics and the input type.
+Returns integer 0 after count evaluations of expr. A SQL NULL count returns NULL; a negative count returns NULL with warning 1411. A zero count performs no expr evaluations. Expression errors and cancellation propagate.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: 0
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SLEEP`](sleep.md), [`LOAD_FILE`](load_file.md), [`MYSQL_QUERY_ATTRIBUTE_STRING`](mysql_query_attribute_string.md).

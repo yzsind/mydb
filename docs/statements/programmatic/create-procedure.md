@@ -30,6 +30,12 @@ Creates or replaces a stored procedure and saves its parameters, characteristics
 - The new definition is validated and compiled before catalog replacement; validation or authorization failure leaves the existing definition available. Replacement uses exclusive routine metadata locking and the normal DDL implicit-commit rules; subsequent calls and prepared calls use the new definition.
 - OR REPLACE cannot be combined with IF NOT EXISTS. Built-in sys procedures cannot be replaced.
 
+## Context, Errors, and Lifecycle
+
+Requires CREATE ROUTINE on the schema. It implicitly commits preceding DML. The body captures SQL mode/character-set metadata; DEFINER/INVOKER controls execution identity, and EXECUTE on the procedure is checked at CALL. Automatic routine privileges follow automatic_sp_privileges.
+
+Procedure recursion is bounded by max_sp_recursion_depth; recursive functions are forbidden. OUT/INOUT values are converted to declared types when assigned. The transfer example assumes a caller-provided business transaction if both updates must succeed together; CALL itself does not add that transaction. See [caller transaction](../examples.md#explicit-transaction-around-a-procedure).
+
 ## Examples
 
 ```sql

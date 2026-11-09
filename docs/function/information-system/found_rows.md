@@ -35,8 +35,10 @@ Result:
 ## Notes
 
 - The result depends on the current session, server state, execution time, privileges, or the external environment; do not treat it as a constant reusable across statements.
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
+
+- SQL_CALC_FOUND_ROWS measures rows before LIMIT; an ordinary SELECT tracks delivered rows. Read the value before another statement overwrites session state; it is not an independent snapshot or a replacement for an explicit COUNT query.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ROW_COUNT`](row_count.md), [`LAST_INSERT_ID`](last_insert_id.md).

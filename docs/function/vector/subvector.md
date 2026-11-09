@@ -25,7 +25,7 @@ Returns a VECTOR with the input datatype; returns `NULL` when any argument is `N
 ## Examples
 
 ```sql
-SELECT SUBVECTOR(STRING_TO_VECTOR('[1,2]'), 1, 2);
+SELECT VECTOR_TO_STRING(SUBVECTOR(STRING_TO_VECTOR('[1,2]'), 1, 2));
 ```
 
 Result:
@@ -44,4 +44,4 @@ Result:
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`VECTOR_NORM`](vector_norm.md), [`L2_NORMALIZE`](l2_normalize.md).

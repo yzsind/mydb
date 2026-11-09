@@ -15,6 +15,10 @@ Lists registered replica slots with their connection and retention state on the 
 - Returns Replica_UUID, Connected, Retention_State, Replica_Acked_LSN, Lag_LSN, and more.
 - Offline slots remain visible until DROP MYDB REPLICA.
 
+## Privileges, Results, and Operational Details
+
+Requires SYSTEM_VARIABLES_ADMIN. [All ordered fields/types](status-fields.md#show-mydb-replicas) include registration times in Unix milliseconds and LSN-based lag. Connected and Retention_State are independent: an offline Active slot can retain WAL, while Invalidated/Abandoned slots do not pin it. Ordinary ACK does not automatically revive invalidated history; an approved seed/resume boundary is required.
+
 ## Examples
 
 ```sql

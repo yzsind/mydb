@@ -349,6 +349,7 @@ fn column(name: &str, data_type: DataType) -> ColumnDef {
         data_type,
         unsigned: false,
         zerofill: false,
+        display_width: None,
         invisible: false,
         nullable: false,
         primary_key: false,

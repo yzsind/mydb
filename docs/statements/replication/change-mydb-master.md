@@ -19,6 +19,12 @@ Configures the master endpoint of a native replica.
 - A standalone node (including after RESET) switches to replica and immediately forbids new writes; when entering replica state or changing the source, reseeding is mandatory to prevent local forked data from mixing with the master's WAL. Run `START MYDB REPLICATION FORCE_RESYNC` to complete the reseed.
 - The master must use DEMOTE TO REPLICA; role switching cannot be bypassed through this command.
 
+## Privileges, Results, and Operational Details
+
+Requires global SYSTEM_VARIABLES_ADMIN. PORT is a u16 port; omission uses the configured native master_port (default 3316), not the MySQL listener port. STOP the receiver before changing endpoint. Changing a standalone/source identity persists a resync marker and replica read-only role before writes can resume. A master must use DEMOTE; this command cannot bypass a write fence or convert the old master's forked pages into a valid continuation.
+
+For a source change, run FORCE_RESYNC only after arranging transport/auth token configuration and accepting replacement of local data. Poll [native status](status-fields.md#show-mydb-replica-status); an endpoint change alone is not successful reseeding.
+
 ## Examples
 
 ```sql

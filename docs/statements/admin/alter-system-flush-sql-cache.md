@@ -16,6 +16,10 @@ Clears the statement, plan, view resolution, prepared DML (single and batch), an
 - Prepared statement definitions and user data are not deleted; subsequent executions re-parse/re-plan on demand.
 - This is for the mydb SQL cache, not the deprecated MySQL query cache commands.
 
+## Privileges, Transaction, and Result Details
+
+Requires global SYSTEM_VARIABLES_ADMIN. It does not implicitly commit the caller's transaction. An OK invalidates SQL caches, not named SQL PREPARE definitions, binary statement handles, data pages or privileges. A subsequent prepared execution revalidates dependencies as needed. SHOW MYDB MEMORY reports logical cache accounting, which can include shared allocations and delayed per-thread invalidation.
+
 ## Examples
 
 ```sql

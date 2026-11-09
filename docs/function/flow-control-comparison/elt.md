@@ -14,9 +14,9 @@ ELT(index, str1 [, str2 [, ...]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `index` | Yes | Integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `str1` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
-| `str2 ...` | No, repeatable | String | The 3rd argument; the meaning is determined by the function syntax and description |
+| `index` | Yes | Integer | One-based index into the following strings. |
+| `str1` | Yes | String | First string. |
+| `str2 ...` | No, repeatable | String | Additional strings, in argument order. |
 
 ## Return Value
 
@@ -36,8 +36,8 @@ second
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`GREATEST`](greatest.md), [`LEAST`](least.md), [`FIELD`](field.md), [`INTERVAL`](interval.md).

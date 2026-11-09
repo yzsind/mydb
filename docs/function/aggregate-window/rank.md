@@ -21,16 +21,23 @@ Returns a BIGINT rank starting at 1. Peers receive the same rank and subsequent 
 ## Examples
 
 ```sql
-SELECT v, RANK() OVER (ORDER BY v) AS result
-FROM (SELECT 10 AS v UNION ALL SELECT 20) AS t ORDER BY v;
+SELECT id,v,RANK() OVER (ORDER BY v) AS result
+FROM (SELECT 1 id,10 v UNION ALL SELECT 2,10 UNION ALL SELECT 3,20) t
+ORDER BY id;
 ```
 
-Result: returns two rows with the corresponding window values in the order of `v`.
+Result:
+
+```text
+1	10	1
+2	10	1
+3	20	3
+```
 
 ## Notes
 
-- For window-capable functions, OVER controls the partition and ordering; frame-sensitive aggregates and value functions use the selected frame. Ranking and LAG/LEAD use partition positions. The function-specific NULL and empty-input rules above apply.
+- See [window partitions and frames](README.md#window-partitions-and-frames) for defaults, peers, ordering and supported forms. Empty-input/NULL behavior follows this function's return-value rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DENSE_RANK`](dense_rank.md), [`PERCENT_RANK`](percent_rank.md), [`CUME_DIST`](cume_dist.md), [`ROW_NUMBER`](row_number.md).

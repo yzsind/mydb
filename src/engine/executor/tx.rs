@@ -383,7 +383,7 @@ pub(super) fn rollback_session_txn(
         }
     }
     session.rls.finish_transaction();
-    rollback_temp_journal_to(db, session, 0)?;
+    let temp_rollback = rollback_temp_journal_to(db, session, 0);
     if let Some(branch) = session.xa_branch.take() {
         db.release_xa(&branch.xid, branch.txn_id);
     }
@@ -416,7 +416,7 @@ pub(super) fn rollback_session_txn(
     session.next_txn_read_only = None;
     db.release_mdl_duration(session.connection_id as u64, MdlDuration::Transaction);
     session.advance_mdl_txn_generation();
-    Ok(())
+    temp_rollback
 }
 
 fn is_inactive_transaction_error(err: &QueryError) -> bool {
@@ -579,23 +579,27 @@ pub(super) fn nonlocking_select_transaction_view(
     session: &mut SessionContext,
     txn: TxnView,
 ) -> TxnView {
-    let ro_snapshot = session_read_only_snapshot(session);
     if txn.isolation.uses_repeatable_snapshot() {
-        let mut view = db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot);
-        view.connection_id = session.connection_id;
         if let Some(snapshot_scn) = session.txn_snapshot_scn {
-            view.snapshot_scn = snapshot_scn;
-        } else {
-            session.pin_transaction_snapshot(db, view.snapshot_scn);
+            return TxnView {
+                snapshot_scn,
+                ..txn
+            };
         }
-        view
-    } else if txn.isolation == IsolationLevel::ReadUncommitted {
-        let mut view = db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot);
+        let (mut view, guard) = db.session_statement_view_with_guard(
+            txn.txn_id,
+            txn.isolation,
+            session_read_only_snapshot(session),
+            session.read_only_txn,
+        );
         view.connection_id = session.connection_id;
-        view.dirty_read = true;
+        session.pin_transaction_snapshot_with_guard(view.snapshot_scn, guard);
         view
     } else {
-        txn
+        TxnView {
+            dirty_read: txn.isolation == IsolationLevel::ReadUncommitted,
+            ..txn
+        }
     }
 }
 
@@ -1409,9 +1413,11 @@ pub(super) fn execute_select_in_transaction(
             return Ok(response);
         }
         let locked_row_ids = lock_select_rows_for_update(db, txn, &stmt)?;
-        let ro_snapshot = session_read_only_snapshot(session);
         let txn = if stmt.for_update || txn.isolation == IsolationLevel::Serializable {
-            db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot)
+            TxnView {
+                snapshot_scn: u64::MAX,
+                ..txn
+            }
         } else {
             nonlocking_select_transaction_view(db, session, txn)
         };
@@ -1420,7 +1426,15 @@ pub(super) fn execute_select_in_transaction(
                 return Ok(response);
             }
         }
-        execute_select(db, txn, stmt, registry)
+        let locking = select_has_locking_read(&stmt);
+        let response = execute_select(db, txn, stmt, registry)?;
+        // Deferred subquery evaluation must acquire locks before the owning
+        // statement transaction commits, never from an already committed view.
+        if locking {
+            response.materialize_preserving_precision()
+        } else {
+            Ok(response)
+        }
     })
 }
 
@@ -1446,9 +1460,11 @@ pub(super) fn execute_select_in_transaction_borrowed(
             return Ok(response);
         }
         let locked_row_ids = lock_select_rows_for_update(db, txn, stmt)?;
-        let ro_snapshot = session_read_only_snapshot(session);
         let txn = if stmt.for_update || txn.isolation == IsolationLevel::Serializable {
-            db.session_statement_view(txn.txn_id, txn.isolation, ro_snapshot)
+            TxnView {
+                snapshot_scn: u64::MAX,
+                ..txn
+            }
         } else {
             nonlocking_select_transaction_view(db, session, txn)
         };
@@ -1457,6 +1473,11 @@ pub(super) fn execute_select_in_transaction_borrowed(
                 return Ok(response);
             }
         }
-        execute_select(db, txn, stmt.clone(), registry)
+        let response = execute_select(db, txn, stmt.clone(), registry)?;
+        if select_has_locking_read(stmt) {
+            response.materialize_preserving_precision()
+        } else {
+            Ok(response)
+        }
     })
 }

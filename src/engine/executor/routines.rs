@@ -206,9 +206,10 @@ fn check_trigger_row_qualifier(qualifier: &str) -> Result<(), QueryError> {
 pub(super) fn execute_create_routine(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    def: RoutineDef,
+    mut def: RoutineDef,
 ) -> Result<QueryResponse, QueryError> {
     super::implicit_commit_for_ddl(db, session)?;
+    bind_current_user_definer(session, &mut def.definer);
     validate_routine_def(&def)?;
     validate_binlog_function_creator(db, session, &def)?;
     validate_routine_definer_privilege(db, session, &def)?;
@@ -368,6 +369,10 @@ pub(super) fn execute_call(
     }
     let mut caller_locals = None;
     let result = execute_procedure_call(db, session, call, registry, caller_locals.as_mut(), None);
+    let affected_rows = session.last_row_count.max(0) as u64;
+    // CALL has its own status, without an inner DML statement's info trailer.
+    crate::engine::api::clear_statement_matched_rows();
+    crate::engine::api::clear_statement_info();
     // A procedure containing only local expressions still opens a read view.
     // Finish that implicit transaction, but honor any START TRANSACTION or
     // autocommit change deliberately left by the procedure for its caller.
@@ -391,7 +396,7 @@ pub(super) fn execute_call(
             rows: vec![row],
         }));
     }
-    responses.push(QueryResponse::Ok);
+    responses.push(QueryResponse::OkAffected { affected_rows });
     Ok(QueryResponse::MultiResult(responses))
 }
 
@@ -775,6 +780,7 @@ fn validate_routine_structure(
     let mut declaration_phase = 0u8;
     let mut variables = BTreeSet::new();
     let mut conditions = inherited_conditions.clone();
+    let mut local_conditions = BTreeSet::new();
     let mut cursors = BTreeSet::new();
     let mut handler_conditions = BTreeSet::new();
     for stmt in statements {
@@ -804,7 +810,7 @@ fn validate_routine_structure(
             }
             RoutineStmt::DeclareCondition { name, condition } => {
                 let key = normalize_local(name);
-                if conditions.contains_key(&key) {
+                if !local_conditions.insert(key.clone()) {
                     return Err(error(
                         crate::error::catalog::ER_SP_DUP_COND,
                         format!("Duplicate condition: {name}"),
@@ -1070,6 +1076,19 @@ fn validate_binlog_function_creator(
         crate::error::catalog::ER_BINLOG_CREATE_ROUTINE_NEED_SUPER,
         "You do not have the SUPER privilege and binary logging is enabled",
     ))
+}
+
+/// Resolve the parser's symbolic account before authorization and storage.
+pub(super) fn bind_current_user_definer(
+    session: &SessionContext,
+    definer: &mut Option<crate::parser::AccountIdent>,
+) {
+    if let Some(account) = definer.as_mut() {
+        if account.user == "CURRENT_USER()" && account.host.is_empty() {
+            account.user.clone_from(&session.authenticated_as.user);
+            account.host.clone_from(&session.authenticated_as.host);
+        }
+    }
 }
 
 /// Setting `DEFINER` to an account other than the current user requires the
@@ -1797,6 +1816,11 @@ struct RoutineFrame {
     /// block exits so its handler can run.
     active_handler_scopes: usize,
     outer_handlers: Vec<Vec<HandlerDecl>>,
+    lexical_scopes: Vec<RoutineLexicalScope>,
+    /// A condition escaping a handler cannot re-enter that handler's scope
+    /// while the interpreter unwinds through the suspended inner blocks.
+    handler_scope_limit: Option<usize>,
+    handled_warning_ranges: Vec<std::ops::Range<usize>>,
     /// Rows affected by the most recent body statement, for
     /// `GET DIAGNOSTICS ... = ROW_COUNT`.
     diag_row_count: i64,
@@ -1897,6 +1921,87 @@ struct HandlerDecl {
     action: RoutineHandlerAction,
     conditions: Vec<RoutineCondition>,
     statement: RoutineStmt,
+    lexical_depth: usize,
+}
+
+#[derive(Debug)]
+struct RoutineLexicalScope {
+    locals: Vec<(String, Option<Value>, Option<(DataTypeKind, bool)>)>,
+    conditions: Vec<(String, Option<RoutineCondition>)>,
+    cursors: Vec<(String, Option<CursorState>)>,
+}
+
+impl RoutineLexicalScope {
+    fn restore(self, frame: &mut RoutineFrame) {
+        fn entry<T>(map: &mut HashMap<String, T>, key: String, saved: Option<T>) {
+            if let Some(value) = saved {
+                map.insert(key, value);
+            } else {
+                map.remove(&key);
+            }
+        }
+        for (key, value, kind) in self.locals {
+            entry(&mut frame.locals, key.clone(), value);
+            entry(&mut frame.local_types, key, kind);
+        }
+        for (key, value) in self.conditions {
+            entry(&mut frame.conditions, key, value);
+        }
+        for (key, value) in self.cursors {
+            entry(&mut frame.cursors, key, value);
+        }
+    }
+
+    /// Swapping suspends a child scope without destroying its cursor or local
+    /// state. Swapping back also retains changes made to shadowed outer locals.
+    fn swap(&mut self, frame: &mut RoutineFrame) {
+        fn entry<T>(map: &mut HashMap<String, T>, key: &str, saved: &mut Option<T>) {
+            let current = map.remove(key);
+            if let Some(value) = saved.take() {
+                map.insert(key.to_string(), value);
+            }
+            *saved = current;
+        }
+        for (key, value, kind) in &mut self.locals {
+            entry(&mut frame.locals, key, value);
+            entry(&mut frame.local_types, key, kind);
+        }
+        for (key, value) in &mut self.conditions {
+            entry(&mut frame.conditions, key, value);
+        }
+        for (key, value) in &mut self.cursors {
+            entry(&mut frame.cursors, key, value);
+        }
+    }
+}
+
+impl RoutineFrame {
+    fn mark_handled_warnings(&mut self, mut start: usize, mut end: usize) {
+        if start >= end {
+            return;
+        }
+        // Nested compound statements may cover a previously handled range.
+        // Merge intervals so loops with handled warnings retain bounded state.
+        while self
+            .handled_warning_ranges
+            .last()
+            .is_some_and(|range| range.end >= start)
+        {
+            let range = self.handled_warning_ranges.pop().unwrap();
+            start = start.min(range.start);
+            end = end.max(range.end);
+        }
+        self.handled_warning_ranges.push(start..end);
+    }
+
+    fn warning_was_handled(&self, index: usize) -> bool {
+        let next = self
+            .handled_warning_ranges
+            .partition_point(|range| range.end <= index);
+        self.handled_warning_ranges
+            .get(next)
+            .is_some_and(|range| range.start <= index)
+    }
 }
 
 #[derive(Debug)]
@@ -2008,8 +2113,8 @@ fn authorize_routine_privilege(
             format!(
                 "{} command denied to user '{}'@'{}' for routine '{}.{}'",
                 required.privilege.sql_name().to_ascii_lowercase(),
-                session.user,
-                session.host,
+                session.authenticated_as.user,
+                session.authenticated_as.host,
                 routine.database,
                 routine.name
             ),
@@ -2254,6 +2359,9 @@ fn execute_routine_inner(
         block_depth: 0,
         active_handler_scopes: 0,
         outer_handlers: Vec::new(),
+        lexical_scopes: Vec::new(),
+        handler_scope_limit: None,
+        handled_warning_ranges: Vec::new(),
         diag_row_count: 0,
         diag_conditions: Vec::new(),
         allow_result_sets: capabilities.allow_result_sets && !is_function,
@@ -2320,6 +2428,9 @@ fn execute_routine_inner(
         return Err(err);
     }
     let invocation_snapshot = RoutineInvocationSnapshot::capture(session);
+    if !is_function {
+        session.last_row_count = 0;
+    }
     // RETURN/IF/SET expressions can evaluate subqueries without dispatching
     // a separate SQL statement. Isolate the entire body from view bindings.
     // SAFETY: db, session and registry remain pinned throughout this call.
@@ -2516,6 +2627,9 @@ fn execute_trigger_body_inner(
         block_depth: 0,
         active_handler_scopes: 0,
         outer_handlers: Vec::new(),
+        lexical_scopes: Vec::new(),
+        handler_scope_limit: None,
+        handled_warning_ranges: Vec::new(),
         diag_row_count: 0,
         diag_conditions: Vec::new(),
         allow_result_sets: false,
@@ -2866,8 +2980,21 @@ fn exec_block_inner(
             } => {
                 handlers.push(HandlerDecl {
                     action: *action,
-                    conditions: conditions.clone(),
+                    // Capture named conditions in the declaration scope; an
+                    // inner block may later declare the same condition name.
+                    conditions: conditions
+                        .iter()
+                        .map(|condition| match condition {
+                            RoutineCondition::Named(name) => frame
+                                .conditions
+                                .get(&normalize_local(name))
+                                .unwrap_or(condition)
+                                .clone(),
+                            other => other.clone(),
+                        })
+                        .collect(),
                     statement: (**statement).clone(),
+                    lexical_depth: frame.lexical_scopes.len(),
                 });
                 Ok(RoutineControl::None)
             }
@@ -2889,8 +3016,10 @@ fn exec_block_inner(
             let warnings = crate::engine::api::statement_warnings_snapshot();
             let new_warnings = warnings
                 .iter()
+                .enumerate()
                 .skip(warning_start.min(warnings.len()))
-                .cloned()
+                .filter(|(index, _)| !frame.warning_was_handled(*index))
+                .map(|(_, warning)| warning.clone())
                 .collect::<Vec<_>>();
             // Diagnostics retrieval and lexical declarations do not replace
             // the current area. A compound block retains its last statement's
@@ -2906,35 +3035,33 @@ fn exec_block_inner(
             ) {
                 frame.diag_conditions = new_warnings.clone();
             }
-            if let Some(warning) = new_warnings
-                .iter()
-                .rev()
-                .find(|warning| warning.level() == crate::error::ConditionLevel::Warning)
-            {
-                let err = QueryError::user_defined(
-                    warning.code(),
-                    warning.sql_state().as_str(),
-                    warning.message(),
-                )
-                .map_err(|invalid| {
-                    RoutineExecError::Query(error(
-                        crate::error::catalog::ER_WRONG_VALUE,
-                        format!("invalid warning condition: {invalid}"),
-                    ))
-                })?
-                .with_condition_information(warning.condition_information());
-                let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
-                if find_matching_handler(frame, &handlers, &warning).is_some()
-                    || frame.outer_handlers.iter().any(|scope| {
-                        scope.iter().any(|handler| {
-                            handler
-                                .conditions
-                                .iter()
-                                .any(|condition| condition_matches(frame, condition, &warning))
-                        })
-                    })
+            let has_handlers =
+                !handlers.is_empty() || frame.outer_handlers.iter().any(|scope| !scope.is_empty());
+            if has_handlers {
+                for warning in new_warnings
+                    .iter()
+                    .rev()
+                    .filter(|warning| warning.level() == crate::error::ConditionLevel::Warning)
                 {
-                    result = Err(warning);
+                    let err = QueryError::user_defined(
+                        warning.code(),
+                        warning.sql_state().as_str(),
+                        warning.message(),
+                    )
+                    .map_err(|invalid| {
+                        RoutineExecError::Query(error(
+                            crate::error::catalog::ER_WRONG_VALUE,
+                            format!("invalid warning condition: {invalid}"),
+                        ))
+                    })?
+                    .with_condition_information(warning.condition_information());
+                    let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
+                    if find_matching_handler(frame, &handlers, &warning).is_some()
+                        || find_outer_handler(frame, &warning).is_some()
+                    {
+                        result = Err(warning);
+                        break;
+                    }
                 }
             }
         }
@@ -2954,29 +3081,21 @@ fn exec_block_inner(
                         &err.query_error(),
                     )];
                 }
-                if let Some(handler) = find_matching_handler(frame, &handlers, &err) {
-                    let previous_handler_error = frame.active_handler_error.replace(err.clone());
-                    // SHOW WARNINGS / SHOW ERRORS inside a handler reads the
-                    // current session diagnostics area. Nested routine
-                    // statements bypass the top-level begin/finish boundary,
-                    // so expose the handled condition explicitly for the
-                    // handler lifetime and restore the caller's area after it
-                    // completes. GET [STACKED] DIAGNOSTICS continues to use
-                    // `active_handler_error` as its lossless source.
-                    let previous_handler_diagnostics = std::mem::replace(
-                        &mut session.warnings,
-                        vec![crate::engine::api::SqlWarning::from_error(
-                            crate::error::ConditionLevel::Error,
-                            &err.query_error(),
-                        )]
-                        .into(),
+                if let Some(handler) = find_matching_handler(frame, &handlers, &err).filter(|_| {
+                    frame
+                        .handler_scope_limit
+                        .is_none_or(|limit| frame.outer_handlers.len() < limit)
+                }) {
+                    frame.mark_handled_warnings(
+                        warning_start,
+                        crate::engine::api::statement_warning_count(),
                     );
                     let handler_result =
-                        exec_stmt(db, session, frame, registry, &handler.statement);
-                    session.warnings = previous_handler_diagnostics;
-                    frame.active_handler_error = previous_handler_error;
-                    let handler_result = handler_result?;
-                    crate::engine::perf_errors::record_handled(session, &err.query_error());
+                        exec_handler(db, session, frame, registry, &handler, &err)?;
+                    frame.mark_handled_warnings(
+                        warning_start,
+                        crate::engine::api::statement_warning_count(),
+                    );
                     match handler_result {
                         RoutineControl::None => match handler.action {
                             RoutineHandlerAction::Continue => continue,
@@ -2990,6 +3109,22 @@ fn exec_block_inner(
                         },
                         control => return Ok(control),
                     }
+                } else if let Some(result) =
+                    exec_outer_continue_handler(db, session, frame, registry, &err, warning_start)
+                {
+                    match result? {
+                        RoutineControl::None => continue,
+                        control => return Ok(control),
+                    }
+                } else if matches!(err, RoutineExecError::Warning(_, _))
+                    && find_outer_handler(frame, &err).is_none()
+                {
+                    crate::engine::api::push_statement_condition(
+                        crate::error::ConditionLevel::Warning,
+                        &err.query_error(),
+                    );
+                    frame.handler_scope_limit = None;
+                    continue;
                 } else if is_root {
                     match &err {
                         RoutineExecError::Warning(_, _) => continue,
@@ -2997,15 +3132,23 @@ fn exec_block_inner(
                             RoutineCondition::NotFound | RoutineCondition::SqlWarning,
                             warning,
                         ) => {
-                            if !frame.diag_conditions.iter().any(|condition| {
-                                condition.code() == warning.code()
-                                    && condition.sql_state().as_str() == warning.sql_state()
-                            }) {
+                            // The frame already records the condition for GET
+                            // DIAGNOSTICS; only the published area proves that
+                            // the caller can see it through SHOW WARNINGS.
+                            if !crate::engine::api::statement_warnings_snapshot()
+                                .iter()
+                                .skip(warning_start)
+                                .any(|condition| {
+                                    condition.code() == warning.code()
+                                        && condition.sql_state().as_str() == warning.sql_state()
+                                })
+                            {
                                 crate::engine::api::push_statement_condition(
                                     crate::error::ConditionLevel::Warning,
                                     warning,
                                 );
                             }
+                            frame.handler_scope_limit = None;
                             continue;
                         }
                         _ => return Err(err),
@@ -3017,6 +3160,108 @@ fn exec_block_inner(
         }
     }
     Ok(RoutineControl::None)
+}
+
+/// Find the nearest eligible declaration scope before comparing specificity.
+fn find_outer_handler(
+    frame: &RoutineFrame,
+    err: &RoutineExecError,
+) -> Option<(usize, HandlerDecl)> {
+    let limit = frame
+        .handler_scope_limit
+        .unwrap_or(frame.outer_handlers.len());
+    frame
+        .outer_handlers
+        .iter()
+        .enumerate()
+        .take(limit)
+        .rev()
+        .find_map(|(index, scope)| {
+            find_matching_handler(frame, scope, err).map(|handler| (index, handler))
+        })
+}
+
+fn exec_handler(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    frame: &mut RoutineFrame,
+    registry: &SessionRegistry,
+    handler: &HandlerDecl,
+    err: &RoutineExecError,
+) -> Result<RoutineControl, RoutineExecError> {
+    let scope_index = frame.outer_handlers.len();
+    frame.handler_scope_limit = None;
+    let previous_error = frame.active_handler_error.replace(err.clone());
+    let previous_diagnostics = std::mem::replace(
+        &mut session.warnings,
+        vec![crate::engine::api::SqlWarning::from_error(
+            if matches!(err, RoutineExecError::Warning(_, _)) {
+                crate::error::ConditionLevel::Warning
+            } else {
+                crate::error::ConditionLevel::Error
+            },
+            &err.query_error(),
+        )]
+        .into(),
+    );
+    // A scalar handler statement needs the same condition dispatch as a
+    // compound handler, including CONTINUE after a handled RESIGNAL.
+    let result = exec_block(
+        db,
+        session,
+        frame,
+        registry,
+        std::slice::from_ref(&handler.statement),
+    );
+    session.warnings = previous_diagnostics;
+    frame.active_handler_error = previous_error;
+    if result.is_err() {
+        frame.handler_scope_limit = Some(
+            frame
+                .handler_scope_limit
+                .map_or(scope_index, |limit| limit.min(scope_index)),
+        );
+    } else {
+        frame.handler_scope_limit = None;
+        crate::engine::perf_errors::record_handled(session, &err.query_error());
+    }
+    result
+}
+
+/// Run an ancestor CONTINUE handler without unwinding the failing statement.
+/// EXIT handlers still unwind to their declaration block through the normal
+/// error path, preserving their existing boundary and label semantics.
+fn exec_outer_continue_handler(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    frame: &mut RoutineFrame,
+    registry: &SessionRegistry,
+    err: &RoutineExecError,
+    warning_start: usize,
+) -> Option<Result<RoutineControl, RoutineExecError>> {
+    let (index, handler) = find_outer_handler(frame, err)?;
+    if !matches!(handler.action, RoutineHandlerAction::Continue) {
+        return None;
+    }
+    frame.mark_handled_warnings(warning_start, crate::engine::api::statement_warning_count());
+    let mut scopes = frame.lexical_scopes.split_off(handler.lexical_depth);
+    for scope in scopes.iter_mut().rev() {
+        scope.swap(frame);
+    }
+    let suspended_handlers = frame.outer_handlers.split_off(index);
+    let active_scopes = frame.active_handler_scopes;
+    frame.active_handler_scopes = active_scopes.saturating_sub(suspended_handlers.len());
+    let result = exec_handler(db, session, frame, registry, &handler, err);
+    frame.active_handler_scopes = active_scopes;
+    frame.outer_handlers.extend(suspended_handlers);
+    for scope in &mut scopes {
+        scope.swap(frame);
+    }
+    frame.lexical_scopes.extend(scopes);
+    if result.is_ok() {
+        frame.mark_handled_warnings(warning_start, crate::engine::api::statement_warning_count());
+    }
+    Some(result)
 }
 
 /// Execute a BEGIN/END block with MySQL lexical declaration scope.
@@ -3089,47 +3334,18 @@ fn exec_scoped_block(
         .map(|key| (key.clone(), frame.cursors.remove(key)))
         .collect::<Vec<_>>();
 
+    frame.lexical_scopes.push(RoutineLexicalScope {
+        locals: saved_locals,
+        conditions: saved_conditions,
+        cursors: saved_cursors,
+    });
     let result = exec_block(db, session, frame, registry, statements);
+    frame
+        .lexical_scopes
+        .pop()
+        .expect("active lexical scope")
+        .restore(frame);
 
-    for (key, value, data_type) in saved_locals {
-        match value {
-            Some(value) => {
-                frame.locals.insert(key.clone(), value);
-            }
-            None => {
-                frame.locals.remove(&key);
-            }
-        }
-        match data_type {
-            Some(data_type) => {
-                frame.local_types.insert(key, data_type);
-            }
-            None => {
-                frame.local_types.remove(&key);
-            }
-        }
-    }
-    for (key, condition) in saved_conditions {
-        match condition {
-            Some(condition) => {
-                frame.conditions.insert(key, condition);
-            }
-            None => {
-                frame.conditions.remove(&key);
-            }
-        }
-    }
-    for (key, cursor) in saved_cursors {
-        frame.cursors.remove(&key);
-        match cursor {
-            Some(cursor) => {
-                frame.cursors.insert(key, cursor);
-            }
-            None => {
-                frame.cursors.remove(&key);
-            }
-        }
-    }
     result
 }
 
@@ -3219,6 +3435,7 @@ fn exec_stmt(
                                 value: Expr::BoundValue(value),
                             }]),
                             &[],
+                            usize::MAX,
                             frame.forbid_transaction_control,
                             frame.trigger_table.as_deref(),
                         )?;
@@ -3240,6 +3457,8 @@ fn exec_stmt(
                 )?;
             }
             session.last_row_count = 0;
+            crate::engine::api::clear_statement_matched_rows();
+            crate::engine::api::clear_statement_info();
             frame.diag_row_count = 0;
             Ok(RoutineControl::None)
         }
@@ -3259,7 +3478,7 @@ fn exec_stmt(
                 frame.forbid_transaction_control,
                 frame.trigger_table.as_deref(),
             )?;
-            let row = match select_into_single_row(response) {
+            let row = match select_into_single_row(response, targets.len()) {
                 Ok(row) => row,
                 Err(err) => {
                     session.last_row_count = if err
@@ -3274,13 +3493,6 @@ fn exec_stmt(
                     return Err(err);
                 }
             };
-            if row.len() != targets.len() {
-                return Err(error(
-                    crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-                    "SELECT ... INTO target count does not match result column count",
-                )
-                .into());
-            }
             for (target, value) in targets.iter().zip(row.into_iter()) {
                 assign_target(
                     session,
@@ -3584,10 +3796,16 @@ fn exec_stmt(
                 information,
                 active_error.condition_information(),
             )?);
+            let retain_warning =
+                resolved.is_none() && matches!(active, RoutineExecError::Warning(_, _));
             let condition = resolved
                 .map(|(condition, _)| condition)
                 .unwrap_or_else(|| active.condition());
-            Err(RoutineExecError::Condition(condition, err))
+            if retain_warning {
+                Err(RoutineExecError::Warning(condition, err))
+            } else {
+                Err(RoutineExecError::Condition(condition, err))
+            }
         }
         RoutineStmt::Call(call) => {
             let inherited_capabilities = RoutineCapabilities::from_frame(frame);
@@ -3602,6 +3820,10 @@ fn exec_stmt(
             for response in result.responses {
                 collect_routine_response(session, frame, response)?;
             }
+            session.last_row_count = session.last_row_count.max(0);
+            frame.diag_row_count = session.last_row_count;
+            crate::engine::api::clear_statement_matched_rows();
+            crate::engine::api::clear_statement_info();
             Ok(RoutineControl::None)
         }
         RoutineStmt::Prepare { name, source } => {
@@ -3691,6 +3913,7 @@ fn exec_stmt(
                         database: session.current_database.clone(),
                         parameter_count: next_placeholder,
                         result_columns: Arc::from([]),
+                        result_catalog_epoch: db.catalog_publication_epoch(),
                         routine_result_metadata: false,
                         memory_charge,
                     },
@@ -3747,6 +3970,7 @@ fn exec_stmt(
                     registry,
                     (*prepared.statement).clone(),
                     &params,
+                    usize::MAX,
                     frame.forbid_transaction_control,
                     frame.trigger_table.as_deref(),
                 )
@@ -3887,37 +4111,12 @@ fn response_row_count(response: &QueryResponse) -> i64 {
     }
 }
 
-fn select_into_single_row(response: QueryResponse) -> Result<Vec<Value>, RoutineExecError> {
-    match response {
-        QueryResponse::ResultSet(mut result) => match result.rows.len() {
-            0 => Err(not_found_condition()),
-            1 => Ok(result.rows.pop().expect("single SELECT INTO row")),
-            _ => Err(error(
-                crate::error::catalog::ER_TOO_MANY_ROWS,
-                "Result consisted of more than one row",
-            )
-            .into()),
-        },
-        QueryResponse::StreamingResultSet(mut result) => {
-            let first = result.cursor.next_row()?;
-            let second = result.cursor.next_row()?;
-            crate::engine::api::append_statement_warnings(result.cursor.take_warnings());
-            match (first, second) {
-                (None, _) => Err(not_found_condition()),
-                (Some(row), None) => Ok(row),
-                (Some(_), Some(_)) => Err(error(
-                    crate::error::catalog::ER_TOO_MANY_ROWS,
-                    "Result consisted of more than one row",
-                )
-                .into()),
-            }
-        }
-        _ => Err(error(
-            crate::error::catalog::ER_TOO_MANY_ROWS,
-            "SELECT ... INTO requires a result set",
-        )
-        .into()),
-    }
+fn select_into_single_row(
+    response: QueryResponse,
+    targets: usize,
+) -> Result<Vec<Value>, RoutineExecError> {
+    super::dispatch::validate_into_column_count(&response, targets)?;
+    super::dispatch::take_single_into_row(response)?.ok_or_else(not_found_condition)
 }
 
 /// Execute `GET [CURRENT|STACKED] DIAGNOSTICS`. Statement-area items
@@ -4105,6 +4304,11 @@ fn execute_sql_in_routine(
             registry,
             statement,
             &bound_params,
+            if used_parameterized_template {
+                0
+            } else {
+                usize::MAX
+            },
             forbid_transaction_control,
             trigger_table,
         )
@@ -4171,6 +4375,7 @@ fn execute_parsed_statement_in_routine(
     registry: &SessionRegistry,
     statement: crate::parser::Statement,
     params: &[Value],
+    internal_param_start: usize,
     forbid_transaction_control: bool,
     trigger_table: Option<&str>,
 ) -> Result<QueryResponse, RoutineExecError> {
@@ -4189,10 +4394,14 @@ fn execute_parsed_statement_in_routine(
     // through the unique `&mut session` on this connection thread.
     let outer_insert_id = crate::engine::api::snapshot_statement_insert_id();
     crate::engine::api::clear_statement_insert_id();
+    crate::engine::api::clear_statement_matched_rows();
+    crate::engine::api::clear_statement_info();
     let result = unsafe {
         crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
-            params::with_params(params.to_vec(), || {
-                super::dispatch::execute_statement(db, session, statement, registry)
+            params::with_parameter_scope(internal_param_start, || {
+                params::with_params(params.to_vec(), || {
+                    super::dispatch::execute_statement(db, session, statement, registry)
+                })
             })
         })
     };
@@ -4207,7 +4416,14 @@ fn execute_parsed_statement_in_routine(
     if !crate::engine::api::statement_insert_id_is_set() {
         crate::engine::api::restore_statement_insert_id(outer_insert_id);
     }
-    session.last_row_count = result.as_ref().map(super::response_row_count).unwrap_or(-1);
+    session.last_row_count = match &result {
+        Ok(QueryResponse::OkAffected { affected_rows }) if session.client_found_rows => {
+            i64::try_from(crate::engine::api::statement_matched_rows().unwrap_or(*affected_rows))
+                .unwrap_or(i64::MAX)
+        }
+        Ok(response) => super::response_row_count(response),
+        Err(_) => -1,
+    };
     if held_trigger_transaction {
         session.explicit_txn = previous_explicit;
     }
@@ -4810,9 +5026,15 @@ fn condition_matches(
     let query = err.query_error();
     match resolved {
         RoutineCondition::SqlException => {
-            !query.sql_state().starts_with("01") && !query.sql_state().starts_with("02")
+            !matches!(err, RoutineExecError::Warning(_, _))
+                && !query.sql_state().starts_with("01")
+                && !query.sql_state().starts_with("02")
         }
-        RoutineCondition::SqlWarning => query.sql_state().starts_with("01"),
+        // Warning severity is independent of the nominal SQLSTATE class
+        // (for example, truncation warnings retain SQLSTATE 22007).
+        RoutineCondition::SqlWarning => {
+            matches!(err, RoutineExecError::Warning(_, _)) || query.sql_state().starts_with("01")
+        }
         RoutineCondition::NotFound => query.sql_state().starts_with("02"),
         RoutineCondition::MysqlError(code) => query.code() == *code,
         RoutineCondition::SqlState(state) => query.sql_state().eq_ignore_ascii_case(state),
@@ -4845,7 +5067,10 @@ fn condition_from_query_error(err: &QueryError) -> RoutineCondition {
 fn not_found_condition() -> RoutineExecError {
     RoutineExecError::Condition(
         RoutineCondition::NotFound,
-        error(crate::error::catalog::ER_SP_FETCH_NO_DATA, "No data"),
+        error(
+            crate::error::catalog::ER_SP_FETCH_NO_DATA,
+            "No data - zero rows fetched, selected, or processed",
+        ),
     )
 }
 

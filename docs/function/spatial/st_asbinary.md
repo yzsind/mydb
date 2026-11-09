@@ -26,11 +26,17 @@ Returns a binary string; returns `NULL` when the input is `NULL`.
 SELECT HEX(ST_ASBINARY(ST_GEOMFROMTEXT('POINT(1 2)')));
 ```
 
-Result: Returns the hexadecimal text of the WKB for POINT(1 2).
+Result:
+
+```text
+0101000000000000000000F03F0000000000000040
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
+
+- Only the single-geometry output form is implemented. The optional MySQL axis-order output argument is not implemented and is rejected; constructor axis-order options are separate.
 
 ## Related Functions
 

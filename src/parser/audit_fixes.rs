@@ -316,9 +316,9 @@ fn audit_rollup_bounds_expansion_before_allocation() {
 }
 
 #[test]
-fn audit_alias_clone_expansion_is_admitted_and_released() {
+fn audit_ordinal_clone_expansion_is_admitted_and_released() {
     let sql = format!(
-        "SELECT CONCAT('{}') AS k ORDER BY k,k,k",
+        "SELECT CONCAT('{}') AS k ORDER BY 1,1,1",
         "x".repeat(10_000)
     );
     let before = crate::engine::controlled_memory_snapshot().2[12];

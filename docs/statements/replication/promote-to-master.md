@@ -25,6 +25,12 @@ Promotes a standalone node, or a native replica that has caught up and is safely
 - When sequence synchronization uses `remote_apply`, append the operator-confirmed current `SEQUENCE_SYNC_EPOCH=N` after the other parameters. Missing or mismatched epochs return 50030 (`MYDB_ER_ROLE_CHANGE_BLOCKED`). The supplied epoch must be a positive integer and match the persisted configuration even if the local policy does not require remote_apply.
 - A promoted replica may have no eligible remote candidate left; new strict reservation windows then fail until a replacement candidate is configured and caught up. External fencing and retained configuration epochs remain operational requirements. See [CHANGE MYDB SEQUENCE SYNC TO](change-mydb-sequence-sync.md).
 
+## Privileges, Results, and Operational Details
+
+Requires SYSTEM_VARIABLES_ADMIN. Planned inputs come from STOP MASTER WRITES on the old master: use its returned Fence_LSN, Timeline_ID and Fence_Token, wait for the replica's Durable_Applied_LSN, and use the fresh token before its source-frozen proof expires. A requested WAIT is 1..3600 seconds. Role transition failure must be inspected before reopening writes; a partially pending promotion cannot be bypassed by endpoint changes.
+
+FORCE FENCED asserts external isolation and can lose unreplicated data. It provides neither consensus election nor MySQL downstream GTID/file continuity. The optional sequence epoch is the retained reservation-config epoch, not Role Epoch. See [full planned procedure](../../native-replication.md#planned-switchover).
+
 ## Examples
 
 ```sql

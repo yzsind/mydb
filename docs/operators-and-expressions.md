@@ -555,4 +555,4 @@ scans, and predicate pushdown recognize stable optimizable expressions.
 - [SQL Syntax Notation and Common Conventions](statements/syntax-conventions.md)
 - [SELECT](statements/query/select.md)
 - [MySQL 8.0 Compatibility Status](mysql80-compatibility.md)
-- [Executor Maintenance Constraints](executor.md)
+- [Query Execution](optimizer-and-operators.md#execution-modes-and-resource-limits)

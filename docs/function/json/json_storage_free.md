@@ -14,7 +14,7 @@ JSON_STORAGE_FREE(json_doc)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `json_doc` | Yes | JSON document or JSON path/scalar | The 1st argument; the JSON document to process |
+| `json_doc` | Yes | JSON document or valid JSON text | The json document to process |
 
 ## Return Value
 
@@ -30,8 +30,8 @@ Result: 0
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_STORAGE_SIZE`](json_storage_size.md), [`JSON_PRETTY`](json_pretty.md).

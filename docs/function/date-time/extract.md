@@ -19,7 +19,7 @@ EXTRACT(unit FROM temporal_value)
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns an integer field or packed compound-unit value from the temporal input. Compound values concatenate the named fields, for example YEAR_MONTH is YYYYMM. Negative durations retain their applicable sign. SQL NULL in a required input returns NULL.
 
 ## Examples
 
@@ -31,8 +31,10 @@ Result: 2026
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
+
+- See [interval units](README.md#interval-units) for supported units, compound values, and operator restrictions.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`DATE`](date.md), [`TIME`](time.md), [`TIMESTAMP`](timestamp.md).

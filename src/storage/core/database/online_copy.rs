@@ -552,10 +552,7 @@ impl Database {
                         .with_index_read(storage_id, &index.name, |file| file.get_unique_one(&key))?
                         .is_some()
                     {
-                        return Err(error(
-                            crate::error::catalog::ER_DUP_ENTRY,
-                            format!("duplicate entry for key '{}'", index.name),
-                        ));
+                        return Err(duplicate_entry_error(target, index, &key));
                     }
                 }
                 keys.push((&index.name, key));

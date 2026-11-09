@@ -14,13 +14,13 @@ RPAD(str, len, padstr)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `len` | Yes | Integer | The 2nd argument; the length, interpreted with the function's character or byte semantics |
-| `padstr` | Yes | String | The 3rd argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `len` | Yes | Integer | Requested length; text uses characters and binary input uses bytes. |
+| `padstr` | Yes | String | Repeated padding content; all three arguments are required. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns text/binary content of len characters/bytes, padding at the right by repeating padstr or truncating the source. SQL NULL or negative len returns NULL; extension with an empty padstr returns an empty string. All three arguments are required.
 
 ## Examples
 
@@ -39,8 +39,8 @@ mydb00
 - All three arguments are required, even when `len` would truncate the input; missing `padstr` returns 1582/42000.
 - A NULL argument returns SQL NULL. A negative length returns NULL; an empty pad string returns an empty string when extension would be needed.
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LPAD`](lpad.md), [`LTRIM`](ltrim.md), [`RTRIM`](rtrim.md), [`TRIM`](trim.md).

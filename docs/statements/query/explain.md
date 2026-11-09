@@ -56,6 +56,12 @@ Shows the physical plan of a SELECT or DML statement. `EXPLAIN ANALYZE` actually
   standard 12 columns.
 - Uses the same privileges, object resolution, session semantics, CBO, hints, and plan-cache rules as the real statement.
 
+## Privileges, Results, and Boundaries
+
+Plain EXPLAIN validates the target's read/write privileges even though it does not execute writes. EXPLAIN ANALYZE runs in the normal target transaction context. To inspect a write and then discard it, explicitly START TRANSACTION, run EXPLAIN ANALYZE, inspect the result, and ROLLBACK; autocommit ANALYZE may already commit the write.
+
+TRADITIONAL has id, select_type, table, partitions, type, possible_keys, key, key_len, ref, rows, filtered and Extra. TREE and JSON each return a single plan-text column. ANALYZE appends the documented actual fields or enriches the selected format. TABLE and SELECT-backed CTE/set queries use the ordinary query plan boundary. [Optimizer and operators](../../optimizer-and-operators.md) explains plan nodes and estimates.
+
 ## Examples
 
 ```sql

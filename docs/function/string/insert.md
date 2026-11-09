@@ -14,14 +14,14 @@ INSERT(str, pos, len, newstr)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `pos` | Yes | Numeric or integer | The 2nd argument; the 1-based position |
-| `len` | Yes | Integer | The 3rd argument; the length, interpreted in the function's character or byte semantics |
-| `newstr` | Yes | String | The 4th argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `pos` | Yes | Numeric or integer | One-based starting position; negative positions are supported only by SUBSTRING and its aliases. |
+| `len` | Yes | Integer | Requested length; text uses characters and binary input uses bytes. |
+| `newstr` | Yes | String | Replacement string. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns the source string with len characters/bytes replaced at one-based pos. Invalid positions preserve the source; a length extending beyond the end replaces the remaining suffix. A negative len replaces the suffix. Any SQL NULL argument returns NULL.
 
 ## Examples
 
@@ -37,8 +37,8 @@ mxb
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SUBSTRING`](substring.md), [`LEFT`](left.md), [`RIGHT`](right.md), [`SUBSTRING_INDEX`](substring_index.md).

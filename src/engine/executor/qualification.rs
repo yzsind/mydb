@@ -24,6 +24,14 @@ pub(crate) fn qualify_persistent_table_name(session: &SessionContext, name: &str
     crate::storage::table_key(&database, &table)
 }
 
+fn qualify_dml_source_name(session: &SessionContext, name: &str) -> String {
+    if !name.contains('.') && super::cte::has_cte(name) {
+        name.to_string()
+    } else {
+        qualify_table_name(session, name)
+    }
+}
+
 pub(super) fn qualify_statement_tables<'q>(
     db: &Database,
     session: &SessionContext,
@@ -76,9 +84,9 @@ pub(super) fn qualify_statement_tables<'q>(
             }
         }
         crate::parser::QueryMut::Other(Statement::Update(stmt)) => {
-            stmt.table = qualify_table_name(session, &stmt.table);
+            stmt.table = qualify_dml_source_name(session, &stmt.table);
             for join in &mut stmt.joins {
-                join.table.name = qualify_table_name(session, &join.table.name);
+                join.table.name = qualify_dml_source_name(session, &join.table.name);
                 if let Some(condition) = &mut join.condition {
                     qualify_expr_tables(db, session, condition)?;
                 }
@@ -94,9 +102,9 @@ pub(super) fn qualify_statement_tables<'q>(
             }
         }
         crate::parser::QueryMut::Other(Statement::Delete(stmt)) => {
-            stmt.table = qualify_table_name(session, &stmt.table);
+            stmt.table = qualify_dml_source_name(session, &stmt.table);
             for join in &mut stmt.joins {
-                join.table.name = qualify_table_name(session, &join.table.name);
+                join.table.name = qualify_dml_source_name(session, &join.table.name);
                 if let Some(condition) = &mut join.condition {
                     qualify_expr_tables(db, session, condition)?;
                 }

@@ -85,6 +85,12 @@ SHOW ENGINE MYDB STATUS;
 
 Focus on the `idle_memory_reclaim_*` metrics in the output.
 
+## Diagnostic Workflow
+
+Compare `system.controlled_memory` with its process operational budget, then inspect rows whose IN_TRACKED_TOTAL is YES to identify attribution. Use SCOPE and COUNTER_SCOPE before comparing cache rates across threads. To locate a retained session allocation, run [SHOW MYDB MEMORY SESSIONS](show-mydb-memory-sessions.md); an account without PROCESS can inspect only its current connection there. For before/after cache flush comparisons, retain the same set of components and expect concurrent activity to change counters.
+
+Use [memory configuration](../../configuration.md) for soft sizing and hard admission budgets. A positive rss_minus_tracked value alone does not prove a leak, and summing detail rows with their parent totals double-counts memory.
+
 ## See Also
 
 - [Session memory](show-mydb-memory-sessions.md)

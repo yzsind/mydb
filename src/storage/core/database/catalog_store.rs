@@ -1755,6 +1755,7 @@ impl Database {
         // candidates cannot erase the authoritative row layout or primary key.
         validate_persisted_layouts(expected)?;
         validate_persisted_layouts(&candidate)?;
+        candidate.bind_statistics_definitions();
         candidate.bump_schema_version_without_system_time_epoch();
         let rows = dd_rows_for_table(&candidate)?;
         let previous = dd_rows_for_table(expected)?;

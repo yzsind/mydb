@@ -8,3 +8,5 @@
 | Engine maintenance | [CHECKPOINT](alter-system-checkpoint.md) · [FLUSH DATA_CACHE](alter-system-flush-data-cache.md) · [FLUSH SQL_CACHE](alter-system-flush-sql-cache.md) · [CANCEL DDL JOB](cancel-ddl-job.md) |
 | Resource group | [CREATE](create-resource-group.md) · [ALTER](alter-resource-group.md) · [DROP](drop-resource-group.md) |
 | Component | [INSTALL](install-component.md) · [UNINSTALL](uninstall-component.md) |
+
+RESOURCE GROUP entries are explicit unsupported errors. INSTALL/UNINSTALL supports the built-in validate_password component, not arbitrary plugin binaries. Additional local administration includes [HTTP policy](../integration/reload-http-config.md), [AI policy](../integration/reload-ai-config.md), [AI key rotation](../integration/rotate-ai-encryption-key.md) and [API Key master-key rotation](../account/rotate-api-key-master-key.md). See [privilege and commit rules](../execution-contracts.md).

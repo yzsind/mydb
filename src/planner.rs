@@ -1662,7 +1662,8 @@ pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, Quer
     resolve_group_by_refs(db, &mut select_owned);
     prune_redundant_constant_group_keys(&mut select_owned);
     prune_redundant_functional_group_keys(db, &mut select_owned);
-    bind_rollup_expressions(&mut select_owned)?;
+    resolve_order_by_output_refs(db, &mut select_owned)?;
+    bind_rollup_expressions(db, &mut select_owned)?;
     validate_select_column_references(db, &select_owned)?;
     rewrite_enum_set_numeric_semantics(db, &mut select_owned);
     normalize_select_predicates(db, &mut select_owned);
@@ -2572,7 +2573,19 @@ pub(crate) fn resolve_group_by_refs(db: &Database, select: &mut Select) {
     } else {
         None
     };
-    for expr in &mut select.group_by {
+    for (group_index, expr) in select.group_by.iter_mut().enumerate() {
+        let group_alias = match expr {
+            Expr::Identifier(name)
+                if select.group_by_modifier != GroupByModifier::None
+                    && aliases.contains_key(&name.to_ascii_lowercase())
+                    && scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.column_matches(None, name, true) == 0) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        };
         if let Expr::Identifier(name) = expr {
             if let Some(scope) = &scope {
                 if scope.column_matches(None, name, true) > 0 {
@@ -2598,6 +2611,22 @@ pub(crate) fn resolve_group_by_refs(db: &Database, select: &mut Select) {
             }
         }
         *expr = resolve_group_ref_expr(expr.clone(), &projection_exprs, &aliases);
+        if let Some(alias_name) = group_alias {
+            for item in &mut select.projection {
+                if let SelectItem::Expr {
+                    expr: projected,
+                    alias: Some(alias),
+                } = item
+                {
+                    if alias.eq_ignore_ascii_case(&alias_name) {
+                        *projected = Expr::GroupKeyRef {
+                            index: group_index,
+                            expr: Box::new(expr.clone()),
+                        };
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -2709,6 +2738,7 @@ pub(crate) fn resolve_wildcard_order_ordinals(
                 ));
             };
             order.expr = expr.clone();
+            order.names_bound = true;
         }
     }
     for key in &mut select.group_by {
@@ -2736,14 +2766,16 @@ pub(crate) fn resolve_wildcard_order_ordinals(
     Ok(())
 }
 
-pub(crate) fn resolve_order_by_output_refs(db: &Database, select: &mut Select) {
-    if select.order_by.is_empty() {
-        return;
+/// Bind ORDER BY names once, before execution paths choose their sort keys.
+/// A bare name prefers the output; names inside an expression prefer FROM.
+pub(crate) fn resolve_order_by_output_refs(
+    db: &Database,
+    select: &mut Select,
+) -> Result<(), QueryError> {
+    if select.order_by.iter().all(|order| order.names_bound) {
+        return Ok(());
     }
-    // Output-column name → its projection expression; `None` marks a name
-    // carried by more than one output column (ambiguous, not rewritten).
-    let mut output: std::collections::HashMap<String, Option<Expr>> =
-        std::collections::HashMap::new();
+    let mut output: HashMap<String, Option<&Expr>> = HashMap::new();
     for item in &select.projection {
         if let SelectItem::Expr { expr, alias } = item {
             let name = alias
@@ -2752,33 +2784,88 @@ pub(crate) fn resolve_order_by_output_refs(db: &Database, select: &mut Select) {
                 .to_ascii_lowercase();
             output
                 .entry(name)
-                .and_modify(|slot| *slot = None)
-                .or_insert_with(|| Some(expr.clone()));
+                .and_modify(|slot| {
+                    if slot
+                        .as_ref()
+                        .is_some_and(|old| !expr_semantically_eq(old, expr))
+                    {
+                        *slot = None;
+                    }
+                })
+                .or_insert(Some(expr));
         }
     }
-    let needs = select.order_by.iter().any(|ob| {
-        matches!(&ob.expr, Expr::Identifier(n)
-            if matches!(output.get(&n.to_ascii_lowercase()), Some(Some(_))))
+    let needs = select.order_by.iter().filter(|order| !order.names_bound).any(|order| {
+        crate::parser::visit::any_expr_matching(
+            &order.expr,
+            |node| matches!(node, Expr::Identifier(name) if output.contains_key(&name.to_ascii_lowercase())),
+            |_| true,
+        )
     });
     if !needs {
-        return;
+        for order in &mut select.order_by {
+            order.names_bound = true;
+        }
+        return Ok(());
     }
     let scope = build_column_scope(db, select, None).ok();
-    for ob in &mut select.order_by {
-        if let Expr::Identifier(name) = &ob.expr {
-            let key = name.to_ascii_lowercase();
-            let Some(Some(target)) = output.get(&key) else {
-                continue;
-            };
-            // A uniquely-resolvable FROM column keeps its meaning.
-            if let Some(scope) = &scope {
-                if scope.column_matches(None, name, true) == 1 {
-                    continue;
-                }
+    let ambiguous = |name: &str| {
+        error(
+            crate::error::catalog::ER_NON_UNIQ_ERROR,
+            format!("Column '{name}' in order clause is ambiguous"),
+        )
+    };
+    let mut expansion_charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge> =
+        None;
+    let mut clone_target = |target: &Expr| -> Result<Expr, QueryError> {
+        let bytes = crate::engine::expr_program::expr_ast_heap_bytes(target);
+        if bytes > 1024 {
+            if let Some(charge) = &mut expansion_charge {
+                charge.try_grow(bytes)?;
+            } else {
+                expansion_charge = Some(
+                    crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+                        bytes,
+                    )?,
+                );
             }
-            ob.expr = target.clone();
         }
+        Ok(target.clone())
+    };
+    for order in &mut select.order_by {
+        if order.names_bound {
+            continue;
+        }
+        if let Expr::Identifier(name) = &order.expr {
+            if let Some(target) = output.get(&name.to_ascii_lowercase()) {
+                order.expr = clone_target(target.as_ref().ok_or_else(|| ambiguous(name))?)?;
+            }
+            order.names_bound = true;
+            continue;
+        }
+        crate::parser::visit::try_rewrite_value_expr(&mut order.expr, |node| {
+            if let Expr::Identifier(name) = node {
+                let matches = scope
+                    .as_ref()
+                    .map_or(0, |scope| scope.column_matches(None, name, true));
+                if matches > 1 {
+                    return Err(ambiguous(name));
+                }
+                if matches == 0 {
+                    if let Some(target) = output.get(&name.to_ascii_lowercase()) {
+                        *node = clone_target(target.as_ref().ok_or_else(|| ambiguous(name))?)?;
+                    }
+                }
+                // The source expression of an alias belongs to the SELECT
+                // list. Never resolve its identifiers as more ORDER aliases.
+                return Ok(false);
+            }
+            Ok(true)
+        })?;
+        order.names_bound = true;
     }
+    Ok(())
 }
 
 /// Resolve SELECT aliases referenced anywhere inside HAVING. Unlike GROUP BY,
@@ -2829,7 +2916,7 @@ pub(crate) fn bind_rollup_select_for_execution(
     select: &mut Select,
 ) -> Result<(), QueryError> {
     resolve_group_by_refs(db, select);
-    bind_rollup_expressions(select)
+    bind_rollup_expressions(db, select)
 }
 
 fn projection_alias_exprs(select: &Select) -> HashMap<String, Expr> {
@@ -2859,7 +2946,15 @@ fn resolve_group_ref_expr(
     while let Expr::GroupKeyRef { expr, .. } = resolved {
         resolved = *expr;
     }
-    resolved
+    match resolved {
+        Expr::Literal(crate::parser::Literal::Int(value)) => {
+            Expr::BoundValue(crate::types::Value::Int(value))
+        }
+        Expr::Literal(crate::parser::Literal::UInt(value)) => {
+            Expr::BoundValue(crate::types::Value::UInt(value))
+        }
+        other => other,
+    }
 }
 
 fn resolve_group_ref_target(
@@ -2901,7 +2996,214 @@ fn resolve_rollup_alias_ref(expr: Expr, aliases: &HashMap<String, Expr>) -> Expr
     }
 }
 
-fn bind_rollup_expressions(select: &mut Select) -> Result<(), QueryError> {
+fn expr_has_aggregate_owned_by_scope(db: &Database, scope: &ColumnScope<'_>, expr: &Expr) -> bool {
+    if has_aggregate_expr(expr) {
+        return true;
+    }
+    if !crate::parser::visit::value_expr_contains_subquery(expr) {
+        return false;
+    }
+    let mut found = false;
+    for_each_nested_owned_aggregate(db, scope, [expr], &mut |_| found = true);
+    found
+}
+
+pub(crate) fn validate_outer_aggregate_nesting(
+    db: &Database,
+    select: &Select,
+) -> Result<(), QueryError> {
+    if !projection_having_exprs(select)
+        .chain(select.order_by.iter().map(|order| &order.expr))
+        .any(crate::parser::visit::value_expr_contains_subquery)
+    {
+        return Ok(());
+    }
+    let mut scope = None;
+    for expr in
+        projection_having_exprs(select).chain(select.order_by.iter().map(|order| &order.expr))
+    {
+        crate::parser::visit::try_inspect_value_expr(expr, |node| {
+            let Expr::Function { name, args, .. } = node else {
+                return Ok(true);
+            };
+            if !is_aggregate_function(name) {
+                return Ok(true);
+            }
+            for argument in args
+                .iter()
+                .filter(|argument| crate::parser::visit::value_expr_contains_subquery(argument))
+            {
+                if scope.is_none() {
+                    scope = Some(build_column_scope(db, select, None)?);
+                }
+                if expr_has_aggregate_owned_by_scope(db, scope.as_ref().unwrap(), argument) {
+                    return Err(error(
+                        crate::error::catalog::ER_INVALID_GROUP_FUNC_USE,
+                        "Invalid use of group function",
+                    ));
+                }
+            }
+            Ok(false)
+        })?;
+    }
+    Ok(())
+}
+
+fn bind_any_value_expressions(db: &Database, select: &mut Select) -> Result<(), QueryError> {
+    let has_any_value = projection_having_exprs(select).chain(select.order_by.iter().map(|order| &order.expr))
+        .any(|expr| crate::parser::visit::any_expr_matching(expr,
+            |node| matches!(node, Expr::Function { name, .. } if name.eq_ignore_ascii_case("ANY_VALUE")),
+            |node| !matches!(node, Expr::Function { name, .. } if is_aggregate_function(name))));
+    if !has_any_value {
+        return Ok(());
+    }
+    let scope = build_column_scope(db, select, None)?;
+    struct FreeColumns<'a> {
+        db: &'a Database,
+        outer: &'a ColumnScope<'a>,
+        scopes: Vec<ColumnScope<'static>>,
+        descend: bool,
+        error: Option<QueryError>,
+    }
+    impl crate::parser::visit::AstVisitorMut for FreeColumns<'_> {
+        fn enter_select(&mut self, select: &mut Select) {
+            match build_column_scope(self.db, select, None) {
+                Ok(scope) => self.scopes.push(scope),
+                Err(err) => {
+                    self.error = Some(err);
+                    self.scopes.push(ColumnScope {
+                        tables: Vec::new(),
+                        outer: None,
+                    });
+                }
+            }
+        }
+        fn exit_select(&mut self, _: &mut Select) {
+            self.scopes.pop();
+        }
+        fn enter_expr(&mut self, expr: &mut Expr) {
+            self.descend = true;
+            if matches!(expr, Expr::GroupKeyRef { .. })
+                || (matches!(expr, Expr::Function { name, .. } if is_aggregate_function(name))
+                    && (self.scopes.is_empty()
+                        || aggregate_binds_to_outer_scope(expr, self.outer, &self.scopes)))
+            {
+                self.descend = false;
+                return;
+            }
+            let (qualifier, column) = match expr {
+                Expr::Identifier(column) => (None, column.as_str()),
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                    Some(parts[parts.len() - 2].as_str()),
+                    parts.last().unwrap().as_str(),
+                ),
+                _ => return,
+            };
+            if self.outer.column_matches(qualifier, column, false) == 1
+                && self
+                    .scopes
+                    .iter()
+                    .all(|scope| scope.column_matches(qualifier, column, false) == 0)
+            {
+                *expr = Expr::Function {
+                    name: crate::parser::HIDDEN_FIRST_VALUE_FN.into(),
+                    args: vec![expr.clone()],
+                    distinct: false,
+                };
+                self.descend = false;
+            }
+        }
+        fn walk_expr_children(&self, _: &Expr) -> bool {
+            self.descend
+        }
+        fn continue_expr_walk(&self) -> bool {
+            self.error.is_none()
+        }
+    }
+    struct Bind<'a> {
+        db: &'a Database,
+        outer: &'a ColumnScope<'a>,
+        error: Option<QueryError>,
+    }
+    impl crate::parser::visit::AstVisitorMut for Bind<'_> {
+        fn enter_expr(&mut self, expr: &mut Expr) {
+            if let Expr::Function { name, args, .. } = expr {
+                if name.eq_ignore_ascii_case("ANY_VALUE") && args.len() == 1 {
+                    if expr_has_aggregate_owned_by_scope(self.db, self.outer, &args[0]) {
+                        // Aggregates are evaluated after grouping; only the
+                        // free columns inside ANY_VALUE take a sample row.
+                        let mut columns = FreeColumns {
+                            db: self.db,
+                            outer: self.outer,
+                            scopes: Vec::new(),
+                            descend: true,
+                            error: None,
+                        };
+                        crate::parser::visit::visit_expr_mut(&mut columns, &mut args[0]);
+                        self.error = columns.error;
+                    } else {
+                        *name = crate::parser::HIDDEN_FIRST_VALUE_FN.into();
+                    }
+                }
+            }
+        }
+        fn walk_expr_children(&self, expr: &Expr) -> bool {
+            !matches!(expr,Expr::Function{name,..} if is_aggregate_function(name))
+        }
+        fn walk_select_children(&self, _: &Select) -> bool {
+            false
+        }
+        fn continue_expr_walk(&self) -> bool {
+            self.error.is_none()
+        }
+    }
+    let mut bind = Bind {
+        db,
+        outer: &scope,
+        error: None,
+    };
+    for item in &mut select.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            crate::parser::visit::visit_expr_mut(&mut bind, expr);
+        }
+    }
+    if let Some(having) = &mut select.having {
+        crate::parser::visit::visit_expr_mut(&mut bind, having);
+    }
+    for order in &mut select.order_by {
+        crate::parser::visit::visit_expr_mut(&mut bind, &mut order.expr);
+    }
+    bind.error.map_or(Ok(()), Err)
+}
+
+fn bind_rollup_expressions(db: &Database, select: &mut Select) -> Result<(), QueryError> {
+    validate_outer_aggregate_nesting(db, select)?;
+    if select.group_by_modifier == GroupByModifier::None && select.grouping_sets.is_empty() {
+        let grouping = |expr: &Expr| {
+            crate::parser::visit::any_expr_matching(
+                expr,
+                |node| matches!(node, Expr::Function { name, .. } if name.eq_ignore_ascii_case("GROUPING")),
+                |_| true,
+            )
+        };
+        if select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { expr, .. } if grouping(expr)))
+            || select.having.as_ref().is_some_and(grouping)
+            || select.selection.as_ref().is_some_and(grouping)
+            || select.order_by.iter().any(|order| grouping(&order.expr))
+        {
+            return Err(crate::error::catalog::ER_INVALID_GROUP_FUNC_USE
+                .error("GROUPING requires ROLLUP or grouping sets"));
+        }
+    }
+    if !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select_has_aggregate(db, select)
+    {
+        bind_any_value_expressions(db, select)?;
+    }
     if select.group_by.is_empty() && select.grouping_sets.is_empty() {
         if select.group_by_modifier == GroupByModifier::None {
             return Ok(());
@@ -2910,6 +3212,9 @@ fn bind_rollup_expressions(select: &mut Select) -> Result<(), QueryError> {
             crate::error::catalog::ER_PARSE_ERROR,
             "GROUP BY modifier requires at least one GROUP BY expression",
         ));
+    }
+    if select.group_by_modifier != GroupByModifier::None || !select.grouping_sets.is_empty() {
+        bind_rollup_correlations(db, select)?;
     }
     let aliases = projection_alias_exprs(select);
     let projection_exprs: Vec<Expr> = select
@@ -2921,12 +3226,62 @@ fn bind_rollup_expressions(select: &mut Select) -> Result<(), QueryError> {
         })
         .collect();
     let group_by = select.group_by.clone();
+    let has_grouping = |expr: &Expr| {
+        crate::parser::visit::any_expr_matching(
+            expr,
+            |expr| matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("GROUPING")),
+            |_| true,
+        )
+    };
+    let order_scope = if select.order_by.is_empty()
+        && !select
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { expr, .. } if has_grouping(expr)))
+        && !select.having.as_ref().is_some_and(has_grouping)
+    {
+        None
+    } else {
+        build_column_scope(db, select, None).ok()
+    };
+    let canonical_groups: Vec<_> = order_scope.as_ref().map_or_else(Vec::new, |scope| {
+        group_by
+            .iter()
+            .map(|expr| canonical_scope_expr(expr, scope))
+            .collect()
+    });
+    let bind_grouping_arguments = |expr: &mut Expr| {
+        if let Some(scope) = &order_scope {
+            crate::parser::visit::rewrite_value_expr(expr, |expr| {
+                if let Expr::Function { name, args, .. } = expr {
+                    if is_aggregate_function(name) {
+                        return false;
+                    }
+                    if name.eq_ignore_ascii_case("GROUPING") {
+                        for arg in args {
+                            let canonical = canonical_scope_expr(arg, scope);
+                            if let Some(index) = canonical_groups
+                                .iter()
+                                .position(|group| expr_semantically_eq(group, &canonical))
+                            {
+                                *arg = group_by[index].clone();
+                            }
+                        }
+                        return false;
+                    }
+                }
+                true
+            });
+        }
+    };
     for item in &mut select.projection {
         if let SelectItem::Expr { expr, .. } = item {
+            bind_grouping_arguments(expr);
             *expr = bind_rollup_expr(expr.clone(), &group_by, &projection_exprs, &aliases, false)?;
         }
     }
-    if let Some(having) = select.having.take() {
+    if let Some(mut having) = select.having.take() {
+        bind_grouping_arguments(&mut having);
         select.having = Some(bind_rollup_expr(
             having,
             &group_by,
@@ -2939,10 +3294,138 @@ fn bind_rollup_expressions(select: &mut Select) -> Result<(), QueryError> {
         // ORDER BY accepts a positive top-level ordinal. Resolve it exactly
         // once here; literals nested inside arithmetic/functions/tuples are
         // values, not projection references.
-        let order_expr = resolve_group_ref_expr(order_by.expr.clone(), &projection_exprs, &aliases);
-        order_by.expr = bind_rollup_expr(order_expr, &group_by, &projection_exprs, &aliases, true)?;
+        let mut order_expr =
+            resolve_group_ref_expr(order_by.expr.clone(), &projection_exprs, &HashMap::new());
+        bind_grouping_arguments(&mut order_expr);
+        if let Some(scope) = &order_scope {
+            crate::parser::visit::rewrite_value_expr(&mut order_expr, |expr| {
+                if matches!(expr, Expr::GroupKeyRef { .. })
+                    || matches!(expr, Expr::Function { name, .. } if is_aggregate_function(name))
+                {
+                    return false;
+                }
+                let canonical = canonical_scope_expr(expr, scope);
+                if let Some(index) = canonical_groups
+                    .iter()
+                    .position(|group| expr_semantically_eq(group, &canonical))
+                {
+                    *expr = Expr::GroupKeyRef {
+                        index,
+                        expr: Box::new(group_by[index].clone()),
+                    };
+                    return false;
+                }
+                true
+            });
+        }
+        // ORDER names were resolved with FROM precedence before grouping.
+        // HAVING's alias-first recursion must not reinterpret them here.
+        order_by.expr =
+            bind_rollup_expr(order_expr, &group_by, &projection_exprs, &aliases, false)?;
     }
     Ok(())
+}
+
+/// Bind free references in nested queries to emitted group keys. Local and
+/// intermediate query scopes take precedence over the grouped outer scope.
+fn bind_rollup_correlations(db: &Database, select: &mut Select) -> Result<(), QueryError> {
+    fn binding(scope: &ColumnScope<'_>, expr: &Expr) -> Option<(usize, String)> {
+        let (qualifier, column) = match expr {
+            Expr::Identifier(column) => (None, column.as_str()),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                Some(parts[parts.len() - 2].as_str()),
+                parts.last()?.as_str(),
+            ),
+            _ => return None,
+        };
+        let mut found = None;
+        for (index, table) in scope.tables.iter().enumerate() {
+            if table.visible
+                && qualifier.is_none_or(|q| matches_table(q, &table.name, table.alias.as_deref()))
+                && table.columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some((index, column.to_ascii_lowercase()));
+            }
+        }
+        found
+    }
+    struct Bind<'a> {
+        db: &'a Database,
+        keys: Vec<(usize, (usize, String))>,
+        scopes: Vec<ColumnScope<'static>>,
+        error: Option<QueryError>,
+    }
+    impl crate::parser::visit::AstVisitorMut for Bind<'_> {
+        fn enter_select(&mut self, select: &mut Select) {
+            match build_column_scope(self.db, select, None) {
+                Ok(scope) => self.scopes.push(scope),
+                Err(error) => {
+                    self.error = Some(error);
+                    self.scopes.push(ColumnScope {
+                        tables: Vec::new(),
+                        outer: None,
+                    });
+                }
+            }
+        }
+        fn exit_select(&mut self, _: &mut Select) {
+            self.scopes.pop();
+        }
+        fn enter_expr(&mut self, expr: &mut Expr) {
+            if self.scopes.len() < 2 {
+                return;
+            }
+            let Some(candidate) = binding(&self.scopes[0], expr) else {
+                return;
+            };
+            let (qualifier, column) = match expr {
+                Expr::Identifier(column) => (None, column.as_str()),
+                Expr::CompoundIdentifier(parts) => (
+                    Some(parts[parts.len() - 2].as_str()),
+                    parts.last().unwrap().as_str(),
+                ),
+                _ => return,
+            };
+            if self.scopes[1..]
+                .iter()
+                .any(|scope| scope.column_matches(qualifier, column, false) != 0)
+            {
+                return;
+            }
+            if let Some((index, _)) = self.keys.iter().find(|(_, key)| *key == candidate) {
+                *expr = Expr::GroupKeyRef {
+                    index: *index,
+                    expr: Box::new(expr.clone()),
+                };
+            }
+        }
+        fn walk_expr_children(&self, expr: &Expr) -> bool {
+            !matches!(expr, Expr::GroupKeyRef { .. })
+                && !(self.scopes.len() >= 2
+                    && aggregate_binds_to_outer_scope(expr, &self.scopes[0], &self.scopes[1..]))
+        }
+        fn continue_expr_walk(&self) -> bool {
+            self.error.is_none()
+        }
+    }
+    let outer_scope = build_column_scope(db, select, None)?;
+    let keys = select
+        .group_by
+        .iter()
+        .enumerate()
+        .filter_map(|(index, expr)| binding(&outer_scope, expr).map(|key| (index, key)))
+        .collect();
+    let mut visitor = Bind {
+        db,
+        keys,
+        scopes: Vec::new(),
+        error: None,
+    };
+    crate::parser::visit::visit_select_mut(&mut visitor, select);
+    visitor.error.map_or(Ok(()), Err)
 }
 
 fn bind_rollup_expr(
@@ -2952,6 +3435,9 @@ fn bind_rollup_expr(
     aliases: &HashMap<String, Expr>,
     allow_alias: bool,
 ) -> Result<Expr, QueryError> {
+    if matches!(expr, Expr::GroupKeyRef { .. }) {
+        return Ok(expr);
+    }
     if let Expr::Function { name, args, .. } = &expr {
         if is_aggregate_function(name) {
             return Ok(expr);
@@ -2969,7 +3455,14 @@ fn bind_rollup_expr(
                 // resolution as GROUP BY itself. This is deliberately local
                 // to each argument: integer literals nested inside an
                 // arithmetic/function expression remain values.
-                let resolved = resolve_group_ref_expr(arg.clone(), projection_exprs, aliases);
+                let resolved = if group_by
+                    .iter()
+                    .any(|group| expr_semantically_eq(group, arg))
+                {
+                    arg.clone()
+                } else {
+                    resolve_group_ref_expr(arg.clone(), projection_exprs, aliases)
+                };
                 let Some(idx) = group_by
                     .iter()
                     .position(|group_expr| expr_semantically_eq(group_expr, &resolved))
@@ -3664,6 +4157,44 @@ struct ColumnScope<'a> {
     outer: Option<&'a ColumnScope<'a>>,
 }
 
+/// Qualify a uniquely bound source column without interpreting output aliases.
+fn qualify_scope_column(expr: &mut Expr, scope: &ColumnScope<'_>) {
+    let (qualifier, column) = match expr {
+        Expr::Identifier(column) => (None, column.as_str()),
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+            Some(parts[parts.len() - 2].as_str()),
+            parts.last().unwrap().as_str(),
+        ),
+        _ => return,
+    };
+    let mut tables = scope.tables.iter().filter(|table| {
+        table.visible
+            && qualifier.is_none_or(|qualifier| table.matches_name(qualifier))
+            && table.has_column(column)
+    });
+    if let Some(table) = tables.next() {
+        if tables.next().is_none() {
+            *expr = Expr::CompoundIdentifier(vec![
+                table
+                    .alias
+                    .as_ref()
+                    .unwrap_or(&table.name)
+                    .to_ascii_lowercase(),
+                column.to_ascii_lowercase(),
+            ]);
+        }
+    }
+}
+
+fn canonical_scope_expr(expr: &Expr, scope: &ColumnScope<'_>) -> Expr {
+    let mut canonical = expr.clone();
+    crate::parser::visit::rewrite_value_expr(&mut canonical, |expr| {
+        qualify_scope_column(expr, scope);
+        !matches!(expr, Expr::GroupKeyRef { .. })
+    });
+    canonical
+}
+
 pub(crate) fn validate_select_column_references(
     db: &Database,
     select: &Select,
@@ -3978,11 +4509,6 @@ fn coalesced_rewrite_map(columns: &[JoinOutputColumn]) -> CoalescedRewrite {
     let mut rewrite = CoalescedRewrite::default();
     for col in columns.iter().filter(|col| col.coalesced) {
         let column_key = col.name.to_ascii_lowercase();
-        for qualifier in &col.qualifiers {
-            rewrite
-                .qualified
-                .insert((qualifier.clone(), column_key.clone()), col.expr.clone());
-        }
         if counts.get(&column_key).copied() == Some(1) {
             rewrite.unqualified.insert(column_key, col.expr.clone());
         }
@@ -4173,6 +4699,18 @@ fn distinct_order_is_selected(
             }
             fn enter_expr(&mut self, expr: &mut Expr) {
                 if self.nested == 0 {
+                    if matches!(
+                        expr,
+                        Expr::Literal(_)
+                            | Expr::Unary {
+                                op: crate::parser::UnaryOp::Neg,
+                                ..
+                            }
+                    ) {
+                        if let Ok(value) = crate::engine::expr::eval_const(expr) {
+                            *expr = Expr::BoundValue(value);
+                        }
+                    }
                     if let Some((idx, name)) = column(expr, self.scope) {
                         *expr = Expr::CompoundIdentifier(vec![
                             format!("__scope{idx}"),
@@ -5316,8 +5854,8 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         // order-providing index scan. The same plan then fell through to a
         // full-table TopK/TopWindow (and deep pages could reserve O(table)
         // sort-key memory) even for `ORDER BY PRIMARY KEY LIMIT ...`.
-        let limit_with_offset = ordered_limit_row_goal(select);
-        let row_goal = plain_limit_row_goal(select);
+        let limit_with_offset = ordered_limit_row_goal(db, select);
+        let row_goal = plain_limit_row_goal(db, select);
         let mut required = collect_required_columns(select, &tables[0]);
         // Security quals are bound after user-AST normalization. Covering
         // access must include their columns even when no user clause reads them.
@@ -6297,7 +6835,7 @@ fn finish_plan(
     {
         if let Some(pushed) = try_covering_index_aggregate_pushdown(ctx, select, &plan) {
             plan = pushed;
-            plan = apply_parallel_hints(plan, select);
+            plan = apply_parallel_hints(db, plan, select);
             apply_output_column_pruning_pass(&mut plan, select);
             synchronize_and_validate_plan_costs(&mut plan)?;
             return Ok(plan);
@@ -6316,7 +6854,7 @@ fn finish_plan(
     let having_has_aggregate = select.having.as_ref().is_some_and(has_aggregate_expr);
     let query_block_is_aggregate = !select.group_by.is_empty()
         || !select.grouping_sets.is_empty()
-        || has_aggregate_select_items(&select.projection)
+        || select_has_aggregate(db, select)
         || having_has_aggregate;
     if query_block_is_aggregate {
         let input_rows = estimated_rows(&plan);
@@ -6511,6 +7049,7 @@ fn finish_plan(
                 .group_by
                 .iter()
                 .map(|expr| OrderBy {
+                    names_bound: false,
                     expr: expr.clone(),
                     asc: true,
                     nulls_first: None,
@@ -6781,7 +7320,7 @@ fn finish_plan(
             cost,
         };
     }
-    plan = apply_parallel_hints(plan, select);
+    plan = apply_parallel_hints(db, plan, select);
     // Run output-column pruning AFTER the parallel rewrite: the rewrite
     // converts `SeqScan` into `Exchange { ParallelSeqScan }`, and the
     // streaming hash-join probe (the consumer that benefits) only
@@ -6947,7 +7486,7 @@ fn group_by_has_enum_empty_member(plan: &PhysicalPlan, group_by: &[Expr]) -> boo
 ///
 /// CTE scans and already-parallel nodes are not considered here — Phase 5
 /// (joins) handles its own parallel plan node.
-fn apply_parallel_hints(plan: PhysicalPlan, select: &Select) -> PhysicalPlan {
+fn apply_parallel_hints(db: &Database, plan: PhysicalPlan, select: &Select) -> PhysicalPlan {
     let mut requested_degree: Option<u32> = None;
     let mut suppressed = false;
     for hint in &select.query_hints {
@@ -6992,7 +7531,7 @@ fn apply_parallel_hints(plan: PhysicalPlan, select: &Select) -> PhysicalPlan {
             push_hint_warning("PARALLEL hint did not apply: effective degree is 1");
         }
     } else {
-        if plain_limit_row_goal(select).is_some() {
+        if plain_limit_row_goal(db, select).is_some() {
             return plan;
         }
         // Auto-parallel compares generic resource-model candidates at the
@@ -8233,13 +8772,13 @@ fn limit_usize(value: Option<&LimitValue>) -> Option<usize> {
     }
 }
 
-fn plain_limit_row_goal(select: &Select) -> Option<usize> {
+fn plain_limit_row_goal(db: &Database, select: &Select) -> Option<usize> {
     let limit = limit_usize(select.limit.as_ref())?;
     if !select.order_by.is_empty()
         || !select.group_by.is_empty()
         || select.having.is_some()
         || select.distinct
-        || has_aggregate_select_items(&select.projection)
+        || select_has_aggregate(db, select)
         || !select.named_windows.is_empty()
     {
         return None;
@@ -8247,7 +8786,7 @@ fn plain_limit_row_goal(select: &Select) -> Option<usize> {
     Some(limit.saturating_add(limit_usize(select.offset.as_ref()).unwrap_or(0)))
 }
 
-fn ordered_limit_row_goal(select: &Select) -> Option<usize> {
+fn ordered_limit_row_goal(db: &Database, select: &Select) -> Option<usize> {
     let limit = limit_usize(select.limit.as_ref())?;
     if select.order_by.is_empty()
         || select
@@ -8258,7 +8797,7 @@ fn ordered_limit_row_goal(select: &Select) -> Option<usize> {
         || !select.grouping_sets.is_empty()
         || select.having.is_some()
         || (select.distinct && !distinct_topk_is_safe(select))
-        || has_aggregate_select_items(&select.projection)
+        || select_has_aggregate(db, select)
         || has_window_in_projection(&select.projection)
         || !select.named_windows.is_empty()
     {
@@ -8516,6 +9055,7 @@ fn input_satisfies_grouping_order(plan: &PhysicalPlan, group_by: &[Expr]) -> boo
     let order_by: Vec<OrderBy> = group_by
         .iter()
         .map(|expr| OrderBy {
+            names_bound: false,
             expr: expr.clone(),
             asc: true,
             nulls_first: None,
@@ -8693,6 +9233,7 @@ fn input_satisfies_distinct_order(plan: &PhysicalPlan, projection: &[SelectItem]
     for item in projection {
         match item {
             SelectItem::Expr { expr, .. } => keys.push(OrderBy {
+                names_bound: false,
                 expr: expr.clone(),
                 asc: true,
                 nulls_first: None,
@@ -8791,6 +9332,21 @@ fn index_order_covers_order_by(
     true
 }
 
+fn validate_table_index_hints(table: &TableRef, schema: &TableSchema) -> Result<(), QueryError> {
+    for name in table.index_hints.iter().flat_map(|hint| &hint.index_names) {
+        if !schema
+            .iter_public_indexes()
+            .any(|index| index.name.eq_ignore_ascii_case(name))
+        {
+            return Err(error(
+                crate::error::catalog::ER_KEY_DOES_NOT_EXITS,
+                format!("Key '{name}' doesn't exist in table '{}'", schema.name),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> {
     if table.sample.is_some()
         && (table.generate_series.is_some()
@@ -8838,6 +9394,7 @@ fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> 
         ));
     }
     if let Some(plan_table) = plan_table_for_ref_if_resolved(db, table) {
+        validate_table_index_hints(table, &plan_table.schema)?;
         let mut plan_table = plan_table.with_system_time(table.system_time.clone());
         plan_table.sample = table.sample.clone();
         plan_table.explicit_partition_storage_ids =
@@ -8852,6 +9409,7 @@ fn plan_table(db: &Database, table: &TableRef) -> Result<PlanTable, QueryError> 
         return Err(error);
     }
     let schema = db.table(&table.name)?;
+    validate_table_index_hints(table, &schema)?;
     let sidecar = db.table_modification_delta(schema.id);
     let live_delta = db.table_live_row_delta(schema.id);
     if table.system_time.is_some() && schema.system {
@@ -9703,17 +10261,11 @@ fn expr_has_column_ref(expr: &Expr) -> bool {
 }
 
 fn expr_has_placeholder(expr: &Expr) -> bool {
-    match expr {
-        Expr::Placeholder(_) => true,
-        Expr::Unary { expr, .. } | Expr::IsNull(expr) | Expr::IsNotNull(expr) => {
-            expr_has_placeholder(expr)
-        }
-        Expr::Binary { left, right, .. } => {
-            expr_has_placeholder(left) || expr_has_placeholder(right)
-        }
-        Expr::Function { args, .. } => args.iter().any(expr_has_placeholder),
-        _ => false,
-    }
+    crate::parser::visit::any_expr_matching(
+        expr,
+        |node| matches!(node, Expr::Placeholder(_)),
+        |_| true,
+    )
 }
 
 /// Find a Public SPATIAL index over exactly `column`.
@@ -10074,7 +10626,7 @@ fn try_knn_vector_scan(
         || select.distinct
         || !select.group_by.is_empty()
         || !select.grouping_sets.is_empty()
-        || has_aggregate_select_items(&select.projection)
+        || select_has_aggregate(db, select)
         || select.having.is_some()
         || has_window_in_projection(&select.projection)
         || select
@@ -17110,7 +17662,7 @@ pub(crate) fn choose_join_with_hints(
     // of the left side. Without this, a LEFT/RIGHT/FULL NLJ could estimate
     // fewer rows than its preserved side, and a semi/anti NLJ could exceed
     // the left side — the same outer-join floor the hash-join path applies.
-    let inner_est = if join_type == JoinType::Cross {
+    let inner_est = if join_type == JoinType::Cross || condition.is_none() {
         left_rows * right_rows
     } else {
         let selectivity = condition
@@ -17160,6 +17712,7 @@ pub(crate) fn choose_join_with_hints(
             let inc_total = (nlj.total - outer.total).max(0.0);
             let inc_cpu = (nlj.cpu_units - outer.cpu_units).max(0.0);
             nlj.total = outer.total + inc_total / d;
+            nlj.startup = outer.startup + (nlj.startup - outer.startup).max(0.0) / d;
             nlj.cpu_units = outer.cpu_units + inc_cpu / d;
         }
     }
@@ -19040,9 +19593,6 @@ fn dependent_range_join_index(
                     })
                 })
                 .count();
-            if eq_prefix_len == 0 {
-                return None;
-            }
             let has_range = match index.key_part(eq_prefix_len) {
                 Some(crate::storage::IndexKeyPart::Column(column)) => {
                     conjuncts.iter().any(|expr| {
@@ -19055,6 +19605,24 @@ fn dependent_range_join_index(
                 }),
                 None => false,
             };
+            if eq_prefix_len == 0 && !has_range {
+                return None;
+            }
+            if eq_prefix_len == 0 {
+                let crate::storage::IndexKeyPart::Column(column) = index.key_part(0)? else {
+                    return None;
+                };
+                let position = table.schema.column_index(column).ok()?;
+                // String comparisons can promote to numeric or a different
+                // collation domain. Keep their residual scan until that
+                // three-operand ordering proof is bound explicitly.
+                if matches!(
+                    table.schema.result_type(position),
+                    crate::types::ColumnType::VarString | crate::types::ColumnType::Blob
+                ) {
+                    return None;
+                }
+            }
             let score = eq_prefix_len * 2 + if has_range { 1 } else { 0 };
             let unique_exact = index.unique && eq_prefix_len >= index.columns.len();
             let mut rows = estimate_index_lookup_rows(
@@ -19206,7 +19774,17 @@ fn equality_between_index_part_and_left_plan(
         return None;
     };
     use crate::engine::expr_type::ExprTypeKind;
-    let outer_type = crate::engine::executor::select::plan::physical_expr_type(left, outer).kind;
+    let outer_descriptor = crate::engine::executor::select::plan::physical_expr_type(left, outer);
+    let outer_type = outer_descriptor.kind;
+    if matches!(outer_type, ExprTypeKind::String { .. }) {
+        if let Some(crate::storage::IndexKeyPart::Column(name)) = index.key_part(pos) {
+            let position = table.schema.column_index(name).ok()?;
+            let inner_collation = table.schema.wire_column_source(position).collation_id;
+            if inner_collation != outer_descriptor.collation_id {
+                return None;
+            }
+        }
+    }
     let target = index_bounds::target_for_index_column(&table.schema, index, pos);
     // A numeric comparison can match multiple string encodings, and f64
     // equality can match several adjacent wide exact numbers. One index key
@@ -19344,6 +19922,23 @@ fn range_on_table_column_with_left_expr(
     column: &str,
     left: &PhysicalPlan,
 ) -> Option<(BinaryOp, Expr)> {
+    if let Expr::Between {
+        expr: value,
+        low,
+        high,
+        negated: false,
+    } = expr
+    {
+        if expr_matches_table_column(value, table, column) && expr_can_resolve_in_plan(low, left) {
+            return Some((BinaryOp::GtEq, (**low).clone()));
+        }
+        if expr_matches_table_column(low, table, column) && expr_can_resolve_in_plan(value, left) {
+            return Some((BinaryOp::LtEq, (**value).clone()));
+        }
+        if expr_matches_table_column(high, table, column) && expr_can_resolve_in_plan(value, left) {
+            return Some((BinaryOp::GtEq, (**value).clone()));
+        }
+    }
     let Expr::Binary {
         left: a,
         op,
@@ -22062,21 +22657,84 @@ pub(crate) fn collect_aggregate_calls(select: &Select) -> Vec<Expr> {
     out
 }
 
+fn aggregate_binds_to_outer_scope(
+    expr: &Expr,
+    outer: &ColumnScope<'_>,
+    inner: &[ColumnScope<'_>],
+) -> bool {
+    if !matches!(expr, Expr::Function { name, .. } if is_aggregate_function(name)) {
+        return false;
+    }
+    let mut references = 0usize;
+    let mut owned = true;
+    crate::parser::visit::inspect_value_expr(
+        expr,
+        |node| {
+            let (qualifier, column) = match node {
+                Expr::Identifier(name) => (None, name.as_str()),
+                Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                    Some(parts[parts.len() - 2].as_str()),
+                    parts.last().unwrap().as_str(),
+                ),
+                Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
+                    owned = false;
+                    return false;
+                }
+                _ => return true,
+            };
+            references += 1;
+            owned &= outer.column_matches(qualifier, column, false) == 1
+                && inner
+                    .iter()
+                    .all(|scope| scope.column_matches(qualifier, column, false) == 0);
+            false
+        },
+        |_| {},
+    );
+    owned && references > 0
+}
+
 /// Include aggregates whose arguments bind entirely to this query block
 /// even though the call is written inside a correlated scalar subquery.
-fn collect_aggregate_calls_scoped(db: &Database, select: &Select) -> Vec<Expr> {
-    let mut calls = collect_aggregate_calls(select);
-    if !crate::parser::visit::select_body_contains_subquery(select) {
-        return calls;
+fn for_each_outer_owned_aggregate<'q>(
+    db: &Database,
+    select: &Select,
+    exprs: impl Iterator<Item = &'q Expr> + Clone,
+    visit: &mut dyn FnMut(&Expr),
+) {
+    if !exprs
+        .clone()
+        .any(crate::parser::visit::value_expr_contains_subquery)
+    {
+        return;
+    }
+    // Ordinary correlated lookups have no aggregate ownership to resolve.
+    // Avoid catalog lookups and scope allocations for those expressions.
+    if !exprs.clone().any(|expr| {
+        crate::parser::visit::any_expr(
+            expr,
+            |node| matches!(node, Expr::Function { name, .. } if is_aggregate_function(name)),
+        )
+    }) {
+        return;
     }
     let Ok(outer) = build_column_scope(db, select, None) else {
-        return calls;
+        return;
     };
+    for_each_nested_owned_aggregate(db, &outer, exprs, visit);
+}
+
+fn for_each_nested_owned_aggregate<'q>(
+    db: &Database,
+    outer: &ColumnScope<'_>,
+    exprs: impl IntoIterator<Item = &'q Expr>,
+    visit: &mut dyn FnMut(&Expr),
+) {
     struct Collector<'a> {
         db: &'a Database,
         outer: &'a ColumnScope<'a>,
         scopes: Vec<ColumnScope<'static>>,
-        calls: &'a mut Vec<Expr>,
+        visit: &'a mut dyn FnMut(&Expr),
     }
     impl crate::parser::visit::AstVisitor for Collector<'_> {
         fn enter_select(&mut self, select: &Select) {
@@ -22096,60 +22754,82 @@ fn collect_aggregate_calls_scoped(db: &Database, select: &Select) -> Vec<Expr> {
             {
                 return;
             }
-            let mut references = 0usize;
-            let mut owned = true;
-            crate::parser::visit::inspect_value_expr(
-                expr,
-                |node| {
-                    let (qualifier, column) = match node {
-                        Expr::Identifier(name) => (None, name.as_str()),
-                        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
-                            Some(parts[parts.len() - 2].as_str()),
-                            parts.last().unwrap().as_str(),
-                        ),
-                        Expr::Subquery(_) | Expr::Exists { .. } | Expr::InSubquery { .. } => {
-                            owned = false;
-                            return false;
-                        }
-                        _ => return true,
-                    };
-                    references += 1;
-                    owned &= self.outer.column_matches(qualifier, column, false) == 1
-                        && self
-                            .scopes
-                            .iter()
-                            .all(|scope| scope.column_matches(qualifier, column, false) == 0);
-                    false
-                },
-                |_| {},
-            );
-            if owned
-                && references > 0
-                && !self
-                    .calls
-                    .iter()
-                    .any(|call| expr_semantically_eq(call, expr))
-            {
-                self.calls.push(expr.clone());
+            if aggregate_binds_to_outer_scope(expr, self.outer, &self.scopes) {
+                (self.visit)(expr);
             }
         }
     }
     let mut collector = Collector {
         db,
-        outer: &outer,
+        outer,
         scopes: Vec::new(),
-        calls: &mut calls,
+        visit,
     };
-    for item in &select.projection {
-        if let SelectItem::Expr { expr, .. } = item {
-            crate::parser::visit::visit_expr(&mut collector, expr);
-        }
-    }
-    if let Some(expr) = &select.having {
+    for expr in exprs {
         crate::parser::visit::visit_expr(&mut collector, expr);
     }
-    for order in &select.order_by {
-        crate::parser::visit::visit_expr(&mut collector, &order.expr);
+}
+
+fn projection_having_exprs(select: &Select) -> impl Iterator<Item = &Expr> + Clone {
+    select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .chain(select.having.iter())
+}
+
+pub(crate) fn select_order_has_aggregate(db: &Database, select: &Select) -> bool {
+    if select
+        .order_by
+        .iter()
+        .any(|order| has_aggregate_expr(&order.expr))
+    {
+        return true;
+    }
+    let mut found = false;
+    for_each_outer_owned_aggregate(
+        db,
+        select,
+        select.order_by.iter().map(|order| &order.expr),
+        &mut |_| found = true,
+    );
+    found
+}
+
+/// Whether this block owns an aggregate, including calls written in nested
+/// query blocks whose arguments resolve only to this block. Local aggregates
+/// in an independent subquery do not collapse the enclosing input rows.
+pub(crate) fn select_has_aggregate(db: &Database, select: &Select) -> bool {
+    if has_aggregate_select_items(&select.projection)
+        || select.having.as_ref().is_some_and(has_aggregate_expr)
+    {
+        return true;
+    }
+    let mut found = false;
+    for_each_outer_owned_aggregate(db, select, projection_having_exprs(select), &mut |_| {
+        found = true
+    });
+    found
+}
+
+pub(crate) fn collect_aggregate_calls_scoped(db: &Database, select: &Select) -> Vec<Expr> {
+    let mut calls = collect_aggregate_calls(select);
+    let had_calls = !calls.is_empty();
+    for_each_outer_owned_aggregate(
+        db,
+        select,
+        projection_having_exprs(select).chain(select.order_by.iter().map(|order| &order.expr)),
+        &mut |expr| {
+            if !calls.iter().any(|call| expr_semantically_eq(call, expr)) {
+                calls.push(expr.clone());
+            }
+        },
+    );
+    if !had_calls && !calls.is_empty() {
+        append_hidden_group_column_aggregates(select, &mut calls);
     }
     calls
 }
@@ -22208,16 +22888,6 @@ fn append_hidden_group_column_aggregates(select: &Select, out: &mut Vec<Expr>) {
             args: vec![col],
             distinct: false,
         });
-    }
-}
-
-/// Lowercased bare column name of a column-reference expression (the last
-/// identifier component), or None for anything else.
-fn column_bare_name(expr: &Expr) -> Option<String> {
-    match expr {
-        Expr::Identifier(name) => Some(name.to_ascii_lowercase()),
-        Expr::CompoundIdentifier(parts) => parts.last().map(|p| p.to_ascii_lowercase()),
-        _ => None,
     }
 }
 
@@ -22328,7 +22998,11 @@ fn collect_correlated_group_columns_checked(
     // Stop at aggregate nodes; elsewhere recurse until a nested query block is
     // found and attribute its unresolved references to this outer block.
     match expr {
-        Expr::Function { name, .. } if is_aggregate_function(name) => Ok(()),
+        Expr::Function { name, .. }
+            if is_aggregate_function(name) || name.eq_ignore_ascii_case("ANY_VALUE") =>
+        {
+            Ok(())
+        }
         Expr::Subquery(subquery) | Expr::Exists { subquery, .. } => {
             collect_one(db, subquery, outer_scope, seen_keys, out)
         }
@@ -22431,7 +23105,7 @@ fn collect_correlated_group_columns_checked(
 /// column name); it never rejects a query MySQL accepts.
 pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result<(), QueryError> {
     use std::collections::HashSet;
-    let has_agg = has_aggregate_select_items(&select.projection)
+    let has_agg = select_has_aggregate(db, select)
         || select.having.as_ref().is_some_and(expr_has_aggregate)
         || select
             .order_by
@@ -22524,10 +23198,37 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
     if hidden.is_empty() {
         return Ok(());
     }
-    // Build the allowed bare-name closure. Seed with GROUP BY columns.
+    // Functional dependencies belong to relation instances, including aliases.
+    let column_key = |expr: &Expr| -> Option<String> {
+        let expr = match expr {
+            Expr::GroupKeyRef { expr, .. } => expr.as_ref(),
+            expr => expr,
+        };
+        let (qualifier, column) = match expr {
+            Expr::Identifier(column) => (None, column.as_str()),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                Some(parts[parts.len() - 2].as_str()),
+                parts.last()?.as_str(),
+            ),
+            _ => return None,
+        };
+        let mut key = None;
+        for (index, table) in outer_scope.tables.iter().enumerate() {
+            if table.visible
+                && qualifier.is_none_or(|q| matches_table(q, &table.name, table.alias.as_deref()))
+                && table.columns.iter().any(|c| c.eq_ignore_ascii_case(column))
+            {
+                if key.is_some() {
+                    return None;
+                }
+                key = Some(format!("{index}\0{}", column.to_ascii_lowercase()));
+            }
+        }
+        key
+    };
     let mut allowed: HashSet<String> = HashSet::new();
     for g in &select.group_by {
-        if let Some(name) = column_bare_name(g) {
+        if let Some(name) = column_key(g) {
             allowed.insert(name);
         }
     }
@@ -22544,7 +23245,7 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
             } = c
             {
                 if list.len() == 1 && is_constant_fd_expr(&list[0]) {
-                    if let Some(column) = column_bare_name(expr) {
+                    if let Some(column) = column_key(expr) {
                         allowed.insert(column);
                     }
                 }
@@ -22555,7 +23256,7 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
                 right,
             } = c
             {
-                match (column_bare_name(left), column_bare_name(right)) {
+                match (column_key(left), column_key(right)) {
                     (Some(l), Some(r)) => equalities.push((l, r)),
                     (Some(l), None) if is_constant_fd_expr(right) => {
                         allowed.insert(l);
@@ -22568,15 +23269,34 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
             }
         }
     }
+    for join in &select.joins {
+        if matches!(join.join_type, JoinType::Inner | JoinType::Cross) {
+            if let Some(condition) = &join.condition {
+                let mut conjuncts = Vec::new();
+                split_conjuncts(condition, &mut conjuncts);
+                for conjunct in conjuncts {
+                    if let Expr::Binary {
+                        left,
+                        op: BinaryOp::Eq,
+                        right,
+                    } = conjunct
+                    {
+                        if let (Some(left), Some(right)) = (column_key(&left), column_key(&right)) {
+                            equalities.push((left, right));
+                        }
+                    }
+                }
+            }
+        }
+    }
     // Base tables in scope (primary + joins). Derived/subquery refs fail
     // `db.table` and are skipped.
-    let mut base_tables: Vec<String> = Vec::new();
-    for t in &select.from {
-        base_tables.push(t.name.clone());
-    }
-    for j in &select.joins {
-        base_tables.push(j.table.name.clone());
-    }
+    let base_tables: Vec<_> = outer_scope
+        .tables
+        .iter()
+        .enumerate()
+        .filter(|(_, table)| table.visible)
+        .collect();
     // Fixpoint: equality propagation + PK / UNIQUE-NOT-NULL key closure.
     loop {
         let before = allowed.len();
@@ -22588,22 +23308,21 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
                 allowed.insert(l.clone());
             }
         }
-        for tname in &base_tables {
-            let Ok(schema) = db.table(tname) else {
+        for (table_index, table) in &base_tables {
+            let Ok(schema) = db.table(&table.name) else {
                 continue;
             };
             let determines = {
                 let pk_ok = !schema.primary_key.is_empty()
-                    && schema
-                        .primary_key
-                        .iter()
-                        .all(|c| allowed.contains(&c.to_ascii_lowercase()));
+                    && schema.primary_key.iter().all(|c| {
+                        allowed.contains(&format!("{table_index}\0{}", c.to_ascii_lowercase()))
+                    });
                 pk_ok
                     || schema.indexes.iter().any(|idx| {
                         idx.unique
                             && !idx.columns.is_empty()
                             && idx.columns.iter().all(|c| {
-                                let lc = c.to_ascii_lowercase();
+                                let lc = format!("{table_index}\0{}", c.to_ascii_lowercase());
                                 allowed.contains(&lc)
                                     && schema
                                         .columns
@@ -22616,7 +23335,7 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
             };
             if determines {
                 for col in &schema.columns {
-                    allowed.insert(col.name.to_ascii_lowercase());
+                    allowed.insert(format!("{table_index}\0{}", col.name.to_ascii_lowercase()));
                 }
             }
         }
@@ -22627,7 +23346,7 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
     // Flag the first hidden column not covered by the closure. Columns whose
     // bare name can't be extracted are left alone (safe / permissive).
     for col in &hidden {
-        if let Some(name) = column_bare_name(col) {
+        if let Some(name) = column_key(col) {
             if !allowed.contains(&name) {
                 let disp = column_display_name(col);
                 if select.group_by.is_empty() && select.grouping_sets.is_empty() && has_agg {
@@ -22684,12 +23403,12 @@ fn collect_hidden_group_columns(
                     false
                 }
                 Expr::Function { name, .. } => {
-                    !is_aggregate_function(name) && name != crate::parser::FT_MATCH_FUNCTION
+                    !is_aggregate_function(name)
+                        && !name.eq_ignore_ascii_case("ANY_VALUE")
+                        && name != crate::parser::FT_MATCH_FUNCTION
                 }
                 Expr::Subquery(_)
                 | Expr::Exists { .. }
-                | Expr::InSubquery { .. }
-                | Expr::QuantifiedComparison { .. }
                 | Expr::WindowFunction { .. }
                 | Expr::GroupKeyRef { .. } => false,
                 _ => true,
@@ -22874,6 +23593,18 @@ fn has_aggregate_select_items(items: &[SelectItem]) -> bool {
 }
 
 pub(crate) fn has_aggregate_expr(expr: &Expr) -> bool {
+    match expr {
+        Expr::Identifier(_)
+        | Expr::CompoundIdentifier(_)
+        | Expr::Literal(_)
+        | Expr::BoundValue(_)
+        | Expr::Placeholder(_)
+        | Expr::SystemVariable { .. }
+        | Expr::UserVariable(_)
+        | Expr::Wildcard => return false,
+        Expr::Function { name, .. } if is_aggregate_function(name) => return true,
+        _ => {}
+    }
     crate::parser::visit::any_expr_matching(
         expr,
         |node| match node {
@@ -23131,12 +23862,23 @@ impl EnumSetColumns {
     }
 
     fn add_table(&mut self, db: &Database, name: &str, alias: Option<&str>) {
-        if crate::engine::executor::cte::has_cte(name) {
+        if let Some(cte) = crate::engine::executor::cte::lookup_cte(name) {
+            let schema = crate::storage::TableSchema::synthetic_for_planning(name, &cte.columns);
+            self.add_schema(&schema, name, alias);
             return;
         }
         let Ok(schema) = db.table(name) else {
             return;
         };
+        self.add_schema(&schema, name, alias);
+    }
+
+    fn add_schema(
+        &mut self,
+        schema: &crate::storage::TableSchema,
+        name: &str,
+        alias: Option<&str>,
+    ) {
         let mut qualifiers = vec![alias.unwrap_or(name).to_ascii_lowercase()];
         if alias.is_none() {
             qualifiers.push(schema.name.to_ascii_lowercase());
@@ -23179,7 +23921,7 @@ impl EnumSetColumns {
         }
     }
 
-    fn resolve(&self, expr: &Expr) -> Option<&EnumSetEntry> {
+    fn resolve(&self, expr: &Expr) -> Option<std::borrow::Cow<'_, EnumSetEntry>> {
         match expr {
             // GROUP BY binding wraps references used by projection
             // expressions before the ENUM numeric-context rewrite runs. The
@@ -23189,11 +23931,44 @@ impl EnumSetColumns {
             Expr::Identifier(name) => self
                 .unqualified
                 .get(&name.to_ascii_lowercase())
-                .and_then(|entry| entry.as_deref()),
+                .and_then(|entry| entry.as_deref())
+                .map(std::borrow::Cow::Borrowed),
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                 let table = parts[..parts.len() - 1].join(".").to_ascii_lowercase();
                 let column = parts[parts.len() - 1].to_ascii_lowercase();
-                self.qualified.get(&(table, column)).map(Arc::as_ref)
+                self.qualified
+                    .get(&(table, column))
+                    .map(|entry| std::borrow::Cow::Borrowed(entry.as_ref()))
+            }
+            Expr::Function { name, args, .. }
+                if name.eq_ignore_ascii_case("__COLLATED_CONST") && args.len() >= 4 =>
+            {
+                let Expr::Literal(crate::parser::Literal::Int(flags)) = &args[3] else {
+                    return None;
+                };
+                let flags = u16::try_from(*flags).ok()?;
+                if flags & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+                    == 0
+                {
+                    return None;
+                }
+                let Expr::Literal(crate::parser::Literal::String(collation)) = &args[1] else {
+                    return None;
+                };
+                let values = args[4..]
+                    .iter()
+                    .map(|arg| match arg {
+                        Expr::Literal(crate::parser::Literal::String(member)) => {
+                            Some(member.clone())
+                        }
+                        _ => None,
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                Some(std::borrow::Cow::Owned(EnumSetEntry {
+                    is_set: flags & crate::mysql::protocol::SET_FLAG != 0,
+                    collation: Some(collation.clone()),
+                    values,
+                }))
             }
             _ => None,
         }
@@ -25684,6 +26459,9 @@ fn projected_indices_for_referenced(
     let total = table.schema.columns.len();
     let mut indices = Vec::with_capacity(total);
     for (i, col) in table.schema.columns.iter().enumerate() {
+        if col.state == crate::storage::ColumnState::Dropped {
+            continue;
+        }
         if referenced.contains(&normalize_expr_column(&col.name)) {
             indices.push(i);
         }

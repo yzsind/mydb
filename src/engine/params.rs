@@ -33,12 +33,15 @@ use crate::types::Value;
 pub struct ParamContextSnapshot {
     params: Vec<Value>,
     auto_parameterized: bool,
+    internal_param_start: usize,
 }
 
 impl ParamContextSnapshot {
     #[inline]
     pub fn run<R>(&self, f: impl FnOnce() -> R) -> R {
-        with_params_slice_and_provenance(&self.params, self.auto_parameterized, f)
+        with_parameter_scope(self.internal_param_start, || {
+            with_params_slice_and_provenance(&self.params, self.auto_parameterized, f)
+        })
     }
 }
 
@@ -59,6 +62,7 @@ impl ParamSliceRef {
 }
 
 thread_local! {
+    static INTERNAL_PARAM_START: Cell<usize> = const { Cell::new(usize::MAX) };
     static PARAMS: Cell<ParamSliceRef> = const { Cell::new(ParamSliceRef::EMPTY) };
     /// Bumped on every install/restore of `PARAMS`, so derived per-binding
     /// facts can be cached without trusting a possibly reused slice address.
@@ -137,6 +141,31 @@ pub fn has_active_params() -> bool {
     !PARAMS.with(|c| c.get()).ptr.is_null()
 }
 
+/// Install the source boundary for a new parameter namespace.
+pub(crate) fn with_parameter_scope<R>(internal_start: usize, f: impl FnOnce() -> R) -> R {
+    struct Restore(usize);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INTERNAL_PARAM_START.with(|slot| slot.set(self.0));
+        }
+    }
+    let previous = INTERNAL_PARAM_START.with(|slot| slot.replace(internal_start));
+    let _guard = Restore(previous);
+    f()
+}
+
+/// Correlated columns appended to an existing binding retain column semantics.
+pub(crate) fn with_internal_param_start<R>(start: usize, f: impl FnOnce() -> R) -> R {
+    let start = INTERNAL_PARAM_START.with(|slot| start.min(slot.get()));
+    with_parameter_scope(start, f)
+}
+
+pub(crate) fn user_parameter_active(index: usize) -> bool {
+    !auto_parameterized_active()
+        && has_active_param(index)
+        && INTERNAL_PARAM_START.with(|slot| index < slot.get())
+}
+
 /// Whether the active binding originated from text auto-parameterization.
 #[inline]
 pub fn auto_parameterized_active() -> bool {
@@ -155,11 +184,39 @@ pub(crate) fn current_binding_identity() -> usize {
 /// their planning-time baked count.
 #[inline]
 pub fn current_param_usize(idx: usize) -> Option<usize> {
-    match current_param(idx)? {
-        Value::Int(n) if n >= 0 => usize::try_from(n).ok(),
-        Value::UInt(n) => usize::try_from(n).ok(),
-        _ => None,
-    }
+    limit_param_usize(&current_param(idx)?).ok()
+}
+
+pub(crate) fn limit_param_usize(value: &Value) -> Result<usize, crate::types::QueryError> {
+    let wrong_arguments = || {
+        crate::error::catalog::ER_WRONG_ARGUMENTS
+            .error("LIMIT/OFFSET parameter must be an integer or an integer string")
+    };
+    let out_of_range = || {
+        crate::error::catalog::ER_DATA_OUT_OF_RANGE
+            .error("unsigned integer value is out of range in LIMIT/OFFSET")
+    };
+    let parse_integer = |text: &str| {
+        text.trim_matches(|c: char| c.is_ascii_whitespace())
+            .parse::<i128>()
+            .map_err(|err| match err.kind() {
+                std::num::IntErrorKind::PosOverflow | std::num::IntErrorKind::NegOverflow => {
+                    out_of_range()
+                }
+                _ => wrong_arguments(),
+            })
+    };
+    let number = match value {
+        Value::Int(n) => i128::from(*n),
+        Value::UInt(n) => i128::from(*n),
+        Value::String(text) => parse_integer(text)?,
+        Value::Bytes(bytes) => {
+            parse_integer(std::str::from_utf8(bytes).map_err(|_| wrong_arguments())?)?
+        }
+        Value::Null => 0,
+        _ => return Err(wrong_arguments()),
+    };
+    usize::try_from(number).map_err(|_| out_of_range())
 }
 
 /// Capture a clone of the active parameter context, suitable for handing
@@ -202,6 +259,7 @@ pub fn snapshot_current_context() -> Option<ParamContextSnapshot> {
     snapshot_current_params().map(|params| ParamContextSnapshot {
         params,
         auto_parameterized: auto_parameterized_active(),
+        internal_param_start: INTERNAL_PARAM_START.with(Cell::get),
     })
 }
 
@@ -332,6 +390,64 @@ mod tests {
     use super::*;
 
     #[test]
+    fn limit_parameters_validate_complete_integer_strings_and_ranges() {
+        for (text, expected) in [
+            ("0", 0),
+            ("+2", 2),
+            (" 2 ", 2),
+            (&usize::MAX.to_string(), usize::MAX),
+        ] {
+            for value in [
+                Value::String(text.into()),
+                Value::Bytes(text.as_bytes().to_vec()),
+            ] {
+                assert_eq!(limit_param_usize(&value).unwrap(), expected, "{value:?}");
+            }
+        }
+        for text in ["invalid", "", " ", "2abc", "2.5", "2e1", "+", "-", "１２"] {
+            for value in [
+                Value::String(text.into()),
+                Value::Bytes(text.as_bytes().to_vec()),
+            ] {
+                assert_eq!(
+                    limit_param_usize(&value).unwrap_err().code(),
+                    1210,
+                    "{value:?}"
+                );
+            }
+        }
+        for text in [
+            "-1".to_string(),
+            (usize::MAX as u128 + 1).to_string(),
+            "9".repeat(100),
+            format!("-{}", "9".repeat(100)),
+        ] {
+            for value in [
+                Value::String(text.clone()),
+                Value::Bytes(text.as_bytes().to_vec()),
+            ] {
+                assert_eq!(
+                    limit_param_usize(&value).unwrap_err().code(),
+                    1690,
+                    "{value:?}"
+                );
+            }
+        }
+        for value in [
+            Value::Bytes(vec![0xff]),
+            Value::Float(2.0),
+            Value::Double(2.0),
+        ] {
+            assert_eq!(
+                limit_param_usize(&value).unwrap_err().code(),
+                1210,
+                "{value:?}"
+            );
+        }
+        assert_eq!(limit_param_usize(&Value::Null).unwrap(), 0);
+    }
+
+    #[test]
     fn no_params_returns_none() {
         assert!(current_param(0).is_none());
         assert!(!has_active_params());
@@ -452,13 +568,7 @@ pub(crate) fn validate_limit(
     let Some(value) = current_param(*index) else {
         return Ok(());
     };
-    match value {
-        Value::Int(n) if n < 0 => Err(crate::error::catalog::ER_DATA_OUT_OF_RANGE
-            .error("unsigned integer value is out of range in LIMIT/OFFSET")),
-        Value::Int(_) | Value::UInt(_) => Ok(()),
-        _ => Err(crate::error::catalog::ER_WRONG_ARGUMENTS
-            .error("LIMIT/OFFSET parameter must be a non-negative integer")),
-    }
+    limit_param_usize(&value).map(|_| ())
 }
 
 pub(crate) fn snapshot_selected_context(
@@ -484,5 +594,6 @@ pub(crate) fn snapshot_selected_context(
     Ok(Some(ParamContextSnapshot {
         params,
         auto_parameterized: auto_parameterized_active(),
+        internal_param_start: INTERNAL_PARAM_START.with(Cell::get),
     }))
 }

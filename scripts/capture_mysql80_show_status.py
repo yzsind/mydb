@@ -18,7 +18,9 @@ from typing import Any
 
 
 EXPECTED_VERSION = "8.0.46"
-DEFAULT_OUTPUT = pathlib.Path("docs/fixtures/mysql80-show-status-8.0.46.json")
+DEFAULT_OUTPUT = pathlib.Path(__file__).resolve().parents[1] / (
+    "tests/fixtures/mysql80/mysql80-show-status-8.0.46.json"
+)
 
 
 def mysql_rows(argv: list[str], sql: str) -> list[list[str]]:

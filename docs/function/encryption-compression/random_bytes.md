@@ -14,11 +14,11 @@ RANDOM_BYTES(len)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `len` | Yes | Integer | The 1st argument; the length, interpreted according to the function's character or byte semantics |
+| `len` | Yes | Integer 1..1024 | Requested byte count, not bit count. |
 
 ## Return Value
 
-Returns cryptographically random bytes of the specified length. The return type is determined by the function semantics and the input types.
+Returns binary random data of exactly len bytes, where len is 1..1024. SQL NULL returns NULL; an out-of-range length raises 1690/22003.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 16
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`AES_ENCRYPT`](aes_encrypt.md), [`AES_DECRYPT`](aes_decrypt.md).

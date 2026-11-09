@@ -20,7 +20,7 @@ JSON_ARRAY_INSERT(json_doc, path, value [, path, value] ...)
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns a JSON document after inserting before each selected array element. Array positions beyond the end insert at the end; unsupported/non-array paths are ignored or rejected according to path validity. SQL NULL document or path returns SQL NULL; a SQL NULL value argument becomes JSON null.
 
 ## Examples
 
@@ -32,8 +32,8 @@ Result: [1, 2, 3]
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_SET`](json_set.md), [`JSON_INSERT`](json_insert.md), [`JSON_REPLACE`](json_replace.md), [`JSON_REMOVE`](json_remove.md).

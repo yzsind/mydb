@@ -373,7 +373,7 @@ fn coalesce_wrapped_sum_empty_table_returns_zero() {
         &engine,
         "SELECT COUNT(*), COALESCE(SUM(w_ytd), 0) FROM w WHERE w_id > 100",
     );
-    assert_eq!(row, vec![Value::Int(0), Value::Int(0)]);
+    assert_eq!(row, vec![Value::Int(0), dec(0, 2)]);
 }
 
 #[test]
@@ -385,7 +385,7 @@ fn ifnull_wrapped_aggregates() {
         &engine,
         "SELECT IFNULL(MAX(w_ytd), -1), IFNULL(MIN(w_ytd), -1) FROM w WHERE tag = 'zzz'",
     );
-    assert_eq!(row, vec![Value::Int(-1), Value::Int(-1)]);
+    assert_eq!(row, vec![dec(-100, 2), dec(-100, 2)]);
 }
 
 #[test]

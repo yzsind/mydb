@@ -31,8 +31,8 @@ Result: `POLYGON((1 2,2 2,2 3,1 3,1 2))`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_CENTROID`](st_centroid.md), [`ST_CONVEXHULL`](st_convexhull.md), [`ST_ENVELOPE`](st_envelope.md), [`ST_SIMPLIFY`](st_simplify.md).

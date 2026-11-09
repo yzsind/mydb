@@ -51,3 +51,68 @@
 | [`UCASE`](ucase.md) | Converts a string to uppercase; an alias of `UPPER`. |
 | [`UNHEX`](unhex.md) | Decodes hexadecimal text into a byte string. |
 | [`UPPER`](upper.md) | Converts a string to uppercase. |
+
+
+## Text and binary semantics
+
+Text strings have a character set and collation; binary strings are byte sequences.
+LENGTH/OCTET_LENGTH and BIT_LENGTH measure encoded bytes, whereas CHAR_LENGTH and
+text slicing count Unicode scalar characters, not display width or grapheme clusters.
+ASCII reads the first encoded byte and ORD combines the encoded bytes of the first
+character. Use `SET NAMES utf8mb4` for the multibyte examples on these pages.
+
+Search/position and STRCMP functions use their resolved comparison semantics.
+REPLACE and SUBSTRING_INDEX delimiter matching are case-sensitive. LOWER/UPPER
+perform character conversion; binary values do not have letter case. Do not assume
+that a case-insensitive connection makes every string operation case-insensitive.
+Positions start at 1. SUBSTRING supports negative positions; a position returned
+by INSTR/LOCATE is 0 when no match exists.
+
+NULL is distinct from empty text. CONCAT propagates NULL; CONCAT_WS skips NULL
+values but returns NULL for a NULL separator. CHAR skips NULL code arguments;
+LIST_ADD/LIST_DROP reject NULL; QUOTE(NULL) returns the text NULL. The function
+pages state these exceptions explicitly.
+
+REPEAT/SPACE/LPAD/RPAD and other constructed strings are bounded by
+max_allowed_packet and governed memory. A packet-overflow result can be NULL with
+warning 1301; memory/cancellation failures are errors. Use HEX for binary output
+and prepared placeholders for application values, rather than building SQL literals.
+
+
+## Regular expression rules
+
+| Argument | Default and meaning |
+| --- | --- |
+| pos | 1; one-based start position |
+| occurrence in INSTR/SUBSTR | 1; positive match number |
+| occurrence in REPLACE | 0; replace every match, or a positive selected occurrence |
+| return_option in INSTR | 0 for match start, 1 for the position just after its end |
+| match_type | Resolved collation supplies the default case sensitivity |
+
+| Flag | Effect |
+| --- | --- |
+| i | Case-insensitive matching |
+| c | Case-sensitive matching |
+| m | Multiline anchors |
+| n | Dot matches line terminators |
+| u | Unix line-ending behavior |
+
+When c and i both occur, the rightmost setting wins. Unknown flags are errors.
+Patterns support ordinary alternation, groups, classes, repetition, anchors and
+the implemented MySQL/POSIX constructs. Unsupported constructs, including pattern
+backreferences, raise a regex diagnostic rather than being silently ignored.
+ICU_VERSION is a compatibility string, not evidence of a complete ICU engine.
+
+Text positions count characters. All-binary operands use byte matching and preserve
+binary results; mixing binary/text regex operands raises 3995. Empty matches are
+valid; replacement advances after them rather than repeatedly replacing at one
+position. INSTR returns 0 for no match; SUBSTR returns NULL; REPLACE preserves the
+source. Patterns exceeding 8192 encoded bytes raise the implementation resource-limit diagnostic.
+Numeric bounds and pattern/result memory are checked before unbounded work.
+
+SQL string parsing consumes backslashes before the regex parser sees them. Under
+the ordinary SQL mode, double a backslash that must reach a pattern or replacement;
+NO_BACKSLASH_ESCAPES changes that SQL-literal step. Replacement capture references
+use $1, $2 and the supported ${name} form; backslash escapes a following replacement
+character and is not the capture-number introducer; use prepared parameters to avoid
+confusing SQL escaping with regex escaping.

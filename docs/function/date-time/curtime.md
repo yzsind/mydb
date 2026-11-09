@@ -14,11 +14,11 @@ CURTIME([fsp])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `fsp` | No | Integer from 0 to 6 | The 1st argument; the meaning is determined by the function syntax and description |
+| `fsp` | No | Integer from 0 to 6 | Fractional-second digits, 0 through 6; defaults to 0. |
 
 ## Return Value
 
-Returns a date, time, datetime, string, or numeric value; invalid input produces `NULL`, a warning, or an error according to the current SQL mode.
+Returns a TIME for the statement-start instant in the session time zone. fsp defaults to 0 and must be 0 through 6.
 
 ## Examples
 
@@ -30,7 +30,7 @@ Result: Returns the current session-zone TIME with three fractional digits, for 
 
 ## Notes
 
-- Date and time functions follow the session `time_zone`, `sql_mode`, and fractional-seconds precision settings.
+- See [temporal inputs and precision](README.md#temporal-inputs-and-precision) for SQL mode, input conversion, fractional seconds, and range diagnostics.
 
 ## Related Functions
 

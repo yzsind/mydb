@@ -4848,6 +4848,11 @@ fn parse_routine_param(sql: &str, kind: RoutineKind) -> Result<RoutineParam, Par
             "routine parameter requires a data type",
         ));
     }
+    if top_level_keyword_pos(&data_type_sql, "DEFAULT").is_some() {
+        return Err(parse_error_at_zero(
+            "routine parameters do not support DEFAULT values",
+        ));
+    }
     let (data_type, unsigned) = parse_routine_data_type(&data_type_sql)?;
     Ok(RoutineParam {
         name: unquote_identifier(name),
@@ -4859,6 +4864,27 @@ fn parse_routine_param(sql: &str, kind: RoutineKind) -> Result<RoutineParam, Par
 }
 
 fn parse_routine_data_type(sql: &str) -> Result<(DataType, bool), ParseError> {
+    // Column conversion supplies legacy default widths. Routine declarations
+    // must validate the explicit type before that conversion loses the syntax.
+    let dialect = MydbDialect::default();
+    let mut parser = SqlParser::new(&dialect)
+        .try_with_sql(sql)
+        .map_err(|err| ParseError::from_sqlparser(sql, err))?;
+    let declared = parser
+        .parse_data_type()
+        .map_err(|err| ParseError::from_sqlparser(sql, err))?;
+    if matches!(
+        declared,
+        SqlDataType::Varchar(None)
+            | SqlDataType::Nvarchar(None)
+            | SqlDataType::CharacterVarying(None)
+            | SqlDataType::CharVarying(None)
+            | SqlDataType::Varbinary(None)
+    ) {
+        return Err(parse_error_at_zero(
+            "variable-length routine data types require a length",
+        ));
+    }
     let ddl = format!("CREATE TABLE __mydb_routine_type (x {sql})");
     let statement = parse_statement(&ddl)?;
     let Statement::CreateTable(table) = statement else {

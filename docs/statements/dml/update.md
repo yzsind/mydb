@@ -26,6 +26,12 @@ Modifies rows that match the condition. Supports single-table and joined/multi-t
 - Returns affected rows; CLIENT_FOUND_ROWS affects whether matched rows or actually changed rows are reported.
 - UPDATE acquires row locks and the necessary metadata locks; on failure, statement-level changes are rolled back, while committing or rolling back an explicit transaction remains the user's decision.
 
+## Privileges, Results, and Boundaries
+
+Assignments can use a target alias qualifier, such as c.value=c.value+1. Single-table assignments are evaluated with the implemented MySQL left-to-right semantics; do not rely on a portable assignment order for multiple targets. A joined target row is updated once even if it matches multiple joined source rows. ORDER BY/LIMIT must be valid for the chosen execution shape; a LIMIT offset is rejected.
+
+UPDATE needs UPDATE on changed columns and SELECT on columns read by expressions/predicates. RETURNING additionally needs SELECT. It exposes OLD and final NEW, including no-op logical updates; multi-target writes with RETURNING return 1235. [DML RETURNING](../../dml-returning.md) describes projections and error rollback.
+
 ## Examples
 
 ```sql

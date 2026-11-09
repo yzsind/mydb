@@ -14,7 +14,7 @@ HEX(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | Numeric, text or binary expression | Numbers use integer formatting; text/binary content is encoded byte by byte. |
 
 ## Return Value
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`UNHEX`](unhex.md), [`QUOTE`](quote.md), [`QUOTE_IDENTIFIER`](quote_identifier.md).

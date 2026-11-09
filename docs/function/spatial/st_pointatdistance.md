@@ -31,8 +31,10 @@ Result: `POINT(0.7071067811865475 0.7071067811865475)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
+
+- Coordinates use the input LineString and its length units. Single-point fractional interpolation accepts [0,1]; repeated-point interpolation requires (0,1]. Distance positions must lie within [0,line length]. Empty/zero-length/invalid inputs follow the geometry diagnostic rules. Interpolating many output points is bounded by governed memory.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_LINEINTERPOLATEPOINT`](st_lineinterpolatepoint.md), [`ST_LINEINTERPOLATEPOINTS`](st_lineinterpolatepoints.md).

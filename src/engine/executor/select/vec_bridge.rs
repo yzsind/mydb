@@ -5884,6 +5884,7 @@ fn computed_batch_field(program: &ExprProgram, table: &str, name: String) -> Opt
     }
     let mut source = crate::types::ColumnSource::default();
     descriptor.apply_to_source(&mut source);
+    source.round_decimal_result = program.rounds_decimal_result();
     Some(BatchField {
         table: table.to_string(),
         alias: None,

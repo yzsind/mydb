@@ -14,11 +14,11 @@ ST_CENTROID(geometry)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `geometry` | Yes | GEOMETRY matching the function's requirements | The geometry to process |
+| `geometry` | Yes | GEOMETRY | Point, linear, polygonal or collection input; the result uses the highest contributing dimension. |
 
 ## Return Value
 
-Returns a GEOMETRY value; returns `NULL` when any required argument is `NULL`.
+Returns a POINT GEOMETRY with the input SRID, or SQL NULL for NULL/empty input with no centroid. The calculation prefers area-weighted polygon centroids, then length-weighted line midpoints, then the vertex average.
 
 ## Examples
 
@@ -30,8 +30,10 @@ Result: `POINT(0.6666666666666666 1.3333333333333333)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
+
+- In a mixed collection the highest available nondegenerate dimension supplies the centroid. The result is a POINT, not a bounding polygon or a validity repair.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_CONVEXHULL`](st_convexhull.md), [`ST_ENVELOPE`](st_envelope.md), [`ST_MAKEENVELOPE`](st_makeenvelope.md), [`ST_SIMPLIFY`](st_simplify.md).

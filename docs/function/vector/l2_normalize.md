@@ -23,7 +23,7 @@ Returns a FLOAT32 VECTOR; returns `NULL` when any argument is `NULL`.
 ## Examples
 
 ```sql
-SELECT L2_NORMALIZE(STRING_TO_VECTOR('[1,2]'));
+SELECT VECTOR_TO_STRING(L2_NORMALIZE(STRING_TO_VECTOR('[1,2]')));
 ```
 
 Result:
@@ -41,4 +41,4 @@ Result:
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`VECTOR_NORM`](vector_norm.md), [`SUBVECTOR`](subvector.md).

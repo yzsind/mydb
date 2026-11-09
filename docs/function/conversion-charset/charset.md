@@ -14,11 +14,11 @@ CHARSET(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | Any expression | Expression whose character set is inspected; numeric and binary values use binary. |
 
 ## Return Value
 
-Returns a charset name as text; numeric input has charset `binary`.
+Returns a character-set name as text. Numeric values, binary strings and SQL NULL have charset binary; the input need not be numeric.
 
 ## Examples
 
@@ -34,8 +34,8 @@ binary
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`COLLATION`](collation.md), [`COERCIBILITY`](coercibility.md), [`WEIGHT_STRING`](weight_string.md).

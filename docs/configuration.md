@@ -638,7 +638,7 @@ placed after the leading keyword. Page range scans, sort double buffering, page
 task queues, encoding buffers, and the 4 MiB per-worker stacks are all charged to
 `StorageScratch` by capacity; on insufficient budget the parallelism is lowered
 or spills, and 1037/HY001 is returned if even the minimum work area cannot be
-obtained. See [`hints.md`](hints.md#63-b-tree-index-creation) for details.
+obtained. See [`hints.md`](hints.md#63-b-tree-and-fulltext-index-creation) for details.
 Historical validation for `ALTER TABLE ... ADD FOREIGN KEY` also uses these two
 environment variables, requesting 2 workers by default. The covering-index path
 shards and merges by foreign key prefix; under concurrent writes, snapshot
@@ -834,8 +834,8 @@ Zone Map shared cache pages, rebuild scratch, and background workers are likewis
 governed by the unified memory governor; when metadata is untrusted or corrupted,
 the budget is short, or a predicate cannot prune safely, the executor keeps the
 original row predicate and falls back to an ordinary scan without sacrificing
-result correctness. See [`storage-format.md`](storage-format.md) for the
-persistent format and recovery procedures.
+result correctness. See [`storage-format.md`](storage-format.md) for persistent
+file roles and recovery boundaries.
 
 ### Zone Map Maintenance and Diagnostics Supplement
 

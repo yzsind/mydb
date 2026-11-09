@@ -2301,7 +2301,8 @@ pub(super) fn try_build_direct_index_batch_scan<'a>(
     }
     let effective_filter = match (&access, filter.as_ref()) {
         (vec_index_scan::IndexBatchAccess::Lookup { key, exact }, Some(predicate))
-            if !db.has_active_write_txns() =>
+            if !db.has_active_write_txns()
+                && !db.has_pending_index_repairs_for(table.schema.id, &index.name) =>
         {
             let access = crate::engine::executor::indexes::EngineIndexAccess::Lookup {
                 key: key.clone(),

@@ -43,6 +43,13 @@ use super::sublink::{
 /// nothing to do (the LEFT JOIN's derived no longer contains an
 /// `Expr::Subquery`).
 pub fn decorrelate_scalar_subqueries(db: &Database, select: &mut Select) -> usize {
+    if select.group_by_modifier != crate::parser::GroupByModifier::None
+        || !select.grouping_sets.is_empty()
+    {
+        // Correlation consumes the emitted group key, including NULL subtotal
+        // keys. A join below aggregation cannot preserve that scope.
+        return 0;
+    }
     // Validate the original correlated references before lifting them out of
     // a grouped query. Derived inputs later become CTE scans and lose their
     // grouping-key provenance, so preserve the proven group-constant result
@@ -511,11 +518,10 @@ fn correlated_ref_matches_source(
 }
 
 fn source_matches_qualifier(source: &TableRef, qualifier: &str) -> bool {
-    source
-        .alias
-        .as_deref()
-        .is_some_and(|alias| alias.eq_ignore_ascii_case(qualifier))
-        || source.name.eq_ignore_ascii_case(qualifier)
+    if let Some(alias) = &source.alias {
+        return alias.eq_ignore_ascii_case(qualifier);
+    }
+    source.name.eq_ignore_ascii_case(qualifier)
         || source
             .name
             .rsplit('.')

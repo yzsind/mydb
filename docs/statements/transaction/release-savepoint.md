@@ -15,6 +15,10 @@ Removes a named savepoint without undoing data.
 - The target must exist in the current transaction.
 - Releasing a savepoint does not commit, modify rows, or release transaction locks.
 
+## Transaction and Error Details
+
+A missing savepoint returns 1305. Releasing the named savepoint leaves later savepoints usable and does not release row locks. Use BEGIN/SAVEPOINT/RELEASE/COMMIT in one connection; a name in another connection does not identify this session's savepoint.
+
 ## Examples
 
 ```sql

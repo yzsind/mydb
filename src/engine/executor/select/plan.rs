@@ -2381,7 +2381,12 @@ pub(super) fn execute_plan_rows_inner(
             let projection = projected_columns.as_deref().map(|v| v.as_slice());
             let residual_filter = match filter.as_ref() {
                 None => None,
-                Some(expr) if db.has_active_write_txns() => Some(expr.clone()),
+                Some(expr)
+                    if db.has_active_write_txns()
+                        || db.has_pending_index_repairs_for(table.schema.id, &index.name) =>
+                {
+                    Some(expr.clone())
+                }
                 Some(expr) => {
                     let access = EngineIndexAccess::Lookup {
                         key: key.clone(),

@@ -17,6 +17,10 @@ Repeats stored program statements while the condition is true.
 - The condition is evaluated before each iteration; FALSE or NULL ends the loop.
 - Labels are the targets for LEAVE/ITERATE.
 
+## Context, Errors, and Lifecycle
+
+The condition is tested before each iteration and after a normal continuation. FALSE/NULL exits, so the body can run zero times. LEAVE/ITERATE require a visible loop label; labels at both ends must match. Initialize the counter before this inner-body example and include an exit condition. See [execution contexts](README.md#execution-contexts).
+
 ## Examples
 
 ```sql

@@ -14,11 +14,11 @@ IS_UUID(uuid)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `uuid` | Yes | Address, UUID, sequence name, integer, or flag value | The 1st argument; the meaning is determined by the function syntax and description |
+| `uuid` | Yes | String | UUID text to validate; NULL returns NULL. |
 
 ## Return Value
 
-Returns `1` when the condition holds and `0` otherwise; `NULL` input usually returns `NULL`.
+Returns integer 1 for a valid UUID text representation, 0 otherwise. SQL NULL returns SQL NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: 1
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`UUID`](uuid.md), [`UUID_SHORT`](uuid_short.md), [`UUID_TO_BIN`](uuid_to_bin.md), [`BIN_TO_UUID`](bin_to_uuid.md).

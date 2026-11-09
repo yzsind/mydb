@@ -14,12 +14,12 @@ INSTR(str, substr)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `substr` | Yes | String | The 2nd argument; the substring to search for |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `substr` | Yes | String | Substring to locate. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns the one-based position of substr in str, 0 when not found, or SQL NULL for NULL input. Text uses character positions and resolved comparison semantics; binary strings use bytes.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: 3
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LOCATE`](locate.md), [`POSITION`](position.md), [`FIND_IN_SET`](find_in_set.md), [`STRCMP`](strcmp.md).

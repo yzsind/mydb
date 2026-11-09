@@ -26,6 +26,10 @@ including the supported integer backing types, CACHE, bounds, CYCLE and
 - Dropping an owning table or column drops the dependent sequence; `OWNED BY NONE` detaches it. Permanent sequences cannot depend on temporary tables, and cross-database dependency moves are rejected.
 - IF EXISTS only handles a missing target. Concurrent nextval and DDL are serialized through sequence/metadata synchronization.
 
+## Privileges, Transactions, and Dependencies
+
+Requires ALTER on the source sequence. Rename additionally requires DROP on source and CREATE on destination, and remains in the same schema. This is an implicit-commit DDL operation. Changing START sets a future restart point; it does not by itself reset the active counter. RESTART changes the generation, invalidates future session CACHE blocks and retains existing session CURRVAL until next allocation. See [cache/reset semantics](../../sequences.md#caching-and-resets).
+
 ## Examples
 
 ```sql
@@ -40,4 +44,4 @@ DROP SEQUENCE invoice_number_seq;
 
 - [DDL category index](README.md)
 - [Syntax notation](../syntax-conventions.md)
-- [SHOW CREATE TABLE](../metadata/show-create-table.md)
+- [SHOW CREATE SEQUENCE](../metadata/show-create-sequence.md)

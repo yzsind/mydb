@@ -72,7 +72,7 @@ fn eligible_select(statement: &Statement) -> Option<&Select> {
     }
     // Reads only: FOR UPDATE / FOR SHARE / LOCK take row locks and need the
     // lock-wait retry loop + transactional view, not the read-only view.
-    if select.for_update || select.lock_clause.is_some() {
+    if super::tx::select_has_locking_read(select) {
         return None;
     }
     if select.values.is_some() || select.json_table.is_some() || select.derived.is_some() {

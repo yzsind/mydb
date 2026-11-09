@@ -14,11 +14,11 @@ QUOTE_IDENTIFIER(identifier)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `identifier` | Yes | String | The 1st argument; the meaning is determined by the function syntax and description |
+| `identifier` | Yes | String | One identifier to quote; embedded backticks are doubled. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns text enclosed in backticks, doubling each embedded backtick. SQL NULL returns NULL. Quote the components of a qualified name separately.
 
 ## Examples
 
@@ -34,8 +34,8 @@ Result:
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`HEX`](hex.md), [`UNHEX`](unhex.md), [`QUOTE`](quote.md).

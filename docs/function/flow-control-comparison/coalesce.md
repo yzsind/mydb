@@ -14,8 +14,8 @@ COALESCE(expr1 [, expr2 [, ...]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `expr1` | Yes | Any SQL expression | The 1st argument; the meaning is determined by the function syntax and description |
-| `expr2 ...` | No, repeatable | Any SQL expression | The 2nd argument; the meaning is determined by the function syntax and description |
+| `expr1` | Yes | Any SQL expression | First input expression. |
+| `expr2 ...` | No, repeatable | Any SQL expression | Additional expressions considered from left to right. |
 
 ## Return Value
 
@@ -24,19 +24,19 @@ Returns the first non-NULL argument; all-NULL input returns NULL. The declared r
 ## Examples
 
 ```sql
-SELECT COALESCE('example');
+SELECT COALESCE(NULL,'fallback'), COALESCE(NULL,NULL);
 ```
 
 Result:
 
 ```text
-example
+fallback	NULL
 ```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`IFNULL`](ifnull.md), [`NULLIF`](nullif.md), [`ISNULL`](isnull.md), [`IF`](if.md).

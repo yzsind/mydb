@@ -236,7 +236,7 @@ fn column_is_not_null(db: &Database, outer: &Select, col: &ColumnLoc) -> bool {
                 .next()
                 .unwrap_or(&t.name)
                 .to_ascii_lowercase();
-            if alias != *qualifier && bare != *qualifier {
+            if alias != *qualifier && (t.alias.is_some() || bare != *qualifier) {
                 continue;
             }
         }

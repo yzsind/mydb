@@ -60,7 +60,7 @@ The 64-character identifier limit is enforced for:
 | Database name (CREATE DATABASE) | — |
 | Table name (CREATE TABLE / LIKE / TEMP LIKE) | Also checked by ALTER / RENAME TABLE |
 | Column name | Checked by CREATE and ALTER, including MODIFY / CHANGE / RENAME COLUMN |
-| Index name | Checked in CREATE TABLE and ALTER TABLE ADD / RENAME INDEX; standalone CREATE INDEX has a gap below |
+| Index name | Checked in CREATE TABLE, ALTER TABLE ADD / RENAME INDEX, and standalone CREATE INDEX |
 | View name | Checked by CREATE / ALTER VIEW |
 | Sequence name | Checked by CREATE SEQUENCE / ALTER SEQUENCE RENAME |
 | CHECK constraint name | byte-based, see caveat |
@@ -71,9 +71,8 @@ The 64-character identifier limit is enforced for:
 Account identifiers: user name ≤ **32** chars, host ≤ **255** chars
 (error 1470, `ER_WRONG_STRING_LENGTH`, on overflow).
 
-No explicit identifier-length validation: trigger names, event names, table
-aliases / correlation names, and index names introduced by standalone
-`CREATE INDEX`. These are enforcement gaps; statement and resource budgets
+No explicit identifier-length validation: trigger names, event names, and table
+aliases / correlation names. These are enforcement gaps; statement and resource budgets
 still apply.
 
 **Caveat:** most names are counted in characters while CHECK/FK/partition
@@ -542,9 +541,8 @@ has its own bounded request limits, independent of the SQL engine.
 Current differences and enforcement gaps (see also the caveats inline
 above):
 
-1. Trigger and event names, table aliases / correlation names, and index names
-   introduced by standalone `CREATE INDEX` have no explicit identifier-length
-   validation.
+1. Trigger and event names and table aliases / correlation names have no explicit
+   identifier-length validation.
 2. Identifier length is counted by characters for most objects but by bytes
    for CHECK/FK/partition names.
 3. Index caps (64/16/3072) are not re-validated when a catalog is loaded from

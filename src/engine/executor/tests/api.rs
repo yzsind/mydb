@@ -118,7 +118,7 @@ fn sql_execute_reuses_prepare_time_result_domain() {
     else {
         panic!("expected prepared SELECT result");
     };
-    assert_eq!(result.rows, vec![vec![Value::Int(1)]]);
+    assert_eq!(result.rows, vec![vec![Value::String("1".into())]]);
     assert_eq!(result.columns[0].column_type, ColumnType::VarString);
     assert_eq!(result.columns[0].source.length, Some(84));
     assert_ne!(
@@ -224,7 +224,7 @@ fn cast_as_json_preserves_enum_set_bit_and_binary_source_types() {
         vec![vec![
             Value::String("STRING".into()),
             Value::String("STRING".into()),
-            Value::String("UNSIGNED INTEGER".into()),
+            Value::String("BIT".into()),
             Value::String("BLOB".into()),
         ]]
     );
@@ -1744,7 +1744,7 @@ fn show_table_status_supports_dbeaver_metadata_sql() {
         Value::String(crate::charset::DEFAULT_COLLATION.to_string())
     );
     assert!(matches!(&row[11], Value::String(ts) if !ts.is_empty()));
-    assert!(matches!(&row[12], Value::String(ts) if !ts.is_empty()));
+    assert_eq!(row[12], Value::Null);
     assert_eq!(row[17], Value::String("tpch lineitem".to_string()));
 
     let QueryResponse::ResultSet(where_status) = engine
@@ -3835,6 +3835,7 @@ fn prepared_limit_offset_and_dml_order_limit_execute() {
         group_by_modifier: crate::parser::GroupByModifier::None,
         having: None,
         order_by: vec![OrderBy {
+            names_bound: false,
             expr: Expr::Identifier("id".into()),
             asc: true,
             nulls_first: None,
@@ -3882,6 +3883,7 @@ fn prepared_limit_offset_and_dml_order_limit_execute() {
         }),
         view_check_predicate: None,
         order_by: vec![OrderBy {
+            names_bound: false,
             expr: Expr::Identifier("v".into()),
             asc: false,
             nulls_first: None,
@@ -3912,6 +3914,7 @@ fn prepared_limit_offset_and_dml_order_limit_execute() {
             right: Box::new(Expr::Literal(Literal::Int(0))),
         }),
         order_by: vec![OrderBy {
+            names_bound: false,
             expr: Expr::Identifier("v".into()),
             asc: true,
             nulls_first: None,

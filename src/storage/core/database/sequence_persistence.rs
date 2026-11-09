@@ -142,22 +142,6 @@ impl CatalogTxn<'_> {
         }
         let tables = objects;
         for def in self.db.sequences.owned_definitions(&tables) {
-            let owner = crate::storage::mdl::allocate_internal_owner()?;
-            let lease = SequenceValueLease {
-                db: self.db,
-                owner: Some(owner),
-                fast: None,
-            };
-            self.db.acquire_mdl(
-                owner,
-                None,
-                MdlDuration::Statement,
-                vec![MdlRequest {
-                    key: MdlObjectKey::table(&def.database, &def.name),
-                    lock_type: MdlLockType::Exclusive,
-                }],
-                "sql/sequence-dependency",
-            )?;
             let current = self
                 .db
                 .catalog_read()?
@@ -180,6 +164,15 @@ impl CatalogTxn<'_> {
                 .values()
                 .find(|table| Some(table.object_id) == current.owned_table_id)
                 .cloned();
+            // Compact catalog headers deliberately omit columns. They do
+            // not prove that an owned column was dropped.
+            let table = table.map(|table| {
+                if table.columns.is_empty() {
+                    self.db.table(&table.qualified_name())
+                } else {
+                    Ok(table)
+                }
+            }).transpose()?;
             let column = table.as_ref().and_then(|table| {
                 table.columns.iter().find(|column| {
                     Some(column.column_id) == current.owned_column_id
@@ -191,8 +184,13 @@ impl CatalogTxn<'_> {
                     if !table.database.eq_ignore_ascii_case(&current.database) {
                         return Err(sequence_state_error("moving a table with owned sequences to another database is not supported"));
                     }
-                    if current.owned_table.as_deref() == Some(table.name.as_str())
-                        && current.owned_column.as_deref() == Some(column.name.as_str())
+                    let owner_matches = current.owned_table.as_deref().is_some_and(|name| {
+                        let (database, name) = split_table_name(&current.database, name);
+                        database.eq_ignore_ascii_case(&table.database)
+                            && name.eq_ignore_ascii_case(&table.name)
+                    });
+                    if owner_matches
+                        && current.owned_column.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
                     {
                         continue;
                     }
@@ -203,6 +201,26 @@ impl CatalogTxn<'_> {
                 }
                 _ => None,
             };
+            let session_owner = crate::engine::expr::session_connection_id();
+            let owner = match session_owner {
+                Some(owner) => owner,
+                None => crate::storage::mdl::allocate_internal_owner()?,
+            };
+            let lease = SequenceValueLease {
+                db: self.db,
+                owner: session_owner.is_none().then_some(owner),
+                fast: None,
+            };
+            self.db.acquire_mdl(
+                owner,
+                None,
+                MdlDuration::Statement,
+                vec![MdlRequest {
+                    key: MdlObjectKey::table(&def.database, &def.name),
+                    lock_type: MdlLockType::Exclusive,
+                }],
+                "sql/sequence-dependency",
+            )?;
             self.sequence_changes
                 .push((current.clone(), replacement.clone()));
             self.sequence_leases.push(lease);

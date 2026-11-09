@@ -5,7 +5,7 @@ boundaries. Syntax acceptance alone does not imply support for every option.
 
 ## EBNF Notation
 
-Syntax blocks use readable EBNF:
+Syntax blocks use readable EBNF summaries of the supported forms. They are not a complete lexical grammar. Common structural names and the chapters defining them are indexed in [Grammar terms](grammar.md); object-specific options are defined on their owning pages.
 
 | Symbol | Meaning |
 | --- | --- |
@@ -54,9 +54,9 @@ see [`operators-and-expressions.md`](../operators-and-expressions.md); for optim
 - `sql_mode` bits such as `ANSI_QUOTES`, `NO_BACKSLASH_ESCAPES`, and `IGNORE_SPACE` affect
   quotation, escaping, or function-name parsing; individual statement pages list only the
   additional restrictions.
-- `DELIMITER` is originally a client directive. The mydb server accepts it for import-script
-  compatibility, but it does not change the delimiter rules inside MySQL protocol packets;
-  see the stored programs documentation.
+- `DELIMITER` is a client script directive. The server rejects it with 1235. API clients
+  send an entire stored-program definition as one SQL statement, retaining inner semicolons;
+  see [DELIMITER](programmatic/delimiter.md).
 
 ## Privileges, Transactions, and Errors
 
@@ -65,17 +65,20 @@ see [`operators-and-expressions.md`](../operators-and-expressions.md); for optim
   statements additionally check dedicated privileges.
 - Whether a DDL statement implicitly commits, whether a statement can be rolled back, and
   whether it acquires metadata locks is governed by each page's "Behavior and Limitations" section.
-- Unsupported syntax is never silently ignored. Compatibility metadata operations, deprecated
-  syntax, and a few client-probing statements that produce only a warning or an empty result
-  set are explicitly marked in the corresponding documentation.
+- Unsupported capabilities return errors. Accepted compatibility forms are documented with
+  their actual effect, including metadata-only output and options that currently have no
+  distinct effect. Check the owning page before relying on a physical storage or locking option.
 - Common errors use MySQL errno numbers; syntax errors are usually 1064, unsupported execution
   capabilities are usually 1235, and insufficient privileges are usually 1044, 1045, 1142,
   1227, or a statement-specific error.
 
+## Reference Contracts
+
+See [Execution contracts](execution-contracts.md) for privilege scopes, implicit commits, statement rollback, diagnostics, and result conventions. See [Grammar terms](grammar.md) for the shared syntax vocabulary. Successful parsing alone does not establish that an operation is executable in a stored function, trigger, read-only transaction, native replica, or REST session.
+
 ## Example Conventions
 
-Examples assume a connection to the `test` database using a session that has the privileges
-the example requires. Examples involving files, replication, backup, restart, or shutdown
+Examples use the schemas in [Example setup](examples.md), or explicitly identify their own setup and placeholders. Run each example independently after resetting its objects. A connection must have the privileges the example requires. Examples involving files, replication, backup, restart, or shutdown
 only describe the command and its preconditions and should not be copied directly into a
 production environment. Result text may vary with object names, session state, and data;
 the documentation focuses on guaranteeing column shape, transaction effects, and warning

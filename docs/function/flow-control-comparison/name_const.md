@@ -14,7 +14,7 @@ NAME_CONST(name, value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `name` | Yes | String | The 1st argument; the meaning is determined by the function syntax and description |
+| `name` | Yes | String | Literal name string; use AS for the output column label in mydb. |
 | `value` | Yes | Literal scalar | The value to return; arbitrary expressions are rejected |
 
 ## Return Value
@@ -31,8 +31,8 @@ Result: the return value is 42 and the result column name is answer.
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`IF`](if.md).

@@ -14,25 +14,29 @@ GTID_SUBTRACT(set, set_to_remove)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `set` | Yes | String | The 1st argument; the meaning is determined by the function syntax and description |
-| `set_to_remove` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
+| `set` | Yes | String | GTID set in UUID:interval notation; empty text is the empty set. |
+| `set_to_remove` | Yes | String | GTID intervals to subtract from the first set. |
 
 ## Return Value
 
-Subtracts one GTID set from another. The return type is determined by the function semantics and the input type.
+Returns normalized GTID set text after subtracting set_to_remove from set. Intervals are merged/split as needed, UUIDs normalized, and an empty result is empty text. SQL NULL returns NULL; malformed sets raise a GTID-format error.
 
 ## Examples
 
 ```sql
-SELECT GTID_SUBTRACT('', '');
+SELECT LENGTH(GTID_SUBTRACT('',''));
 ```
 
-Result: returns an empty string.
+Result:
+
+```text
+0
+```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[Category reference](README.md).

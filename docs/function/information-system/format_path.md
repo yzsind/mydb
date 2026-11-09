@@ -14,11 +14,11 @@ FORMAT_PATH(path)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `path` | Yes | String | The 1st argument; a JSON path expression |
+| `path` | Yes | String | Server filesystem path to format; not a JSON path. |
 
 ## Return Value
 
-Shortens and formats Performance Schema file paths. The return type is determined by the function semantics and the input type.
+Returns text with a leading server-process HOME directory replaced by ~, or the original path when that prefix does not match. SQL NULL returns NULL. It does not implement all MySQL Performance Schema path-variable substitutions.
 
 ## Examples
 
@@ -26,12 +26,18 @@ Shortens and formats Performance Schema file paths. The return type is determine
 SELECT FORMAT_PATH('/var/lib/mysql/test/t.ibd');
 ```
 
-Result: returns a shortened path suitable for diagnostic display.
+Result:
+
+```text
+/var/lib/mysql/test/t.ibd
+```
+
+This output assumes the path is outside the server process HOME. A matching HOME prefix is shortened to `~`.
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`EXTRACT_SCHEMA_FROM_FILE_NAME`](extract_schema_from_file_name.md), [`EXTRACT_TABLE_FROM_FILE_NAME`](extract_table_from_file_name.md).

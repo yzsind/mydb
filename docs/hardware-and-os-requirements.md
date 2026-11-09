@@ -152,7 +152,7 @@ cache and the process itself.
   16 KiB, fixed at build time; a data directory is not relocatable across
   engines built with a different page size. WAL is a segmented stream of
   variable-length frames (48-byte headers plus payloads), with a default
-  256 MiB segment rotation threshold. See [WAL layout](storage-format.md#121-wal-segment-and-frame-layout).
+  256 MiB segment rotation threshold. See [WAL and durability](storage-format.md#wal-undo-and-durability).
 - **I/O mode**: buffered I/O by default, so the operating system page cache
   warms index lookups and heap fetches — leave RAM for the page cache when
   sizing memory. Optional Direct I/O on Linux bypasses it for data files (see

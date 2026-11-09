@@ -302,6 +302,44 @@ fn compile_batch_predicate_node(
             && (crate::engine::expr::expr_is_constant(high)
                 || matches!(high.as_ref(), Expr::Placeholder(_))) =>
         {
+            let value_type = crate::engine::expr_program::input_expr_type(value, input);
+            let low_type = crate::engine::expr_program::input_expr_type(low, input);
+            let high_type = crate::engine::expr_program::input_expr_type(high, input);
+            let string = |ty: crate::engine::expr_type::ExprType| {
+                matches!(
+                    ty.kind,
+                    crate::engine::expr_type::ExprTypeKind::String { .. }
+                )
+            };
+            let invalid_temporal_parameter = matches!(
+                value_type.kind,
+                crate::engine::expr_type::ExprTypeKind::Temporal { .. }
+            ) && [low, high].iter().any(|bound| {
+                if let Expr::Placeholder(index) = bound.as_ref() {
+                    crate::engine::params::user_parameter_active(*index)
+                        && crate::engine::params::current_param(*index).is_some_and(|value| {
+                            crate::storage::is_numeric_value(&value)
+                                && crate::util::temporal::parse_compact_datetime(
+                                    &value.to_display_string(),
+                                )
+                                .is_none()
+                        })
+                } else {
+                    false
+                }
+            });
+            if invalid_temporal_parameter
+                || string(value_type)
+                    != (string(low_type)
+                        && !crate::engine::expr::expr_is_numeric_hexbit_literal(low))
+                || string(value_type)
+                    != (string(high_type)
+                        && !crate::engine::expr::expr_is_numeric_hexbit_literal(high))
+            {
+                return Ok(compile_program(expr, input, cache)
+                    .ok()
+                    .map(BatchPredicateNode::leaf));
+            }
             // A column is side-effect free, so BETWEEN can use the same two
             // column/constant bitmap leaves as the equivalent comparisons.
             // This preserves SQL three-valued logic while avoiding a row-wise
@@ -2699,6 +2737,17 @@ pub fn batch_schema_to_input(schema: &BatchSchema) -> InputSchema {
         })
         .collect();
     let mut input = InputSchema::new_with_bound_types(cols, bound_types);
+    input.mark_numeric_display_columns(schema.fields().iter().enumerate().filter_map(
+        |(index, field)| {
+            (field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0).then_some((
+                index,
+                crate::mysql::protocol::numeric_display_width(
+                    field.column_type,
+                    field.source.length,
+                ),
+            ))
+        },
+    ));
     input.mark_silent_string_columns(schema.fields().iter().enumerate().filter_map(
         |(index, field)| match field.column_type {
             crate::types::ColumnType::Blob

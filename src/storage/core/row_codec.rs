@@ -5495,7 +5495,7 @@ fn value_to_string_bytes(v: &Value) -> Vec<u8> {
         Value::Double(x) => x.to_string().into_bytes(),
         Value::Null => Vec::new(),
         Value::Json(b) => crate::engine::json::unquote_text(b).into_bytes(),
-        Value::Geometry(b) => crate::engine::geo::to_text(b).into_bytes(),
+        Value::Geometry(b) => b.clone(),
         Value::Vector(b) => crate::engine::vector::to_text(b).into_bytes(),
         Value::DecimalCompact(..)
         | Value::Decimal128(..)
@@ -6832,11 +6832,18 @@ fn parse_year(s: &str) -> Result<u8, QueryError> {
     crate::util::temporal::year_byte_from_int(v)
 }
 
-// Keep the storage codec's internal exports while sharing the bit transform
-// with ORDER BY key encoding. Callers own signed-zero and NaN policy.
-pub(crate) use crate::util::ordered_float::{
-    f32_from_order_u32, f32_to_order_u32, f64_from_order_u64, f64_to_order_u64,
-};
+pub(crate) use crate::util::ordered_float::{f32_from_order_u32, f64_from_order_u64};
+
+// SQL equality identifies both signed zeros, including every stored/probe key.
+#[inline]
+pub(crate) fn f32_to_order_u32(value: f32) -> u32 {
+    crate::util::ordered_float::f32_to_order_u32(if value == 0.0 { 0.0 } else { value })
+}
+
+#[inline]
+pub(crate) fn f64_to_order_u64(value: f64) -> u64 {
+    crate::util::ordered_float::f64_to_order_u64(if value == 0.0 { 0.0 } else { value })
+}
 
 /// Test-only convenience: a codec capable of round-tripping rows that
 /// look like `[BigInt, VarString, VarString, ...]` (up to 16 columns).
@@ -7590,7 +7597,7 @@ mod row_codec_tests {
         ] {
             let enc = f32_to_order_u32(v);
             let dec = f32_from_order_u32(enc);
-            assert_eq!(dec.to_bits(), v.to_bits());
+            assert_eq!(dec.to_bits(), if v == 0.0 { 0 } else { v.to_bits() });
         }
         // Order preservation: encode(-1.5) < encode(-0.5) < encode(0.5) < encode(1.5).
         let neg_big = f32_to_order_u32(-1.5);

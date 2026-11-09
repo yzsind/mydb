@@ -18,7 +18,7 @@ ST_ENDPOINT(geometry)
 
 ## Return Value
 
-Returns a GEOMETRY value; returns `NULL` when any required argument is `NULL`.
+Returns the last POINT of a LineString with the same SRID. SQL NULL, an empty input or an inapplicable geometry type returns NULL.
 
 ## Examples
 
@@ -30,8 +30,8 @@ Result: `POINT(2 2)`.
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_STARTPOINT`](st_startpoint.md), [`ST_POINTN`](st_pointn.md), [`ST_NUMPOINTS`](st_numpoints.md).

@@ -28,6 +28,12 @@ Creates a one-time or recurring scheduled event with its SQL routine body.
 - ON COMPLETION controls whether the definition is kept after a one-time event finishes; with PRESERVE the definition is kept after completion and marked DISABLED.
 - An already expired one-time event is never executed by CREATE. NOT PRESERVE returns note 1588 without retaining the event; PRESERVE retains a disabled definition. CURRENT_TIMESTAMP is evaluated at the schedule's time precision.
 
+## Context, Errors, and Lifecycle
+
+Requires EVENT on the schema and uses an implicit-commit boundary. A specified definer is validated separately; execution uses its privileges and the SQL mode/character-set/time-zone settings captured by the definition. Global event_scheduler must permit execution; ENABLE alone does not override an OFF/DISABLED scheduler.
+
+The default ON COMPLETION NOT PRESERVE drops an expired/completed one-time definition; PRESERVE retains it disabled. AT/STARTS/ENDS accept supported timestamp expressions rather than unconverted Unix numbers. Compound intervals must be positive and within the documented component limit. SHOW EVENTS/SHOW CREATE EVENT inspect persisted schedule/state, not confirmation that every body execution succeeded. Event work cannot be made rollbackable by rolling back the connection that created the event.
+
 ## Examples
 
 ```sql

@@ -14,11 +14,11 @@ MD5(value)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `value` | Yes | Numeric or integer | The 1st argument; the input value |
+| `value` | Yes | String or binary string; convertible scalar where accepted | Input bytes/text; numeric scalars are converted to their display bytes. |
 
 ## Return Value
 
-Returns the MD5 hexadecimal digest of the input. The return type is determined by the function semantics and the input types.
+Returns a lowercase 32-character hexadecimal MD5 digest. SQL NULL returns NULL. The digest is over input bytes, not a normalized Unicode representation.
 
 ## Examples
 
@@ -26,12 +26,16 @@ Returns the MD5 hexadecimal digest of the input. The return type is determined b
 SELECT MD5('mydb');
 ```
 
-Result: returns the MD5 digest as 32 hexadecimal characters.
+Result:
+
+```text
+e04d88072f90f86a07481418b8ff4b6b
+```
 
 ## Notes
 
-- Returns a clear MySQL-compatible error when the number or type of arguments does not match the syntax.
+- Argument-count errors and invalid argument types are SQL errors; consult the function-specific rules above.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`SHA1`](sha1.md), [`SHA2`](sha2.md).

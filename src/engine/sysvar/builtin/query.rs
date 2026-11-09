@@ -293,6 +293,13 @@ pub(crate) fn register(reg: &mut Registry) {
         },
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
             let value = v.to_display_string();
+            if value
+                .split(',')
+                .any(|mode| mode.trim().eq_ignore_ascii_case("PAD_CHAR_TO_FULL_LENGTH"))
+            {
+                return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                    .error("PAD_CHAR_TO_FULL_LENGTH sql_mode is not supported"));
+            }
             if ctx.is_global() {
                 *global_sql_mode_cell().write().unwrap() = value;
             } else {
@@ -618,7 +625,7 @@ pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
         SysVarDef::new(
             "vector_result_format",
-            Scope::Session,
+            Scope::Both,
             DataType::Enum {
                 values: &["NATIVE", "TEXT"],
             },
@@ -626,7 +633,10 @@ pub(crate) fn register(reg: &mut Registry) {
         .with_doc("VECTOR output on the text protocol; prepared binary results remain native."),
         |ctx| {
             SysVarValue::String(
-                if ctx.session.is_some_and(|s| s.vector_result_format_text) {
+                if match (ctx.session, ctx.scope) {
+                    (Some(session), Scope::Session) => session.vector_result_format_text,
+                    _ => crate::engine::api::global_vector_result_format_text(),
+                } {
                     "TEXT"
                 } else {
                     "NATIVE"
@@ -635,8 +645,12 @@ pub(crate) fn register(reg: &mut Registry) {
             )
         },
         |ctx: &mut WriteCtx<'_>, value: SysVarValue| -> Result<(), QueryError> {
-            ctx.session.vector_result_format_text =
-                value.to_display_string().eq_ignore_ascii_case("TEXT");
+            let text = value.to_display_string().eq_ignore_ascii_case("TEXT");
+            if ctx.scope == Scope::Global {
+                crate::engine::api::set_global_vector_result_format_text(text);
+            } else {
+                ctx.session.vector_result_format_text = text;
+            }
             Ok(())
         },
     ));
@@ -1176,6 +1190,9 @@ fn optimizer_flag_default(key: &str) -> Option<&'static str> {
 /// Unknown flag names are rejected (MySQL ER 1231), so a flag that
 /// "takes" is guaranteed to exist — declared capability stays honest.
 fn merge_optimizer_switch(current: &str, delta: &str) -> Result<String, String> {
+    if delta.trim().eq_ignore_ascii_case("default") {
+        return Ok(default_optimizer_switch().to_string());
+    }
     // Parse current into ordered (key, value) pairs preserving insertion order.
     let mut entries: Vec<(String, String)> = Vec::new();
     for piece in current.split(',') {

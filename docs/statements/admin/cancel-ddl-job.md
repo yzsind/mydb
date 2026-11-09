@@ -18,6 +18,10 @@ Requests cancellation of a specific job before an online DDL performs its final 
 - COPY, online BTREE builds, online column/constraint validation, and supported partition jobs expose cancellable phases. An accepted cancellation prevents publication even with an empty final delta; requests after the finalization gate are rejected.
 - Completed results remain in bounded in-memory history with `CANCEL_ALLOWED=0`. Legacy special-index progress without a job ID does not imply cancellation support.
 
+## Privileges, Transaction, and Result Details
+
+Requires global SYSTEM_VARIABLES_ADMIN. Returning OK means cancellation was accepted before the finalization gate, not that the worker has completed cleanup. Poll information_schema.mydb_ddl_jobs for its terminal state/error. Job IDs identify this process's bounded recent history, not a durable backup ID. A completed/published/unknown job is rejected rather than undone.
+
 ## Examples
 
 ```sql

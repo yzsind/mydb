@@ -893,48 +893,180 @@ fn bind_insert_select_source(stmt: &Insert, bindings: &[Expr], values: &[Value])
     row_stmt
 }
 
-/// Bind binary destinations once, preserving source charsets at the sink.
-fn insert_select_binary_targets(db: &Database, stmt: &Insert) -> Result<Vec<usize>, QueryError> {
+/// Bind string destinations once, before source descriptors are discarded.
+fn insert_select_string_targets(
+    db: &Database,
+    stmt: &Insert,
+) -> Result<Vec<(usize, bool, bool)>, QueryError> {
     let table = db.table(&stmt.table)?;
     let targets = insert_column_indexes(&table, stmt.columns.as_deref())?;
     Ok(targets
         .iter()
         .enumerate()
         .filter_map(|(position, &column)| {
-            matches!(
-                table.columns[column].data_type,
-                DataTypeKind::Binary { .. }
-                    | DataTypeKind::VarBinary { .. }
-                    | DataTypeKind::Blob { .. }
+            crate::engine::expr::assignment_consumes_string(&table.columns[column].data_type).then(
+                || {
+                    (
+                        position,
+                        matches!(
+                            table.columns[column].data_type,
+                            DataTypeKind::Binary { .. }
+                                | DataTypeKind::VarBinary { .. }
+                                | DataTypeKind::Blob { .. }
+                                | DataTypeKind::Bit { .. }
+                        ),
+                        matches!(table.columns[column].data_type, DataTypeKind::Bit { .. }),
+                    )
+                },
             )
-            .then_some(position)
         })
         .collect())
 }
 
-fn insert_select_binary_sources(
+struct InsertSelectStringSource {
+    position: usize,
+    charset: Option<&'static str>,
+    temporal_fsp: Option<u8>,
+    enum_source: Option<(Arc<TableSchema>, usize)>,
+}
+
+fn insert_select_string_sources(
+    db: &Database,
     response: &QueryResponse,
-    targets: &[usize],
-) -> Vec<(usize, &'static str)> {
+    targets: &[(usize, bool, bool)],
+    source_epoch: u64,
+) -> Result<Vec<InsertSelectStringSource>, QueryError> {
     let columns: &[Column] = match response {
         QueryResponse::ResultSet(result) => &result.columns,
         QueryResponse::SharedResultSet(result) => &result.columns,
         QueryResponse::StreamingResultSet(result) => &result.columns,
         _ => &[],
     };
-    targets
-        .iter()
-        .map(|&position| {
-            let charset = columns
-                .get(position)
-                .and_then(|column| column.source.collation_id)
+    let mut sources = Vec::new();
+    let mut has_enum_source = false;
+    for &(position, binary, bit) in targets {
+        let Some(source) = columns.get(position) else {
+            continue;
+        };
+        let enum_source = if bit
+            && source.source.flags
+                & (crate::mysql::protocol::ENUM_FLAG | crate::mysql::protocol::SET_FLAG)
+                != 0
+        {
+            has_enum_source = true;
+            let origin = &source.source;
+            let table_name = if origin.schema.is_empty() {
+                origin.org_table.clone()
+            } else {
+                format!("{}.{}", origin.schema, origin.org_table)
+            };
+            let schema = db.table(&table_name).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                    "ENUM/SET source definition changed during INSERT SELECT",
+                )
+            })?;
+            let index = schema.column_index(&origin.org_name).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                    "ENUM/SET source column changed during INSERT SELECT",
+                )
+            })?;
+            if !matches!(
+                schema.columns[index].data_type,
+                DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }
+            ) {
+                return Err(error(
+                    crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                    "ENUM/SET source type changed during INSERT SELECT",
+                ));
+            }
+            Some((schema, index))
+        } else {
+            None
+        };
+        let temporal_fsp = matches!(
+            source.column_type,
+            ColumnType::Time | ColumnType::DateTime | ColumnType::Timestamp
+        )
+        .then_some(source.source.decimals.unwrap_or(0));
+        if !binary && temporal_fsp.is_none() && enum_source.is_none() {
+            continue;
+        }
+        let charset = binary.then(|| {
+            source
+                .source
+                .collation_id
                 .and_then(crate::charset::resolve_collation_id)
                 .map_or_else(crate::engine::expr::connection_charset, |collation| {
                     collation.charset
-                });
-            (position, charset)
-        })
-        .collect()
+                })
+        });
+        sources.push(InsertSelectStringSource {
+            position,
+            charset,
+            temporal_fsp,
+            enum_source,
+        });
+    }
+    // The native member domain must belong to the source plan's catalog
+    // generation. Refuse a concurrent DDL change before writing any chunk.
+    if has_enum_source && db.catalog_publication_epoch() != source_epoch {
+        return Err(error(
+            crate::error::catalog::ER_TABLE_DEF_CHANGED,
+            "ENUM/SET source definition changed during INSERT SELECT",
+        ));
+    }
+    Ok(sources)
+}
+
+#[cfg(test)]
+mod bit_source_binding_tests {
+    use super::*;
+
+    #[test]
+    fn audit1108_bit_enum_source_rejects_a_changed_catalog_generation() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            crate::engine::executor::tests::memory_test_storage_config(),
+        )
+        .unwrap();
+        engine
+            .execute("CREATE TABLE bit_epoch(e ENUM('a','b'))")
+            .unwrap();
+        engine.execute("INSERT INTO bit_epoch VALUES('b')").unwrap();
+        let db = engine.database();
+        let epoch = db.catalog_publication_epoch();
+        let old = engine
+            .execute("SELECT e FROM bit_epoch")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        engine
+            .execute("ALTER TABLE bit_epoch MODIFY e ENUM('b','a')")
+            .unwrap();
+        assert_eq!(
+            insert_select_string_sources(db, &old, &[(0, true, true)], epoch)
+                .err()
+                .unwrap()
+                .code(),
+            1412
+        );
+        let epoch = db.catalog_publication_epoch();
+        let fresh = engine
+            .execute("SELECT e FROM bit_epoch")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        let sources = insert_select_string_sources(db, &fresh, &[(0, true, true)], epoch).unwrap();
+        let QueryResponse::ResultSet(mut result) = fresh else {
+            panic!()
+        };
+        encode_insert_select_string_sources(&mut result.rows, &sources).unwrap();
+        assert_eq!(result.rows, vec![vec![Value::UInt(1)]]);
+    }
 }
 
 fn validate_insert_select_width(
@@ -956,20 +1088,31 @@ fn validate_insert_select_width(
     Ok(())
 }
 
-fn encode_insert_select_binary_sources(
+fn encode_insert_select_string_sources(
     rows: &mut [Vec<Value>],
-    sources: &[(usize, &'static str)],
+    sources: &[InsertSelectStringSource],
 ) -> Result<(), QueryError> {
     if sources.is_empty() {
         return Ok(());
     }
     for row in rows {
-        for &(position, charset) in sources {
-            if let Some(value) = row.get_mut(position) {
-                *value = crate::engine::expr::encode_binary_assignment_value(
-                    std::mem::replace(value, Value::Null),
-                    charset,
-                )?;
+        for source in sources {
+            if let Some(value) = row.get_mut(source.position) {
+                let mut converted = std::mem::replace(value, Value::Null);
+                if let Some((schema, index)) = &source.enum_source {
+                    converted = crate::storage::enum_set_numeric_assignment(
+                        converted,
+                        &schema.columns[*index].data_type,
+                    )?;
+                }
+                if let Some(fsp) = source.temporal_fsp {
+                    converted = crate::engine::expr::temporal_string_value(converted, fsp)?;
+                }
+                if let Some(charset) = source.charset {
+                    converted =
+                        crate::engine::expr::encode_binary_assignment_value(converted, charset)?;
+                }
+                *value = converted;
             }
         }
     }
@@ -991,7 +1134,7 @@ fn execute_insert_from_select_stream(
     let target = db.table(&stmt.table)?;
     let target_width = insert_column_indexes(&target, stmt.columns.as_deref())?.len();
     let source_bindings = insert_select_source_bindings(db, stmt, &mut select)?;
-    let binary_targets = insert_select_binary_targets(db, stmt)?;
+    let string_targets = insert_select_string_targets(db, stmt)?;
     let mut total_affected: u64 = 0;
     let mut total_records: u64 = 0;
     let mut returning_columns = None;
@@ -1023,7 +1166,7 @@ fn execute_insert_from_select_stream(
             select,
             registry,
             parallel_degree,
-            &binary_targets,
+            &string_targets,
             target_width,
         )?;
         total_affected = affected;
@@ -1035,6 +1178,7 @@ fn execute_insert_from_select_stream(
         // index splits. Materialize only this semantic dependency shape; all
         // other INSERT ... SELECT statements retain bounded streaming.
         let source_references_target = source_references_target(&select, &stmt.table);
+        let source_epoch = db.catalog_publication_epoch();
         let source_response =
             super::dispatch::execute_set_operation_branch_response(db, txn, select, registry)?;
         validate_insert_select_width(
@@ -1046,12 +1190,13 @@ fn execute_insert_from_select_stream(
         } else {
             source_response
         };
-        let binary_sources = insert_select_binary_sources(&source_response, &binary_targets);
+        let string_sources =
+            insert_select_string_sources(db, &source_response, &string_targets, source_epoch)?;
         crate::engine::executor::select::drive_response_chunks(
             source_response,
             INSERT_SELECT_CHUNK_ROWS,
             |mut chunk_rows| {
-                encode_insert_select_binary_sources(&mut chunk_rows, &binary_sources)?;
+                encode_insert_select_string_sources(&mut chunk_rows, &string_sources)?;
                 if !crate::engine::expr::strict_dml_expression() {
                     crate::engine::api::retain_statement_warnings(|warning| {
                         !(warning.is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE)
@@ -1376,7 +1521,7 @@ fn execute_insert_from_select_parallel(
     select: crate::parser::QueryExpr,
     registry: &SessionRegistry,
     degree: usize,
-    binary_targets: &[usize],
+    string_targets: &[(usize, bool, bool)],
     target_width: usize,
 ) -> Result<(u64, u64), QueryError> {
     use crate::util::thread_spawn as thread;
@@ -1473,6 +1618,7 @@ fn execute_insert_from_select_parallel(
     let mut total_affected: u64 = 0;
     let mut coord_error: Option<QueryError> = None;
     let source_result = (|| {
+        let source_epoch = db.catalog_publication_epoch();
         let response = match select {
             crate::parser::QueryExpr::Select(select) => execute_select(db, txn, *select, registry)?,
             query => {
@@ -1480,12 +1626,13 @@ fn execute_insert_from_select_parallel(
             }
         };
         validate_insert_select_width(&response, target_width)?;
-        let binary_sources = insert_select_binary_sources(&response, binary_targets);
+        let string_sources =
+            insert_select_string_sources(db, &response, string_targets, source_epoch)?;
         super::select::drive_response_chunks(
             response,
             INSERT_SELECT_CHUNK_ROWS,
             |mut chunk_rows| {
-                encode_insert_select_binary_sources(&mut chunk_rows, &binary_sources)?;
+                encode_insert_select_string_sources(&mut chunk_rows, &string_sources)?;
                 total_records = total_records.saturating_add(chunk_rows.len() as u64);
                 let mut pending = chunk_rows;
                 loop {
@@ -1668,7 +1815,12 @@ fn eval_insert_default_bound(
     current: &[Value],
 ) -> Result<Value, QueryError> {
     let bound = crate::engine::expr::bind_column_defaults(expr, table, Some(column))?;
-    crate::engine::expr::eval_expr(&bound, table, current)
+    crate::engine::expr::binary_assignment_value(
+        crate::engine::expr::eval_expr(&bound, table, current)?,
+        &bound,
+        table,
+        &table.columns[column].data_type,
+    )
 }
 
 /// One validation/evaluation order for owned and prepared VALUES. The static
@@ -1759,6 +1911,7 @@ where
                     DataTypeKind::Binary { .. }
                         | DataTypeKind::VarBinary { .. }
                         | DataTypeKind::Blob { .. }
+                        | DataTypeKind::Bit { .. }
                 )
                 .then(|| {
                     crate::engine::expr::expr_collation(expr.borrow(), &table)
@@ -2422,7 +2575,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
     let probe_first = replace && replace_probe_first();
     let needs_image = TRIGGERS || returning_clause.is_some();
     let row_defaults = row_default_plans(&table, &column_indexes)?;
-    for row in source_rows {
+    'source: for row in source_rows {
         crate::engine::cancel::check_cancelled()?;
         let expected = if rows_prepared {
             table.columns.len()
@@ -2509,73 +2662,85 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                 continue;
             }
         }
-        // Preserve the existing IGNORE boundary: BEFORE INSERT failures propagate.
-        let row_savepoint = if ignore && txn.txn_id != 0 {
-            Some(db.statement_savepoint(txn.txn_id)?)
-        } else {
-            None
-        };
         let mut deleted = 0u64;
-        let insertion = if probe_first {
-            replace_insert_row::<TRIGGERS>(db, &mut hooks, txn, &table, table_name, &values, true)
+        let inserted = loop {
+            // Preserve the existing IGNORE boundary: BEFORE INSERT failures propagate.
+            let row_savepoint = if (ignore || replace || on_duplicate.is_some()) && txn.txn_id != 0
+            {
+                Some(db.statement_savepoint(txn.txn_id)?)
+            } else {
+                None
+            };
+            let insertion = if probe_first {
+                replace_insert_row::<TRIGGERS>(
+                    db, &mut hooks, txn, &table, table_name, &values, true,
+                )
                 .map(|(inserted, count)| {
                     deleted = count;
                     inserted
                 })
-        } else {
-            db.insert_rows_detailed(txn, table_name, vec![values.clone()])
-        };
-        let inserted = match insertion {
-            Ok(inserted) => inserted,
-            Err(err) if err.is(crate::error::catalog::ER_DUP_ENTRY) && !probe_first => {
-                if let Some(updates) = on_duplicate {
-                    let _partition = replace_partition_guard(&table, &values)?;
-                    let Some(row_id) = find_conflicting_row_id(db, txn, &table, &values)? else {
-                        // Never silently lose a source row when a conflict vanished.
-                        return Err(err);
-                    };
-                    let (changed, updated_id) = apply_insert_duplicate::<TRIGGERS>(
-                        db,
-                        &mut hooks,
-                        txn,
-                        &table,
-                        row_id,
-                        &values,
-                        updates,
-                        alias_binding.as_ref(),
-                        view_check_predicate,
-                        needs_image,
-                        &mut returning,
-                    )?;
-                    if changed {
-                        ids.last_updated = updated_id;
+            } else {
+                db.insert_rows_detailed(txn, table_name, vec![values.clone()])
+            };
+            let inserted = match insertion {
+                Ok(inserted) => inserted,
+                Err(err) if err.is(crate::error::catalog::ER_DUP_ENTRY) && !probe_first => {
+                    // A failed speculative insert may own unique reservations.
+                    // Release its changes before locking the conflicting row.
+                    if let Some(savepoint) = row_savepoint {
+                        db.rollback_to_statement_savepoint(txn.txn_id, savepoint)?;
                     }
-                    duplicates += 1;
-                    affected += if changed { 2 } else { 0 };
-                    unchanged_duplicates += u64::from(!changed);
-                    continue;
-                } else if replace {
-                    let (inserted, count) = replace_insert_row::<TRIGGERS>(
-                        db, &mut hooks, txn, &table, table_name, &values, false,
-                    )?;
-                    deleted = count;
-                    inserted
-                } else if ignore {
+                    if let Some(updates) = on_duplicate {
+                        let _partition = replace_partition_guard(&table, &values)?;
+                        let Some(row_id) = find_conflicting_row_id(db, txn, &table, &values)?
+                        else {
+                            // The conflict vanished while waiting; retry INSERT.
+                            continue;
+                        };
+                        let (changed, updated_id) = apply_insert_duplicate::<TRIGGERS>(
+                            db,
+                            &mut hooks,
+                            txn,
+                            &table,
+                            row_id,
+                            &values,
+                            updates,
+                            alias_binding.as_ref(),
+                            view_check_predicate,
+                            needs_image,
+                            &mut returning,
+                        )?;
+                        if changed {
+                            ids.last_updated = updated_id;
+                        }
+                        duplicates += 1;
+                        affected += if changed { 2 } else { 0 };
+                        unchanged_duplicates += u64::from(!changed);
+                        continue 'source;
+                    } else if replace {
+                        let (inserted, count) = replace_insert_row::<TRIGGERS>(
+                            db, &mut hooks, txn, &table, table_name, &values, false,
+                        )?;
+                        deleted = count;
+                        inserted
+                    } else if ignore {
+                        record_ignore_warning(db, &err);
+                        duplicates += 1;
+                        continue 'source;
+                    } else {
+                        return Err(err);
+                    }
+                }
+                Err(err) if ignore && !probe_first && ignore_data_error(&err) => {
+                    if let Some(savepoint) = row_savepoint {
+                        db.rollback_to_statement_savepoint(txn.txn_id, savepoint)?;
+                    }
                     record_ignore_warning(db, &err);
-                    duplicates += 1;
-                    continue;
-                } else {
-                    return Err(err);
+                    continue 'source;
                 }
-            }
-            Err(err) if ignore && !probe_first && ignore_data_error(&err) => {
-                if let Some(savepoint) = row_savepoint {
-                    db.rollback_to_statement_savepoint(txn.txn_id, savepoint)?;
-                }
-                record_ignore_warning(db, &err);
-                continue;
-            }
-            Err(err) => return Err(err),
+                Err(err) => return Err(err),
+            };
+            break inserted;
         };
         if ids.first_generated == 0 {
             ids.first_generated = inserted.first_insert_id;
@@ -2695,6 +2860,16 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
             )?;
         }
         if TRIGGERS {
+            // Match UPDATE: BEFORE observes typed SET values and automatic
+            // timestamps. Trigger-only changes do not activate ON UPDATE,
+            // and explicit trigger assignments may override its value.
+            crate::storage::coerce_updated_row(table, &mut new_values, Some(&changed_columns))?;
+            if changed_columns
+                .iter()
+                .any(|&index| !new_values[index].storage_eq(&existing[index]))
+            {
+                super::dml::apply_on_update_timestamps(table, &mut new_values, &on_update);
+            }
             let hook = hooks.as_mut().expect("trigger context");
             new_values = fire_before_update(
                 db,
@@ -2704,19 +2879,9 @@ fn apply_insert_duplicate<const TRIGGERS: bool>(
                 new_values,
                 hook.registry,
             )?;
-            // Only timestamp no-op detection and view predicates need an early
-            // normalized image. Otherwise storage normalizes once, after BEFORE.
-            if !on_update.is_empty() || view_check.is_some() {
+            if view_check.is_some() {
                 db.coerce_row_for_load(table, &mut new_values)?;
                 db.materialize_generated_columns_for_insert(table, &mut new_values)?;
-                if new_values != existing {
-                    let automatic = on_update
-                        .iter()
-                        .copied()
-                        .filter(|&i| new_values[i] == existing[i])
-                        .collect::<Vec<_>>();
-                    super::dml::apply_on_update_timestamps(table, &mut new_values, &automatic);
-                }
             }
         } else {
             super::dml::apply_on_update_timestamps(table, &mut new_values, &on_update);
@@ -2828,6 +2993,7 @@ fn replace_insert_row<const TRIGGERS: bool>(
                 deleted += 1;
             }
         }
+        let insert_savepoint = db.statement_savepoint(txn.txn_id)?;
         match db.insert_rows_detailed(txn, table_name, vec![values.to_vec()]) {
             Ok(inserted) => return Ok((inserted, deleted)),
             Err(err)
@@ -2835,6 +3001,7 @@ fn replace_insert_row<const TRIGGERS: bool>(
                     && err.is(crate::error::catalog::ER_DUP_ENTRY)
                     && attempt < REPLACE_MAX_RETRY =>
             {
+                db.rollback_to_statement_savepoint(txn.txn_id, insert_savepoint)?;
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -2950,6 +3117,20 @@ fn bind_proposed_row_expr(
                 let idx = table.column_index(column)?;
                 Expr::BoundValue(proposed.get(idx).cloned().unwrap_or(Value::Null))
             }
+            Expr::Identifier(column) => {
+                let Some(idx) =
+                    insert_alias.and_then(|alias| alias.columns.get(&column.to_ascii_lowercase()))
+                else {
+                    return Ok(None);
+                };
+                if table.column_index(column).is_ok() {
+                    return Err(error(
+                        crate::error::catalog::ER_NON_UNIQ_ERROR,
+                        format!("Column '{}' in field list is ambiguous", column),
+                    ));
+                }
+                Expr::BoundValue(proposed.get(*idx).cloned().unwrap_or(Value::Null))
+            }
             Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
                 let qualifier = parts[parts.len() - 2].to_ascii_lowercase();
                 let column = &parts[parts.len() - 1];
@@ -2989,8 +3170,7 @@ pub(super) fn find_conflicting_row_id(
         if key.0.iter().any(|p| matches!(p, KeyPart::Null)) && !index.primary {
             continue;
         }
-        let ids = db.lookup_index_for_write(txn, table, index, key)?;
-        if let Some(id) = ids.into_iter().next() {
+        if let Some(id) = db.lock_unique_index_row_for_write(txn, table, index, key)? {
             return Ok(Some(id));
         }
     }
@@ -3009,8 +3189,7 @@ pub(super) fn find_all_conflicting_row_ids(
         if key.0.iter().any(|p| matches!(p, KeyPart::Null)) && !index.primary {
             continue;
         }
-        let ids = db.lookup_index_for_write(txn, table, index, key)?;
-        for id in ids {
+        if let Some(id) = db.lock_unique_index_row_for_write(txn, table, index, key)? {
             if !all_ids.contains(&id) {
                 all_ids.push(id);
             }

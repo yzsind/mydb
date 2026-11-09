@@ -3,13 +3,11 @@
 //! segment-intersection primitives shared with the topological-relation
 //! engine in [`super::relate`].
 //!
-//! Robustness uses a small absolute epsilon. Test/data coordinates are
-//! typically exact integers or short decimals, for which this is reliable; a
-//! fully robust exact-arithmetic kernel is a future improvement.
+//! Incidence and hull predicates use adaptive robust orientation so translating
+//! or scaling coordinates cannot change their topology.
 
 use super::types::*;
-
-const EPS: f64 = 1e-9;
+use geo::kernels::{Kernel, Orientation, RobustKernel};
 
 // ---------------------------------------------------------------------------
 // Low-level primitives
@@ -24,43 +22,46 @@ pub(super) enum Containment {
 }
 
 #[inline]
-fn cross(o: Coord, a: Coord, b: Coord) -> f64 {
-    (a.x - o.x) * (b.y - o.y) - (a.y - o.y) * (b.x - o.x)
-}
-
-#[inline]
 fn dist2(a: Coord, b: Coord) -> f64 {
     let dx = a.x - b.x;
     let dy = a.y - b.y;
     dx * dx + dy * dy
 }
 
+#[inline]
+fn orientation(a: Coord, b: Coord, c: Coord) -> Orientation {
+    RobustKernel::orient2d(
+        geo::Coord { x: a.x, y: a.y },
+        geo::Coord { x: b.x, y: b.y },
+        geo::Coord { x: c.x, y: c.y },
+    )
+}
+
 /// True when `p` lies on the closed segment `a`–`b`.
 pub(super) fn on_segment(p: Coord, a: Coord, b: Coord) -> bool {
-    if cross(a, b, p).abs() > EPS * (1.0 + a.x.abs() + a.y.abs() + b.x.abs() + b.y.abs()) {
-        return false;
-    }
-    p.x >= a.x.min(b.x) - EPS
-        && p.x <= a.x.max(b.x) + EPS
-        && p.y >= a.y.min(b.y) - EPS
-        && p.y <= a.y.max(b.y) + EPS
+    p.x >= a.x.min(b.x)
+        && p.x <= a.x.max(b.x)
+        && p.y >= a.y.min(b.y)
+        && p.y <= a.y.max(b.y)
+        && orientation(a, b, p) == Orientation::Collinear
 }
 
 /// Proper or improper intersection test for two closed segments.
-pub(super) fn segments_intersect(p1: Coord, p2: Coord, p3: Coord, p4: Coord) -> bool {
-    let d1 = cross(p3, p4, p1);
-    let d2 = cross(p3, p4, p2);
-    let d3 = cross(p1, p2, p3);
-    let d4 = cross(p1, p2, p4);
-    if ((d1 > 0.0 && d2 < 0.0) || (d1 < 0.0 && d2 > 0.0))
-        && ((d3 > 0.0 && d4 < 0.0) || (d3 < 0.0 && d4 > 0.0))
-    {
-        return true;
-    }
-    on_segment(p1, p3, p4)
-        || on_segment(p2, p3, p4)
-        || on_segment(p3, p1, p2)
-        || on_segment(p4, p1, p2)
+pub(super) fn segments_intersect(a: Coord, b: Coord, c: Coord, d: Coord) -> bool {
+    let ab_c = orientation(a, b, c);
+    let ab_d = orientation(a, b, d);
+    let cd_a = orientation(c, d, a);
+    let cd_b = orientation(c, d, b);
+    (ab_c != Orientation::Collinear
+        && ab_d != Orientation::Collinear
+        && ab_c != ab_d
+        && cd_a != Orientation::Collinear
+        && cd_b != Orientation::Collinear
+        && cd_a != cd_b)
+        || on_segment(a, c, d)
+        || on_segment(b, c, d)
+        || on_segment(c, a, b)
+        || on_segment(d, a, b)
 }
 
 /// Crossing-number test; boundary handled separately by the caller. The ring
@@ -89,7 +90,7 @@ fn point_strictly_in_ring(pt: Coord, ring: &[Coord]) -> bool {
 fn point_on_ring_boundary(pt: Coord, ring: &[Coord]) -> bool {
     let n = ring.len();
     if n < 2 {
-        return n == 1 && dist2(pt, ring[0]) <= EPS * EPS;
+        return n == 1 && pt == ring[0];
     }
     for i in 0..n {
         let a = ring[i];
@@ -134,7 +135,8 @@ fn ring_signed_area(ring: &[Coord]) -> f64 {
     let mut sum = 0.0;
     let mut j = n - 1;
     for i in 0..n {
-        sum += (ring[j].x + ring[i].x) * (ring[j].y - ring[i].y);
+        sum += (ring[j].x - ring[0].x) * (ring[i].y - ring[0].y)
+            - (ring[i].x - ring[0].x) * (ring[j].y - ring[0].y);
         j = i;
     }
     sum / 2.0
@@ -224,7 +226,7 @@ fn push_ring_prims(ring: &[Coord], out: &mut Vec<Prim>) {
 
 fn point_seg_dist(p: Coord, a: Coord, b: Coord) -> f64 {
     let l2 = dist2(a, b);
-    if l2 <= EPS * EPS {
+    if l2 == 0.0 {
         return dist2(p, a).sqrt();
     }
     let t = (((p.x - a.x) * (b.x - a.x) + (p.y - a.y) * (b.y - a.y)) / l2).clamp(0.0, 1.0);
@@ -379,7 +381,7 @@ fn polygon_centroid(rings: &[Vec<Coord>]) -> Option<(Coord, f64)> {
         cy += sign * ry * a.abs();
         area_sum += sign * a.abs();
     }
-    if area_sum.abs() < EPS {
+    if area_sum == 0.0 {
         return None;
     }
     Some((
@@ -409,19 +411,23 @@ fn ring_centroid_raw(ring: &[Coord]) -> (f64, f64) {
     let mut s = 0.0;
     let mut j = n - 1;
     for i in 0..n {
-        let f = ring[j].x * ring[i].y - ring[i].x * ring[j].y;
-        cx += (ring[j].x + ring[i].x) * f;
-        cy += (ring[j].y + ring[i].y) * f;
+        let ax = ring[j].x - ring[0].x;
+        let ay = ring[j].y - ring[0].y;
+        let bx = ring[i].x - ring[0].x;
+        let by = ring[i].y - ring[0].y;
+        let f = ax * by - bx * ay;
+        cx += (ax + bx) * f;
+        cy += (ay + by) * f;
         s += f;
         j = i;
     }
-    if s.abs() < EPS {
+    if s == 0.0 {
         let (sx, sy) = ring
             .iter()
             .fold((0.0, 0.0), |(sx, sy), c| (sx + c.x, sy + c.y));
         return (sx / n as f64, sy / n as f64);
     }
-    (cx / (3.0 * s), cy / (3.0 * s))
+    (ring[0].x + cx / (3.0 * s), ring[0].y + cy / (3.0 * s))
 }
 
 /// MySQL `ST_Centroid`: area-weighted for areal geometry, else length-weighted
@@ -441,7 +447,7 @@ pub(crate) fn centroid(geom: &Geom) -> Option<Coord> {
                 wsum += w;
             }
         }
-        if wsum.abs() > EPS {
+        if wsum != 0.0 {
             return Some(Coord {
                 x: cx / wsum,
                 y: cy / wsum,
@@ -463,7 +469,7 @@ pub(crate) fn centroid(geom: &Geom) -> Option<Coord> {
                 wsum += len;
             }
         }
-        if wsum > EPS {
+        if wsum > 0.0 {
             return Some(Coord {
                 x: cx / wsum,
                 y: cy / wsum,
@@ -510,8 +516,8 @@ fn collect_lines(geom: &Geom, out: &mut Vec<Vec<Coord>>) {
 /// degenerate line → LINESTRING, otherwise a closed rectangle POLYGON.
 pub(crate) fn envelope(geom: &Geom) -> Option<Geom> {
     let m = geom.mbr()?;
-    let degenerate_x = (m.maxx - m.minx).abs() < EPS;
-    let degenerate_y = (m.maxy - m.miny).abs() < EPS;
+    let degenerate_x = m.maxx == m.minx;
+    let degenerate_y = m.maxy == m.miny;
     if degenerate_x && degenerate_y {
         Some(Geom::Point(Coord {
             x: m.minx,
@@ -567,21 +573,26 @@ pub(crate) fn convex_hull(geom: &Geom) -> Option<Geom> {
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.y.partial_cmp(&b.y).unwrap_or(std::cmp::Ordering::Equal))
     });
-    pts.dedup_by(|a, b| dist2(*a, *b) <= EPS * EPS);
+    pts.dedup();
     if pts.len() == 1 {
         return Some(Geom::Point(pts[0]));
     }
     // Build lower and upper hulls.
     let mut hull: Vec<Coord> = Vec::with_capacity(pts.len() + 1);
     for &p in &pts {
-        while hull.len() >= 2 && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= EPS {
+        while hull.len() >= 2
+            && orientation(hull[hull.len() - 2], hull[hull.len() - 1], p)
+                != Orientation::CounterClockwise
+        {
             hull.pop();
         }
         hull.push(p);
     }
     let lower_len = hull.len() + 1;
     for &p in pts.iter().rev().skip(1) {
-        while hull.len() >= lower_len && cross(hull[hull.len() - 2], hull[hull.len() - 1], p) <= EPS
+        while hull.len() >= lower_len
+            && orientation(hull[hull.len() - 2], hull[hull.len() - 1], p)
+                != Orientation::CounterClockwise
         {
             hull.pop();
         }
@@ -596,9 +607,9 @@ pub(crate) fn convex_hull(geom: &Geom) -> Option<Geom> {
         return Some(Geom::LineString(vec![hull[0], hull[1]]));
     }
     // Detect all-collinear (monotone chain collapses to a line both ways).
-    let collinear = pts.iter().all(|&p| {
-        cross(pts[0], pts[pts.len() - 1], p).abs() <= EPS * (1.0 + p.x.abs() + p.y.abs())
-    });
+    let collinear = pts
+        .iter()
+        .all(|&p| orientation(pts[0], pts[pts.len() - 1], p) == Orientation::Collinear);
     if collinear {
         return Some(Geom::LineString(vec![pts[0], pts[pts.len() - 1]]));
     }

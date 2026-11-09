@@ -15,6 +15,10 @@ Drops an SQL stored function.
 - IF EXISTS controls whether a missing object is an error or a Note.
 - After the drop, dependent queries report the function as missing when re-resolved; existing persisted data is unchanged.
 
+## Context, Errors, and Lifecycle
+
+Requires ALTER ROUTINE on the function and uses an implicit-commit DDL boundary. IF EXISTS changes missing-object diagnostics; a missing unqualified function normally returns 1305. Dependent query/function resolution is invalidated; recreating a name creates a new definition with its own captured settings/grants. This manages SQL stored functions, not arbitrary UDF shared libraries.
+
 ## Examples
 
 ```sql

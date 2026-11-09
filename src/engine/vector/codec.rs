@@ -933,6 +933,30 @@ pub(crate) fn from_build_f32(
     Ok(VectorValue::new(datatype, values.len() as u32, payload))
 }
 
+fn from_wire_f32_payload(
+    bytes: &[u8],
+    datatype: VectorDataType,
+    dimension: u32,
+) -> Result<VectorValue, QueryError> {
+    // A storage datatype can support more coordinates than a FLOAT32 column.
+    // Validate against the destination domain, not FLOAT32's storage limit.
+    if dimension == 0
+        || dimension > datatype.max_dimension()
+        || bytes.len() != VectorDataType::Float32.payload_len(dimension)
+        || !finite_float32_payload(bytes)
+    {
+        return Err(vector_err("invalid FLOAT32 VECTOR wire payload"));
+    }
+    let mut payload = Vec::with_capacity(datatype.payload_len(dimension));
+    for (index, bytes) in bytes.chunks_exact(4).enumerate() {
+        let element = f32::from_le_bytes(bytes.try_into().unwrap());
+        append_number(&mut payload, index as u32, datatype, f64::from(element))?;
+    }
+    let value = VectorValue::new(datatype, dimension, payload);
+    validate_internal(&value)?;
+    Ok(value)
+}
+
 /// Comparisons accept raw binary protocol payloads as well as strict text.
 /// The column's scalar format also governs text literals and index probes.
 pub(crate) fn coerce_comparison_value(
@@ -980,11 +1004,31 @@ pub(crate) fn coerce_value(
             if let Some(body) = bytes.strip_prefix(VECTOR_BINLOG_MAGIC) {
                 return convert_value(&decode_value(body)?, datatype, dimension);
             }
-            parse_typed_text(
-                std::str::from_utf8(&bytes)
-                    .map_err(|_| vector_err("raw VECTOR payload requires VECTOR_FROM_BINARY"))?,
-                datatype,
-            )?
+            let raw_dimension = dimension.unwrap_or_else(|| match datatype {
+                VectorDataType::Float32 => (bytes.len() / 4) as u32,
+                VectorDataType::Float16 | VectorDataType::BFloat16 => (bytes.len() / 2) as u32,
+                VectorDataType::Int8 => bytes.len() as u32,
+                VectorDataType::Binary => bytes.len().saturating_mul(8) as u32,
+            });
+            if raw_dimension != 0 && bytes.len() == datatype.payload_len(raw_dimension) {
+                let value = VectorValue::new(datatype, raw_dimension, bytes);
+                validate_internal(&value)?;
+                value
+            } else if dimension.is_some_and(|dim| {
+                datatype != VectorDataType::Float32
+                    && bytes.len() == VectorDataType::Float32.payload_len(dim)
+            }) {
+                // The native MySQL result protocol exports every storage
+                // datatype as FLOAT32 coordinates. Accept that wire image
+                // on restore, while retaining native payloads above.
+                from_wire_f32_payload(&bytes, datatype, dimension.unwrap())?
+            } else {
+                parse_typed_text(
+                    std::str::from_utf8(&bytes)
+                        .map_err(|_| vector_err("invalid VECTOR payload length"))?,
+                    datatype,
+                )?
+            }
         }
         _ => return Err(vector_err("cannot convert value to VECTOR")),
     };
@@ -1001,6 +1045,44 @@ pub(crate) fn coerce_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ddl1108_typed_vector_accepts_native_and_mysql_wire_payloads() {
+        for datatype in [
+            VectorDataType::Float16,
+            VectorDataType::BFloat16,
+            VectorDataType::Int8,
+            VectorDataType::Binary,
+        ] {
+            let wire = from_f32(&[1.0, 0.0, 1.0]);
+            let value =
+                coerce_value(crate::types::Value::Bytes(wire.payload), datatype, Some(3)).unwrap();
+            assert_eq!(value.datatype, datatype);
+            assert_eq!(to_f32(&value), vec![1.0, 0.0, 1.0]);
+            let restored = coerce_value(
+                crate::types::Value::Bytes(value.payload.clone()),
+                datatype,
+                Some(3),
+            )
+            .unwrap();
+            assert_eq!(restored, value);
+            let invalid = from_f32(&[f32::INFINITY, 0.0, 1.0]);
+            assert!(coerce_value(
+                crate::types::Value::Bytes(invalid.payload),
+                datatype,
+                Some(3)
+            )
+            .is_err());
+            let dimension = 16_400;
+            let mut wire = vec![0; dimension as usize * 4];
+            wire[..4].copy_from_slice(&1_f32.to_le_bytes());
+            let value =
+                coerce_value(crate::types::Value::Bytes(wire), datatype, Some(dimension)).unwrap();
+            assert_eq!(value.dimension, dimension);
+            assert_eq!(value.element(0), 1.0);
+            assert_eq!(value.element(dimension as usize - 1), 0.0);
+        }
+    }
 
     #[test]
     fn finite_payload_simd_matches_scalar_at_unaligned_boundaries() {

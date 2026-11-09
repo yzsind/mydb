@@ -163,7 +163,7 @@ fn coerce_row(table: &TableSchema, values: &mut [Value]) -> Result<(), QueryErro
         let current = std::mem::replace(value, Value::Null);
         *value = coerce_column_value_for_schema(current, column)?;
     }
-    validate_cosine_index_vectors(table, values)?;
+    validate_row_domain_constraints(table, values)?;
     Ok(())
 }
 
@@ -212,11 +212,12 @@ pub(crate) fn coerce_updated_row(
         values[idx] = coerce_column_value_for_schema(current, column)?;
     }
     compact_char_columns_for_storage(table, values);
-    validate_cosine_index_vectors(table, values)?;
+    validate_row_domain_constraints(table, values)?;
     Ok(())
 }
 
-fn validate_cosine_index_vectors(table: &TableSchema, values: &[Value]) -> Result<(), QueryError> {
+fn validate_row_domain_constraints(table: &TableSchema, values: &[Value]) -> Result<(), QueryError> {
+    crate::binlog::validate_row_domain(table, values)?;
     for index in table.indexes.iter().filter(|index| {
         index.is_vector()
             && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
@@ -384,6 +385,20 @@ fn generated_column_value(
         )
     })?;
     let value = program.eval(table, values)?;
+    let value = if matches!(column.data_type,DataTypeKind::Bit { .. }) {
+        if let crate::engine::expr_program::CompiledTableExpr::SimpleColumn(source)=program {
+            enum_set_numeric_assignment(value,&table.columns[*source].data_type)?
+        } else { value }
+    } else { value };
+    let value = if crate::engine::expr::assignment_consumes_string(&column.data_type) {
+        if let Some(fsp) = program.temporal_fsp(table) {
+            crate::engine::expr::temporal_string_value(value, fsp)?
+        } else { value }
+    } else { value };
+    let value = if matches!(column.data_type,
+        DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. } | DataTypeKind::Blob { .. } | DataTypeKind::Bit { .. }) {
+        crate::engine::expr::encode_binary_assignment_value(value, program.source_charset(table))?
+    } else { value };
     coerce_column_value_for_schema(value, column)
 }
 
@@ -418,7 +433,7 @@ fn build_check_constraints_for_table(
     let mut used = existing
         .unwrap_or(&[])
         .iter()
-        .map(|check| check.name.clone())
+        .map(|check| normalize_name(&check.name))
         .collect::<BTreeSet<_>>();
     let mut out = Vec::with_capacity(defs.len());
     let mut next_generated = preferred_start.unwrap_or(1);
@@ -433,12 +448,12 @@ fn build_check_constraints_for_table(
             None => loop {
                 let candidate = format!("{}_chk_{}", table.name, next_generated);
                 next_generated = next_generated.saturating_add(1);
-                if !used.contains(&candidate) {
+                if !used.contains(&normalize_name(&candidate)) {
                     break candidate;
                 }
             },
         };
-        if !used.insert(name.clone()) {
+        if !used.insert(normalize_name(&name)) {
             return Err(error(
                 crate::error::catalog::ER_CHECK_CONSTRAINT_DUP_NAME,
                 format!("Duplicate check constraint name '{name}'."),
@@ -475,7 +490,7 @@ fn check_constraint_names_in_schema(
             table
                 .check_constraints
                 .iter()
-                .map(|check| check.name.clone())
+                .map(|check| normalize_name(&check.name))
         })
         .collect()
 }
@@ -486,7 +501,7 @@ fn ensure_check_constraint_names_available(
 ) -> Result<(), QueryError> {
     let mut seen = BTreeSet::new();
     for check in candidates {
-        if !seen.insert(check.name.clone()) || used.contains(&check.name) {
+        if !seen.insert(normalize_name(&check.name)) || used.contains(&normalize_name(&check.name)) {
             return Err(error(
                 crate::error::catalog::ER_CHECK_CONSTRAINT_DUP_NAME,
                 format!("Duplicate check constraint name '{}'.", check.name),
@@ -619,21 +634,23 @@ fn collect_check_expr_columns(
 
 fn validate_check_expr_supported(table: &TableSchema, expr: &Expr) -> Result<(), QueryError> {
     let schema = crate::engine::expr_program::InputSchema::from_table(table);
-    crate::engine::expr_program::ExprCompiler::compile_check_constraint(expr, &schema)
-        .map(|_| ())
-        .map_err(|_| {
-            error(
-                crate::error::catalog::ER_CHECK_CONSTRAINT_FUNCTION_IS_NOT_ALLOWED,
-                "unsupported expression in CHECK constraint",
-            )
-        })
+    let program = crate::engine::expr_program::ExprCompiler::compile_check_constraint(expr, &schema)
+        .map_err(|_| error(crate::error::catalog::ER_CHECK_CONSTRAINT_FUNCTION_IS_NOT_ALLOWED, "unsupported expression in CHECK constraint"))?;
+    if !crate::engine::expr::expr_is_boolean_typed(expr) && matches!(program.result_type().column_type(), crate::types::ColumnType::VarString | crate::types::ColumnType::Blob) {
+        return Err(error(crate::error::catalog::ER_NON_BOOLEAN_EXPR_FOR_CHECK_CONSTRAINT, "An expression of non-boolean type specified to a check constraint"));
+    }
+    Ok(())
 }
 
 fn validate_and_prepare_generated_columns(table: &mut TableSchema) -> Result<(), QueryError> {
+    validate_primary_generated_columns(&table.primary_key, &table.columns)?;
     let generated_exprs = table
         .columns
         .iter()
         .map(|column| {
+            if column.state == ColumnState::Dropped {
+                return Ok(None);
+            }
             column
                 .generated_expr
                 .as_deref()
@@ -886,7 +903,8 @@ fn reject_column_referenced_by_generated(
     column_name: &str,
 ) -> Result<(), QueryError> {
     if table.columns.iter().any(|column| {
-        !column.name.eq_ignore_ascii_case(column_name)
+        column.state != ColumnState::Dropped
+            && !column.name.eq_ignore_ascii_case(column_name)
             && column
                 .generated_column_names
                 .iter()
@@ -1263,10 +1281,21 @@ pub(crate) fn coerce_routine_typed_value(
     coerce_column_value(value, name, data_type, unsigned)
 }
 
+fn normalize_string_assignment(value: Value, target: &DataTypeKind) -> Value {
+    if matches!(target, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. } | DataTypeKind::Text { .. } | DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. } | DataTypeKind::Blob { .. } | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+        match value {
+            Value::Json(bytes) => Value::String(crate::engine::json::to_text(&bytes)),
+            Value::Geometry(bytes) => Value::Bytes(bytes),
+            other => other,
+        }
+    } else { value }
+}
+
 fn coerce_column_value_for_schema(
     mut value: Value,
     column: &ColumnSchema,
 ) -> Result<Value, QueryError> {
+    value = normalize_string_assignment(value, &column.data_type);
     // Already typed text within the byte bound is also within the character
     // bound. Keep charset validation, and canonicalize CHAR padding in place.
     // Oversized/multibyte assignments still use the diagnostic conversion path.
@@ -1479,111 +1508,133 @@ fn coerce_enum_set_with_collation(
             }
         }
         DataTypeKind::Set { values } => {
-            let numeric = match &value {
-                Value::UInt(value) => Some(*value),
-                Value::Int(value) if *value >= 0 => Some(*value as u64),
-                Value::Int(_) => {
-                    return enum_set_truncation(Value::String(String::new()), "SET", &column.name);
-                }
-                Value::Float(value) => {
-                    let value = f64::from(*value);
-                    if value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 {
-                        let mask = value.trunc() as u64;
-                        if value.fract() == 0.0 {
-                            Some(mask)
-                        } else {
-                            return enum_set_truncation(
-                                Value::String(set_bitmask_to_csv(mask, values)),
-                                "SET",
-                                &column.name,
-                            );
-                        }
-                    } else {
-                        let mask = if value.is_sign_negative() {
-                            0
-                        } else {
-                            u64::MAX
-                        };
-                        return enum_set_truncation(
-                            Value::String(set_bitmask_to_csv(mask, values)),
-                            "SET",
-                            &column.name,
-                        );
-                    }
-                }
-                Value::Double(value) => {
-                    if value.is_finite() && *value >= 0.0 && *value <= u64::MAX as f64 {
-                        let mask = value.trunc() as u64;
-                        if value.fract() == 0.0 {
-                            Some(mask)
-                        } else {
-                            return enum_set_truncation(
-                                Value::String(set_bitmask_to_csv(mask, values)),
-                                "SET",
-                                &column.name,
-                            );
-                        }
-                    } else {
-                        let mask = if value.is_sign_negative() {
-                            0
-                        } else {
-                            u64::MAX
-                        };
-                        return enum_set_truncation(
-                            Value::String(set_bitmask_to_csv(mask, values)),
-                            "SET",
-                            &column.name,
-                        );
-                    }
-                }
-                _ => None,
-            };
-            if let Some(mask) = numeric {
-                return Ok(Value::String(set_bitmask_to_csv(mask, values)));
-            }
-            let text = match value {
-                Value::String(value) | Value::Decimal(value) => value,
-                Value::Bytes(value) => String::from_utf8_lossy(&value).to_string(),
-                other => value_to_coercion_string(&other)?,
-            };
-            if !text.contains(',') {
-                let trimmed = text.trim_end_matches(' ');
-                if let Some(member) = enum_lookup_member(trimmed, values, Some(collation)) {
-                    return Ok(Value::String(member));
-                }
-                if let Ok(mask) = trimmed.parse::<u64>() {
-                    return Ok(Value::String(set_bitmask_to_csv(mask, values)));
-                }
-            }
-            let mut result = Vec::new();
-            let mut truncated = false;
-            for token in text.split(',') {
-                let trimmed = token.trim_end_matches(' ');
-                if trimmed.is_empty() {
-                    continue;
-                }
-                let Some(member) = enum_lookup_member(trimmed, values, Some(collation)) else {
-                    truncated = true;
-                    continue;
-                };
-                if !result.iter().any(|value| value == &member) {
-                    result.push(member);
-                }
-            }
-            result.sort_by_key(|member| {
-                values
-                    .iter()
-                    .position(|value| value == member)
-                    .unwrap_or(usize::MAX)
-            });
-            let value = Value::String(result.join(","));
-            if truncated {
-                enum_set_truncation(value, "SET", &column.name)
-            } else {
-                Ok(value)
-            }
+            coerce_set_assignment(value, values, &column.name, Some(collation))
         }
         _ => unreachable!("caller restricts this helper to ENUM/SET"),
+    }
+}
+
+/// Numeric SET assignment truncates fractions before interpreting the integer
+/// as a bitmask. Keep the unsigned domain: casting through i64 would lose bit
+/// 63 of legal DECIMAL/DOUBLE values. The flag marks source-domain overflow.
+fn set_numeric_assignment_mask(value: &Value) -> Option<(u64, bool)> {
+    let from_integer = |number: i128| {
+        if number < i128::from(i64::MIN) {
+            (i64::MIN as u64, true)
+        } else if number > i128::from(u64::MAX) {
+            (u64::MAX, true)
+        } else {
+            (number as u64, false)
+        }
+    };
+    let from_real = |number: f64| {
+        let number = number.trunc();
+        if number.is_finite() && number >= 0.0 && number < 18446744073709551616.0 {
+            (number as u64, false)
+        } else if number.is_finite() && number >= i64::MIN as f64 && number < 0.0 {
+            (number as i64 as u64, false)
+        } else if number.is_sign_negative() {
+            (i64::MIN as u64, true)
+        } else {
+            (u64::MAX, true)
+        }
+    };
+    match value {
+        Value::UInt(number) => Some((*number, false)),
+        Value::Int(number) => Some((*number as u64, false)),
+        Value::Float(number) => Some(from_real(f64::from(*number))),
+        Value::Double(number) => Some(from_real(*number)),
+        Value::Year(year) => Some((if *year == 0 { 0 } else { u64::from(*year) + 1900 }, false)),
+        Value::Decimal(_)
+        | Value::DecimalCompact(..)
+        | Value::Decimal128(..)
+        | Value::DecimalWide(..) => {
+            use crate::util::decimal::{rescale_trunc_i128, ExactDecimal};
+            use num_traits::{Signed, ToPrimitive};
+            let integer = match value.exact_decimal()? {
+                ExactDecimal::I64(number, scale) => {
+                    return Some(from_integer(rescale_trunc_i128(i128::from(number), scale, 0)?));
+                }
+                ExactDecimal::I128(number, scale) => {
+                    return Some(from_integer(rescale_trunc_i128(number, scale, 0)?));
+                }
+                ExactDecimal::Big(number, scale) => {
+                    number / num_bigint::BigInt::from(10u8).pow(u32::from(scale))
+                }
+            };
+            Some(integer.to_i128().map(from_integer).unwrap_or_else(|| {
+                if integer.is_negative() {
+                    (i64::MIN as u64, true)
+                } else {
+                    (u64::MAX, true)
+                }
+            }))
+        }
+        _ => None,
+    }
+}
+
+fn coerce_set_assignment(
+    value: Value,
+    members: &[String],
+    column: &str,
+    collation: Option<&str>,
+) -> Result<Value, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let allowed_mask = u64::MAX >> (64 - members.len().min(64).max(1));
+    if let Some((mask, overflow)) = set_numeric_assignment_mask(&value) {
+        let result = Value::String(set_bitmask_to_csv(mask & allowed_mask, members));
+        return if overflow || mask & !allowed_mask != 0 {
+            enum_set_truncation(result, "SET", column)
+        } else {
+            Ok(result)
+        };
+    }
+    let text = match value {
+        Value::String(text) => text,
+        Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        other => value_to_coercion_string(&other)?,
+    };
+    if text.is_empty() {
+        return Ok(Value::String(text));
+    }
+    // Only the complete value is unpadded. Inner token spaces participate
+    // in the column collation; NO PAD must not silently accept "a ,b".
+    let unpadded = text.trim_end_matches(' ');
+    let mut mask = 0u64;
+    let mut truncated = unpadded.is_empty();
+    if !unpadded.is_empty() {
+        for token in unpadded.split(',') {
+            if let Some(member) = enum_lookup_member(token, members, collation) {
+                if let Some(index) = members.iter().position(|candidate| candidate == &member) {
+                    mask |= 1u64 << index;
+                }
+            } else {
+                truncated = true;
+            }
+        }
+    }
+    // A quoted integer is a fallback only after member lookup fails. Unlike
+    // numeric input, an invalid quoted mask contributes no partial low bits.
+    // Require the whole original text to be consumed ("1 " is not a mask).
+    if truncated && mask == 0 && !text.contains(',') {
+        let number = text.trim_start_matches(|c: char| c.is_ascii_whitespace());
+        let numeric = number
+            .parse::<u64>()
+            .ok()
+            .or_else(|| number.parse::<i64>().ok().map(|value| value as u64));
+        if let Some(number) = numeric.filter(|number| number & !allowed_mask == 0) {
+            mask = number;
+            truncated = false;
+        }
+    }
+    let result = Value::String(set_bitmask_to_csv(mask, members));
+    if truncated {
+        enum_set_truncation(result, "SET", column)
+    } else {
+        Ok(result)
     }
 }
 
@@ -1788,6 +1839,7 @@ fn enum_assignment_member(
     members: &[String],
     collation: Option<&str>,
 ) -> Option<String> {
+    let input = input.trim_end_matches(' ');
     enum_lookup_member(input, members, collation).or_else(|| {
         let ordinal = input.trim().parse::<usize>().ok()?;
         ordinal
@@ -1951,7 +2003,9 @@ fn enum_set_default_error(
                     if s.is_empty() {
                         return None; // '' is the empty-index sentinel
                     }
-                    if enum_lookup_member(s, values, collation).is_some() {
+                    // ENUM assignment strips trailing U+0020 even with NO PAD
+                    // collations; validate defaults against the same spelling.
+                    if enum_lookup_member(s.trim_end_matches(' '), values, collation).is_some() {
                         None
                     } else {
                         invalid()
@@ -2314,6 +2368,25 @@ fn decimal_numeric_prefix(raw: &str) -> (Option<&str>, bool) {
     (Some(&trimmed[..index]), index == bytes.len())
 }
 
+fn negative_decimal_prefix(raw: &str) -> (bool, bool) {
+    if !raw
+        .trim_start_matches(|ch: char| ch.is_ascii_whitespace())
+        .starts_with('-')
+    {
+        return (false, true);
+    }
+    let (prefix, clean) = decimal_numeric_prefix(raw);
+    let negative = prefix.is_some_and(|prefix| {
+        prefix
+            .split(['e', 'E'])
+            .next()
+            .unwrap_or(prefix)
+            .bytes()
+            .any(|byte| matches!(byte, b'1'..=b'9'))
+    });
+    (negative, clean)
+}
+
 fn format_decimal(
     raw: &str,
     precision: Option<u8>,
@@ -2538,11 +2611,8 @@ fn out_of_range_1264<T>(clamped: T, column: &str) -> Result<T, QueryError> {
     }
 }
 
-/// BIT stores fed by an over-width binary string (including `b'…'`) and by
-/// floating values outside the unsigned 64-bit conversion domain use
-/// ER_DATA_TOO_LONG, not the numeric 1264 diagnostic. Unlike ordinary
-/// VARCHAR truncation, INSERT IGNORE retains errno 1406 as the warning code
-/// while saturating the BIT value to its all-ones representation.
+/// BIT width overflow is 1406 in strict mode. Strict INSERT IGNORE retains
+/// that diagnostic, whereas ordinary non-strict assignment warns 1264.
 #[cold]
 fn bit_data_too_long_1406<T>(clamped: T, column: &str) -> Result<T, QueryError> {
     if coercion_strict() {
@@ -2551,6 +2621,13 @@ fn bit_data_too_long_1406<T>(clamped: T, column: &str) -> Result<T, QueryError> 
             format!("data too long for column '{column}'"),
         ))
     } else {
+        let bits = crate::engine::expr::session_temporal_sql_mode_bits();
+        if DML_IGNORE_COERCION_DEPTH.with(|depth| depth.get() == 0)
+            || bits & crate::engine::api::TEMPORAL_MODE_STRICT == 0
+                && bits & crate::engine::api::TEMPORAL_MODE_EXPLICIT != 0
+        {
+            return out_of_range_1264(clamped, column);
+        }
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_DATA_TOO_LONG,
@@ -2558,6 +2635,104 @@ fn bit_data_too_long_1406<T>(clamped: T, column: &str) -> Result<T, QueryError> 
         );
         Ok(clamped)
     }
+}
+
+fn coerce_bit_assignment(value: Value, width: usize, column: &str) -> Result<Value, QueryError> {
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let maximum = u64::MAX >> (64 - width);
+    let binary = |bytes: &[u8]| -> Result<u64, QueryError> {
+        let first = bytes.iter().position(|byte| *byte != 0).unwrap_or(bytes.len());
+        let significant = &bytes[first..];
+        if significant.len() > 8 {
+            return bit_data_too_long_1406(maximum, column);
+        }
+        Ok(significant.iter().fold(0u64, |value, &byte| (value << 8) | u64::from(byte)))
+    };
+    let real = |number: f64| -> Result<u64, QueryError> {
+        let number = number.trunc();
+        if number.is_finite() && number >= 0.0 && number < 18446744073709551616.0 {
+            Ok(number as u64)
+        } else if number.is_finite() && number >= i64::MIN as f64 && number < 0.0 {
+            Ok(number as i64 as u64)
+        } else {
+            out_of_range_1264(if number.is_sign_negative() { i64::MIN as u64 } else { u64::MAX }, column)
+        }
+    };
+    let number = match value {
+        Value::Int(number) => number as u64,
+        Value::UInt(number) => number,
+        Value::Year(year) => if year == 0 { 0 } else { u64::from(year) + 1900 },
+        Value::Float(number) => real(f64::from(number))?,
+        Value::Double(number) => real(number)?,
+        decimal @ (Value::Decimal(_)
+        | Value::DecimalCompact(..)
+        | Value::Decimal128(..)
+        | Value::DecimalWide(..)) => coerce_to_unsigned(decimal, u64::MAX, column)?,
+        Value::Bytes(bytes) | Value::Geometry(bytes) => binary(&bytes)?,
+        Value::String(text) => {
+            binary(&crate::charset::encode_string(crate::engine::expr::connection_charset(), &text)?)?
+        }
+        Value::SmallString(text) => {
+            let text = std::str::from_utf8(&text).expect("SmallString is UTF-8");
+            binary(&crate::charset::encode_string(crate::engine::expr::connection_charset(), text)?)?
+        }
+        // These source domains use their textual octets, including JSON
+        // quotes and temporal separators. Source-aware assignment binds FSP
+        // and charset before reaching this fallback.
+        temporal @ (Value::Date(_) | Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_)) => {
+            binary(value_to_coercion_string(&temporal)?.as_bytes())?
+        }
+        json @ Value::Json(_) => binary(json.to_display_string().as_bytes())?,
+        other => {
+            return Err(error(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
+                format!("cannot convert {} to BIT column '{column}'", other.to_display_string())));
+        }
+    };
+    if number > maximum {
+        return bit_data_too_long_1406(Value::UInt(maximum), column);
+    }
+    Ok(Value::UInt(number))
+}
+
+/// Native ENUM/SET fields expose an ordinal/mask to numeric destinations;
+/// an ordinary character expression with the same spelling remains text.
+pub(crate) fn enum_set_numeric_assignment(value: Value, source: &DataTypeKind) -> Result<Value, QueryError> {
+    if !matches!(source,DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+        return Ok(value);
+    }
+    if matches!(value, Value::Null | Value::Int(_) | Value::UInt(_)) {
+        return Ok(value);
+    }
+    let text = match &value {
+        Value::String(text) => text.as_str(),
+        Value::SmallString(text) => std::str::from_utf8(text).expect("SmallString is UTF-8"),
+        Value::Bytes(bytes) if bytes.is_empty() => return Ok(Value::UInt(0)),
+        _ => return Err(error(crate::error::catalog::WARN_DATA_TRUNCATED,"invalid ENUM/SET field value")),
+    };
+    let number = match source {
+        DataTypeKind::Enum { values } => values.iter().position(|member| member == text)
+            .map(|index| index as u64 + 1)
+            .ok_or_else(||error(crate::error::catalog::WARN_DATA_TRUNCATED,"invalid ENUM field member"))?,
+        DataTypeKind::Set { values } => {
+            if values.iter().any(String::is_empty) {
+                return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    "BIT assignment from SET with an empty member is not supported"));
+            }
+            let mut mask=0u64;
+            if !text.is_empty() {
+                for token in text.split(',') {
+                    let index=values.iter().position(|member|member==token)
+                        .ok_or_else(||error(crate::error::catalog::WARN_DATA_TRUNCATED,"invalid SET field member"))?;
+                    mask |= 1u64 << index;
+                }
+            }
+            mask
+        }
+        _ => return Ok(value),
+    };
+    Ok(Value::UInt(number))
 }
 
 /// Over-length string/blob value: error 1406 (strict) or truncate to
@@ -2715,18 +2890,23 @@ fn rounded_integer_assignment_text(
     Ok((rounded, clean))
 }
 
+fn integer_assignment_json(json: &[u8], column: &str) -> Result<Value, QueryError> {
+    let (value, invalid) = crate::engine::json::integer_input(json)?;
+    if invalid {
+        let condition = crate::error::catalog::ER_INVALID_JSON_VALUE_FOR_CAST;
+        let message = format!("Invalid JSON value for CAST to INTEGER for column '{column}' at row 1");
+        if coercion_strict() {
+            return Err(condition.error(message));
+        }
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Warning, condition, message,
+        );
+    }
+    Ok(value)
+}
+
 fn integer_assignment_text(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
     match value {
-        Value::Json(json) => {
-            let scalar = crate::engine::json::JsonbRef::new(json).ok()?;
-            if let Some(text) = scalar.as_str() {
-                Some(std::borrow::Cow::Owned(text.to_string()))
-            } else if scalar.as_u64().is_some() || scalar.as_i64().is_some() || scalar.as_f64().is_some() {
-                Some(std::borrow::Cow::Owned(crate::engine::json::to_text(json)))
-            } else {
-                None
-            }
-        }
         Value::String(text) | Value::Decimal(text) => {
             Some(std::borrow::Cow::Borrowed(text.as_str()))
         }
@@ -2755,6 +2935,25 @@ fn warn_integer_assignment_truncation(column: &str) {
 /// 18446744073709551615.0) still need to reach the common 1264
 /// strict/non-strict saturation policy rather than turning into 1366.
 fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i64, QueryError> {
+    if let Value::Json(json) = &value {
+        return coerce_to_signed(integer_assignment_json(json, column)?, min, max, column);
+    }
+    let approximate = match &value {
+        Value::Float(number) => Some(f64::from(*number)),
+        Value::Double(number) => Some(*number),
+        _ => None,
+    };
+    if let Some(number) = approximate {
+        let rounded = number.round_ties_even();
+        let integer = rounded as i128;
+        if !rounded.is_finite() || integer > i128::from(max) {
+            return out_of_range_1264(if number.is_sign_negative() { min } else { max }, column);
+        }
+        if integer < i128::from(min) {
+            return out_of_range_1264(min, column);
+        }
+        return Ok(integer as i64);
+    }
     if let Some(text) = integer_assignment_text(&value) {
         use num_bigint::BigInt;
         use num_traits::ToPrimitive;
@@ -2794,6 +2993,13 @@ fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i6
             .to_i64()
             .expect("signed integer assignment range was checked"));
     }
+    if let Value::UInt(number) = value {
+        return if number > max as u64 {
+            out_of_range_1264(max, column)
+        } else {
+            Ok(number as i64)
+        };
+    }
     let number = to_i64(value)?;
     check_int_range(number, min, max, column)
 }
@@ -2803,6 +3009,25 @@ fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i6
 /// 0 (non-strict) or errors (strict) rather than wrapping — `to_u64` alone
 /// hard-errors on negatives, so intercept them here first.
 fn coerce_to_unsigned(value: Value, max: u64, column: &str) -> Result<u64, QueryError> {
+    if let Value::Json(json) = &value {
+        return coerce_to_unsigned(integer_assignment_json(json, column)?, max, column);
+    }
+    let approximate = match &value {
+        Value::Float(number) => Some(f64::from(*number)),
+        Value::Double(number) => Some(*number),
+        _ => None,
+    };
+    if let Some(number) = approximate {
+        let rounded = number.round_ties_even();
+        let integer = rounded as i128;
+        if rounded < 0.0 {
+            return out_of_range_1264(0, column);
+        }
+        if !rounded.is_finite() || integer > i128::from(max) {
+            return out_of_range_1264(max, column);
+        }
+        return Ok(integer as u64);
+    }
     if matches!(&value, Value::Int(v) if *v < 0) {
         return out_of_range_1264(0, column);
     }
@@ -2811,7 +3036,9 @@ fn coerce_to_unsigned(value: Value, max: u64, column: &str) -> Result<u64, Query
         use num_traits::{Signed, ToPrimitive};
 
         let (number, clean) = rounded_integer_assignment_text(&text, column)?;
-        if number.is_negative() {
+        if number.is_negative()
+            || (matches!(value, Value::Decimal(_)) && negative_decimal_prefix(&text).0)
+        {
             return out_of_range_1264(0, column);
         }
         if number > BigInt::from(max) {
@@ -2834,6 +3061,14 @@ fn coerce_to_unsigned(value: Value, max: u64, column: &str) -> Result<u64, Query
         let exact = value
             .exact_decimal()
             .expect("binary decimal variants are exact");
+        let negative = match &exact {
+            crate::util::decimal::ExactDecimal::I64(magnitude, _) => *magnitude < 0,
+            crate::util::decimal::ExactDecimal::I128(magnitude, _) => *magnitude < 0,
+            crate::util::decimal::ExactDecimal::Big(magnitude, _) => magnitude.is_negative(),
+        };
+        if negative {
+            return out_of_range_1264(0, column);
+        }
         let (rounded, _) = crate::util::decimal::rescale_exact(exact, 0, true).into_big_parts();
         if rounded.is_negative() {
             return out_of_range_1264(0, column);
@@ -2844,21 +3079,6 @@ fn coerce_to_unsigned(value: Value, max: u64, column: &str) -> Result<u64, Query
         return Ok(rounded
             .to_u64()
             .expect("unsigned integer assignment range was checked"));
-    }
-    // Check the floating-point range before Rust's saturating cast erases
-    // overflow. The exclusive 2^64 boundary cannot be represented as u64.
-    let float = match &value {
-        Value::Float(v) => Some(f64::from(*v)),
-        Value::Double(v) => Some(*v),
-        _ => None,
-    };
-    if let Some(number) = float {
-        if number < 0.0 {
-            return out_of_range_1264(0, column);
-        }
-        if !number.is_finite() || number >= 18446744073709551616.0 || number > max as f64 {
-            return out_of_range_1264(max, column);
-        }
     }
     let v = to_u64(value)?;
     check_uint_range(v, max, column)
@@ -3049,6 +3269,7 @@ fn coerce_value_with_unsigned(
     if matches!(value, Value::Null) {
         return Ok(Value::Null);
     }
+    let value = normalize_string_assignment(value, data_type);
     match data_type {
         DataTypeKind::TinyInt => {
             if unsigned {
@@ -3117,10 +3338,10 @@ fn coerce_value_with_unsigned(
             // value just came out of a SELECT.
             if let Value::DecimalCompact(mag, vscale) = &value {
                 let target_scale = scale.unwrap_or(0);
+                if unsigned && *mag < 0 {
+                    return out_of_range_1264(Value::DecimalCompact(0, target_scale), column);
+                }
                 if let Some(rescaled) = rescale_decimal_compact(*mag, *vscale, target_scale) {
-                    if unsigned && rescaled < 0 {
-                        return out_of_range_1264(Value::DecimalCompact(0, target_scale), column);
-                    }
                     let rescaled = if let Some(pr) = precision {
                         enforce_decimal_precision(rescaled, target_scale, *pr, column)?
                     } else {
@@ -3152,12 +3373,21 @@ fn coerce_value_with_unsigned(
                 Value::DecimalCompact(..) => value.to_display_string(),
                 Value::Decimal128(..) | Value::DecimalWide(..) => value.to_display_string(),
             };
+            let (negative_unsigned, clean) = if unsigned {
+                negative_decimal_prefix(&raw)
+            } else {
+                (false, true)
+            };
+            if negative_unsigned && clean {
+                return out_of_range_1264(Value::DecimalCompact(0, scale.unwrap_or(0)), column);
+            }
             let formatted = format_decimal(&raw, *precision, *scale, column)?;
             if unsigned
-                && formatted.starts_with('-')
-                && formatted
-                    .bytes()
-                    .any(|byte| byte.is_ascii_digit() && byte != b'0')
+                && (negative_unsigned
+                    || (formatted.starts_with('-')
+                        && formatted
+                            .bytes()
+                            .any(|byte| byte.is_ascii_digit() && byte != b'0')))
             {
                 let target_scale = scale.unwrap_or(0);
                 let zero = if target_scale == 0 {
@@ -3199,11 +3429,11 @@ fn coerce_value_with_unsigned(
             }
         }
         DataTypeKind::Geometry { subtype, srid } => {
-            // Geometry columns accept only an actual geometry expression.
-            // MySQL does not implicitly interpret text, raw WKB, or a BLOB
-            // prepared-statement parameter as geometry.
+            // Binary SQL literals and prepared parameters carry MySQL's SRID + WKB format.
             let bytes = match value {
                 Value::Geometry(b) => crate::engine::geo::normalize_internal(&b)?,
+                Value::Bytes(b) => crate::engine::geo::normalize_internal(&b).map_err(|err| error(crate::error::catalog::ER_CANT_CREATE_GEOMETRY_OBJECT,
+                    format!("Cannot get geometry object from data you send to the GEOMETRY field: {}", err.message())))?,
                 _ => {
                     return Err(error(
                         crate::error::catalog::ER_CANT_CREATE_GEOMETRY_OBJECT,
@@ -3345,23 +3575,20 @@ fn coerce_value_with_unsigned(
             Ok(Value::Date(days))
         }
         DataTypeKind::Time { fsp } => {
+            let max = (838 * 3600 + 59 * 60 + 59) * 1_000_000i64;
             let micros = match value {
-                Value::Time(t) => t,
+                Value::Time(t) => {
+                    if t.unsigned_abs() > max as u64 {
+                        temporal_violation("incorrect time value: out of range".to_string())?;
+                    }
+                    t.clamp(-max, max)
+                }
                 other => {
                     let original = value_to_coercion_string(&other)?;
                     match coerce_to_time_string(other).and_then(|normalized| {
                         // Normalization has already parsed compact dates/day
-                        // prefixes. Check its duration before the codec clamps
-                        // it; do not reparse every TIME through chrono.
-                        let hours = normalized
-                            .trim_start_matches('-')
-                            .split(':')
-                            .next()
-                            .and_then(|hours| hours.parse::<u64>().ok())
-                            .unwrap_or(0);
-                        if hours > 838 {
-                            temporal_violation(format!("incorrect time value: '{original}'"))?;
-                        }
+                        // prefixes. Preserve the duration until the range check
+                        // below, before the codec clamps or quantizes it.
                         let parts = crate::util::temporal::parse_time_duration(&normalized).map_err(|_| {
                             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE.error("incorrect time value")
                         })?;
@@ -3370,7 +3597,20 @@ fn coerce_value_with_unsigned(
                             + i64::from(parts.second) * 1_000_000 + i64::from(parts.micros);
                         Ok(if parts.neg { -magnitude } else { magnitude })
                     }) {
-                        Ok(micros) => quantize_time_text_micros(micros, &original, *fsp),
+                        Ok(micros) => {
+                            // Validate before rounding/truncating to the column's
+                            // precision; quantization must not hide overflow.
+                            if micros.unsigned_abs() > max as u64
+                                || (micros.unsigned_abs() == max as u64
+                                    && quantize_time_text_micros(micros, &original, 6)
+                                        .unsigned_abs() > max as u64)
+                            {
+                                temporal_violation(format!("incorrect time value: '{original}'"))?;
+                                micros.clamp(-max, max)
+                            } else {
+                                quantize_time_text_micros(micros, &original, *fsp)
+                            }
+                        }
                         Err(err)
                             if err.is_any(&[
                                 crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
@@ -3394,8 +3634,7 @@ fn coerce_value_with_unsigned(
             } else {
                 round_time_micros_to_fsp(micros, *fsp)
             };
-            let max = (838 * 3600 + 59 * 60 + 59) * 1_000_000i64;
-            if quantized.unsigned_abs() >= (max + 1_000_000) as u64 {
+            if quantized.unsigned_abs() > max as u64 {
                 temporal_violation("incorrect time value after fractional rounding".to_string())?;
             }
             Ok(Value::Time(quantized.clamp(-max, max)))
@@ -3755,137 +3994,8 @@ fn coerce_value_with_unsigned(
                 enum_set_truncation(enum_zero_value(), "ENUM", column)
             }
         }
-        DataTypeKind::Set { values: allowed } => {
-            // Numeric input path — MySQL 8.0 semantics: the value is a
-            // little-endian bitmask over the declared members, so
-            // `INSERT INTO s VALUES (5)` on `SET('a','b','c')` stores
-            // `'a,c'`. Bits beyond `values.len()` are silently ignored
-            // (matches MySQL's non-strict mode).
-            let numeric_mask: Option<u64> = match &value {
-                Value::UInt(v) => Some(*v),
-                Value::Int(v) if *v >= 0 => Some(*v as u64),
-                Value::Int(_) => {
-                    return enum_set_truncation(Value::String(String::new()), "SET", column);
-                }
-                _ => None,
-            };
-            if let Some(mask) = numeric_mask {
-                return Ok(Value::String(set_bitmask_to_csv(mask, allowed)));
-            }
-            let s = match value {
-                Value::String(v) | Value::Decimal(v) => v,
-                Value::Bytes(v) => String::from_utf8_lossy(&v).to_string(),
-                other => value_to_coercion_string(&other)?,
-            };
-            // A quoted numeric string that is not itself a declared member
-            // falls back to SET's numeric bitmask semantics. This is why
-            // `"100"` on SET('1', ... '64') stores members 3,6,7.
-            if !s.contains(',') {
-                let trimmed = s.trim_end_matches(' ');
-                if let Some(matched) = enum_lookup_member(trimmed, allowed, None) {
-                    return Ok(Value::String(matched));
-                }
-                if let Ok(mask) = trimmed.parse::<u64>() {
-                    return Ok(Value::String(set_bitmask_to_csv(mask, allowed)));
-                }
-            }
-            // Split on ',' then trim trailing spaces only (MySQL 8.0
-            // rstrips per-token; a leading space in `'a ,b'` should
-            // fail 1265, not silently match `'a'`).
-            let mut result: Vec<String> = Vec::new();
-            let mut truncated = false;
-            for part in s.split(',') {
-                let trimmed = part.trim_end_matches(' ');
-                if trimmed.is_empty() {
-                    continue;
-                }
-                if let Some(matched) = enum_lookup_member(trimmed, allowed, None) {
-                    if !result.iter().any(|v: &String| v == &matched) {
-                        result.push(matched);
-                    }
-                } else {
-                    truncated = true;
-                }
-            }
-            // MySQL always stores/echoes SET members in declaration
-            // order regardless of input order.
-            result.sort_by_key(|m| allowed.iter().position(|v| v == m).unwrap_or(usize::MAX));
-            let value = Value::String(result.join(","));
-            if truncated {
-                enum_set_truncation(value, "SET", column)
-            } else {
-                Ok(value)
-            }
-        }
-        DataTypeKind::Bit { len } => {
-            if matches!(value, Value::Null) {
-                return Ok(Value::Null);
-            }
-            // BIT(M) accepts an integer, a bit-literal `b'…'`, or a hex
-            // literal `0x…` / `x'…'`. The literals arrive as `Value::Bytes`
-            // and are read as a big-endian unsigned integer (MySQL's bit
-            // value); an integer keeps its magnitude. The value is stored as
-            // `ceil(M/8)` big-endian bytes and read back as an integer, so
-            // BIT is numeric in expression context (`b + 0`).
-            let max_bits = len.unwrap_or(1);
-            let max_value = if max_bits == 64 {
-                u64::MAX
-            } else {
-                (1u64 << max_bits) - 1
-            };
-            let n: u64 = match value {
-                Value::UInt(v) => v,
-                Value::Int(v) if v >= 0 => v as u64,
-                Value::Int(_) => {
-                    return out_of_range_1264(Value::UInt(0), column);
-                }
-                Value::Bytes(ref b) => {
-                    if b.len() > 8 {
-                        return bit_data_too_long_1406(Value::UInt(max_value), column);
-                    }
-                    let n = b.iter().fold(0u64, |acc, &byte| (acc << 8) | byte as u64);
-                    if n > max_value {
-                        return bit_data_too_long_1406(Value::UInt(max_value), column);
-                    }
-                    n
-                }
-                Value::Float(v) => {
-                    let v = v as f64;
-                    if !v.is_finite() || v > u64::MAX as f64 || v < i64::MIN as f64 {
-                        return bit_data_too_long_1406(Value::UInt(max_value), column);
-                    }
-                    if v < 0.0 {
-                        return out_of_range_1264(Value::UInt(0), column);
-                    }
-                    v.round() as u64
-                }
-                Value::Double(v) => {
-                    if !v.is_finite() || v > u64::MAX as f64 || v < i64::MIN as f64 {
-                        return bit_data_too_long_1406(Value::UInt(max_value), column);
-                    }
-                    if v < 0.0 {
-                        return out_of_range_1264(Value::UInt(0), column);
-                    }
-                    v.round() as u64
-                }
-                // A numeric string / decimal coerces through its integer value.
-                other => {
-                    let v = to_i64(other)?;
-                    if v < 0 {
-                        return out_of_range_1264(Value::UInt(0), column);
-                    }
-                    v as u64
-                }
-            };
-            if n > max_value {
-                return if max_bits == 1 {
-                    out_of_range_1264(Value::UInt(max_value), column)
-                } else {
-                    bit_data_too_long_1406(Value::UInt(max_value), column)
-                };
-            }
-            Ok(Value::UInt(n))
-        }
+        DataTypeKind::Set { values } => coerce_set_assignment(value, values, column, None),
+        DataTypeKind::Bit { len } => coerce_bit_assignment(value, len.unwrap_or(1), column),
         DataTypeKind::Text { max_len } => {
             let s = match value {
                 Value::String(v) | Value::Decimal(v) => v,
@@ -4167,8 +4277,8 @@ fn apply_float_md(
 /// user error.
 fn auto_increment_type_max(data_type: &DataTypeKind, unsigned: bool) -> Result<u64, QueryError> {
     Ok(match (data_type, unsigned) {
-        (DataTypeKind::TinyInt, false) => 127,
-        (DataTypeKind::TinyInt, true) => 255,
+        (DataTypeKind::TinyInt | DataTypeKind::Bool, false) => 127,
+        (DataTypeKind::TinyInt | DataTypeKind::Bool, true) => 255,
         (DataTypeKind::SmallInt, false) => 32_767,
         (DataTypeKind::SmallInt, true) => 65_535,
         (DataTypeKind::MediumInt, false) => 8_388_607,
@@ -4219,6 +4329,7 @@ fn validate_auto_increment_schema(table: &TableSchema) -> Result<(), QueryError>
     if !matches!(
         column.data_type,
         DataTypeKind::TinyInt
+            | DataTypeKind::Bool
             | DataTypeKind::SmallInt
             | DataTypeKind::MediumInt
             | DataTypeKind::Int
@@ -4405,6 +4516,12 @@ fn validate_index_key_parts(
     table_columns: &[ColumnSchema],
     index_type: &str,
 ) -> Result<(), QueryError> {
+    let mut seen = HashSet::new();
+    for column in columns {
+        if !column.is_empty() && !seen.insert(normalize_name(column)) {
+            return Err(error(crate::error::catalog::ER_DUP_FIELDNAME, format!("Duplicate column name '{column}'")));
+        }
+    }
     if columns.len() > MAX_INDEX_KEY_PARTS {
         return Err(error(
             crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
@@ -4677,6 +4794,7 @@ fn validate_existing_unique_index_values(
 
 fn literal_default_value(expr: &Expr) -> Result<Value, QueryError> {
     match expr {
+        Expr::BoundValue(value) => Ok(value.clone()),
         Expr::Literal(Literal::Null) => Ok(Value::Null),
         Expr::Literal(Literal::Bool(value)) => Ok(Value::Int(*value as i64)),
         Expr::Literal(Literal::Int(value)) => Ok(Value::Int(*value)),
@@ -4842,6 +4960,7 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
     // ALTER ADD COLUMN backfill can re-parse and evaluate at runtime. Plain
     // `DEFAULT CURRENT_TIMESTAMP` (no parens) keeps the legacy bare-string
     // sentinel.
+    let boolean_default = matches!(column.default, Some(Expr::Literal(Literal::Bool(_))));
     let default_expr = column
         .default
         .as_ref()
@@ -5174,6 +5293,11 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
         }
         _ => {}
     }
+    if matches!(data_type, DataTypeKind::Enum { .. } | DataTypeKind::Set { .. })
+        && (boolean_default
+            || matches!(data_type, DataTypeKind::Set { .. }) && default.as_ref().is_some_and(|value| matches!(value, Value::Int(_) | Value::UInt(_)))) {
+        return Err(error(crate::error::catalog::ER_INVALID_DEFAULT, format!("Invalid default value for '{}'", column.name)));
+    }
     // ENUM / SET literal DEFAULT: must be a declared member (or NULL for
     // nullable columns). Numeric DEFAULT is legal for ENUM but not SET.
     // Failing here mirrors MySQL's ER_INVALID_DEFAULT(1067) at DDL.
@@ -5188,48 +5312,14 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
             }
         }
     }
-    // Validate and canonicalize literal defaults at DDL time through the
-    // same type-coercion kernel used by INSERT/UPDATE. Invalid temporal and
-    // numeric defaults are definition errors (1067), not latent failures on
-    // the first row that happens to use DEFAULT.
-    if default_expr.is_none() {
-        if let Some(literal) = default.take() {
-            if matches!(literal, Value::Null) {
-                default = Some(Value::Null);
-            } else if matches!(data_type, DataTypeKind::Enum { .. })
-                && matches!(literal, Value::Int(0) | Value::UInt(0))
-            {
-                // ENUM/SET defaults have already gone through their dedicated
-                // member/ordinal validator above. Canonicalize an ENUM
-                // DEFAULT 0 to the internal stored sentinel now: applying a
-                // schema default is not a new invalid user conversion and
-                // must not emit 1265 for every subsequently inserted row.
-                default = Some(enum_zero_value());
-            } else if matches!(
-                data_type,
-                DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }
-            ) {
-                default = Some(literal);
-            } else {
-                default = Some(
-                    coerce_value_with_unsigned(literal, &data_type, column.unsigned, &column.name)
-                        .map_err(|_| {
-                            error(
-                                crate::error::catalog::ER_INVALID_DEFAULT,
-                                format!("Invalid default value for '{}'", column.name),
-                            )
-                        })?,
-                );
-            }
-        }
-    }
-    Ok(ColumnSchema {
+    let mut schema = ColumnSchema {
         not_null_from_scn: 0,
         name: column.name,
         data_type,
         nullable: column.nullable,
         unsigned: column.unsigned,
         zerofill: column.zerofill,
+        display_width: column.display_width,
         invisible: column.invisible,
         auto_increment: column.auto_increment,
         default,
@@ -5254,7 +5344,49 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
         generated_column_names: Vec::new(),
         generated_expr_ast: None,
         generated_program: None,
-    })
+    };
+    validate_literal_column_default(&mut schema)?;
+    Ok(schema)
+}
+
+fn validate_literal_column_default(column: &mut ColumnSchema) -> Result<(), QueryError> {
+    if column.default_expr.is_some() { return Ok(()); }
+    let Some(value) = column.default.clone() else { return Ok(()); };
+    let invalid = || error(crate::error::catalog::ER_INVALID_DEFAULT, format!("Invalid default value for '{}'", column.name));
+    if matches!(value, Value::Null) {
+        return if column.nullable { Ok(()) } else { Err(invalid()) };
+    }
+    if matches!(column.data_type, DataTypeKind::Enum { .. }) && matches!(&value, Value::Bytes(bytes) if bytes.is_empty()) { return Ok(()); }
+    if let Some(err) = enum_set_default_error(&column.name, &column.data_type, &value, column.collation.as_deref()) { return Err(err); }
+    let value = if matches!(column.data_type, DataTypeKind::Enum { .. }) && matches!(value, Value::Int(0) | Value::UInt(0)) {
+        enum_zero_value()
+    } else if let (DataTypeKind::Enum { values }, Value::String(text) | Value::Decimal(text)) =
+        (&column.data_type, &value)
+    {
+        // Instant ADD COLUMN reads this default directly for existing rows.
+        // Persist the declared spelling so backfill agrees with INSERT coercion.
+        enum_lookup_member(text.trim_end_matches(' '), values, column.collation.as_deref())
+            .map(Value::String)
+            .unwrap_or(value)
+    } else if matches!(column.data_type, DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+        value
+    } else {
+        coerce_partition_bound(value, column).map_err(|_| invalid())?
+    };
+    validate_column_charset_value(column, &value).map_err(|_| invalid())?;
+    column.default = Some(value);
+    Ok(())
+}
+
+fn validate_primary_generated_columns(columns: &[String], table_columns: &[ColumnSchema]) -> Result<(), QueryError> {
+    for name in columns {
+        if table_columns.iter().any(|column| column.state != ColumnState::Dropped && column.name.eq_ignore_ascii_case(name)
+            && column.generated_expr.is_some() && !column.generated_stored) {
+            return Err(error(crate::error::catalog::ER_UNSUPPORTED_ACTION_ON_GENERATED_COLUMN,
+                "Defining a virtual generated column as primary key is not supported"));
+        }
+    }
+    Ok(())
 }
 
 /// Persist only expressions accepted by the scalar SQL encoder.

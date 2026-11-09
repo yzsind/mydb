@@ -1713,6 +1713,8 @@ pub struct ColumnDef {
     /// flag, echoes it from SHOW CREATE / SHOW COLUMNS, and zero-pads
     /// text-protocol output to the type's default display width.
     pub zerofill: bool,
+    #[serde(default)]
+    pub display_width: Option<u16>,
     /// MySQL 8.0.23+ `INVISIBLE` column attribute: hidden from
     /// `SELECT *` and INSERT-without-column-list, addressable by name.
     pub invisible: bool,
@@ -2834,6 +2836,10 @@ pub enum ExplainFormat {
 pub struct OrderBy {
     pub expr: Expr,
     pub asc: bool,
+    /// Preserve binding across planner clones and stored view renames. A
+    /// resolved positional/output reference must not become a new alias use.
+    #[serde(default)]
+    pub names_bound: bool,
     /// Explicit `NULLS FIRST` / `NULLS LAST` (mydb extension; MySQL 8.0
     /// rejects this syntax with 1064). `None` follows the process default
     /// placement (see [`order_by_nulls_default_high`]).

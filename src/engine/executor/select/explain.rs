@@ -1410,7 +1410,21 @@ fn explain_with_cte(
     let body_rows = super::cte::with_cte_registry(
         stubs,
         || -> Result<Vec<planner::ExplainRow>, QueryError> {
+            let mut plans = std::collections::HashMap::new();
             for cte in &with.ctes {
+                if let Some((plan, extras, _, columns)) =
+                    plan_cte_inner_for_explain(db, cte, &mut plans, &mut Vec::new(), &mut false)
+                {
+                    let estimate = planner::estimated_rows(&plan)
+                        + extras.iter().map(planner::estimated_rows).sum::<f64>();
+                    super::cte::set_cte_result(
+                        &cte.name,
+                        Arc::new(crate::engine::api::CteResult::stub_for_explain(
+                            columns, estimate,
+                        )),
+                    );
+                    plans.insert(cte.name.to_ascii_lowercase(), plan);
+                }
                 let cte_rows = explain_cte_body(db, cte)?;
                 rows.extend(cte_rows);
             }
@@ -2073,17 +2087,6 @@ fn explain_statement_body<'q>(
     let stmt = stmt.into();
     match stmt {
         crate::parser::QueryRef::Select(select) => {
-            // If the body references a CTE in FROM/JOIN, emit synthetic rows
-            // (the planner doesn't know about CTEs; running plan_select would
-            // fail with "table not found").
-            if super::cte::has_cte(select.from.first().map(|t| t.name.as_str()).unwrap_or(""))
-                || select
-                    .joins
-                    .iter()
-                    .any(|j| super::cte::has_cte(&j.table.name))
-            {
-                return Ok(synth_cte_referencing_explain(select));
-            }
             if needs_multi_source_explain(select) {
                 return explain_multi_source_select(db, select);
             }
@@ -2181,56 +2184,6 @@ fn decode_explain_rs(rs: ResultSet) -> Vec<planner::ExplainRow> {
             }
         })
         .collect()
-}
-
-/// Emit synthetic EXPLAIN rows for a SELECT whose FROM/JOIN targets are CTE
-/// references. The planner doesn't know about CTEs, so we describe each
-/// reference as an `ALL` scan of the materialised result.
-fn synth_cte_referencing_explain(select: &Select) -> Vec<planner::ExplainRow> {
-    let mut rows = Vec::new();
-    if let Some(table) = select.from.first() {
-        rows.push(planner::ExplainRow {
-            id: 0,
-            select_type: "SIMPLE".to_string(),
-            table: table.alias.clone().unwrap_or_else(|| table.name.clone()),
-            partitions: "NULL".to_string(),
-            access_type: "ALL".to_string(),
-            possible_keys: String::new(),
-            key: String::new(),
-            key_len: String::new(),
-            ref_: String::new(),
-            rows: 0,
-            filtered: 100.0,
-            extra: format!("CTE scan: {}", table.name),
-            plan_id: None,
-        });
-    }
-    for join in &select.joins {
-        rows.push(planner::ExplainRow {
-            id: 0,
-            select_type: "SIMPLE".to_string(),
-            table: join
-                .table
-                .alias
-                .clone()
-                .unwrap_or_else(|| join.table.name.clone()),
-            partitions: "NULL".to_string(),
-            access_type: format!("{:?} join", join.join_type),
-            possible_keys: String::new(),
-            key: String::new(),
-            key_len: String::new(),
-            ref_: String::new(),
-            rows: 0,
-            filtered: 100.0,
-            extra: if super::cte::has_cte(&join.table.name) {
-                format!("CTE scan: {}", join.table.name)
-            } else {
-                String::new()
-            },
-            plan_id: None,
-        });
-    }
-    rows
 }
 
 fn select_has_window_in_projection(select: &Select) -> bool {
@@ -2541,6 +2494,16 @@ fn explain_one_source(
     }
     .to_string();
     let mut extra = String::new();
+    let mut estimated_rows = super::cte::lookup_cte(&table.name)
+        .map(|cte| cte.estimated_rows)
+        .unwrap_or_else(|| {
+            db.table(&table.name).map_or(0.0, |table| {
+                table
+                    .stats
+                    .row_count
+                    .saturating_add(db.table_modification_delta(table.id)) as f64
+            })
+        });
     if let Some(sub) = derived {
         let inner = sub.leftmost_select().ok_or_else(|| {
             error(
@@ -2549,6 +2512,9 @@ fn explain_one_source(
             )
         })?;
         let mut sub_rows = explain_select_node(db, inner)?;
+        estimated_rows = planner::plan_select(db, inner)
+            .map(|planned| planner::estimated_rows(&planned.physical))
+            .unwrap_or_else(|_| sub_rows.iter().map(|row| row.rows).max().unwrap_or(0) as f64);
         for row in &mut sub_rows {
             if row.select_type == "SIMPLE" || row.select_type == "PRIMARY" {
                 row.select_type = "DERIVED".to_string();
@@ -2569,7 +2535,7 @@ fn explain_one_source(
         key: String::new(),
         key_len: String::new(),
         ref_: String::new(),
-        rows: 0,
+        rows: estimated_rows.max(0.0).ceil() as usize,
         filtered: 100.0,
         extra,
         plan_id: None,

@@ -58,6 +58,8 @@ struct Participant {
     base: usize,
     enforce_rls: bool,
     rls_read_required: bool,
+    cte: Option<Arc<crate::engine::api::CteResult>>,
+    _cte_spill_charge: Option<Arc<super::mem_budget::OwnedMemCharge>>,
 }
 
 /// `(storage_id, row_id, values)` tuple cloned out of `StoredRow`. Owning
@@ -154,8 +156,11 @@ fn build_context(
                             alias: Option<&str>,
                             partitions: &[String]|
      -> Result<(), QueryError> {
-        let schema_arc = db.table(storage_key)?;
-        let schema: TableSchema = (*schema_arc).clone();
+        let cte = super::cte::lookup_cte(storage_key);
+        let schema = match &cte {
+            Some(cte) => TableSchema::synthetic_for_planning(storage_key, &cte.columns),
+            None => (*db.table(storage_key)?).clone(),
+        };
         let alias_lc = alias
             .map(|a| a.to_ascii_lowercase())
             .unwrap_or_else(|| schema.name.to_ascii_lowercase());
@@ -183,6 +188,8 @@ fn build_context(
             base,
             enforce_rls: false,
             rls_read_required: false,
+            cte,
+            _cte_spill_charge: None,
         });
         Ok(())
     };
@@ -459,6 +466,35 @@ impl MultiContext {
     ) -> Result<(), QueryError> {
         for (index, participant) in self.participants.iter_mut().enumerate() {
             let write = targets.contains(&index);
+            if let Some(cte) = &participant.cte {
+                if write {
+                    return Err(crate::error::catalog::ER_NON_UPDATABLE_TABLE.error(format!(
+                        "The target table '{}' is not updatable",
+                        participant.alias
+                    )));
+                }
+                let stored = |values| StoredJoinRow {
+                    storage_id: 0,
+                    row_id: RowId::new(0, 0),
+                    values,
+                };
+                participant.rows = if let Some(spill) = &cte.spill {
+                    let rows = super::cte::spilled_cte_read_all(spill)?;
+                    participant._cte_spill_charge = rows.charge;
+                    Arc::unwrap_or_clone(rows.rows)
+                        .into_iter()
+                        .map(stored)
+                        .collect()
+                } else {
+                    cte.store
+                        .dense_rows()?
+                        .iter()
+                        .cloned()
+                        .map(stored)
+                        .collect()
+                };
+                continue;
+            }
             let read = !write || reads.is_none_or(|reads| reads.contains(&index));
             participant.rls_read_required = read;
             let read_binding = if read {
@@ -571,6 +607,124 @@ fn eval_in_context(
 /// visitor in UPDATE / DELETE must NOT try to mutate this participant's
 /// row when its index slot equals this sentinel.
 pub(super) const OUTER_NULL_PARTICIPANT: usize = usize::MAX;
+
+/// Rebuild a joined candidate from current versions after target locks are held.
+/// All SET values are prepared before any target is changed, including aliases
+/// of the same physical row and statements changing their own join keys.
+fn current_joined_candidate(
+    db: &Database,
+    txn: TxnView,
+    ctx: &MultiContext,
+    indices: &[usize],
+    conditions: &[Option<BoundMultiExpr>],
+    selection: Option<&BoundMultiExpr>,
+    cache: &mut HashMap<(u64, RowId), Option<Vec<Value>>>,
+) -> Result<Option<Vec<Value>>, QueryError> {
+    let mut combined = vec![Value::Null; ctx.expression_schema.columns.len()];
+    for (p_idx, participant) in ctx.participants.iter().enumerate() {
+        if indices[p_idx] == OUTER_NULL_PARTICIPANT {
+            continue;
+        }
+        let stored = &participant.rows[indices[p_idx]];
+        let values = if participant.cte.is_some() {
+            &stored.values
+        } else {
+            let identity = (stored.storage_id, stored.row_id);
+            if !cache.contains_key(&identity) {
+                let row = db.read_row_at(
+                    &participant.schema,
+                    stored.storage_id,
+                    stored.row_id,
+                    TxnView {
+                        snapshot_scn: u64::MAX,
+                        dirty_read: false,
+                        ..txn
+                    },
+                )?;
+                cache.insert(identity, row.map(|row| row.values));
+            }
+            let Some(values) = cache[&identity].as_ref() else {
+                return Ok(None);
+            };
+            if participant.rls_read_required
+                && !crate::engine::rls::row_allowed(
+                    db,
+                    txn,
+                    &participant.schema,
+                    crate::parser::rls::Command::Select,
+                    false,
+                    values,
+                )?
+            {
+                return Ok(None);
+            }
+            values
+        };
+        combined[participant.base..participant.base + values.len()].clone_from_slice(values);
+        if participant.rowid {
+            combined[participant.base + participant.schema.columns.len()] =
+                Value::UInt(crate::storage::rowid::for_row(
+                    &participant.schema,
+                    crate::storage::DmlRowRef {
+                        storage_id: stored.storage_id,
+                        row_id: stored.row_id,
+                    },
+                )?);
+        }
+        if let Some(condition) = &conditions[p_idx] {
+            if !truthy(&eval_in_context(condition, ctx, &combined)?) {
+                return Ok(None);
+            }
+        }
+    }
+    if let Some(selection) = selection {
+        if !truthy(&eval_in_context(selection, ctx, &combined)?) {
+            return Ok(None);
+        }
+    }
+    Ok(Some(combined))
+}
+
+/// Usually the first snapshot match remains valid. Re-enumerate alternative
+/// matches only after that tuple changed while waiting, rather than retaining
+/// every tuple of a many-to-many join in memory.
+#[allow(clippy::too_many_arguments)]
+fn current_joined_for_target(
+    db: &Database,
+    txn: TxnView,
+    ctx: &MultiContext,
+    first: &[usize],
+    target: usize,
+    identity: (u64, RowId),
+    join_types: &[JoinType],
+    conditions: &[Option<BoundMultiExpr>],
+    selection: Option<&BoundMultiExpr>,
+    cache: &mut HashMap<(u64, RowId), Option<Vec<Value>>>,
+) -> Result<Option<Vec<Value>>, QueryError> {
+    let first = current_joined_candidate(db, txn, ctx, first, conditions, selection, cache)?;
+    if first.is_some() {
+        return Ok(first);
+    }
+    let mut found = None;
+    enumerate_joined(
+        ctx,
+        join_types,
+        conditions,
+        selection,
+        |_combined, indices| {
+            if found.is_some() || indices[target] == OUTER_NULL_PARTICIPANT {
+                return Ok(());
+            }
+            let stored = &ctx.participants[target].rows[indices[target]];
+            if (stored.storage_id, stored.row_id) == identity {
+                found =
+                    current_joined_candidate(db, txn, ctx, indices, conditions, selection, cache)?;
+            }
+            Ok(())
+        },
+    )?;
+    Ok(found)
+}
 
 /// Walk the N-way nested-loop join. For every combined row that satisfies
 /// the per-join `ON` conditions and (optionally) `where_predicate`, calls
@@ -998,6 +1152,7 @@ pub(super) fn execute_multi_update(
         new: Vec<Value>,
         user_columns: Vec<usize>,
         column_assignment_order: Vec<usize>,
+        contexts: Vec<(usize, Vec<usize>)>,
     }
     let mut planned: HashMap<(u64, RowId), PlannedUpdate> = HashMap::new();
     enumerate_joined(
@@ -1005,8 +1160,8 @@ pub(super) fn execute_multi_update(
         &join_types,
         &join_conditions,
         selection.as_ref(),
-        |combined, indices| {
-            for (&p_idx, assignments) in &assignments_per_participant {
+        |_combined, indices| {
+            for &p_idx in assignments_per_participant.keys() {
                 let row_idx = indices[p_idx];
                 if row_idx == OUTER_NULL_PARTICIPANT {
                     continue;
@@ -1022,28 +1177,12 @@ pub(super) fn execute_multi_update(
                         new: row.values.clone(),
                         user_columns: Vec::new(),
                         column_assignment_order: Vec::new(),
+                        contexts: Vec::new(),
                     });
-                if entry.aliases.contains(&p_idx) {
-                    continue;
-                }
-                entry.aliases.push(p_idx);
-                entry.participant = entry.participant.min(p_idx);
-                for (col_idx, order, expr) in assignments {
-                    if let Some(pos) = entry.user_columns.iter().position(|col| col == col_idx) {
-                        if entry.column_assignment_order[pos] > *order {
-                            continue;
-                        }
-                        entry.column_assignment_order[pos] = *order;
-                    } else {
-                        entry.user_columns.push(*col_idx);
-                        entry.column_assignment_order.push(*order);
-                    }
-                    let value = eval_in_context(expr, &ctx, combined)?;
-                    entry.new[*col_idx] = crate::engine::expr::contextual_numeric_literal(
-                        value,
-                        &expr.expression,
-                        &participant.schema.columns[*col_idx].data_type,
-                    );
+                if !entry.aliases.contains(&p_idx) {
+                    entry.contexts.push((p_idx, indices.to_vec()));
+                    entry.aliases.push(p_idx);
+                    entry.participant = entry.participant.min(p_idx);
                 }
             }
             Ok(())
@@ -1078,7 +1217,75 @@ pub(super) fn execute_multi_update(
     planned.sort_unstable_by_key(|((storage_id, row_id), update)| {
         (update.participant, *storage_id, *row_id)
     });
+    // Acquire the complete target set in physical identity order, then freeze
+    // the current joined images before writing any target.
+    let mut lock_order: Vec<_> = planned
+        .iter()
+        .map(|((sid, rid), update)| (*sid, *rid, update.participant))
+        .collect();
+    lock_order.sort_unstable();
+    for (sid, rid, p_idx) in lock_order {
+        db.lock_row_for_update_at(txn, &ctx.participants[p_idx].schema, sid, rid)?;
+    }
+    let mut current_cache = HashMap::new();
+    for ((sid, rid), update) in &mut planned {
+        let participant = &ctx.participants[update.participant];
+        let current = db.dml_candidate_row_at_for_write(
+            &participant.schema,
+            crate::storage::DmlRowRef {
+                storage_id: *sid,
+                row_id: *rid,
+            },
+            txn,
+        )?;
+        let Some(current) = current else { continue };
+        update.old = current.values;
+        update.new = update.old.clone();
+        let mut matched_aliases = HashSet::new();
+        for (p_idx, indices) in &update.contexts {
+            if matched_aliases.contains(p_idx) {
+                continue;
+            }
+            let Some(combined) = current_joined_for_target(
+                db,
+                txn,
+                &ctx,
+                indices,
+                *p_idx,
+                (*sid, *rid),
+                &join_types,
+                &join_conditions,
+                selection.as_ref(),
+                &mut current_cache,
+            )?
+            else {
+                continue;
+            };
+            matched_aliases.insert(*p_idx);
+            for (col_idx, order, expr) in &assignments_per_participant[p_idx] {
+                if let Some(pos) = update.user_columns.iter().position(|col| col == col_idx) {
+                    if update.column_assignment_order[pos] > *order {
+                        continue;
+                    }
+                    update.column_assignment_order[pos] = *order;
+                } else {
+                    update.user_columns.push(*col_idx);
+                    update.column_assignment_order.push(*order);
+                }
+                update.new[*col_idx] = crate::engine::expr::binary_assignment_value(
+                    eval_in_context(expr, &ctx, &combined)?,
+                    &expr.expression,
+                    &ctx.expression_schema,
+                    &participant.schema.columns[*col_idx].data_type,
+                )?;
+            }
+        }
+    }
     for ((storage_id, row_id), update) in planned {
+        if update.user_columns.is_empty() {
+            continue;
+        }
+
         let p_idx = update.participant;
         let mut old_values = update.old;
         let mut new_values = update.new;
@@ -1359,7 +1566,7 @@ pub(super) fn execute_multi_delete(
 
     // Dedup key includes `storage_id`: same-numbered rows in different
     // partitions are distinct and must both be deletable.
-    let mut planned: HashMap<usize, HashSet<(u64, RowId)>> = HashMap::new();
+    let mut planned: BTreeMap<usize, BTreeMap<(u64, RowId), Vec<usize>>> = BTreeMap::new();
     enumerate_joined(
         &ctx,
         &join_types,
@@ -1379,7 +1586,8 @@ pub(super) fn execute_multi_delete(
                 planned
                     .entry(p_idx)
                     .or_default()
-                    .insert((storage_id, row_id));
+                    .entry((storage_id, row_id))
+                    .or_insert_with(|| indices.to_vec());
             }
             Ok(())
         },
@@ -1413,11 +1621,46 @@ pub(super) fn execute_multi_delete(
     } else {
         None
     };
+    let mut lock_order = Vec::new();
+    for (p_idx, rows) in &planned {
+        for (sid, rid) in rows.keys() {
+            lock_order.push((*sid, *rid, *p_idx));
+        }
+    }
+    lock_order.sort_unstable();
+    for (sid, rid, p_idx) in lock_order {
+        db.lock_row_for_update_at(txn, &ctx.participants[p_idx].schema, sid, rid)?;
+    }
+    let mut current_cache = HashMap::new();
+    let mut valid = HashSet::new();
+    for (p_idx, rows) in &planned {
+        for (identity, indices) in rows {
+            if current_joined_for_target(
+                db,
+                txn,
+                &ctx,
+                indices,
+                *p_idx,
+                *identity,
+                &join_types,
+                &join_conditions,
+                selection.as_ref(),
+                &mut current_cache,
+            )?
+            .is_some()
+            {
+                valid.insert((*p_idx, *identity));
+            }
+        }
+    }
     let mut affected_rows = 0u64;
     for (p_idx, row_ids) in planned {
         let schema = ctx.participants[p_idx].schema.clone();
         let has_triggers = participant_has_delete_triggers[p_idx];
-        for (storage_id, row_id) in row_ids {
+        for ((storage_id, row_id), _) in row_ids {
+            if !valid.contains(&(p_idx, (storage_id, row_id))) {
+                continue;
+            }
             crate::engine::cancel::check_cancelled()?;
             let mut old_image = None;
             let mut trigger_failed = false;

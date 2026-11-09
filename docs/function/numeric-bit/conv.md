@@ -15,8 +15,8 @@ CONV(number, from_base, to_base)
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
 | `number` | Yes | Integer text or numeric value | Digits interpreted in from_base; the result is returned as text |
-| `from_base` | Yes | Numeric expression | The 2nd argument; the meaning is determined by the function syntax and description |
-| `to_base` | Yes | Numeric expression | The 3rd argument; the meaning is determined by the function syntax and description |
+| `from_base` | Yes | Numeric expression | Input radix; its absolute value must be 2 through 36. |
+| `to_base` | Yes | Numeric expression | Output radix; its absolute value must be 2 through 36; a negative radix requests signed output. |
 
 ## Return Value
 
@@ -36,8 +36,10 @@ Result:
 
 ## Notes
 
-- Numeric conversion, overflow, division by zero, and domain errors follow the current `sql_mode`; errors are never silently ignored.
+- See [numeric domains and diagnostics](README.md#domains-and-diagnostics) for conversion, domain, and overflow rules.
+
+- The result is text. Negative input is represented using the selected signed/unsigned 64-bit conversion rules; invalid bases return NULL. Trailing non-digit content can produce conversion diagnostics. Use a negative output base when signed output is required.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`BIN`](bin.md), [`OCT`](oct.md), [`BIT_COUNT`](bit_count.md), [`CRC32`](crc32.md).

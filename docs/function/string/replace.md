@@ -14,13 +14,13 @@ REPLACE(str, from_str, to_str)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `str` | Yes | String | The 1st argument; the string to process |
-| `from_str` | Yes | String | The 2nd argument; the meaning is determined by the function syntax and description |
-| `to_str` | Yes | String | The 3rd argument; the meaning is determined by the function syntax and description |
+| `str` | Yes | String | Source string; numeric scalar input is converted to text where accepted. |
+| `from_str` | Yes | String | Substring to replace; matching is case-sensitive. |
+| `to_str` | Yes | String | Replacement content. |
 
 ## Return Value
 
-Returns text, or binary bytes when binary input semantics apply; it does not return an integer. SQL NULL propagation follows the argument rules below.
+Returns text/binary content with every case-sensitive occurrence of from_str replaced by to_str. An empty from_str preserves the source. Any SQL NULL argument returns NULL.
 
 ## Examples
 
@@ -36,8 +36,8 @@ myx
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`REGEXP_REPLACE`](regexp_replace.md), [`REGEXP_SUBSTR`](regexp_substr.md), [`REGEXP_INSTR`](regexp_instr.md), [`REGEXP_LIKE`](regexp_like.md).

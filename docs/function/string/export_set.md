@@ -14,14 +14,15 @@ EXPORT_SET(bits, on, off [, separator [, number_of_bits]])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `bits` | Yes | Integer | The 1st argument; the meaning is determined by the function syntax and description |
-| `on` | Yes | String or binary string | The 2nd argument; the meaning is determined by the function syntax and description |
-| `off` | Yes | String or binary string | The 3rd argument; the meaning is determined by the function syntax and description |
-| `separator` | No | String or binary string | The 4th argument; the separator used in the concatenated result |
+| `bits` | Yes | Integer | Bitmap read from least significant bit first. |
+| `on` | Yes | String | Output for a set bit. |
+| `off` | Yes | String | Output for an unset bit. |
+| `separator` | No | String | Separator, default comma. |
+| `number_of_bits` | No | Integer | Number of bits to emit, default 64 and capped at 64. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns text selected bit by bit, from the least significant bit first. Set bits emit on and unset bits emit off. Separator defaults to comma and number_of_bits to 64, capped at 64. Any supplied SQL NULL argument returns NULL.
 
 ## Examples
 
@@ -33,8 +34,8 @@ Result: Y,N,Y
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`MAKE_SET`](make_set.md), [`LIST_ADD`](list_add.md), [`LIST_DROP`](list_drop.md), [`FORMAT`](format.md).

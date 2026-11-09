@@ -421,9 +421,10 @@ impl Iterator for ValidatedFixed128IndexIter {
         }
         let identity = encoded >> ((16 - self.key_width) * 8);
         if self.unique && !has_null && self.previous_key == Some(identity) {
-            return Some(Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!("duplicate entry for key '{}'", self.index_name),
+            return Some(Err(encoded_duplicate_entry_error(
+                &self.index_name,
+                key_bytes,
+                &self.program,
             )));
         }
         if self.unique && !has_null {
@@ -468,9 +469,10 @@ impl Iterator for ValidatedFixedIndexIter {
                 self.bytes[previous..previous + self.key_width] == *key_bytes
             });
         if duplicate {
-            return Some(Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!("duplicate entry for key '{}'", self.index_name),
+            return Some(Err(encoded_duplicate_entry_error(
+                &self.index_name,
+                key_bytes,
+                &self.program,
             )));
         }
         if self.unique && !has_null {
@@ -498,6 +500,7 @@ impl Iterator for ValidatedFixedIndexIter {
 
 struct ValidatedEncodedRecordIter {
     inner: EncodedSortedRecordIter,
+    program: Arc<CompiledIndexKeyProgram>,
     unique: bool,
     primary: bool,
     index_name: String,
@@ -670,9 +673,10 @@ impl Iterator for ValidatedFixed128Iter {
             }
             let key_identity = encoded >> ((16 - self.key_width) * 8);
             if self.unique && !has_null && self.previous_key == Some(key_identity) {
-                return Some(Err(error(
-                    crate::error::catalog::ER_DUP_ENTRY,
-                    format!("duplicate entry for key '{}'", self.index_name),
+                return Some(Err(encoded_duplicate_entry_error(
+                    &self.index_name,
+                    key,
+                    &self.program,
                 )));
             }
             if self.unique && !has_null {
@@ -755,10 +759,10 @@ impl Iterator for ValidatedEncodedRecordIter {
                 .as_ref()
                 .is_some_and(|key| key.as_slice() == record.order_key)
         {
-            return Some(Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!("duplicate entry for key '{}'", self.index_name),
-            )));
+            return Some(Err(match self.program.materialize_key(&record) {
+                Ok(key) => duplicate_entry_error_for_index(&self.index_name, &key),
+                Err(err) => err,
+            }));
         }
         if self.unique && !record.has_null {
             self.previous = Some(record.order_key.clone());
@@ -773,7 +777,8 @@ fn validated_encoded_record_iter(
     index: &IndexSchema,
 ) -> Result<ValidatedEncodedRecordIter, QueryError> {
     Ok(ValidatedEncodedRecordIter {
-        inner: sorted.into_record_iter(program)?,
+        inner: sorted.into_record_iter(program.clone())?,
+        program,
         unique: index.unique,
         primary: index.primary,
         index_name: index.name.clone(),
@@ -1104,10 +1109,12 @@ fn create_rebuilt_from_encoded_composite_with_degree(
                             ));
                         }
                         if index.unique && !has_null && equal {
-                            return Err(error(
-                                crate::error::catalog::ER_DUP_ENTRY,
-                                format!("duplicate entry for key '{}'", index.name),
-                            ));
+                            let key = if let Some(payload) = payload {
+                                decode_index_key_from(payload, &mut 0)?
+                            } else {
+                                decode_compiled_fixed_order_key(order, &program)?
+                            };
+                            return Err(duplicate_entry_error_for_index(&index.name, &key));
                         }
                         if let Some(counts) = validation.as_mut() {
                             if equal {
@@ -4750,6 +4757,17 @@ impl CompiledIndexKeyProgram {
                 .sum::<usize>()
                 .saturating_add(6)
         })
+    }
+}
+
+fn encoded_duplicate_entry_error(
+    name: &str,
+    bytes: &[u8],
+    program: &CompiledIndexKeyProgram,
+) -> QueryError {
+    match decode_compiled_fixed_order_key(bytes, program) {
+        Ok(key) => duplicate_entry_error_for_index(name, &key),
+        Err(err) => err,
     }
 }
 

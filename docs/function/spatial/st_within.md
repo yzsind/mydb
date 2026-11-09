@@ -24,15 +24,19 @@ Returns `1` when the condition holds and `0` otherwise; returns `NULL` when the 
 ## Examples
 
 ```sql
-SELECT ST_WITHIN(ST_GEOMFROMTEXT('POINT(1 2)'), ST_GEOMFROMTEXT('POINT(2 3)'));
+SELECT ST_WITHIN(ST_GEOMFROMTEXT('POINT(1 2)'),ST_GEOMFROMTEXT('POINT(2 3)'));
 ```
 
-Result: returns 0 or 1, indicating whether the spatial relationship holds.
+Result:
+
+```text
+0
+```
 
 ## Notes
 
-- Geometry arguments must be valid and satisfy the function's type and SRID requirements; an incompatible SRID or geometry type returns a clear error.
+- See [spatial inputs and diagnostics](README.md#spatial-inputs-and-diagnostics) for encoding, SRID, empty-geometry, and geometry-type rules.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`ST_CONTAINS`](st_contains.md), [`ST_TOUCHES`](st_touches.md), [`ST_CROSSES`](st_crosses.md), [`ST_INTERSECTS`](st_intersects.md).

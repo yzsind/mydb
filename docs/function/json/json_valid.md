@@ -14,7 +14,7 @@ JSON_VALID(json_doc)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `json_doc` | Yes | JSON document or JSON path/scalar | The 1st argument; the JSON document to process |
+| `json_doc` | Yes | JSON document or valid JSON text | The json document to process |
 
 ## Return Value
 
@@ -34,4 +34,4 @@ Result: 1
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_EXTRACT`](json_extract.md), [`JSON_VALUE`](json_value.md), [`JSON_KEYS`](json_keys.md), [`JSON_LENGTH`](json_length.md).

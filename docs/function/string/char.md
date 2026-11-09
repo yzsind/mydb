@@ -14,25 +14,29 @@ CHAR(n [, n] ... [USING charset_name])
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `n` | No, repeatable | Integer | Code value to convert into a character |
-| `charset_name` | No | Charset name | Result charset specified by the USING clause |
+| `n ...` | Yes, repeatable | Integer or convertible numeric expression | Code bytes; NULL arguments are skipped. |
+| `charset_name` | No | Charset name | USING requests conversion of the resulting bytes; default is binary. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns binary bytes by default, or text in the charset selected by USING. NULL integer arguments are skipped; at least one integer argument is required. Integers above 255 produce multiple bytes, not a Unicode code point conversion. Invalid encoded output under USING follows charset conversion diagnostics.
 
 ## Examples
 
 ```sql
-SELECT CHAR(77, 121, 68, 66);
+SELECT HEX(CHAR(65,NULL,256));
 ```
 
-Result: MyDB
+Result:
+
+```text
+410100
+```
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`LENGTH`](length.md), [`CHAR_LENGTH`](char_length.md), [`BIT_LENGTH`](bit_length.md), [`ASCII`](ascii.md).

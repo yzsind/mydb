@@ -6579,10 +6579,9 @@ impl Database {
             // MySQL/InnoDB semantics (M4): `ROLLBACK TO SAVEPOINT` undoes data
             // changes and deletes later savepoints, but does NOT release the row
             // locks acquired after the savepoint — they are held until the
-            // transaction ends. (Rows *inserted* after the savepoint are undone by
-            // `rollback_txn_changes_until` above, which releases their implicit
-            // locks along with the row versions, matching InnoDB.) The legacy
-            // early-release path is kept behind `MYDB_SAVEPOINT_RELEASE_LOCKS` as a
+            // transaction ends. Inserted tuple versions are removed by
+            // compensation, but explicit lock-log entries are retained too.
+            // The early-release path is kept behind `MYDB_SAVEPOINT_RELEASE_LOCKS` as a
             // differential oracle.
             if savepoint_release_locks_on_rollback() {
                 let mut released = self

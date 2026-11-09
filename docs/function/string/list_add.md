@@ -14,12 +14,12 @@ LIST_ADD(list, item)
 
 | Parameter | Required | Accepted Types | Description |
 | --- | --- | --- | --- |
-| `list` | Yes | String | The 1st argument; the comma-separated list |
-| `item` | Yes | String | The 2nd argument; the list element to add or remove |
+| `list` | Yes | String | Comma-separated list; empty entries are discarded and surrounding spaces are trimmed. |
+| `item` | Yes | String | Element to add or remove; comparison ignores ASCII case. |
 
 ## Return Value
 
-Returns a string, binary string, or integer; returns `NULL` when a required argument is `NULL`, except where noted otherwise.
+Returns normalized comma-separated text with item appended only if it is not already present, comparing without ASCII case. Empty entries are discarded and entry whitespace is trimmed. Any SQL NULL argument raises 1138/02200.
 
 ## Examples
 
@@ -31,8 +31,8 @@ Result: a,b,c
 
 ## Notes
 
-- Character counts differ from byte counts; binary strings are processed by bytes, while text strings follow charset and collation semantics.
+- See [text and binary semantics](README.md#text-and-binary-semantics) for encoding, indexing and result-size limits.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`EXPORT_SET`](export_set.md), [`MAKE_SET`](make_set.md), [`LIST_DROP`](list_drop.md), [`FORMAT`](format.md).

@@ -22,7 +22,7 @@ JSON_VALUE(json_doc, path [RETURNING type] [on_empty] [on_error])
 
 ## Return Value
 
-Returns a JSON value or JSON text; no match, `NULL` input, or an error-handling clause may produce `NULL`.
+Returns the selected scalar converted to RETURNING type, default CHAR(512). No match uses ON EMPTY (default NULL); non-scalar/conversion failures use ON ERROR (default NULL). SQL NULL document returns NULL. Invalid document/path and SQL errors are not all caught by ON ERROR.
 
 ## Examples
 
@@ -34,8 +34,11 @@ Result: 1
 
 ## Notes
 
-- JSON paths must use the MySQL JSON path syntax currently supported by mydb; an invalid document or path returns a clear error.
+- See [JSON values and paths](README.md#json-values-and-paths) for conversion, path support and invalid-input diagnostics.
+
+- `NULL ON EMPTY`, `ERROR ON EMPTY`, or `DEFAULT literal ON EMPTY` select missing-path handling. The corresponding ON ERROR forms control scalar-conversion failures. Place ON EMPTY before ON ERROR.
+- RETURNING accepts the supported JSON_VALUE scalar targets (CHAR, SIGNED/UNSIGNED, DECIMAL, FLOAT/DOUBLE, DATE, TIME, DATETIME, YEAR and JSON). Specify sizes/precision when needed; unsupported targets and nonconstant paths are rejected.
 
 ## Related Functions
 
-This function has no direct alias in this category; see the category index for related functions.
+[`JSON_EXTRACT`](json_extract.md), [`JSON_KEYS`](json_keys.md), [`JSON_LENGTH`](json_length.md), [`JSON_DEPTH`](json_depth.md).

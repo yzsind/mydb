@@ -460,26 +460,6 @@ fn extract_windows_into_specs(
     }
 }
 
-/// Approximate the result column type of a Part 2 post-window projection
-/// expression for result metadata. The runtime `Value` carries the precise
-/// type; this only affects the advertised column type, so arithmetic / nested
-/// shapes default to DOUBLE (TPC-DS window-in-expression cases are numeric).
-fn window_output_expr_type(expr: &Expr) -> ColumnType {
-    match expr {
-        Expr::Unary { expr, .. } => window_output_expr_type(expr),
-        Expr::Case {
-            results,
-            else_result,
-            ..
-        } => results
-            .first()
-            .or(else_result.as_deref())
-            .map(window_output_expr_type)
-            .unwrap_or(ColumnType::Double),
-        _ => ColumnType::Double,
-    }
-}
-
 /// Session-free product of [`prepare_window_execution`]: the windowed
 /// projection rewritten into a windowless inner select + window specs + output
 /// template, with the inner select already planned. Both the session-ful
@@ -698,6 +678,9 @@ fn prepare_window_execution(
     // charset/type errors in nested window arguments win over an unrelated
     // planner-routing error (notably LEAD/LAG defaults in constant SELECTs).
     crate::engine::executor::select::validate_select_static_collations(&stmt)?;
+    // Capture ORDER keys only after binding SELECT aliases. The windowless
+    // inner binder no longer has the original output definitions available.
+    crate::planner::resolve_order_by_output_refs(db, &mut stmt)?;
     // Tier 0 #1: predicate normalization on the outer select
     // (the inner stmt below inherits it).
     crate::planner::normalize_select_predicates(db, &mut stmt);
@@ -839,11 +822,9 @@ fn prepare_window_execution(
                         &mut inner_projection,
                         &mut hoist_counter,
                     );
-                    let column_type = window_output_expr_type(&out_expr);
                     output_template.push(OutputCol::Expr {
                         name: alias_name,
                         expr: out_expr,
-                        column_type,
                     });
                 }
             }
@@ -1456,30 +1437,40 @@ pub(in crate::engine::executor) fn rollup_window_topk_hint_for_window_derived(
         return None;
     }
     let aliases = projection_alias_exprs(inner);
-    Some(
-        crate::engine::executor::select::plan::RollupWindowTopKHint {
-            partition_by: partition_by
-                .iter()
-                .map(|expr| {
-                    rebind_window_expr_to_rollup_derived_projection(expr, &aliases, &inner.group_by)
-                })
-                .collect(),
-            order_by: order_by
-                .iter()
-                .map(|item| {
-                    let mut item = item.clone();
-                    item.expr = rebind_window_expr_to_rollup_derived_projection(
-                        &item.expr,
-                        &aliases,
-                        &inner.group_by,
-                    );
-                    item
-                })
-                .collect(),
-            k,
-            kind,
-        },
-    )
+    let hint = crate::engine::executor::select::plan::RollupWindowTopKHint {
+        partition_by: partition_by
+            .iter()
+            .map(|expr| {
+                rebind_window_expr_to_rollup_derived_projection(expr, &aliases, &inner.group_by)
+            })
+            .collect(),
+        order_by: order_by
+            .iter()
+            .map(|item| {
+                let mut item = item.clone();
+                item.expr = rebind_window_expr_to_rollup_derived_projection(
+                    &item.expr,
+                    &aliases,
+                    &inner.group_by,
+                );
+                item
+            })
+            .collect(),
+        k,
+        kind,
+    };
+    if !hint
+        .partition_by
+        .iter()
+        .all(|expr| column_key(expr) || matches!(expr, Expr::GroupKeyRef { .. }))
+        || !hint
+            .order_by
+            .iter()
+            .all(|item| column_key(&item.expr) || expr_has_aggregate(&item.expr))
+    {
+        return None;
+    }
+    Some(hint)
 }
 
 /// Share limit pushdown decisions without changing either execution mode's
@@ -1860,21 +1851,30 @@ fn prepare_window_final_projection(
                         .unwrap_or(ColumnType::VarString),
                 });
             }
-            OutputCol::Expr {
-                name,
-                expr,
-                column_type,
-            } => {
+            OutputCol::Expr { name, expr } => {
                 final_cols.push(WindowFinalCol::Eval(
                     crate::engine::expr_program::CompiledTableExpr::compile_once(
                         expr,
                         &post_schema,
                     ),
                 ));
+                let descriptor =
+                    crate::engine::expr_type::infer_expr_type_in_table(expr, &post_schema);
+                let mut source = crate::types::ColumnSource::default();
+                descriptor.apply_to_source(&mut source);
+                source.round_decimal_result = crate::parser::visit::any_expr(expr, |node| {
+                    matches!(
+                        node,
+                        Expr::Binary {
+                            op: crate::parser::BinaryOp::Div,
+                            ..
+                        }
+                    )
+                });
                 final_columns.push(Column {
-                    source: Default::default(),
+                    source,
                     name: name.clone(),
-                    column_type: *column_type,
+                    column_type: descriptor.column_type(),
                 });
             }
         }
@@ -2263,7 +2263,6 @@ enum OutputCol {
     Expr {
         name: String,
         expr: Expr,
-        column_type: ColumnType,
     },
 }
 
@@ -3581,9 +3580,36 @@ pub(super) fn evaluate_window_per_partition(
         }
         _ => None,
     };
-    crate::engine::expr::with_optional_compare_collation(collation, || {
+    let values = crate::engine::expr::with_optional_compare_collation(collation, || {
         evaluate_window_per_partition_inner(expr, effective_frame, partitions, columns, rows)
-    })
+    })?;
+    if let Expr::WindowFunction { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("LEAD") || name.eq_ignore_ascii_case("LAG") {
+            let schema = synthetic_set_op_schema(columns);
+            let descriptor = crate::engine::expr_type::infer_expr_type_in_table(expr, &schema);
+            return values
+                .into_iter()
+                .map(|value| crate::engine::expr::coerce_result_to_expr_type(value, descriptor))
+                .collect();
+        }
+        if name.eq_ignore_ascii_case("SUM") || name.eq_ignore_ascii_case("AVG") {
+            let schema = synthetic_set_op_schema(columns);
+            if args.first().is_some_and(|arg| {
+                matches!(
+                    crate::engine::expr_type::infer_expr_type_in_table(arg, &schema).kind,
+                    crate::engine::expr_type::ExprTypeKind::Temporal { .. }
+                        | crate::engine::expr_type::ExprTypeKind::Year
+                )
+            }) {
+                if let ColumnType::Decimal { scale, .. } =
+                    crate::engine::expr_type::infer_expr_type_in_table(expr, &schema).column_type()
+                {
+                    return Ok(values.into_iter().map(|value| crate::engine::executor::select::aggregate::exact_aggregate_value_at_scale(value, scale)).collect());
+                }
+            }
+        }
+    }
+    Ok(values)
 }
 
 fn evaluate_window_per_partition_inner(
@@ -3881,13 +3907,19 @@ fn evaluate_window_per_partition_inner(
                         "JSON_ARRAYAGG requires an argument",
                     )
                 })?;
+                let typed_arg =
+                    crate::engine::executor::select::aggregate::json_aggregate_value_expr(arg);
                 let vals: Vec<Vec<u8>> = partition
                     .iter()
                     .map(|&i| -> Result<_, QueryError> {
-                        Ok(crate::engine::expr::value_to_jsonb_typed(
-                            &eval_expr_against_columns(arg, columns, &rows[i])?,
-                            crate::engine::expr::expr_is_boolean_typed(arg),
-                        ))
+                        let value = eval_expr_against_columns(&typed_arg, columns, &rows[i])?;
+                        Ok(match value {
+                            Value::Json(bytes) => bytes,
+                            value => crate::engine::expr::value_to_jsonb_typed(
+                                &value,
+                                crate::engine::expr::expr_is_boolean_typed(arg),
+                            ),
+                        })
                     })
                     .collect::<Result<_, QueryError>>()?;
                 for (pos, &row_idx) in partition.iter().enumerate() {
@@ -3923,10 +3955,12 @@ fn evaluate_window_per_partition_inner(
                         "JSON_OBJECTAGG requires a key and a value argument",
                     ));
                 }
+                let key_expr =
+                    crate::engine::executor::select::aggregate::json_objectagg_key_expr(&args[0]);
                 let pairs: Vec<(Value, Vec<u8>)> = partition
                     .iter()
                     .map(|&i| -> Result<_, QueryError> {
-                        let key = eval_expr_against_columns(&args[0], columns, &rows[i])?;
+                        let key = eval_expr_against_columns(&key_expr, columns, &rows[i])?;
                         let val = crate::engine::expr::value_to_jsonb_typed(
                             &eval_expr_against_columns(&args[1], columns, &rows[i])?,
                             crate::engine::expr::expr_is_boolean_typed(&args[1]),
@@ -3959,9 +3993,13 @@ fn evaluate_window_per_partition_inner(
                         }
                     }
                     let pairs = map.into_iter().collect::<Vec<_>>();
-                    result[row_idx] = crate::engine::expr::checked_json_value(
-                        crate::engine::json::build_object(&pairs),
-                    )?;
+                    result[row_idx] = if pairs.is_empty() {
+                        Value::Null
+                    } else {
+                        crate::engine::expr::checked_json_value(crate::engine::json::build_object(
+                            &pairs,
+                        ))?
+                    };
                 }
             }
             "NTILE" => {

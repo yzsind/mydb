@@ -17,6 +17,10 @@ Executes statements first, then ends when the UNTIL condition is true.
 
 - The body executes at least once; UNTIL TRUE ends the loop, FALSE/NULL continue it.
 
+## Context, Errors, and Lifecycle
+
+The body executes once before checking UNTIL. FALSE/NULL repeats and TRUE exits. ITERATE targets an enclosing visible loop; labels must match at END REPEAT. Initialize v_i before this example; it is not a top-level SQL statement. Resource limits/KILL still apply to nonterminating execution.
+
 ## Examples
 
 ```sql
