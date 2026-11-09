@@ -998,7 +998,11 @@ pub(crate) fn execute_compiled_select(
     compiled.validate_limit_parameters()?;
     let _caller_partition_scope =
         crate::engine::executor::partition_router::suspend_pruned_partitions();
-    let sample_context = super::sampling::preflight(db, stmt)?;
+    let sample_context = if compiled.has_table_sampling {
+        super::sampling::preflight(db, stmt)?
+    } else {
+        None
+    };
     let _sample_scope = sample_context.map(|context| super::sampling::enter(Some(context)));
     let _read_schema = crate::storage::read_schema::ReadSchemaScope::enter(
         (!txn.dirty_read).then_some(txn.snapshot_scn),

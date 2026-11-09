@@ -12196,7 +12196,7 @@ mod tests {
     fn raw_token_caches_reserve_before_parallel_allocation_and_release() {
         use crate::engine::executor::mem_budget::with_query_budget;
         let budget = Arc::new(MemBudget::new(63 * 1024 * 1024));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let mut workers = Vec::new();
             for _ in 0..8 {
                 let budget = budget.clone();

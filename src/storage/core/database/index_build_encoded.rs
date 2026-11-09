@@ -588,9 +588,9 @@ where
     let Some(_reservation) = reservation else {
         return build(PrefetchedFixedEntries::Direct(entries));
     };
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let (sender, receiver) = std::sync::mpsc::sync_channel(QUEUED_BATCHES);
-        let producer = std::thread::Builder::new()
+        let producer = crate::util::thread_spawn::Builder::new()
             .name("mydb-index-merge-read".into())
             .spawn_scoped(scope, move || {
                 let mut batch = Vec::with_capacity(BATCH_ROWS);
@@ -2864,7 +2864,7 @@ fn parallel_partition_sort_fixed128(records: &mut Vec<u128>, degree: usize) -> b
     let workers = degree.min(rows / (MIN_ROWS / 8)).max(2);
     let chunk_rows = rows.div_ceil(workers);
     let first = records[0];
-    let varying = std::thread::scope(|scope| {
+    let varying = crate::util::thread_spawn::scope(|scope| {
         records
             .chunks(chunk_rows)
             .map(|chunk| {
@@ -2899,7 +2899,7 @@ fn parallel_partition_sort_fixed128(records: &mut Vec<u128>, degree: usize) -> b
         })
     };
     let buckets = 1usize << positions.len();
-    let histograms = std::thread::scope(|scope| {
+    let histograms = crate::util::thread_spawn::scope(|scope| {
         records
             .chunks(chunk_rows)
             .map(|chunk| {
@@ -2939,7 +2939,7 @@ fn parallel_partition_sort_fixed128(records: &mut Vec<u128>, degree: usize) -> b
     // reserved for its chunk by the prefix sums above.
     unsafe impl Sync for ScatterTarget {}
     let target = ScatterTarget(scratch.as_mut_ptr());
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for (chunk, mut cursor) in records.chunks(chunk_rows).zip(starts) {
             let target = &target;
             scope.spawn(move || {
@@ -2968,7 +2968,7 @@ fn parallel_partition_sort_fixed128(records: &mut Vec<u128>, degree: usize) -> b
     slices.sort_unstable_by_key(|bucket| bucket.len());
     let sorters = degree.min(slices.len()).max(1);
     let queue = Mutex::new(slices);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for _ in 0..sorters {
             scope.spawn(|| loop {
                 let Some(bucket) = queue.lock().unwrap_or_else(|e| e.into_inner()).pop() else {
@@ -3016,7 +3016,7 @@ fn parallel_sort_fixed128_in_place(records: &mut Vec<u128>, degree: usize) {
     }
 
     let workers = degree.min(records.len() / (MIN_PARALLEL_ROWS / 2)).max(2);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut partitions = Vec::with_capacity(workers);
         partition(records, workers, &mut partitions);
         for partition in partitions {
@@ -3136,7 +3136,7 @@ fn parallel_msd_sort_fixed_ordinals(bytes: &[u8], stride: usize, order: &mut [u3
     let next = AtomicUsize::new(0);
     let tasks = &tasks;
     let order_addr = order.as_mut_ptr() as usize;
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
             scope.spawn(move || loop {
@@ -4081,7 +4081,7 @@ impl Database {
             let shared_sorters = sorters.into_iter().map(Mutex::new).collect::<Vec<_>>();
             let next_page = AtomicU64::new(0);
             visible_rows = self.with_heap_read(table.id, |heap| {
-                std::thread::scope(|scope| -> Result<u64, QueryError> {
+                crate::util::thread_spawn::scope(|scope| -> Result<u64, QueryError> {
                     let mut handles = Vec::with_capacity(scan_degree);
                     for worker in 0..scan_degree {
                         let shared_sorters = &shared_sorters;
@@ -4091,7 +4091,7 @@ impl Database {
                         let needed_columns = &needed_columns;
                         let mut scan_charge = scan_charges.pop().expect("prepaid scan worker lease");
                         handles.push(
-                            std::thread::Builder::new()
+                            crate::util::thread_spawn::Builder::new()
                                 .name(format!("mydb-encoded-index-scan-{worker}"))
                                 .stack_size(4 * 1024 * 1024)
                                 .spawn_scoped(scope, move || -> Result<u64, QueryError> {
@@ -4245,7 +4245,7 @@ impl Database {
             let shared_sorters = sorters.into_iter().map(Mutex::new).collect::<Vec<_>>();
             let next_page = AtomicU64::new(0);
             visible_rows = self.with_heap_read(table.id, |heap| {
-                std::thread::scope(|scope| -> Result<u64, QueryError> {
+                crate::util::thread_spawn::scope(|scope| -> Result<u64, QueryError> {
                     let mut handles = Vec::with_capacity(scan_degree);
                     for worker in 0..scan_degree {
                         let shared_sorters = &shared_sorters;
@@ -4253,7 +4253,7 @@ impl Database {
                         let programs = &programs;
                         let needed_columns = &needed_columns;
                         handles.push(
-                            std::thread::Builder::new()
+                            crate::util::thread_spawn::Builder::new()
                                 .name(format!("mydb-encoded-variable-scan-{worker}"))
                                 .stack_size(4 * 1024 * 1024)
                                 .spawn_scoped(scope, move || -> Result<u64, QueryError> {
@@ -4418,7 +4418,7 @@ impl Database {
         let (sender, receiver) = std::sync::mpsc::channel();
         let receiver = Mutex::new(receiver);
         let cancelled = AtomicBool::new(false);
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::with_capacity(outer_degree);
             for _ in 0..outer_degree {
                 handles.push(scope.spawn(|| -> Result<(), QueryError> {

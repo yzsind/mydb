@@ -508,7 +508,7 @@ mod tests {
         });
         assert_eq!(spool.len(), 50);
         assert!(spool.bytes() > 0);
-        let retained = std::thread::spawn(move || {
+        let retained = crate::util::thread_spawn::spawn(move || {
             let mut reader = spool.reader().unwrap();
             for ordinal in [49, 0, 23] {
                 assert_eq!(encode(&reader.row(ordinal).unwrap().values), expected);

@@ -1340,7 +1340,7 @@ impl BufferPool {
             if lsn != 0 {
                 frame.dirty_lsn.fetch_max(lsn, Ordering::AcqRel);
                 frame.note_first_dirty_lsn(lsn);
-                if let Ok(mut bytes) = frame.bytes.write() {
+                if let Ok(mut bytes) = frame.write_bytes() {
                     set_page_lsn(&mut bytes, lsn);
                     frame.checksum_dirty.store(true, Ordering::Release);
                 }
@@ -1674,7 +1674,7 @@ impl BufferPool {
                 return f(&bytes);
             }
         }
-        let mut bytes = frame.bytes.write().map_err(|_| {
+        let mut bytes = frame.write_bytes().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "buffer frame write lock poisoned",
@@ -1786,7 +1786,7 @@ impl BufferPool {
         debug_assert!(Arc::ptr_eq(self, &pinned.pool));
         let key = &pinned.frame.key;
         let result = {
-            let mut bytes = pinned.frame.bytes.write().map_err(|_| {
+            let mut bytes = pinned.frame.write_bytes().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "buffer frame write lock poisoned",
@@ -1846,7 +1846,7 @@ impl BufferPool {
         }
         let result = (|| {
             self.wait_until_ready(&frame)?;
-            let mut bytes = frame.bytes.write().map_err(|_| {
+            let mut bytes = frame.write_bytes().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "buffer frame write lock poisoned",
@@ -1906,7 +1906,7 @@ impl BufferPool {
         };
         let _admission = crate::engine::executor::mem_budget::StorageLatchAdmissionScope::enter();
         self.wait_until_ready(&pinned.frame)?;
-        let mut bytes = pinned.frame.bytes.write().map_err(|_| {
+        let mut bytes = pinned.frame.write_bytes().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "buffer frame write lock poisoned",
@@ -1972,7 +1972,7 @@ impl BufferPool {
     {
         debug_assert!(Arc::ptr_eq(self, &pinned.pool));
         self.wait_until_ready(&pinned.frame)?;
-        let mut bytes = pinned.frame.bytes.write().map_err(|_| {
+        let mut bytes = pinned.frame.write_bytes().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "buffer frame write lock poisoned",
@@ -2033,13 +2033,13 @@ impl BufferPool {
         let result = (|| {
             self.wait_until_ready(low)?;
             self.wait_until_ready(high)?;
-            let mut low_bytes = low.bytes.write().map_err(|_| {
+            let mut low_bytes = low.write_bytes().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "buffer frame write lock poisoned",
                 )
             })?;
-            let mut high_bytes = high.bytes.write().map_err(|_| {
+            let mut high_bytes = high.write_bytes().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "buffer frame write lock poisoned",
@@ -2408,7 +2408,7 @@ impl BufferPool {
             drop(shard);
             self.push_clock_key(shard_idx, key.clone())?;
             let load_result = {
-                let mut frame_bytes = frame.bytes.write().map_err(|_| {
+                let mut frame_bytes = frame.write_bytes().map_err(|_| {
                     error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "buffer frame write lock poisoned",
@@ -3135,7 +3135,7 @@ impl BufferPool {
                 }
                 let result = (|| {
                     self.wait_until_ready(&frame)?;
-                    let mut frame_bytes = frame.bytes.write().map_err(|_| {
+                    let mut frame_bytes = frame.write_bytes().map_err(|_| {
                         error(
                             crate::error::catalog::ER_GET_ERRNO,
                             "buffer frame write lock poisoned",
@@ -4622,9 +4622,7 @@ impl BufferPool {
             self.notify_frame_waiters();
             return Ok(false);
         }
-        frame
-            .state
-            .store(FrameIoState::Evicting as u8, Ordering::Release);
+        frame.publish_io_state(FrameIoState::Evicting);
         // D-2 - measure the synchronous dirty-victim flushes that still
         // happen (grace window expired or a race re-dirtied the frame).
         // This pair is the direct foreground-latency cost of eviction.
@@ -5110,6 +5108,7 @@ impl BufferPool {
             // coalesce. Foreground headroom and panic cleaning bypass this
             // preference; the oldest-LSN budget advances recovery separately.
             frames.retain(|frame| {
+                frame.refresh_root_routing_reference();
                 !frame.ref_bit.load(Ordering::Acquire)
                     && frame.usage_count.load(Ordering::Acquire) == 0
             });
@@ -5262,6 +5261,7 @@ impl BufferPool {
                     let Some(frame) = self.lookup_frame(&key)? else {
                         continue;
                     };
+                    frame.refresh_root_routing_reference();
                     if frame.pin_count.load(Ordering::Acquire) != 0
                         || !frame.is_ready()
                         || !frame.dirty.load(Ordering::Acquire)
@@ -5613,7 +5613,7 @@ impl BufferPool {
         let mut snapshots = Vec::with_capacity(frames.len());
         let mut newest_lsn = synced_lsn;
         for frame in frames {
-            let mut bytes_guard = frame.bytes.write().map_err(|_| {
+            let mut bytes_guard = frame.write_bytes().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "buffer frame write lock poisoned",
@@ -5736,7 +5736,7 @@ impl BufferPool {
             return Ok(false);
         }
         let (epoch, dirty_lsn, generation, bytes) = {
-            let mut bytes_guard = frame.bytes.write().map_err(|_| {
+            let mut bytes_guard = frame.write_bytes().map_err(|_| {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "buffer frame write lock poisoned",
@@ -7381,7 +7381,7 @@ impl BufferPool {
                 };
                 let mut guards = Vec::with_capacity(run_len);
                 for frame in &reserved[start..end] {
-                    let mut guard = frame.bytes.write().map_err(|_| {
+                    let mut guard = frame.write_bytes().map_err(|_| {
                         error(
                             crate::error::catalog::ER_GET_ERRNO,
                             "buffer frame write lock poisoned",
@@ -8467,7 +8467,7 @@ mod oldest_dirty_tests {
         assert!(file.take_needs_sync());
         let (entered, entering) = std::sync::mpsc::channel();
         let (done, completed) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             entered.send(()).unwrap();
             pool.sync_cached_files().unwrap();
             done.send(()).unwrap();
@@ -8527,7 +8527,7 @@ mod oldest_dirty_tests {
         let worker_files = vec![files[1].clone(), files[0].clone(), files[0].clone()];
         let worker_pool = pool.clone();
         let (send, done) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             send.send(worker_pool.sync_cached_files_by_device(worker_files))
                 .unwrap();
         });
@@ -8681,7 +8681,7 @@ mod oldest_dirty_tests {
             }],
             None,
         );
-        *frame.bytes.write().unwrap() =
+        *frame.write_bytes().unwrap() =
             encode_index_tree_page(&IndexPage::Leaf(replacement)).unwrap();
         frame.mark_dirty(1);
         let third = pool.index_page_for_read(&frame).unwrap();
@@ -8774,7 +8774,7 @@ mod oldest_dirty_tests {
         let second = frame(2);
         let (tx, rx) = std::sync::mpsc::channel();
 
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for (id, frame) in [(1, Arc::clone(&first)), (2, Arc::clone(&second))] {
                 let pool = Arc::clone(&pool);
                 let tx = tx.clone();
@@ -9452,7 +9452,7 @@ mod oldest_dirty_tests {
         let barrier = std::sync::Barrier::new(9);
         let chances = AtomicUsize::new(0);
         let mut violations = 0;
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..8 {
                 scope.spawn(|| {
                     for _ in 0..128 {
@@ -9896,7 +9896,7 @@ mod oldest_dirty_tests {
         let file = Arc::new(BufferPool::overflow_file_key(path, 7));
         let expected = (0..PAGES).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
         let barrier = std::sync::Barrier::new(WORKERS);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..WORKERS {
                 let pool = pool.clone();
                 let file = file.clone();
@@ -9967,7 +9967,7 @@ mod oldest_dirty_tests {
         let expected = (0..PAGES).map(|_| AtomicU64::new(0)).collect::<Vec<_>>();
         let locks = (0..PAGES).map(|_| Mutex::new(())).collect::<Vec<_>>();
         let barrier = std::sync::Barrier::new(WORKERS);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..WORKERS {
                 let pool = pool.clone();
                 let file = file.clone();
@@ -10052,8 +10052,8 @@ mod oldest_dirty_tests {
         };
         pool.store_page(key.clone(), vec![1; PAGE_SIZE], 0).unwrap();
         let frame = pool.lookup_frame(&key).unwrap().unwrap();
-        let mut bytes = frame.bytes.write().unwrap();
-        std::thread::scope(|scope| {
+        let mut bytes = frame.write_bytes().unwrap();
+        crate::util::thread_spawn::scope(|scope| {
             let worker = scope.spawn(|| pool.flush_frame(&frame));
             let deadline = Instant::now() + Duration::from_secs(2);
             while frame.flush_lock.try_lock().is_ok() {
@@ -11040,7 +11040,7 @@ mod oldest_dirty_tests {
         let (done, recv) = std::sync::mpsc::channel();
         let worker_pool = pool.clone();
         let worker_key = key.clone();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             worker_pool.discard_page(&worker_key).unwrap();
             done.send(()).unwrap();
         });
@@ -11352,6 +11352,8 @@ impl Frame {
             key,
             raw_memory_charge: Mutex::new(Some(raw_page.charge)),
             bytes: RwLock::new(raw_page.bytes),
+            root_routing: parking_lot::Mutex::new(None),
+            has_root_routing: AtomicBool::new(false),
             small_scan_accesses: AtomicU8::new(u8::from(intent == AccessIntent::SmallScan)),
             pin_count: AtomicUsize::new(1),
             state: AtomicU8::new(FrameIoState::Loading as u8),
@@ -11416,6 +11418,8 @@ impl Frame {
             key,
             raw_memory_charge: Mutex::new(Some(raw_memory_charge)),
             bytes: RwLock::new(bytes),
+            root_routing: parking_lot::Mutex::new(None),
+            has_root_routing: AtomicBool::new(false),
             small_scan_accesses: AtomicU8::new(0),
             pin_count: AtomicUsize::new(1),
             state: AtomicU8::new(FrameIoState::Ready as u8),
@@ -11455,6 +11459,9 @@ impl Frame {
     }
 
     fn mark_dirty_with_intent(&self, dirty_lsn: u64, intent: AccessIntent) -> bool {
+        if self.has_root_routing.load(Ordering::Relaxed) {
+            self.invalidate_root_routing();
+        }
         self.dirty_lsn.fetch_max(dirty_lsn, Ordering::AcqRel);
         let was_clean = !self.dirty.swap(true, Ordering::AcqRel);
         self.note_first_dirty_lsn(dirty_lsn);
@@ -11481,6 +11488,9 @@ impl Frame {
             .is_err()
         {
             return;
+        }
+        if matches!(state, FrameIoState::Discarded | FrameIoState::Evicting) {
+            self.invalidate_root_routing();
         }
         if self.io_waiters.load(Ordering::Acquire) == 0 {
             return;
@@ -11513,7 +11523,7 @@ impl Frame {
     }
 
     fn take_raw_page_lease(&self) -> Option<RawPageLease> {
-        let mut bytes = self.bytes.write().ok()?;
+        let mut bytes = self.write_bytes().ok()?;
         let mut charge = self.raw_memory_charge.lock().ok()?;
         let charge = charge.take()?;
         self.invalidate_packed_leaf();
@@ -11532,6 +11542,7 @@ impl Frame {
     /// conditional atomic update: load + fetch_sub can wrap zero to 255 when
     /// another hand or scan demotion clears the heat between those operations.
     fn clock_second_chance(&self) -> bool {
+        self.refresh_root_routing_reference();
         if self.ref_bit.swap(false, Ordering::AcqRel) {
             return true;
         }

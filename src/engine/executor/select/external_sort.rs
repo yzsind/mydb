@@ -352,7 +352,7 @@ pub(super) fn sort_plan_rows_parallel_spill(
     let session_info = super::eval::current_session_expr_info();
     let session_info = &session_info;
     let params_snapshot = crate::engine::params::snapshot_current_context();
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(chunks.len());
         for (idx, chunk) in chunks.into_iter().enumerate() {
             let tmp_ref = &tmp;
@@ -934,7 +934,7 @@ fn merge_stream_run_pass(
     let params = crate::engine::params::snapshot_current_context();
     let env = crate::util::env::override_snapshot();
     let collector = super::analyze_stats::current_collector_handle();
-    let mut merged = std::thread::scope(|scope| -> Result<Vec<(usize, SortRun)>, QueryError> {
+    let mut merged = crate::util::thread_spawn::scope(|scope| -> Result<Vec<(usize, SortRun)>, QueryError> {
         let mut handles = Vec::new();
         for _ in 0..workers {
             let groups = &groups;
@@ -947,7 +947,7 @@ fn merge_stream_run_pass(
             let env = env.clone();
             let collector = collector.clone();
             handles.push(
-                std::thread::Builder::new()
+                crate::util::thread_spawn::Builder::new()
                     .stack_size(2 * 1024 * 1024)
                     .name("mydb-sort-spill".into())
                     .spawn_scoped(scope, move || {

@@ -213,7 +213,7 @@ impl Trainer {
                 model_charge.try_grow_recoverable(
                     k.saturating_mul(d).saturating_mul(8) + (parts + 1) * 8 + parts * 24,
                 )?;
-                let mut threads = std::thread::available_parallelism()
+                let mut threads = crate::util::thread_spawn::available_parallelism()
                     .map_or(1, |n| n.get())
                     .min(parts)
                     .min(16);
@@ -250,7 +250,7 @@ impl Trainer {
                 }
                 model.centers = vec![Vec::new(); parts];
                 let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
-                std::thread::scope(|scope| -> Result<(), QueryError> {
+                crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
                     let mut handles = Vec::new();
                     for (chunk, output) in model
                         .centers
@@ -1437,7 +1437,7 @@ mod tests {
             crate::engine::cancel::install_statement_deadline(std::time::Duration::from_millis(1));
         std::thread::sleep(std::time::Duration::from_millis(2));
         let snapshot = crate::engine::cancel::CancellationSnapshot::capture();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope
                 .spawn(|| {
                     let _scope = snapshot.enter();

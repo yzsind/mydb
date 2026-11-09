@@ -45,7 +45,7 @@ impl RecoveryDirectorySync {
         // Every data file is synchronized before its parents are registered.
         // Preserve child-before-parent ordering while coalescing shared roots.
         for paths in levels.into_values().rev() {
-            let workers = std::thread::available_parallelism()
+            let workers = crate::util::thread_spawn::available_parallelism()
                 .map_or(1, |n| n.get())
                 .min(8)
                 .min(paths.len());
@@ -54,7 +54,7 @@ impl RecoveryDirectorySync {
                 continue;
             }
             let next = std::sync::atomic::AtomicUsize::new(0);
-            std::thread::scope(|scope| -> Result<(), QueryError> {
+            crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
                 let mut handles = Vec::with_capacity(workers);
                 for _ in 0..workers {
                     let paths = &paths;
@@ -517,7 +517,7 @@ mod recovery_io_tests {
         let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         fs::create_dir_all(root.path().join("objects")).unwrap();
         let coordinator = RecoveryIoScope::enter().unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for index in 0..2 {
                 let root = root.path();
                 let directories = Arc::clone(&coordinator.directories);
@@ -593,7 +593,7 @@ mod recovery_io_tests {
             refresh_page_checksum(&mut newer);
             fs::write(dir.join(relative), newer).unwrap();
         }
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for (name, context, expected) in [
                 ("restore", RecoveryContext::restore(10, 100).unwrap(), 77),
                 ("crash", RecoveryContext::default(), 999),

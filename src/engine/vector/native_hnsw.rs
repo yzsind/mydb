@@ -2412,7 +2412,7 @@ mod duplicate_regressions {
             .unwrap();
         let reader = graph.state.read();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let completed = std::thread::scope(|scope| {
+        let completed = crate::util::thread_spawn::scope(|scope| {
             let worker = scope.spawn(|| sender.send(graph.prepare_csr()).unwrap());
             let completed = receiver.recv_timeout(std::time::Duration::from_secs(2));
             // Always release and join, including on the failing old path.
@@ -2580,7 +2580,7 @@ mod duplicate_regressions {
         let before = graph.search(&query, request).unwrap().candidates;
         graph.state.write().query_cache = None;
         let barrier = std::sync::Barrier::new(16);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let peers: Vec<_> = (0..16)
                 .map(|_| {
                     scope.spawn(|| {

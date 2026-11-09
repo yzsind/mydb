@@ -3118,7 +3118,7 @@ impl Database {
             let started = Instant::now();
             let files = reduced_redo_files(&self.log, txn_id);
             let pool = &self.buffer_pool;
-            std::thread::scope(|scope| -> Result<(), QueryError> {
+            crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
                 let handles = files
                     .into_iter()
                     .map(|file| {

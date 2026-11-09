@@ -1331,7 +1331,7 @@ pub(super) fn try_execute_nested_loop_join_block(
 
     let pre_ref = &pre;
     type ChunkResult = (Vec<PlanRow>, Option<Vec<bool>>, u64, u64);
-    let parts_result: Result<Vec<ChunkResult>, QueryError> = std::thread::scope(|scope| {
+    let parts_result: Result<Vec<ChunkResult>, QueryError> = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::new();
         for chunk in left_rows.chunks(chunk_size) {
             let worker_context = execution_context.clone();

@@ -149,6 +149,7 @@ pub(super) fn compile_uncached_prepared_select(
         )?;
     let template = Arc::new(PreparedSelectTemplate {
         select: Arc::clone(&normalized),
+        has_locking_read: super::tx::select_has_locking_read(&normalized),
         deps,
         object_deps,
         semantics: super::plan_semantics(db, session),
@@ -361,6 +362,7 @@ pub(super) fn compile_prepared_select_from_memo(
         semantics: super::plan_semantics(db, session),
         optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
         compiled,
+        has_locking_read: super::tx::select_has_locking_read(&normalized),
         presentation_select: normalized,
         structural_fingerprint,
         parameter_plan_signature: Arc::from(parameter_plan_signature),

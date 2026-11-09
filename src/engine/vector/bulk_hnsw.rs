@@ -464,7 +464,7 @@ impl BulkHnsw {
         self.locks = (0..self.rows.len()).map(|_| Mutex::new(())).collect();
         let cursor = AtomicUsize::new(0);
         let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::new();
             let graph = &*self;
             for _ in 0..threads.max(1).min(self.rows.len()) {
@@ -503,7 +503,7 @@ impl BulkHnsw {
             first_error.map_or(Ok(()), Err)
         })?;
         let cursor = AtomicUsize::new(0);
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::new();
             for _ in 0..threads.max(1).min(self.rows.len()) {
                 let graph = &*self;

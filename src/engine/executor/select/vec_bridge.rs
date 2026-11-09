@@ -770,7 +770,7 @@ impl ParallelIndexInBatchStream<'_> {
             let predicate = self.predicate.clone();
             let row_ids = Arc::clone(&row_ids);
             let row_ids_charge = Arc::clone(&row_ids_charge);
-            self.execution.workers.push(std::thread::spawn(move || {
+            self.execution.workers.push(crate::util::thread_spawn::spawn(move || {
                 let _row_ids_charge = row_ids_charge;
                 context.run(&db, || {
                     let result = (|| -> Result<(), QueryError> {
@@ -3008,7 +3008,7 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
         super::stream::stream_channel_batches(),
     );
     let worker_plan = Arc::clone(&plan);
-    let worker = std::thread::spawn(move || {
+    let worker = crate::util::thread_spawn::spawn(move || {
         let _snapshot_guard = snapshot_guard;
         let _active_worker = super::stream::ActiveStreamWorker::enter();
         let result = execution_context.run(&db, || -> Result<(), QueryError> {

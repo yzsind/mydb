@@ -880,7 +880,7 @@ mod tests {
         let mut reg = open_reg(&TempDir::new().unwrap());
         let h = reg.create_or_get("r", 0);
         let waiter = reg.semi_sync_waiter();
-        let waker = std::thread::spawn(move || {
+        let waker = crate::util::thread_spawn::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             h.record_ack(500, 0);
         });
@@ -895,7 +895,7 @@ mod tests {
         let h = reg.create_or_get("r", 0);
         let reg = Arc::new(reg);
         let reg2 = Arc::clone(&reg);
-        let waker = std::thread::spawn(move || {
+        let waker = crate::util::thread_spawn::spawn(move || {
             std::thread::sleep(Duration::from_millis(50));
             h.record_ack(500, 0);
             // keep the registry handle alive

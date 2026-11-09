@@ -559,7 +559,7 @@ pub(super) fn merge_direct_count_lane_parallel(target: &mut [u64], source: &[u64
         return;
     }
     let chunk = target.len().div_ceil(workers.max(1));
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for (target, source) in target.chunks_mut(chunk).zip(source.chunks(chunk)) {
             scope.spawn(move || {
                 for (target, source) in target.iter_mut().zip(source) {
@@ -599,7 +599,7 @@ fn run_parallel_unique_build_count_probe(
     };
     let mut probe_batches = 0u64;
     let mut probe_rows = 0u64;
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut senders = Vec::with_capacity(workers);
         let mut handles = Vec::with_capacity(workers);
         for _ in 0..workers {

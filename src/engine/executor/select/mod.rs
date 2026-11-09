@@ -5785,7 +5785,7 @@ fn try_bridge_scalar_derived_parallel(
             .collect::<Vec<Option<(String, std::sync::Arc<crate::engine::api::CteResult>)>>>(),
     );
     let abort = std::sync::atomic::AtomicBool::new(false);
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         let mut handles = Vec::with_capacity(parallelism);
         for _ in 0..parallelism {
             let db = Arc::clone(db);

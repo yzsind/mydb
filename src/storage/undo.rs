@@ -3511,7 +3511,7 @@ impl UndoManager {
                 }
             }
         } else {
-            let workers = std::thread::available_parallelism()
+            let workers = crate::util::thread_spawn::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(2)
                 .min(ids.len())
@@ -3522,7 +3522,7 @@ impl UndoManager {
                 .collect();
             let chunk_size = paths.len().div_ceil(workers).max(1);
             let decoded_chunks: Vec<Result<Vec<DecodedSegment>, QueryError>> =
-                std::thread::scope(|scope| {
+                crate::util::thread_spawn::scope(|scope| {
                     let mut handles = Vec::with_capacity(workers);
                     for chunk in paths.chunks(chunk_size) {
                         let chunk = chunk.to_vec();
@@ -6183,7 +6183,7 @@ mod purge_tests {
         let record = make_record(1, 7, 1, None);
         let expected = estimate_undo_resident_bytes(&record) as usize;
         let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || tx.send(admission.reserve(&record)).unwrap());
+        let worker = crate::util::thread_spawn::spawn(move || tx.send(admission.reserve(&record)).unwrap());
         let reserved = rx.recv_timeout(std::time::Duration::from_secs(1));
         drop(held);
         worker.join().unwrap();
@@ -9252,7 +9252,7 @@ mod buffer_tests {
         let mut handles = Vec::new();
         for t in 0..threads {
             let undo = std::sync::Arc::clone(&undo);
-            handles.push(std::thread::spawn(move || {
+            handles.push(crate::util::thread_spawn::spawn(move || {
                 let mut ids = Vec::new();
                 for i in 0..per_thread {
                     let txn = t * 10_000 + i + 1;

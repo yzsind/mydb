@@ -15,7 +15,7 @@ Modifies stored procedure characteristics without replacing parameters or the ro
 
 - Only explicitly specified characteristics are updated; omitted items keep their current values.
 - An error is returned when the target does not exist or is not a procedure; after the catalog is modified, related call caches are invalidated.
-- To change parameters or the routine body, DROP and then CREATE again.
+- To change parameters or the routine body, use CREATE OR REPLACE PROCEDURE (a mydb extension), or DROP and then CREATE again.
 
 ## Examples
 
@@ -25,5 +25,6 @@ ALTER PROCEDURE transfer SQL SECURITY INVOKER COMMENT 'account transfer';
 
 ## See Also
 
+- [CREATE PROCEDURE](create-procedure.md)
 - [Stored programs index](README.md)
 - [Syntax conventions](../syntax-conventions.md)

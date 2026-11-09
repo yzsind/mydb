@@ -3,7 +3,7 @@ use crate::engine::executor::mem_budget::load_data_reclaim_target as load_data_b
 use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::sync::{mpsc, Arc};
-use std::thread;
+use crate::util::thread_spawn as thread;
 
 use memchr::{memchr, memchr2};
 

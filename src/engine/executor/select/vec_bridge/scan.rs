@@ -1390,7 +1390,7 @@ pub(super) fn split_parallel_scan_workers(
         let context = worker_context.clone();
         let db = worker.db();
         let visit_collector = partition_visit_collector.clone();
-        workers.push(std::thread::spawn(move || {
+        workers.push(crate::util::thread_spawn::spawn(move || {
             crate::engine::executor::partition_router::with_partition_visit_collector(
                 visit_collector,
                 || {
@@ -1727,7 +1727,7 @@ impl ParallelIndexBatchStream {
             let context = self.execution.worker_context.clone();
             let db = Arc::clone(&self.db);
             let visit_collector = visit_collector.clone();
-            self.execution.workers.push(std::thread::spawn(move || {
+            self.execution.workers.push(crate::util::thread_spawn::spawn(move || {
                 analyze_stats::with_range_scan_plan_key_if_present(range_plan_key, || {
                     crate::engine::executor::partition_router::with_partition_visit_collector(
                         visit_collector,

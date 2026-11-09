@@ -3171,7 +3171,7 @@ fn mysql_rand_arg_extreme_parallel(
     let workers = workers.max(1).min(rows);
     let chunk = rows.div_ceil(workers);
     let mut partials = Vec::with_capacity(workers);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(workers);
         for worker in 0..workers {
             let start = worker.saturating_mul(chunk);
@@ -29856,7 +29856,7 @@ mod stack_safety_tests {
 
     #[test]
     fn recursive_scalar_paths_are_bounded_on_small_worker_stack() {
-        std::thread::Builder::new()
+        crate::util::thread_spawn::Builder::new()
             .stack_size(2 * 1024 * 1024)
             .spawn(|| {
                 let schema = empty_expr_schema();

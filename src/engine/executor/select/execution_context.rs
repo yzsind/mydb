@@ -76,7 +76,7 @@ mod tests {
         let (first, first_info) = capture(1_600_000_000);
         let (second, second_info) = capture(1_700_000_000);
         api::clear_statement_now_freeze();
-        std::thread::spawn(move || {
+        crate::util::thread_spawn::spawn(move || {
             let micros = || expr::session_utc_now().and_utc().timestamp_micros();
             assert_eq!(api::stmt_frozen_utc_now_micros(|| 123), 123);
             for _ in 0..3 {
@@ -119,7 +119,7 @@ mod tests {
                 ))
             };
             let db = db.clone();
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 let _scope = crate::storage::schema::ZoneMapOptimizerScope::install(!enabled);
                 context.run(&db, || {
                     assert_eq!(
@@ -147,7 +147,7 @@ mod tests {
         .fork_worker_cancellation();
         context.cancellation().cancel_local();
         let cancelled = context.clone();
-        let code = std::thread::spawn(move || {
+        let code = crate::util::thread_spawn::spawn(move || {
             assert!(crate::engine::cancel::current_token().is_none());
             cancelled
                 .enter_parallel_read_pressure()
@@ -159,7 +159,7 @@ mod tests {
         .unwrap();
         assert_eq!(code, 1317);
         budget.latch_terminal_oom(crate::error::catalog::ER_OUTOFMEMORY.error("test OOM"));
-        let code = std::thread::spawn(move || {
+        let code = crate::util::thread_spawn::spawn(move || {
             context.enter_parallel_read_pressure().err().unwrap().code()
         })
         .join()
@@ -190,7 +190,7 @@ mod tests {
         let sink = context.warning_sink().clone();
         let ready = std::sync::Barrier::new(2);
         let finalized = std::sync::Barrier::new(2);
-        let synchronous = std::thread::scope(|scope| {
+        let synchronous = crate::util::thread_spawn::scope(|scope| {
             let worker = scope.spawn(|| {
                 api::with_statement_warning_sink(sink.clone(), || {
                     for _ in 0..5 {

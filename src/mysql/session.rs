@@ -683,6 +683,8 @@ struct PreparedStatement {
     /// `statement_has_computed_ordering(parsed)`, derived once: the parsed
     /// template never changes for the lifetime of the handle.
     computed_ordering: bool,
+    /// Immutable transport requirement; dynamic HTTP/AI admission stays live.
+    needs_async_progress: bool,
     /// `prepared_dml_transactional_inline_retry_allowed(parsed)`, derived once
     /// for the same reason: its HTTP probe walks the whole statement.
     dml_inline_retry: bool,
@@ -2299,6 +2301,7 @@ where
             let Some(packet) = packet else {
                 return Ok(());
             };
+            crate::util::connection_dispatch::yield_to_peer_connections().await;
             if crate::engine::sysvar::builtin::replication::offline_mode()
                 && self
                     .engine
@@ -4810,6 +4813,14 @@ where
                 .await?;
             return Ok(());
         };
+        let computed_ordering = parsed
+            .as_deref()
+            .is_some_and(|statement| statement_has_computed_ordering(statement));
+        let needs_async_progress = computed_ordering
+            && parsed.as_deref().is_some_and(|statement| {
+                statement_contains_fusion(statement)
+                    || statement_contains_blocking_function(statement)
+            });
         let mut prepared = PreparedStatement {
             original_sql_sensitivity: crate::engine::http::SensitivityMemo::new(&sql),
             original_sql: Arc::from(sql.as_str()),
@@ -4829,9 +4840,8 @@ where
                 ])
             }),
             value_scratch: Vec::with_capacity(param_count),
-            computed_ordering: parsed
-                .as_deref()
-                .is_some_and(|statement| statement_has_computed_ordering(statement)),
+            computed_ordering,
+            needs_async_progress,
             dml_inline_retry: parsed
                 .as_deref()
                 .is_some_and(prepared_dml_transactional_inline_retry_allowed),
@@ -5214,7 +5224,7 @@ where
             // and non-cursor consumers share this plan. A `None` result means the
             // statement/session needs a different execution vehicle.
             {
-                let (parsed_arc, computed_ordering, mut select_memo_state) = {
+                let (parsed_arc, computed_ordering, needs_async_progress, mut select_memo_state) = {
                     let entry = self
                         .prepared
                         .get_mut(&statement_id)
@@ -5222,6 +5232,7 @@ where
                     (
                         entry.parsed.clone(),
                         entry.computed_ordering,
+                        entry.needs_async_progress,
                         std::mem::take(&mut entry.select_memo_state),
                     )
                 };
@@ -5235,8 +5246,6 @@ where
                         let texts = perf_texts.clone();
                         let mut state = std::mem::take(&mut select_memo_state);
                         let params = std::mem::take(&mut values);
-                        let needs_async_progress = statement_contains_fusion(arc.as_ref())
-                            || statement_contains_blocking_function(arc.as_ref());
                         let work = move || {
                             let result = crate::engine::perf_events::with_prepared_statement_texts(
                                 &texts,
@@ -11065,7 +11074,7 @@ mod tests {
             )
             .unwrap();
         let parked = session.park_context();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
             while parked.check_cancelled().is_ok() {
                 assert!(
@@ -11118,7 +11127,7 @@ mod tests {
 
     #[test]
     fn shared_reactor_txn_control_keeps_sibling_timer_runnable() {
-        std::thread::spawn(|| {
+        crate::util::thread_spawn::spawn(|| {
             crate::util::connection_dispatch::test_set_worker_connection_count(2);
             let mut context = SessionContext::default();
             assert!(!prepared_dml_inline_allowed(&context));
@@ -11354,6 +11363,7 @@ mod tests {
             value_scratch: Vec::with_capacity(1),
             parsed: None,
             computed_ordering: false,
+            needs_async_progress: false,
             dml_inline_retry: false,
             com_kind: None,
             long_data: vec![None],

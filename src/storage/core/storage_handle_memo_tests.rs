@@ -322,3 +322,54 @@ fn storage_handle_memos_follow_index_rename_and_name_reuse() {
     assert!(!Arc::ptr_eq(&old, &current));
     assert_eq!(current.read().entries().unwrap().len(), 32);
 }
+
+#[test]
+fn storage_handle_handoff_drains_every_shard_before_publication() {
+    use std::sync::mpsc;
+    let gate = Arc::new(StorageHandleHandoff::default());
+    let held = gate.try_read_slot(31).unwrap();
+    let (acquired, wait) = mpsc::channel();
+    let (release, finish) = mpsc::channel();
+    let writer_gate = Arc::clone(&gate);
+    let writer = std::thread::spawn(move || {
+        let _all = writer_gate.write();
+        acquired.send(()).unwrap();
+        finish.recv().unwrap();
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while gate.active.load(Ordering::Acquire) & StorageHandleHandoff::CLOSED == 0 {
+        assert!(Instant::now() < deadline);
+        std::thread::yield_now();
+    }
+    assert!(wait.try_recv().is_err());
+    drop(held);
+    wait.recv_timeout(Duration::from_secs(5)).unwrap();
+    for slot in 0..32 {
+        assert!(gate.try_read_slot(slot).is_none());
+    }
+    release.send(()).unwrap();
+    writer.join().unwrap();
+    assert!(gate.try_read().is_some());
+}
+
+#[test]
+fn storage_handle_handoff_rejects_registration_across_retirement() {
+    let gate = StorageHandleHandoff::default();
+    assert!(gate.register_slot(31));
+    drop(gate.write());
+    assert!(gate.read_registered_slot(31).is_none());
+    assert!(gate.try_read_slot(31).is_some());
+}
+
+#[test]
+fn storage_handle_handoff_only_allocates_shards_for_reused_epochs() {
+    let gate = StorageHandleHandoff::default();
+    for _ in 0..64 {
+        assert!(gate.try_read().is_some());
+    }
+    assert!(gate.extra.get().is_none());
+    assert!(gate.try_read().is_some());
+    assert!(gate.extra.get().is_some());
+    drop(gate.write());
+    assert_eq!(gate.reads.load(Ordering::Relaxed), 0);
+}

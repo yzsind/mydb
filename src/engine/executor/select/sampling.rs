@@ -885,7 +885,7 @@ impl RefScan {
                 let table = scan.table.clone();
                 let context = scan.context.clone();
                 let work = scan.work.clone();
-                let worker = std::thread::Builder::new()
+                let worker = crate::util::thread_spawn::Builder::new()
                     .name("mydb-sample-scan".into())
                     .spawn(move || {
                         context.run(&db, || {

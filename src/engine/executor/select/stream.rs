@@ -5,7 +5,7 @@ use crate::planner::RuntimeFilter;
 
 use std::sync::atomic::Ordering;
 use std::sync::mpsc;
-use std::thread;
+use crate::util::thread_spawn as thread;
 
 static ACTIVE_STREAM_WORKERS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 thread_local! {

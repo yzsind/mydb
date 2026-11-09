@@ -52,7 +52,7 @@ use crate::util::env::is_disabled as env_off;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::thread;
+use crate::util::thread_spawn as thread;
 
 // ---------------------------------------------------------------------------
 // Counters (SHOW ENGINE MYDB STATUS)
@@ -1461,7 +1461,7 @@ mod stream_build_side_tests {
         let (_tx, rx) = std::sync::mpsc::sync_channel(1);
         let finished = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let flag = finished.clone();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(20));
             flag.store(true, std::sync::atomic::Ordering::Release);
         });

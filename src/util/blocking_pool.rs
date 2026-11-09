@@ -59,7 +59,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, OnceLock, Weak};
 use std::task::{Context, Poll};
-use std::thread;
+use crate::util::thread_spawn as thread;
 
 use crossbeam_deque::{Injector, Steal};
 use parking_lot::Mutex;
@@ -594,7 +594,7 @@ fn global_limits() -> &'static GlobalPoolLimits {
                 stack_reservation: None,
             };
         }
-        let cpus = std::thread::available_parallelism()
+        let cpus = crate::util::thread_spawn::available_parallelism()
             .map(|n| n.get())
             .unwrap_or(4);
         let automatic = super::exec_permit::automatic_limit_for(cpus);
@@ -765,7 +765,7 @@ fn cpu_scaled_baseline() -> usize {
     // wider than the active demand. Under heavier concurrency the pool now
     // grows past this baseline on demand (see `configured_max`), so this is
     // only the pre-spawned floor, not a hard cap.
-    std::thread::available_parallelism()
+    crate::util::thread_spawn::available_parallelism()
         .map(|n| n.get().saturating_mul(4).clamp(16, 128))
         .unwrap_or(32)
 }

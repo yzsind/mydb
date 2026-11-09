@@ -704,7 +704,7 @@ fn fixture_sync_batch_is_private_joined_and_removed_on_unwind() {
     assert!(try_private_sync_file(&outside).is_none());
     sync_standard_file_at(&standard, &path).unwrap();
     sync_standard_data_at(&standard, &path).unwrap();
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         scope
             .spawn(|| {
                 assert!(private_sync::root_for(&path).is_some());

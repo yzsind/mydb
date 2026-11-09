@@ -8704,7 +8704,7 @@ mod cache_tests {
         assert!(shared.referenced_columns.get().is_none());
         let before = shared.charged_bytes();
         assert!(before >= shared.column_reference_bound * std::mem::size_of::<usize>());
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..4 {
                 scope.spawn(|| assert_eq!(shared.referenced_columns(), [0]));
             }
@@ -8895,7 +8895,7 @@ mod cache_tests {
         assert!(before.l1_entries > 0);
         // A different worker invalidates the cache, but this thread still owns
         // its old objects until its next compilation. Reading must not free them.
-        std::thread::spawn(flush_program_caches).join().unwrap();
+        crate::util::thread_spawn::spawn(flush_program_caches).join().unwrap();
         let after = expr_program_stats();
         assert_eq!(after.l1_entries, before.l1_entries);
         assert_eq!(after.l1_bytes, before.l1_bytes);

@@ -1959,7 +1959,7 @@ mod tests {
             });
         drop(charger.charge(512).unwrap());
         assert_eq!(budget.spill_bytes(), 512);
-        std::thread::spawn(move || release_dir(&charger))
+        crate::util::thread_spawn::spawn(move || release_dir(&charger))
             .join()
             .unwrap();
         assert_eq!(budget.spill_bytes(), 0);
@@ -1982,7 +1982,7 @@ mod tests {
             });
         let barrier = Arc::new(std::sync::Barrier::new(3));
         let successes = Arc::new(AtomicU64::new(0));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for charger in [first.clone(), second.clone()] {
                 let barrier = Arc::clone(&barrier);
                 let successes = Arc::clone(&successes);
@@ -2121,7 +2121,7 @@ mod tests {
         let reader = TrackedSpillReader::open(&path, charger.clone(), 32 * 1024).unwrap();
         assert_eq!(budget.used(), manifest_memory + 32 * 1024);
         assert_eq!(active_spill_files(), active_before + 1);
-        std::thread::spawn(move || drop(reader)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(reader)).join().unwrap();
         assert_eq!(budget.used(), manifest_memory);
         assert_eq!(active_spill_files(), active_before);
         release_dir(&charger);
@@ -2571,7 +2571,7 @@ mod tests {
         drop(file);
         assert!(path.exists());
         assert!(charger.dir_bytes() >= 8);
-        std::thread::spawn(move || drop(mirror)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(mirror)).join().unwrap();
         assert!(!path.exists());
         assert_eq!(charger.dir_bytes(), 0);
         assert_eq!(global_spilled_bytes(), before);

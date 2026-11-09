@@ -514,7 +514,7 @@ impl HashPartitions<'_> {
             let mut worker_tuning = tuning.clone();
             worker_tuning.scheduler_parallelism = 1;
             worker_tuning.sort_run_bytes = Some(quota / 4);
-            let worker = std::thread::Builder::new()
+            let worker = crate::util::thread_spawn::Builder::new()
                 .name("mydb-window-spill".into())
                 .stack_size(STACK_BYTES)
                 .spawn(move || {

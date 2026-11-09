@@ -388,7 +388,7 @@ pub(super) fn try_execute_parallel_compact_topwindow(
         .collect();
     let execution_context =
         crate::engine::executor::select::execution_context::ExecutionContext::capture(txn);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(ranges.len());
         for (page_lo, page_hi) in ranges {
             let worker_context = execution_context.clone();

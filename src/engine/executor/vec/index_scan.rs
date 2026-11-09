@@ -3243,7 +3243,7 @@ mod tests {
         assert!(workers.len() > 1);
         let fallback_before =
             DIRECT_HEAP_BATCH_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed);
-        let mut actual = std::thread::scope(|scope| {
+        let mut actual = crate::util::thread_spawn::scope(|scope| {
             let handles: Vec<_> = workers
                 .into_iter()
                 .map(|mut worker| {

@@ -1401,7 +1401,7 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
             let weak = Arc::downgrade(manager);
             let stop = Arc::new((parking_lot::Mutex::new(false), parking_lot::Condvar::new()));
             let thread_stop = Arc::clone(&stop);
-            let thread = std::thread::Builder::new()
+            let thread = crate::util::thread_spawn::Builder::new()
                 .name("binlog-retention".into())
                 .spawn(move || loop {
                     let mut stopped = thread_stop.0.lock();
@@ -7777,7 +7777,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let waiter = {
             let order = order.clone();
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 order.wait_wal(third).unwrap();
                 tx.send(()).unwrap();
                 order.finish_wal(third);
@@ -7895,7 +7895,7 @@ mod tests {
             .map(|commit| {
                 let manager = manager.clone();
                 let barrier = barrier.clone();
-                std::thread::spawn(move || {
+                crate::util::thread_spawn::spawn(move || {
                     barrier.wait();
                     manager
                         .sync_staged_commit(&commit)
@@ -7996,7 +7996,7 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         let worker = {
             let manager = manager.clone();
-            std::thread::spawn(move || tx.send(stage_test_write(&manager, 2)).unwrap())
+            crate::util::thread_spawn::spawn(move || tx.send(stage_test_write(&manager, 2)).unwrap())
         };
         assert!(rx.recv_timeout(Duration::from_millis(20)).is_err());
         assert!(!manager
@@ -8082,7 +8082,7 @@ mod tests {
             .map(|commit| {
                 let manager = manager.clone();
                 let barrier = barrier.clone();
-                std::thread::spawn(move || {
+                crate::util::thread_spawn::spawn(move || {
                     barrier.wait();
                     manager.sync_staged_commit(&commit).unwrap();
                     commit
@@ -9752,7 +9752,7 @@ mod tests {
         let _guard = manager.register_replica(semi_sync_replica(9)).unwrap();
         manager.semi_sync_mark_replica(9);
         let acker = Arc::clone(&manager);
-        let handle = std::thread::spawn(move || {
+        let handle = crate::util::thread_spawn::spawn(move || {
             std::thread::sleep(Duration::from_millis(30));
             acker.record_semi_sync_ack(9, "binlog.000001", 100);
         });

@@ -581,7 +581,7 @@ const HNSW_LINK_CLAIM_BATCH: u32 = 64;
 /// under static chunking stay so. Assumes `threads >= 1` and `start < end`.
 fn parallel_claim_ids(start: u32, end: u32, threads: usize, f: impl Fn(u32) + Sync) {
     let cursor = AtomicU32::new(start);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         for _ in 0..threads {
             let cursor = &cursor;
             let f = &f;
@@ -4131,7 +4131,7 @@ mod tests {
         }
         let builder = index.quant_build.lock();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope.spawn(|| {
                 tx.send(index.search(&[80.0, 1.0], 1, 96)).unwrap();
             });
@@ -4275,7 +4275,7 @@ mod tests {
             64,
         );
         let accepted = AtomicUsize::new(0);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..8 {
                 let graph = &graph;
                 let accepted = &accepted;
@@ -4390,7 +4390,7 @@ mod tests {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or_else(|| {
-                std::thread::available_parallelism()
+                crate::util::thread_spawn::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(4)
             });
@@ -4986,7 +4986,7 @@ mod tests {
             }
             let idx = Arc::clone(&parallel_index);
             let slice: Vec<(usize, Vec<f32>)> = (lo..hi).map(|i| (i, vectors[i].clone())).collect();
-            handles.push(std::thread::spawn(move || {
+            handles.push(crate::util::thread_spawn::spawn(move || {
                 for (i, v) in slice {
                     idx.insert(rid(i as u32), v);
                 }
@@ -5048,7 +5048,7 @@ mod tests {
             let idx = Arc::clone(&index);
             let stop = Arc::clone(&stop);
             let q = vectors[r * 3 % warmup_n].clone();
-            readers.push(std::thread::spawn(move || {
+            readers.push(crate::util::thread_spawn::spawn(move || {
                 let mut iters = 0u64;
                 while !stop.load(Ordering::Acquire) {
                     let _ = idx.search(&q, 10, 64);
@@ -5064,7 +5064,7 @@ mod tests {
         let writer_vecs: Vec<(usize, Vec<f32>)> = (warmup_n..total_n)
             .map(|i| (i, vectors[i].clone()))
             .collect();
-        let writer = std::thread::spawn(move || {
+        let writer = crate::util::thread_spawn::spawn(move || {
             for (i, v) in writer_vecs {
                 writer_idx.insert(rid(i as u32), v);
             }
@@ -5108,7 +5108,7 @@ mod tests {
                 .filter(|i| i % threads == t)
                 .map(|i| (i, vectors[i].clone()))
                 .collect();
-            handles.push(std::thread::spawn(move || {
+            handles.push(crate::util::thread_spawn::spawn(move || {
                 for (i, v) in slice {
                     idx.insert(rid(i as u32), v);
                 }
@@ -5136,7 +5136,7 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let reader_index = Arc::clone(&index);
         let reader_stop = Arc::clone(&stop);
-        let reader = std::thread::spawn(move || {
+        let reader = crate::util::thread_spawn::spawn(move || {
             let mut searches = 0u64;
             while !reader_stop.load(Ordering::Acquire) || searches < 2_000 {
                 let got = reader_index.search(&[0.0, 1.0, 2.0, 3.0], 1, 32);
@@ -5166,13 +5166,13 @@ mod tests {
             index.insert(rid(i as u32), vec![i as f32, 0.0, 0.0]);
         }
         let a_idx = Arc::clone(&index);
-        let a = std::thread::spawn(move || {
+        let a = crate::util::thread_spawn::spawn(move || {
             for i in (0..20).step_by(2) {
                 a_idx.mark_deleted_by_row_id(rid(i as u32));
             }
         });
         let b_idx = Arc::clone(&index);
-        let b = std::thread::spawn(move || {
+        let b = crate::util::thread_spawn::spawn(move || {
             for i in (20..40).step_by(2) {
                 b_idx.mark_deleted_by_row_id(rid(i as u32));
             }
@@ -5209,7 +5209,7 @@ mod source_audit_tests {
         let slab = NodeSlab::new();
         let (claimed_tx, claimed_rx) = std::sync::mpsc::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let slab_ref = &slab;
             let writer = scope.spawn(move || {
                 slab_ref

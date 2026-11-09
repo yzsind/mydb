@@ -637,7 +637,7 @@ mod warning_batch_tests {
                 });
             });
         };
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..8 {
                 let sink = sink.clone();
                 scope.spawn(move || emit_constant(sink));
@@ -645,7 +645,7 @@ mod warning_batch_tests {
         });
         assert_eq!(sink.lock().len(), 1);
         let _drained = std::mem::take(&mut *sink.lock());
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let sink = sink.clone();
             scope.spawn(move || emit_constant(sink));
         });
@@ -666,7 +666,7 @@ mod warning_batch_tests {
     #[test]
     fn batched_warning_workers_keep_every_condition_and_flush_partial_batches() {
         let sink: StatementWarningSink = Default::default();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..8 {
                 let sink = sink.clone();
                 scope.spawn(move || {
@@ -1526,6 +1526,8 @@ pub struct PreparedSelectMemo {
     /// Handle-local presentation/placeholder AST. This is deliberately not
     /// taken from the shared plan because column spelling belongs to PREPARE.
     pub(crate) presentation_select: Arc<crate::parser::Select>,
+    /// Immutable AST property, including locks inside nested queries.
+    pub(crate) has_locking_read: bool,
     /// Parameter-independent cache key for the normalized semantic template.
     /// Reused when a different parameter tier needs another physical plan.
     pub(crate) structural_fingerprint: Arc<str>,
@@ -1552,6 +1554,7 @@ pub struct PreparedSelectMemo {
 #[derive(Debug)]
 pub struct PreparedSelectTemplate {
     pub(crate) select: Arc<crate::parser::Select>,
+    pub(crate) has_locking_read: bool,
     pub(crate) deps: smallvec::SmallVec<[crate::engine::cache::PlanDep; 4]>,
     pub(crate) object_deps: smallvec::SmallVec<[crate::engine::cache::ObjectDep; 2]>,
     pub(crate) semantics: crate::engine::cache::PlanSemantics,
@@ -3931,7 +3934,7 @@ mod warning_sink_reuse_tests {
 
     #[test]
     fn idle_warning_sink_reuses_only_exclusive_root_and_clears_once_identity() {
-        std::thread::spawn(|| {
+        crate::util::thread_spawn::spawn(|| {
             let address = {
                 let root = StatementWarningSinkScope::enter();
                 assert_eq!(

@@ -1695,7 +1695,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
             crate::engine::executor::select::execution_context::ExecutionContext::capture(txn);
         let mut worker_results: Vec<Result<Vec<(usize, GraceJoinOutput)>, QueryError>> =
             (0..workers).map(|_| Ok(Vec::new())).collect();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::with_capacity(workers);
             for _ in 0..workers {
                 let worker_context = execution_context.clone();

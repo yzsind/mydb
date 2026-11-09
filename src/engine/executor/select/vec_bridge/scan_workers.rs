@@ -167,7 +167,7 @@ mod tests {
         });
         let joined = Arc::new(AtomicBool::new(false));
         let flag = joined.clone();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             assert!(tx
                 .send(Err(crate::engine::cancel::interrupted_error()))
                 .is_err());
@@ -186,7 +186,7 @@ mod tests {
         for query_error in [false, true] {
             let budget = Arc::new(mem_budget::MemBudget::new(4096));
             let (tx, rx) = std::sync::mpsc::channel();
-            let worker = std::thread::spawn(move || {
+            let worker = crate::util::thread_spawn::spawn(move || {
                 if query_error {
                     tx.send(Err(crate::engine::cancel::interrupted_error()))
                         .unwrap_or_else(|_| panic!("queue unexpectedly closed"));
@@ -219,7 +219,7 @@ mod tests {
                 };
                 let error = expected.clone();
                 let (tx, rx) = std::sync::mpsc::sync_channel(1);
-                let worker = std::thread::spawn(move || {
+                let worker = crate::util::thread_spawn::spawn(move || {
                     if oom {
                         producer.budget().latch_terminal_oom(error);
                     } else {

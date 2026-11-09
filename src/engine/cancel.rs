@@ -523,7 +523,7 @@ mod tests {
             let outer = install_query_deadline(duration).expect("outer query owns deadline");
             let deadline = STATEMENT_DEADLINE.with(Cell::get);
             let snapshot = CancellationSnapshot::capture();
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 let _scope = snapshot.enter();
                 for nested in [
                     Duration::ZERO,
@@ -547,7 +547,7 @@ mod tests {
         let _g = install_statement_deadline(Duration::from_millis(10));
         let snapshot = CancellationSnapshot::capture();
         std::thread::sleep(Duration::from_millis(20));
-        let code = std::thread::spawn(move || {
+        let code = crate::util::thread_spawn::spawn(move || {
             let _scope = snapshot.enter();
             check_cancelled().unwrap_err().code()
         })
@@ -562,7 +562,7 @@ mod tests {
         let snapshot = CancellationSnapshot::capture();
         let worker_snapshot = snapshot.clone();
         snapshot.cancel_local();
-        let code = std::thread::spawn(move || {
+        let code = crate::util::thread_spawn::spawn(move || {
             let _scope = worker_snapshot.enter();
             check_cancelled().unwrap_err().code()
         })
@@ -599,7 +599,7 @@ mod tests {
         let observed: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
         let observed_ref = &observed;
         let started_ref = &started;
-        std::thread::scope(|s| {
+        crate::util::thread_spawn::scope(|s| {
             let token = token.clone();
             s.spawn(move || {
                 let _scope = enter(token);
@@ -639,7 +639,7 @@ mod tests {
         let observed: std::sync::Mutex<Option<u16>> = std::sync::Mutex::new(None);
         let observed_ref = &observed;
         let started_ref = &started;
-        std::thread::scope(|s| {
+        crate::util::thread_spawn::scope(|s| {
             let token = token.clone();
             s.spawn(move || {
                 let _scope = enter(token);

@@ -17,7 +17,7 @@ impl ScoringShare {
     fn degree(&self, requested: usize) -> usize {
         static CPUS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
         let cpus =
-            *CPUS.get_or_init(|| std::thread::available_parallelism().map_or(1, usize::from));
+            *CPUS.get_or_init(|| crate::util::thread_spawn::available_parallelism().map_or(1, usize::from));
         let capacity =
             crate::planner::cpu_bound_parallel_degree(cpus.min(u32::MAX as usize) as u32) as usize;
         requested.min((capacity / self.0).max(1)).max(1)
@@ -264,7 +264,7 @@ pub(super) fn try_score(
         vec![worker(heaps.pop().unwrap())?]
     } else {
         let context = super::super::super::execution_context::ExecutionContext::capture(txn);
-        std::thread::scope(|scope| -> Result<Vec<_>, QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<Vec<_>, QueryError> {
             let mut handles = Vec::with_capacity(degree);
             for heap in heaps {
                 let context = context.clone();

@@ -410,7 +410,7 @@ mod tests {
     fn context_snapshot_reinstalls_auto_parameterized_provenance() {
         with_auto_params(vec![Value::Int(5)], || {
             let snapshot = snapshot_current_context().expect("active context");
-            std::thread::spawn(move || {
+            crate::util::thread_spawn::spawn(move || {
                 assert!(!auto_parameterized_active());
                 snapshot.run(|| {
                     assert!(auto_parameterized_active());

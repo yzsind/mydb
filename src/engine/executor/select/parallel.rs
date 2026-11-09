@@ -6,7 +6,7 @@
 //!   applies WHERE / runtime filters locally, and returns its slice of
 //!   `PlanRow`s.
 //! - `Exchange`: the parallel boundary. Spawns the workers via
-//!   `std::thread::scope`, collects per-worker output, and concatenates.
+//!   `crate::util::thread_spawn::scope`, collects per-worker output, and concatenates.
 //!   `ExchangeOrder::Sorted` performs a k-way merge using `merge_keys`;
 //!   `Unordered` is a plain extend.
 //!
@@ -1032,7 +1032,7 @@ fn worker_projected_storage(
 }
 
 /// Drive a `ParallelSeqScan`. Spawns `degree` workers in
-/// `std::thread::scope`, each scanning its assigned `[lo, hi)` page
+/// `crate::util::thread_spawn::scope`, each scanning its assigned `[lo, hi)` page
 /// range. Falls back to a single in-thread serial scan when the heap
 /// is too small to benefit from partitioning.
 pub(super) fn execute_parallel_seq_scan(
@@ -1094,7 +1094,7 @@ pub(super) fn execute_parallel_seq_scan(
     // the parent's lexical CTE scope here so a WHERE/JOIN subquery referencing
     // a CTE can still resolve it when evaluated inside a worker (else 1146).
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective_degree as usize);
         for (lo, hi) in parts {
             let table_ref = table;
@@ -1175,7 +1175,7 @@ fn execute_parallel_zone_map_scan(
     let next_task = Arc::new(AtomicUsize::new(0));
     let mut results: Vec<Result<Vec<PlanRow>, QueryError>> =
         (0..worker_count).map(|_| Ok(Vec::new())).collect();
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let worker_context = execution_context.clone();
@@ -1273,7 +1273,7 @@ fn execute_parallel_partitioned_seq_scan(
 
     let execution_context = super::execution_context::ExecutionContext::capture(txn);
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective_degree);
         for group in groups {
             let table_ref = table;
@@ -1397,7 +1397,7 @@ pub(super) fn execute_parallel_seq_scan_limited(
         .map(|_| Ok(Vec::new()))
         .collect();
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective_degree as usize);
         for (lo, hi) in parts {
             let table_ref = table;
@@ -1509,7 +1509,7 @@ pub(super) fn execute_parallel_index_fast_scan(
     PARALLEL_WORKERS_SPAWNED.fetch_add(effective_degree as u64, AtomicOrdering::Relaxed);
     let execution_context = super::execution_context::ExecutionContext::capture(txn);
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective_degree as usize);
         for (lo_idx, hi_idx) in parts {
             let leaf_slice = &leaf_ids[lo_idx..hi_idx];
@@ -1645,7 +1645,7 @@ pub(super) fn execute_parallel_index_range_scan(
         &filter_for_icp,
     );
     let icp = icp.as_ref();
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective_degree as usize);
         for (lo_idx, hi_idx) in parts {
             let leaf_slice = &leaf_ids[lo_idx..hi_idx];
@@ -1817,7 +1817,7 @@ pub(super) fn execute_parallel_index_multi_lookup(
 
     let execution_context = super::execution_context::ExecutionContext::capture(txn);
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective as usize);
         for (lo_idx, hi_idx) in parts {
             let key_slice = &keys[lo_idx..hi_idx];
@@ -1961,7 +1961,7 @@ pub(super) fn execute_parallel_index_aggregate(
             })
             .collect();
 
-        std::thread::scope(|s| {
+        crate::util::thread_spawn::scope(|s| {
             let mut handles = Vec::with_capacity(effective_degree as usize);
             for (page_lo, page_hi) in parts {
                 let db_ref = db;
@@ -2018,7 +2018,7 @@ pub(super) fn execute_parallel_index_aggregate(
         })
         .collect();
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(effective_degree as usize);
         for (lo_idx, hi_idx) in parts {
             let leaf_slice = &leaf_ids[lo_idx..hi_idx];
@@ -2360,7 +2360,7 @@ pub(super) fn execute_parallel_rollup_aggregate(
     let mut results: Vec<Result<Vec<PartialMap>, QueryError>> =
         (0..p).map(|_| Ok(Vec::new())).collect();
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles: Vec<
             Option<std::thread::ScopedJoinHandle<'_, Result<Vec<PartialMap>, QueryError>>>,
         > = Vec::with_capacity(p);
@@ -2560,7 +2560,7 @@ pub(super) fn execute_parallel_rollup_aggregate(
 
     let rollup_topk_hint = super::plan::current_rollup_window_topk_hint();
     let rollup_topk_hint = &rollup_topk_hint;
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles: Vec<
             Option<std::thread::ScopedJoinHandle<'_, Result<Vec<PlanRow>, QueryError>>>,
         > = Vec::with_capacity(p2_workers);
@@ -2721,7 +2721,7 @@ pub(super) fn execute_parallel_sort(
     let execution_context = super::execution_context::ExecutionContext::capture(txn);
     let mut sorted_chunks: Vec<Option<Result<PreparedParallelSortChunk, QueryError>>> =
         (0..chunks.len()).map(|_| None).collect();
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let context = execution_context.clone();
@@ -2998,7 +2998,7 @@ fn try_execute_parallel_distinct_topk_scan(
             ))
         })
         .collect();
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {
             let tasks = Arc::clone(&tasks);
@@ -3337,7 +3337,7 @@ pub(super) fn execute_parallel_topk(
         })
         .collect();
 
-    std::thread::scope(|s| {
+    crate::util::thread_spawn::scope(|s| {
         let mut handles = Vec::with_capacity(chunks.len());
         for chunk in chunks {
             let worker_context = execution_context.clone();
@@ -3667,7 +3667,7 @@ mod tests {
             asc: true,
             nulls_first: None,
         }];
-        let chunk = std::thread::scope(|scope| {
+        let chunk = crate::util::thread_spawn::scope(|scope| {
             let budget = budget.clone();
             let order = &order;
             scope
@@ -3804,7 +3804,7 @@ mod scan_worker_completion_tests {
     #[test]
     fn scan_worker_errors_join_later_panics_and_preserve_first_error() {
         let finished = AtomicUsize::new(0);
-        let result = std::thread::scope(|scope| {
+        let result = crate::util::thread_spawn::scope(|scope| {
             let handles = vec![
                 scope.spawn(|| {
                     Err(error(
@@ -3822,7 +3822,7 @@ mod scan_worker_completion_tests {
         });
         assert_eq!(result.unwrap_err().message(), "first error");
         assert_eq!(finished.load(AtomicOrdering::Relaxed), 1);
-        let result = std::thread::scope(|scope| {
+        let result = crate::util::thread_spawn::scope(|scope| {
             collect_scan_workers(
                 vec![scope.spawn(|| panic!("first worker panic"))],
                 "scan panic",

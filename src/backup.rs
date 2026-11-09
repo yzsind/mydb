@@ -846,7 +846,7 @@ impl Drop for PoolPanicGuard<'_> {
 fn desired_chunk_parallelism(task_count: usize) -> usize {
     // Leave CPU capacity for foreground requests while backup workers hash
     // large chunks, including when the offline sealer runs in another process.
-    std::thread::available_parallelism()
+    crate::util::thread_spawn::available_parallelism()
         .map(usize::from)
         .unwrap_or(1)
         .div_ceil(2)
@@ -915,7 +915,7 @@ fn process_chunks_parallel<T: Send>(
     let failed = AtomicBool::new(false);
     // Bound queued results even if progress reporting is slower than workers.
     let (sender, receiver) = mpsc::sync_channel(charges.len().max(1));
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         for charge in charges {
             let context = context.clone();
             let sender = sender.clone();
@@ -1559,7 +1559,7 @@ fn sync_paths_parallel(paths: &[PathBuf]) -> Result<(), QueryError> {
     }
     let next = AtomicUsize::new(0);
     let (sender, receiver) = mpsc::sync_channel(grants.len().max(1));
-    std::thread::scope(|scope| -> Result<(), QueryError> {
+    crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
         // On an error, drop the receiver before joining workers so a blocked
         // producer cannot deadlock the scoped join.
         let receiver = receiver;

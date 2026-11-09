@@ -212,8 +212,10 @@ pub(super) fn execute_create_routine(
     validate_routine_def(&def)?;
     validate_binlog_function_creator(db, session, &def)?;
     validate_routine_definer_privilege(db, session, &def)?;
+    let or_replace = def.or_replace;
+    let kind = def.kind;
     let if_not_exists = def.if_not_exists;
-    let schema = routine_schema_from_def(db, session, def);
+    let mut schema = routine_schema_from_def(db, session, def);
     validate_routine_definer(db, &schema)?;
     if crate::engine::sys_schema::routine_definition(
         &schema.database,
@@ -238,14 +240,26 @@ pub(super) fn execute_create_routine(
             || crate::planner::is_aggregate_function(&schema.name));
     let routine_name = schema.name.clone();
     let target_database = schema.database.clone();
-    // Compile and reserve the version-1 program before publishing catalog
+    if or_replace {
+        if let Some(existing) =
+            db.routine_definition(&target_database, schema.kind.clone(), &routine_name)
+        {
+            authorize_routine_privilege(db, session, &existing, Privilege::AlterRoutine)?;
+            // The statement holds exclusive routine MDL until publication.
+            // Match the catalog version so parameter binding cannot reuse an
+            // older program when only the signature changes.
+            schema.schema_version = existing.schema_version.saturating_add(1).max(1);
+        }
+    }
+    // Compile and reserve the new program before publishing catalog
     // state. CREATE therefore never succeeds only to make the first CALL fail
     // for parser/cache memory, and the first invocation is a cache hit.
     compile_routine(&schema)?;
+    let schema_version = schema.schema_version;
     let created = db.create_routine(
         &target_database,
         schema,
-        false,
+        or_replace,
         if_not_exists,
         Some(&session.authenticated_as),
         crate::engine::sysvar::builtin::transaction::automatic_sp_privileges(),
@@ -257,6 +271,14 @@ pub(super) fn execute_create_routine(
             "Routine already exists",
         );
         return Ok(QueryResponse::Ok);
+    }
+    if or_replace {
+        invalidate_routine_cache_except(
+            &target_database,
+            kind,
+            &routine_name,
+            Some(schema_version),
+        );
     }
     if native_collision {
         crate::engine::api::push_statement_warning(
@@ -1324,7 +1346,7 @@ fn compile_routine_in_namespace(
         namespace.to_string(),
         routine.name.clone(),
         routine.schema_version,
-        stable_sql_hash(&routine.body_sql),
+        routine_program_hash(routine),
         routine.sql_mode.clone(),
     );
     let cache = routine_cache();
@@ -1484,6 +1506,18 @@ fn compile_trigger(
 fn stable_sql_hash(sql: &str) -> u64 {
     let mut hasher = DefaultHasher::new();
     sql.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn routine_program_hash(routine: &RoutineSchema) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    routine.body_sql.hash(&mut hasher);
+    // Parameter names determine whether static SQL references a local slot
+    // or a table column, even if the body and schema version are identical
+    // (for example, after a failed catalog publication followed by a retry).
+    for param in &routine.params {
+        param.name.hash(&mut hasher);
+    }
     hasher.finish()
 }
 
@@ -1699,6 +1733,15 @@ fn reserve_compiled_program_memory(
 }
 
 fn invalidate_routine_cache(database: &str, kind: RoutineKind, name: &str) {
+    invalidate_routine_cache_except(database, kind, name, None);
+}
+
+fn invalidate_routine_cache_except(
+    database: &str,
+    kind: RoutineKind,
+    name: &str,
+    keep_version: Option<u64>,
+) {
     if let Some(cache) = ROUTINE_CACHE.get() {
         if let Ok(mut cache) = cache.lock() {
             let keys = cache
@@ -1706,7 +1749,8 @@ fn invalidate_routine_cache(database: &str, kind: RoutineKind, name: &str) {
                 .filter_map(|(key, _)| {
                     (key.0.eq_ignore_ascii_case(database)
                         && key.1.eq_ignore_ascii_case(kind.lower())
-                        && key.2.eq_ignore_ascii_case(name))
+                        && key.2.eq_ignore_ascii_case(name)
+                        && keep_version != Some(key.3))
                     .then(|| key.clone())
                 })
                 .collect::<Vec<_>>();
@@ -1933,11 +1977,20 @@ fn authorize_routine_execute(
     session: &SessionContext,
     routine: &RoutineSchema,
 ) -> Result<(), QueryError> {
+    authorize_routine_privilege(db, session, routine, Privilege::Execute)
+}
+
+fn authorize_routine_privilege(
+    db: &Database,
+    session: &SessionContext,
+    routine: &RoutineSchema,
+    privilege: Privilege,
+) -> Result<(), QueryError> {
     if session.internal_system_session {
         return Ok(());
     }
     let required = RequiredPrivilege {
-        privilege: Privilege::Execute,
+        privilege,
         scope: PrivilegeScope::Routine {
             database: routine.database.clone(),
             routine: routine.name.clone(),
@@ -1953,8 +2006,12 @@ fn authorize_routine_execute(
         Err(error(
             crate::error::catalog::ER_PROCACCESS_DENIED_ERROR,
             format!(
-                "execute command denied to user '{}'@'{}' for routine '{}.{}'",
-                session.user, session.host, routine.database, routine.name
+                "{} command denied to user '{}'@'{}' for routine '{}.{}'",
+                required.privilege.sql_name().to_ascii_lowercase(),
+                session.user,
+                session.host,
+                routine.database,
+                routine.name
             ),
         ))
     }

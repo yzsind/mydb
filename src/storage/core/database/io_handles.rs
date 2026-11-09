@@ -125,21 +125,157 @@ struct StorageHandleEpochRegistry {
 // cache lines on both x86 and Apple Silicon.
 #[repr(align(128))]
 #[derive(Default)]
-struct StorageHandleHandoff(parking_lot::RwLock<()>);
+struct StorageHandleHandoff {
+    single: CachePadded<parking_lot::RwLock<()>>,
+    extra: OnceLock<Option<Box<StorageHandleHandoffShards>>>,
+    reads: AtomicU8,
+    active: AtomicU64,
+    retirement: parking_lot::Mutex<()>,
+}
+
+struct StorageHandleHandoffShards {
+    gates: [CachePadded<parking_lot::RwLock<()>>; 31],
+    _memory: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+struct StorageHandleHandoffWrite<'a> {
+    handoff: &'a StorageHandleHandoff,
+    guards: smallvec::SmallVec<[parking_lot::RwLockWriteGuard<'a, ()>; 32]>,
+    _retirement: parking_lot::MutexGuard<'a, ()>,
+}
+
+impl Drop for StorageHandleHandoffWrite<'_> {
+    fn drop(&mut self) {
+        self.guards.clear();
+        self.handoff.reads.store(0, Ordering::Relaxed);
+        self.handoff.active.store(0, Ordering::Release);
+    }
+}
+
+thread_local! {
+    static STORAGE_HANDOFF_SLOT: usize = {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        NEXT.fetch_add(1, Ordering::Relaxed) % 32
+    };
+}
+
+impl StorageHandleHandoff {
+    const CLOSED: u64 = 1 << 63;
+
+    fn try_read(&self) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        let reads = self.reads.load(Ordering::Relaxed);
+        if reads < 64 {
+            self.reads.fetch_max(reads + 1, Ordering::Relaxed);
+            return self.try_read_slot(0);
+        }
+        if self.extra_gates().is_none() {
+            return self.try_read_slot(0);
+        }
+        STORAGE_HANDOFF_SLOT.with(|slot| self.try_read_slot(*slot))
+    }
+
+    fn extra_gates(&self) -> Option<&StorageHandleHandoffShards> {
+        self.extra
+            .get_or_init(|| {
+                use crate::engine::executor::mem_budget::{
+                    ControlledMemoryCategory, ControlledMemoryCharge, StorageLatchAdmissionScope,
+                };
+                let _admission = StorageLatchAdmissionScope::enter();
+                let memory = ControlledMemoryCharge::try_new_optional(
+                    ControlledMemoryCategory::SystemMetadata,
+                    std::mem::size_of::<StorageHandleHandoffShards>(),
+                )?;
+                Some(Box::new(StorageHandleHandoffShards {
+                    gates: std::array::from_fn(|_| CachePadded::default()),
+                    _memory: memory,
+                }))
+            })
+            .as_deref()
+    }
+
+    fn gate(&self, slot: usize) -> Option<&parking_lot::RwLock<()>> {
+        if slot == 0 {
+            Some(&self.single)
+        } else {
+            Some(&self.extra_gates()?.gates[slot - 1])
+        }
+    }
+
+    fn try_read_slot(&self, slot: usize) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        if !self.register_slot(slot) {
+            return None;
+        }
+        self.read_registered_slot(slot)
+    }
+
+    fn register_slot(&self, slot: usize) -> bool {
+        let bit = 1 << slot;
+        let mut active = self.active.load(Ordering::Acquire);
+        loop {
+            if active & Self::CLOSED != 0 {
+                return false;
+            }
+            if active & bit != 0 {
+                break;
+            }
+            match self.active.compare_exchange_weak(
+                active,
+                active | bit,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(current) => active = current,
+            }
+        }
+        true
+    }
+
+    fn read_registered_slot(&self, slot: usize) -> Option<parking_lot::RwLockReadGuard<'_, ()>> {
+        let guard = self.gate(slot)?.try_read()?;
+        let bit = 1 << slot;
+        let active = self.active.load(Ordering::Acquire);
+        // A reader can pause between registration and taking its gate while
+        // a whole retirement completes. Do not use an unregistered gate in
+        // the next epoch, even when the caller will also recheck its version.
+        (active & (Self::CLOSED | bit) == bit).then_some(guard)
+    }
+
+    fn write(&self) -> StorageHandleHandoffWrite<'_> {
+        let retirement = self.retirement.lock();
+        // Close registration before sampling the used gates. A new reader
+        // either registers before this RMW and is drained, or falls back.
+        let active = self.active.fetch_or(Self::CLOSED, Ordering::AcqRel);
+        let mut active = active & !Self::CLOSED;
+        let mut guards = smallvec::SmallVec::new();
+        while active != 0 {
+            let slot = active.trailing_zeros() as usize;
+            if let Some(gate) = self.gate(slot) {
+                guards.push(gate.write());
+            }
+            active &= active - 1;
+        }
+        StorageHandleHandoffWrite {
+            handoff: self,
+            guards,
+            _retirement: retirement,
+        }
+    }
+}
 
 trait StorageHandleKind {
-    fn handoff(epoch: &StorageHandleOpenEpoch) -> &parking_lot::RwLock<()>;
+    fn handoff(epoch: &StorageHandleOpenEpoch) -> &StorageHandleHandoff;
 }
 
 impl StorageHandleKind for HeapFile {
-    fn handoff(epoch: &StorageHandleOpenEpoch) -> &parking_lot::RwLock<()> {
-        &epoch.heap_handoff.0
+    fn handoff(epoch: &StorageHandleOpenEpoch) -> &StorageHandleHandoff {
+        &epoch.heap_handoff
     }
 }
 
 impl StorageHandleKind for IndexFile {
-    fn handoff(epoch: &StorageHandleOpenEpoch) -> &parking_lot::RwLock<()> {
-        &epoch.index_handoff.0
+    fn handoff(epoch: &StorageHandleOpenEpoch) -> &StorageHandleHandoff {
+        &epoch.index_handoff
     }
 }
 
@@ -321,8 +457,8 @@ impl Database {
             .get(&table_id)
             .and_then(std::sync::Weak::upgrade)
         {
-            let _heap_handoffs = epoch.heap_handoff.0.write();
-            let _index_handoffs = epoch.index_handoff.0.write();
+            let _heap_handoffs = epoch.heap_handoff.write();
+            let _index_handoffs = epoch.index_handoff.write();
             epoch.fetch_add(1, Ordering::AcqRel);
         } else {
             registry.epochs.remove(&table_id);

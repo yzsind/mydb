@@ -2616,7 +2616,7 @@ fn execute_set_op_branches_maybe_parallel(
         let context =
             crate::engine::executor::select::execution_context::ExecutionContext::capture(txn);
         let left_context = context.clone();
-        return std::thread::scope(|scope| {
+        return crate::util::thread_spawn::scope(|scope| {
             let left_handle = scope.spawn(move || {
                 left_context.run(db, || {
                     with_setop_branch_scheduler(|| {

@@ -154,7 +154,7 @@ mod tests {
     #[test]
     fn recovery_rules_are_independent_values() {
         let restore = RecoveryContext::restore(10, 12).unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope.spawn(move || {
                 assert!(restore.must_redo(10));
                 assert!(!restore.must_redo(9));

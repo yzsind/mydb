@@ -17,7 +17,7 @@ use std::sync::atomic::{
 use std::sync::{
     Arc, Condvar, Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-use std::thread;
+use crate::util::thread_spawn as thread;
 use std::time::{Duration, Instant};
 
 use chrono::NaiveDate;
@@ -3221,6 +3221,8 @@ struct Frame {
     key: PageKey,
     raw_memory_charge: Mutex<Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>>,
     bytes: RwLock<Vec<u8>>,
+    root_routing: parking_lot::Mutex<Option<Arc<RootRoutingCache>>>,
+    has_root_routing: AtomicBool,
     /// Number of logical SmallScan demands observed for this frame. Unlike a
     /// cache hit counter this starts at zero for Prefetch, so consuming a
     /// prefetched page during the first scan does not masquerade as reuse.
@@ -4892,6 +4894,7 @@ mod zone_map_page;
 include!("core/heap.rs");
 include!("core/overflow.rs");
 include!("core/btree.rs");
+include!("core/root_routing.rs");
 include!("core/packed_index_leaf.rs");
 include!("core/vector_page_io.rs");
 include!("core/vector_page.rs");

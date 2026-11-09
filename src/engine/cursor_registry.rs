@@ -416,7 +416,7 @@ impl Drop for CursorHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::thread;
+    use crate::util::thread_spawn as thread;
     use std::time::Duration;
 
     /// nextest runs tests in parallel — every test in this module

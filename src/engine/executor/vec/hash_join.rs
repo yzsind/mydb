@@ -1574,7 +1574,7 @@ pub fn run_inner_hash_join_partitioned(
         .first()
         .map(|b| b.columns().len())
         .unwrap_or(0);
-    let payloads: Vec<BuildPayload> = std::thread::scope(|s| {
+    let payloads: Vec<BuildPayload> = crate::util::thread_spawn::scope(|s| {
         let handles: Vec<_> = (0..parts)
             .map(|pid| {
                 let build_batches = &build_batches;

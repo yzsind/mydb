@@ -2584,7 +2584,7 @@ impl PagedHnsw {
         let epoch_source = Arc::clone(&self.query_nav_epoch);
         let m0 = self.m0;
         let budget = Arc::new(crate::engine::executor::mem_budget::MemBudget::from_env());
-        std::thread::spawn(move || {
+        crate::util::thread_spawn::spawn(move || {
             crate::engine::executor::mem_budget::with_query_budget(budget, || {
                 let _gate = navigation_gate.read();
                 let _mutation = mutation_gate.write();
@@ -4316,7 +4316,7 @@ impl PagedHnsw {
         };
         let chunk = appended.len().div_ceil(effective);
         let completed = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::with_capacity(effective);
             for (work, scratch) in appended
                 .chunks(chunk)
@@ -5399,7 +5399,7 @@ mod build_adj_tests {
         let store =
             BuildAdjStore::create(dir.path().join("published.build-adj"), 16, 32, 256, 0).unwrap();
         let done = std::sync::atomic::AtomicBool::new(false);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope.spawn(|| {
                 for ordinal in 0..256 {
                     store
@@ -5497,7 +5497,7 @@ mod build_adj_tests {
         for vid in [20, 30, 40] {
             store.append(vid, 0).unwrap();
         }
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for vid in [20, 30, 40] {
                 let store = &store;
                 scope.spawn(move || assert!(store.push_neighbor(10, 0, vid).unwrap()));
@@ -6080,7 +6080,7 @@ mod source_audit_tests {
         graph.start_query_navigation_build();
         graph.invalidate_query_topology();
         let (tx, rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             scope.spawn(|| tx.send(graph.search(&[1.0, 2.0], 1, 32)).unwrap());
             let found = rx.recv_timeout(std::time::Duration::from_secs(3));
             drop(mutation);

@@ -1683,7 +1683,7 @@ mod tests {
         let query_id = budget.query_id();
         let worker_registry = registry.clone();
         let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             SNAPSHOT_AFTER_UPGRADE.with(|hook| {
                 *hook.borrow_mut() = Some(Box::new(move || drop(budget)));
             });
@@ -1829,7 +1829,7 @@ mod tests {
             let handle = Arc::clone(&handle);
             let entered = Arc::clone(&entered);
             let leave = Arc::clone(&leave);
-            workers.push(std::thread::spawn(move || {
+            workers.push(crate::util::thread_spawn::spawn(move || {
                 let _stage = handle.enter_stage(ProcessState::SortingForOrder);
                 entered.wait();
                 leave.wait();

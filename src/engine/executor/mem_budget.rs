@@ -2721,7 +2721,7 @@ mod tests {
         let admission = RECLAIM_ADMISSION.get_or_init(|| Mutex::new(()));
         let held = admission.lock().unwrap();
         let (sender, receiver) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             let result = record_process_charge_with_reclaim(usize::MAX, false);
             let budget = MemBudget::process_tracked_for_test(1024);
             assert!(budget.try_charge_spill_buffer(usize::MAX).is_err());
@@ -2842,7 +2842,7 @@ mod tests {
         let writers = CATEGORY_ACTIVITY_SHARDS + 8;
         let barrier = std::sync::Barrier::new(writers);
         let category = ControlledMemoryCategory::PerformanceSchema;
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..writers {
                 let barrier = &barrier;
                 scope.spawn(move || {
@@ -2887,7 +2887,7 @@ mod tests {
         // Allocation and release can belong to different workers. The
         // releasing thread has never recorded statistics before its exit.
         record_category_alloc(ControlledMemoryCategory::PerformanceSchema, 16, 16);
-        std::thread::spawn(|| RELEASE.with(|slot| *slot.borrow_mut() = Some(ReleaseOnExit)))
+        crate::util::thread_spawn::spawn(|| RELEASE.with(|slot| *slot.borrow_mut() = Some(ReleaseOnExit)))
             .join()
             .unwrap();
         let snapshot = pfs_memory_category_snapshots()
@@ -2930,7 +2930,7 @@ mod tests {
         };
         assert!(current_reclaim_database().is_none());
         let expected = Arc::clone(&database);
-        std::thread::spawn(move || {
+        crate::util::thread_spawn::spawn(move || {
             with_query_budget(budget, || {
                 assert!(Arc::ptr_eq(&current_reclaim_database().unwrap(), &expected));
             })
@@ -3115,7 +3115,7 @@ mod tests {
         for _ in 0..8 {
             let admitted = Arc::clone(&admitted);
             let release = Arc::clone(&release);
-            workers.push(std::thread::spawn(move || {
+            workers.push(crate::util::thread_spawn::spawn(move || {
                 let charge = ControlledMemoryCharge::try_new(
                     ControlledMemoryCategory::DerivedCache,
                     384 * 1024,
@@ -3162,7 +3162,7 @@ mod tests {
         assert_eq!(owner.bytes() + worker.bytes(), limit);
         drop(owner);
         assert_eq!(controlled_memory_snapshot().0, worker.bytes());
-        std::thread::spawn(move || drop(worker)).join().unwrap();
+        crate::util::thread_spawn::spawn(move || drop(worker)).join().unwrap();
         assert_eq!(controlled_memory_snapshot().0, 0);
         MEMORY_TARGET_BYTES.store(prior_target, Ordering::Release);
         EFFECTIVE_MEMORY_LIMIT_BYTES.store(prior_effective, Ordering::Release);
@@ -3183,7 +3183,7 @@ mod tests {
         .unwrap();
         let admission = RECLAIM_ADMISSION.get_or_init(|| Mutex::new(()));
         let held = admission.lock().unwrap();
-        let worker = std::thread::spawn(|| {
+        let worker = crate::util::thread_spawn::spawn(|| {
             ControlledMemoryCharge::try_new(ControlledMemoryCategory::Executor, 64 * 1024)
         });
         std::thread::sleep(std::time::Duration::from_millis(10));
@@ -3621,7 +3621,7 @@ mod tests {
     fn concurrent_release_is_saturating() {
         let budget = Arc::new(MemBudget::new(4096));
         budget.charge(1024).unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..8 {
                 let budget = Arc::clone(&budget);
                 scope.spawn(move || budget.release(1024));
@@ -3722,7 +3722,7 @@ mod tests {
     fn terminal_oom_is_shared_across_query_workers() {
         let budget = Arc::new(MemBudget::new(1024));
         let published = Arc::new(std::sync::Barrier::new(2));
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let failing_budget = Arc::clone(&budget);
             let failing_barrier = Arc::clone(&published);
             let failing = scope.spawn(move || {

@@ -403,7 +403,7 @@ mod tests {
         let threads: Vec<_> = (0..WAITERS)
             .map(|_| {
                 let ready = std::sync::Arc::clone(&ready);
-                std::thread::spawn(move || {
+                crate::util::thread_spawn::spawn(move || {
                     let rt = tokio::runtime::Builder::new_current_thread()
                         .enable_all()
                         .build()

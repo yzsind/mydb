@@ -492,6 +492,8 @@ pub(crate) struct IndexFile {
     root_page: AtomicU64,
     /// Bounded weak root-page hint; it never prevents buffer eviction.
     root_frame_hint: AtomicFrameHint,
+    root_routing: OnceLock<arc_swap::ArcSwapOption<RootRoutingCache>>,
+    root_routing_reads: AtomicU8,
     /// Serializes structural B-tree changes (split/merge/root/meta).
     /// Ordinary leaf-only DML can hold this in shared mode and rely on
     /// per-leaf latches; any fallback that may change topology takes it
@@ -2600,7 +2602,7 @@ fn with_parallel_bulk_image_writes<T>(
     let cancel = crate::engine::cancel::CancellationSnapshot::capture();
     let (sender, receiver) = std::sync::mpsc::sync_channel::<(u64, Vec<u8>)>(1);
     let receiver = Mutex::new(receiver);
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(degree);
         for _ in 0..degree {
             let receiver = &receiver;
@@ -2969,6 +2971,8 @@ impl IndexFile {
             durability,
             root_page: root_page_atomic,
             root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -3025,6 +3029,8 @@ impl IndexFile {
             durability,
             root_page: root_page_atomic,
             root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -3265,6 +3271,8 @@ impl IndexFile {
             durability: DurabilityMode::Strict,
             root_page: root_page_atomic,
             root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -3614,6 +3622,8 @@ impl IndexFile {
             durability,
             root_page: root_page_atomic,
             root_frame_hint: AtomicFrameHint::empty(),
+            root_routing: OnceLock::new(),
+            root_routing_reads: AtomicU8::new(0),
             structure_lock: Arc::new(parking_lot::RwLock::new(())),
             split_prepare: parking_lot::Mutex::new(()),
             meta_state: parking_lot::Mutex::new(IndexMetaState { meta, meta_image }),
@@ -5527,7 +5537,7 @@ impl IndexFile {
         let degree = degree.min(records.len().div_ceil(128 * 1024)).max(1);
         let chunk = records.len().div_ceil(degree);
         let cancel = crate::engine::cancel::CancellationSnapshot::capture();
-        let plans = std::thread::scope(|scope| -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
+        let plans = crate::util::thread_spawn::scope(|scope| -> Result<Vec<Vec<(usize, usize)>>, QueryError> {
             let mut handles = Vec::new();
             for (worker, slice) in records.chunks(chunk).enumerate() {
                 let key_bytes = &key_bytes;
@@ -5562,7 +5572,7 @@ impl IndexFile {
         for _ in 0..count {
             ids.push(self.reserve_page_id()?);
         }
-        let level = std::thread::scope(|scope| -> Result<Vec<(u64, IndexEntry)>, QueryError> {
+        let level = crate::util::thread_spawn::scope(|scope| -> Result<Vec<(u64, IndexEntry)>, QueryError> {
             let mut handles = Vec::new();
             let mut offset = 0usize;
             for pages in plans {
@@ -9182,6 +9192,13 @@ impl IndexFile {
         let mut page_id = self.root_page.load(Ordering::Acquire);
         let mut progress = IndexPageProgress::new(page_id);
         loop {
+            if let Some(RawIndexPageRoute::Child { page_id: child, .. }) =
+                self.route_cached_root(page_id, key, zero)?
+            {
+                progress.advance(child)?;
+                page_id = child;
+                continue;
+            }
             let pinned = pin(page_id)?;
             if pinned.frame.has_packed_leaf() {
                 return Ok(pinned);
@@ -9191,6 +9208,7 @@ impl IndexFile {
             match route {
                 RawIndexPageRoute::Leaf => return Ok(pinned),
                 RawIndexPageRoute::Child { page_id: child, .. } => {
+                    self.remember_root_routing(&pinned)?;
                     progress.advance(child)?;
                     page_id = child;
                 }
@@ -18645,7 +18663,7 @@ mod logged_delete_batch_tests {
         let topology = file.structure_lock.read();
         let (tx, rx) = std::sync::mpsc::channel();
         let worker_file = Arc::clone(&file);
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             tx.send(worker_file.apply_batch_with_lsn(7, deletes.into(), Some(lsn)))
                 .unwrap();
         });

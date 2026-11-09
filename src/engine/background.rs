@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
+use crate::util::thread_spawn as thread;
 use std::time::Duration;
 
 /// Shutdown signal for a background worker that sleeps on a condition
@@ -144,7 +144,7 @@ mod tests {
         let shutdown = Arc::new(BackgroundShutdown::new());
         let worker_shutdown = Arc::clone(&shutdown);
         let worker =
-            std::thread::spawn(move || worker_shutdown.wait_timeout(Duration::from_secs(60)));
+            crate::util::thread_spawn::spawn(move || worker_shutdown.wait_timeout(Duration::from_secs(60)));
 
         std::thread::sleep(Duration::from_millis(10));
         let started = Instant::now();
@@ -163,7 +163,7 @@ mod tests {
 
         let worker_signal = Arc::clone(&signal);
         let worker =
-            std::thread::spawn(move || worker_signal.wait_timeout(Duration::from_secs(60)));
+            crate::util::thread_spawn::spawn(move || worker_signal.wait_timeout(Duration::from_secs(60)));
         std::thread::sleep(Duration::from_millis(10));
         signal.request_wake();
         assert!(!worker.join().unwrap());

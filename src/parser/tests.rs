@@ -3892,6 +3892,58 @@ fn parses_optimizer_hint_parallel_with_other() {
 }
 
 #[test]
+fn parses_create_or_replace_routines_and_batches() {
+    for (header, kind) in [
+        (
+            "PROCEDURE `test`.`replace_p`(IN x INT, OUT y INT) BEGIN SET y = x; SELECT y; END",
+            RoutineKind::Procedure,
+        ),
+        (
+            "FUNCTION `test`.`replace_f`(x INT) RETURNS INT RETURN x + 1",
+            RoutineKind::Function,
+        ),
+    ] {
+        for prefix in [
+            "CREATE OR REPLACE",
+            "/* DDL */ create or replace DEFINER = 'root'@'localhost'",
+        ] {
+            let sql = format!("{prefix} {header}");
+            let Statement::CreateRoutine(def) = parse_statement(&sql).unwrap() else {
+                panic!("expected CREATE ROUTINE");
+            };
+            assert!(def.or_replace);
+            assert!(!def.if_not_exists);
+            assert_eq!(def.kind, kind);
+            assert_eq!(def.definer.is_some(), prefix.contains("DEFINER"));
+            let statements = parse_statements(&format!("{sql}; SELECT 1")).unwrap();
+            assert_eq!(statements.len(), 2);
+            assert!(matches!(&statements[0], Statement::CreateRoutine(def) if def.or_replace));
+        }
+    }
+}
+
+#[test]
+fn rejects_create_or_replace_routine_with_if_not_exists() {
+    for definition in [
+        "PROCEDURE IF NOT EXISTS p() SELECT 1",
+        "FUNCTION IF NOT EXISTS f() RETURNS INT RETURN 1",
+    ] {
+        let err = parse_statement(&format!("CREATE OR REPLACE {definition}")).unwrap_err();
+        assert!(
+            err.message.contains("OR REPLACE and IF NOT EXISTS"),
+            "{err:?}"
+        );
+        let Statement::CreateRoutine(def) =
+            parse_statement(&format!("CREATE {definition}")).unwrap()
+        else {
+            panic!("expected CREATE ROUTINE");
+        };
+        assert!(!def.or_replace);
+        assert!(def.if_not_exists);
+    }
+}
+
+#[test]
 fn parses_mysql_create_procedure_with_compound_body() {
     let stmt = parse_statement(
         "CREATE PROCEDURE p(IN a INT, OUT b INT)

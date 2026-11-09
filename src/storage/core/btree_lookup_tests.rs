@@ -48,6 +48,13 @@ fn point_lookup_consumes_the_routed_leaf_without_repinning() {
 }
 
 fn index_fixture(keys: Vec<IndexKey>) -> (tempfile::TempDir, IndexFile) {
+    index_fixture_with_durability(keys, DurabilityMode::Memory)
+}
+
+fn index_fixture_with_durability(
+    keys: Vec<IndexKey>,
+    durability: DurabilityMode,
+) -> (tempfile::TempDir, IndexFile) {
     let dir = tempfile::tempdir().unwrap();
     let log = Arc::new(parking_lot::Mutex::new(
         LogManager::open(dir.path()).unwrap(),
@@ -55,16 +62,12 @@ fn index_fixture(keys: Vec<IndexKey>) -> (tempfile::TempDir, IndexFile) {
     let pool = BufferPool::new(
         1024,
         log.clone(),
-        DurabilityMode::Memory,
+        durability,
         Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
     );
-    let index = IndexFile::open_with_durability(
-        dir.path().join("lookup.idx"),
-        log,
-        DurabilityMode::Memory,
-        pool,
-    )
-    .unwrap();
+    let index =
+        IndexFile::open_with_durability(dir.path().join("lookup.idx"), log, durability, pool)
+            .unwrap();
     let mut entries: Vec<_> = keys
         .into_iter()
         .enumerate()
@@ -224,9 +227,8 @@ fn compare_paths(index: &IndexFile, keys: &[IndexKey], exact: bool, dedup: bool)
     );
 }
 
-#[test]
-fn small_batch_lookup_matches_scalar_and_fallback_across_key_types() {
-    let makers: Vec<Box<dyn Fn(i64) -> Vec<KeyPart>>> = vec![
+fn lookup_key_makers() -> Vec<Box<dyn Fn(i64) -> Vec<KeyPart>>> {
+    vec![
         Box::new(|n| vec![KeyPart::Int(n - 100)]),
         Box::new(|n| vec![KeyPart::Int(n * 100_000)]),
         Box::new(|n| vec![KeyPart::UInt((1 << 63) + n as u64)]),
@@ -268,7 +270,12 @@ fn small_batch_lookup_matches_scalar_and_fallback_across_key_types() {
         Box::new(|n| vec![KeyPart::Int(n / 7), KeyPart::String(format!("v-{n:08}"))]),
         // More than four parts exercises heap-backed IndexKey storage too.
         Box::new(|n| vec![KeyPart::Int(n); 5]),
-    ];
+    ]
+}
+
+#[test]
+fn small_batch_lookup_matches_scalar_and_fallback_across_key_types() {
+    let makers = lookup_key_makers();
     let mut layouts = std::collections::BTreeSet::new();
     for make in makers {
         let (_dir, index) = index_fixture(
@@ -449,4 +456,244 @@ fn small_batch_lookup_dense_prefixes_and_shared_rowids() {
             compare_paths(&index, &keys, false, dedup);
         }
     }
+}
+
+#[test]
+fn root_routing_cache_retires_payload_on_eviction_and_raw_mutation() {
+    let (_dir, index) = index_fixture_with_durability(
+        (0..6000)
+            .map(|n| IndexKey::from(vec![KeyPart::Int(n)]))
+            .collect(),
+        DurabilityMode::Relaxed,
+    );
+    let key = IndexKey::from(vec![KeyPart::Int(1234)]);
+    let expected = warm_root_routing(&index, &key);
+    assert!(expected.is_some());
+    let token = index.root_routing.get().unwrap().load_full().unwrap();
+    let payload = Arc::downgrade(token.image.load().as_ref().unwrap());
+    let page = index.page_key(token.page_id);
+    let root = index.buffer_pool.lookup_frame(&page).unwrap().unwrap();
+    assert_eq!(root.pin_count.load(Ordering::Acquire), 0);
+    root.ref_bit.store(false, Ordering::Release);
+    root.usage_count.store(0, Ordering::Release);
+    for _ in 0..20 {
+        assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+    }
+    root.refresh_root_routing_reference();
+    assert!(root.ref_bit.load(Ordering::Acquire));
+    assert_eq!(
+        root.usage_count.load(Ordering::Acquire),
+        Frame::MAX_NORMAL_USAGE_COUNT
+    );
+    // A failed/no-op writer must invalidate before receiving mutable bytes.
+    {
+        let _bytes = root.write_bytes().unwrap();
+        assert!(token.image.load().is_none());
+    }
+    assert!(payload.upgrade().is_none());
+    assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+    let token = index.root_routing.get().unwrap().load_full().unwrap();
+    let payload = Arc::downgrade(token.image.load().as_ref().unwrap());
+    index.buffer_pool.flush_and_evict_all().unwrap();
+    assert!(token.image.load().is_none());
+    assert!(payload.upgrade().is_none());
+    assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+    let root = index.buffer_pool.lookup_frame(&page).unwrap().unwrap();
+    drop(root.write_bytes().unwrap());
+    crate::engine::executor::mem_budget::with_test_effective_memory_limit(1, || {
+        assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+        assert!(index.root_routing.get().unwrap().load().is_none());
+    });
+    assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+    index.buffer_pool.discard_file(&index.file_key).unwrap();
+    assert!(index
+        .root_routing
+        .get()
+        .unwrap()
+        .load()
+        .as_ref()
+        .unwrap()
+        .image
+        .load()
+        .is_none());
+}
+
+#[test]
+fn root_routing_cache_follows_root_replacement_and_small_tree_collapse() {
+    let (_dir, mut index) = index_fixture(
+        (0..6000)
+            .map(|n| IndexKey::from(vec![KeyPart::Int(n)]))
+            .collect(),
+    );
+    let key = IndexKey::from(vec![KeyPart::Int(12)]);
+    assert!(warm_root_routing(&index, &key).is_some());
+    let old = index.root_routing.get().unwrap().load_full().unwrap();
+    index
+        .bulk_load_sorted(
+            2,
+            vec![IndexEntry {
+                key: key.clone(),
+                row_id: RowId {
+                    page_id: 99,
+                    slot_id: 1,
+                },
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        index.get_unique_one(&key).unwrap(),
+        Some(RowId {
+            page_id: 99,
+            slot_id: 1
+        })
+    );
+    assert!(old.image.load().is_none());
+    index
+        .delete(
+            key.clone(),
+            RowId {
+                page_id: 99,
+                slot_id: 1,
+            },
+        )
+        .unwrap();
+    assert_eq!(index.get_unique_one(&key).unwrap(), None);
+    index
+        .insert(
+            key.clone(),
+            RowId {
+                page_id: 100,
+                slot_id: 2,
+            },
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        index.get_unique_one(&key).unwrap(),
+        Some(RowId {
+            page_id: 100,
+            slot_id: 2
+        })
+    );
+}
+
+#[test]
+fn root_routing_cache_matches_oracle_across_key_layouts() {
+    for make in lookup_key_makers() {
+        let keys: Vec<_> = (0..6000).map(|n| IndexKey::from(make(n))).collect();
+        let (_dir, index) = index_fixture(keys.clone());
+        for n in [0, 17, 999, 3000, 5999] {
+            let key = &keys[n];
+            let expected: Vec<_> = keys
+                .iter()
+                .enumerate()
+                .filter_map(|(i, k)| {
+                    (k == key).then_some(RowId {
+                        page_id: (i / 32) as u32,
+                        slot_id: (i % 32) as u16,
+                    })
+                })
+                .collect();
+            for _ in 0..2 {
+                assert_eq!(index.get(key, false).unwrap(), expected);
+            }
+        }
+        assert!(index.root_routing.get().unwrap().load().is_some());
+        assert_eq!(index.buffer_pool.snapshot().pinned_pages, 0);
+    }
+}
+
+#[test]
+fn root_routing_cache_readers_race_republication_without_retaining_pins() {
+    let (_dir, index) = index_fixture(
+        (0..6000)
+            .map(|n| IndexKey::from(vec![KeyPart::Int(n)]))
+            .collect(),
+    );
+    let key = IndexKey::from(vec![KeyPart::Int(42)]);
+    let expected = warm_root_routing(&index, &key);
+    let page = index.page_key(index.root_page.load(Ordering::Acquire));
+    let frame = index.buffer_pool.lookup_frame(&page).unwrap().unwrap();
+    let index = Arc::new(index);
+    let barrier = Arc::new(std::sync::Barrier::new(5));
+    let workers: Vec<_> = (0..4)
+        .map(|_| {
+            let index = Arc::clone(&index);
+            let barrier = Arc::clone(&barrier);
+            let key = key.clone();
+            std::thread::spawn(move || {
+                barrier.wait();
+                for _ in 0..200 {
+                    assert_eq!(index.get_unique_one(&key).unwrap(), expected);
+                }
+            })
+        })
+        .collect();
+    barrier.wait();
+    for _ in 0..200 {
+        drop(frame.write_bytes().unwrap());
+    }
+    for worker in workers {
+        worker.join().unwrap();
+    }
+    assert_eq!(index.buffer_pool.snapshot().pinned_pages, 0);
+    index.buffer_pool.discard_file(&index.file_key).unwrap();
+    assert!(index
+        .root_routing
+        .get()
+        .unwrap()
+        .load()
+        .as_ref()
+        .unwrap()
+        .image
+        .load()
+        .is_none());
+}
+
+fn warm_root_routing(index: &IndexFile, key: &IndexKey) -> Option<RowId> {
+    let mut result = None;
+    for _ in 0..=ROOT_ROUTING_MIN_READS {
+        result = index.get_unique_one(key).unwrap();
+    }
+    result
+}
+
+#[test]
+fn root_routing_cache_avoids_copying_single_use_handles() {
+    let (_dir, index) = index_fixture(
+        (0..6000)
+            .map(|n| IndexKey::from(vec![KeyPart::Int(n)]))
+            .collect(),
+    );
+    assert!(index
+        .get_unique_one(&IndexKey::from(vec![KeyPart::Int(20)]))
+        .unwrap()
+        .is_some());
+    assert!(index.root_routing.get().is_none());
+}
+
+#[test]
+fn root_routing_cache_rejects_another_files_same_page_number() {
+    let (_a, index) = index_fixture(
+        (0..6000)
+            .map(|n| IndexKey::from(vec![KeyPart::Int(n)]))
+            .collect(),
+    );
+    let (_b, other) = index_fixture(
+        (10000..16000)
+            .map(|n| IndexKey::from(vec![KeyPart::Int(n)]))
+            .collect(),
+    );
+    let key = IndexKey::from(vec![KeyPart::Int(1234)]);
+    let expected = warm_root_routing(&index, &key);
+    let old = index.root_routing.get().unwrap().load_full().unwrap();
+    let page = index.root_page.load(Ordering::Acquire);
+    assert_eq!(other.root_page.load(Ordering::Acquire), page);
+    let unrelated = other.pin_tree_page(page).unwrap();
+    index.remember_root_routing(&unrelated).unwrap();
+    assert!(Arc::ptr_eq(
+        &old,
+        &index.root_routing.get().unwrap().load_full().unwrap()
+    ));
+    assert_eq!(index.get_unique_one(&key).unwrap(), expected);
 }

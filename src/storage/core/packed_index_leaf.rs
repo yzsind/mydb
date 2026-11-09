@@ -1243,7 +1243,7 @@ impl Frame {
             return Ok(bytes);
         }
         drop(bytes);
-        let mut bytes = self.bytes.write().map_err(|_| {
+        let mut bytes = self.write_bytes().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "buffer frame write lock poisoned",
@@ -1293,7 +1293,7 @@ impl BufferPool {
         if pinned.frame.packed_leaf_state.load(Ordering::Acquire) != 2 {
             return Ok(None);
         }
-        let _bytes = pinned.frame.bytes.write().map_err(|_| {
+        let _bytes = pinned.frame.write_bytes().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "buffer frame write lock poisoned",
@@ -1331,7 +1331,7 @@ impl BufferPool {
             return Ok(None);
         }
         self.wait_until_ready(&pinned.frame)?;
-        let mut bytes = pinned.frame.bytes.write().map_err(|_| {
+        let mut bytes = pinned.frame.write_bytes().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "buffer frame write lock poisoned",
@@ -1759,6 +1759,13 @@ mod packed_leaf_tree_tests {
                 DurabilityMode::Strict,
                 Duration::from_secs(5),
             );
+            // Observe native dirty images until the explicit flush below.
+            // Background cleaning has independent coverage and may otherwise
+            // materialize this fixture during a slow/concurrent test run.
+            pool.shutdown.store(true, Ordering::Release);
+            pool.worker_cv.notify_all();
+            let workers = std::mem::take(&mut *pool.flusher.lock().unwrap());
+            for worker in workers { worker.join().unwrap(); }
             IndexFile::open_with_durability(path, log, DurabilityMode::Strict, pool).unwrap()
         };
         let index = open(path.clone(), Arc::clone(&log));

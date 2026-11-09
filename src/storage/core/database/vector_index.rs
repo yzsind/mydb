@@ -328,7 +328,7 @@ fn hnsw_build_threads() -> usize {
             return v.min(HNSW_BUILD_MAX_THREADS);
         }
     }
-    let cores = std::thread::available_parallelism()
+    let cores = crate::util::thread_spawn::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     cores.clamp(1, HNSW_BUILD_MAX_THREADS)
@@ -429,7 +429,7 @@ fn vector_brute_scan_threads() -> usize {
             return v.clamp(1, HNSW_BUILD_MAX_THREADS);
         }
     }
-    let cores = std::thread::available_parallelism()
+    let cores = crate::util::thread_spawn::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(1);
     cores.saturating_sub(1).clamp(1, HNSW_BUILD_MAX_THREADS)
@@ -1595,7 +1595,7 @@ impl Database {
                 Err(error) => return Err(error),
             }
         };
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
             let mut inputs = Vec::new();
             let mut outputs = Vec::new();
@@ -2077,7 +2077,7 @@ impl Database {
         graph: &HnswIndex,
     ) -> Result<(), QueryError> {
         type ExactRow = (RowId, Vec<f32>);
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let (sender, receiver) = std::sync::mpsc::sync_channel::<ExactRow>(8);
             let scanner = scope.spawn(move || -> Result<usize, QueryError> {
                 let mut sent = 0usize;
@@ -2342,7 +2342,7 @@ impl Database {
     /// Walk one storage_id's heap (one partition, or the whole table for
     /// unpartitioned cases) and reconcile its vectors with `graph`.
     /// Dispatches between a single-threaded serial
-    /// scan and a `std::thread::scope`-driven parallel page-range fan-out
+    /// scan and a `crate::util::thread_spawn::scope`-driven parallel page-range fan-out
     /// based on `threads` and the page count — small heaps stay serial so
     /// spawn / join overhead never dominates.
     fn vector_graph_populate_from_heap(
@@ -2435,7 +2435,7 @@ impl Database {
         }
 
         let chunk = page_count.div_ceil(effective as u64);
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::with_capacity(effective);
             let mut lo = 0u64;
             while lo < page_count {
@@ -2514,7 +2514,7 @@ impl Database {
             scan_range(0, u64::MAX)?;
         } else {
             let chunk = page_count.div_ceil(effective as u64);
-            std::thread::scope(|scope| -> Result<(), QueryError> {
+            crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
                 let mut handles = Vec::with_capacity(effective);
                 let mut lo = 0u64;
                 while lo < page_count {
@@ -2640,7 +2640,7 @@ impl Database {
         }
         let group_size = units.len().div_ceil(workers);
         let per_worker = (bytes / workers / PAGE_SIZE).max(1) * PAGE_SIZE;
-        let partials: Vec<Result<BruteTopK, QueryError>> = std::thread::scope(|scope| {
+        let partials: Vec<Result<BruteTopK, QueryError>> = crate::util::thread_spawn::scope(|scope| {
             let mut handles = Vec::new();
             for group in units.chunks(group_size) {
                 let mut charge = envelope.split(per_worker);

@@ -511,7 +511,7 @@ mod sharded_undo_tests {
         let maintenance = latch.write();
         let worker_latch = Arc::clone(&latch);
         let (send, receive) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             send.send(worker_latch.publish(entry, bytes, ptr, segment, end, reservation, lease))
                 .unwrap();
         });
@@ -621,7 +621,7 @@ mod sharded_undo_tests {
         let held_lane = latch.publications[latch.shard(ptr)].state.lock();
         let worker_latch = Arc::clone(&latch);
         let (send, receive) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || {
+        let worker = crate::util::thread_spawn::spawn(move || {
             send.send(worker_latch.try_read().is_none()).unwrap();
         });
         let skipped = receive.recv_timeout(Duration::from_millis(200));

@@ -87,7 +87,7 @@ mod audit1022_atomic_tests {
         std::fs::create_dir_all("/tmp/mydb").unwrap();
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let barrier = std::sync::Barrier::new(4);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for worker in 0..4 {
                 let path = dir.path().join("marker.json");
                 let tmp = path.with_extension("json.tmp");

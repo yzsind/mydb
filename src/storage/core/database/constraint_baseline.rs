@@ -216,14 +216,14 @@ impl Database {
                     CONSTRAINT_BASELINE_PARALLEL_RUNS.fetch_add(1, Ordering::Relaxed);
                     let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
                     let budget = crate::engine::executor::mem_budget::current_budget();
-                    std::thread::scope(|scope| {
+                    crate::util::thread_spawn::scope(|scope| {
                         let mut handles = Vec::with_capacity(degree);
                         let mut failure = None;
                         for worker in 0..degree {
                             let inputs = &inputs;
                             let cancellation = cancellation.clone();
                             let budget = budget.clone();
-                            match std::thread::Builder::new()
+                            match crate::util::thread_spawn::Builder::new()
                                 .name(format!("mydb-fk-snapshot-{worker}"))
                                 .stack_size(2 * 1024 * 1024)
                                 .spawn_scoped(scope, move || {

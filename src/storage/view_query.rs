@@ -566,7 +566,7 @@ mod tests {
     #[test]
     fn codec_runs_with_a_small_caller_stack() {
         let original = select(&format!("SELECT id{} AS n FROM t", "+1".repeat(62)));
-        std::thread::Builder::new()
+        crate::util::thread_spawn::Builder::new()
             .stack_size(64 * 1024)
             .spawn(move || {
                 let query = ViewQuery::new(original).unwrap();

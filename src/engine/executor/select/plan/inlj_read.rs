@@ -125,7 +125,7 @@ where
     let read_tasks = &read_tasks;
 
     let read_rows = &read_rows;
-    let mut completed = std::thread::scope(|scope| {
+    let mut completed = crate::util::thread_spawn::scope(|scope| {
         let mut handles = Vec::with_capacity(degree);
         for _ in 0..degree {
             let next_task = &next_task;

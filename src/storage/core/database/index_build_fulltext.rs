@@ -133,7 +133,7 @@ fn combine_fulltext_sorters(
     if !resident {
         // Flush concurrently before transferring the runs into one RAII owner.
         // The merger consolidates to a bounded fan-in, regardless of run count.
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let handles = sorters
                 .iter_mut()
                 .map(|sorter| scope.spawn(move || sorter.flush_run(data_dir)))
@@ -201,7 +201,7 @@ fn combine_fulltext_sorters(
         ranks[id] = rank as u32;
     }
     let mut records = vec![0u128; total];
-    std::thread::scope(|scope| {
+    crate::util::thread_spawn::scope(|scope| {
         let mut remaining = records.as_mut_slice();
         let mut handles = Vec::with_capacity(workers.len());
         for (local, mapping) in workers {
@@ -251,7 +251,7 @@ fn consolidate_fulltext_sort_runs(
             .map(|group| tmp.join(format!("fulltext-merge-{pass}-{group}")))
             .collect::<Vec<_>>();
         let next = AtomicUsize::new(0);
-        std::thread::scope(|scope| -> Result<(), QueryError> {
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let mut handles = Vec::new();
             for _ in 0..degree.min(groups.len()).max(1) {
                 let groups = &groups;
@@ -334,7 +334,7 @@ impl Database {
         };
         let started = Instant::now();
         let outputs = self.with_heap_read(table.id, |heap| {
-            std::thread::scope(
+            crate::util::thread_spawn::scope(
                 |scope| -> Result<Vec<(EncodedIndexSorter, u64)>, QueryError> {
                     let mut handles = Vec::with_capacity(degree);
                     for worker in 0..degree {
@@ -344,7 +344,7 @@ impl Database {
                         let cancel = cancel.clone();
                         let cfg = &cfg;
                         handles.push(
-                            std::thread::Builder::new()
+                            crate::util::thread_spawn::Builder::new()
                                 .name(format!("mydb-fulltext-scan-{worker}"))
                                 .spawn_scoped(scope, move || -> Result<_, QueryError> {
                                     let _worker = enter_index_build_worker();

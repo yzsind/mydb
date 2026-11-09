@@ -333,7 +333,7 @@ fn run_topn_parallel_impl(
     let budget = crate::engine::executor::mem_budget::current_budget();
     let env_snapshot = crate::util::env::override_snapshot();
     let mut producer_error = None;
-    let sinks = std::thread::scope(|scope| {
+    let sinks = crate::util::thread_spawn::scope(|scope| {
         let mut senders = Vec::with_capacity(worker_count);
         let mut handles = Vec::with_capacity(worker_count);
         for _ in 0..worker_count {

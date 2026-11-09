@@ -2,7 +2,8 @@
 //! factories can be reassigned when their selected worker cannot poll them.
 //! Potentially blocking statement work keeps the pool-wide admission guard.
 
-use std::cell::OnceCell;
+use crate::util::thread_spawn as thread;
+use std::cell::{Cell, OnceCell};
 use std::future::Future;
 use std::io;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -10,7 +11,6 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, OnceLock};
 use std::task::Poll;
-use std::thread;
 use std::time::{Duration, Instant};
 
 use smallvec::SmallVec;
@@ -24,7 +24,7 @@ const ADMISSION_RETRY: Duration = Duration::from_millis(1);
 // flags on separate cache lines; connection counts change only at admission
 // and teardown.
 #[repr(align(64))]
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct WorkerState {
     connections: AtomicUsize,
     polling: AtomicBool,
@@ -129,6 +129,9 @@ struct Dispatcher {
 
 thread_local! {
     static WORKER_LOAD: OnceCell<Arc<AtomicUsize>> = const { OnceCell::new() };
+    static CURRENT_WORKER: OnceCell<Arc<WorkerState>> = const { OnceCell::new() };
+    static COMMANDS_THIS_POLL: Cell<u8> = const { Cell::new(0) };
+    static REACTOR_CPU: Cell<Option<usize>> = const { Cell::new(None) };
 }
 
 /// Only a process-wide sole connection may execute potentially blocking work
@@ -147,6 +150,25 @@ pub fn current_worker_has_sibling_connections() -> bool {
         load.get()
             .is_some_and(|load| load.load(Ordering::Acquire) > 1)
     })
+}
+
+/// Buffered protocol reads can remain ready without returning to the I/O
+/// driver. Bound buffered bursts without adding an extra turn when ordinary
+/// socket or executor waits have already returned control to the scheduler.
+pub async fn yield_to_peer_connections() {
+    let peers = CURRENT_WORKER.with(|worker| {
+        worker
+            .get()
+            .is_some_and(|worker| worker.connections.load(Ordering::Acquire) > 1)
+    });
+    if peers {
+        if COMMANDS_THIS_POLL.with(|commands| commands.get() != 0) {
+            tokio::task::yield_now().await;
+        }
+        // A suspended I/O/executor operation resets this in the outer poll.
+        // Resumption after our explicit yield starts a fresh command turn.
+        COMMANDS_THIS_POLL.with(|commands| commands.set(1));
+    }
 }
 
 struct Polling<'a>(&'a AtomicBool);
@@ -176,6 +198,7 @@ async fn run_connection(admission: Arc<Admission>, worker: Arc<WorkerState>) {
     let result = match factory {
         Ok(mut connection) => {
             std::future::poll_fn(|cx| {
+                COMMANDS_THIS_POLL.with(|commands| commands.set(0));
                 let _polling = Polling::enter(&worker);
                 match catch_unwind(AssertUnwindSafe(|| connection.as_mut().poll(cx))) {
                     Ok(Poll::Pending) => Poll::Pending,
@@ -199,19 +222,170 @@ async fn run_connection(admission: Arc<Admission>, worker: Arc<WorkerState>) {
     }
 }
 
+static SERVER_PARALLELISM: OnceLock<std::num::NonZeroUsize> = OnceLock::new();
+#[cfg(target_os = "linux")]
+static SERVER_CPUS: OnceLock<Vec<usize>> = OnceLock::new();
+
+pub(crate) fn reactor_server_parallelism() -> Option<std::num::NonZeroUsize> {
+    REACTOR_CPU.with(|cpu| cpu.get().and_then(|_| SERVER_PARALLELISM.get().copied()))
+}
+
+fn affinity_targets(count: usize, allowed: &[usize], enabled: bool) -> Vec<Option<usize>> {
+    if enabled && count <= allowed.len() {
+        allowed[..count].iter().copied().map(Some).collect()
+    } else {
+        vec![None; count]
+    }
+}
+
+fn worker_cpu_targets(count: usize) -> io::Result<Vec<Option<usize>>> {
+    let mode = crate::util::env::var("MYDB_TOKIO_AFFINITY").unwrap_or_else(|_| "auto".into());
+    let enabled = match mode.trim() {
+        value if value.eq_ignore_ascii_case("auto") => true,
+        value if value.eq_ignore_ascii_case("off") => false,
+        _ => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "MYDB_TOKIO_AFFINITY must be auto or off",
+            ))
+        }
+    };
+    let fits_quota = crate::util::thread_spawn::available_parallelism()
+        .is_ok_and(|parallelism| count <= parallelism.get());
+    Ok(affinity_targets(
+        count,
+        &allowed_worker_cpus(),
+        enabled && fits_quota,
+    ))
+}
+
+#[cfg(target_os = "linux")]
+fn allowed_worker_cpus() -> Vec<usize> {
+    // Read the effective calling-thread mask, including taskset and cgroup
+    // restrictions. Do not assume that logical CPU ids are contiguous.
+    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    if unsafe { libc::sched_getaffinity(0, std::mem::size_of_val(&mask), &mut mask) } != 0 {
+        return Vec::new();
+    }
+    (0..libc::CPU_SETSIZE as usize)
+        .filter(|cpu| unsafe { libc::CPU_ISSET(*cpu, &mask) })
+        .collect()
+}
+
+#[cfg(not(target_os = "linux"))]
+fn allowed_worker_cpus() -> Vec<usize> {
+    Vec::new()
+}
+
+fn pin_worker_cpu(cpu: Option<usize>) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if let Some(cpu) = cpu {
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        unsafe { libc::CPU_SET(cpu, &mut mask) };
+        if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) } != 0 {
+            return Err(io::Error::other(format!(
+                "cannot bind connection reactor to CPU {cpu}: {}",
+                io::Error::last_os_error()
+            )));
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cpu;
+    REACTOR_CPU.with(|slot| slot.set(cpu));
+    Ok(())
+}
+
+pub(crate) struct SpawnCpuScope {
+    cpu: Option<usize>,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(target_os = "linux")]
+fn restore_server_cpu_mask() -> io::Result<()> {
+    let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+    // The unbound main thread retains the current server/cgroup mask.
+    if unsafe { libc::sched_getaffinity(libc::getpid(), std::mem::size_of_val(&mask), &mut mask) }
+        != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if let Some(server) = SERVER_CPUS.get() {
+        let mut selected: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let mut any = false;
+        for &cpu in server {
+            if unsafe { libc::CPU_ISSET(cpu, &mask) } {
+                unsafe { libc::CPU_SET(cpu, &mut selected) };
+                any = true;
+            }
+        }
+        // Retain the initializing caller's restriction when embedded in a
+        // wider process. A disjoint cgroup move follows the new process mask.
+        if any {
+            mask = selected;
+        }
+    }
+    if unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+pub(crate) fn unpin_for_spawn() -> io::Result<SpawnCpuScope> {
+    let cpu = REACTOR_CPU.with(Cell::take);
+    #[cfg(target_os = "linux")]
+    if let Some(cpu) = cpu {
+        if let Err(error) = restore_server_cpu_mask() {
+            REACTOR_CPU.with(|slot| slot.set(Some(cpu)));
+            return Err(error);
+        }
+    }
+    Ok(SpawnCpuScope {
+        cpu,
+        _thread_bound: std::marker::PhantomData,
+    })
+}
+
+impl Drop for SpawnCpuScope {
+    fn drop(&mut self) {
+        if let Some(cpu) = self.cpu {
+            if let Err(error) = pin_worker_cpu(Some(cpu)) {
+                crate::util::logging::log_message(format_args!(
+                    "cannot restore reactor CPU affinity: {error}"
+                ));
+            }
+        }
+    }
+}
+
 fn worker_main(
     worker: Arc<WorkerState>,
     load: Arc<AtomicUsize>,
     mut messages: tokio::sync::mpsc::UnboundedReceiver<Message>,
     on_start: fn(),
     started: mpsc::Sender<io::Result<()>>,
+    cpu: Option<usize>,
 ) {
     let runtime = catch_unwind(AssertUnwindSafe(|| {
+        pin_worker_cpu(cpu)?;
+        CURRENT_WORKER.with(|slot| {
+            slot.set(Arc::clone(&worker))
+                .expect("fresh connection reactor state")
+        });
         WORKER_LOAD.with(|slot| {
             slot.set(load).expect("fresh connection reactor thread");
         });
         on_start();
         tokio::runtime::Builder::new_current_thread()
+            .on_thread_start(move || {
+                #[cfg(target_os = "linux")]
+                if cpu.is_some() {
+                    if let Err(error) = restore_server_cpu_mask() {
+                        crate::util::logging::log_message(format_args!(
+                            "cannot restore reactor helper CPU mask: {error}"
+                        ));
+                    }
+                }
+            })
             .enable_all()
             .build()
     }));
@@ -346,6 +520,13 @@ fn control_loop(workers: &[Worker], drain: &Drain, events: mpsc::Receiver<Event>
 impl Dispatcher {
     fn new(count: usize, on_start: fn()) -> io::Result<Self> {
         let count = count.max(1);
+        // Capture CPU/quota-aware capacity before any reactor is bound.
+        if let Ok(parallelism) = crate::util::thread_spawn::available_parallelism() {
+            let _ = SERVER_PARALLELISM.set(parallelism);
+        }
+        #[cfg(target_os = "linux")]
+        let _ = SERVER_CPUS.set(allowed_worker_cpus());
+        let cpus = worker_cpu_targets(count)?;
         let (events, receiver) = mpsc::channel();
         let load = Arc::new(AtomicUsize::new(0));
         let drain = Arc::new(Drain {
@@ -375,10 +556,11 @@ impl Dispatcher {
                     let worker = Arc::clone(&owned_workers[index].state);
                     let load = Arc::clone(&owned_drain.load);
                     let started = started.clone();
+                    let cpu = cpus[index];
                     match thread::Builder::new()
                         .name(format!("mydb-net-{index}"))
                         .stack_size(crate::util::blocking_pool::worker_stack_size())
-                        .spawn(move || worker_main(worker, load, messages, on_start, started))
+                        .spawn(move || worker_main(worker, load, messages, on_start, started, cpu))
                     {
                         Ok(worker) => threads.push(worker),
                         Err(error) => {
@@ -430,8 +612,8 @@ impl Dispatcher {
             .min_by_key(|&index| {
                 let state = &self.workers[index].state;
                 (
-                    state.polling.load(Ordering::Acquire),
                     state.connections.load(Ordering::Acquire),
+                    state.polling.load(Ordering::Acquire),
                 )
             })
             .expect("at least one connection worker")
@@ -807,4 +989,219 @@ fn connection_retains_its_thread_after_socket_and_timer_wakes() {
 #[test]
 fn worker_initialization_panic_returns_an_error_and_joins_started_workers() {
     assert!(Dispatcher::new(2, || panic!("injected initialization panic")).is_err());
+}
+
+#[cfg(test)]
+#[test]
+fn reactor_affinity_respects_sparse_masks_and_preserves_oversubscription_policy() {
+    assert_eq!(
+        affinity_targets(3, &[2, 8, 14, 25], true),
+        vec![Some(2), Some(8), Some(14)]
+    );
+    assert_eq!(affinity_targets(5, &[2, 8, 14, 25], true), vec![None; 5]);
+    assert_eq!(affinity_targets(2, &[2, 8, 14, 25], false), vec![None; 2]);
+    assert_eq!(affinity_targets(1, &[], true), vec![None]);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn reactor_affinity_only_changes_the_worker_thread_mask() {
+    let original = allowed_worker_cpus();
+    let Some(cpu) = original.first().copied() else {
+        return;
+    };
+    crate::util::thread_spawn::spawn(move || {
+        pin_worker_cpu(Some(cpu)).unwrap();
+        assert_eq!(allowed_worker_cpus(), vec![cpu]);
+    })
+    .join()
+    .unwrap();
+    assert_eq!(allowed_worker_cpus(), original);
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn reactor_affinity_does_not_restrict_spawned_compute_workers() {
+    let original = allowed_worker_cpus();
+    let Some(cpu) = original.first().copied() else {
+        return;
+    };
+    std::thread::spawn(move || {
+        pin_worker_cpu(Some(cpu)).unwrap();
+        assert_eq!(allowed_worker_cpus(), vec![cpu]);
+        let expected = original.clone();
+        let inherited = crate::util::thread_spawn::spawn(allowed_worker_cpus)
+            .join()
+            .unwrap();
+        assert_eq!(inherited, expected);
+        assert_eq!(allowed_worker_cpus(), vec![cpu]);
+        let inherited = crate::util::thread_spawn::Builder::new()
+            .spawn(allowed_worker_cpus)
+            .unwrap()
+            .join()
+            .unwrap();
+        assert_eq!(inherited, expected);
+        assert_eq!(allowed_worker_cpus(), vec![cpu]);
+        let inherited = crate::util::thread_spawn::scope(|scope| {
+            scope.spawn(allowed_worker_cpus).join().unwrap()
+        });
+        assert_eq!(inherited, expected);
+        assert_eq!(allowed_worker_cpus(), vec![cpu]);
+    })
+    .join()
+    .unwrap();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn reactor_affinity_does_not_restrict_tokio_blocking_helpers() {
+    let expected = allowed_worker_cpus();
+    let dispatcher = Dispatcher::new(1, || {}).unwrap();
+    let (done, result) = std::sync::mpsc::channel();
+    dispatcher
+        .spawn(Box::new(move || {
+            Box::pin(async move {
+                let reactor = allowed_worker_cpus();
+                let inherited = tokio::task::spawn_blocking(allowed_worker_cpus)
+                    .await
+                    .unwrap();
+                assert_eq!(allowed_worker_cpus(), reactor);
+                done.send(inherited).unwrap();
+            })
+        }))
+        .unwrap();
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).unwrap(),
+        expected
+    );
+    dispatcher.stop();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn reactor_affinity_preserves_server_capacity_for_lazy_pool_sizing() {
+    let expected = std::thread::available_parallelism().unwrap();
+    let dispatcher = Dispatcher::new(1, || {}).unwrap();
+    let (done, result) = std::sync::mpsc::channel();
+    dispatcher
+        .spawn(Box::new(move || {
+            Box::pin(async move {
+                done.send(crate::util::thread_spawn::available_parallelism().unwrap())
+                    .unwrap();
+            })
+        }))
+        .unwrap();
+    assert_eq!(
+        result.recv_timeout(Duration::from_secs(5)).unwrap(),
+        expected
+    );
+    dispatcher.stop();
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn reactor_affinity_keeps_an_embedded_servers_narrower_cpu_boundary() {
+    let original = allowed_worker_cpus();
+    if original.len() < 2 {
+        return;
+    }
+    let expected = original[..2].to_vec();
+    std::thread::spawn(move || {
+        let mut mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        for &cpu in &expected {
+            unsafe { libc::CPU_SET(cpu, &mut mask) };
+        }
+        assert_eq!(
+            unsafe { libc::sched_setaffinity(0, std::mem::size_of_val(&mask), &mask) },
+            0
+        );
+        let dispatcher = Dispatcher::new(1, || {}).unwrap();
+        let (done, result) = std::sync::mpsc::channel();
+        dispatcher
+            .spawn(Box::new(move || {
+                Box::pin(async move {
+                    let inherited = crate::util::thread_spawn::spawn(allowed_worker_cpus)
+                        .join()
+                        .unwrap();
+                    done.send(inherited).unwrap();
+                })
+            }))
+            .unwrap();
+        assert_eq!(
+            result.recv_timeout(Duration::from_secs(5)).unwrap(),
+            expected
+        );
+        dispatcher.stop();
+    })
+    .join()
+    .unwrap();
+    assert_eq!(allowed_worker_cpus(), original);
+}
+
+#[cfg(test)]
+#[test]
+fn admission_balances_connections_before_transient_poll_activity() {
+    let dispatcher = Dispatcher::new(2, || {}).unwrap();
+    dispatcher.workers[0]
+        .state
+        .connections
+        .store(1, Ordering::Release);
+    dispatcher.workers[0]
+        .state
+        .polling
+        .store(true, Ordering::Release);
+    dispatcher.workers[1]
+        .state
+        .connections
+        .store(3, Ordering::Release);
+    assert_eq!(dispatcher.pick_worker(), 0);
+    dispatcher.workers[0]
+        .state
+        .connections
+        .store(3, Ordering::Release);
+    assert_eq!(dispatcher.pick_worker(), 1);
+    for worker in dispatcher.workers.iter() {
+        worker.state.polling.store(false, Ordering::Release);
+        worker.state.connections.store(0, Ordering::Release);
+    }
+    dispatcher.stop();
+}
+
+#[cfg(test)]
+#[test]
+fn buffered_commands_allow_a_ready_peer_to_progress() {
+    let dispatcher = Dispatcher::new(1, || {}).unwrap();
+    let notify = Arc::new(tokio::sync::Notify::new());
+    let (start, started) = tokio::sync::oneshot::channel();
+    let (events, received) = mpsc::channel();
+    let first_events = events.clone();
+    let first_notify = Arc::clone(&notify);
+    dispatcher
+        .spawn(Box::new(move || {
+            Box::pin(async move {
+                started.await.unwrap();
+                for command in 0..10 {
+                    yield_to_peer_connections().await;
+                    first_events.send(command).unwrap();
+                    first_notify.notify_one();
+                }
+            })
+        }))
+        .unwrap();
+    dispatcher
+        .spawn(Box::new(move || {
+            Box::pin(async move {
+                notify.notified().await;
+                events.send(99).unwrap();
+            })
+        }))
+        .unwrap();
+    start.send(()).unwrap();
+    let order: Vec<_> = (0..11)
+        .map(|_| received.recv_timeout(Duration::from_secs(5)).unwrap())
+        .collect();
+    dispatcher.stop();
+    assert!(
+        order.iter().position(|v| *v == 99).unwrap() < order.iter().position(|v| *v == 9).unwrap()
+    );
 }

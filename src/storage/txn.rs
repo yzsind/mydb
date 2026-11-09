@@ -10,7 +10,7 @@ use std::hash::{BuildHasher, Hash, Hasher};
 pub(crate) type FastHashMap<K, V> = HashMap<K, V, ahash::RandomState>;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::thread;
+use crate::util::thread_spawn as thread;
 use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
@@ -3127,7 +3127,7 @@ mod auto_increment_initialization_tests {
         let manager = AutoIncrementManager::new();
         let barrier = std::sync::Barrier::new(8);
         let active = std::sync::atomic::AtomicUsize::new(0);
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..8 {
                 let (manager, barrier, active) = (&manager, &barrier, &active);
                 scope.spawn(move || {
@@ -3150,7 +3150,7 @@ mod auto_increment_initialization_tests {
         let manager = AutoIncrementManager::new();
         let first = manager.initialization(1).unwrap();
         let guard = first.lock();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             let (send, receive) = std::sync::mpsc::channel();
             let manager = &manager;
             let worker = scope.spawn(move || {
@@ -5769,7 +5769,7 @@ mod group_commit_tests {
     use super::*;
     use std::cell::RefCell;
     use std::sync::Arc;
-    use std::thread;
+    use crate::util::thread_spawn as thread;
     use std::time::Duration;
 
     fn make_err() -> QueryError {
@@ -6369,7 +6369,7 @@ mod group_commit_tests {
         manager
             .acquire_unique_key_lock(1, 9, "uk", &key(first), true, &|_| Some(TxnStatus::Active))
             .unwrap();
-        std::thread::scope(|scope| {
+        crate::util::thread_spawn::scope(|scope| {
             for _ in 0..4 {
                 let summary = &summary;
                 scope.spawn(move || {
