@@ -3234,6 +3234,55 @@ impl LogManager {
         Ok(lsn)
     }
 
+    /// Native replica commits must not claim ownership of source binlog files.
+    /// Backup/restore frame imports use append_replication_frame unchanged.
+    pub(crate) fn append_physical_replication_frame(
+        &mut self,
+        bytes: &[u8],
+        frame: &mut ReplicationFrame,
+    ) -> Result<(), QueryError> {
+        fn has_remote_binlog(payload: &WalPayload) -> bool {
+            match payload {
+                WalPayload::CommitTxn { binlog, .. } => binlog.is_some(),
+                WalPayload::TxnBatch { records } => records.iter().any(has_remote_binlog),
+                _ => false,
+            }
+        }
+        fn clear_remote_binlog(payload: &mut WalPayload) {
+            match payload {
+                WalPayload::CommitTxn { binlog, .. } => *binlog = None,
+                WalPayload::TxnBatch { records } => {
+                    records.iter_mut().for_each(clear_remote_binlog)
+                }
+                _ => {}
+            }
+        }
+        if !has_remote_binlog(&frame.payload) {
+            return self.append_replication_frame(bytes, frame);
+        }
+        {
+            // Source binlog coordinates describe files owned by the source.
+            // Preserve transaction identity/LSNs and strip only those foreign
+            // references before persisting the local recovery stream.
+            clear_remote_binlog(&mut frame.payload);
+            let payload = &frame.payload;
+            let mut local =
+                Vec::with_capacity(WAL_FRAME_HEADER_LEN + encoded_payload_len(payload)?);
+            write_frame_header(
+                &mut local,
+                encoded_payload_len(payload)?,
+                WalRecordHeader {
+                    record_type: payload.record_type(),
+                    ..frame.header
+                },
+            );
+            encode_payload_into(payload, &mut local)?;
+            let crc = wal_frame_checksum(&local, &local[WAL_FRAME_HEADER_LEN..]);
+            local[44..48].copy_from_slice(&crc.to_le_bytes());
+            self.append_replication_frame(&local, frame)
+        }
+    }
+
     pub(crate) fn append_replication_frame(
         &mut self,
         bytes: &[u8],
@@ -5449,23 +5498,43 @@ fn scan_segment_inner_with_mode(
 /// is not merely a torn final append; fail closed even for a coincidental marker.
 fn wal_has_frame_after(path: &Path, offset: u64) -> Result<bool, QueryError> {
     let mut file = File::open(path).map_err(io_err)?;
+    let mut candidate = File::open(path).map_err(io_err)?;
+    let len = file.metadata().map_err(io_err)?.len();
     file.seek(SeekFrom::Start(offset)).map_err(io_err)?;
     let magic = WAL_RECORD_MAGIC.to_le_bytes();
-    // Normal preallocated tails can span hundreds of MiB. Use the optimized
-    // byte search rather than a debug-build comparison at every byte offset.
     let finder = memchr::memmem::Finder::new(&magic);
     let mut buffer = [0u8; 64 * 1024 + 3];
     let mut carry = 0;
+    let mut base = offset;
     loop {
         let n = file.read(&mut buffer[carry..]).map_err(io_err)?;
         if n == 0 {
             return Ok(false);
         }
         let end = carry + n;
-        if finder.find(&buffer[..end]).is_some() {
+        for hit in finder.find_iter(&buffer[..end]) {
+            let position = base + hit as u64;
+            if position.saturating_add(WAL_FRAME_HEADER_LEN as u64) > len {
+                continue;
+            }
+            candidate.seek(SeekFrom::Start(position)).map_err(io_err)?;
+            let mut header = [0u8; WAL_FRAME_HEADER_LEN];
+            candidate.read_exact(&mut header).map_err(io_err)?;
+            let remaining = read_u32(&header, 4) as u64;
+            if remaining > len - position - WAL_FRAME_HEADER_LEN as u64
+                || read_u64(&header, 8) == 0
+                || read_u64(&header, 16) >= read_u64(&header, 8)
+                || read_record_header(&header).is_err()
+            {
+                continue;
+            }
+            // A credible later header is enough to refuse truncation. Its
+            // payload may itself be corrupt; requiring a matching CRC here
+            // could discard damaged committed history as an apparent tail.
             return Ok(true);
         }
         carry = end.min(3);
+        base += (end - carry) as u64;
         buffer.copy_within(end - carry..end, 0);
     }
 }
@@ -7748,6 +7817,138 @@ fn io_err(err: std::io::Error) -> QueryError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn txn_audit_wal_tail_magic_requires_a_credible_frame_header() {
+        use std::io::Write;
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("tail");
+        std::fs::write(&path, b"torn payload MWAL trailing text").unwrap();
+        assert!(!super::wal_has_frame_after(&path, 0).unwrap());
+        let record = super::WalRecord {
+            lsn: 5,
+            txn_id: 2,
+            prev_txn_lsn: 0,
+            source_time_us: 1,
+            payload: super::WalPayload::EndTxn,
+        };
+        let frame = super::encode_record(&record).unwrap();
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(&frame)
+            .unwrap();
+        assert!(super::wal_has_frame_after(&path, 0).unwrap());
+        // A corrupt checksum on a credible later frame is not permission to
+        // destroy the intervening history during automatic tail repair.
+        let mut damaged = frame;
+        damaged[44] ^= 1;
+        std::fs::write(&path, damaged).unwrap();
+        assert!(super::wal_has_frame_after(&path, 0).unwrap());
+    }
+
+    #[test]
+    fn txn_audit_backup_wal_import_preserves_binlog_receipts() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let reference = super::WalBinlogRef {
+            file: "source-bin.000001".into(),
+            start_pos: 4,
+            end_pos: 99,
+            gtid: None,
+        };
+        let record = super::WalRecord {
+            lsn: 1,
+            txn_id: 1,
+            prev_txn_lsn: 0,
+            source_time_us: 1,
+            payload: super::WalPayload::CommitTxn {
+                commit_scn: 1,
+                commit_unix_us: 1,
+                binlog: Some(reference.clone()),
+            },
+        };
+        let bytes = super::encode_record(&record).unwrap();
+        let frame = super::decode_frame_for_replication(&bytes).unwrap();
+        let mut log = super::LogManager::open(dir.path()).unwrap();
+        log.append_replication_frame(&bytes, &frame).unwrap();
+        log.flush().unwrap();
+        drop(log);
+        let scan = super::LogManager::scan(dir.path()).unwrap();
+        assert!(matches!(&scan.records[0].payload,
+            super::WalPayload::CommitTxn { binlog: Some(actual), .. } if actual == &reference));
+    }
+
+    #[test]
+    fn txn_audit_replica_wal_does_not_reference_source_binlog_files() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut log = super::LogManager::open(dir.path()).unwrap();
+        for (lsn, payload) in [
+            (
+                1,
+                super::WalPayload::CommitTxn {
+                    commit_scn: 1,
+                    commit_unix_us: 1,
+                    binlog: Some(super::WalBinlogRef {
+                        file: "foreign-bin.000001".into(),
+                        start_pos: 4,
+                        end_pos: 999,
+                        gtid: None,
+                    }),
+                },
+            ),
+            (
+                3,
+                super::WalPayload::TxnBatch {
+                    records: vec![
+                        super::WalPayload::BeginTxn { start_scn: 1 },
+                        super::WalPayload::CommitTxn {
+                            commit_scn: 2,
+                            commit_unix_us: 2,
+                            binlog: Some(super::WalBinlogRef {
+                                file: "foreign-bin.000001".into(),
+                                start_pos: 999,
+                                end_pos: 1999,
+                                gtid: None,
+                            }),
+                        },
+                    ],
+                },
+            ),
+        ] {
+            let record = super::WalRecord {
+                lsn,
+                txn_id: lsn,
+                prev_txn_lsn: 0,
+                source_time_us: 1,
+                payload,
+            };
+            let bytes = super::encode_record(&record).unwrap();
+            let mut frame = super::decode_frame_for_replication(&bytes).unwrap();
+            log.append_physical_replication_frame(&bytes, &mut frame)
+                .unwrap();
+        }
+        log.flush().unwrap();
+        drop(log);
+        let scan = super::LogManager::scan(dir.path()).unwrap();
+        let commits: Vec<_> = scan
+            .records
+            .iter()
+            .filter_map(|r| {
+                if let super::WalPayload::CommitTxn { binlog, .. } = &r.payload {
+                    Some(binlog)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(commits.len(), 2);
+        assert!(commits.iter().all(|reference| reference.is_none()));
+        assert_eq!(scan.next_lsn, 4);
+    }
+
     use super::*;
     use std::time::Duration;
 
@@ -8973,10 +9174,18 @@ mod tests {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         let path = dir.path().join("tail.log");
         let magic = WAL_RECORD_MAGIC.to_le_bytes();
+        let frame = encode_record(&WalRecord {
+            source_time_us: 1,
+            lsn: 1,
+            txn_id: 1,
+            prev_txn_lsn: 0,
+            payload: WalPayload::EndTxn,
+        })
+        .unwrap();
         let mut bytes = vec![0; 3 * 64 * 1024];
         for offset in [0, 1, 65535, 65536, 65537, 65538, 65539, 65540, 131075] {
             bytes.fill(0);
-            bytes[offset..offset + magic.len()].copy_from_slice(&magic);
+            bytes[offset..offset + frame.len()].copy_from_slice(&frame);
             fs::write(&path, &bytes).unwrap();
             assert!(wal_has_frame_after(&path, 0).unwrap(), "offset {offset}");
             assert!(wal_has_frame_after(&path, offset as u64).unwrap());

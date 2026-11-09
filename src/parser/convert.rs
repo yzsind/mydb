@@ -942,7 +942,12 @@ fn convert_view_definer(
             if name.eq_ignore_ascii_case("CURRENT_USER")
                 || name.eq_ignore_ascii_case("CURRENT_USER()")
             {
-                Ok(None)
+                // An explicit CURRENT_USER must remain distinguishable from
+                // an omitted DEFINER, especially when ALTER replaces an owner.
+                Ok(Some(AccountIdent {
+                    user: "CURRENT_USER()".into(),
+                    host: String::new(),
+                }))
             } else {
                 parse_definer_account(&name)
                     .map(Some)
@@ -2616,6 +2621,7 @@ fn convert_order_by(items: &[sqlparser::ast::OrderByExpr]) -> Result<Vec<OrderBy
         .iter()
         .map(|item| {
             Ok(OrderBy {
+                names_bound: false,
                 expr: convert_expr(&item.expr)?,
                 asc: item.options.asc.unwrap_or(true),
                 nulls_first: item.options.nulls_first,
@@ -4696,7 +4702,13 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                     for clause in &list.clauses {
                         match clause {
                             FunctionArgumentClause::Separator(value) => {
-                                separator = Some(convert_value(value, function.args.span())?);
+                                let value = convert_value(value, function.args.span())?;
+                                if !matches!(value, Expr::Literal(Literal::String(_))) {
+                                    return Err(parse_error_at_zero(
+                                        "GROUP_CONCAT SEPARATOR must be a string literal",
+                                    ));
+                                }
+                                separator = Some(value);
                             }
                             FunctionArgumentClause::OrderBy(order_exprs) => {
                                 for item in order_exprs {
@@ -4752,14 +4764,35 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                         }
                     }
                 }
+                if upper_name == "GROUP_CONCAT"
+                    && function_args_distinct(&function.args)
+                    && args.len() > 1
+                {
+                    // Preserve argument boundaries: CONCAT(a,b) alone cannot
+                    // distinguish ('ab','c') from ('a','bc') for DISTINCT.
+                    order_pairs.push(Expr::Function {
+                        name: "__DISTINCT_TUPLE".to_string(),
+                        args: args
+                            .iter()
+                            .cloned()
+                            .map(|arg| Expr::Function {
+                                name: "__DISTINCT_COLLATION_KEY".to_string(),
+                                args: vec![arg],
+                                distinct: false,
+                            })
+                            .collect(),
+                        distinct: false,
+                    });
+                    order_pairs.push(Expr::Literal(Literal::String("ASC".into())));
+                }
                 let value_expr = if args.is_empty() {
                     Expr::Literal(Literal::Null)
                 } else if args.len() == 1 || upper_name == "JSON_ARRAYAGG" {
                     args.swap_remove(0)
                 } else {
-                    // GROUP_CONCAT with multiple value expressions.
+                    // Keep aggregate value formatting distinct from explicit CONCAT.
                     Expr::Function {
-                        name: "CONCAT".to_string(),
+                        name: "__GROUP_CONCAT_VALUE".to_string(),
                         args: std::mem::take(&mut args),
                         distinct: false,
                     }
@@ -7063,6 +7096,13 @@ fn convert_group_by(
                     }
                 }
             }
+            if trailing_modifier == GroupByModifier::Rollup {
+                // Positional duplicate keys define distinct ROLLUP levels.
+                group_by_keys = exprs
+                    .iter()
+                    .map(convert_expr)
+                    .collect::<Result<Vec<_>, _>>()?;
+            }
             let grouping_sets = if trailing_modifier == GroupByModifier::Rollup {
                 rollup_sets((0..group_by_keys.len()).map(|idx| vec![idx]).collect())?
             } else if trailing_modifier == GroupByModifier::Cube {
@@ -8431,21 +8471,17 @@ fn resolve_order_by_refs(
         .into_iter()
         .map(|mut item| {
             match &item.expr {
-                Expr::Identifier(name) => {
-                    if let Some(expr) = projection_alias_expr(projection, name) {
-                        item.expr = clone_parser_expression(expr)
-                            .map_err(SelectListRefError::Allocation)?;
-                    }
-                }
                 // A plain integer literal in ORDER BY is a positional
                 // reference into the select list (MySQL semantics). Only
                 // raw number tokens reach here: `-1` stays a Unary minus
                 // expression, so it is never mistaken for a position.
                 Expr::Literal(Literal::Int(pos)) if *pos >= 0 && !has_wildcard => {
                     item.expr = ordinal_projection_expr(*pos as u64, projection, has_wildcard)?;
+                    item.names_bound = true;
                 }
                 Expr::Literal(Literal::UInt(pos)) if !has_wildcard => {
                     item.expr = ordinal_projection_expr(*pos, projection, has_wildcard)?;
+                    item.names_bound = true;
                 }
                 _ => {}
             }
@@ -8520,7 +8556,13 @@ fn resolve_group_by_ordinals(
                 return Err(GroupByRefError::Aggregate(display));
             }
         }
-        *expr = resolved;
+        *expr = match resolved {
+            Expr::Literal(Literal::Int(value)) => Expr::BoundValue(crate::types::Value::Int(value)),
+            Expr::Literal(Literal::UInt(value)) => {
+                Expr::BoundValue(crate::types::Value::UInt(value))
+            }
+            other => other,
+        };
     }
     Ok(())
 }
@@ -8640,16 +8682,6 @@ fn clone_parser_expression(expr: &Expr) -> Result<Expr, ParseError> {
         reserve_parser_expansion(size.0)?;
     }
     with_parser_stack(|| expr.clone())
-}
-
-fn projection_alias_expr<'a>(projection: &'a [SelectItem], name: &str) -> Option<&'a Expr> {
-    projection.iter().find_map(|item| match item {
-        SelectItem::Expr {
-            expr,
-            alias: Some(alias),
-        } if alias.eq_ignore_ascii_case(name) => Some(expr),
-        _ => None,
-    })
 }
 
 /// Extract the lowercased user-variable name from an assignment target,

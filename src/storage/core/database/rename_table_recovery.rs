@@ -1,4 +1,5 @@
-// Crash-safe RENAME TABLE physical-path journal.
+// Legacy physical-path rename journal reader. Current RENAME changes only
+// catalog names; immutable object IDs keep all physical paths stable.
 
 const RENAME_TABLE_INTENT_DIR: &str = "ddl/rename_table";
 

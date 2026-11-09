@@ -300,7 +300,7 @@ pub(super) fn execute(
         return Err(unsupported());
     }
     crate::planner::validate_select_column_references(db, stmt)?;
-    let aggregate = select_projection_has_toplevel_aggregate(&stmt.projection)
+    let aggregate = crate::planner::select_has_aggregate(db, stmt)
         || !stmt.group_by.is_empty()
         || !stmt.grouping_sets.is_empty()
         || stmt
@@ -355,8 +355,10 @@ pub(super) fn execute(
     let mut skipped = HashSet::new();
     loop {
         crate::engine::cancel::check_cancelled()?;
-        let current = db.session_statement_view(txn.txn_id, txn.isolation, None);
-        let _snapshot = db.register_statement_snapshot(current.snapshot_scn);
+        let (mut current, _snapshot) = db.session_statement_view_with_guard(
+            txn.txn_id, txn.isolation, None, false,
+        );
+        current.snapshot_scn = u64::MAX;
         let mut query = stmt.clone();
         query.for_update = false;
         query.lock_clause = None;

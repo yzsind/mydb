@@ -1542,7 +1542,13 @@ impl IndexBatchStream {
                     // unbounded composite-prefix lookup.
                     && key.0.len() < self.index.effective_columns().len()
                 {
-                    Some(key.resolve_params()?)
+                    let (resolved, unsatisfiable) =
+                        crate::storage::resolve_index_key(&self.index, key.clone())?;
+                    if unsatisfiable {
+                        self.state = ScanState::Done;
+                        return Ok(());
+                    }
+                    Some(resolved)
                 } else {
                     None
                 };
@@ -2701,7 +2707,24 @@ impl BatchOperator for IndexBatchStream {
                 }
                 let mask = mask.expect("visibility mask computed");
                 let projector = self.projector.as_ref().expect("covering projector");
-                for ((key, _), visible) in entries.iter().zip(mask) {
+                let float_rows = projector.prepare_float_rows(
+                    &self.db,
+                    self.txn,
+                    entries
+                        .iter()
+                        .zip(mask.iter())
+                        .filter_map(|((key, id), visible)| {
+                            (*visible
+                                && self.exact_runtime_filters.iter().enumerate().all(
+                                    |(index, filter)| {
+                                        Some(index) == raw_filter_index || filter.admits(key)
+                                    },
+                                ))
+                            .then_some((key, *id))
+                        }),
+                    || index_scan_heap(&self.db, &self.table),
+                )?;
+                for ((key, row_id), visible) in entries.iter().zip(mask) {
                     if !visible {
                         continue;
                     }
@@ -2718,8 +2741,16 @@ impl BatchOperator for IndexBatchStream {
                         }
                     }
                     if admitted {
-                        projector.append_to_accumulators(key, &mut accumulators);
-                        count += 1;
+                        if projector.append_visible_to_accumulators(
+                            &self.db,
+                            self.txn,
+                            *row_id,
+                            key,
+                            float_rows.as_ref(),
+                            &mut accumulators,
+                        )? {
+                            count += 1;
+                        }
                     }
                 }
             }
@@ -2880,7 +2911,11 @@ impl BatchOperator for IndexBatchStream {
                     row_ids.len() as u64,
                     heap_page_probes,
                 );
-                let batch = if row_ids_are_ordered {
+                let batch = if row_ids_are_ordered
+                    && fetched.windows(2).all(|pair| pair[0].0 <= pair[1].0)
+                {
+                    // Deferred forwarding/undo reads may append rows out of order.
+                    // Only skip restoration when the fetched output is ordered.
                     // Predicate-first visits sorted RowIds in input order.
                     // The overwhelmingly common ordered PRIMARY scan can
                     // therefore feed accepted values directly into the batch

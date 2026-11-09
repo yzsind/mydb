@@ -16,7 +16,10 @@
 /// stored NULLs. Single-key / range-scan callers must return no rows when
 /// this is `true`; batched-INLJ probe callers only ever pass concrete keys,
 /// so they never observe it and can ignore the flag.
-fn resolve_index_key(index: &IndexSchema, key: IndexKey) -> Result<(IndexKey, bool), QueryError> {
+pub(crate) fn resolve_index_key(
+    index: &IndexSchema,
+    key: IndexKey,
+) -> Result<(IndexKey, bool), QueryError> {
     if !key.contains_param() {
         return Ok((key, false));
     }
@@ -728,7 +731,7 @@ impl Database {
             let mut visible = Vec::with_capacity(ids.len());
             for id in ids {
                 if let Some(row) = self.read_row(table, id, txn)? {
-                    if table.index_key(index, &row.values)? == key {
+                    if table.stored_index_key(index, &row.values)? == key {
                         visible.push(id);
                     }
                 }
@@ -815,7 +818,7 @@ impl Database {
         // row also needs a key recheck after reconstructing its MVCC version.
         for id in ids {
             if let Some(row) = self.read_row(table, id, txn)? {
-                if table.index_key(index, &row.values)? == key {
+                if table.stored_index_key(index, &row.values)? == key {
                     return Ok(Some(id));
                 }
             }
@@ -1006,6 +1009,69 @@ impl Database {
                 index_file.get_unique_one(&key)
             })
         })
+    }
+
+    /// Resolve a unique write candidate and confirm its identity after locking.
+    /// A concurrent key update or DELETE+INSERT can replace the initial RowId.
+    pub(crate) fn lock_unique_index_row_for_write(
+        &self,
+        txn: TxnView,
+        table: &TableSchema,
+        index: &IndexSchema,
+        key: IndexKey,
+    ) -> Result<Option<RowId>, QueryError> {
+        let mut candidate = if !table.is_partitioned() && txn.txn_id != 0 {
+            self.check_primary_read_view(table, txn)?;
+            let (resolved, _) = resolve_index_key(index, key.clone())?;
+            self.check_unique_key_lock_blocking(txn.txn_id, table.id, &index.name, &resolved)?;
+            let (candidate, locked) = self.with_index_read(table.id, &index.name, |file| {
+                let candidate = file.get_unique_one(&resolved)?;
+                // Never wait under the index latch. A successful try-lock
+                // makes the probed physical key stable before releasing it,
+                // preserving the single-probe uncontended point-write path.
+                let locked = match candidate {
+                    Some(row_id) => self.try_row_lock_without_wait(
+                        txn.txn_id,
+                        table.id,
+                        row_id,
+                        LockMode::Exclusive,
+                    )?,
+                    None => false,
+                };
+                Ok((candidate, locked))
+            })?;
+            if locked {
+                return Ok(candidate);
+            }
+            if candidate.is_none() {
+                self.recheck_unique_index_miss(
+                    txn.txn_id,
+                    table.id,
+                    &index.name,
+                    &resolved,
+                    || {
+                        self.with_index_read(table.id, &index.name, |file| {
+                            file.get_unique_one(&resolved)
+                        })
+                    },
+                )?
+            } else {
+                candidate
+            }
+        } else {
+            self.lookup_unique_index_for_write_one(txn, table, index, key.clone())?
+        };
+        while let Some(row_id) = candidate {
+            let storage_id = self.locate_row_storage_id(table, row_id)?;
+            self.acquire_row_lock_blocking(txn.txn_id, storage_id, row_id, LockMode::Exclusive)?;
+            let confirmed =
+                self.lookup_unique_index_for_write_one(txn, table, index, key.clone())?;
+            if confirmed == candidate {
+                return Ok(candidate);
+            }
+            candidate = confirmed;
+        }
+        Ok(None)
     }
 
     /// Sorted multi-key counterpart of [`Self::lookup_unique_index_for_write_one`].
@@ -2426,7 +2492,7 @@ impl Database {
                     let Some(row) = self.read_row(table, row_id, txn)? else {
                         return Ok(false);
                     };
-                    Ok(table.index_key(index, &row.values)? == *key)
+                    Ok(table.stored_index_key(index, &row.values)? == *key)
                 },
                 choose.take().unwrap(),
             )

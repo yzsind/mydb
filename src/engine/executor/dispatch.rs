@@ -7013,17 +7013,23 @@ pub(super) fn kill_session(
     let auth = db.auth_catalog();
     registry.kill_authorized(connection_id, query_only, |target| {
         if target != &session.authenticated_as && !session.internal_system_session {
+            let kill_denied = || {
+                error(
+                    crate::error::catalog::ER_KILL_DENIED_ERROR,
+                    format!("You are not owner of thread {connection_id}"),
+                )
+            };
             let required = RequiredPrivilege {
                 privilege: Privilege::Dynamic("CONNECTION_ADMIN".into()),
                 scope: PrivilegeScope::Global,
             };
             if !auth.account_has_privilege(&session.authorization_context(), &required, false) {
-                return Err(error(
-                    crate::error::catalog::ER_KILL_DENIED_ERROR,
-                    format!("You are not owner of thread {connection_id}"),
-                ));
+                return Err(kill_denied());
             }
-            ensure_system_account_access(&auth, session, std::iter::once(target))?;
+            // KILL reports the same denial for ownership and SYSTEM_USER
+            // protection; account-management statements retain error 1227.
+            ensure_system_account_access(&auth, session, std::iter::once(target))
+                .map_err(|_| kill_denied())?;
         }
         Ok(())
     })?;
@@ -7409,6 +7415,7 @@ fn execute_sql_prepare(
     registry: &SessionRegistry,
 ) -> Result<(), QueryError> {
     let prepare_started = std::time::Instant::now();
+    let result_catalog_epoch = db.catalog_publication_epoch();
     let key = name.to_ascii_lowercase();
     // MySQL drops the old named statement before compiling its replacement.
     session.remove_sql_prepared_statement(&key);
@@ -7541,6 +7548,7 @@ fn execute_sql_prepare(
             database: session.current_database.clone(),
             parameter_count,
             result_columns,
+            result_catalog_epoch,
             routine_result_metadata: !routine_resolution.routines.is_empty(),
             memory_charge,
         },
@@ -7617,7 +7625,9 @@ fn execute_sql_prepared(
     session.xml_parameter_types = saved_xml_types;
     session.xml_parameter_binding = saved_xml_binding;
     if let Ok(result) = &mut response {
-        if !prepared.routine_result_metadata {
+        if !prepared.routine_result_metadata
+            && prepared.result_catalog_epoch == db.catalog_publication_epoch()
+        {
             apply_sql_prepared_result_columns(result, &prepared.result_columns);
         }
         super::select::cap_prepared_group_concat_limit_warnings(&prepared.statement, result);
@@ -7643,7 +7653,12 @@ fn apply_sql_prepared_result_columns(
         prepared_columns: &[crate::types::Column],
     ) {
         if columns.len() == prepared_columns.len() {
+            // Schema-derived descriptors belong to the execution schema. Only
+            // expression descriptors may inherit PREPARE-time parameter labels.
             for (column, prepared) in columns.iter_mut().zip(prepared_columns) {
+                if !column.source.org_name.is_empty() || !prepared.source.org_name.is_empty() {
+                    continue;
+                }
                 if prepared.source.dynamic_parameter {
                     column.name.clone_from(&prepared.name);
                     continue;
@@ -9411,7 +9426,7 @@ pub(super) fn execute_qualified_statement(
             or_replace,
             if_not_exists,
             algorithm,
-            definer,
+            mut definer,
             security_type,
             columns,
             check_option,
@@ -9430,6 +9445,7 @@ pub(super) fn execute_qualified_statement(
                 }
                 return Err(crate::error::messages::table_exists(&name));
             }
+            super::routines::bind_current_user_definer(session, &mut definer);
             super::routines::validate_definer_privilege(db, session, definer.as_ref())?;
             let view_options = materialize_view_options(session, algorithm, definer, security_type);
             // P3.2 — a missing DEFINER at CREATE time is only a warning (1449);
@@ -9461,7 +9477,7 @@ pub(super) fn execute_qualified_statement(
             sql,
             query,
             algorithm,
-            definer,
+            mut definer,
             security_type,
             columns,
             check_option,
@@ -9491,6 +9507,7 @@ pub(super) fn execute_qualified_statement(
                     format!("unknown view '{}'", name),
                 ));
             };
+            super::routines::bind_current_user_definer(session, &mut definer);
             super::routines::validate_definer_privilege(db, session, definer.as_ref())?;
             let view_options = materialize_alter_view_options(
                 session,
@@ -10461,7 +10478,7 @@ fn execute_explain_for_connection(
 /// its result, check shape, and bind the row's columns to user variables.
 /// MySQL semantics:
 ///   • 0 rows: variables retain their previous value (no error).
-///   • 1 row: column count must match target count (error 1222 / 1241 otherwise).
+///   • Column count must match target count even with zero rows (error 1222).
 ///   • ≥2 rows: error 1172 ("Result consisted of more than one row").
 /// MySQL `DO expr [, expr] ...` (13.2.3). Evaluate each expression for its
 /// side effects (typically `RELEASE_LOCK()` / `GET_LOCK()` / `SLEEP()`),
@@ -10535,6 +10552,7 @@ fn execute_select_into_vars(
         ));
     }
     let response = execute_statement(db, session, inner.into_statement(), registry)?;
+    validate_into_column_count(&response, targets.len())?;
     let Some(row) = take_single_into_row(response)? else {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
@@ -10543,19 +10561,31 @@ fn execute_select_into_vars(
         );
         return Ok(QueryResponse::Ok);
     };
-    if row.len() != targets.len() {
-        return Err(error(crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-            format!(
-                "The used SELECT statements have a different number of columns ({}) than INTO targets ({})",
-                row.len(),
-                targets.len()
-            ),
-        ));
-    }
     for (name, value) in targets.iter().zip(row.into_iter()) {
         session.set_user_variable(name, value)?;
     }
     Ok(QueryResponse::Ok)
+}
+
+/// Result metadata exists even when the query produces no rows. Check shape
+/// before reading a streaming cursor so cardinality cannot hide a bind error.
+pub(super) fn validate_into_column_count(
+    response: &QueryResponse,
+    targets: usize,
+) -> Result<(), QueryError> {
+    let columns = match response {
+        QueryResponse::ResultSet(result) => result.columns.len(),
+        QueryResponse::SharedResultSet(result) => result.columns.len(),
+        QueryResponse::StreamingResultSet(result) => result.columns.len(),
+        _ => return Ok(()),
+    };
+    if columns != targets {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
+            "The used SELECT statements have a different number of columns",
+        ));
+    }
+    Ok(())
 }
 
 /// SELECT INTO needs one row or a cardinality error. Do not drain a large

@@ -264,7 +264,7 @@ fn bit_n_range_is_enforced() {
     let err2 = engine
         .execute("INSERT INTO t VALUES (3, -1)")
         .expect_err("BIT(3) must reject -1");
-    assert_eq!(err2.code(), 1264);
+    assert_eq!(err2.code(), 1406);
 }
 
 #[test]

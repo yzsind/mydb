@@ -1313,7 +1313,17 @@ impl Database {
                 Some(TxnStatus::Committed) | None
             );
         if !newest_is_visible {
-            return self.fk_row_key_matches(parent, index, row_id, key, txn);
+            if self.fk_row_key_matches(parent, index, row_id, key, txn)? {
+                return Ok(true);
+            }
+            // An uncommitted insert (or new key) may become the parent.
+            // Wait only when no committed matching image already exists, so
+            // non-key parent updates retain the fine-grained reference path.
+            if txn.txn_id != 0 {
+                self.acquire_row_lock_blocking(txn.txn_id, parent.id, row_id, LockMode::Shared)?;
+                return self.fk_row_key_matches(parent, index, row_id, key, txn);
+            }
+            return Ok(false);
         }
         if header.is_deleted() {
             return Ok(false);

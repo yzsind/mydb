@@ -802,9 +802,10 @@ fn finalize_completed_event(inner: &Arc<EventSchedulerInner>, event: &EventSchem
 pub(super) fn execute_create_event(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    def: EventDef,
+    mut def: EventDef,
     _registry: &crate::engine::SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    super::routines::bind_current_user_definer(session, &mut def.definer);
     super::routines::validate_definer_privilege(db, session, def.definer.as_ref())?;
     super::implicit_commit_for_ddl(db, session)?;
     let statement_second = current_unix_ms() / 1000;
@@ -945,8 +946,9 @@ fn event_schema_from_def(
 pub(super) fn execute_alter_event(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    stmt: AlterEventStmt,
+    mut stmt: AlterEventStmt,
 ) -> Result<QueryResponse, QueryError> {
+    super::routines::bind_current_user_definer(session, &mut stmt.definer);
     super::routines::validate_definer_privilege(db, session, stmt.definer.as_ref())?;
     let definer = stmt
         .definer

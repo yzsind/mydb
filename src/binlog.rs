@@ -1728,6 +1728,15 @@ pub fn require_manager() -> Result<Arc<BinlogSourceManager>, QueryError> {
     manager().ok_or_else(disabled_error)
 }
 
+pub fn require_dump_manager() -> Result<Arc<BinlogSourceManager>, QueryError> {
+    if crate::repl::global_manager().is_some_and(|manager| manager.role() == crate::repl::Role::Replica) {
+        return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET.error(
+            "native physical replicas cannot serve MySQL binlog streams; use the native master",
+        ));
+    }
+    require_manager()
+}
+
 pub fn commit_gate() -> parking_lot::MutexGuard<'static, ()> {
     COMMIT_GATE
         .get_or_init(|| parking_lot::Mutex::new(()))

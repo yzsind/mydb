@@ -811,7 +811,7 @@ fn quality_native_json_value_execution_view_and_parameters() {
             &mut session,
             r#"SELECT JSON_VALUE(JSON_VALUE('{"x":{}}', '$.x' RETURNING JSON), '$.y' RETURNING SIGNED DEFAULT 3 ON EMPTY)"#
         ),
-        vec![vec![Value::Null]]
+        vec![vec![Value::Int(3)]]
     );
     run(&engine, &mut session, r#"CREATE VIEW native_json AS SELECT JSON_VALUE(JSON_VALUE('{"x":{}}', '$.x' RETURNING CHAR), '$.y' RETURNING SIGNED DEFAULT 3 ON EMPTY) AS n"#).unwrap();
     assert_eq!(

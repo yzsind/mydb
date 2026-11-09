@@ -1,3 +1,5 @@
+mod routines_views_triggers_events_1109;
+mod txn_acid_audit_1108;
 mod ai;
 mod bug_report_1107;
 mod collated_constant_in;
@@ -17,6 +19,7 @@ mod rls;
 mod routine_handler_continuation;
 mod sql_execution_audit_1015;
 mod sql_execution_audit_1027;
+mod sql_execution_audit_1108;
 mod sql_execution_fixes;
 mod subquery_scope_audit;
 mod support;
@@ -546,3 +549,5 @@ mod xml_functions;
 mod audit_fixes_1106;
 
 mod table_ddl_audit_1108;
+
+mod exec_optimizer_audit_1108;

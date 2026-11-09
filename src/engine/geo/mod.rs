@@ -47,6 +47,7 @@ pub(crate) use relate::{mbr_predicate, st_predicate, MbrOp, StOp};
 // layer build on.
 #[cfg(test)]
 pub(crate) use geojson::from_geojson;
+#[cfg(test)]
 pub(crate) use geojson::to_geojson;
 pub(crate) use wkb::{read_geometry, read_wkb, write_geometry, write_wkb};
 pub(crate) use wkt::{parse_wkt, write_wkt};
@@ -130,8 +131,17 @@ pub(crate) fn validate_internal_constraints(
     required_srid: Option<u32>,
 ) -> Result<(), QueryError> {
     let g = read_geometry(internal)?;
+    sql::validate_geometry_srs(&g, "geometry column")?;
     if let Some(code) = allowed_type_code {
-        if g.geom.type_code() != code {
+        if g.geom.type_code() != code
+            && !(code == types::WKB_GEOMETRYCOLLECTION
+                && matches!(
+                    g.geom,
+                    types::Geom::MultiPoint(_)
+                        | types::Geom::MultiLineString(_)
+                        | types::Geom::MultiPolygon(_)
+                ))
+        {
             return Err(geo_err(
                 crate::error::catalog::ER_WRONG_SRID_FOR_COLUMN,
                 format!(
@@ -183,4 +193,26 @@ pub(crate) fn mbr_of(internal: &[u8]) -> Option<Mbr> {
 /// internal binary, which is what we do (deterministic and stable).
 pub(crate) fn compare(a: &[u8], b: &[u8]) -> Ordering {
     a.cmp(b)
+}
+
+/// Convert valid internal geometry to its structured JSON representation.
+pub(crate) fn json_value(bytes: &[u8]) -> serde_json::Value {
+    read_geometry(bytes)
+        .and_then(|geometry| geometry_json_value(&geometry))
+        .unwrap_or(serde_json::Value::Null)
+}
+
+pub(super) fn geometry_json_value(
+    geometry: &types::Geometry,
+) -> Result<serde_json::Value, QueryError> {
+    if matches!(
+        srs::require(geometry.srid, "GeoJSON conversion")?.axis_order,
+        srs::AxisOrder::LatLong
+    ) {
+        let mut geom = geometry.geom.clone();
+        geom.for_each_coord_mut(&mut |coord| std::mem::swap(&mut coord.x, &mut coord.y));
+        Ok(geojson::geom_json(&geom))
+    } else {
+        Ok(geojson::geom_json(&geometry.geom))
+    }
 }

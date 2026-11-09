@@ -14,6 +14,7 @@ pub(super) fn execute_create_trigger(
     mut def: TriggerDef,
 ) -> Result<QueryResponse, QueryError> {
     super::implicit_commit_for_ddl(db, session)?;
+    super::routines::bind_current_user_definer(session, &mut def.definer);
     validate_trigger_body(session, &def.body.statements)?;
     validate_trigger_rows(&mut def.body.statements, def.event, def.timing)?;
     let (database, table_name) =

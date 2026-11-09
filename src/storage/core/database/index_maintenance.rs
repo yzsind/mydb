@@ -323,9 +323,9 @@ where
         }
         let nullable_unique = !self.primary && has_null;
         if !nullable_unique && self.previous.as_ref() == Some(&entry.key) {
-            return Some(Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!("duplicate entry for key '{}'", self.index_name),
+            return Some(Err(duplicate_entry_error_for_index(
+                &self.index_name,
+                &entry.key,
             )));
         }
         self.previous = (!nullable_unique).then(|| entry.key.clone());
@@ -354,10 +354,7 @@ fn validate_unique_memory_entries(
             continue;
         }
         if previous == Some(&entry.key) {
-            return Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!("duplicate entry for key '{}'", index.name),
-            ));
+            return Err(duplicate_entry_error_for_index(&index.name, &entry.key));
         }
         previous = Some(&entry.key);
     }
@@ -1463,10 +1460,7 @@ impl LoadDataIndexBuilders {
             return Ok(());
         }
         if previous.as_ref() == Some(&entry.key) || file.get_unique_one(&entry.key)?.is_some() {
-            return Err(error(
-                crate::error::catalog::ER_DUP_ENTRY,
-                format!("duplicate entry for key '{}'", index.name),
-            ));
+            return Err(duplicate_entry_error_for_index(&index.name, &entry.key));
         }
         *previous = Some(entry.key.clone());
         Ok(())
@@ -2641,7 +2635,7 @@ impl Database {
                 // visibility repair.
                 let new_keys: std::collections::HashSet<IndexKey> =
                     table.index_keys(index, new_values)?.into_iter().collect();
-                for old_key in table.index_keys(index, old_values)? {
+                for old_key in table.stored_index_keys(index, old_values)? {
                     if !new_keys.contains(&old_key) {
                         repairs.push((
                             IndexRepairKey {
@@ -2659,7 +2653,7 @@ impl Database {
                 }
                 continue;
             }
-            let old_key = table.index_key(index, old_values)?;
+            let old_key = table.stored_index_key(index, old_values)?;
             let new_key = table.index_key(index, new_values)?;
             if old_key.same_stored_value(&new_key) {
                 continue;
@@ -3022,7 +3016,7 @@ impl Database {
                 // keys in new∖old. A full delete-all + insert-all would
                 // churn the B-tree and defeat its exact-duplicate no-op
                 // dedup for unchanged keys.
-                let old_keys = table.index_keys(index, old_values)?;
+                let old_keys = table.stored_index_keys(index, old_values)?;
                 let new_keys = table.index_keys(index, new_values)?;
                 let old_set: std::collections::HashSet<&IndexKey> = old_keys.iter().collect();
                 let new_set: std::collections::HashSet<&IndexKey> = new_keys.iter().collect();
@@ -3061,7 +3055,7 @@ impl Database {
                 (old, new)
             } else {
                 (
-                    table.index_key(index, old_values)?,
+                    table.stored_index_key(index, old_values)?,
                     table.index_key(index, new_values)?,
                 )
             };
@@ -3108,7 +3102,7 @@ impl Database {
     ) -> Result<(), QueryError> {
         for index in &table.indexes {
             let new_keys = table.index_keys(index, new_values)?;
-            let old_keys = match table.index_keys(index, old_values) {
+            let old_keys = match table.stored_index_keys(index, old_values) {
                 Ok(keys) => keys,
                 Err(_) => {
                     // The failed forward update can leave a heap value that
@@ -3192,7 +3186,7 @@ impl Database {
                     .expect("affected index should have a batch entry");
                 if index.is_fulltext() || index.has_multi_valued_parts() {
                     // Token/MVI-set diff per updated row (see the single-row path).
-                    let old_keys = table.index_keys(index, &update.old_values)?;
+                    let old_keys = table.stored_index_keys(index, &update.old_values)?;
                     let new_keys = table.index_keys(index, &update.new_values)?;
                     let old_set: std::collections::HashSet<&IndexKey> = old_keys.iter().collect();
                     let new_set: std::collections::HashSet<&IndexKey> = new_keys.iter().collect();
@@ -3231,7 +3225,7 @@ impl Database {
                     }
                     continue;
                 }
-                let old_key = table.index_key(index, &update.old_values)?;
+                let old_key = table.stored_index_key(index, &update.old_values)?;
                 let new_key = table.index_key(index, &update.new_values)?;
                 if old_key.same_stored_value(&new_key) {
                     continue;
@@ -3826,6 +3820,24 @@ impl Database {
         table: &TableSchema,
         values: &[Value],
     ) -> Result<(), QueryError> {
+        self.lock_unique_keys_for_values_inner::<false>(txn_id, table, values)
+    }
+
+    fn lock_unique_keys_for_stored_values(
+        &self,
+        txn_id: u64,
+        table: &TableSchema,
+        values: &[Value],
+    ) -> Result<(), QueryError> {
+        self.lock_unique_keys_for_values_inner::<true>(txn_id, table, values)
+    }
+
+    fn lock_unique_keys_for_values_inner<const STORED: bool>(
+        &self,
+        txn_id: u64,
+        table: &TableSchema,
+        values: &[Value],
+    ) -> Result<(), QueryError> {
         if self.insert_locks_covered_by_table(txn_id, table.id) {
             return Ok(());
         }
@@ -3835,7 +3847,11 @@ impl Database {
             .iter()
             .filter(|index| index.enforces_uniqueness())
         {
-            let key = table.index_key(index, values)?;
+            let key = if STORED {
+                table.stored_index_key(index, values)?
+            } else {
+                table.index_key(index, values)?
+            };
             if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                 continue;
             }
@@ -3945,7 +3961,7 @@ impl Database {
             {
                 continue;
             }
-            let old_key = table.index_key(index, old_values)?;
+            let old_key = table.stored_index_key(index, old_values)?;
             let new_key = table.index_key(index, new_values)?;
             if old_key == new_key {
                 continue;
@@ -4052,7 +4068,7 @@ impl Database {
             if !index_may_be_affected_by_columns(table, index, changed_columns) {
                 continue;
             }
-            let old_key = table.index_key(index, old_values)?;
+            let old_key = table.stored_index_key(index, old_values)?;
             let new_key = table.index_key(index, new_values)?;
             if old_key == new_key {
                 continue;
@@ -4081,7 +4097,7 @@ impl Database {
         let mut repairs = Vec::new();
         let mut deletes = Vec::new();
         for index in &table.indexes {
-            for key in table.index_keys(index, values)? {
+            for key in table.stored_index_keys(index, values)? {
                 repairs.push((
                     IndexRepairKey {
                         table_id: if index.is_spatial() {
@@ -4139,7 +4155,7 @@ impl Database {
                 let batch = by_index
                     .get_mut(&index.name)
                     .expect("index should have a batch entry");
-                for key in table.index_keys(index, &delete.values)? {
+                for key in table.stored_index_keys(index, &delete.values)? {
                     batch.push(IndexBatchEntry {
                         kind: WalIndexOpKind::Delete,
                         key: key.clone(),
@@ -4192,6 +4208,11 @@ impl Database {
     }
 
     pub(super) fn rebuild_indexes(&self, table: &TableSchema) -> Result<(), QueryError> {
+        let _maintenance = table
+            .indexes
+            .iter()
+            .any(|index| index.has_expression_parts())
+            .then(crate::engine::expr::CompensationExpressionGuard::new);
         let names = table
             .indexes
             .iter()
@@ -4350,10 +4371,7 @@ impl Database {
                 }
                 if let Some(prev) = &prev_key {
                     if prev == &key {
-                        return Err(error(
-                            crate::error::catalog::ER_DUP_ENTRY,
-                            format!("duplicate entry for key '{}'", index.name),
-                        ));
+                        return Err(duplicate_entry_error_for_index(&index.name, &key));
                     }
                 }
                 prev_key = Some(key);

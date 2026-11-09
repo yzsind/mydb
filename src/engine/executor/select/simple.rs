@@ -2418,7 +2418,9 @@ pub(super) fn simple_scan_source(
                 db.prefix_index_visible(&table.schema, index, key.clone(), txn)?
             };
             let residual_filter = filter.as_ref().and_then(|expr| {
-                if db.has_active_write_txns() {
+                if db.has_active_write_txns()
+                    || db.has_pending_index_repairs_for(table.schema.id, &index.name)
+                {
                     return Some(expr.clone());
                 }
                 let access = EngineIndexAccess::Lookup {
@@ -2486,7 +2488,9 @@ pub(super) fn simple_scan_source(
                 );
             }
             let residual_filter = filter.as_ref().and_then(|expr| {
-                if db.has_active_write_txns() {
+                if db.has_active_write_txns()
+                    || db.has_pending_index_repairs_for(table.schema.id, &index.name)
+                {
                     return Some(expr.clone());
                 }
                 let access = EngineIndexAccess::Range {

@@ -4666,6 +4666,15 @@ impl QueryEngine for StorageQueryEngine {
         {
             return None;
         }
+        if let Statement::Select(select) = parsed.as_ref() {
+            let validation = crate::engine::params::with_params_slice(params, || {
+                crate::engine::params::validate_limit(select.limit.as_ref())?;
+                crate::engine::params::validate_limit(select.offset.as_ref())
+            });
+            if let Err(error) = validation {
+                return Some(Err(error));
+            }
+        }
         use crate::engine::api::PreparedSelectMemoState;
         if statement_refs_temp_table(session, parsed) {
             return None;

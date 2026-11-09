@@ -384,8 +384,15 @@ Closing the loop on MySQL 8.0 semantics:
 | `generate_series(start, stop [, step])` | ➕ mydb extension; integer/exact decimal/temporal families and `WITH ORDINALITY` |
 | Window functions + ROWS/RANGE frames | ✅/◑; including exact numeric and temporal INTERVAL bounds and prepared frame rebinding |
 | Window frame `GROUPS` / `EXCLUDE` | ➕ mydb extensions |
-| `FOR UPDATE` / `FOR SHARE [NOWAIT\|SKIP LOCKED]` | ✅; `OF` alias lists and multiple clauses support per-source lock modes and NOWAIT/SKIP LOCKED; NATURAL/USING, lateral, and grouped locking-join shapes retain explicit restrictions |
+| `FOR UPDATE` / `FOR SHARE [NOWAIT\|SKIP LOCKED]` | ✅; `OF` alias lists and multiple clauses support per-source lock modes and NOWAIT/SKIP LOCKED; NATURAL/USING, lateral, and grouped locking-join shapes retain explicit restrictions; unsupported aggregate/DISTINCT SKIP LOCKED shapes return 1235 |
 | `SELECT ... INTO OUTFILE` / `INTO DUMPFILE` | ✅ |
+
+Aggregates inside correlated scalar subqueries belong to the enclosing block
+when their arguments bind entirely there. The inner `FROM`, filter and
+`LIMIT` still determine whether the scalar subquery returns zero, one or
+multiple rows. For an empty outer implicit group, mydb consistently returns
+zero for an outer-owned `COUNT`; MySQL 8.0.46 returns `NULL` in some such
+subquery placements.
 
 **Compiled SELECT fast paths**: cover
 projection-only point lookups, index range/multi lookups, fused
@@ -708,6 +715,14 @@ distance use the project's pure-Rust kernels;
 area/length/distance, polygon set operations, and Buffer without a reliable
 pure-Rust implementation return clear errors — no silent degradation.
 
+mydb also preserves typed empty LineString, Polygon, MultiPoint,
+MultiLineString, and MultiPolygon values, including WKT/WKB round trips.
+This is a deliberate extension beyond MySQL 8.0.46, which accepts only an
+empty GeometryCollection. MultiPoint WKT uses the compact coordinate-list
+spelling shown in [OGC Simple Feature Access](https://docs.ogc.org/is/05-126/05-126.pdf);
+MySQL can read this spelling. Typed empty values require conversion before
+export to MySQL.
+
 "Registered" here does not mean every input shape is accepted. Still missing
 are SRS DDL/dynamic privileges and DD persistence, full EPSG projection
 transforms, complete geographic/axis-order semantics, all Geometry combinations
@@ -947,12 +962,19 @@ mydb ships **two fully independent** replication stacks, distinguished in the SQ
 - ◑ Single SQL applier (no MTS multi-threaded/parallel apply; `replica_parallel_*` is advisory); consecutive
   row-only source transactions still commit independently in order but may share a bounded durability barrier at the highest WAL LSN.
 
+STRICT apply errors remain errors after STOP/START or restart. Recovery skips a row transaction only when an apply receipt committed atomically with its data proves that the source boundary was already applied; relay replay does not force IDEMPOTENT mode.
+
 Connection failures retry until STOP REPLICA. SOURCE_RETRY_COUNT is advisory
 and produces a warning; the legacy Source_Retry_Count status value of 86400
 is a compatibility display, not a finite retry limit. Deterministic source
 binlog errors stop the IO thread and preserve the source error number.
 
 ### mydb → MySQL (as a Binlog Source)
+
+Native physical replicas do not synthesize MySQL row binlog events from physical WAL.
+MySQL binlog dump requests on such replicas return 1235; connect the downstream
+MySQL-protocol consumer to the native master. `log_replica_updates` applies to
+the independent MySQL row-event receiver, not native physical apply.
 
 **◑** `sync_binlog` / `max_binlog_size` / `log_replica_updates` are writable at runtime.
 `sync_binlog=N` counts commit groups and `max_binlog_size` controls transaction-boundary
@@ -1236,8 +1258,15 @@ The following expression differences are retained:
 - `TIME` vs. string comparisons preserve operand microsecond precision instead of re-rounding the comparison constant to the stored column's fsp; time literals also compare as time values. Hence `TIME '10:00:00' = '10:00:00.000000'` is true. This keeps exact-value semantics and requires index, scan, and row-based/vectorized agreement.
 - An UPDATE target table may also appear in a scalar subquery; non-correlated scalar subqueries in reports materialize before writes, avoiding the extra derived-table rewrites demanded by MySQL's 1093 restriction.
 - `PI()` returns the double-precision value `3.141592653589793` and is not truncated to six decimals to match the display form.
+- Empty-input `ROLLUP` retains its grand-total grouping set: `COUNT(*)` is zero and `SUM` is NULL. Constant expressions in window `PARTITION BY` and `ORDER BY` are accepted as values, without MySQL's ordinal restriction.
+- `ANY`/`ALL` subqueries may contain `ORDER BY` and `LIMIT`; these clauses are evaluated inside the subquery before the quantified comparison.
+- `ENUM`/`SET` `MIN`/`MAX` use string ordering consistently across indexed and unindexed execution. They do not reproduce MySQL's plan-dependent ordinal shortcut. SET/string equality also keeps string comparison semantics across access paths; it does not reorder a comparison string such as `b,a` into the stored canonical `a,b`.
+- Wide exact decimal multiplication retains intermediate digits before rounding the result to at most 30 fractional digits. Some large products therefore differ from MySQL's less precise intermediate arithmetic.
+- Prepared statements use each execution's bound value types instead of retaining MySQL's type-freezing behavior across mixed-type executions. Temporal comparison parameters retain their declared comparison conversion; internal parameters used for correlated columns do not change column semantics.
+- SQL `PREPARE` may defer semantic name/grouping validation until `EXECUTE`, where invalid statements return explicit errors. Numeric-string LIMIT/OFFSET parameters are applied; negative limits return 1690 and floating-point bindings return 1210.
+- `PAD_CHAR_TO_FULL_LENGTH` is unsupported and returns 1235 when assigned through `sql_mode`.
 - Error codes and SQLSTATEs are aligned; messages keep mydb's clear descriptions and position hints and are not required to copy MySQL's text verbatim.
-- `ONLY_FULL_GROUP_BY` is on by default; loose grouping requires explicitly removing it from the session `sql_mode`. `DISTINCT` does not allow ordering by unprojected source columns.
+- `ONLY_FULL_GROUP_BY` is on by default; loose grouping requires explicitly removing it from the session `sql_mode`. MySQL's complete primary-key functional-dependency inference is not reproduced; an otherwise ungrouped column can still return 1055. `DISTINCT` does not allow ordering by unprojected source columns.
 
 ## Related Documentation
 

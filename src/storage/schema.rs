@@ -3110,6 +3110,18 @@ fn data_type_kind_for_column_type(
     column_type: ColumnType,
     source: &crate::types::ColumnSource,
 ) -> DataTypeKind {
+    if let Some(values) = &source.enum_set_values {
+        if source.flags & crate::mysql::protocol::ENUM_FLAG != 0 {
+            return DataTypeKind::Enum {
+                values: values.to_vec(),
+            };
+        }
+        if source.flags & crate::mysql::protocol::SET_FLAG != 0 {
+            return DataTypeKind::Set {
+                values: values.to_vec(),
+            };
+        }
+    }
     let length = source.length;
     let decimals = source.decimals.unwrap_or(0).min(6);
     match column_type {
@@ -3135,9 +3147,26 @@ fn data_type_kind_for_column_type(
         ColumnType::Time => DataTypeKind::Time { fsp: decimals },
         ColumnType::DateTime => DataTypeKind::DateTime { fsp: decimals },
         ColumnType::Timestamp => DataTypeKind::Timestamp { fsp: decimals },
-        ColumnType::Blob => DataTypeKind::Blob {
-            max_len: length.unwrap_or(DEFAULT_LOB_MAX),
-        },
+        ColumnType::Blob => {
+            let binary = source.collation_id.map_or(
+                source.flags & crate::mysql::protocol::BINARY_FLAG != 0,
+                |id| id == crate::charset::BINARY_COLLATION_ID,
+            );
+            match (binary, source.wire_type) {
+                (true, Some(254)) => DataTypeKind::Binary {
+                    len: length.map(|n| n as usize),
+                },
+                (true, Some(253)) => DataTypeKind::VarBinary {
+                    len: length.map(|n| n as usize),
+                },
+                (true, _) => DataTypeKind::Blob {
+                    max_len: length.unwrap_or(DEFAULT_LOB_MAX),
+                },
+                (false, _) => DataTypeKind::Text {
+                    max_len: length.unwrap_or(DEFAULT_LOB_MAX),
+                },
+            }
+        }
         ColumnType::Json => DataTypeKind::Json,
         ColumnType::Geometry => DataTypeKind::Geometry {
             subtype: GeometrySubtype::Geometry,
@@ -4351,34 +4380,14 @@ fn value_to_datetime_micros(v: &Value) -> Result<i64, QueryError> {
 }
 
 fn value_to_year_byte(v: &Value) -> u8 {
-    match v {
-        Value::Year(y) => *y,
-        Value::Int(v) => {
-            let v = *v;
-            if (1..=69).contains(&v) {
-                (v + 100) as u8
-            } else if (70..=99).contains(&v) {
-                (v - 70 + 70) as u8
-            } else if (1901..=2155).contains(&v) {
-                (v - 1900) as u8
-            } else {
-                0
-            }
-        }
-        Value::UInt(v) => value_to_year_byte(&Value::Int(*v as i64)),
-        // A string bound (`WHERE year_col = '2020'`) must parse to the same
-        // YEAR byte as the integer form, not fall through to 0 (= year 0000),
-        // which made the index probe miss every real row.
-        Value::String(s) | Value::Decimal(s) => s
-            .trim()
-            .parse::<i64>()
-            .map(|n| value_to_year_byte(&Value::Int(n)))
-            .unwrap_or(0),
-        Value::Bytes(b) => String::from_utf8_lossy(b)
-            .trim()
-            .parse::<i64>()
-            .map(|n| value_to_year_byte(&Value::Int(n)))
-            .unwrap_or(0),
+    if let Value::Year(year) = v {
+        return *year;
+    }
+    match crate::engine::expr::mysql_year_equality_number(v)
+        .ok()
+        .flatten()
+    {
+        Some(year @ 1901..=2155) => (year - 1900) as u8,
         _ => 0,
     }
 }
@@ -4880,6 +4889,12 @@ impl TableSchema {
             _ => None,
         };
         crate::types::ColumnSource {
+            enum_set_values: match &column.data_type {
+                DataTypeKind::Enum { values } | DataTypeKind::Set { values } => {
+                    Some(values.clone().into())
+                }
+                _ => None,
+            },
             vector_type: if let DataTypeKind::Vector { datatype, dim } = column.data_type {
                 Some((datatype, dim))
             } else {
@@ -4887,6 +4902,7 @@ impl TableSchema {
             },
             collation_coercibility: Some(2),
             dynamic_parameter: false,
+            round_decimal_result: false,
             wire_type,
             schema: self.database.clone(),
             table: self.name.clone(),
@@ -4910,6 +4926,29 @@ impl TableSchema {
             source.table = alias.to_string();
         }
         source
+    }
+
+    /// Existing row images were validated when written. Retry only a failed
+    /// functional-key evaluation without the caller's newer strict policy;
+    /// successful probes and ordinary column keys keep their original cost.
+    pub(crate) fn stored_index_key(&self, index: &IndexSchema, values: &[Value]) -> Result<IndexKey, QueryError> {
+        match self.index_key(index, values) {
+            Err(_) if index.has_expression_parts() => {
+                let _maintenance = crate::engine::expr::CompensationExpressionGuard::new();
+                self.index_key(index, values)
+            }
+            result => result,
+        }
+    }
+
+    pub(crate) fn stored_index_keys(&self, index: &IndexSchema, values: &[Value]) -> Result<Vec<IndexKey>, QueryError> {
+        match self.index_keys(index, values) {
+            Err(_) if index.has_expression_parts() => {
+                let _maintenance = crate::engine::expr::CompensationExpressionGuard::new();
+                self.index_keys(index, values)
+            }
+            result => result,
+        }
     }
 
     pub fn index_key(&self, index: &IndexSchema, values: &[Value]) -> Result<IndexKey, QueryError> {

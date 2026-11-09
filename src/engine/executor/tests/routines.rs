@@ -537,6 +537,7 @@ fn definer_security_requires_definer_execute_privilege() {
 
     let err = exec(&engine, &mut root, "CALL foreign_definer()").unwrap_err();
     assert_eq!(err.code(), 1370);
+    assert!(err.message().contains("'routine_definer'@'%'"));
 
     exec(
         &engine,

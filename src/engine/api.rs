@@ -1488,6 +1488,41 @@ impl QueryResponse {
     }
 
     pub fn materialize(self) -> Result<Self, QueryError> {
+        let mut response = self.materialize_preserving_precision()?;
+        if let QueryResponse::ResultSet(result) = &mut response {
+            let decimals: Vec<_> = result
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, c)| {
+                    c.source.round_decimal_result
+                        && matches!(c.column_type, crate::types::ColumnType::Decimal { .. })
+                })
+                .map(|(index, c)| (index, c.column_type))
+                .collect();
+            for row in &mut result.rows {
+                for &(index, column_type) in &decimals {
+                    if let Some(value) = row.get_mut(index) {
+                        if let std::borrow::Cow::Owned(shaped) =
+                            crate::engine::expr::decimal_result_value(value, column_type)
+                        {
+                            *value = shaped;
+                        }
+                    }
+                }
+            }
+        }
+        if let QueryResponse::MultiResult(results) = response {
+            return results
+                .into_iter()
+                .map(QueryResponse::materialize)
+                .collect::<Result<Vec<_>, _>>()
+                .map(QueryResponse::MultiResult);
+        }
+        Ok(response)
+    }
+
+    pub(crate) fn materialize_preserving_precision(self) -> Result<Self, QueryError> {
         match self {
             QueryResponse::SharedResultSet(result) => Ok(QueryResponse::ResultSet(ResultSet {
                 columns: result.columns.to_vec(),
@@ -1514,7 +1549,7 @@ impl QueryResponse {
             QueryResponse::MultiResult(results) => Ok(QueryResponse::MultiResult(
                 results
                     .into_iter()
-                    .map(QueryResponse::materialize)
+                    .map(QueryResponse::materialize_preserving_precision)
                     .collect::<Result<Vec<_>, _>>()?,
             )),
             other => Ok(other),
@@ -2387,6 +2422,9 @@ pub struct SessionContext {
     pub pending_statement_info: Option<String>,
     /// Matched rows must cross the execution-thread boundary with the OK metadata.
     pub pending_statement_matched_rows: Option<u64>,
+    /// Negotiated CLIENT_FOUND_ROWS semantics also apply to ROW_COUNT()
+    /// inside stored programs, before the final protocol response is built.
+    pub(crate) client_found_rows: bool,
     pub last_row_count: i64,
     /// ROW_COUNT in the retained diagnostics area, independent of the most
     /// recent diagnostics-reading statement's ROW_COUNT() return value.
@@ -2996,6 +3034,7 @@ pub(crate) struct SessionSqlPreparedStatement {
     /// Result metadata bound at PREPARE time. Declared domains stay fixed;
     /// untyped parameter-derived domains are resolved at EXECUTE time.
     pub(crate) result_columns: std::sync::Arc<[crate::types::Column]>,
+    pub(crate) result_catalog_epoch: u64,
     /// Routine domains are rebound by EXECUTE after routine DDL, so stale
     /// PREPARE descriptors must not replace the current execution metadata.
     pub(crate) routine_result_metadata: bool,
@@ -3303,6 +3342,7 @@ impl SessionContext {
             statement_insert_id: 0,
             pending_statement_info: None,
             pending_statement_matched_rows: None,
+            client_found_rows: false,
             seq_state: std::cell::RefCell::new(Default::default()),
             last_row_count: 0,
             diagnostics_row_count: 0,
@@ -3391,6 +3431,7 @@ impl SessionContext {
         fresh.current_user_is_system = self.current_user_is_system;
         fresh.internal_system_session = self.internal_system_session;
         fresh.connection_id = self.connection_id;
+        fresh.client_found_rows = self.client_found_rows;
         fresh.status = self.status.clone();
         fresh.ssl_cipher = self.ssl_cipher.clone();
         fresh.ssl_version = self.ssl_version.clone();

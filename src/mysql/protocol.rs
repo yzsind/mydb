@@ -1075,6 +1075,7 @@ pub(crate) fn columnar_text_row_packet_into(
                     charset,
                     column.and_then(|c| c.source.decimals),
                     column.map(|c| c.column_type),
+                    column.is_some_and(|c| c.source.round_decimal_result),
                 )
             };
         }
@@ -1106,6 +1107,7 @@ pub(crate) fn columnar_text_row_packet_into(
                 charset,
                 column.and_then(|c| c.source.decimals),
                 column.map(|c| c.column_type),
+                column.is_some_and(|c| c.source.round_decimal_result),
             ),
             ColumnVector::Bool { values, .. } => {
                 integer!(values.get(row) as i64, values.get(row) as u64)
@@ -1198,6 +1200,7 @@ fn write_text_row<const VECTOR_TEXT: bool>(
             result_charset_for_column(charset, col),
             fsp,
             col_type,
+            col.is_some_and(|c| c.source.round_decimal_result),
         );
     }
 }
@@ -1395,6 +1398,14 @@ pub fn binary_row_packet_into_with_charset(
             continue;
         }
         let column_type = columns.get(idx).map(|column| column.column_type);
+        let shaped = column_type
+            .filter(|_| {
+                columns
+                    .get(idx)
+                    .is_some_and(|c| c.source.round_decimal_result)
+            })
+            .map(|ty| crate::engine::expr::decimal_result_value(value, ty));
+        let value = shaped.as_deref().unwrap_or(value);
         if let Some(integral) = integral_decimal_for_integer_column(column_type, value) {
             // A DECIMAL-typed runtime value under INTEGER metadata must
             // still use the advertised fixed-width integer encoding.
@@ -2625,7 +2636,12 @@ fn write_text_value(
     charset: Option<&'static crate::charset::CharsetInfo>,
     fsp: Option<u8>,
     col_type: Option<ColumnType>,
+    round_decimal: bool,
 ) {
+    let shaped = col_type
+        .filter(|_| round_decimal)
+        .map(|ty| crate::engine::expr::decimal_result_value(value, ty));
+    let value = shaped.as_deref().unwrap_or(value);
     if matches!(col_type, Some(ColumnType::Float)) {
         if let Value::Double(value) = value {
             return write_text_value_inner(payload, &Value::Float(*value as f32), charset, fsp);

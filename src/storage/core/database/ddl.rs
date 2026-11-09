@@ -3305,10 +3305,7 @@ impl Database {
                     )
                 })?;
                 if !seen.insert(key) {
-                    return Err(error(
-                        crate::error::catalog::ER_DUP_ENTRY,
-                        format!("duplicate entry for key '{}'", index.name),
-                    ));
+                    return Err(duplicate_entry_error(&table, index, &table.index_key(index, values)?));
                 }
                 Ok(())
             },
@@ -7789,10 +7786,7 @@ impl Database {
                         .get_mut(&index.name)
                         .expect("unique index batch should exist");
                     if !seen.insert(key) {
-                        return Err(error(
-                            crate::error::catalog::ER_DUP_ENTRY,
-                            format!("duplicate entry for key '{}'", index.name),
-                        ));
+                        return Err(duplicate_entry_error(&candidate, index, &candidate.index_key(index, &values)?));
                     }
                 }
                 rewritten_rows.push(values);

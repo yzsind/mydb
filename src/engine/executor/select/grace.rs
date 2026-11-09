@@ -345,8 +345,22 @@ impl PartitionWriter {
                     .map_err(io_err)?;
                 let dim = f.source.vector_type.and_then(|v| v.1).unwrap_or(0);
                 self.writer.write_all(&dim.to_le_bytes()).map_err(io_err)?;
+                write_u32(
+                    &mut self.writer,
+                    f.source
+                        .enum_set_values
+                        .as_ref()
+                        .map_or(0, |v| v.len() as u32),
+                )
+                .map_err(io_err)?;
+                if let Some(values) = &f.source.enum_set_values {
+                    for value in values.iter() {
+                        write_str(&mut self.writer, value).map_err(io_err)?;
+                    }
+                }
                 self.writer
-                    .write_all(&[u8::from(f.source.dynamic_parameter)])
+                    .write_all(&[u8::from(f.source.dynamic_parameter)
+                        | (u8::from(f.source.round_decimal_result) << 1)])
                     .map_err(io_err)?;
             }
             self.schema_written = true;
@@ -558,6 +572,16 @@ impl PartitionReader {
                         })
                 })
                 .transpose()?;
+            let member_count = read_u32(&mut reader).map_err(io_err)? as usize;
+            let enum_set_values = if member_count == 0 {
+                None
+            } else {
+                let mut members = Vec::new();
+                for _ in 0..member_count {
+                    members.push(read_str(&mut reader).map_err(io_err)?);
+                }
+                Some(members.into())
+            };
             let mut dynamic_parameter = [0u8; 1];
             reader.read_exact(&mut dynamic_parameter).map_err(io_err)?;
             schema.push(crate::engine::executor::select::plan::intern_col_meta(
@@ -567,8 +591,10 @@ impl PartitionReader {
                     column,
                     column_type,
                     source: crate::types::ColumnSource {
+                        enum_set_values,
                         vector_type,
-                        dynamic_parameter: dynamic_parameter[0] != 0,
+                        dynamic_parameter: dynamic_parameter[0] & 1 != 0,
+                        round_decimal_result: dynamic_parameter[0] & 2 != 0,
                         schema: source_schema,
                         table: source_table,
                         org_table: source_org_table,
@@ -1574,9 +1600,11 @@ mod tests {
         let tmp = SpillTmpDir::create(dir.path()).unwrap();
         let path = tmp.path().join("meta");
         let source = crate::types::ColumnSource {
+            enum_set_values: None,
             vector_type: Some((crate::vector::VectorDataType::Binary, Some(65))),
             collation_coercibility: Some(0),
             dynamic_parameter: true,
+            round_decimal_result: true,
             wire_type: Some(crate::mysql::protocol::MYSQL_TYPE_STRING),
             schema: "db".into(),
             table: "alias_t".into(),

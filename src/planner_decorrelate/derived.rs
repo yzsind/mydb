@@ -264,7 +264,7 @@ fn pushdown_union_all_derived_predicates(db: &Database, select: &mut Select) -> 
         let alias = table.alias.as_deref().unwrap_or(&table.name);
         staged.push((
             None,
-            union_source_pushdown_candidates(db, select, set, alias),
+            union_source_pushdown_candidates(db, select, set, alias, &table.column_aliases),
         ));
     }
     for (index, join) in select.joins.iter().enumerate() {
@@ -272,7 +272,13 @@ fn pushdown_union_all_derived_predicates(db: &Database, select: &mut Select) -> 
             let alias = join.table.alias.as_deref().unwrap_or(&join.table.name);
             staged.push((
                 Some(index),
-                union_source_pushdown_candidates(db, select, set, alias),
+                union_source_pushdown_candidates(
+                    db,
+                    select,
+                    set,
+                    alias,
+                    &join.table.column_aliases,
+                ),
             ));
         }
     }
@@ -297,6 +303,7 @@ fn union_source_pushdown_candidates(
     select: &Select,
     set_stmt: &crate::parser::SetOperation,
     derived_alias: &str,
+    column_aliases: &[String],
 ) -> Vec<UnionPushdownCandidate> {
     let set_op = set_stmt;
     if !is_pure_union_all_setop(set_op) {
@@ -309,9 +316,19 @@ fn union_source_pushdown_candidates(
     {
         return Vec::new();
     }
-    let Some(derived_columns) = union_output_columns(set_stmt) else {
+    let Some(mut derived_columns) = union_output_columns(set_stmt) else {
         return Vec::new();
     };
+    if !column_aliases.is_empty() {
+        if column_aliases.len() != derived_columns.len() {
+            return Vec::new();
+        }
+        derived_columns = column_aliases
+            .iter()
+            .enumerate()
+            .map(|(index, name)| (name.to_ascii_lowercase(), index))
+            .collect();
+    }
     let sources = collect_outer_sources(db, select, &derived_alias);
     if sources.is_empty() {
         return Vec::new();
@@ -975,7 +992,16 @@ fn build_alias_map(inner: &Select) -> Option<HashMap<String, Expr>> {
         .iter()
         .filter_map(direct_column_name)
         .collect();
-    let group_active = !inner.group_by.is_empty();
+    let group_active = !inner.group_by.is_empty()
+        || inner
+            .projection
+            .iter()
+            .any(|item| matches!(item, SelectItem::Expr { expr, .. } if expr_has_aggregate(expr)))
+        || inner.having.as_ref().is_some_and(expr_has_aggregate)
+        || inner
+            .order_by
+            .iter()
+            .any(|item| expr_has_aggregate(&item.expr));
     let mut map = HashMap::new();
     for item in &inner.projection {
         match item {

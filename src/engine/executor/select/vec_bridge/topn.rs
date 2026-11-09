@@ -4357,14 +4357,17 @@ impl TopNBatchOperator<'_> {
                     0,
                 );
                 let rows = entry
-                    .map(|(key, _)| {
-                        projector
-                            .project(&key)
-                            .fields
-                            .into_iter()
-                            .map(|field| field.value)
-                            .collect()
+                    .map(|(key, row_id)| {
+                        Ok::<_, QueryError>(
+                            projector
+                                .project_visible(exact.db, exact.txn, row_id, &key, None)?
+                                .map(|row| {
+                                    row.fields.into_iter().map(|field| field.value).collect()
+                                }),
+                        )
                     })
+                    .transpose()?
+                    .flatten()
                     .into_iter()
                     .collect();
                 if let (Some(started), Some(io_start)) = (started, io_start) {
@@ -4429,7 +4432,7 @@ impl TopNBatchOperator<'_> {
                             exact.txn,
                         )
                     })?;
-                for ((key, _row_id), visible) in entries.iter().zip(visible) {
+                for ((key, row_id), visible) in entries.iter().zip(visible) {
                     if !visible {
                         continue;
                     }
@@ -4439,7 +4442,11 @@ impl TopNBatchOperator<'_> {
                         }
                         None
                     } else {
-                        let row = projector.project(key);
+                        let Some(row) =
+                            projector.project_visible(exact.db, exact.txn, *row_id, key, None)?
+                        else {
+                            continue;
+                        };
                         if !crate::engine::executor::select::plan::eval_covering_filter(
                             exact.db,
                             exact.txn,
@@ -4464,7 +4471,17 @@ impl TopNBatchOperator<'_> {
                     if better {
                         best = Some((
                             rand_key,
-                            projected.unwrap_or_else(|| projector.project(key)),
+                            match projected {
+                                Some(row) => row,
+                                None => {
+                                    let Some(row) = projector
+                                        .project_visible(exact.db, exact.txn, *row_id, key, None)?
+                                    else {
+                                        continue;
+                                    };
+                                    row
+                                }
+                            },
                         ));
                     }
                 }
@@ -4597,20 +4614,26 @@ impl TopNBatchOperator<'_> {
                     0,
                 );
                 let rows = entry
-                    .map(|(key, _row_id)| {
+                    .map(|(key, row_id)| {
                         let projector =
                             crate::engine::executor::select::plan::IndexEntryProjector::new(
                                 exact.table,
                                 exact.index,
                                 exact.projected_columns,
                             );
-                        projector
-                            .project(&key)
-                            .fields
-                            .into_iter()
-                            .map(|field| field.value)
-                            .collect::<Vec<_>>()
+                        Ok::<_, QueryError>(
+                            projector
+                                .project_visible(exact.db, exact.txn, row_id, &key, None)?
+                                .map(|row| {
+                                    row.fields
+                                        .into_iter()
+                                        .map(|field| field.value)
+                                        .collect::<Vec<_>>()
+                                }),
+                        )
                     })
+                    .transpose()?
+                    .flatten()
                     .into_iter()
                     .collect();
                 if let (Some(started), Some(io_start)) = (started, io_start) {

@@ -576,6 +576,7 @@ fn sqlproc_sus_streaming_group_contiguity_does_not_imply_order() {
     assert!(!plan_satisfies_order_by(
         &plan,
         &[OrderBy {
+            names_bound: false,
             expr: key,
             asc: true,
             nulls_first: None

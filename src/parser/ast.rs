@@ -2835,6 +2835,10 @@ pub enum ExplainFormat {
 pub struct OrderBy {
     pub expr: Expr,
     pub asc: bool,
+    /// Preserve binding across planner clones and stored view renames. A
+    /// resolved positional/output reference must not become a new alias use.
+    #[serde(default)]
+    pub names_bound: bool,
     /// Explicit `NULLS FIRST` / `NULLS LAST` (mydb extension; MySQL 8.0
     /// rejects this syntax with 1064). `None` follows the process default
     /// placement (see [`order_by_nulls_default_high`]).

@@ -46,7 +46,11 @@ pub(crate) fn mbr_predicate(op: MbrOp, a: &Geom, b: &Geom) -> Option<bool> {
         MbrOp::Equals => ma.equals(&mb),
         MbrOp::Touches => ma.intersects(&mb) && !interiors_overlap(&ma, &mb),
         MbrOp::Overlaps => {
-            interiors_overlap(&ma, &mb) && !ma.contains(&mb) && !mb.contains(&ma) && !ma.equals(&mb)
+            (ma.minx == ma.maxx) == (mb.minx == mb.maxx)
+                && (ma.miny == ma.maxy) == (mb.miny == mb.maxy)
+                && interiors_overlap(&ma, &mb)
+                && !ma.contains(&mb)
+                && !mb.contains(&ma)
         }
     })
 }
@@ -68,7 +72,15 @@ fn contains_interior(a: &Mbr, b: &Mbr) -> bool {
 
 #[inline]
 fn interiors_overlap(a: &Mbr, b: &Mbr) -> bool {
-    a.minx < b.maxx && a.maxx > b.minx && a.miny < b.maxy && a.maxy > b.miny
+    fn axis(amin: f64, amax: f64, bmin: f64, bmax: f64) -> bool {
+        match (amin == amax, bmin == bmax) {
+            (true, true) => amin == bmin,
+            (true, false) => amin > bmin && amin < bmax,
+            (false, true) => bmin > amin && bmin < amax,
+            (false, false) => amin < bmax && amax > bmin,
+        }
+    }
+    axis(a.minx, a.maxx, b.minx, b.maxx) && axis(a.miny, a.maxy, b.miny, b.maxy)
 }
 
 /// Evaluate a topological predicate. `None` when either geometry is empty.
@@ -101,10 +113,8 @@ enum Cover {
     Outside,
 }
 
-const PT_EPS: f64 = 1e-9;
-
 fn coincides(a: Coord, b: Coord) -> bool {
-    (a.x - b.x).abs() <= PT_EPS && (a.y - b.y).abs() <= PT_EPS
+    a == b
 }
 
 fn on_seg(p: Coord, a: Coord, b: Coord) -> bool {
@@ -417,14 +427,27 @@ fn touches(a: &Geom, b: &Geom) -> bool {
 
 fn crosses(a: &Geom, b: &Geom) -> bool {
     use geo::Relate;
-    topology_geometry(a)
-        .relate(&topology_geometry(b))
+    normalized_topology_geometry(a)
+        .relate(&normalized_topology_geometry(b))
         .is_crosses()
 }
 
 fn overlaps(a: &Geom, b: &Geom) -> bool {
     use geo::Relate;
-    topology_geometry(a)
-        .relate(&topology_geometry(b))
+    normalized_topology_geometry(a)
+        .relate(&normalized_topology_geometry(b))
         .is_overlaps()
+}
+
+fn normalized_topology_geometry(geom: &Geom) -> geo::Geometry<f64> {
+    if matches!(geom, Geom::GeometryCollection(_)) {
+        let mut groups = topology_groups(geom);
+        if groups.len() == 1 {
+            groups.pop().unwrap()
+        } else {
+            geo::Geometry::GeometryCollection(geo::GeometryCollection(groups))
+        }
+    } else {
+        topology_geometry(geom)
+    }
 }

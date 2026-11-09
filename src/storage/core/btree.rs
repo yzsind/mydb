@@ -5680,10 +5680,8 @@ impl IndexFile {
             }
             let rank = interned_record_rank(record);
             if index.unique && !key.has_null && previous_unique_rank == Some(rank) {
-                return Err(error(
-                    crate::error::catalog::ER_DUP_ENTRY,
-                    format!("duplicate entry for key '{}'", index.name),
-                ));
+                let entry = separator(record)?;
+                return Err(duplicate_entry_error_for_index(&index.name, &entry.key));
             }
             if index.unique && !key.has_null {
                 previous_unique_rank = Some(rank);

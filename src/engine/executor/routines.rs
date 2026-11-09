@@ -206,9 +206,10 @@ fn check_trigger_row_qualifier(qualifier: &str) -> Result<(), QueryError> {
 pub(super) fn execute_create_routine(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    def: RoutineDef,
+    mut def: RoutineDef,
 ) -> Result<QueryResponse, QueryError> {
     super::implicit_commit_for_ddl(db, session)?;
+    bind_current_user_definer(session, &mut def.definer);
     validate_routine_def(&def)?;
     validate_binlog_function_creator(db, session, &def)?;
     validate_routine_definer_privilege(db, session, &def)?;
@@ -346,6 +347,10 @@ pub(super) fn execute_call(
     }
     let mut caller_locals = None;
     let result = execute_procedure_call(db, session, call, registry, caller_locals.as_mut(), None);
+    let affected_rows = session.last_row_count.max(0) as u64;
+    // CALL has its own status, without an inner DML statement's info trailer.
+    crate::engine::api::clear_statement_matched_rows();
+    crate::engine::api::clear_statement_info();
     // A procedure containing only local expressions still opens a read view.
     // Finish that implicit transaction, but honor any START TRANSACTION or
     // autocommit change deliberately left by the procedure for its caller.
@@ -369,7 +374,7 @@ pub(super) fn execute_call(
             rows: vec![row],
         }));
     }
-    responses.push(QueryResponse::Ok);
+    responses.push(QueryResponse::OkAffected { affected_rows });
     Ok(QueryResponse::MultiResult(responses))
 }
 
@@ -1049,6 +1054,19 @@ fn validate_binlog_function_creator(
         crate::error::catalog::ER_BINLOG_CREATE_ROUTINE_NEED_SUPER,
         "You do not have the SUPER privilege and binary logging is enabled",
     ))
+}
+
+/// Resolve the parser's symbolic account before authorization and storage.
+pub(super) fn bind_current_user_definer(
+    session: &SessionContext,
+    definer: &mut Option<crate::parser::AccountIdent>,
+) {
+    if let Some(account) = definer.as_mut() {
+        if account.user == "CURRENT_USER()" && account.host.is_empty() {
+            account.user.clone_from(&session.authenticated_as.user);
+            account.host.clone_from(&session.authenticated_as.host);
+        }
+    }
 }
 
 /// Setting `DEFINER` to an account other than the current user requires the
@@ -2041,7 +2059,10 @@ fn authorize_routine_execute(
             crate::error::catalog::ER_PROCACCESS_DENIED_ERROR,
             format!(
                 "execute command denied to user '{}'@'{}' for routine '{}.{}'",
-                session.user, session.host, routine.database, routine.name
+                session.authenticated_as.user,
+                session.authenticated_as.host,
+                routine.database,
+                routine.name
             ),
         ))
     }
@@ -2353,6 +2374,9 @@ fn execute_routine_inner(
         return Err(err);
     }
     let invocation_snapshot = RoutineInvocationSnapshot::capture(session);
+    if !is_function {
+        session.last_row_count = 0;
+    }
     // RETURN/IF/SET expressions can evaluate subqueries without dispatching
     // a separate SQL statement. Isolate the entire body from view bindings.
     // SAFETY: db, session and registry remain pinned throughout this call.
@@ -3054,10 +3078,17 @@ fn exec_block_inner(
                             RoutineCondition::NotFound | RoutineCondition::SqlWarning,
                             warning,
                         ) => {
-                            if !frame.diag_conditions.iter().any(|condition| {
-                                condition.code() == warning.code()
-                                    && condition.sql_state().as_str() == warning.sql_state()
-                            }) {
+                            // The frame already records the condition for GET
+                            // DIAGNOSTICS; only the published area proves that
+                            // the caller can see it through SHOW WARNINGS.
+                            if !crate::engine::api::statement_warnings_snapshot()
+                                .iter()
+                                .skip(warning_start)
+                                .any(|condition| {
+                                    condition.code() == warning.code()
+                                        && condition.sql_state().as_str() == warning.sql_state()
+                                })
+                            {
                                 crate::engine::api::push_statement_condition(
                                     crate::error::ConditionLevel::Warning,
                                     warning,
@@ -3350,6 +3381,7 @@ fn exec_stmt(
                                 value: Expr::BoundValue(value),
                             }]),
                             &[],
+                            usize::MAX,
                             frame.forbid_transaction_control,
                             frame.trigger_table.as_deref(),
                         )?;
@@ -3371,6 +3403,8 @@ fn exec_stmt(
                 )?;
             }
             session.last_row_count = 0;
+            crate::engine::api::clear_statement_matched_rows();
+            crate::engine::api::clear_statement_info();
             frame.diag_row_count = 0;
             Ok(RoutineControl::None)
         }
@@ -3390,7 +3424,7 @@ fn exec_stmt(
                 frame.forbid_transaction_control,
                 frame.trigger_table.as_deref(),
             )?;
-            let row = match select_into_single_row(response) {
+            let row = match select_into_single_row(response, targets.len()) {
                 Ok(row) => row,
                 Err(err) => {
                     session.last_row_count = if err
@@ -3405,13 +3439,6 @@ fn exec_stmt(
                     return Err(err);
                 }
             };
-            if row.len() != targets.len() {
-                return Err(error(
-                    crate::error::catalog::ER_WRONG_NUMBER_OF_COLUMNS_IN_SELECT,
-                    "SELECT ... INTO target count does not match result column count",
-                )
-                .into());
-            }
             for (target, value) in targets.iter().zip(row.into_iter()) {
                 assign_target(
                     session,
@@ -3739,6 +3766,10 @@ fn exec_stmt(
             for response in result.responses {
                 collect_routine_response(session, frame, response)?;
             }
+            session.last_row_count = session.last_row_count.max(0);
+            frame.diag_row_count = session.last_row_count;
+            crate::engine::api::clear_statement_matched_rows();
+            crate::engine::api::clear_statement_info();
             Ok(RoutineControl::None)
         }
         RoutineStmt::Prepare { name, source } => {
@@ -3828,6 +3859,7 @@ fn exec_stmt(
                         database: session.current_database.clone(),
                         parameter_count: next_placeholder,
                         result_columns: Arc::from([]),
+                        result_catalog_epoch: db.catalog_publication_epoch(),
                         routine_result_metadata: false,
                         memory_charge,
                     },
@@ -3884,6 +3916,7 @@ fn exec_stmt(
                     registry,
                     (*prepared.statement).clone(),
                     &params,
+                    usize::MAX,
                     frame.forbid_transaction_control,
                     frame.trigger_table.as_deref(),
                 )
@@ -4024,37 +4057,12 @@ fn response_row_count(response: &QueryResponse) -> i64 {
     }
 }
 
-fn select_into_single_row(response: QueryResponse) -> Result<Vec<Value>, RoutineExecError> {
-    match response {
-        QueryResponse::ResultSet(mut result) => match result.rows.len() {
-            0 => Err(not_found_condition()),
-            1 => Ok(result.rows.pop().expect("single SELECT INTO row")),
-            _ => Err(error(
-                crate::error::catalog::ER_TOO_MANY_ROWS,
-                "Result consisted of more than one row",
-            )
-            .into()),
-        },
-        QueryResponse::StreamingResultSet(mut result) => {
-            let first = result.cursor.next_row()?;
-            let second = result.cursor.next_row()?;
-            crate::engine::api::append_statement_warnings(result.cursor.take_warnings());
-            match (first, second) {
-                (None, _) => Err(not_found_condition()),
-                (Some(row), None) => Ok(row),
-                (Some(_), Some(_)) => Err(error(
-                    crate::error::catalog::ER_TOO_MANY_ROWS,
-                    "Result consisted of more than one row",
-                )
-                .into()),
-            }
-        }
-        _ => Err(error(
-            crate::error::catalog::ER_TOO_MANY_ROWS,
-            "SELECT ... INTO requires a result set",
-        )
-        .into()),
-    }
+fn select_into_single_row(
+    response: QueryResponse,
+    targets: usize,
+) -> Result<Vec<Value>, RoutineExecError> {
+    super::dispatch::validate_into_column_count(&response, targets)?;
+    super::dispatch::take_single_into_row(response)?.ok_or_else(not_found_condition)
 }
 
 /// Execute `GET [CURRENT|STACKED] DIAGNOSTICS`. Statement-area items
@@ -4242,6 +4250,11 @@ fn execute_sql_in_routine(
             registry,
             statement,
             &bound_params,
+            if used_parameterized_template {
+                0
+            } else {
+                usize::MAX
+            },
             forbid_transaction_control,
             trigger_table,
         )
@@ -4308,6 +4321,7 @@ fn execute_parsed_statement_in_routine(
     registry: &SessionRegistry,
     statement: crate::parser::Statement,
     params: &[Value],
+    internal_param_start: usize,
     forbid_transaction_control: bool,
     trigger_table: Option<&str>,
 ) -> Result<QueryResponse, RoutineExecError> {
@@ -4326,10 +4340,14 @@ fn execute_parsed_statement_in_routine(
     // through the unique `&mut session` on this connection thread.
     let outer_insert_id = crate::engine::api::snapshot_statement_insert_id();
     crate::engine::api::clear_statement_insert_id();
+    crate::engine::api::clear_statement_matched_rows();
+    crate::engine::api::clear_statement_info();
     let result = unsafe {
         crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
-            params::with_params(params.to_vec(), || {
-                super::dispatch::execute_statement(db, session, statement, registry)
+            params::with_parameter_scope(internal_param_start, || {
+                params::with_params(params.to_vec(), || {
+                    super::dispatch::execute_statement(db, session, statement, registry)
+                })
             })
         })
     };
@@ -4344,7 +4362,14 @@ fn execute_parsed_statement_in_routine(
     if !crate::engine::api::statement_insert_id_is_set() {
         crate::engine::api::restore_statement_insert_id(outer_insert_id);
     }
-    session.last_row_count = result.as_ref().map(super::response_row_count).unwrap_or(-1);
+    session.last_row_count = match &result {
+        Ok(QueryResponse::OkAffected { affected_rows }) if session.client_found_rows => {
+            i64::try_from(crate::engine::api::statement_matched_rows().unwrap_or(*affected_rows))
+                .unwrap_or(i64::MAX)
+        }
+        Ok(response) => super::response_row_count(response),
+        Err(_) => -1,
+    };
     if held_trigger_transaction {
         session.explicit_txn = previous_explicit;
     }
@@ -4988,7 +5013,10 @@ fn condition_from_query_error(err: &QueryError) -> RoutineCondition {
 fn not_found_condition() -> RoutineExecError {
     RoutineExecError::Condition(
         RoutineCondition::NotFound,
-        error(crate::error::catalog::ER_SP_FETCH_NO_DATA, "No data"),
+        error(
+            crate::error::catalog::ER_SP_FETCH_NO_DATA,
+            "No data - zero rows fetched, selected, or processed",
+        ),
     )
 }
 

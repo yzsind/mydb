@@ -7243,7 +7243,7 @@ fn compile_zone_member_comparison(
         .iter()
         .map(literal_value)
         .collect::<Option<Vec<_>>>()?;
-    let member_start = if !is_set && matches!(constants.get(2), Some(Value::UInt(_))) { 3 } else { 2 };
+    let member_start = if matches!(constants.get(2), Some(Value::UInt(_))) { 3 } else { 2 };
     let members = &constants[member_start..];
     let declared = match &column.data_type {
         DataTypeKind::Enum { values } | DataTypeKind::Set { values } => values,

@@ -216,6 +216,7 @@ fn cte_union_branch_concurrency() -> usize {
 pub(super) struct CteSpillBuilder {
     columns: Vec<crate::types::Column>,
     ncols: usize,
+    decimal_columns: smallvec::SmallVec<[usize; 4]>,
     data_dir: std::path::PathBuf,
     buffered: Vec<Vec<Value>>,
     buffered_batches: Vec<crate::engine::executor::vec::batch::Batch>,
@@ -346,9 +347,16 @@ impl CteSpillBuilder {
                 crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
                 0,
             );
+        let decimal_columns = columns
+            .iter()
+            .enumerate()
+            .filter(|(_, column)| matches!(column.column_type, ColumnType::Decimal { .. }))
+            .map(|(index, _)| index)
+            .collect();
         Self {
             columns,
             ncols,
+            decimal_columns,
             data_dir,
             buffered: Vec::new(),
             buffered_batches: Vec::new(),
@@ -365,7 +373,17 @@ impl CteSpillBuilder {
         }
     }
 
-    pub(super) fn push(&mut self, row: Vec<Value>) -> Result<(), QueryError> {
+    pub(super) fn push(&mut self, mut row: Vec<Value>) -> Result<(), QueryError> {
+        for &index in &self.decimal_columns {
+            if let Some(value) = row.get_mut(index) {
+                if let std::borrow::Cow::Owned(shaped) = crate::engine::expr::decimal_result_value(
+                    value,
+                    self.columns[index].column_type,
+                ) {
+                    *value = shaped;
+                }
+            }
+        }
         if !self.buffered_batches.is_empty() {
             self.start_spill()?;
         }
@@ -461,6 +479,12 @@ impl CteSpillBuilder {
                 crate::error::catalog::ER_INTERNAL_ERROR,
                 "CTE batch width differs from its result metadata",
             ));
+        }
+        if self.decimal_columns.iter().any(|&index| {
+            matches!(self.columns[index].column_type, ColumnType::Decimal { scale, .. } if batch.columns()[index].decimal_scale() != Some(scale))
+        }) {
+            for row in batch.visible_indices() { self.push(batch.row(row))?; }
+            return Ok(());
         }
         if self.stats.is_some() {
             for row in batch.visible_indices() {
@@ -1709,7 +1733,7 @@ fn materialize_aggregate_over_lazy_union(
         return Ok(None);
     }
     let group_cols = select.group_by.len();
-    let mut columns = None;
+    let mut columns: Option<Vec<Column>> = None;
     let mut partials = Vec::new();
     for branch in &lazy.branches {
         let Some(branch_select) = rewrite_union_aggregate_branch(select, dep_name, branch) else {
@@ -1724,12 +1748,26 @@ fn materialize_aggregate_over_lazy_union(
         let QueryResponse::ResultSet(rs) = response.materialize()? else {
             return Ok(None);
         };
-        if columns.is_none() {
-            columns = Some(rs.columns.clone());
+        let mut branch_columns = rs.columns;
+        if let Some(columns) = columns.as_mut() {
+            super::dispatch::unify_setop_declared_column_metadata(columns, &mut branch_columns)?;
+        } else {
+            columns = Some(branch_columns);
         }
         partials.push(rs.rows);
     }
     let columns = columns.unwrap_or_default();
+    for branch in &mut partials {
+        for row in branch {
+            for (value, column) in row.iter_mut().zip(&columns) {
+                *value = super::dispatch::coerce_setop_value(
+                    std::mem::replace(value, Value::Null),
+                    column.column_type,
+                    &column.source,
+                )?;
+            }
+        }
+    }
     let rows = merge_union_aggregate_partials(partials, group_cols)?;
     crate::engine::status_counters::record_internal_temp_table(false);
     let mut result = CteResult::materialized(columns, rows);
@@ -2972,7 +3010,8 @@ fn union_column_needs_coercion(source: &Column, target: &Column) -> bool {
         )
     };
     if integer(source.column_type) && integer(target.column_type) {
-        return false;
+        return source.source.flags & crate::mysql::protocol::UNSIGNED_FLAG
+            != target.source.flags & crate::mysql::protocol::UNSIGNED_FLAG;
     }
     if source.column_type == ColumnType::Vector && target.column_type == ColumnType::Vector {
         return source.source.vector_type != target.source.vector_type;
@@ -3487,14 +3526,17 @@ fn materialize_recursive(
     // resolves the current delta from the registry at open time, so changing
     // delta cardinality cannot silently change join order or parallel
     // topology between iterations.
-    let owned_anchor_plan = if supplied_branches.is_none() {
+    let anchor_has_derived = matches!(anchor_stmt, crate::parser::QueryExpr::Select(select)
+        if select.derived.is_some() || select.joins.iter().any(|join| join.derived.is_some()));
+    let owned_anchor_plan = if supplied_branches.is_none() && !anchor_has_derived {
         crate::planner::plan_query_physical(db, anchor_stmt)?
     } else {
         None
     };
     let anchor_plan = supplied_branches
         .map(|(anchor, _)| anchor)
-        .or(owned_anchor_plan.as_ref());
+        .or(owned_anchor_plan.as_ref())
+        .filter(|_| !anchor_has_derived);
     let mut anchor = match (anchor_plan, anchor_stmt) {
         (Some(anchor_plan), crate::parser::QueryExpr::Select(anchor_select)) => {
             materialize_cte_from_physical(db, txn, &anchor_def, anchor_select, anchor_plan)?
@@ -3504,6 +3546,15 @@ fn materialize_recursive(
     };
     for column in &mut anchor.columns {
         column.source.flags &= !crate::mysql::protocol::NOT_NULL_FLAG;
+        if column.source.wire_type == Some(6) {
+            // A NULL-only anchor declares a nullable zero-width binary
+            // string, rather than leaving later iterations untyped.
+            column.source.wire_type = Some(crate::mysql::protocol::MYSQL_TYPE_STRING);
+            column.source.collation_id = Some(crate::charset::BINARY_COLLATION_ID);
+            column.source.length = Some(0);
+            column.source.decimals = Some(0);
+            column.source.flags |= crate::mysql::protocol::BINARY_FLAG;
+        }
     }
     let anchor = Arc::new(anchor);
     let total_columns = anchor.columns.clone();
@@ -3542,7 +3593,32 @@ fn materialize_recursive(
     set_cte_result(&cte.name, Arc::clone(&working));
     let target_types: Vec<_> = total_columns
         .iter()
-        .map(crate::storage::schema::data_type_kind_for_result_column)
+        .map(|column| {
+            if column.column_type == ColumnType::VarString {
+                if column.source.collation_id == Some(crate::charset::BINARY_COLLATION_ID) {
+                    return crate::storage::DataTypeKind::VarBinary {
+                        len: column.source.length.map(|bytes| bytes as usize),
+                    };
+                }
+                // Wire string widths count maximum encoded bytes; recursive
+                // VARCHAR assignment is bounded by the anchor's characters.
+                let charset = column
+                    .source
+                    .collation_id
+                    .and_then(crate::charset::resolve_collation_id)
+                    .map(|collation| collation.charset)
+                    .unwrap_or_else(crate::engine::expr::connection_charset);
+                let width = crate::charset::resolve_charset(charset)
+                    .map(|charset| u32::from(charset.max_len))
+                    .unwrap_or(1)
+                    .max(1);
+                crate::storage::DataTypeKind::VarChar {
+                    len: column.source.length.map(|bytes| (bytes / width) as usize),
+                }
+            } else {
+                crate::storage::schema::data_type_kind_for_result_column(column)
+            }
+        })
         .collect();
     let coerce_row = |mut row: Vec<Value>| -> Result<Vec<Value>, QueryError> {
         if row.len() != total_columns.len() {
@@ -3552,12 +3628,53 @@ fn materialize_recursive(
             ));
         }
         for ((value, column), target) in row.iter_mut().zip(&total_columns).zip(&target_types) {
+            let decimal_before = match target {
+                crate::storage::DataTypeKind::Decimal { scale, .. } => {
+                    let scale = scale.unwrap_or(0);
+                    if let Some(exact) = value.exact_decimal() {
+                        (exact.scale() > scale).then(|| Value::from_exact_decimal(exact))
+                    } else if matches!(value, Value::Float(_) | Value::Double(_)) {
+                        Some(value.clone())
+                    } else if matches!(
+                        value,
+                        Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                    ) {
+                        crate::util::decimal::parse_exact_decimal_big(
+                            &crate::engine::expr::str_value(value),
+                        )
+                        .filter(|(_, source_scale)| *source_scale > scale)
+                        .map(|(magnitude, scale)| {
+                            Value::from_exact_decimal(crate::util::decimal::ExactDecimal::from_big(
+                                magnitude, scale,
+                            ))
+                        })
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
+            };
+            let warnings_before = decimal_before
+                .as_ref()
+                .map(|_| crate::engine::api::statement_warning_count());
             *value = crate::storage::coerce_routine_typed_value(
                 std::mem::replace(value, Value::Null),
                 &column.name,
                 target,
                 column.source.flags & crate::mysql::protocol::UNSIGNED_FLAG != 0,
             )?;
+            if let Some(before) = decimal_before {
+                if warnings_before == Some(crate::engine::api::statement_warning_count())
+                    && crate::engine::expr::compare_values(&before, value)?
+                        != std::cmp::Ordering::Equal
+                {
+                    crate::engine::api::push_statement_warning(
+                        crate::error::ConditionLevel::Note,
+                        crate::error::catalog::WARN_DATA_TRUNCATED,
+                        format!("Data truncated for column '{}' at row 1", column.name),
+                    );
+                }
+            }
         }
         Ok(row)
     };
@@ -3679,6 +3796,32 @@ fn validate_recursive_part(stmt: &Select, cte_name: &str) -> Result<(), QueryErr
     if count_select_refs(stmt, cte_name) > 1 {
         return Err(error(crate::error::catalog::ER_CTE_RECURSIVE_REQUIRES_SINGLE_REFERENCE,
             format!("Recursive CTE '{cte_name}' must reference itself only once per recursive query block")));
+    }
+    let mut left_has_recursive = stmt
+        .from
+        .iter()
+        .any(|table| table.name.eq_ignore_ascii_case(cte_name))
+        || stmt
+            .derived
+            .as_ref()
+            .is_some_and(|derived| subquery_references_cte(derived, cte_name));
+    for join in &stmt.joins {
+        let right_has_recursive = join.table.name.eq_ignore_ascii_case(cte_name)
+            || join
+                .derived
+                .as_ref()
+                .is_some_and(|derived| subquery_references_cte(derived, cte_name));
+        if matches!(join.join_type, crate::parser::JoinType::Left) && right_has_recursive
+            || matches!(join.join_type, crate::parser::JoinType::Right) && left_has_recursive
+            || matches!(join.join_type, crate::parser::JoinType::Full)
+                && (left_has_recursive || right_has_recursive)
+        {
+            return Err(error(
+                crate::error::catalog::ER_CTE_RECURSIVE_FORBIDDEN_JOIN_ORDER,
+                format!("Recursive table '{cte_name}' cannot be on the null-producing side of an outer join"),
+            ));
+        }
+        left_has_recursive |= right_has_recursive;
     }
     if super::dispatch::select_has_window_functions(stmt) {
         return Err(error(
@@ -4316,6 +4459,34 @@ pub(super) fn prune_unused_cte_columns(ctes: &mut [CteDef], body: &Statement) {
                 collect_used_stmt(&other.query, &aliases, &mut used);
             }
         }
+        fn retain_local_aliases(query: &crate::parser::QueryExpr, used: &mut UsedCols) {
+            match query {
+                crate::parser::QueryExpr::Select(select) => {
+                    for expr in select
+                        .having
+                        .iter()
+                        .chain(select.order_by.iter().map(|order| &order.expr))
+                    {
+                        crate::parser::visit::inspect_value_expr(
+                            expr,
+                            |node| {
+                                if let Expr::Identifier(name) = node {
+                                    used.names.insert(name.to_ascii_lowercase());
+                                }
+                                true
+                            },
+                            |_| {},
+                        );
+                    }
+                }
+                crate::parser::QueryExpr::SetOp(set) => {
+                    retain_local_aliases(&set.left, used);
+                    retain_local_aliases(&set.right, used);
+                }
+                _ => {}
+            }
+        }
+        retain_local_aliases(&ctes[i].query, &mut used);
         if used.wild {
             continue;
         }
@@ -5046,6 +5217,8 @@ fn narrowable_stmt_output_names<'q>(
 /// (so the output schema is known statically and dropping an unreferenced item
 /// changes nothing). Returns `None` (skip narrowing) otherwise.
 fn narrowable_select_output_names(s: &Select) -> Option<Vec<String>> {
+    // HAVING and ORDER BY may reference output aliases even when the CTE's
+    // consumers do not project those columns.
     if s.distinct
         || s.group_by_modifier != crate::parser::GroupByModifier::None
         || !s.grouping_sets.is_empty()
@@ -6832,6 +7005,10 @@ fn select_pushable_output_expr(select: &Select, expr: &Expr) -> Option<Expr> {
         || select.having.is_some()
         || select.limit.is_some()
         || select.offset.is_some()
+        || select.projection.iter().any(|item| {
+            matches!(item,
+            SelectItem::Expr { expr, .. } if super::expr_has_window(expr))
+        })
         || expr_has_aggregate(expr)
         || expr_is_nondeterministic(expr)
     {

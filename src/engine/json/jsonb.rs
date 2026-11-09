@@ -175,15 +175,23 @@ fn plan_node<'a>(value: &'a Json, plans: &mut Vec<ContainerPlan<'a>>) -> usize {
 }
 
 pub(super) fn encode(value: &Json) -> Vec<u8> {
+    encode_mode::<false>(value)
+}
+
+pub(super) fn encode_text_dom(value: &Json) -> Vec<u8> {
+    encode_mode::<true>(value)
+}
+
+fn encode_mode<const TEXT_NUMBERS: bool>(value: &Json) -> Vec<u8> {
     let mut plans = Vec::new();
     let size = plan_node(value, &mut plans);
     let mut out = Vec::with_capacity(size);
-    write_planned_node(value, &plans, &mut 0, &mut out);
+    write_planned_node::<TEXT_NUMBERS>(value, &plans, &mut 0, &mut out);
     debug_assert_eq!(out.len(), size);
     out
 }
 
-fn write_planned_node(
+fn write_planned_node<const TEXT_NUMBERS: bool>(
     value: &Json,
     plans: &[ContainerPlan<'_>],
     next: &mut usize,
@@ -194,7 +202,16 @@ fn write_planned_node(
         Json::Bool(true) => out.push(T_TRUE),
         Json::Bool(false) => out.push(T_FALSE),
         Json::Number(n) => {
-            if let Some(i) = n.as_i64() {
+            // JSON text parsers classify nonnegative 64-bit integers above
+            // UINT32_MAX as unsigned. SQL numeric constructors bypass this
+            // DOM encoder and retain their bound signedness.
+            if let Some(u) = n
+                .as_u64()
+                .filter(|u| TEXT_NUMBERS && *u > u64::from(u32::MAX))
+            {
+                out.push(T_U64);
+                out.extend_from_slice(&u.to_le_bytes());
+            } else if let Some(i) = n.as_i64() {
                 out.push(T_I64);
                 out.extend_from_slice(&i.to_le_bytes());
             } else if let Some(u) = n.as_u64() {
@@ -218,7 +235,7 @@ fn write_planned_node(
             write_uvarint(out, plan.payload_len as u64);
             write_uvarint(out, arr.len() as u64);
             for child in arr {
-                write_planned_node(child, plans, next, out);
+                write_planned_node::<TEXT_NUMBERS>(child, plans, next, out);
             }
         }
         Json::Object(_) => {
@@ -230,7 +247,7 @@ fn write_planned_node(
             for (key, child) in &plan.entries {
                 write_uvarint(out, key.len() as u64);
                 out.extend_from_slice(key.as_bytes());
-                write_planned_node(child, plans, next, out);
+                write_planned_node::<TEXT_NUMBERS>(child, plans, next, out);
             }
         }
     }

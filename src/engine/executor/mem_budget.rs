@@ -1935,7 +1935,10 @@ impl MemBudget {
                 .is_none_or(|next| next > process_mem_limit_bytes())
         {
             PROCESS_RESERVATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
-            return OperatorCharge::SoftLimit(None);
+            return OperatorCharge::SoftLimit(Some(crate::error::catalog::ER_OUTOFMEMORY.error(format!(
+                "process query memory limit exceeded: tried to allocate {} bytes, process used {} / {}",
+                bytes, PROCESS_QUERY_MEM_USED.load(Ordering::Acquire), process_mem_limit_bytes()
+            ))));
         }
         let Some(new_used) = try_atomic_add_bounded(&self.used, bytes, self.limit) else {
             QUERY_RESERVATION_REJECTIONS.fetch_add(1, Ordering::Relaxed);
@@ -2704,6 +2707,28 @@ pub(crate) fn try_reserve_vec_hard<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optimizer1108_process_soft_limit_diagnostic_preserves_accounting() {
+        let _serial = GLOBAL_MEMORY_TEST_LOCK.lock().unwrap();
+        let before = process_query_mem_used();
+        let old = PROCESS_MEM_LIMIT_BYTES.swap(before.saturating_add(32), Ordering::AcqRel);
+        let budget = MemBudget::process_tracked_for_test(1024);
+        let result = budget.charge_for_spillable_operator(64);
+        PROCESS_MEM_LIMIT_BYTES.store(old, Ordering::Release);
+        let OperatorCharge::SoftLimit(Some(error)) = result else {
+            panic!("expected process watermark");
+        };
+        assert_eq!(error.code(), 1037);
+        assert!(error
+            .message()
+            .contains("process query memory limit exceeded"));
+        assert!(error
+            .message()
+            .contains(&format!("process used {before} / {}", before + 32)));
+        assert_eq!(budget.used(), 0);
+        assert_eq!(process_query_mem_used(), before);
+    }
 
     #[test]
     fn spill_preflight_rejects_without_waiting_on_global_reclaim_and_keeps_accounting() {

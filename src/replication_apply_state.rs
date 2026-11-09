@@ -57,6 +57,26 @@ impl ChannelRunner {
         gtid: Option<String>,
         record: &RelayRecord,
     ) -> Result<(), QueryError> {
+        let has_rows = ops.iter().any(|op| {
+            matches!(
+                op,
+                RelayOp::RawRows { .. }
+                    | RelayOp::WriteRows { .. }
+                    | RelayOp::UpdateRows { .. }
+                    | RelayOp::DeleteRows { .. }
+            )
+        });
+        if has_rows && recovered_row_boundary_covers(record) {
+            if let Some(gtid) = &gtid {
+                self.update_status(|status| {
+                    status.executed_gtid_set = append_gtid(&status.executed_gtid_set, gtid);
+                });
+            }
+            return Ok(());
+        }
+        let _row_receipt = has_rows
+            .then(|| self.row_receipt_guard(record))
+            .transpose()?;
         let channel = self.status_snapshot().channel;
         let receipt = DdlReceipt {
             boundary: serde_json::to_string(&(
@@ -312,5 +332,76 @@ impl ChannelRunner {
             return Err(err);
         }
         db.commit_txn(txn.txn_id).map(|_| ())
+    }
+}
+
+// A row receipt commits in the same storage transaction as its row events.
+thread_local! {
+    static ROW_RECEIPT: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+    static RECOVERED_ROW_RECEIPT: std::cell::RefCell<Option<(String, u64)>> = const { std::cell::RefCell::new(None) };
+}
+
+fn source_boundary_covers(applied: &(String, u64), file: &str, pos: u64) -> bool {
+    if applied.0 == file {
+        return applied.1 >= pos;
+    }
+    match (applied.0.rsplit_once('.'), file.rsplit_once('.')) {
+        (Some((a, x)), Some((b, y))) if a == b => {
+            matches!((x.parse::<u64>(), y.parse::<u64>()), (Ok(x), Ok(y)) if x > y)
+        }
+        _ => false,
+    }
+}
+
+struct RowReceiptGuard(Option<(String, String)>);
+impl Drop for RowReceiptGuard {
+    fn drop(&mut self) {
+        ROW_RECEIPT.with(|slot| {
+            slot.replace(self.0.take());
+        });
+    }
+}
+
+fn recovered_row_boundary_covers(record: &RelayRecord) -> bool {
+    RECOVERED_ROW_RECEIPT.with(|slot| {
+        slot.borrow().as_ref().is_some_and(|applied| {
+            source_boundary_covers(applied, &record.source_file, record.source_pos)
+        })
+    })
+}
+
+fn write_current_row_receipt(
+    db: &crate::storage::Database,
+    txn: TxnView,
+) -> Result<(), QueryError> {
+    ROW_RECEIPT.with(|slot| {
+        if let Some((key, value)) = slot.borrow().as_ref() {
+            db.write_replication_property(txn, key, Some(value))?;
+        }
+        Ok(())
+    })
+}
+
+impl ChannelRunner {
+    fn row_receipt_guard(&self, record: &RelayRecord) -> Result<RowReceiptGuard, QueryError> {
+        let key = replication_property_key("rows", &self.status_snapshot().channel, b"");
+        let value = serde_json::to_string(&(&record.source_file, record.source_pos))
+            .map_err(|err| io_error("serialize row apply receipt", std::io::Error::other(err)))?;
+        Ok(RowReceiptGuard(
+            ROW_RECEIPT.with(|slot| slot.replace(Some((key, value)))),
+        ))
+    }
+
+    fn prepare_row_records_at_boundary(
+        &self,
+        ops: Vec<RelayOp>,
+        gtid: Option<&str>,
+        record: &RelayRecord,
+    ) -> Result<Option<DeferredCommit>, QueryError> {
+        if recovered_row_boundary_covers(record) {
+            return Ok(None);
+        }
+        let _guard = self.row_receipt_guard(record)?;
+        self.prepare_row_records(ops, gtid)
     }
 }

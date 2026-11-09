@@ -135,6 +135,9 @@ pub(crate) struct ExprType {
     pub(crate) coercibility: u8,
     /// Precision retained when a temporal branch enters a character domain.
     pub(crate) temporal_string_fsp: Option<u8>,
+    /// MySQL's internal scalar field type for opaque JSON. This differs
+    /// from the protocol tag for VARCHAR/VARBINARY (15 versus 253).
+    pub(crate) json_opaque_type: Option<u8>,
 }
 
 /// Static part of a built-in's bind-time contract.  Argument-dependent
@@ -195,7 +198,8 @@ pub(crate) enum Volatility {
 pub(crate) struct TypeContext<'a> {
     pub(crate) resolve_column: &'a dyn Fn(&Expr) -> Option<ExprType>,
     pub(crate) resolve_placeholder: &'a dyn Fn(usize) -> Option<ExprType>,
-    pub(crate) resolve_subquery: &'a dyn Fn(&crate::parser::Select) -> Option<ExprType>,
+    pub(crate) resolve_subquery:
+        &'a dyn Fn(&crate::parser::Select, &TypeContext<'_>) -> Option<ExprType>,
     pub(crate) div_precision_increment: u8,
     pub(crate) group_concat_max_len: u64,
     pub(crate) connection_collation_id: u16,
@@ -279,6 +283,7 @@ impl ExprType {
     pub(crate) const fn new(kind: ExprTypeKind, nullable: bool) -> Self {
         Self {
             temporal_string_fsp: None,
+            json_opaque_type: None,
             dynamic_parameter: false,
             kind,
             nullable,
@@ -361,10 +366,14 @@ impl ExprType {
                 // The wire BLOB tag represents both TEXT and binary BLOB.
                 // Preserve the semantic family from flags/collation when a
                 // derived or set-operation schema is rebound.
-                kind: if source.flags & crate::mysql::protocol::BINARY_FLAG != 0
-                    || source.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
-                {
-                    StringKind::Blob
+                kind: if source.collation_id.map_or(
+                    source.flags & crate::mysql::protocol::BINARY_FLAG != 0,
+                    |id| id == crate::charset::BINARY_COLLATION_ID,
+                ) {
+                    match source.wire_type {
+                        Some(253 | 254) => StringKind::Binary,
+                        _ => StringKind::Blob,
+                    }
                 } else {
                     StringKind::Text
                 },
@@ -383,6 +392,25 @@ impl ExprType {
         };
         Self {
             temporal_string_fsp: None,
+            json_opaque_type: match kind {
+                ExprTypeKind::String {
+                    kind: StringKind::Binary | StringKind::Blob,
+                } => Some(match source.wire_type {
+                    Some(254) => 254,
+                    Some(252) => 252,
+                    _ if matches!(
+                        kind,
+                        ExprTypeKind::String {
+                            kind: StringKind::Blob
+                        }
+                    ) =>
+                    {
+                        252
+                    }
+                    _ => 15,
+                }),
+                _ => None,
+            },
             dynamic_parameter: false,
             kind,
             nullable: source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0,
@@ -491,6 +519,12 @@ impl ExprType {
         };
         Self {
             temporal_string_fsp: None,
+            json_opaque_type: match data_type {
+                DataTypeKind::Binary { .. } => Some(254),
+                DataTypeKind::VarBinary { .. } => Some(15),
+                DataTypeKind::Blob { .. } => Some(252),
+                _ => None,
+            },
             dynamic_parameter: false,
             kind,
             nullable,
@@ -577,6 +611,20 @@ impl ExprType {
                 kind: StringKind::Binary | StringKind::Blob,
             } => {
                 source.flags |= BINARY_FLAG;
+                source.wire_type = Some(match self.json_opaque_type {
+                    Some(254) => 254,
+                    Some(252) => 252,
+                    _ if matches!(
+                        self.kind,
+                        ExprTypeKind::String {
+                            kind: StringKind::Blob
+                        }
+                    ) =>
+                    {
+                        252
+                    }
+                    _ => 253,
+                });
             }
             ExprTypeKind::String { .. } => {
                 if let Some(collation) = self
@@ -822,6 +870,12 @@ pub(crate) fn aggregate_branch_types(left: ExprType, right: ExprType) -> ExprTyp
             },
             nullable,
         ),
+        (Geometry { .. }, _) | (_, Geometry { .. }) => ExprType::new(
+            String {
+                kind: StringKind::Binary,
+            },
+            nullable,
+        ),
         (String { kind: lk }, String { kind: rk }) => {
             let kind = if lk == rk {
                 lk
@@ -926,6 +980,12 @@ pub(crate) fn checked_branch_types(
         }
     }
     if matches!(result.kind, ExprTypeKind::String { .. }) {
+        if matches!(left.kind, ExprTypeKind::Geometry { .. })
+            || matches!(right.kind, ExprTypeKind::Geometry { .. })
+        {
+            result.collation_id = Some(crate::charset::BINARY_COLLATION_ID);
+            return Ok(result);
+        }
         let operands: Vec<Expr> = [left, right]
             .iter()
             .filter_map(|ty| {
@@ -1092,7 +1152,16 @@ fn bound_value_type(value: &Value, context: &TypeContext<'_>) -> ExprType {
             result.max_octets = Some(u32::try_from(value.len()).unwrap_or(u32::MAX));
         }
         Value::SmallString(value) => {
-            result.max_octets = Some(u32::try_from(value.len()).unwrap_or(u32::MAX));
+            result.max_octets = Some(
+                u32::try_from(
+                    std::str::from_utf8(value)
+                        .expect("SmallString is UTF-8")
+                        .chars()
+                        .count(),
+                )
+                .unwrap_or(u32::MAX)
+                .saturating_mul(u32::from(context.connection_mbmaxlen)),
+            );
             result.collation_id = Some(context.connection_collation_id);
         }
         Value::Bytes(value) => {
@@ -1502,7 +1571,16 @@ fn cast_type(args: &[Expr], input: ExprType, context: &TypeContext<'_>) -> ExprT
                     1
                 })
             })
-            .or(input.max_octets);
+            .or_else(|| {
+                string_display_octet_bound(
+                    &input,
+                    if target == "CHAR" {
+                        context.connection_mbmaxlen
+                    } else {
+                        1
+                    },
+                )
+            });
     }
     if matches!(
         kind,
@@ -1555,7 +1633,27 @@ pub(crate) fn aggregate_result_type(
         }
         "SUM" | "AVG" => {
             let avg = normalized.as_str() == "AVG";
-            let argument = argument.unwrap_or_else(|| ExprType::new(ExprTypeKind::Unknown, true));
+            let mut argument =
+                argument.unwrap_or_else(|| ExprType::new(ExprTypeKind::Unknown, true));
+            let temporal_decimal = match argument.kind {
+                ExprTypeKind::Year => Some((4, 0)),
+                ExprTypeKind::Temporal { kind, fsp } => Some((
+                    match kind {
+                        TemporalKind::Date => 8,
+                        TemporalKind::Time => 7,
+                        TemporalKind::DateTime | TemporalKind::Timestamp => 14,
+                    } + fsp,
+                    fsp,
+                )),
+                _ => None,
+            };
+            if let Some((precision, scale)) = temporal_decimal {
+                argument.kind = ExprTypeKind::Decimal {
+                    precision,
+                    scale,
+                    unsigned: false,
+                };
+            }
             match argument.kind {
                 ExprTypeKind::Float { .. } => ExprType::new(
                     ExprTypeKind::Float {
@@ -1612,14 +1710,6 @@ pub(crate) fn aggregate_result_type(
                         true,
                     )
                 }
-                ExprTypeKind::Year => ExprType::new(
-                    ExprTypeKind::Decimal {
-                        precision: 4,
-                        scale: 0,
-                        unsigned: false,
-                    },
-                    true,
-                ),
                 _ => {
                     let mut result = ExprType::new(
                         ExprTypeKind::Float {
@@ -1648,9 +1738,11 @@ pub(crate) fn aggregate_result_type(
             let binary = argument.is_some_and(|argument| {
                 matches!(
                     argument.kind,
-                    ExprTypeKind::String {
-                        kind: StringKind::Binary | StringKind::Blob
-                    }
+                    ExprTypeKind::Bit { .. }
+                        | ExprTypeKind::Geometry { .. }
+                        | ExprTypeKind::String {
+                            kind: StringKind::Binary | StringKind::Blob
+                        }
                 )
             });
             let mut result = ExprType::new(
@@ -1745,12 +1837,25 @@ fn display_octet_bound(value: &ExprType) -> Option<u32> {
         Float { .. } => Some(384),
         Temporal { kind, fsp } => Some(match kind {
             TemporalKind::Date => 10,
-            TemporalKind::Time => 11 + if fsp > 0 { 7 } else { 0 },
-            _ => 19 + if fsp > 0 { 7 } else { 0 },
+            TemporalKind::Time => 10 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
+            _ => 19 + if fsp > 0 { u32::from(fsp) + 1 } else { 0 },
         }),
         String { .. } => value.max_octets,
         _ => None,
     }
+}
+
+/// Scalar presentation widths are characters; protocol string bounds are
+/// octets in the result character set. Existing string bounds already carry
+/// their source encoding and must not be multiplied a second time.
+fn string_display_octet_bound(value: &ExprType, mbmaxlen: u8) -> Option<u32> {
+    display_octet_bound(value).map(|bytes| {
+        if matches!(value.kind, ExprTypeKind::String { .. }) {
+            bytes
+        } else {
+            bytes.saturating_mul(u32::from(mbmaxlen))
+        }
+    })
 }
 
 /// Infer a complete expression descriptor once during binding.  This routine
@@ -1815,7 +1920,13 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     let mut result = input;
                     match &mut result.kind {
                         Integer { unsigned, .. } | Decimal { unsigned, .. } => *unsigned = false,
-                        String { .. } => {
+                        Year => {
+                            result.kind = Integer {
+                                width: IntegerWidth::Big,
+                                unsigned: false,
+                            };
+                        }
+                        String { .. } | Temporal { .. } => {
                             result.kind = Float {
                                 single: false,
                                 precision: None,
@@ -1905,6 +2016,11 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
             result
         }
         Expr::Function { name, args, .. } => {
+            if crate::planner::is_aggregate_function(name) {
+                if let Some(result) = (context.resolve_column)(expr) {
+                    return result;
+                }
+            }
             if name.eq_ignore_ascii_case("RLS_CONTEXT") {
                 let mut result = fixed_string_result(None, true);
                 result.collation_id = Some(46);
@@ -1992,6 +2108,14 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 );
             }
             match normalized.as_str() {
+                "__JSON_AGG_VALUE" if args.len() == 1 => {
+                    let input = infer_expr_type(&args[0], context);
+                    if crate::engine::json::SqlScalarSource::for_type(&input).is_some() {
+                        ExprType::new(Json, false)
+                    } else {
+                        input
+                    }
+                }
                 "CONVERT_USING" if matches!(args.len(), 2 | 3) => {
                     // Octet consumers must bind the target encoding before
                     // constant folding erases the conversion's syntax.
@@ -2001,6 +2125,45 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     );
                     descriptor.collation_id =
                         crate::engine::expr::expression_metadata_collation_id(expr);
+                    let input = infer_expr_type(&args[0], context);
+                    if matches!(input.kind, String { .. }) {
+                        let target_width = descriptor
+                            .collation_id
+                            .and_then(crate::charset::resolve_collation_id)
+                            .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+                            .map(|charset| u32::from(charset.max_len))
+                            .unwrap_or(1)
+                            .max(1);
+                        let source_width = input
+                            .collation_id
+                            .and_then(crate::charset::resolve_collation_id)
+                            .and_then(|info| crate::charset::resolve_charset(info.charset).ok())
+                            .map(|charset| u32::from(charset.max_len))
+                            .unwrap_or(1)
+                            .max(1);
+                        descriptor.max_octets = input.max_octets.map(|bytes| {
+                            if descriptor.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
+                            {
+                                match &args[0] {
+                                    Expr::Literal(Literal::String(value)) => {
+                                        u32::try_from(value.len()).unwrap_or(u32::MAX)
+                                    }
+                                    Expr::BoundValue(value)
+                                        if matches!(
+                                            value,
+                                            Value::String(_) | Value::SmallString(_)
+                                        ) =>
+                                    {
+                                        u32::try_from(crate::engine::expr::str_value(value).len())
+                                            .unwrap_or(u32::MAX)
+                                    }
+                                    _ => bytes,
+                                }
+                            } else {
+                                bytes.div_ceil(source_width).saturating_mul(target_width)
+                            }
+                        });
+                    }
                     descriptor.coercibility =
                         if matches!(args.get(2), Some(Expr::Literal(Literal::Bool(true)))) {
                             4
@@ -2040,7 +2203,7 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     descriptor.coercibility = 0;
                     descriptor
                 }
-                "__COLLATED_CONST" if args.len() == 3 => {
+                "__COLLATED_CONST" if args.len() >= 3 => {
                     let mut descriptor = infer_expr_type(&args[0], context);
                     descriptor.collation_id =
                         crate::engine::expr::expression_metadata_collation_id(expr);
@@ -2212,27 +2375,63 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     result.collation_id = Some(context.connection_collation_id);
                     result
                 }
-                "CONCAT" | "CONCAT_WS" | "SUBSTRING" | "SUBSTR" | "LEFT" | "RIGHT" | "LOWER"
-                | "LCASE" | "UPPER" | "UCASE" | "TRIM" | "LTRIM" | "RTRIM" | "REVERSE"
+                "CONCAT"
+                | "__GROUP_CONCAT_VALUE"
+                | "CONCAT_WS"
+                | "SUBSTRING"
+                | "SUBSTR"
+                | "LEFT"
+                | "RIGHT"
+                | "LOWER"
+                | "LCASE"
+                | "UPPER"
+                | "UCASE"
+                | "TRIM"
+                | "LTRIM"
+                | "RTRIM"
+                | "REVERSE"
                 | "SUBSTRING_INDEX" => {
                     // Infer each string operand once: nested string functions
                     // would otherwise re-infer every subtree per pass.
                     let operands: smallvec::SmallVec<[ExprType; 4]> = args
                         .iter()
-                        .take(if matches!(normalized.as_str(), "CONCAT" | "CONCAT_WS") {
-                            args.len()
-                        } else {
-                            1
+                        .take(
+                            if matches!(
+                                normalized.as_str(),
+                                "CONCAT" | "CONCAT_WS" | "__GROUP_CONCAT_VALUE"
+                            ) {
+                                args.len()
+                            } else {
+                                1
+                            },
+                        )
+                        .map(|arg| {
+                            let mut ty = infer_expr_type(arg, context);
+                            if normalized.as_str() == "__GROUP_CONCAT_VALUE"
+                                && matches!(ty.kind, Bit { .. })
+                            {
+                                let nullable = ty.nullable;
+                                ty = ExprType::new(
+                                    String {
+                                        kind: StringKind::Binary,
+                                    },
+                                    nullable,
+                                );
+                                ty.max_octets = Some(20);
+                                ty.collation_id = Some(63);
+                            }
+                            ty
                         })
-                        .map(|arg| infer_expr_type(arg, context))
                         .collect();
                     let binary = operands.iter().any(|arg| {
-                        matches!(
-                            arg.kind,
-                            String {
-                                kind: StringKind::Binary | StringKind::Blob
-                            }
-                        )
+                        matches!(arg.kind, Bit { .. })
+                            || matches!(
+                                arg.kind,
+                                Geometry { .. }
+                                    | String {
+                                        kind: StringKind::Binary | StringKind::Blob
+                                    }
+                            )
                     });
                     let mut result = ExprType::new(
                         String {
@@ -2244,8 +2443,19 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         },
                         true,
                     );
-                    let widths: Option<smallvec::SmallVec<[u32; 4]>> =
-                        operands.iter().map(display_octet_bound).collect();
+                    let widths: Option<smallvec::SmallVec<[u32; 4]>> = operands
+                        .iter()
+                        .map(|operand| {
+                            string_display_octet_bound(
+                                operand,
+                                if binary {
+                                    1
+                                } else {
+                                    context.connection_mbmaxlen
+                                },
+                            )
+                        })
+                        .collect();
                     result.max_octets = widths.map(|widths| match normalized.as_str() {
                         "CONCAT" => widths.into_iter().fold(0u32, u32::saturating_add),
                         "CONCAT_WS" => {
@@ -2277,9 +2487,11 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         crate::charset::BINARY_COLLATION_ID
                     } else {
                         collation
+                            .as_ref()
                             .and_then(|c| c.collation_id)
                             .unwrap_or(context.connection_collation_id)
                     });
+                    result.coercibility = collation.map_or(4, |c| c.coercibility);
                     result
                 }
                 "REPLACE" if args.len() == 3 => {
@@ -2354,6 +2566,91 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     );
                     result.collation_id = Some(context.connection_collation_id);
                     result
+                }
+                "TIMESTAMPADD" => {
+                    let input = args
+                        .get(2)
+                        .map(|arg| infer_expr_type(arg, context))
+                        .unwrap_or_else(|| ExprType::new(Unknown, true));
+                    let unit = args
+                        .first()
+                        .map(crate::engine::expr::interval_unit_from_arg)
+                        .unwrap_or_default();
+                    let dynamic_input = !crate::engine::params::auto_parameterized_active()
+                        && args.get(2).is_some_and(|arg| {
+                            matches!(arg, Expr::Placeholder(_) | Expr::BoundValue(_))
+                        });
+                    if !dynamic_input && !matches!(input.kind, Temporal { .. }) {
+                        let mut result = fixed_string_result(
+                            Some(26 * u32::from(context.connection_mbmaxlen)),
+                            true,
+                        );
+                        result.collation_id = Some(context.connection_collation_id);
+                        return result;
+                    }
+                    let kind = if (matches!(
+                        input.kind,
+                        Temporal {
+                            kind: TemporalKind::Date,
+                            ..
+                        }
+                    ) || dynamic_input && !matches!(input.kind, Temporal { .. }))
+                        && matches!(unit.as_str(), "DAY" | "WEEK" | "MONTH" | "QUARTER" | "YEAR")
+                    {
+                        TemporalKind::Date
+                    } else if matches!(
+                        input.kind,
+                        Temporal {
+                            kind: TemporalKind::Time,
+                            ..
+                        }
+                    ) && matches!(
+                        unit.as_str(),
+                        "MICROSECOND" | "SECOND" | "MINUTE" | "HOUR"
+                    ) {
+                        TemporalKind::Time
+                    } else {
+                        TemporalKind::DateTime
+                    };
+                    ExprType::new(
+                        Temporal {
+                            kind,
+                            fsp: args
+                                .get(2)
+                                .map(|arg| temporal_argument_fsp(arg, context))
+                                .unwrap_or(0)
+                                .max(if dynamic_input && kind != TemporalKind::Date {
+                                    6
+                                } else {
+                                    0
+                                })
+                                .max(
+                                    crate::engine::expr::expression_metadata_decimals(expr)
+                                        .unwrap_or(0),
+                                ),
+                        },
+                        true,
+                    )
+                }
+                "JSON_VALUE"
+                    if crate::engine::expr::expression_metadata_decimals(expr).is_some() =>
+                {
+                    let kind = match args.get(2) {
+                        Some(Expr::Literal(Literal::String(returning)))
+                            if returning.trim().to_ascii_uppercase().starts_with("TIME") =>
+                        {
+                            TemporalKind::Time
+                        }
+                        _ => TemporalKind::DateTime,
+                    };
+                    ExprType::new(
+                        Temporal {
+                            kind,
+                            fsp: crate::engine::expr::expression_metadata_decimals(expr)
+                                .unwrap_or(0),
+                        },
+                        true,
+                    )
                 }
                 "DATE_ADD" | "DATE_SUB" | "ADDDATE" | "SUBDATE" => {
                     let input = args
@@ -2494,6 +2791,45 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         true,
                     )
                 }
+                "LPAD" | "RPAD" if args.len() == 3 => {
+                    let input = infer_expr_type(&args[0], context);
+                    let binary = matches!(
+                        input.kind,
+                        Bit { .. }
+                            | String {
+                                kind: StringKind::Binary | StringKind::Blob
+                            }
+                    );
+                    let mut result = ExprType::new(
+                        String {
+                            kind: if binary {
+                                StringKind::Binary
+                            } else {
+                                StringKind::Character
+                            },
+                        },
+                        true,
+                    );
+                    result.collation_id = if binary {
+                        Some(63)
+                    } else {
+                        input.collation_id.or(Some(context.connection_collation_id))
+                    };
+                    result.coercibility = input.coercibility;
+                    result.max_octets = match &args[1] {
+                        Expr::Literal(Literal::Int(n)) | Expr::BoundValue(Value::Int(n)) => Some(
+                            u32::try_from((*n).max(0))
+                                .unwrap_or(u32::MAX)
+                                .saturating_mul(if binary {
+                                    1
+                                } else {
+                                    u32::from(context.connection_mbmaxlen)
+                                }),
+                        ),
+                        _ => Some(u32::MAX),
+                    };
+                    result
+                }
                 "REPEAT" if args.len() == 2 => {
                     let input = infer_expr_type(&args[0], context);
                     let count = match &args[1] {
@@ -2506,11 +2842,11 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         _ => None,
                     };
                     let string_input = matches!(input.kind, String { .. });
+                    let binary = matches!(input.kind, Bit { .. })
+                        || (string_input && input.collation_id == Some(63));
                     let mut result = ExprType::new(
                         String {
-                            kind: if string_input
-                                && input.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
-                            {
+                            kind: if binary {
                                 StringKind::Binary
                             } else {
                                 StringKind::Character
@@ -2518,7 +2854,9 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         },
                         true, // Packet limits can produce NULL for non-NULL operands.
                     );
-                    result.collation_id = if string_input {
+                    result.collation_id = if binary {
+                        Some(63)
+                    } else if string_input {
                         input.collation_id.or(Some(context.connection_collation_id))
                     } else {
                         Some(context.connection_collation_id)
@@ -2748,7 +3086,7 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
         Expr::Subquery(select) => {
             // Empty scalar subqueries yield NULL. Use the selected expression's
             // domain, with nullability independent of whether it is a literal.
-            let mut result = (context.resolve_subquery)(select).unwrap_or_else(|| {
+            let mut result = (context.resolve_subquery)(select, context).unwrap_or_else(|| {
                 match select.projection.as_slice() {
                     [crate::parser::SelectItem::Expr { expr, .. }] if select.from.is_empty() => {
                         infer_expr_type(expr, context)
@@ -2781,6 +3119,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 }
                 "LAG" | "LEAD" | "FIRST_VALUE" | "LAST_VALUE" | "NTH_VALUE" => {
                     let mut result = argument.unwrap_or_else(|| ExprType::new(Unknown, true));
+                    if matches!(normalized.as_str(), "LAG" | "LEAD") {
+                        if let Some(default) = args.get(2) {
+                            result =
+                                aggregate_branch_types(result, infer_expr_type(default, context));
+                        }
+                    }
                     result.nullable = true;
                     result
                 }

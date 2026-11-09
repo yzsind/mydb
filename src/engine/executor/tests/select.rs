@@ -3249,7 +3249,7 @@ fn compiled_expression_program_matches_scalar_semantics() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(result.rows, vec![vec![Value::Int(42)]]);
+    assert_eq!(result.rows, vec![vec![Value::String("42".into())]]);
 
     let table = engine.db_for_tests().table("exprprog").unwrap();
     let schema = InputSchema::from_table(&table);
@@ -4589,7 +4589,7 @@ fn join_using_and_natural_join_follow_mysql_projection_rules() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(qualified_common.rows, vec![vec![Value::Int(2)]]);
+    assert_eq!(qualified_common.rows, vec![vec![Value::Null]]);
 
     let QueryResponse::ResultSet(bare_id) = engine
         .execute("SELECT id, l.id, r.id FROM lefty l JOIN righty r USING (id)")

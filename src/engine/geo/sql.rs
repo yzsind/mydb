@@ -11,8 +11,8 @@ use super::algo;
 use super::relate::{mbr_predicate, st_predicate, MbrOp, StOp};
 use super::types::*;
 use super::{
-    geo_err, invalid_gis_data, parse_wkt, read_geometry, read_wkb, srid_mismatch, to_geojson,
-    write_geometry, write_wkb, write_wkt,
+    geo_err, invalid_gis_data, parse_wkt, read_geometry, read_wkb, srid_mismatch, write_geometry,
+    write_wkb, write_wkt,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -279,6 +279,11 @@ where
 /// Evaluate a spatial function. `values` are the already-evaluated argument
 /// values. NULL in any argument yields SQL NULL for every spatial function.
 pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, QueryError> {
+    std::panic::catch_unwind(|| eval_checked(upper, name, values))
+        .map_err(|_| super::invalid_gis_data(name))?
+}
+
+fn eval_checked(upper: &str, name: &str, values: &[Value]) -> Result<Value, QueryError> {
     let Some(spec) = function_spec(upper) else {
         return Err(geo_err(
             crate::error::catalog::ER_SP_DOES_NOT_EXIST,
@@ -325,11 +330,13 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
 
         // ---- format ----
         "ST_ASTEXT" => {
-            let g = one_geom(name, values)?;
+            let mut g = geom_value(&values[0], name)?;
+            apply_axis_option(name, &mut g.geom, g.srid, values.get(1))?;
             Ok(Value::String(write_wkt(&g.geom)))
         }
         "ST_ASBINARY" => {
-            let g = one_geom(name, values)?;
+            let mut g = geom_value(&values[0], name)?;
+            apply_axis_option(name, &mut g.geom, g.srid, values.get(1))?;
             Ok(Value::Bytes(write_wkb(&g.geom)))
         }
         "ST_ASGEOJSON" => {
@@ -341,22 +348,9 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
             }
             check_range(name, values, 1, 3)?;
             let g = geom_value(&values[0], name)?;
-            let mut geojson_geom = g.geom.clone();
-            if matches!(
-                super::srs::require(g.srid, name)?.axis_order,
-                super::srs::AxisOrder::LatLong
-            ) {
-                // RFC 7946 coordinate arrays are longitude/latitude even
-                // when the SRS definition stores latitude/longitude axes.
-                geojson_geom.for_each_coord_mut(&mut |coord| {
-                    std::mem::swap(&mut coord.x, &mut coord.y);
-                });
-            }
-            let text = to_geojson(&geojson_geom);
-            // MySQL returns a JSON document.
-            Ok(Value::Json(
-                crate::engine::json::parse_text_opt(&text).unwrap_or_default(),
-            ))
+            Ok(Value::Json(crate::engine::json::from_serde(
+                &super::geometry_json_value(&g)?,
+            )))
         }
 
         // ---- properties ----
@@ -422,6 +416,7 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
         // ---- construction ----
         "ST_CENTROID" => {
             let g = one_geom(name, values)?;
+            require_planar(name, &g)?;
             match algo::centroid(&g.geom) {
                 Some(c) => geom_to_value(Geometry::new(g.srid, Geom::Point(c))),
                 None => Ok(Value::Null),
@@ -429,6 +424,7 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
         }
         "ST_ENVELOPE" => {
             let g = one_geom(name, values)?;
+            require_planar(name, &g)?;
             match algo::envelope(&g.geom) {
                 Some(geom) => geom_to_value(Geometry::new(g.srid, geom)),
                 None => Ok(Value::Null),
@@ -436,6 +432,7 @@ pub(crate) fn eval(upper: &str, name: &str, values: &[Value]) -> Result<Value, Q
         }
         "ST_CONVEXHULL" => {
             let g = one_geom(name, values)?;
+            require_planar(name, &g)?;
             match algo::convex_hull(&g.geom) {
                 Some(geom) => geom_to_value(Geometry::new(g.srid, geom)),
                 None => Ok(Value::Null),
@@ -588,9 +585,21 @@ fn geohash_decode(hash: &str) -> Option<(f64, f64)> {
             even = !even;
         }
     }
+    fn shortest_cell_decimal((low, high): (f64, f64)) -> f64 {
+        let center = (low + high) * 0.5;
+        let mut factor = 1.0;
+        for _ in 0..=16 {
+            let rounded = (center * factor).round_ties_even() / factor;
+            if (low..=high).contains(&rounded) {
+                return rounded;
+            }
+            factor *= 10.0;
+        }
+        center
+    }
     Some((
-        (lon_range.0 + lon_range.1) / 2.0,
-        (lat_range.0 + lat_range.1) / 2.0,
+        shortest_cell_decimal(lon_range),
+        shortest_cell_decimal(lat_range),
     ))
 }
 
@@ -614,7 +623,14 @@ fn st_geohash(name: &str, values: &[Value]) -> Result<Value, QueryError> {
                 format!("function {name} is only defined for POINT values."),
             ));
         };
-        (c.x, c.y, 1)
+        if matches!(
+            super::srs::require(g.srid, name)?.axis_order,
+            super::srs::AxisOrder::LatLong
+        ) {
+            (c.y, c.x, 1)
+        } else {
+            (c.x, c.y, 1)
+        }
     };
     let max_len = as_i64(&values[len_idx])?;
     if !(1..=100).contains(&max_len) {
@@ -674,7 +690,15 @@ fn st_point_from_geohash(name: &str, values: &[Value]) -> Result<Value, QueryErr
         )
     })?;
     let srid = as_srid(&values[1], name)?;
-    geom_to_value(Geometry::new(srid, Geom::Point(Coord { x: lon, y: lat })))
+    let coord = if matches!(
+        super::srs::require(srid, name)?.axis_order,
+        super::srs::AxisOrder::LatLong
+    ) {
+        Coord { x: lat, y: lon }
+    } else {
+        Coord { x: lon, y: lat }
+    };
+    geom_to_value(Geometry::new(srid, Geom::Point(coord)))
 }
 
 fn check_count(name: &str, values: &[Value], n: usize) -> Result<(), QueryError> {
@@ -705,7 +729,7 @@ fn geom_value(v: &Value, func: &str) -> Result<Geometry, QueryError> {
     Ok(geometry)
 }
 
-fn validate_geometry_srs(geometry: &Geometry, function: &str) -> Result<(), QueryError> {
+pub(super) fn validate_geometry_srs(geometry: &Geometry, function: &str) -> Result<(), QueryError> {
     let srs = super::srs::require(geometry.srid, function)?;
     if srs.kind != super::srs::SrsKind::Geographic {
         // Reading the projected system's native linear unit here keeps the
@@ -720,8 +744,17 @@ fn validate_geometry_srs(geometry: &Geometry, function: &str) -> Result<(), Quer
         .angular_unit
         .map(|unit| unit.radians_per_unit)
         .unwrap_or(std::f64::consts::PI / 180.0);
-    let half_turn = std::f64::consts::PI / radians_per_unit;
-    let quarter_turn = std::f64::consts::FRAC_PI_2 / radians_per_unit;
+    let unit_limit = |radians: f64| {
+        let value = radians / radians_per_unit;
+        let rounded = value.round();
+        if (value - rounded).abs() <= value.abs() * f64::EPSILON * 8.0 {
+            rounded
+        } else {
+            value
+        }
+    };
+    let half_turn = unit_limit(std::f64::consts::PI);
+    let quarter_turn = unit_limit(std::f64::consts::FRAC_PI_2);
     let mut violation = None;
     geometry.geom.for_each_coord(&mut |coord| {
         if violation.is_some() {
@@ -735,7 +768,7 @@ fn validate_geometry_srs(geometry: &Geometry, function: &str) -> Result<(), Quer
             violation = Some(geo_err(
                 crate::error::catalog::ER_GEOMETRY_PARAM_LONGITUDE_OUT_OF_RANGE,
                 format!(
-                    "Longitude {longitude} is out of range in function {function}. It must be within (-{half_turn}, {half_turn}]."
+                    "Longitude {longitude} is out of range in function {function}. It must be within [-{half_turn}, {half_turn}]."
                 ),
             ));
         } else if !(-quarter_turn..=quarter_turn).contains(&latitude) {
@@ -778,37 +811,14 @@ fn as_f64(v: &Value) -> Result<f64, QueryError> {
 }
 
 fn as_srid(v: &Value, function: &str) -> Result<u32, QueryError> {
-    if matches!(
-        v,
-        Value::Decimal(_)
-            | Value::DecimalCompact(..)
-            | Value::Decimal128(..)
-            | Value::DecimalWide(..)
-    ) {
-        if let Some(exact) = v.exact_decimal() {
-            use num_traits::ToPrimitive;
-            let integer = crate::util::decimal::rescale_exact(exact, 0, false)
-                .into_big_parts()
-                .0;
-            if integer.to_u32().is_none() {
-                return Err(geo_err(
-                    crate::error::catalog::ER_DATA_OUT_OF_RANGE,
-                    "SRID value is out of range",
-                ));
-            }
-        }
-    }
-    if matches!(v, Value::UInt(value) if *value > u32::MAX as u64) {
-        return Err(geo_err(
+    let value = crate::engine::expr::cast_to_integer(v, true)?;
+    let Value::UInt(value) = value else {
+        unreachable!("unsigned CAST")
+    };
+    let srid = u32::try_from(value).map_err(|_| {
+        geo_err(
             crate::error::catalog::ER_DATA_OUT_OF_RANGE,
             "SRID value is out of range",
-        ));
-    }
-    let s = crate::engine::expr::int_value(v)?;
-    let srid = u32::try_from(s).map_err(|_| {
-        geo_err(
-            crate::error::catalog::ER_SRS_PARSE_ERROR,
-            "the SRID value must be between 0 and 2^32-1",
         )
     })?;
     super::srs::require(srid, function)?;
@@ -816,7 +826,18 @@ fn as_srid(v: &Value, function: &str) -> Result<u32, QueryError> {
 }
 
 fn geom_to_value(g: Geometry) -> Result<Value, QueryError> {
+    validate_geometry_srs(&g, "geometry constructor")?;
     Ok(Value::Geometry(write_geometry(&g)?))
+}
+
+fn require_planar(name: &str, geometry: &Geometry) -> Result<(), QueryError> {
+    if super::srs::require(geometry.srid, name)?.kind == super::srs::SrsKind::Geographic {
+        return Err(geo_err(
+            crate::error::catalog::ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS,
+            format!("Function {name} is not implemented for geographic spatial reference systems."),
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -899,17 +920,20 @@ fn geom_from_geojson(name: &str, values: &[Value]) -> Result<Value, QueryError> 
     check_range(name, values, 1, 3)?;
     // MySQL defaults the result SRID to 4326 for GeoJSON; an explicit SRID is
     // the 3rd argument.
-    let srid = match values.get(2) {
-        Some(v) => as_srid(v, name)?,
-        None => 4326,
-    };
+    let srid = values
+        .get(2)
+        .map(|value| as_srid(value, name))
+        .transpose()?;
     let option = values.get(1).map(as_i64).transpose()?.unwrap_or(1);
     if !(1..=4).contains(&option) {
         return Err(buffer_strategy_arguments_error(name));
     }
-    let mut g = super::geojson::from_geojson_options(&text_of(&values[0]), srid, option != 1)?;
+    let Some(mut g) = super::geojson::from_geojson_sql(&text_of(&values[0]), srid, option != 1)?
+    else {
+        return Ok(Value::Null);
+    };
     if matches!(
-        super::srs::require(srid, name)?.axis_order,
+        super::srs::require(g.srid, name)?.axis_order,
         super::srs::AxisOrder::LatLong
     ) {
         // GeoJSON is always longitude/latitude. Convert to the SRS-defined
@@ -1470,6 +1494,7 @@ fn discrete_curve_distance(
     if left.srid != right.srid {
         return Err(srid_mismatch(name, left.srid, right.srid));
     }
+    require_planar(name, &left)?;
     let left = curve_coords(&left, name)?;
     let right = curve_coords(&right, name)?;
     if left.is_empty() || right.is_empty() {
@@ -1529,6 +1554,7 @@ fn line_interpolate(
 ) -> Result<Value, QueryError> {
     check_count(name, values, 2)?;
     let geometry = geom_value(&values[0], name)?;
+    require_planar(name, &geometry)?;
     let coords = curve_coords(&geometry, name)?;
     if coords.len() < 2 {
         return Ok(Value::Null);
@@ -1601,10 +1627,11 @@ fn line_interpolate(
 fn simplify_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> {
     check_count(name, values, 2)?;
     let mut geometry = geom_value(&values[0], name)?;
+    require_planar(name, &geometry)?;
     let tolerance = as_f64(&values[1])?;
-    if !tolerance.is_finite() || tolerance < 0.0 {
+    if !tolerance.is_finite() || tolerance <= 0.0 {
         return Err(geo_err(
-            crate::error::catalog::ER_DATA_OUT_OF_RANGE,
+            crate::error::catalog::ER_WRONG_ARGUMENTS,
             format!("The tolerance is out of range in function {name}."),
         ));
     }
@@ -1689,6 +1716,31 @@ fn simplify_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError> 
         Ok(())
     }
     simplify(&mut geometry.geom, tolerance)?;
+    fn retain_polygon(rings: &mut Vec<Vec<Coord>>) -> bool {
+        if rings.first().is_none_or(|ring| ring.len() < 4) {
+            return false;
+        }
+        rings.retain(|ring| ring.len() >= 4);
+        true
+    }
+    fn retain_geometry(geom: &mut Geom) -> bool {
+        match geom {
+            Geom::Polygon(rings) => retain_polygon(rings),
+            Geom::MultiPolygon(polygons) => {
+                polygons.retain_mut(retain_polygon);
+                !polygons.is_empty()
+            }
+            Geom::GeometryCollection(geometries) => {
+                geometries.retain_mut(retain_geometry);
+                !geometries.is_empty()
+            }
+            _ => true,
+        }
+    }
+    if !retain_geometry(&mut geometry.geom) {
+        return Ok(Value::Null);
+    }
+    super::validate_shape(&geometry.geom)?;
     geom_to_value(geometry)
 }
 
@@ -1699,13 +1751,17 @@ fn transform_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError>
     if geometry.srid == target {
         return geom_to_value(geometry);
     }
+    let mut outside_projection = false;
     match (geometry.srid, target) {
         (4326, 3857) => geometry.geom.for_each_coord_mut(&mut |coord| {
-            let latitude = coord.x.clamp(-85.051_128_779_806_6, 85.051_128_779_806_6);
+            let latitude = coord.x;
+            if latitude.abs() >= 90.0 {
+                outside_projection = true;
+                return;
+            }
             let longitude = coord.y;
             coord.x = longitude.to_radians() * 6_378_137.0;
-            coord.y = ((std::f64::consts::FRAC_PI_4 + latitude.to_radians() / 2.0).tan()).ln()
-                * 6_378_137.0;
+            coord.y = latitude.to_radians().tan().asinh() * 6_378_137.0;
         }),
         (3857, 4326) => geometry.geom.for_each_coord_mut(&mut |coord| {
             let longitude = (coord.x / 6_378_137.0).to_degrees();
@@ -1713,7 +1769,10 @@ fn transform_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError>
                 - std::f64::consts::FRAC_PI_2)
                 .to_degrees();
             coord.x = latitude;
-            coord.y = longitude;
+            coord.y = (longitude + 180.0).rem_euclid(360.0) - 180.0;
+            if coord.y == -180.0 {
+                coord.y = 180.0;
+            }
         }),
         _ => {
             return Err(geo_err(
@@ -1724,6 +1783,9 @@ fn transform_geometry(name: &str, values: &[Value]) -> Result<Value, QueryError>
                 ),
             ))
         }
+    }
+    if outside_projection {
+        return Ok(Value::Null);
     }
     geometry.srid = target;
     geom_to_value(geometry)
@@ -1748,14 +1810,23 @@ fn st_pred(name: &str, values: &[Value], op: StOp) -> Result<Value, QueryError> 
     if a.srid != b.srid {
         return Err(srid_mismatch(name, a.srid, b.srid));
     }
-    if matches!(op, StOp::Touches | StOp::Crosses)
-        && matches!((&a.geom, &b.geom), (Geom::Point(_), Geom::Point(_)))
+    let left_dimension = a.geom.dimension();
+    let right_dimension = b.geom.dimension();
+    if (matches!(op, StOp::Touches) && left_dimension == Some(0) && right_dimension == Some(0))
+        || (matches!(op, StOp::Crosses)
+            && (left_dimension == Some(2) || right_dimension == Some(0)))
+        || (matches!(op, StOp::Overlaps) && left_dimension != right_dimension)
     {
         return Ok(Value::Null);
     }
-    Ok(st_predicate(op, &a.geom, &b.geom)
-        .map(|t| Value::Int(t as i64))
-        .unwrap_or(Value::Null))
+    if left_dimension.is_some_and(|dimension| dimension > 0)
+        || right_dimension.is_some_and(|dimension| dimension > 0)
+    {
+        require_planar(name, &a)?;
+    }
+    let result = std::panic::catch_unwind(|| st_predicate(op, &a.geom, &b.geom))
+        .map_err(|_| super::invalid_gis_data(name))?;
+    Ok(result.map(|t| Value::Int(t as i64)).unwrap_or(Value::Null))
 }
 
 // ---------------------------------------------------------------------------
@@ -1764,9 +1835,7 @@ fn st_pred(name: &str, values: &[Value], op: StOp) -> Result<Value, QueryError> 
 
 fn is_closed(geom: &Geom) -> bool {
     fn line_closed(cs: &[Coord]) -> bool {
-        cs.len() >= 2
-            && (cs[0].x - cs[cs.len() - 1].x).abs() < 1e-9
-            && (cs[0].y - cs[cs.len() - 1].y).abs() < 1e-9
+        cs.len() >= 2 && cs.first() == cs.last()
     }
     match geom {
         Geom::LineString(cs) => line_closed(cs),
@@ -1777,8 +1846,8 @@ fn is_closed(geom: &Geom) -> bool {
 
 fn ring_ok(ring: &[Coord]) -> bool {
     ring.len() >= 4
-        && (ring[0].x - ring[ring.len() - 1].x).abs() < 1e-9
-        && (ring[0].y - ring[ring.len() - 1].y).abs() < 1e-9
+        && ring.first() == ring.last()
+        && algo::area(&Geom::Polygon(vec![ring.to_vec()])) > 0.0
 }
 
 fn is_valid(geom: &Geom) -> bool {
@@ -1804,7 +1873,7 @@ fn is_simple(geom: &Geom) -> bool {
             // simple iff no two points coincide
             for i in 0..ps.len() {
                 for j in (i + 1)..ps.len() {
-                    if (ps[i].x - ps[j].x).abs() < 1e-9 && (ps[i].y - ps[j].y).abs() < 1e-9 {
+                    if ps[i] == ps[j] {
                         return false;
                     }
                 }
@@ -1857,8 +1926,23 @@ fn is_simple(geom: &Geom) -> bool {
             true
         }
         // Polygon simplicity is separate from validity, matching MySQL.
-        Geom::Polygon(_) | Geom::MultiPolygon(_) => true,
+        Geom::Polygon(rings) => rings.iter().all(|ring| ring_is_simple(ring)),
+        Geom::MultiPolygon(polygons) => polygons
+            .iter()
+            .all(|rings| rings.iter().all(|ring| ring_is_simple(ring))),
     }
+}
+
+fn ring_is_simple(ring: &[Coord]) -> bool {
+    if ring.windows(2).any(|segment| segment[0] == segment[1]) {
+        return false;
+    }
+    let overlap =
+        |a: Coord, b: Coord, c: Coord| algo::on_segment(a, b, c) || algo::on_segment(c, a, b);
+    !ring
+        .windows(3)
+        .any(|points| overlap(points[0], points[1], points[2]))
+        && (ring.len() < 3 || !overlap(ring[ring.len() - 2], ring[0], ring[1]))
 }
 
 /// A line is simple if no pair of non-adjacent segments intersects (a closed
@@ -1868,10 +1952,17 @@ fn line_is_simple(cs: &[Coord]) -> bool {
         return true;
     }
     let n = cs.len() - 1; // segment count
-    let closed = (cs[0].x - cs[n].x).abs() < 1e-9 && (cs[0].y - cs[n].y).abs() < 1e-9;
+    let closed = cs[0] == cs[n];
     for i in 0..n {
         for j in (i + 1)..n {
             if j == i + 1 {
+                if cs[i] != cs[j]
+                    && cs[j] != cs[j + 1]
+                    && (algo::on_segment(cs[i], cs[j], cs[j + 1])
+                        || algo::on_segment(cs[j + 1], cs[i], cs[j]))
+                {
+                    return false;
+                }
                 continue; // adjacent segments share a vertex
             }
             // First and last segment of a closed ring share the start vertex.

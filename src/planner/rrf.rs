@@ -34,6 +34,7 @@ fn normalize(query: &mut QueryExpr) -> Result<(), QueryError> {
                 if let SelectItem::Expr { expr, .. } = item {
                     if !select.order_by.iter().any(|order| order.expr == *expr) {
                         select.order_by.push(OrderBy {
+                            names_bound: false,
                             expr: expr.clone(),
                             asc: true,
                             nulls_first: None,
@@ -101,6 +102,7 @@ pub(super) fn build(db: &Database, rrf: &RrfFusion) -> Result<PhysicalPlan, Quer
             if let PhysicalPlan::VectorIndexScan { order_by, .. } = node {
                 if order_by.len() == 1 {
                     order_by.push(OrderBy {
+                        names_bound: false,
                         expr: Expr::Literal(Literal::Int(0)),
                         asc: true,
                         nulls_first: None,

@@ -83,7 +83,7 @@ pub(super) fn lock_select_rows_for_update(
         && stmt.having.is_none()
     {
         if let Some(row_id) =
-            unique_row_id_for_exact_write(db, txn, &table, stmt.selection.as_ref())?
+            unique_row_id_for_exact_write(db, txn, &table, stmt.selection.as_ref(), false)?
         {
             let row_ref = crate::storage::DmlRowRef {
                 storage_id: table.id,
@@ -297,6 +297,14 @@ pub(super) fn execute_locked_single_table_select(
             .iter()
             .any(|item| expr_has_subquery(&item.expr))
     {
+        if stmt
+            .lock_clause
+            .as_ref()
+            .is_some_and(|clause| clause.wait == crate::parser::LockWaitMode::SkipLocked)
+        {
+            return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET
+                .error("SKIP LOCKED is not supported for this locking SELECT shape"));
+        }
         return Ok(None);
     }
 
@@ -587,7 +595,7 @@ pub(super) fn execute_update(
         if !has_update_triggers
             || user_changed_columns
                 .iter()
-                .any(|&idx| values[idx] != new_values[idx])
+                .any(|&idx| !values[idx].storage_eq(&new_values[idx]))
         {
             apply_on_update_timestamps(&table, &mut new_values, &on_update_columns);
         }
@@ -634,7 +642,9 @@ pub(super) fn execute_update(
         );
     }
     if !has_update_triggers && stmt.returning.is_none() {
-        if let Some(row_id) = unique_row_id_for_exact_write(db, txn, &table, selection_for_scan)? {
+        if let Some(row_id) =
+            unique_row_id_for_exact_write(db, txn, &table, selection_for_scan, true)?
+        {
             let changed = match db.update_row_by_id_with_changed_columns_noop(
                 txn,
                 &table,
@@ -1120,7 +1130,9 @@ pub(super) fn execute_update_borrowed_simple(
         return Ok(Some(QueryResponse::OkAffected { affected_rows }));
     }
     let ordered_limited_candidates: Option<Vec<RowId>> = None;
-    if let Some(row_id) = unique_row_id_for_exact_write(db, txn, &table, stmt.selection.as_ref())? {
+    if let Some(row_id) =
+        unique_row_id_for_exact_write(db, txn, &table, stmt.selection.as_ref(), true)?
+    {
         if ordered_limited_candidates.is_none() {
             let changed = match db.update_row_by_id_with_changed_columns_noop(
                 txn,
@@ -1306,7 +1318,7 @@ pub(super) fn execute_prepared_point_update(
             crate::engine::expr::validate_dml_temporal_functions(selection)?;
         }
     }
-    let row_id = db.lookup_unique_index_for_write_one(
+    let row_id = db.lock_unique_index_row_for_write(
         txn,
         &point.table,
         &point.index,
@@ -1452,7 +1464,7 @@ pub(super) fn changed_columns_after_trigger(
 ) -> Vec<usize> {
     let mut changed_columns = planned_changed_columns.to_vec();
     for (idx, (old_value, new_value)) in old_values.iter().zip(new_values.iter()).enumerate() {
-        if old_value != new_value && !changed_columns.contains(&idx) {
+        if !old_value.storage_eq(new_value) && !changed_columns.contains(&idx) {
             changed_columns.push(idx);
         }
     }
@@ -2373,6 +2385,7 @@ pub(super) fn unique_row_id_for_exact_write(
     txn: TxnView,
     table: &TableSchema,
     selection: Option<&Expr>,
+    lock_candidate: bool,
 ) -> Result<Option<RowId>, QueryError> {
     if table.is_partitioned() {
         return Ok(None);
@@ -2391,7 +2404,13 @@ pub(super) fn unique_row_id_for_exact_write(
     {
         return Ok(None);
     }
-    let row_id = db.lookup_unique_index_for_write_one(txn, table, index, key)?;
+    // Locking SELECT applies its own FOR SHARE/UPDATE and wait mode below.
+    // Only point UPDATE acquires and validates its candidate here.
+    let row_id = if lock_candidate {
+        db.lock_unique_index_row_for_write(txn, table, index, key)?
+    } else {
+        db.lookup_unique_index_for_write_one(txn, table, index, key)?
+    };
     crate::engine::api::add_statement_dml_candidate_rows(u64::from(row_id.is_some()));
     Ok(row_id)
 }
@@ -2419,7 +2438,7 @@ pub(super) fn unique_row_ids_for_exact_delete(
     {
         return Ok(None);
     }
-    let row_id = db.lookup_unique_index_for_write_one(txn, table, index, key)?;
+    let row_id = db.lock_unique_index_row_for_write(txn, table, index, key)?;
     crate::engine::api::add_statement_dml_candidate_rows(u64::from(row_id.is_some()));
     Ok(row_id.map(|id| vec![id]))
 }
@@ -2489,7 +2508,7 @@ pub(super) fn materialize_subqueries(
                     *subquery.clone(),
                     dml_subquery_registry(),
                 )?
-                .materialize()?;
+                .materialize_preserving_precision()?;
                 let QueryResponse::ResultSet(result) = response else {
                     return Err(error(
                         crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -2949,7 +2968,7 @@ fn execute_scalar_subquery(
     // P1-1: the subquery may run on the streaming path; materialise
     // before destructuring so we can index `result.rows`.
     let response = execute_expression_subquery(db, txn, subquery.clone(), dml_subquery_registry())?
-        .materialize()?;
+        .materialize_preserving_precision()?;
     scalar_subquery_value(response)
 }
 
@@ -3022,8 +3041,8 @@ pub(super) fn execute_scalar_subquery_strict(
 ) -> Result<Value, QueryError> {
     let mut subquery = subquery.clone();
     super::qualification::qualify_select_tables(db, session, &mut subquery)?;
-    let response =
-        execute_expression_subquery(db, txn, subquery, dml_subquery_registry())?.materialize()?;
+    let response = execute_expression_subquery(db, txn, subquery, dml_subquery_registry())?
+        .materialize_preserving_precision()?;
     scalar_subquery_value(response)
 }
 
@@ -3033,7 +3052,7 @@ fn execute_in_subquery_values(
     subquery: &Select,
 ) -> Result<Vec<Value>, QueryError> {
     let response = execute_expression_subquery(db, txn, subquery.clone(), dml_subquery_registry())?
-        .materialize()?;
+        .materialize_preserving_precision()?;
     let QueryResponse::ResultSet(result) = response else {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -3053,7 +3072,7 @@ fn execute_quantified_subquery_values(
     subquery: &Select,
 ) -> Result<Vec<Value>, QueryError> {
     let response = execute_expression_subquery(db, txn, subquery.clone(), dml_subquery_registry())?
-        .materialize()?;
+        .materialize_preserving_precision()?;
     let QueryResponse::ResultSet(result) = response else {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -3089,7 +3108,8 @@ fn execute_exists_subquery(
             }
         }
     }
-    let response = execute_select(db, txn, subquery, dml_subquery_registry())?.materialize()?;
+    let response = execute_select(db, txn, subquery, dml_subquery_registry())?
+        .materialize_preserving_precision()?;
     let QueryResponse::ResultSet(result) = response else {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,

@@ -822,9 +822,13 @@ pub(super) fn stored_view_query(view: &ViewSchema) -> Result<Select, QueryError>
 /// variable number of columns and are left alone (they pick up the
 /// underlying table's names, which is also MySQL's behaviour for views
 /// without an explicit column list).
-fn apply_view_column_aliases(db: &Database, select: &mut Select, columns: &[ViewColumnDef]) {
+fn apply_view_column_aliases(
+    db: &Database,
+    select: &mut Select,
+    columns: &[ViewColumnDef],
+) -> Result<(), QueryError> {
     if columns.is_empty() || columns.len() != select.projection.len() {
-        return;
+        return Ok(());
     }
     use crate::parser::SelectItem as PSelectItem;
     if select.projection.iter().zip(columns).any(|(item, target)| {
@@ -835,13 +839,14 @@ fn apply_view_column_aliases(db: &Database, select: &mut Select, columns: &[View
         // internal clauses retain the bindings of the original SELECT.
         crate::planner::resolve_group_by_refs(db, select);
         crate::planner::resolve_having_aliases(select);
-        crate::planner::resolve_order_by_output_refs(db, select);
+        crate::planner::resolve_order_by_output_refs(db, select)?;
     }
     for (item, target) in select.projection.iter_mut().zip(columns.iter()) {
         if let PSelectItem::Expr { alias, .. } = item {
             *alias = Some(target.name.clone());
         }
     }
+    Ok(())
 }
 
 /// Validate a CREATE/ALTER VIEW body. Verifies the body parses as a SELECT,
@@ -1062,12 +1067,11 @@ pub(super) fn validate_view_definition(
                 )
                 .is_none()
         {
+            let (database, function) =
+                crate::storage::split_table_name(&session.current_database, &name);
             return Err(error(
                 crate::error::catalog::ER_SP_DOES_NOT_EXIST,
-                format!(
-                    "FUNCTION {}.{} does not exist",
-                    session.current_database, name
-                ),
+                format!("FUNCTION {database}.{function} does not exist"),
             ));
         }
     }
@@ -1179,7 +1183,7 @@ pub(super) fn validate_view_definition(
         }
     }
 
-    apply_view_column_aliases(db, &mut original_select, &columns);
+    apply_view_column_aliases(db, &mut original_select, &columns)?;
     original_select.no_merge = algorithm.eq_ignore_ascii_case("TEMPTABLE");
 
     // Canonicalize presentation separately from the semantic query. Rendered
@@ -1776,12 +1780,9 @@ fn infer_view_expr_type(
             let name = parts.last()?;
             view_scope_column(db, current_database, select, name)
         }
-        // User variables / placeholders / bound params / subqueries: let the
-        // execute-time type win, matching MySQL's treatment of these as
-        // dynamically typed in view columns.
+        // User variables and parameters have no fixed declaration here.
         PExpr::UserVariable(_)
         | PExpr::Placeholder(_)
-        | PExpr::Subquery(_)
         | PExpr::Exists { .. }
         | PExpr::InSubquery { .. }
         | PExpr::QuantifiedComparison { .. } => None,
