@@ -272,6 +272,12 @@ pub(super) enum PredicateNode {
         negated: bool,
         has_null: bool,
     },
+    IntegerIn {
+        col: usize,
+        keys: Arc<IntegerInSet>,
+        negated: bool,
+        fallback: Arc<crate::engine::expr_program::ExprProgram>,
+    },
     ColumnCmp {
         left: usize,
         op: BinaryOp,
@@ -293,6 +299,24 @@ pub(super) enum PredicateNode {
     },
     Const(bool),
     Program(crate::engine::expr_program::ExprProgram),
+}
+
+pub(super) struct IntegerInSet {
+    values: Vec<i128>,
+    has_null: bool,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl IntegerInSet {
+    #[inline]
+    fn admits(&self, value: i128, negated: bool) -> bool {
+        let found = self.values.binary_search(&value).is_ok();
+        if negated {
+            !found && !self.has_null
+        } else {
+            found
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -326,6 +350,7 @@ impl CompiledPredicate {
                 PredicateNode::Cmp { .. }
                 | PredicateNode::StringCmp { .. }
                 | PredicateNode::StringIn { .. }
+                | PredicateNode::IntegerIn { .. }
                 | PredicateNode::ColumnCmp { .. }
                 | PredicateNode::IsNull { .. }
                 | PredicateNode::TimestampDateIntCmp { .. }
@@ -1070,6 +1095,7 @@ pub(super) fn collect_typed_conjunction(
         PredicateNode::Cmp { .. }
         | PredicateNode::StringCmp { .. }
         | PredicateNode::StringIn { .. }
+        | PredicateNode::IntegerIn { .. }
         | PredicateNode::ColumnCmp { .. }
         | PredicateNode::IsNull { .. }
         | PredicateNode::TimestampDateIntCmp { .. }
@@ -1333,6 +1359,9 @@ pub(super) fn compile_predicate_node(expr: &Expr, schema: &TableSchema) -> Optio
             if let Some(node) = compile_fast_string_in(tested, list, *negated, schema) {
                 return Some(node);
             }
+            if let Some(node) = compile_fast_integer_in(expr, tested, list, *negated, schema) {
+                return Some(node);
+            }
             let input = InputSchema::from_table(schema);
             ExprCompiler::compile(expr, &input)
                 .ok()
@@ -1361,6 +1390,78 @@ pub(super) fn compile_predicate_node(expr: &Expr, schema: &TableSchema) -> Optio
                 .map(PredicateNode::Program)
         }
     }
+}
+
+/// Opened scans capture bound constants once, just like their scalar range
+/// leaves. Fractional/invalid operands and representation-sensitive literals
+/// retain the complete oracle; optional key storage uses the executor budget.
+fn compile_fast_integer_in(
+    expr: &Expr,
+    tested: &Expr,
+    list: &[Expr],
+    negated: bool,
+    schema: &TableSchema,
+) -> Option<PredicateNode> {
+    let col = simple_column_index_of(tested, schema)?;
+    if list.is_empty()
+        || !matches!(
+            schema.columns.get(col)?.data_type,
+            DataTypeKind::TinyInt
+                | DataTypeKind::SmallInt
+                | DataTypeKind::MediumInt
+                | DataTypeKind::Int
+                | DataTypeKind::BigInt
+                | DataTypeKind::Bool
+        )
+    {
+        return None;
+    }
+    let bytes = list
+        .len()
+        .checked_mul(std::mem::size_of::<i128>())?
+        .checked_add(std::mem::size_of::<IntegerInSet>() + 2 * std::mem::size_of::<usize>())?;
+    let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+        bytes,
+    )?;
+    let mut values =
+        crate::engine::executor::mem_budget::try_vec_with_capacity(list.len(), "integer IN keys")
+            .ok()?;
+    let mut has_null = false;
+    for item in list {
+        if crate::engine::expr::expr_is_numeric_hexbit_literal(item) {
+            return None;
+        }
+        // Statement-stable calls can still publish conversion diagnostics.
+        // Resolve only literal/execution bindings before visiting any row.
+        let value = crate::engine::expr::expr_literal_value(item)?;
+        let value = match value {
+            Value::Null => {
+                has_null = true;
+                continue;
+            }
+            Value::Int(_) | Value::UInt(_) => value,
+            _ => crate::engine::expr::exact_integer_comparison_constant(&value)?,
+        };
+        values.push(match value {
+            Value::Int(value) => i128::from(value),
+            Value::UInt(value) => i128::from(value),
+            _ => return None,
+        });
+    }
+    values.sort_unstable();
+    values.dedup();
+    let fallback = ExprCompiler::compile(expr, &InputSchema::from_table(schema)).ok()?;
+    Some(PredicateNode::IntegerIn {
+        col,
+        keys: Arc::new(IntegerInSet {
+            values,
+            has_null,
+            _charge: charge,
+        }),
+        negated,
+        fallback: Arc::new(fallback),
+    })
 }
 
 pub(super) fn compile_fast_string_in(
@@ -1495,6 +1596,22 @@ pub(super) fn eval_predicate_node(
             eval_string_in_predicate(&values[*col], literals, *collation, *negated, *has_null)
                 .unwrap_or(false),
         ),
+        PredicateNode::IntegerIn {
+            col,
+            keys,
+            negated,
+            fallback,
+        } => match &values[*col] {
+            Value::Null => Ok(false),
+            Value::Int(value) => Ok(keys.admits(i128::from(*value), *negated)),
+            Value::UInt(value) => Ok(keys.admits(i128::from(*value), *negated)),
+            _ => {
+                let mut scratch = crate::engine::expr_program::EvalScratch::default();
+                fallback
+                    .eval_source(&values, &mut scratch)
+                    .map(|value| crate::engine::expr::truthy(&value))
+            }
+        },
         PredicateNode::ColumnCmp { left, op, right } => {
             if matches!(values[*left], Value::Null) || matches!(values[*right], Value::Null) {
                 return Ok(matches!(op, BinaryOp::NullSafeEq)
@@ -1644,6 +1761,14 @@ pub(super) fn eval_typed_predicate_leaf(
             PredicateValue::Value(value) => Ok(eval_string_in_predicate(
                 value, literals, *collation, *negated, *has_null,
             )),
+            _ => Ok(None),
+        },
+        PredicateNode::IntegerIn {
+            col, keys, negated, ..
+        } => match &values[*col] {
+            PredicateValue::Null => Ok(Some(false)),
+            PredicateValue::I64(value) => Ok(Some(keys.admits(i128::from(*value), *negated))),
+            PredicateValue::U64(value) => Ok(Some(keys.admits(i128::from(*value), *negated))),
             _ => Ok(None),
         },
         PredicateNode::ColumnCmp { left, op, right } => {

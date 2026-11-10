@@ -59,6 +59,7 @@ enum PredicateKernel {
     StringIn,
     IntegerIn,
     Coalesce,
+    TemporalBetween,
     ColumnConstant,
     ColumnColumn,
     Like,
@@ -75,6 +76,8 @@ impl PredicateKernel {
             Self::IntegerIn
         } else if program.as_coalesce_column_const_cmp().is_some() {
             Self::Coalesce
+        } else if program.as_column_between_shape().is_some() {
+            Self::TemporalBetween
         } else if program.as_column_const_cmp_shape().is_some()
             || program.as_column_param_cmp_shape().is_some()
         {
@@ -799,6 +802,7 @@ fn try_native_truth_mask(
         PredicateKernel::StringIn => try_column_string_in_const_set_truth_mask(program, batch),
         PredicateKernel::IntegerIn => try_column_integer_in_const_set_truth_mask(program, batch),
         PredicateKernel::Coalesce => try_coalesce_column_const_cmp_truth_mask(program, batch),
+        PredicateKernel::TemporalBetween => try_temporal_between_truth_mask(program, batch),
         PredicateKernel::ColumnConstant => {
             let (column, op, value, collation_id) = column_const_cmp_for_batch(program, batch)?;
             let truth =
@@ -1111,6 +1115,95 @@ fn column_null_bitmap(column: &ColumnVector, rows: usize) -> Bitmap {
             .map(Bitmap::not)
             .unwrap_or_else(|| Bitmap::new_all_invalid(rows)),
     }
+}
+
+/// Keep BETWEEN's single-domain oracle intact. Only temporal lanes with two
+/// warning-free bounds enter this kernel; numeric/mixed domains, invalid
+/// parameters and component-preserving dates retain the complete row oracle.
+fn try_temporal_between_truth_mask(program: &ExprProgram, batch: &Batch) -> Option<TruthMask> {
+    use crate::storage::DataTypeKind;
+
+    let (column, negated) = program.as_column_between_shape()?;
+    let lane = batch.columns().get(column)?;
+    let kind = match lane {
+        ColumnVector::Date32 { data, .. } => {
+            if batch.visible_indices().any(|row| {
+                !lane.is_null(row) && crate::types::decode_tagged_date(data[row]).is_some()
+            }) {
+                return None;
+            }
+            DataTypeKind::Date
+        }
+        ColumnVector::DateTime64 { data, .. } | ColumnVector::Timestamp64 { data, .. } => {
+            if batch.visible_indices().any(|row| {
+                !lane.is_null(row) && crate::types::decode_tagged_datetime(data[row]).is_some()
+            }) {
+                return None;
+            }
+            if matches!(lane, ColumnVector::Timestamp64 { .. }) {
+                // The scalar oracle compares textual bounds in local wall
+                // time. A DST fold is not an injective mapping to UTC.
+                if !crate::engine::expr::session_timestamp_comparison_has_fixed_offset() {
+                    return None;
+                }
+                DataTypeKind::Timestamp { fsp: 6 }
+            } else {
+                DataTypeKind::DateTime { fsp: 6 }
+            }
+        }
+        ColumnVector::Time64 { .. } => DataTypeKind::Time { fsp: 6 },
+        _ => return None,
+    };
+    let (low, high) = program.column_between_bounds()?;
+    let coerce = |bound: &Value| {
+        if matches!(bound, Value::Null) {
+            return Some(Value::Null);
+        }
+        // A bound numeric parameter can select a different BETWEEN domain.
+        // Do not turn it into a temporal constant through its display text.
+        if !matches!(
+            bound,
+            Value::String(_)
+                | Value::SmallString(_)
+                | Value::Bytes(_)
+                | Value::Date(_)
+                | Value::DateTime(_)
+                | Value::Timestamp(_)
+                | Value::Time(_)
+        ) {
+            return None;
+        }
+        let value = crate::engine::expr::coerce_comparison_constant_for_type(bound, &kind)?;
+        match value {
+            Value::Date(value) if crate::types::decode_tagged_date(value).is_some() => None,
+            Value::DateTime(value) | Value::Timestamp(value)
+                if crate::types::decode_tagged_datetime(value).is_some() =>
+            {
+                None
+            }
+            _ => Some(value),
+        }
+    };
+    let low = coerce(low.as_ref())?;
+    let high = coerce(high.as_ref())?;
+    let compare = |op, bound: &Value| {
+        let truth = try_column_const_cmp_bitmap_parts(column, op, bound, None, batch)?;
+        let null = if matches!(bound, Value::Null) {
+            Bitmap::new_all_valid(batch.num_rows())
+        } else {
+            column_null_bitmap(lane, batch.num_rows())
+        };
+        Some((truth, null))
+    };
+    let (lower, lower_null) = compare(BinaryOp::GtEq, &low)?;
+    let (upper, upper_null) = compare(BinaryOp::LtEq, &high)?;
+    let inside = lower.and(&upper);
+    let outside = lower.or(&lower_null).not().or(&upper.or(&upper_null).not());
+    let null = restrict_bitmap_to_selection(batch, inside.or(&outside).not());
+    Some(TruthMask {
+        truth: restrict_bitmap_to_selection(batch, if negated { outside } else { inside }),
+        null,
+    })
 }
 
 /// Evaluate the common nullable-measure predicate
@@ -3489,6 +3582,260 @@ mod tests {
         let (native, fallback) = program.expression_rows();
         assert_eq!(fallback, 0);
         assert!(native >= 4);
+    }
+
+    #[test]
+    fn temporal_between_string_bounds_keep_native_masks() {
+        use crate::parser::Literal;
+
+        let mut session = crate::engine::api::SessionContext::default();
+        session.sysvars.time_zone = "+00:00".into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            let day = crate::storage::parse_date_to_days_bytes(b"2001-02-03").unwrap();
+            let micros = crate::storage::parse_datetime_to_micros("2001-02-03 12:30:00").unwrap();
+            let mut valid = Bitmap::new_all_valid(6);
+            valid.set(5, false);
+            for (kind, column, low, high) in [
+                (
+                    ColumnType::Date,
+                    ColumnVector::Date32 {
+                        data: vec![day - 1, day, day + 1, day + 2, day + 3, 0],
+                        nulls: Some(valid.clone()),
+                    },
+                    "2001-02-03",
+                    "2001-02-05",
+                ),
+                (
+                    ColumnType::DateTime,
+                    ColumnVector::DateTime64 {
+                        data: vec![micros - 1, micros, micros + 1, micros + 2, micros + 3, 0],
+                        nulls: Some(valid.clone()),
+                    },
+                    "2001-02-03 12:30:00.000000",
+                    "2001-02-03 12:30:00.000002",
+                ),
+                (
+                    ColumnType::Timestamp,
+                    ColumnVector::Timestamp64 {
+                        data: vec![micros - 1, micros, micros + 1, micros + 2, micros + 3, 0],
+                        nulls: Some(valid.clone()),
+                    },
+                    "2001-02-03 12:30:00.000000",
+                    "2001-02-03 12:30:00.000002",
+                ),
+                (
+                    ColumnType::Time,
+                    ColumnVector::Time64 {
+                        data: vec![-2, -1, 0, 1, 2, 0],
+                        nulls: Some(valid.clone()),
+                    },
+                    "-00:00:00.000001",
+                    "00:00:00.000001",
+                ),
+            ] {
+                let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                    table: "events".into(),
+                    alias: None,
+                    name: "occurred_at".into(),
+                    column_type: kind,
+                    source: Default::default(),
+                }]));
+                let input = Batch::new(schema.clone(), vec![column]);
+                for negated in [false, true] {
+                    let expr = Expr::Between {
+                        expr: Box::new(Expr::Identifier("occurred_at".into())),
+                        low: Box::new(Expr::Literal(Literal::String(low.into()))),
+                        high: Box::new(Expr::Literal(Literal::String(high.into()))),
+                        negated,
+                    };
+                    for batch in [
+                        input.clone(),
+                        input
+                            .clone()
+                            .with_selection(Selection::Indices(vec![0, 2, 4, 5])),
+                    ] {
+                        let program = BatchExprProgram::compile(&expr, &schema).unwrap().unwrap();
+                        let actual = program.eval_predicate_bitmap(&batch).unwrap();
+                        let oracle = compile_for_batch(&expr, &schema).unwrap().unwrap();
+                        let expected = eval_value_per_row(&oracle, &batch).unwrap();
+                        for row in batch.visible_indices() {
+                            assert_eq!(
+                                actual.get(row),
+                                crate::engine::expr::truthy(&expected[row])
+                            );
+                        }
+                        let (native, fallback) = program.expression_rows();
+                        assert_eq!(fallback, 0, "{kind:?}, negated={negated}");
+                        assert!(native >= batch.visible_rows() as u64);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn temporal_between_timestamp_dst_matches_wall_clock_oracle() {
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "events".into(),
+            alias: None,
+            name: "ts".into(),
+            column_type: ColumnType::Timestamp,
+            source: Default::default(),
+        }]));
+        let mut session = crate::engine::api::SessionContext::default();
+        session.sysvars.time_zone = "America/New_York".into();
+        for (instants, low, high) in [
+            (
+                ["2021-11-07 05:15:00", "2021-11-07 06:15:00"],
+                "2021-11-07 01:00:00",
+                "2021-11-07 01:30:00",
+            ),
+            (
+                ["2021-03-14 06:45:00", "2021-03-14 07:05:00"],
+                "2021-03-14 02:30:00",
+                "2021-03-14 03:15:00",
+            ),
+        ] {
+            let batch = Batch::new(
+                schema.clone(),
+                vec![ColumnVector::Timestamp64 {
+                    data: instants
+                        .iter()
+                        .map(|v| crate::storage::parse_datetime_to_micros(v).unwrap())
+                        .collect(),
+                    nulls: None,
+                }],
+            );
+            let expr =
+                crate::parser::parse_expr_fragment(&format!("ts BETWEEN '{low}' AND '{high}'"))
+                    .unwrap();
+            crate::engine::expr::with_session_expr_info(&session, || {
+                let program = BatchExprProgram::compile(&expr, &schema).unwrap().unwrap();
+                let actual = program.eval_predicate_bitmap(&batch).unwrap();
+                let oracle = compile_for_batch(&expr, &schema).unwrap().unwrap();
+                let expected = eval_value_per_row(&oracle, &batch).unwrap();
+                for (row, expected) in expected.iter().enumerate() {
+                    assert_eq!(
+                        actual.get(row),
+                        crate::engine::expr::truthy(expected),
+                        "{instants:?}, row={row}"
+                    );
+                }
+                assert_eq!(program.expression_rows().1, batch.visible_rows() as u64);
+            });
+        }
+    }
+
+    #[test]
+    fn temporal_between_rebinding_preserves_nulls_and_declines_unsafe_bounds() {
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "events".into(),
+            alias: None,
+            name: "occurred_at".into(),
+            column_type: ColumnType::Date,
+            source: Default::default(),
+        }]));
+        let day = crate::storage::parse_date_to_days_bytes(b"2001-02-03").unwrap();
+        let mut valid = Bitmap::new_all_valid(5);
+        valid.set(4, false);
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::Date32 {
+                data: vec![crate::types::ZERO_DATE, day - 1, day, day + 1, 0],
+                nulls: Some(valid),
+            }],
+        );
+        for negated in [false, true] {
+            let expr = Expr::Between {
+                expr: Box::new(Expr::Identifier("occurred_at".into())),
+                low: Box::new(Expr::Placeholder(0)),
+                high: Box::new(Expr::Placeholder(1)),
+                negated,
+            };
+            let initial = vec![
+                Value::String("2001-02-03".into()),
+                Value::String("2001-02-04".into()),
+            ];
+            let program = crate::engine::params::with_params(initial, || {
+                BatchExprProgram::compile(&expr, &schema).unwrap().unwrap()
+            });
+            let oracle = compile_for_batch(&expr, &schema).unwrap().unwrap();
+            for bounds in [
+                vec![
+                    Value::String("2001-02-03".into()),
+                    Value::String("2001-02-04".into()),
+                ],
+                vec![
+                    Value::String("2001-02-04".into()),
+                    Value::String("2001-02-03".into()),
+                ],
+                vec![Value::Null, Value::String("2001-02-03".into())],
+                vec![Value::String("2001-02-03".into()), Value::Null],
+                vec![Value::Null, Value::Null],
+                vec![
+                    Value::String("0000-00-00".into()),
+                    Value::String("2001-02-03".into()),
+                ],
+            ] {
+                crate::engine::params::with_params(bounds, || {
+                    let actual = program.eval_predicate_bitmap(&batch).unwrap();
+                    let mask = try_temporal_between_truth_mask(&oracle, &batch).unwrap();
+                    let expected = eval_value_per_row(&oracle, &batch).unwrap();
+                    for (row, expected) in expected.iter().enumerate() {
+                        assert_eq!(actual.get(row), crate::engine::expr::truthy(expected));
+                        assert_eq!(mask.null.get(row), matches!(expected, Value::Null));
+                    }
+                });
+            }
+            assert_eq!(program.expression_rows().1, 0);
+            for bounds in [
+                vec![Value::Int(1), Value::Int(2)],
+                vec![
+                    Value::String("not-a-date".into()),
+                    Value::String("2001-02-03".into()),
+                ],
+                vec![
+                    Value::String("2001-02-03 12:30:00".into()),
+                    Value::String("2001-02-04".into()),
+                ],
+            ] {
+                crate::engine::params::with_params(bounds, || {
+                    assert!(try_temporal_between_truth_mask(&oracle, &batch).is_none());
+                    let actual = program.eval_predicate_bitmap(&batch);
+                    let expected = eval_value_per_row(&oracle, &batch);
+                    match (actual, expected) {
+                        (Ok(actual), Ok(expected)) => {
+                            for (row, expected) in expected.iter().enumerate() {
+                                assert_eq!(actual.get(row), crate::engine::expr::truthy(expected));
+                            }
+                        }
+                        (Err(actual), Err(expected)) => assert_eq!(actual.code(), expected.code()),
+                        (actual, expected) => {
+                            panic!("BETWEEN oracle drift: {actual:?} vs {expected:?}")
+                        }
+                    }
+                });
+            }
+            let tagged = Batch::new(
+                schema.clone(),
+                vec![ColumnVector::Date32 {
+                    data: vec![crate::types::encode_tagged_date(2001, 0, 0).unwrap()],
+                    nulls: None,
+                }],
+            );
+            crate::engine::params::with_params(
+                vec![
+                    Value::String("2000-01-01".into()),
+                    Value::String("2002-01-01".into()),
+                ],
+                || {
+                    assert!(try_temporal_between_truth_mask(&oracle, &tagged).is_none());
+                    let actual = program.eval_predicate_bitmap(&tagged).unwrap();
+                    let expected = eval_value_per_row(&oracle, &tagged).unwrap();
+                    assert_eq!(actual.get(0), crate::engine::expr::truthy(&expected[0]));
+                },
+            );
+        }
     }
 
     #[test]

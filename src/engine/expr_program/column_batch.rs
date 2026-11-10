@@ -16,6 +16,7 @@ mod string_read;
 mod temporal_read;
 mod temporal_shift;
 mod temporal_value;
+mod text_compare;
 mod unsigned_read;
 mod vector_read;
 use super::*;
@@ -46,6 +47,7 @@ use string_read::StringRead;
 use temporal_read::TemporalRead;
 use temporal_shift::TemporalShift;
 use temporal_value::TemporalValue;
+use text_compare::TextCompare;
 use unsigned_read::UnsignedRead;
 use vector_read::VectorRead;
 
@@ -422,6 +424,9 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
         return Some(read.contract());
     }
     if let Some(read) = FormatRead::bind(node, schema) {
+        return Some(read.contract());
+    }
+    if let Some(read) = TextCompare::bind(node, schema) {
         return Some(read.contract());
     }
     if let Some(read) = BooleanRead::bind(node, schema) {
@@ -910,6 +915,9 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
     if let Some(read) = FormatRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
+    if let Some(read) = TextCompare::bind(node, batch.schema()) {
+        return read.workspace(batch);
+    }
     if let Some(read) = BooleanRead::bind(node, batch.schema()) {
         return read.workspace(batch);
     }
@@ -1386,6 +1394,9 @@ fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
         return read.evaluate(batch);
     }
     if let Some(read) = FormatRead::bind(node, batch.schema()) {
+        return read.evaluate(batch);
+    }
+    if let Some(read) = TextCompare::bind(node, batch.schema()) {
         return read.evaluate(batch);
     }
     if let Some(read) = BooleanRead::bind(node, batch.schema()) {

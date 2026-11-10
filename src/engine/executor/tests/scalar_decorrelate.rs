@@ -218,6 +218,132 @@ fn correlated_sum_outer_filter_domain_preserves_distinct_keys() {
 }
 
 #[test]
+fn scalar_integer_primary_key_domain_preserves_aggregate_multiplicity() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE domain_parent (tenant INT,k BIGINT,active INT,PRIMARY KEY(tenant,k))",
+        "CREATE TABLE domain_child (id INT PRIMARY KEY,tenant INT,k BIGINT,x DECIMAL(9,2))",
+        "CREATE INDEX domain_child_key ON domain_child(tenant,k)",
+        "INSERT INTO domain_parent VALUES (1,-1,1),(2,-1,1),(1,2,0),(3,7,1)",
+        "INSERT INTO domain_child VALUES (1,1,-1,5.25),(2,1,-1,7.25),(3,2,-1,9.50),(4,1,2,100.00),(5,NULL,-1,50.00),(6,1,NULL,99.00)",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let check = |sql: &str, domain_type: crate::parser::JoinType, expected: Vec<Vec<Value>>| {
+        let Statement::Select(mut select) = crate::parser::parse_statement(sql).unwrap() else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            crate::planner_decorrelate::scalar::decorrelate_scalar_subqueries(
+                &engine.db,
+                &mut select,
+            ),
+            1
+        );
+        let domain = select.joins.last().unwrap().derived.as_ref().unwrap();
+        assert_eq!(
+            domain.as_select().unwrap().joins.last().unwrap().join_type,
+            domain_type
+        );
+        let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap() else {
+            panic!("expected result set");
+        };
+        assert_eq!(result.rows, expected);
+    };
+    check(
+        "SELECT o.tenant,o.k,(SELECT SUM(i.x) FROM domain_child i WHERE i.tenant=o.tenant AND i.k=o.k) FROM domain_parent o WHERE o.active=1 ORDER BY o.tenant,o.k",
+        crate::parser::JoinType::Inner,
+        vec![
+            vec![Value::Int(1), Value::Int(-1), Value::DecimalCompact(1250, 2)],
+            vec![Value::Int(2), Value::Int(-1), Value::DecimalCompact(950, 2)],
+            vec![Value::Int(3), Value::Int(7), Value::Null],
+        ],
+    );
+    // A partial primary key admits duplicate domain rows. Neither those rows
+    // nor the NULL tenant in the child may multiply the SUM input.
+    check(
+        "SELECT o.tenant,o.k,(SELECT SUM(i.x) FROM domain_child i WHERE i.k=o.k) FROM domain_parent o WHERE o.active=1 ORDER BY o.tenant,o.k",
+        crate::parser::JoinType::Semi,
+        vec![
+            vec![Value::Int(1), Value::Int(-1), Value::DecimalCompact(7200, 2)],
+            vec![Value::Int(2), Value::Int(-1), Value::DecimalCompact(7200, 2)],
+            vec![Value::Int(3), Value::Int(7), Value::Null],
+        ],
+    );
+}
+
+#[test]
+fn scalar_key_domain_retains_semi_for_text_and_later_primary_publications() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE text_parent (k VARCHAR(16) PRIMARY KEY,active INT)",
+        "CREATE TABLE text_child (k VARCHAR(16),x INT)",
+        "CREATE TABLE added_parent (k INT NOT NULL,active INT)",
+        "CREATE TABLE added_child (k INT,x INT)",
+        "INSERT INTO added_parent VALUES (1,1)",
+        "ALTER TABLE added_parent ADD PRIMARY KEY(k)",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    assert_ne!(
+        engine
+            .db
+            .table("added_parent")
+            .unwrap()
+            .primary_definition_scn,
+        0
+    );
+    for (parent, child) in [
+        ("text_parent", "text_child"),
+        ("added_parent", "added_child"),
+    ] {
+        let sql = format!("SELECT (SELECT SUM(i.x) FROM {child} i WHERE i.k=o.k) FROM {parent} o WHERE o.active=1");
+        let Statement::Select(mut select) = crate::parser::parse_statement(&sql).unwrap() else {
+            panic!("expected select");
+        };
+        assert_eq!(
+            crate::planner_decorrelate::scalar::decorrelate_scalar_subqueries(
+                &engine.db,
+                &mut select,
+            ),
+            1
+        );
+        let domain = select.joins.last().unwrap().derived.as_ref().unwrap();
+        assert_eq!(
+            domain.as_select().unwrap().joins.last().unwrap().join_type,
+            crate::parser::JoinType::Semi
+        );
+    }
+}
+
+#[test]
+fn scalar_unsigned_primary_domain_keeps_large_keys_and_null_groups() {
+    let rows = run_with_decor(
+        &[
+            "CREATE TABLE unsigned_parent (k BIGINT UNSIGNED PRIMARY KEY,active INT)",
+            "CREATE TABLE unsigned_child (id INT PRIMARY KEY,k BIGINT UNSIGNED,x DECIMAL(9,2))",
+            "CREATE INDEX unsigned_child_key ON unsigned_child(k)",
+            "INSERT INTO unsigned_parent VALUES (0,1),(9223372036854775808,1),(18446744073709551615,1)",
+            "INSERT INTO unsigned_child VALUES (1,18446744073709551615,1.25),(2,18446744073709551615,2.50),(3,9223372036854775808,7.25),(4,NULL,99.00)",
+        ],
+        "SELECT o.k,(SELECT SUM(i.x) FROM unsigned_child i WHERE i.k=o.k) FROM unsigned_parent o WHERE o.active=1 ORDER BY o.k",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::UInt(0), Value::Null],
+            vec![
+                Value::UInt(9223372036854775808),
+                Value::DecimalCompact(725, 2)
+            ],
+            vec![Value::UInt(u64::MAX), Value::DecimalCompact(375, 2)],
+        ]
+    );
+}
+
+#[test]
 fn multi_column_correlation_groups_by_both() {
     let setup = [
         "CREATE TABLE o (id INT PRIMARY KEY, k INT, j INT)",

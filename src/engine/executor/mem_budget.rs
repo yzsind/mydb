@@ -993,6 +993,11 @@ fn charge_controlled(category: ControlledMemoryCategory, bytes: usize) -> Result
 }
 
 fn release_controlled(category: ControlledMemoryCategory, bytes: usize) {
+    // Empty reservations are common when moving a reusable scratch buffer.
+    // They release no capacity and must not write the global accounting lines.
+    if bytes == 0 {
+        return;
+    }
     let released = saturating_atomic_sub(category_counter(category), bytes);
     if released != 0 {
         record_category_free(category, released);
