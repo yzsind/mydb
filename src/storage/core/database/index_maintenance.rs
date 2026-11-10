@@ -5,13 +5,25 @@ static INDEX_BUILD_DICTIONARY_BUILDS: AtomicU64 = AtomicU64::new(0);
 static INDEX_BUILD_DICTIONARY_ROWS: AtomicU64 = AtomicU64::new(0);
 static INDEX_BUILD_ENCODED_RUNS: AtomicU64 = AtomicU64::new(0);
 static INDEX_BUILD_SCRATCH_GRANTED_PEAK: AtomicU64 = AtomicU64::new(0);
+static INDEX_BUILD_QUEUE_WAIT_US: AtomicU64 = AtomicU64::new(0);
+static INDEX_BUILD_MERGE_PASSES: AtomicU64 = AtomicU64::new(0);
+static INDEX_BUILD_STREAM_US: AtomicU64 = AtomicU64::new(0);
+static INDEX_BUILD_SPILL_READ_BYTES: AtomicU64 = AtomicU64::new(0);
+static INDEX_BUILD_SPILL_WRITE_BYTES: AtomicU64 = AtomicU64::new(0);
+static INDEX_BUILD_PIPELINE_WORKERS_PEAK: AtomicU64 = AtomicU64::new(0);
 
-pub(crate) fn index_build_extended_perf_snapshot() -> [u64; 4] {
+pub(crate) fn index_build_extended_perf_snapshot() -> [u64; 10] {
     [
         INDEX_BUILD_DICTIONARY_BUILDS.load(Ordering::Relaxed),
         INDEX_BUILD_DICTIONARY_ROWS.load(Ordering::Relaxed),
         INDEX_BUILD_ENCODED_RUNS.load(Ordering::Relaxed),
         INDEX_BUILD_SCRATCH_GRANTED_PEAK.load(Ordering::Relaxed),
+        INDEX_BUILD_QUEUE_WAIT_US.load(Ordering::Relaxed),
+        INDEX_BUILD_MERGE_PASSES.load(Ordering::Relaxed),
+        INDEX_BUILD_STREAM_US.load(Ordering::Relaxed),
+        INDEX_BUILD_SPILL_READ_BYTES.load(Ordering::Relaxed),
+        INDEX_BUILD_SPILL_WRITE_BYTES.load(Ordering::Relaxed),
+        INDEX_BUILD_PIPELINE_WORKERS_PEAK.load(Ordering::Relaxed),
     ]
 }
 
@@ -111,6 +123,9 @@ impl Read for IndexSpillReadFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
         let result = self.0.read(buf);
+        if let Ok(bytes) = result {
+            INDEX_BUILD_SPILL_READ_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         INDEX_BUILD_SPILL_READ_US.fetch_add(
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
@@ -125,6 +140,9 @@ impl Write for IndexSpillWriteFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let started = Instant::now();
         let result = self.0.write(buf);
+        if let Ok(bytes) = result {
+            INDEX_BUILD_SPILL_WRITE_BYTES.fetch_add(bytes as u64, Ordering::Relaxed);
+        }
         INDEX_BUILD_SPILL_WRITE_US.fetch_add(
             started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
@@ -237,6 +255,7 @@ struct RunHeadTournament<E> {
     heads: Vec<Option<E>>,
     tree: Vec<usize>,
     leaf_base: usize,
+    winner_limit: Option<(usize, usize)>,
 }
 
 impl<E: Ord> RunHeadTournament<E> {
@@ -248,6 +267,7 @@ impl<E: Ord> RunHeadTournament<E> {
             heads,
             tree: vec![Self::EMPTY; leaf_base * 2],
             leaf_base,
+            winner_limit: None,
         };
         for run in 0..tournament.heads.len() {
             if tournament.heads[run].is_some() {
@@ -267,6 +287,28 @@ impl<E: Ord> RunHeadTournament<E> {
 
     fn replace(&mut self, run: usize, next: Option<E>) -> Option<E> {
         let previous = std::mem::replace(&mut self.heads[run], next);
+        // Sorted runs often contribute a contiguous range before another run
+        // wins. Its runner-up is unchanged throughout that range, so one
+        // comparison can replace repairing the entire winner path per row.
+        if self.tree[1] == run && self.heads[run].is_some() {
+            let limit = match self.winner_limit {
+                Some((winner, limit)) if winner == run => limit,
+                _ => {
+                    let mut node = self.leaf_base + run;
+                    let mut limit = Self::EMPTY;
+                    while node > 1 {
+                        limit = self.better(limit, self.tree[node ^ 1]);
+                        node /= 2;
+                    }
+                    self.winner_limit = Some((run, limit));
+                    limit
+                }
+            };
+            if self.better(run, limit) == run {
+                return previous;
+            }
+        }
+        self.winner_limit = None;
         let mut node = self.leaf_base + run;
         self.tree[node] = if self.heads[run].is_some() {
             run
@@ -300,6 +342,34 @@ impl<E: Ord> RunHeadTournament<E> {
                     right
                 }
             }
+        }
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn run_tournament_cached_limit_matches_arbitrary_head_updates() {
+    for count in [1, 2, 3, 7, 16, 17] {
+        let mut expected = vec![Some(0u64); count];
+        let mut tournament = RunHeadTournament::new(expected.clone());
+        let mut seed = 19u64;
+        for step in 0..10_000 {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+            let run = if step % 3 == 0 {
+                tournament.winner().unwrap_or(0)
+            } else {
+                seed as usize % count
+            };
+            let next = (step % 11 != 0).then_some((seed >> 32) % 31);
+            assert_eq!(tournament.replace(run, next), expected[run]);
+            expected[run] = next;
+            let winner = expected
+                .iter()
+                .enumerate()
+                .filter_map(|(run, value)| value.map(|value| (value, run)))
+                .min()
+                .map(|(_, run)| run);
+            assert_eq!(tournament.winner(), winner);
         }
     }
 }
@@ -657,6 +727,9 @@ trait IndexSortRunCodec {
     fn open_reader(path: &Path, read_buffer_bytes: usize) -> Result<Self::Reader, QueryError>;
     fn next_entry(reader: &mut Self::Reader) -> Result<Option<Self::Entry>, QueryError>;
     fn create_writer(path: &Path) -> Result<Self::Writer, QueryError>;
+    fn create_merge_writer(path: &Path, _sources: &[PathBuf]) -> Result<Self::Writer, QueryError> {
+        Self::create_writer(path)
+    }
     fn append(writer: &mut Self::Writer, entry: &Self::Entry) -> Result<(), QueryError>;
     fn finish(writer: Self::Writer) -> Result<(), QueryError>;
 }
@@ -722,7 +795,7 @@ fn merge_sort_run_group<C: IndexSortRunCodec>(
         heap.push(Reverse((entry, run)));
     }
 
-    let mut writer = C::create_writer(output)?;
+    let mut writer = C::create_merge_writer(output, paths)?;
     let mut previous = None;
     while let Some(Reverse((entry, run))) = heap.pop() {
         if let Some(next) = C::next_entry(&mut readers[run])? {
@@ -755,6 +828,7 @@ fn consolidate_sort_runs<C: IndexSortRunCodec>(
     debug_assert!(fan_in >= 2);
     let mut pass = 0usize;
     while runs.len() > fan_in {
+        INDEX_BUILD_MERGE_PASSES.fetch_add(1, Ordering::Relaxed);
         let mut next = Vec::with_capacity(runs.len().div_ceil(fan_in));
         for (group, paths) in runs.chunks(fan_in).enumerate() {
             if paths.len() == 1 {

@@ -1800,6 +1800,87 @@ fn dense_probe_matches_point_reads_with_dirty_rows_undo_and_forwarding() {
 }
 
 #[test]
+fn coherent_payload_scan_coalesces_cold_reads_and_keeps_dirty_tail() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("coherent-batch.heap");
+    let total = 150i64;
+    {
+        let heap = HeapFile::open(path.clone(), 1, test_log(dir.path())).unwrap();
+        for value in 0..total {
+            heap.insert_mvcc(
+                1,
+                RowHeader::visible(1),
+                &[Value::Int(value), Value::String("x".repeat(8000))],
+            )
+            .unwrap();
+        }
+        heap.flush_dirty_pages().unwrap();
+    }
+    let heap = HeapFile::open(path, 1, test_log(dir.path())).unwrap();
+    heap.insert_mvcc(
+        2,
+        RowHeader::visible(2),
+        &[Value::Int(total), Value::String("dirty tail".into())],
+    )
+    .unwrap();
+    let mut charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+        PAGE_SIZE * 64,
+    )
+    .unwrap();
+    let before = heap.buffer_pool.snapshot();
+    let mut values = Vec::new();
+    heap.scan_mvcc_payloads_range_with_charge_until(
+        &[0],
+        0,
+        heap.page_count_relaxed(),
+        &mut charge,
+        true,
+        |row| {
+            let mut decoded = Vec::new();
+            assert!(HeapFile::decode_direct_payload_projection_into(
+                &row,
+                &mut decoded
+            )?);
+            let Value::Int(value) = decoded[0] else {
+                panic!("expected INT");
+            };
+            values.push(value);
+            Ok(false)
+        },
+    )
+    .unwrap();
+    let after = heap.buffer_pool.snapshot();
+    values.sort_unstable();
+    assert_eq!(values, (0..=total).collect::<Vec<_>>());
+    assert!(after.batch_read_pages > before.batch_read_pages + 64);
+    assert!(
+        after.read_syscalls - before.read_syscalls < 16,
+        "coherent scan regressed to page-at-a-time demand reads"
+    );
+
+    // A tiny pool falls back to ordinary pins without reserving an impossible
+    // batch or stranding Loading frames.
+    heap.buffer_pool
+        .set_capacity(8, Duration::from_secs(5))
+        .unwrap();
+    let mut count = 0;
+    heap.scan_mvcc_payloads_range_with_charge_until(
+        &[0],
+        0,
+        heap.page_count_relaxed(),
+        &mut charge,
+        true,
+        |_| {
+            count += 1;
+            Ok(false)
+        },
+    )
+    .unwrap();
+    assert_eq!(count, total + 1);
+}
+
+#[test]
 fn offline_projected_scan_reads_unflushed_buffered_heap_pages() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("1.heap");

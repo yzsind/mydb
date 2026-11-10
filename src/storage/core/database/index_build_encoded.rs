@@ -298,6 +298,7 @@ struct EncodedIndexSorter {
     tmp: Option<IndexSortTmpDir>,
     runs: Vec<PathBuf>,
     sort_degree: usize,
+    tail_read_buffer: usize,
 }
 
 enum EncodedSortedRecords {
@@ -324,6 +325,7 @@ enum EncodedSortedRecords {
         tmp: IndexSortTmpDir,
         runs: Vec<PathBuf>,
         fixed128: Option<(usize, usize)>,
+        tail: Vec<u128>,
         read_buffer_bytes: usize,
     },
 }
@@ -598,6 +600,7 @@ where
             .name("mydb-index-merge-read".into())
             .spawn_scoped(scope, move || {
                 let mut batch = Vec::with_capacity(BATCH_ROWS);
+                let mut merge_started = Instant::now();
                 for entry in entries {
                     let entry = match entry {
                         Ok(entry) => entry,
@@ -614,6 +617,10 @@ where
                     };
                     batch.push(entry);
                     if batch.len() == BATCH_ROWS {
+                        INDEX_BUILD_MERGE_US.fetch_add(
+                            merge_started.elapsed().as_micros() as u64,
+                            Ordering::Relaxed,
+                        );
                         if sender
                             .send(Ok(std::mem::replace(
                                 &mut batch,
@@ -623,8 +630,13 @@ where
                         {
                             return;
                         }
+                        merge_started = Instant::now();
                     }
                 }
+                INDEX_BUILD_MERGE_US.fetch_add(
+                    merge_started.elapsed().as_micros() as u64,
+                    Ordering::Relaxed,
+                );
                 if !batch.is_empty() {
                     let _ = sender.send(Ok(batch));
                 }
@@ -709,11 +721,13 @@ fn validated_fixed128_from_sorted(
             runs,
             fixed128: Some((key_width, stride)),
             read_buffer_bytes,
+            tail,
         } => (
-            Fixed128Source::Runs(EncodedFixed128RunMerger::open(
+            Fixed128Source::Runs(EncodedFixed128RunMerger::open_with_tail(
                 tmp,
                 runs,
                 read_buffer_bytes,
+                tail,
             )?),
             key_width,
             stride,
@@ -1022,10 +1036,12 @@ where
             runs,
             fixed128: Some((key_width, _)),
             read_buffer_bytes,
+            tail,
         } => {
             let ops = program.fixed_ops.as_deref().unwrap();
             for (position, record) in
-                EncodedFixed128RunMerger::open(tmp, runs, read_buffer_bytes)?.enumerate()
+                EncodedFixed128RunMerger::open_with_tail(tmp, runs, read_buffer_bytes, tail)?
+                    .enumerate()
             {
                 if position % 4096 == 0 {
                     crate::engine::cancel::check_cancelled()?;
@@ -1634,6 +1650,71 @@ fn encoded_merge_read_buffer_bytes(sorter_budget: usize) -> usize {
 
 struct EncodedRunReader {
     reader: std::io::BufReader<IndexSpillReadFile>,
+    fixed_key_width: usize,
+    file_bytes: u64,
+}
+
+const ENCODED_RUN_MAGIC: [u8; 8] = *b"MYERUN01";
+
+struct EncodedRunWriter {
+    writer: std::io::BufWriter<IndexSpillWriteFile>,
+    fixed_key_width: usize,
+}
+
+impl EncodedRunWriter {
+    fn create(path: &Path, fixed_key_width: usize) -> Result<Self, QueryError> {
+        Self::create_buffered(path, fixed_key_width, 1024 * 1024)
+    }
+
+    fn create_buffered(
+        path: &Path,
+        fixed_key_width: usize,
+        buffer_bytes: usize,
+    ) -> Result<Self, QueryError> {
+        let width = u32::try_from(fixed_key_width).map_err(encoded_arena_too_large)?;
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(io_err)?;
+        let mut writer = std::io::BufWriter::with_capacity(buffer_bytes, IndexSpillWriteFile(file));
+        writer.write_all(&ENCODED_RUN_MAGIC).map_err(io_err)?;
+        writer.write_all(&width.to_le_bytes()).map_err(io_err)?;
+        Ok(Self {
+            writer,
+            fixed_key_width,
+        })
+    }
+
+    fn append(
+        &mut self,
+        key: &[u8],
+        payload: Option<&[u8]>,
+        row_id: RowId,
+        has_null: bool,
+    ) -> Result<(), QueryError> {
+        if self.fixed_key_width == 0 {
+            return write_encoded_run_record(&mut self.writer, key, payload, row_id, has_null);
+        }
+        if key.len() != self.fixed_key_width || payload.is_some() {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "fixed index run record has invalid width or payload",
+            )));
+        }
+        self.writer.write_all(key).map_err(io_err)?;
+        self.writer
+            .write_all(&row_id.page_id.to_be_bytes())
+            .map_err(io_err)?;
+        self.writer
+            .write_all(&row_id.slot_id.to_be_bytes())
+            .map_err(io_err)?;
+        self.writer.write_all(&[u8::from(has_null)]).map_err(io_err)
+    }
+
+    fn finish(mut self) -> Result<(), QueryError> {
+        self.writer.flush().map_err(io_err)
+    }
 }
 
 struct EncodedRunMerger {
@@ -1645,6 +1726,62 @@ struct EncodedRunMerger {
 
 struct EncodedFixed128RunReader {
     reader: std::io::BufReader<IndexSpillReadFile>,
+    width: usize,
+}
+
+const FIXED_RUN_MAGIC: [u8; 7] = *b"MYIRUN1";
+
+struct EncodedFixed128RunWriter {
+    writer: std::io::BufWriter<IndexSpillWriteFile>,
+    width: usize,
+}
+
+impl EncodedFixed128RunWriter {
+    fn create(path: &Path, width: usize) -> Result<Self, QueryError> {
+        Self::create_buffered(path, width, 1024 * 1024)
+    }
+
+    fn create_buffered(path: &Path, width: usize, buffer_bytes: usize) -> Result<Self, QueryError> {
+        if !(1..=16).contains(&width) {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid fixed run width",
+            )));
+        }
+        let file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+            .map_err(io_err)?;
+        let mut writer = std::io::BufWriter::with_capacity(buffer_bytes, IndexSpillWriteFile(file));
+        writer.write_all(&FIXED_RUN_MAGIC).map_err(io_err)?;
+        writer.write_all(&[width as u8]).map_err(io_err)?;
+        Ok(Self { writer, width })
+    }
+
+    fn append(&mut self, record: u128) -> Result<(), QueryError> {
+        self.writer
+            .write_all(&record.to_be_bytes()[..self.width])
+            .map_err(io_err)
+    }
+
+    fn append_batch(&mut self, records: &[u128]) -> Result<(), QueryError> {
+        // A bounded stack block avoids one buffered Write call per record.
+        let mut block = [0u8; 16 * 1024];
+        for chunk in records.chunks(block.len() / self.width) {
+            for (record, target) in chunk.iter().zip(block.chunks_exact_mut(self.width)) {
+                target.copy_from_slice(&record.to_be_bytes()[..self.width]);
+            }
+            self.writer
+                .write_all(&block[..chunk.len() * self.width])
+                .map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<(), QueryError> {
+        self.writer.flush().map_err(io_err)
+    }
 }
 
 struct EncodedFixed128RunMerger {
@@ -1652,6 +1789,7 @@ struct EncodedFixed128RunMerger {
     readers: Vec<EncodedFixed128RunReader>,
     tournament: RunHeadTournament<u128>,
     previous: Option<u128>,
+    tail: std::vec::IntoIter<u128>,
 }
 
 impl EncodedSortedRecords {
@@ -1699,8 +1837,14 @@ impl EncodedSortedRecords {
                 runs,
                 fixed128: Some((key_width, _)),
                 read_buffer_bytes,
+                tail,
             } => EncodedSortedRecordIter::Fixed128Spilled(EncodedFixed128RunIter {
-                merger: EncodedFixed128RunMerger::open(tmp, runs, read_buffer_bytes)?,
+                merger: EncodedFixed128RunMerger::open_with_tail(
+                    tmp,
+                    runs,
+                    read_buffer_bytes,
+                    tail,
+                )?,
                 program,
                 key_width,
             }),
@@ -1709,6 +1853,7 @@ impl EncodedSortedRecords {
                 runs,
                 fixed128: None,
                 read_buffer_bytes,
+                ..
             } => EncodedSortedRecordIter::Spilled(EncodedRunMerger::open(
                 tmp,
                 runs,
@@ -1845,12 +1990,64 @@ impl EncodedRunReader {
         if let Ok(meta) = fs::metadata(path) {
             record_spill_bytes_read(meta.len());
         }
+        Self::open_unaccounted(path, read_buffer_bytes)
+    }
+
+    fn open_unaccounted(path: &Path, read_buffer_bytes: usize) -> Result<Self, QueryError> {
+        let mut reader = open_index_sort_run(path, read_buffer_bytes)?;
+        let mut header = [0u8; 12];
+        reader.read_exact(&mut header).map_err(io_err)?;
+        if header[..8] != ENCODED_RUN_MAGIC {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid encoded index run header",
+            )));
+        }
+        let fixed_key_width = u32::from_le_bytes(header[8..].try_into().unwrap()) as usize;
+        let file_bytes = reader.get_ref().0.metadata().map_err(io_err)?.len();
         Ok(Self {
-            reader: open_index_sort_run(path, read_buffer_bytes)?,
+            reader,
+            fixed_key_width,
+            file_bytes,
         })
     }
 
     fn next_record(&mut self) -> Result<Option<EncodedIndexRecord>, QueryError> {
+        if self.fixed_key_width != 0 {
+            let mut first = [0u8; 1];
+            if self.reader.read(&mut first).map_err(io_err)? == 0 {
+                return Ok(None);
+            }
+            // Bound allocation by the actual file extent before trusting width.
+            if self.fixed_key_width as u64 > self.file_bytes {
+                return Err(io_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid fixed index run extent",
+                )));
+            }
+            let mut order_key = vec![0u8; self.fixed_key_width];
+            order_key[0] = first[0];
+            self.reader
+                .read_exact(&mut order_key[1..])
+                .map_err(io_err)?;
+            let mut suffix = [0u8; 7];
+            self.reader.read_exact(&mut suffix).map_err(io_err)?;
+            if suffix[6] > 1 {
+                return Err(io_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid fixed index run null marker",
+                )));
+            }
+            return Ok(Some(EncodedIndexRecord {
+                order_key,
+                materialized_key: None,
+                row_id: RowId {
+                    page_id: u32::from_be_bytes(suffix[..4].try_into().unwrap()),
+                    slot_id: u16::from_be_bytes(suffix[4..6].try_into().unwrap()),
+                },
+                has_null: suffix[6] != 0,
+            }));
+        }
         let mut header = [0u8; 15];
         if self.reader.read(&mut header[..1]).map_err(io_err)? == 0 {
             return Ok(None);
@@ -1858,6 +2055,12 @@ impl EncodedRunReader {
         self.reader.read_exact(&mut header[1..]).map_err(io_err)?;
         let order_len = u32::from_le_bytes(header[..4].try_into().unwrap()) as usize;
         let payload_len = u32::from_le_bytes(header[4..8].try_into().unwrap()) as usize;
+        if (order_len as u64).saturating_add(payload_len as u64) > self.file_bytes {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "encoded index run record exceeds file extent",
+            )));
+        }
         let row_id = RowId {
             page_id: u32::from_le_bytes(header[8..12].try_into().unwrap()),
             slot_id: u16::from_le_bytes(header[12..14].try_into().unwrap()),
@@ -1885,12 +2088,10 @@ struct EncodedIndexRunCodec;
 impl IndexSortRunCodec for EncodedIndexRunCodec {
     type Entry = EncodedIndexRecord;
     type Reader = EncodedRunReader;
-    type Writer = std::io::BufWriter<File>;
+    type Writer = EncodedRunWriter;
 
     fn open_reader(path: &Path, read_buffer_bytes: usize) -> Result<Self::Reader, QueryError> {
-        Ok(EncodedRunReader {
-            reader: open_index_sort_run(path, read_buffer_bytes)?,
-        })
+        EncodedRunReader::open_unaccounted(path, read_buffer_bytes)
     }
 
     fn next_entry(reader: &mut Self::Reader) -> Result<Option<Self::Entry>, QueryError> {
@@ -1898,19 +2099,24 @@ impl IndexSortRunCodec for EncodedIndexRunCodec {
     }
 
     fn create_writer(path: &Path) -> Result<Self::Writer, QueryError> {
-        Ok(std::io::BufWriter::with_capacity(
-            64 * 1024,
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)
-                .map_err(io_err)?,
-        ))
+        EncodedRunWriter::create(path, 0)
+    }
+
+    fn create_merge_writer(path: &Path, sources: &[PathBuf]) -> Result<Self::Writer, QueryError> {
+        let mut width = None;
+        for source in sources {
+            let current = EncodedRunReader::open_unaccounted(source, 12)?.fixed_key_width;
+            width = Some(match width {
+                None => current,
+                Some(previous) if previous == current => current,
+                _ => 0,
+            });
+        }
+        EncodedRunWriter::create_buffered(path, width.unwrap_or(0), 64 * 1024)
     }
 
     fn append(writer: &mut Self::Writer, entry: &Self::Entry) -> Result<(), QueryError> {
-        write_encoded_run_record(
-            writer,
+        writer.append(
             &entry.order_key,
             entry.materialized_key.as_deref(),
             entry.row_id,
@@ -1918,8 +2124,8 @@ impl IndexSortRunCodec for EncodedIndexRunCodec {
         )
     }
 
-    fn finish(mut writer: Self::Writer) -> Result<(), QueryError> {
-        writer.flush().map_err(io_err)
+    fn finish(writer: Self::Writer) -> Result<(), QueryError> {
+        writer.finish()
     }
 }
 
@@ -1984,17 +2190,39 @@ impl EncodedFixed128RunReader {
         if let Ok(meta) = fs::metadata(path) {
             record_spill_bytes_read(meta.len());
         }
+        Self::open_unaccounted(path, read_buffer_bytes)
+    }
+
+    fn open_unaccounted(path: &Path, read_buffer_bytes: usize) -> Result<Self, QueryError> {
+        let mut reader = open_index_sort_run(path, read_buffer_bytes)?;
+        let mut header = [0u8; 8];
+        reader.read_exact(&mut header).map_err(io_err)?;
+        if header[..7] != FIXED_RUN_MAGIC || !(1..=16).contains(&header[7]) {
+            return Err(io_err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid fixed index run header",
+            )));
+        }
         Ok(Self {
-            reader: open_index_sort_run(path, read_buffer_bytes)?,
+            reader,
+            width: usize::from(header[7]),
         })
     }
 
     fn next_record(&mut self) -> Result<Option<u128>, QueryError> {
         let mut bytes = [0u8; 16];
-        if self.reader.read(&mut bytes[..1]).map_err(io_err)? == 0 {
+        let available = std::io::BufRead::fill_buf(&mut self.reader).map_err(io_err)?;
+        if available.is_empty() {
             return Ok(None);
         }
-        self.reader.read_exact(&mut bytes[1..]).map_err(io_err)?;
+        if available.len() >= self.width {
+            bytes[..self.width].copy_from_slice(&available[..self.width]);
+            std::io::BufRead::consume(&mut self.reader, self.width);
+        } else {
+            self.reader
+                .read_exact(&mut bytes[..self.width])
+                .map_err(io_err)?;
+        }
         Ok(Some(u128::from_be_bytes(bytes)))
     }
 }
@@ -2004,12 +2232,10 @@ struct EncodedFixed128RunCodec;
 impl IndexSortRunCodec for EncodedFixed128RunCodec {
     type Entry = u128;
     type Reader = EncodedFixed128RunReader;
-    type Writer = std::io::BufWriter<File>;
+    type Writer = EncodedFixed128RunWriter;
 
     fn open_reader(path: &Path, read_buffer_bytes: usize) -> Result<Self::Reader, QueryError> {
-        Ok(EncodedFixed128RunReader {
-            reader: open_index_sort_run(path, read_buffer_bytes)?,
-        })
+        EncodedFixed128RunReader::open_unaccounted(path, read_buffer_bytes)
     }
 
     fn next_entry(reader: &mut Self::Reader) -> Result<Option<Self::Entry>, QueryError> {
@@ -2017,30 +2243,41 @@ impl IndexSortRunCodec for EncodedFixed128RunCodec {
     }
 
     fn create_writer(path: &Path) -> Result<Self::Writer, QueryError> {
-        Ok(std::io::BufWriter::with_capacity(
-            64 * 1024,
-            OpenOptions::new()
-                .create_new(true)
-                .write(true)
-                .open(path)
-                .map_err(io_err)?,
-        ))
+        EncodedFixed128RunWriter::create(path, 16)
+    }
+
+    fn create_merge_writer(path: &Path, sources: &[PathBuf]) -> Result<Self::Writer, QueryError> {
+        let mut width = 1;
+        for source in sources {
+            width = width.max(EncodedFixed128RunReader::open_unaccounted(source, 8)?.width);
+        }
+        EncodedFixed128RunWriter::create_buffered(path, width, 64 * 1024)
     }
 
     fn append(writer: &mut Self::Writer, entry: &Self::Entry) -> Result<(), QueryError> {
-        writer.write_all(&entry.to_be_bytes()).map_err(io_err)
+        writer.append(*entry)
     }
 
-    fn finish(mut writer: Self::Writer) -> Result<(), QueryError> {
-        writer.flush().map_err(io_err)
+    fn finish(writer: Self::Writer) -> Result<(), QueryError> {
+        writer.finish()
     }
 }
 
 impl EncodedFixed128RunMerger {
+    #[cfg(test)]
     fn open(
         tmp: IndexSortTmpDir,
         runs: Vec<PathBuf>,
         read_buffer_bytes: usize,
+    ) -> Result<Self, QueryError> {
+        Self::open_with_tail(tmp, runs, read_buffer_bytes, Vec::new())
+    }
+
+    fn open_with_tail(
+        tmp: IndexSortTmpDir,
+        runs: Vec<PathBuf>,
+        read_buffer_bytes: usize,
+        tail: Vec<u128>,
     ) -> Result<Self, QueryError> {
         let runs = consolidate_sort_runs::<EncodedFixed128RunCodec>(
             &tmp.path,
@@ -2057,11 +2294,16 @@ impl EncodedFixed128RunMerger {
                 heads.push(Some(record));
             }
         }
+        let mut tail = tail.into_iter();
+        if let Some(head) = tail.next() {
+            heads.push(Some(head));
+        }
         Ok(Self {
             _tmp: tmp,
             readers,
             tournament: RunHeadTournament::new(heads),
             previous: None,
+            tail,
         })
     }
 }
@@ -2072,7 +2314,11 @@ impl Iterator for EncodedFixed128RunMerger {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             let run = self.tournament.winner()?;
-            let next = match self.readers[run].next_record() {
+            let next = match if run == self.readers.len() {
+                Ok(self.tail.next())
+            } else {
+                self.readers[run].next_record()
+            } {
                 Ok(next) => next,
                 Err(err) => return Some(Err(err)),
             };
@@ -2090,6 +2336,21 @@ impl Iterator for EncodedFixed128RunMerger {
 }
 
 impl EncodedIndexSorter {
+    fn with_external_merge_reserve(mut self) -> Self {
+        if let EncodedSortStorage::Fixed128 { records, .. } = &mut self.storage {
+            // Keep the tail allocation alive through consolidation/final merge.
+            // All readers and the consolidation writer fit in this reservation.
+            let read_bytes = (self.run_bytes / 32 / MAX_ENCODED_MERGE_FAN_IN).min(4 * 1024 * 1024);
+            let reserve = read_bytes * MAX_ENCODED_MERGE_FAN_IN + 1024 * 1024;
+            if read_bytes >= 64 * 1024 && reserve < self.run_bytes / 4 {
+                debug_assert!(records.is_empty());
+                *records = Vec::new();
+                *records = Vec::with_capacity((self.run_bytes - reserve) / 16);
+                self.tail_read_buffer = read_bytes;
+            }
+        }
+        self
+    }
     fn new(program: Arc<CompiledIndexKeyProgram>, run_bytes: usize) -> Self {
         let run_bytes = run_bytes.max(1024 * 1024);
         let storage = if let Some(record_width) = program.fixed_record_width() {
@@ -2135,6 +2396,7 @@ impl EncodedIndexSorter {
             tmp: None,
             runs: Vec::new(),
             sort_degree: index_sort_parallel_degree(),
+            tail_read_buffer: 0,
         }
     }
 
@@ -2590,6 +2852,7 @@ impl EncodedIndexSorter {
     }
 
     fn sort_current(&mut self) {
+        let _timer = IndexBuildSortTimer::start();
         match &mut self.storage {
             EncodedSortStorage::Fixed128 { records, .. } => {
                 if !records.windows(2).any(|pair| pair[0] > pair[1]) {
@@ -2666,72 +2929,73 @@ impl EncodedIndexSorter {
             .expect("encoded sorter owns temp dir")
             .path
             .join(format!("encoded-run-{}", self.runs.len()));
-        let file = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&path)
-            .map_err(io_err)?;
-        let mut writer = std::io::BufWriter::with_capacity(1024 * 1024, file);
-        match &self.storage {
-            EncodedSortStorage::Fixed128 { records, .. } => {
-                for encoded in records {
-                    writer.write_all(&encoded.to_be_bytes()).map_err(io_err)?;
+        if let EncodedSortStorage::Fixed128 {
+            records, stride, ..
+        } = &self.storage
+        {
+            let mut writer = EncodedFixed128RunWriter::create(&path, *stride)?;
+            writer.append_batch(records)?;
+            writer.finish()?;
+        } else {
+            let width = match &self.storage {
+                EncodedSortStorage::Fixed { key_width, .. } => *key_width,
+                _ => 0,
+            };
+            let mut writer = EncodedRunWriter::create(&path, width)?;
+            match &self.storage {
+                EncodedSortStorage::Fixed128 { .. } => unreachable!(),
+                EncodedSortStorage::Fixed {
+                    key_width,
+                    stride,
+                    bytes,
+                    order,
+                    ..
+                } => {
+                    for ordinal in order {
+                        let start = *ordinal as usize * *stride;
+                        let record = &bytes[start..start + *stride];
+                        writer.append(
+                            &record[..*key_width],
+                            None,
+                            RowId {
+                                page_id: u32::from_be_bytes(
+                                    record[*key_width..*key_width + 4].try_into().unwrap(),
+                                ),
+                                slot_id: u16::from_be_bytes(
+                                    record[*key_width + 4..].try_into().unwrap(),
+                                ),
+                            },
+                            self.program.fixed_ops.as_ref().is_some_and(|ops| {
+                                fixed_order_key_has_null(&record[..*key_width], ops)
+                            }),
+                        )?;
+                    }
+                }
+                EncodedSortStorage::Variable { arena, records, .. } => {
+                    for descriptor in records {
+                        let payload = descriptor_materialized_key(arena, descriptor);
+                        writer.append(
+                            descriptor_order_key(arena, descriptor),
+                            (!payload.is_empty()).then_some(payload),
+                            descriptor.row_id,
+                            descriptor.has_null,
+                        )?;
+                    }
+                }
+                EncodedSortStorage::Interned { keys, records, .. } => {
+                    for record in records {
+                        let key = &keys[interned_record_key_id(*record) as usize];
+                        writer.append(
+                            &key.order_key,
+                            key.materialized_key.as_deref(),
+                            interned_record_row_id(*record),
+                            key.has_null,
+                        )?;
+                    }
                 }
             }
-            EncodedSortStorage::Fixed {
-                key_width,
-                stride,
-                bytes,
-                order,
-                ..
-            } => {
-                for ordinal in order {
-                    let start = *ordinal as usize * *stride;
-                    let record = &bytes[start..start + *stride];
-                    write_encoded_run_record(
-                        &mut writer,
-                        &record[..*key_width],
-                        None,
-                        RowId {
-                            page_id: u32::from_be_bytes(
-                                record[*key_width..*key_width + 4].try_into().unwrap(),
-                            ),
-                            slot_id: u16::from_be_bytes(
-                                record[*key_width + 4..].try_into().unwrap(),
-                            ),
-                        },
-                        self.program.fixed_ops.as_ref().is_some_and(|ops| {
-                            fixed_order_key_has_null(&record[..*key_width], ops)
-                        }),
-                    )?;
-                }
-            }
-            EncodedSortStorage::Variable { arena, records, .. } => {
-                for descriptor in records {
-                    let payload = descriptor_materialized_key(arena, descriptor);
-                    write_encoded_run_record(
-                        &mut writer,
-                        descriptor_order_key(arena, descriptor),
-                        (!payload.is_empty()).then_some(payload),
-                        descriptor.row_id,
-                        descriptor.has_null,
-                    )?;
-                }
-            }
-            EncodedSortStorage::Interned { keys, records, .. } => {
-                for record in records {
-                    let key = &keys[interned_record_key_id(*record) as usize];
-                    write_encoded_run_record(
-                        &mut writer,
-                        &key.order_key,
-                        key.materialized_key.as_deref(),
-                        interned_record_row_id(*record),
-                        key.has_null,
-                    )?;
-                }
-            }
+            writer.finish()?;
         }
-        writer.flush().map_err(io_err)?;
         if let Ok(meta) = fs::metadata(&path) {
             record_spill_bytes_written(meta.len());
         }
@@ -2800,7 +3064,15 @@ impl EncodedIndexSorter {
                 }
             });
         }
-        self.flush_run(data_dir)?;
+        let mut tail = Vec::new();
+        if self.tail_read_buffer != 0 {
+            self.sort_current();
+            if let EncodedSortStorage::Fixed128 { records, .. } = &mut self.storage {
+                tail = std::mem::take(records);
+            }
+        } else {
+            self.flush_run(data_dir)?;
+        }
         let fixed128 = match &self.storage {
             EncodedSortStorage::Fixed128 {
                 key_width, stride, ..
@@ -2811,7 +3083,12 @@ impl EncodedIndexSorter {
             tmp: self.tmp.take().expect("encoded runs own temp dir"),
             runs: self.runs,
             fixed128,
-            read_buffer_bytes: encoded_merge_read_buffer_bytes(self.run_bytes),
+            tail,
+            read_buffer_bytes: if self.tail_read_buffer != 0 {
+                self.tail_read_buffer
+            } else {
+                encoded_merge_read_buffer_bytes(self.run_bytes)
+            },
         })
     }
 }
@@ -3074,8 +3351,7 @@ fn parallel_sort_fixed128_in_place(records: &mut Vec<u128>, degree: usize) {
 /// Packing and restoring reuse the input allocation, so run admission and
 /// spill boundaries are unchanged.
 fn try_sort_compact_fixed128(records: &mut [u128]) -> bool {
-    #[cfg(target_arch = "x86_64")]
-    if records.len() >= 64 * 1024 && std::is_x86_feature_detected!("bmi2") {
+    if records.len() >= 64 * 1024 {
         // The comparison sorter handles long monotone runs especially well;
         // avoid paying two conversion passes for those inputs.
         let inversions = records
@@ -3086,12 +3362,82 @@ fn try_sort_compact_fixed128(records: &mut [u128]) -> bool {
         if !(64..=960).contains(&inversions) {
             return false;
         }
-        // SAFETY: BMI2 was checked at runtime. The helper stays inside the
-        // initialized allocation and restores every u128 before returning.
-        return unsafe { sort_compact_fixed128_bmi2(records) };
+        #[cfg(target_arch = "x86_64")]
+        if std::is_x86_feature_detected!("bmi2") {
+            // SAFETY: BMI2 was checked at runtime. The helper stays inside the
+            // initialized allocation and restores every u128 before returning.
+            return unsafe { sort_compact_fixed128_bmi2(records) };
+        }
+        return sort_compact_fixed128_portable(records);
     }
     let _ = records;
     false
+}
+
+/// Gather a few contiguous varying-bit ranges instead of requiring BMI2.
+/// The key encoding and RowId remain one unsigned total-order identity.
+/// Highly fragmented masks or more than 64 varying bits use the u128 sorter.
+fn sort_compact_fixed128_portable(records: &mut [u128]) -> bool {
+    let Some(&first) = records.first() else {
+        return true;
+    };
+    let mut varying = 0u128;
+    for &record in records.iter() {
+        varying |= record ^ first;
+        if varying.count_ones() > 64 {
+            return false;
+        }
+    }
+    if varying == 0 {
+        return true;
+    }
+    let mut ranges = [(0u32, 0u32, 0u64); 6];
+    let mut count = 0;
+    let mut remaining = varying;
+    let mut target = 0;
+    while remaining != 0 {
+        if count == ranges.len() {
+            return false;
+        }
+        let source = remaining.trailing_zeros();
+        let bits = (remaining >> source).trailing_ones();
+        let mask = if bits == 64 {
+            u64::MAX
+        } else {
+            (1u64 << bits) - 1
+        };
+        ranges[count] = (source, target, mask);
+        remaining &= !(u128::from(mask) << source);
+        target += bits;
+        count += 1;
+    }
+    let ranges = &ranges[..count];
+    let fixed = first & !varying;
+    let pointer = records.as_mut_ptr();
+    let length = records.len();
+    // SAFETY: each forward write occupies 8*i after reading 16*i. Reverse
+    // expansion reads 8*i before writing 16*i, so neither direction destroys
+    // unread input. Both integer types accept all bits and u128 aligns u64.
+    unsafe {
+        for i in 0..length {
+            let record = *pointer.add(i);
+            let mut compact = 0;
+            for &(source, target, mask) in ranges {
+                compact |= ((record >> source) as u64 & mask) << target;
+            }
+            *pointer.cast::<u64>().add(i) = compact;
+        }
+        std::slice::from_raw_parts_mut(pointer.cast::<u64>(), length).sort_unstable();
+        for i in (0..length).rev() {
+            let compact = *pointer.cast::<u64>().add(i);
+            let mut record = fixed;
+            for &(source, target, mask) in ranges {
+                record |= u128::from((compact >> target) & mask) << source;
+            }
+            *pointer.add(i) = record;
+        }
+    }
+    true
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -3759,6 +4105,188 @@ fn poisoned_sorter_error() -> QueryError {
     )
 }
 
+/// A spillable sorter has one owner. Scan workers transfer bounded encoded
+/// chunks, never hold a sorter lock across sorting or filesystem I/O.
+struct BackgroundFixedSorter {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    handle: Option<std::thread::JoinHandle<Result<EncodedIndexSorter, QueryError>>>,
+    recycled: Arc<Mutex<Vec<Vec<u8>>>>,
+    cancelled: Arc<AtomicBool>,
+    failure: Arc<Mutex<Option<QueryError>>>,
+}
+
+impl BackgroundFixedSorter {
+    fn new(mut sorter: EncodedIndexSorter, data_dir: PathBuf) -> Result<Self, QueryError> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(1);
+        let recycled = Arc::new(Mutex::new(Vec::new()));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let failure = Arc::new(Mutex::new(None));
+        let pool = Arc::clone(&recycled);
+        let cancel = Arc::clone(&cancelled);
+        let errors = Arc::clone(&failure);
+        let cancel_snapshot = crate::engine::cancel::CancellationSnapshot::capture();
+        sorter.sort_degree = 1;
+        let handle = crate::util::thread_spawn::Builder::new()
+            .name("mydb-index-run".into())
+            .stack_size(4 * 1024 * 1024)
+            .spawn(move || {
+                let _worker = enter_index_build_worker();
+                let _cancel_scope = cancel_snapshot.enter();
+                for mut chunk in receiver {
+                    if cancel.load(Ordering::Acquire) {
+                        break;
+                    }
+                    if let Err(err) = crate::engine::cancel::check_cancelled()
+                        .and_then(|()| sorter.push_fixed_batch(&data_dir, &chunk))
+                    {
+                        *errors.lock().unwrap_or_else(|e| e.into_inner()) = Some(err.clone());
+                        return Err(err);
+                    }
+                    chunk.clear();
+                    pool.lock().unwrap_or_else(|e| e.into_inner()).push(chunk);
+                }
+                Ok(sorter)
+            })
+            .map_err(io_err)?;
+        Ok(Self {
+            sender: Some(sender),
+            handle: Some(handle),
+            recycled,
+            cancelled,
+            failure,
+        })
+    }
+
+    fn error(&self) -> QueryError {
+        self.failure
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| {
+                error(
+                    crate::error::catalog::ER_UNKNOWN_ERROR,
+                    "index run worker stopped",
+                )
+            })
+    }
+
+    fn push(&self, chunk: &mut Vec<u8>, wait: bool) -> Result<bool, QueryError> {
+        let capacity = chunk.capacity();
+        let pending = std::mem::take(chunk);
+        let sender = self.sender.as_ref().expect("live run worker");
+        if wait {
+            sender.send(pending).map_err(|_| self.error())?;
+        } else {
+            match sender.try_send(pending) {
+                Ok(()) => {}
+                Err(std::sync::mpsc::TrySendError::Full(pending)) => {
+                    *chunk = pending;
+                    return Ok(false);
+                }
+                Err(std::sync::mpsc::TrySendError::Disconnected(_)) => return Err(self.error()),
+            }
+        }
+        *chunk = self
+            .recycled
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .pop()
+            .unwrap_or_else(|| Vec::with_capacity(capacity));
+        Ok(true)
+    }
+
+    fn finish(mut self) -> Result<EncodedIndexSorter, QueryError> {
+        drop(self.sender.take());
+        self.handle
+            .take()
+            .unwrap()
+            .join()
+            .map_err(|_| self.error())?
+    }
+}
+
+impl Drop for BackgroundFixedSorter {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Release);
+        drop(self.sender.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+enum FixedScanSorter {
+    Direct(Mutex<EncodedIndexSorter>),
+    Background(BackgroundFixedSorter),
+}
+
+impl FixedScanSorter {
+    fn finish(self) -> Result<EncodedIndexSorter, QueryError> {
+        match self {
+            Self::Direct(sorter) => sorter.into_inner().map_err(|_| poisoned_sorter_error()),
+            Self::Background(sorter) => sorter.finish(),
+        }
+    }
+}
+
+fn flush_fixed_scan_chunks(
+    sorters: &[FixedScanSorter],
+    chunks: &mut [Vec<u8>],
+    start: usize,
+    data_dir: &Path,
+) -> Result<(), QueryError> {
+    let mut remaining = chunks.iter().filter(|c| !c.is_empty()).count();
+    let mut wait = false;
+    while remaining != 0 {
+        crate::engine::cancel::check_cancelled()?;
+        let mut progress = false;
+        for step in 0..sorters.len() {
+            let i = (start + step) % sorters.len();
+            if chunks[i].is_empty() {
+                continue;
+            }
+            let started = Instant::now();
+            let pushed = match &sorters[i] {
+                FixedScanSorter::Background(sorter) => {
+                    let pushed = sorter.push(&mut chunks[i], wait)?;
+                    if wait {
+                        INDEX_BUILD_QUEUE_WAIT_US
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    pushed
+                }
+                FixedScanSorter::Direct(sorter) => {
+                    let mut guard = if wait {
+                        sorter.lock().map_err(|_| poisoned_sorter_error())?
+                    } else {
+                        match sorter.try_lock() {
+                            Ok(guard) => guard,
+                            Err(std::sync::TryLockError::WouldBlock) => continue,
+                            Err(std::sync::TryLockError::Poisoned(_)) => {
+                                return Err(poisoned_sorter_error())
+                            }
+                        }
+                    };
+                    if wait {
+                        INDEX_BUILD_QUEUE_WAIT_US
+                            .fetch_add(started.elapsed().as_micros() as u64, Ordering::Relaxed);
+                    }
+                    guard.push_fixed_batch(data_dir, &chunks[i])?;
+                    chunks[i].clear();
+                    true
+                }
+            };
+            if pushed {
+                remaining -= 1;
+                progress = true;
+                wait = false;
+            }
+        }
+        wait = !progress;
+    }
+    Ok(())
+}
+
 /// Move one scan worker's per-sorter chunks into the shared sorters. Every
 /// sorter has its own lock. A worker starts at its own offset and skips busy
 /// sorters, blocking only when all pending sorters are held, so concurrent
@@ -4135,8 +4663,18 @@ impl Database {
             .iter()
             .cloned()
             .zip(budgets.iter().copied())
-            .map(|(program, budget)| {
-                EncodedIndexSorter::new(program, budget).with_sort_degree(sorter_degree)
+            .enumerate()
+            .map(|(i, (program, budget))| {
+                let sorter =
+                    EncodedIndexSorter::new(program, budget).with_sort_degree(sorter_degree);
+                if program_estimates
+                    .as_ref()
+                    .is_some_and(|estimates| estimates[i] > budget)
+                {
+                    sorter.with_external_merge_reserve()
+                } else {
+                    sorter
+                }
             })
             .collect::<Vec<_>>();
         debug_assert!(
@@ -4147,6 +4685,27 @@ impl Database {
                 <= aggregate
         );
 
+        let mut background = vec![false; sorters.len()];
+        if fixed_parallel && scan_degree >= 4 {
+            if let Some(estimates) = &program_estimates {
+                let mut slots = scan_degree - 2;
+                for (i, budget) in budgets.iter().enumerate() {
+                    if slots > 0 && *budget < estimates[i] {
+                        background[i] = true;
+                        slots -= 1;
+                    }
+                }
+            }
+        }
+        let background_count = background.iter().filter(|enabled| **enabled).count();
+        let scan_degree = if background_count == 0 {
+            scan_degree
+        } else {
+            scan_degree - background_count.max(2)
+        };
+        // The released scan slots fund one stack per run worker and up to two
+        // extra chunks per pipelined index (queued and currently consumed).
+        INDEX_BUILD_PIPELINE_WORKERS_PEAK.fetch_max(background_count as u64, Ordering::Relaxed);
         let scan_started = Instant::now();
         let mut visible_rows = 0u64;
         if scan_degree > 1 && fixed_parallel {
@@ -4176,7 +4735,19 @@ impl Database {
                         .expect("parallel program has fixed width")
                 })
                 .collect::<Vec<_>>();
-            let shared_sorters = sorters.into_iter().map(Mutex::new).collect::<Vec<_>>();
+            let shared_sorters = sorters
+                .into_iter()
+                .zip(&background)
+                .map(|(mut sorter, background)| {
+                    sorter.sort_degree = 1;
+                    if *background {
+                        BackgroundFixedSorter::new(sorter, self.data_dir().to_path_buf())
+                            .map(FixedScanSorter::Background)
+                    } else {
+                        Ok(FixedScanSorter::Direct(Mutex::new(sorter)))
+                    }
+                })
+                .collect::<Result<Vec<_>, QueryError>>()?;
             let next_page = AtomicU64::new(0);
             visible_rows = self.with_heap_read(table.id, |heap| {
                 crate::util::thread_spawn::scope(|scope| -> Result<u64, QueryError> {
@@ -4210,17 +4781,7 @@ impl Database {
                                     let mut chunk_rows = 0usize;
                                     let mut visible = 0u64;
                                     let flush = |chunks: &mut [Vec<u8>]| {
-                                        flush_chunks_to_sorters(
-                                            shared_sorters,
-                                            chunks,
-                                            worker,
-                                            Vec::is_empty,
-                                            |sorter, chunk| {
-                                                sorter.push_fixed_batch(self.data_dir(), chunk)?;
-                                                chunk.clear();
-                                                Ok(())
-                                            },
-                                        )
+                                        flush_fixed_scan_chunks(shared_sorters, chunks, worker, self.data_dir())
                                     };
                                     loop {
                                         let start_page =
@@ -4333,7 +4894,11 @@ impl Database {
                     Ok(visible)
                 })
             })?;
-            sorters = into_inner_sorters(shared_sorters)?;
+            sorters = shared_sorters
+                .into_iter()
+                .map(FixedScanSorter::finish)
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(scan_charges);
             charge.shrink(parallel_scratch);
         } else if scan_degree > 1 {
             // Variable direct-column programs still benefit from disjoint
@@ -4463,6 +5028,9 @@ impl Database {
                 }
             })?;
         }
+        for sorter in &mut sorters {
+            sorter.sort_degree = sorter_degree;
+        }
         INDEX_BUILD_SCAN_US.fetch_add(
             scan_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
             Ordering::Relaxed,
@@ -4475,6 +5043,7 @@ impl Database {
                          program: Arc<CompiledIndexKeyProgram>,
                          sorted: EncodedSortedRecords|
          -> Result<(), QueryError> {
+            let stream_started = Instant::now();
             let path = self.index_path_for_table_schema(table, table.id, &index.name);
             let _generation = btree_logical_wal::LsnScope::new(Some(generation_lsn));
             let mut validation = validation_indexes
@@ -4497,6 +5066,10 @@ impl Database {
                     .insert(index.name.clone(), validation);
             }
             file.flush()?;
+            INDEX_BUILD_STREAM_US.fetch_add(
+                stream_started.elapsed().as_micros() as u64,
+                Ordering::Relaxed,
+            );
             if !online {
                 self.remove_index_cache_entry(table.id, &index.name)?;
             }
@@ -4555,12 +5128,7 @@ impl Database {
                     if cancelled.load(Ordering::Acquire) {
                         break;
                     }
-                    let sort_started = Instant::now();
                     let sorted = sorter.finish(self.data_dir())?;
-                    INDEX_BUILD_SORT_US.fetch_add(
-                        sort_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
                     if sender.send((index, program, sorted, sort_charge)).is_err() {
                         break;
                     }
@@ -5613,10 +6181,9 @@ mod encoded_index_program_tests {
             let fixed_path = root.path().join("fixed");
             let count = capacity / 16 + 3;
             let expected = (0..count as u128).map(|n| n * 19).collect::<Vec<_>>();
-            let bytes = expected
-                .iter()
-                .flat_map(|n| n.to_be_bytes())
-                .collect::<Vec<_>>();
+            let mut bytes = FIXED_RUN_MAGIC.to_vec();
+            bytes.push(16);
+            bytes.extend(expected.iter().flat_map(|n| n.to_be_bytes()));
             fs::write(&fixed_path, &bytes).unwrap();
             let mut reader = EncodedFixed128RunReader::open(&fixed_path, capacity).unwrap();
             assert_eq!(reader.reader.capacity(), capacity);
@@ -5639,7 +6206,8 @@ mod encoded_index_program_tests {
                 page_id: 123,
                 slot_id: 45,
             };
-            let mut bytes = Vec::new();
+            let mut bytes = ENCODED_RUN_MAGIC.to_vec();
+            bytes.extend(0u32.to_le_bytes());
             write_encoded_run_record(&mut bytes, &key, Some(&payload), row_id, true).unwrap();
             fs::write(&variable_path, &bytes).unwrap();
             let mut reader = EncodedRunReader::open(&variable_path, capacity).unwrap();
@@ -5700,12 +6268,18 @@ mod encoded_index_program_tests {
 
         for length in 1..15 {
             let path = root.path().join(format!("truncated-{length}"));
-            fs::write(&path, vec![0; length]).unwrap();
+            let mut bytes = ENCODED_RUN_MAGIC.to_vec();
+            bytes.extend(0u32.to_le_bytes());
+            bytes.extend(vec![0; length]);
+            fs::write(&path, bytes).unwrap();
             let mut reader = EncodedRunReader::open(&path, 64 * 1024).unwrap();
             assert!(reader.next_record().is_err());
         }
         let path = root.path().join("empty");
-        fs::write(&path, []).unwrap();
+        EncodedRunWriter::create(&path, 0)
+            .unwrap()
+            .finish()
+            .unwrap();
         assert!(EncodedRunReader::open(&path, 64 * 1024)
             .unwrap()
             .next_record()
@@ -5725,7 +6299,7 @@ mod encoded_index_program_tests {
                 EncodedFixed128RunCodec::append(&mut writer, &key).unwrap();
             }
             EncodedFixed128RunCodec::finish(writer).unwrap();
-            assert_eq!(fs::metadata(&path).unwrap().len(), 3 * 16);
+            assert_eq!(fs::metadata(&path).unwrap().len(), 8 + 3 * 16);
             runs.push(path);
         }
         let merged = EncodedFixed128RunMerger::open(tmp, runs, 64 * 1024)
@@ -5736,7 +6310,10 @@ mod encoded_index_program_tests {
 
         for length in 1..16 {
             let path = root.path().join(format!("fixed-truncated-{length}"));
-            fs::write(&path, vec![0; length]).unwrap();
+            let mut bytes = FIXED_RUN_MAGIC.to_vec();
+            bytes.push(16);
+            bytes.extend(vec![0; length]);
+            fs::write(&path, bytes).unwrap();
             assert!(EncodedFixed128RunReader::open(&path, 64 * 1024)
                 .unwrap()
                 .next_record()
@@ -6002,7 +6579,7 @@ mod encoded_index_program_tests {
         assert!(runs.len() > 1);
         assert!(runs
             .iter()
-            .all(|path| fs::metadata(path).unwrap().len() % 16 == 0));
+            .all(|path| (fs::metadata(path).unwrap().len() - 8) % 15 == 0));
         let source = validated_fixed128_from_sorted(sorted, program, &dummy_index()).unwrap();
         let mut previous = None;
         let mut count = 0;
@@ -6060,6 +6637,7 @@ mod encoded_index_program_tests {
             tmp,
             runs,
             fixed128: Some((9, 15)),
+            tail: Vec::new(),
             read_buffer_bytes: 64 * 1024,
         };
         let mut source = validated_fixed128_from_sorted(sorted, Arc::new(program), &index).unwrap();
@@ -6121,6 +6699,284 @@ mod encoded_index_program_tests {
             index_build_ancillary_headroom_for_limit(16 * 1024 * 1024),
             4 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn compact_runs_all_widths_merge_with_resident_tail_and_cleanup() {
+        let root = tempfile::tempdir().unwrap();
+        for width in 1..=16 {
+            let tmp = IndexSortTmpDir::create(root.path()).unwrap();
+            let tmp_path = tmp.path.clone();
+            let shift = (16 - width) * 8;
+            let mut paths = Vec::new();
+            for run in 0..257 {
+                let path = tmp.path.join(format!("run-{run}"));
+                let mut writer = EncodedFixed128RunWriter::create(&path, width).unwrap();
+                writer
+                    .append_batch(&[1u128 << shift, 3u128 << shift])
+                    .unwrap();
+                writer.finish().unwrap();
+                assert_eq!(fs::metadata(&path).unwrap().len(), (8 + 2 * width) as u64);
+                paths.push(path);
+            }
+            let tail = vec![0, 1u128 << shift, 2u128 << shift, 4u128 << shift];
+            let merged = EncodedFixed128RunMerger::open_with_tail(tmp, paths, 7, tail)
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(merged, (0..5u128).map(|n| n << shift).collect::<Vec<_>>());
+            assert!(!tmp_path.exists());
+        }
+        for bytes in [
+            vec![],
+            b"MYIRUN1\0".to_vec(),
+            b"MYIRUN1\x11".to_vec(),
+            b"INVALID\x08".to_vec(),
+        ] {
+            let path = root.path().join("invalid-header");
+            fs::write(&path, bytes).unwrap();
+            assert!(EncodedFixed128RunReader::open(&path, 7).is_err());
+        }
+    }
+
+    #[test]
+    fn portable_compaction_preserves_full_record_order_and_allocation() {
+        for mask in [
+            0,
+            u128::from(u64::MAX),
+            u128::from(u64::MAX) << 64,
+            (0xfffu128 << 100) | (0xfffffu128 << 40) | (0xffu128 << 8),
+            0x5555555555555555u128,
+            u128::MAX,
+        ] {
+            let fixed = 0xa55a98123311234587654321abcdef01u128 & !mask;
+            let mut seed = 71u128;
+            let mut records = (0..70_003)
+                .map(|_| {
+                    seed = seed.wrapping_mul(0xda942042e4dd58b5).wrapping_add(1);
+                    fixed | (seed & mask)
+                })
+                .collect::<Vec<_>>();
+            let original = records.clone();
+            let mut expected = original.clone();
+            expected.sort_unstable();
+            let pointer = records.as_ptr();
+            if sort_compact_fixed128_portable(&mut records) {
+                assert_eq!(records, expected);
+            } else {
+                assert_eq!(records, original);
+            }
+            assert_eq!(records.as_ptr(), pointer);
+        }
+    }
+
+    #[test]
+    fn bounded_sorter_multi_pass_and_resident_tail_preserve_every_row() {
+        let root = tempfile::tempdir().unwrap();
+        let (program, _) = record_for(
+            vec![ParamTarget::Int],
+            IndexKey::from(vec![KeyPart::Int(0)]),
+            RowId {
+                page_id: 0,
+                slot_id: 0,
+            },
+        );
+        let prefix = program
+            .encode_key(&IndexKey::from(vec![KeyPart::Int(0)]))
+            .unwrap()
+            .order_key;
+        let program = Arc::new(program);
+        let rows = 2_100_000u32;
+        for budget in [1024 * 1024, 32 * 1024 * 1024] {
+            let mut sorter = EncodedIndexSorter::new(program.clone(), budget)
+                .with_sort_degree(1)
+                .with_external_merge_reserve();
+            let mut chunk = Vec::new();
+            for page_id in (0..rows).rev() {
+                chunk.extend_from_slice(&prefix);
+                chunk.extend_from_slice(&page_id.to_be_bytes());
+                chunk.extend_from_slice(&0u16.to_be_bytes());
+                if chunk.len() >= 4096 * 15 || page_id == 0 {
+                    sorter.push_fixed_batch(root.path(), &chunk).unwrap();
+                    chunk.clear();
+                }
+            }
+            let sorted = sorter.finish(root.path()).unwrap();
+            let EncodedSortedRecords::Spilled { runs, tail, .. } = &sorted else {
+                panic!("external sort expected");
+            };
+            if budget == 1024 * 1024 {
+                assert!(runs.len() > 16);
+                assert!(tail.is_empty());
+            } else {
+                assert!(!tail.is_empty());
+            }
+            let mut count = 0;
+            for record in
+                validated_fixed128_from_sorted(sorted, program.clone(), &dummy_index()).unwrap()
+            {
+                let record = record.unwrap();
+                assert_eq!(decode_fixed128_row_id(&record, 9).page_id, count);
+                count += 1;
+            }
+            assert_eq!(count, rows);
+        }
+    }
+
+    #[test]
+    fn background_sorter_matches_direct_spills_and_propagates_failure() {
+        let root = tempfile::tempdir().unwrap();
+        for arity in [1, 3] {
+            let (program, _) = record_for(
+                vec![ParamTarget::Int; arity],
+                IndexKey::from(vec![KeyPart::Int(0); arity]),
+                RowId {
+                    page_id: 0,
+                    slot_id: 0,
+                },
+            );
+            let program = Arc::new(program);
+            let mut direct =
+                EncodedIndexSorter::new(program.clone(), 1024 * 1024).with_sort_degree(1);
+            let background = BackgroundFixedSorter::new(
+                EncodedIndexSorter::new(program.clone(), 1024 * 1024),
+                root.path().to_path_buf(),
+            )
+            .unwrap();
+            let mut batch = Vec::new();
+            for page in 0..100_000u32 {
+                let pending = program
+                    .encode_key(&IndexKey::from(vec![
+                        KeyPart::Int(i64::from(page % 97) - 48);
+                        arity
+                    ]))
+                    .unwrap();
+                batch.extend_from_slice(&pending.order_key);
+                batch.extend_from_slice(&page.to_be_bytes());
+                batch.extend_from_slice(&0u16.to_be_bytes());
+                if page % 4096 == 4095 || page == 99_999 {
+                    direct.push_fixed_batch(root.path(), &batch).unwrap();
+                    background.push(&mut batch, true).unwrap();
+                }
+            }
+            let expected = direct
+                .finish(root.path())
+                .unwrap()
+                .into_record_iter(program.clone())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            let actual = background
+                .finish()
+                .unwrap()
+                .finish(root.path())
+                .unwrap()
+                .into_record_iter(program.clone())
+                .unwrap()
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap();
+            assert_eq!(actual, expected);
+
+            let broken = BackgroundFixedSorter::new(
+                EncodedIndexSorter::new(program, 1024 * 1024),
+                root.path().to_path_buf(),
+            )
+            .unwrap();
+            broken.push(&mut vec![0], true).unwrap();
+            assert!(broken.finish().is_err());
+        }
+    }
+
+    #[test]
+    fn background_sorter_cancellation_io_failure_and_drop_release_runs() {
+        let root = tempfile::tempdir().unwrap();
+        let (program, _) = record_for(
+            vec![ParamTarget::Int],
+            IndexKey::from(vec![KeyPart::Int(0)]),
+            RowId {
+                page_id: 0,
+                slot_id: 0,
+            },
+        );
+        let key = program
+            .encode_key(&IndexKey::from(vec![KeyPart::Int(0)]))
+            .unwrap();
+        let program = Arc::new(program);
+        let batch = || {
+            let mut bytes = Vec::new();
+            for page in 0..70_000u32 {
+                bytes.extend_from_slice(&key.order_key);
+                bytes.extend_from_slice(&page.to_be_bytes());
+                bytes.extend_from_slice(&0u16.to_be_bytes());
+            }
+            bytes
+        };
+        let token = crate::engine::cancel::QueryCancelToken::noop();
+        {
+            let _scope = crate::engine::cancel::enter(token.clone());
+            let background = BackgroundFixedSorter::new(
+                EncodedIndexSorter::new(program.clone(), 1024 * 1024),
+                root.path().to_path_buf(),
+            )
+            .unwrap();
+            token.cancel_local();
+            background.push(&mut batch(), true).unwrap();
+            assert!(background.finish().is_err());
+        }
+
+        // A real filesystem failure must disconnect producers even when a
+        // second bounded send is waiting for the worker's spill to complete.
+        let blocked_path = root.path().join("not-a-directory");
+        fs::write(&blocked_path, b"file").unwrap();
+        let broken = BackgroundFixedSorter::new(
+            EncodedIndexSorter::new(program.clone(), 1024 * 1024),
+            blocked_path,
+        )
+        .unwrap();
+        for _ in 0..4 {
+            if broken.push(&mut batch(), true).is_err() {
+                break;
+            }
+        }
+        assert!(broken.finish().is_err());
+
+        let background = BackgroundFixedSorter::new(
+            EncodedIndexSorter::new(program, 1024 * 1024),
+            root.path().to_path_buf(),
+        )
+        .unwrap();
+        background.push(&mut batch(), true).unwrap();
+        let sorter = background.finish().unwrap();
+        let temporary = sorter.tmp.as_ref().unwrap().path.clone();
+        assert!(temporary.exists());
+        drop(sorter);
+        assert!(!temporary.exists());
+    }
+
+    #[test]
+    fn tail_merge_reservation_is_inside_sorter_budget() {
+        let (program, _) = record_for(
+            vec![ParamTarget::Int],
+            IndexKey::from(vec![KeyPart::Int(0)]),
+            RowId {
+                page_id: 0,
+                slot_id: 0,
+            },
+        );
+        for budget in [1024 * 1024, 32 * 1024 * 1024, 128 * 1024 * 1024] {
+            let sorter = EncodedIndexSorter::new(Arc::new(program.clone()), budget)
+                .with_external_merge_reserve();
+            if sorter.tail_read_buffer != 0 {
+                assert!(
+                    sorter.capacity_bytes()
+                        + sorter.tail_read_buffer * MAX_ENCODED_MERGE_FAN_IN
+                        + 1024 * 1024
+                        <= budget
+                );
+            } else {
+                assert!(sorter.capacity_bytes() <= budget);
+            }
+        }
     }
 
     fn dummy_index() -> IndexSchema {

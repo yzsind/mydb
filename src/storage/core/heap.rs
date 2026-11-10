@@ -4472,12 +4472,33 @@ impl HeapFile {
             Ok(false)
         };
 
+        // Keep online scans latched, but coalesce cold page admission before
+        // copying those images. Without this step the coherent branch issued
+        // one demand pread per page despite owning a multi-page scan buffer.
+        let coherent_batch_pages = (self.buffer_pool.capacity_pages() as usize / 8).clamp(1, 128);
+        let mut batch_admission = coherent;
         let mut batch_start = page_lo;
         while batch_start < page_hi {
             let count = usize::try_from(page_hi - batch_start)
                 .unwrap_or(usize::MAX)
-                .min(batch_pages);
+                .min(batch_pages)
+                .min(if coherent {
+                    coherent_batch_pages
+                } else {
+                    usize::MAX
+                });
             let batch = &mut page_buf[..count.saturating_mul(PAGE_SIZE)];
+            if batch_admission
+                && self
+                    .buffer_pool
+                    .load_scan_page_range(&self.file_key, batch_start, count)
+                    .is_err()
+            {
+                // Optional read-ahead may lose admission under pressure. Its
+                // RAII reservations are released; authoritative demand pins
+                // below still report I/O/corruption errors and make progress.
+                batch_admission = false;
+            }
             let mut cached = vec![false; count];
             for (position, is_cached) in cached.iter_mut().enumerate() {
                 let page_id = batch_start + position as u64;
@@ -4485,7 +4506,10 @@ impl HeapFile {
                 if coherent {
                     // Online scans need a latched image even for a cold page:
                     // a concurrent flusher can otherwise race a direct pread.
-                    let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
+                    let pinned = self.buffer_pool.pin_page_with_intent_ref(
+                        self.page_key_ref(page_id),
+                        AccessIntent::Scan,
+                    )?;
                     self.buffer_pool
                         .with_finalized_frame_bytes(&pinned.frame, |bytes| {
                             assert_eq!(bytes.len(), PAGE_SIZE);

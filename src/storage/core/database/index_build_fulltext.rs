@@ -157,6 +157,7 @@ fn combine_fulltext_sorters(
             tmp,
             runs,
             fixed128: None,
+            tail: Vec::new(),
             read_buffer_bytes: encoded_merge_read_buffer_bytes(memory_bytes),
         });
     }
