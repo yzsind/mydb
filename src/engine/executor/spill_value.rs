@@ -264,16 +264,26 @@ pub(crate) fn read_payload_limited<R: Read>(
             Value::Bytes(read_bytes_accounted(r, budget.as_deref_mut(), available).map_err(io_err)?)
         }
         VALUE_STRING => {
-            let bytes =
-                read_bytes_accounted(r, budget.as_deref_mut(), available).map_err(io_err)?;
-            // Reject corrupt text in every execution lane. Preserve the batch
-            // lane's inline representation without allocating a heap String.
-            if inline_strings && bytes.len() <= crate::types::SMALL_STRING_INLINE_CAP {
-                std::str::from_utf8(&bytes).map_err(|error| {
+            let len = read_u32(r).map_err(io_err)? as usize;
+            if available.is_some_and(|available| len as u64 > available.saturating_sub(4)) {
+                return Err(io_err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "spill value length exceeds its record",
+                )));
+            }
+            // Short text is already covered by its Value container. Decode
+            // directly into stack storage, avoiding an allocation and a
+            // global memory reservation just to immediately inline it.
+            if inline_strings && len <= crate::types::SMALL_STRING_INLINE_CAP {
+                let mut bytes = [0; crate::types::SMALL_STRING_INLINE_CAP];
+                r.read_exact(&mut bytes[..len]).map_err(io_err)?;
+                std::str::from_utf8(&bytes[..len]).map_err(|error| {
                     io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
                 })?;
-                Value::SmallString(crate::types::SmallStringBuf::from_slice(&bytes))
+                Value::SmallString(crate::types::SmallStringBuf::from_slice(&bytes[..len]))
             } else {
+                let bytes =
+                    read_exact_bytes_accounted(r, len, budget.as_deref_mut()).map_err(io_err)?;
                 Value::String(String::from_utf8(bytes).map_err(|error| {
                     io_err(std::io::Error::new(std::io::ErrorKind::InvalidData, error))
                 })?)
@@ -360,6 +370,45 @@ mod tests {
 
     fn error(e: std::io::Error) -> QueryError {
         crate::storage::error(crate::error::catalog::ER_UNKNOWN_ERROR, e.to_string())
+    }
+
+    #[test]
+    fn inline_text_decode_needs_no_payload_reservation_and_validates_bytes() {
+        for text in ["", "short", "多字节文本", "1234567890123456789012345678901"] {
+            let mut bytes = Vec::new();
+            write_str(&mut bytes, text).unwrap();
+            let mut charge = super::super::mem_budget::ScopedCharge::new(0);
+            let value = read_payload_accounted(
+                &mut bytes.as_slice(),
+                VALUE_STRING,
+                true,
+                error,
+                Some(&mut charge),
+            )
+            .unwrap();
+            assert!(matches!(value, Value::SmallString(_)));
+            assert_eq!(charge.charged(), 0);
+            let mut encoded = Vec::new();
+            write_value_payload(&mut encoded, &value).unwrap();
+            assert_eq!(encoded, bytes);
+            for end in 0..bytes.len() {
+                assert!(read_payload(&mut &bytes[..end], VALUE_STRING, true, error).is_err());
+            }
+            if !text.is_empty() {
+                assert!(read_payload_limited(
+                    &mut bytes.as_slice(),
+                    VALUE_STRING,
+                    true,
+                    error,
+                    None,
+                    Some(4),
+                )
+                .is_err());
+            }
+        }
+        let mut invalid = Vec::new();
+        write_bytes(&mut invalid, &[0xff]).unwrap();
+        assert!(read_payload(&mut invalid.as_slice(), VALUE_STRING, true, error).is_err());
     }
 
     #[test]

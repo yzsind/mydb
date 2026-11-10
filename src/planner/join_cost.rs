@@ -154,7 +154,9 @@ pub(super) fn exact_runtime_index_probe_cost(
         ctx,
         operator_cost::BatchedIndexLookupInput {
             index_height: index_cost_height(&table.schema, index, total_rows),
-            leaf_pages: operator_cost::estimated_index_leaf_pages(&table.schema, index, fetched),
+            probe_key_locality: 0.0,
+            index_leaf_pages: index_cost_leaf_pages(&table.schema, index, total_rows, total_rows),
+            leaf_pages: index_cost_leaf_pages(&table.schema, index, fetched, total_rows),
             matched_rows: fetched,
             probe_keys: keys,
             table_pages: table_heap_pages_for_cost(&table.schema),

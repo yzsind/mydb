@@ -3607,6 +3607,32 @@ mod tests {
     }
 
     #[test]
+    fn consumer_workspace_drains_over_watermark_producer_without_unbounded_growth() {
+        let budget = Arc::new(MemBudget::new(64 * 1024));
+        with_query_budget(budget.clone(), || {
+            let mut producer = ScopedCharge::new(0);
+            producer.add_force(budget.limit() + 4096).unwrap();
+            let producer_bytes = producer.charged();
+            let mut consumer = ScopedCharge::new(0);
+            // Small aggregate entries must be able to consume a mandatory
+            // producer batch even when no ordinary query headroom remains.
+            for _ in 0..128 {
+                consumer.add_with_workspace(128).unwrap();
+            }
+            assert_eq!(consumer.charged(), 16 * 1024);
+            assert_eq!(budget.used(), producer_bytes + consumer.charged());
+            // The exception is bounded; failed growth retains its old charge.
+            assert!(consumer.add_with_workspace(128).is_err());
+            assert_eq!(consumer.charged(), 16 * 1024);
+            drop(producer);
+            assert_eq!(budget.used(), consumer.charged());
+            // Once the producer releases its batch, ordinary admission resumes.
+            consumer.add_with_workspace(128).unwrap();
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn add_within_never_raises_over_budget() {
         // Even with a tiny active budget, add_within force-charges within
         // its own cap and never returns an error / 1037.

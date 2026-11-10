@@ -3815,6 +3815,7 @@ mod vector_page_tests {
             let vectors = gen_vectors(96, 16, 1984);
             let (graph, vids) =
                 build_paged_with_wal_mode(dir.path(), "mapped", 16, metric, &vectors, true);
+            graph.suppress_query_navigation_builds_for_test();
             let query = vectors[17].clone();
             let expected = graph.search(&query, 10, 64).unwrap();
             assert!(graph.file().prepare_navigation_mapping().unwrap());
