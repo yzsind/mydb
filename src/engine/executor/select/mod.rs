@@ -6125,7 +6125,10 @@ fn execute_derived_select(
             };
             let frequency = match frequencies.entry(count) {
                 std::collections::btree_map::Entry::Vacant(entry) => {
-                    frequency_charge.add(FREQUENCY_ENTRY_RESERVATION)?;
+                    // A mandatory replay batch can already cross the query
+                    // spill watermark. Allow the same bounded consumer
+                    // workspace as scalar aggregates, retaining hard admission.
+                    frequency_charge.add_with_workspace(FREQUENCY_ENTRY_RESERVATION)?;
                     entry.insert(0)
                 }
                 std::collections::btree_map::Entry::Occupied(entry) => entry.into_mut(),

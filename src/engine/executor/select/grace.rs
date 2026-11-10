@@ -1100,12 +1100,19 @@ impl ValueRowReader {
         Ok(Some(row))
     }
 
-    pub(crate) fn reserve_decode_batch(&mut self, max_rows: usize) -> Result<usize, QueryError> {
+    pub(crate) fn reserve_decode_batch(
+        &mut self,
+        max_rows: usize,
+        inline_text_columns: usize,
+    ) -> Result<usize, QueryError> {
         self.decoded = self.reader.memory_charge();
         let cell_bytes = self
             .ncols
             .saturating_mul(std::mem::size_of::<Value>())
-            .saturating_mul(2);
+            .saturating_mul(2)
+            .saturating_add(
+                inline_text_columns.saturating_mul(3 * crate::types::SMALL_STRING_INLINE_CAP),
+            );
         self.batch_row_cap = max_rows.min((self.reader.decode_limit() / cell_bytes.max(1)).max(1));
         self.batch_fixed_bytes = self.batch_row_cap.saturating_mul(cell_bytes);
         self.decoded.add_force(self.batch_fixed_bytes)?;
@@ -1152,7 +1159,7 @@ impl ValueRowReader {
             ));
         }
         if self.decoded.charged() == 0 {
-            self.reserve_decode_batch(max_rows)?;
+            self.reserve_decode_batch(max_rows, 0)?;
         }
         let mut rows = 0usize;
         while rows < max_rows.min(self.batch_row_cap)
@@ -1211,8 +1218,14 @@ impl ValueRowReader {
                 "Grace spill schema width does not match replay accumulators",
             ));
         }
+        // Account inline text payload capacity once, including old/new buffer
+        // overlap during growth. Generic lanes retain SmallString inline.
+        let text_columns = columns
+            .iter()
+            .filter(|column| matches!(column, ColumnAccumulator::Utf8 { .. }))
+            .count();
         if self.decoded.charged() == 0 {
-            self.reserve_decode_batch(max_rows)?;
+            self.reserve_decode_batch(max_rows, text_columns)?;
         }
         let mut rows = 0usize;
         while rows < max_rows.min(self.batch_row_cap)
@@ -1241,7 +1254,7 @@ impl ValueRowReader {
             let first = crate::engine::executor::spill_value::read_payload_accounted(
                 &mut self.reader,
                 first_tag[0],
-                false,
+                true,
                 io_err,
                 Some(&mut self.decoded),
             )?;
@@ -1249,7 +1262,15 @@ impl ValueRowReader {
             self.decoded.add_force(first.allocated_bytes())?;
             columns[0].push(&first);
             for column in columns.iter_mut().skip(1) {
-                let value = read_value_accounted(&mut self.reader, &mut self.decoded)?;
+                let mut tag = [0];
+                self.reader.read_exact(&mut tag).map_err(io_err)?;
+                let value = crate::engine::executor::spill_value::read_payload_accounted(
+                    &mut self.reader,
+                    tag[0],
+                    true,
+                    io_err,
+                    Some(&mut self.decoded),
+                )?;
                 self.decoded.add_force(value.allocated_bytes())?;
                 column.push(&value);
             }
@@ -1489,6 +1510,69 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected
         );
+    }
+
+    #[test]
+    fn inline_text_batch_replay_preserves_nulls_utf8_and_long_payloads() {
+        use crate::engine::executor::vec::schema::{BatchField, BatchSchema};
+        use std::sync::Arc;
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "s".into(),
+            column_type: ColumnType::VarString,
+            source: Default::default(),
+        }]));
+        let values = vec![
+            Value::String("".into()),
+            Value::Null,
+            Value::String("多字节文本".into()),
+            Value::String("x".repeat(crate::types::SMALL_STRING_INLINE_CAP)),
+            Value::String("long".repeat(4096)),
+        ];
+        let batch = Batch::new(schema.clone(), vec![ColumnVector::from_values(values)]);
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let tmp = SpillTmpDir::create(dir.path()).unwrap();
+        let mut pool = LazyValueRowWriterPool::new(tmp.path(), "text", 1, 1, tmp.charger(), 1);
+        for row in 0..batch.num_rows() {
+            pool.append_batch_row(0, &batch, row).unwrap();
+        }
+        pool.finish().unwrap();
+        for generic in [false, true] {
+            let mut reader = ValueRowReader::open(&tmp.path().join("text-0"), tmp.charger())
+                .unwrap()
+                .unwrap();
+            let capacity = reader.reserve_decode_batch(16, 1).unwrap();
+            let mut columns = vec![if generic {
+                ColumnAccumulator::Generic {
+                    values: Vec::with_capacity(capacity),
+                }
+            } else {
+                ColumnAccumulator::for_field(&schema.fields()[0], capacity)
+            }];
+            assert_eq!(
+                reader.read_accumulators(&mut columns, capacity).unwrap(),
+                batch.num_rows()
+            );
+            let replay = columns.pop().unwrap().finish();
+            for row in 0..batch.num_rows() {
+                let mut expected = Vec::new();
+                let mut actual = Vec::new();
+                crate::engine::executor::spill_value::write_value(
+                    &mut expected,
+                    &batch.columns()[0].value_at(row),
+                )
+                .unwrap();
+                crate::engine::executor::spill_value::write_value(
+                    &mut actual,
+                    &replay.value_at(row),
+                )
+                .unwrap();
+                assert_eq!(actual, expected);
+            }
+            assert!(reader.take_decode_charge().charged() >= replay.memory_bytes());
+            assert!(reader.next().unwrap().is_none());
+        }
     }
 
     #[test]

@@ -1873,6 +1873,129 @@ pub(super) fn estimate_index_nlj_probe_keys(
         .unwrap_or_else(|| left_rows.max(1.0))
 }
 
+/// Estimate batch-local key clustering, not a SQL ordering guarantee. Heap
+/// correlation can survive filters and resident probe pipelines, whereas
+/// repartitioning a spilled hash join destroys that evidence.
+pub(super) fn probe_key_locality(plan: &PhysicalPlan, key: &Expr) -> f64 {
+    let heap_locality = |table: &PlanTable| {
+        if table.schema.is_partitioned() {
+            return 0.0;
+        }
+        table
+            .schema
+            .indexes
+            .iter()
+            .filter(|index| {
+                !index.has_expression_parts()
+                    && index
+                        .columns
+                        .first()
+                        .is_some_and(|column| expr_matches_table_column(key, table, column))
+            })
+            .filter_map(|index| {
+                table
+                    .schema
+                    .stats
+                    .indexes
+                    .get(&normalize_expr_column(&index.name))
+                    .and_then(|s| s.correlation)
+            })
+            .filter(|c| c.is_finite())
+            .map(|c| c.abs().clamp(0.0, 1.0))
+            .fold(0.0, f64::max)
+    };
+    match plan {
+        PhysicalPlan::SeqScan { table, .. } | PhysicalPlan::ParallelSeqScan { table, .. } => {
+            heap_locality(table)
+        }
+        PhysicalPlan::IndexFastScan { table, index, .. } => {
+            if index
+                .columns
+                .first()
+                .is_some_and(|c| expr_matches_table_column(key, table, c))
+            {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        PhysicalPlan::IndexRangeScan {
+            table,
+            index,
+            covering,
+            ..
+        } => {
+            if !index
+                .columns
+                .first()
+                .is_some_and(|c| expr_matches_table_column(key, table, c))
+            {
+                return 0.0;
+            }
+            if *covering {
+                1.0
+            } else {
+                heap_locality(table)
+            }
+        }
+        PhysicalPlan::Filter { input, .. } | PhysicalPlan::Limit { input, .. } => {
+            probe_key_locality(input, key)
+        }
+        PhysicalPlan::Apply { outer, .. } => probe_key_locality(outer, key),
+        PhysicalPlan::Projection {
+            input,
+            projection,
+            distinct: false,
+            ..
+        } => probe_key_locality(input, resolve_order_alias(key, projection)),
+        PhysicalPlan::Sort { order_by, .. } | PhysicalPlan::ParallelSort { order_by, .. } => {
+            if order_by.first().is_some_and(|o| o.expr == *key) {
+                1.0
+            } else {
+                0.0
+            }
+        }
+        PhysicalPlan::Exchange {
+            input,
+            output_order,
+            merge_keys,
+            ..
+        } => {
+            if *output_order == ExchangeOrder::Sorted {
+                if merge_keys.first().is_some_and(|o| o.expr == *key) {
+                    1.0
+                } else {
+                    0.0
+                }
+            } else {
+                probe_key_locality(input, key)
+            }
+        }
+        PhysicalPlan::IndexNestedLoopJoin { left, .. } if expr_can_resolve_in_plan(key, left) => {
+            probe_key_locality(left, key)
+        }
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            build_side,
+            join_type: JoinType::Inner,
+            cost,
+            ..
+        } if cost.spill_bytes == 0.0 => {
+            let probe = match build_side {
+                BuildSide::Left => right,
+                BuildSide::Right => left,
+            };
+            if expr_can_resolve_in_plan(key, probe) {
+                probe_key_locality(probe, key)
+            } else {
+                0.0
+            }
+        }
+        _ => 0.0,
+    }
+}
+
 pub(super) fn estimate_index_nlj_operator_cost(
     ctx: &crate::engine::cbo::CboContext,
     left: &PhysicalPlan,
@@ -1975,17 +2098,12 @@ pub(super) fn estimate_index_nlj_operator_cost(
             per_match
         };
         let matched_rows = (left_rows * effective_per_match).max(1.0);
-        let leaf_pages = operator_cost::estimated_index_leaf_pages(
+        let leaf_pages = index_cost_leaf_pages(
             &right_table.schema,
             right_index,
             matched_rows,
+            right_total_rows,
         );
-        // Deliberately NOT stats-backed: the batched-INLJ vs hash-join
-        // balance was calibrated against this constant (see the
-        // INLJ/HJ inversion fix); feeding the ANALYZE-sampled
-        // correlation here flips join-order heuristics that the
-        // calibration already accounts for. Single-table range-scan
-        // costing uses `index_cost_correlation` instead.
         let correlation = index_cost_correlation(&right_table.schema, right_index);
         // Batched probes sort+dedup row_ids and stream the heap in
         // ascending page order, so the inner leg is priced on distinct
@@ -2005,6 +2123,31 @@ pub(super) fn estimate_index_nlj_operator_cost(
             ctx,
             operator_cost::BatchedIndexLookupInput {
                 index_height: height,
+                // A composite equality needs evidence for the entire tuple;
+                // clustering its first component alone is insufficient.
+                probe_key_locality: if eq_prefix_len == 1 {
+                    condition
+                        .and_then(|condition| {
+                            expr_conjuncts(condition).into_iter().find_map(|expr| {
+                                equality_between_index_part_and_left_plan(
+                                    expr,
+                                    right_table,
+                                    right_index,
+                                    0,
+                                    left,
+                                )
+                            })
+                        })
+                        .map_or(0.0, |key| probe_key_locality(left, &key))
+                } else {
+                    0.0
+                },
+                index_leaf_pages: index_cost_leaf_pages(
+                    &right_table.schema,
+                    right_index,
+                    right_total_rows,
+                    right_total_rows,
+                ),
                 leaf_pages,
                 matched_rows,
                 probe_keys,

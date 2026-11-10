@@ -51,7 +51,13 @@ impl BatchOperator for VecJoinSpillBatchStream {
         let Some(reader) = self.reader.as_mut() else {
             return Ok(None);
         };
-        let batch_rows = reader.reserve_decode_batch(self.batch_rows)?;
+        let text_columns = self
+            .schema
+            .fields()
+            .iter()
+            .filter(|field| matches!(field.column_type, crate::types::ColumnType::VarString))
+            .count();
+        let batch_rows = reader.reserve_decode_batch(self.batch_rows, text_columns)?;
         let mut columns = self
             .schema
             .fields()

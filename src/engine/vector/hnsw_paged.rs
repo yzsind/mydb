@@ -5207,6 +5207,25 @@ impl PagedHnsw {
     }
 
     #[cfg(test)]
+    pub(crate) fn suppress_query_navigation_builds_for_test(&self) {
+        // A fixture inspecting eviction must exclude a valid asynchronous
+        // replacement between the mutation and its assertion. Drain any
+        // builder, then retain its admission slot for this test-owned graph.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while self
+            .query_nav_building
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "navigation builder did not drain"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_query_navigation_codes_for_test(&self) -> bool {
         self.query_nav.read().is_some()
     }

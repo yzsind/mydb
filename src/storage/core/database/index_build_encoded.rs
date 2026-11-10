@@ -710,7 +710,11 @@ fn validated_fixed128_from_sorted(
             fixed128: Some((key_width, stride)),
             read_buffer_bytes,
         } => (
-            Fixed128Source::Runs(EncodedFixed128RunMerger::open(tmp, runs, read_buffer_bytes)?),
+            Fixed128Source::Runs(EncodedFixed128RunMerger::open(
+                tmp,
+                runs,
+                read_buffer_bytes,
+            )?),
             key_width,
             stride,
         ),
@@ -3849,6 +3853,54 @@ fn proportional_encoded_index_budgets(weights: &[usize], aggregate_budget: usize
     budgets
 }
 
+/// Keep complete runs resident when a proportional split would spill every
+/// nearly fitting index. Each donor retains at least half its proportional
+/// share, so reducing I/O for one index cannot starve the remaining sorts.
+fn resident_encoded_index_budgets(
+    estimates: Option<&[usize]>,
+    count: usize,
+    total: usize,
+) -> Vec<usize> {
+    let weights = encoded_sorter_budget_weights(estimates, count);
+    let mut budgets = proportional_encoded_index_budgets(&weights, total);
+    let Some(estimates) = estimates else {
+        return budgets;
+    };
+    let floors = budgets
+        .iter()
+        .map(|bytes| (bytes / 2).max(MIN_ENCODED_INDEX_SORTER_BYTES))
+        .collect::<Vec<_>>();
+    let mut candidates = (0..count).collect::<Vec<_>>();
+    candidates.sort_by_key(|&i| estimates[i].saturating_sub(budgets[i]));
+    for i in candidates {
+        let needed = estimates[i].saturating_sub(budgets[i]);
+        if needed == 0 {
+            continue;
+        }
+        let available = (0..count)
+            .filter(|&j| j != i && budgets[j] < estimates[j])
+            .map(|j| budgets[j].saturating_sub(floors[j]))
+            .sum::<usize>();
+        if available < needed {
+            continue;
+        }
+        let mut remaining = needed;
+        for j in (0..count).rev() {
+            if j == i || budgets[j] >= estimates[j] {
+                continue;
+            }
+            let take = remaining.min(budgets[j].saturating_sub(floors[j]));
+            budgets[j] -= take;
+            remaining -= take;
+            if remaining == 0 {
+                break;
+            }
+        }
+        budgets[i] += needed;
+    }
+    budgets
+}
+
 /// Exact governed capacity required by the encoded sorter's resident source
 /// and sorting scratch for `rows` fixed-width records.
 ///
@@ -4037,7 +4089,7 @@ impl Database {
         let soft = crate::engine::executor::mem_budget::query_mem_limit_bytes().max(minimum);
         let requested_aggregate = estimated
             .unwrap_or(soft)
-            .max(soft)
+            .max(sorter_minimum)
             .saturating_add(parallel_scratch)
             .saturating_add(if prepaid_scan {
                 scan_degree * ENCODED_SCAN_BATCH_BYTES
@@ -4071,15 +4123,18 @@ impl Database {
         // index, sorted under the shared scan lock. Weights exclude the
         // per-sorter minimum, so a full grant gives every sorter exactly
         // its estimate.
-        let weights = encoded_sorter_budget_weights(program_estimates.as_deref(), programs.len());
-        let budgets = proportional_encoded_index_budgets(&weights, sorter_budget);
+        let budgets = resident_encoded_index_budgets(
+            program_estimates.as_deref(),
+            programs.len(),
+            sorter_budget,
+        );
         // Sorting runs one index at a time at the full degree (see the
         // sort/write pipeline below), so every sorter gets the whole degree.
         let sorter_degree = options.effective_degree;
         let mut sorters = programs
             .iter()
             .cloned()
-            .zip(budgets)
+            .zip(budgets.iter().copied())
             .map(|(program, budget)| {
                 EncodedIndexSorter::new(program, budget).with_sort_degree(sorter_degree)
             })
@@ -4455,8 +4510,15 @@ impl Database {
             .into_iter()
             .zip(programs)
             .zip(sorters)
-            .map(|((index, program), sorter)| (index, program, sorter))
+            .zip(budgets)
+            .map(|(((index, program), sorter), bytes)| {
+                (index, program, sorter, charge.split(bytes))
+            })
             .collect::<Vec<_>>();
+        // Each writer owns its sorter's reservation through the final read.
+        // Completed indexes return headroom immediately, allowing remaining
+        // sorts to admit optional parallel scratch without double accounting.
+        drop(charge);
         let outer_degree = options.effective_degree.min(work.len()).max(1);
         let (sender, receiver) = std::sync::mpsc::channel();
         let receiver = Mutex::new(receiver);
@@ -4478,7 +4540,7 @@ impl Database {
                                 )
                             })?
                             .recv();
-                        let Ok((index, program, sorted)) = item else {
+                        let Ok((index, program, sorted, _sort_charge)) = item else {
                             return Ok(());
                         };
                         if let Err(err) = write_one(index, program, sorted) {
@@ -4489,7 +4551,7 @@ impl Database {
                 }));
             }
             let sorted = (|| -> Result<(), QueryError> {
-                for (index, program, sorter) in work {
+                for (index, program, sorter, sort_charge) in work {
                     if cancelled.load(Ordering::Acquire) {
                         break;
                     }
@@ -4499,7 +4561,7 @@ impl Database {
                         sort_started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
                         Ordering::Relaxed,
                     );
-                    if sender.send((index, program, sorted)).is_err() {
+                    if sender.send((index, program, sorted, sort_charge)).is_err() {
                         break;
                     }
                 }
@@ -4523,7 +4585,6 @@ impl Database {
             }
             first_error.map_or(Ok(()), Err)
         })?;
-        drop(charge);
         // Online callers already account for this build. Do not report a
         // second serial build merely because only one index was requested.
         if !online {
@@ -5454,6 +5515,42 @@ mod encoded_index_program_tests {
     }
 
     use super::*;
+
+    #[test]
+    fn resident_sorter_budgets_reduce_spills_without_starving_large_indexes() {
+        let unit = MIN_ENCODED_INDEX_SORTER_BYTES;
+        for estimates in [vec![100 * unit; 7], vec![10 * unit, 100 * unit, 250 * unit]] {
+            for numerator in [1, 4, 7, 9, 10, 12] {
+                let total = estimates.iter().sum::<usize>() * numerator / 10;
+                let proportional = proportional_encoded_index_budgets(
+                    &encoded_sorter_budget_weights(Some(&estimates), estimates.len()),
+                    total,
+                );
+                let packed =
+                    resident_encoded_index_budgets(Some(&estimates), estimates.len(), total);
+                assert_eq!(packed.iter().sum::<usize>(), total);
+                for (budget, original) in packed.iter().zip(&proportional) {
+                    assert!(*budget >= (original / 2).max(unit));
+                }
+                let count_fit = |budgets: &[usize]| {
+                    budgets
+                        .iter()
+                        .zip(&estimates)
+                        .filter(|(b, e)| b >= e)
+                        .count()
+                };
+                assert!(count_fit(&packed) >= count_fit(&proportional));
+            }
+        }
+        let estimates = [100 * unit; 7];
+        let packed = resident_encoded_index_budgets(Some(&estimates), 7, 630 * unit);
+        assert!(packed.iter().filter(|&&b| b >= 100 * unit).count() >= 5);
+        assert_eq!(
+            resident_encoded_index_budgets(None, 3, 12 * unit),
+            vec![4 * unit; 3]
+        );
+        assert!(resident_encoded_index_budgets(Some(&[]), 0, 0).is_empty());
+    }
 
     #[test]
     #[cfg(target_pointer_width = "64")]

@@ -21022,18 +21022,16 @@ fn stats_freshness_tag(schema: &TableSchema, sidecar_delta: u64) -> Option<&'sta
 }
 
 /// Stats-backed index-order/heap-order correlation for range-scan
-/// costing. Primary keys keep 1.0 (heap insert order tracks key order
-/// in this engine); secondary indexes use the ANALYZE-sampled value.
+/// costing. Both primary and secondary keys point into the separate heap,
+/// whose insertion order need not match either index's key order.
 /// Missing correlation is conservatively treated as uncorrelated.
 fn index_cost_correlation(schema: &TableSchema, index: &IndexSchema) -> f64 {
-    if index.primary {
-        return 1.0;
-    }
     schema
         .stats
         .indexes
-        .get(&index.name)
+        .get(&normalize_expr_column(&index.name))
         .and_then(|stats| stats.correlation)
+        .filter(|c| c.is_finite())
         .map(|c| c.clamp(0.0, 1.0))
         .unwrap_or(0.0)
 }

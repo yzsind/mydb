@@ -425,37 +425,20 @@ pub(crate) fn calibrated_inlj_range_probe(
     }
 }
 
-/// Cost of the inner leg of a *batched* index nested-loop join over
-/// `matched_rows` candidate entries.
-///
-/// The executor (`try_execute_batched_index_nested_loop_join`) does
-/// NOT perform per-outer-row B-tree descents with immediate heap
-/// fetches. It walks the index once for the de-duplicated key batch,
-/// accumulates all candidate row_ids, runs `sort_unstable() + dedup()`
-/// (CPU charged separately by the planner), and then fetches heap rows
-/// in ascending row_id order — each distinct heap page is touched once,
-/// in the same order a sequential scan would visit it.
-///
-/// Heap I/O is therefore bounded by the number of *distinct pages*
-/// hit, not by `matched_rows`:
-///  - correlated rows (PK-shaped index, heap order ≈ key order)
-///    cluster: ≈ `matched_rows / rows_per_page` contiguous pages,
-///    priced sequentially;
-///  - uncorrelated rows spread uniformly: Yao's approximation
-///    `pages × (1 − (1 − 1/pages)^m)` distinct pages, priced randomly
-///    but capped at one full sequential sweep of the heap — sorted
-///    ascending page visits can never cost more than scanning every
-///    heap page once.
-///
-/// Earlier revisions modeled this leg as `index_range_scan` with
-/// correlation 0.5, charging `matched_rows × (1 − corr)` *independent
-/// random page reads* at near-miss hit rates. On a large FK-shaped
-/// probe that term alone was ~10× the executor's real work (TPC-H
-/// sf=1 part⋈lineitem: INLJ costed 1.05M vs hash join 231k while
-/// running 3× faster), inverting INLJ/HJ plan choice.
+/// Geometry and cost of a batched equality/prefix index join. Keys are sorted
+/// within each bounded batch; candidate RIDs are then sorted for heap reads.
+/// Leaf and heap pages can be revisited by later batches, so distinct global
+/// coverage is separate from logical page visits. Sorted sparse reads still
+/// pay demand-I/O costs when their working set exceeds the planning cache.
 #[derive(Clone, Copy, Debug)]
 pub struct BatchedIndexLookupInput {
     pub index_height: f64,
+    /// Full leaf population, including leaves outside the matched key ranges.
+    /// Sparse equality probes do not visit a packed fraction of this tree.
+    pub index_leaf_pages: f64,
+    /// Batch-local clustering inherited from the outer stream, independent
+    /// of the inner index's correlation with its own heap.
+    pub probe_key_locality: f64,
     pub leaf_pages: f64,
     pub matched_rows: f64,
     pub probe_keys: f64,
@@ -470,6 +453,7 @@ pub struct BatchedIndexLookupInput {
 #[derive(Clone, Copy, Debug)]
 pub struct BatchedIndexLookupEstimate {
     pub cost: Cost,
+    pub logical_index_leaf_visits: f64,
     pub distinct_heap_pages: f64,
     /// Sum of distinct heap pages visited by every fixed-size probe chunk.
     /// Unlike `distinct_heap_pages`, the same physical page is counted again
@@ -485,6 +469,8 @@ pub fn estimate_batched_index_lookup(
 ) -> BatchedIndexLookupEstimate {
     let BatchedIndexLookupInput {
         index_height,
+        index_leaf_pages,
+        probe_key_locality,
         leaf_pages,
         matched_rows,
         probe_keys,
@@ -496,11 +482,11 @@ pub fn estimate_batched_index_lookup(
     let consts = cbo_consts();
     let cache = ctx.effective_cache_pages as f64;
     let pages = table_pages.max(1.0);
+    let index_population = index_leaf_pages.max(leaf_pages).max(1.0);
     let working_set_pages =
-        (pages + index_height.max(0.0) + leaf_pages.max(0.0) + competing_pages.max(0.0)).max(1.0);
-    let index_working_set = (index_height + leaf_pages).max(1.0);
+        (pages + index_height.max(0.0) + index_population + competing_pages.max(0.0)).max(1.0);
+    let index_working_set = (index_height + index_population).max(1.0);
     let descent_io = page_io_cost(AccessKind::Random, index_height, cache, index_working_set);
-    let leaf_io = page_io_cost(AccessKind::Sequential, leaf_pages, cache, working_set_pages);
     let m = matched_rows.max(0.0);
     let corr = correlation.clamp(0.0, 1.0);
     let rows_per_page = ((PAGE_SIZE_BYTES as f64) / output_width.max(8.0)).max(1.0);
@@ -531,12 +517,55 @@ pub fn estimate_batched_index_lookup(
     let matches_per_key = if keys > 0.0 { m / keys } else { 0.0 };
     let full_batches = (keys / chunk_keys).floor();
     let tail_keys = keys - full_batches * chunk_keys;
+    let locality = probe_key_locality.clamp(0.0, 1.0);
+    // Clustered outer streams traverse smaller key-domain intervals per
+    // batch. Filtering leaves gaps, so retain the full domain / total-key
+    // density rather than treating the surviving keys as a packed range.
+    let batch_population = |population: f64, batch_keys: f64| {
+        let local = (population * batch_keys / keys.max(1.0) + 1.0).min(population);
+        population * (1.0 - locality) + local * locality
+    };
+    // Each sorted key batch routes through the whole index domain. Even a
+    // one-row equality needs its containing leaf; a multi-row prefix can
+    // cross additional leaves. Count repeated batch-local visits just as for
+    // heap MRR, rather than treating millions of sparse probes as one packed
+    // sequential range. Dense prefixes retain their contiguous leaf reads.
+    let leaf_visits = |batch_keys: f64| {
+        if batch_keys <= 0.0 || keys <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let starts = distinct_pages(batch_population(index_population, batch_keys), batch_keys);
+        let packed = leaf_pages * batch_keys / keys;
+        let continuation = (packed - batch_keys)
+            .max(0.0)
+            .min(index_population - starts);
+        (starts, continuation)
+    };
+    let (full_starts, full_continuation) = leaf_visits(chunk_keys.min(keys));
+    let (tail_starts, tail_continuation) = leaf_visits(tail_keys);
+    let leaf_starts = full_batches * full_starts + tail_starts;
+    let leaf_continuation = full_batches * full_continuation + tail_continuation;
+    let logical_index_leaf_visits = leaf_starts + leaf_continuation;
+    let leaf_io = page_io_cost(
+        AccessKind::OrderedNoPrefetch,
+        leaf_starts,
+        cache,
+        working_set_pages,
+    ) + page_io_cost(
+        AccessKind::Sequential,
+        leaf_continuation,
+        cache,
+        working_set_pages,
+    );
     let chunk_clustered_pages = |batch_keys: f64| {
         if batch_keys <= 0.0 {
             return 0.0;
         }
         let batch_matches = (batch_keys * matches_per_key).min(m);
         let packed = (batch_matches / rows_per_page).ceil();
+        // Outer key clustering bounds a B-tree interval, but does not prove
+        // matching heap intervals across two relations. Retain the ordinary
+        // heap geometry until joint key/RID distribution evidence exists.
         packed.max(distinct_pages(pages, batch_keys)).min(pages)
     };
     let chunk_scattered_pages = |batch_keys: f64| {
@@ -580,8 +609,9 @@ pub fn estimate_batched_index_lookup(
     // Bulk routing still compares every distinct probe key against the
     // B-tree's routing/leaf key space. This CPU exists even when all pages
     // are resident and is therefore separate from page I/O.
-    let key_routing_cpu = keys * leaf_pages.max(2.0).log2() * consts.cpu_index_tuple_cost();
-    let cpu_index = (index_height + leaf_pages) * consts.cpu_index_tuple_cost() + key_routing_cpu;
+    let key_routing_cpu = keys * index_population.max(2.0).log2() * consts.cpu_index_tuple_cost();
+    let cpu_index = (index_height + logical_index_leaf_visits) * consts.cpu_index_tuple_cost()
+        + key_routing_cpu;
     let cpu_tuples = m * (consts.cpu_index_tuple_cost() + consts.cpu_tuple_cost());
     let startup = descent_io + index_height * consts.cpu_index_tuple_cost();
     let total = startup
@@ -593,7 +623,7 @@ pub fn estimate_batched_index_lookup(
     let cost = Cost {
         startup,
         total: total.max(startup),
-        io_seq_pages: leaf_pages + heap_seq + heap_scatter,
+        io_seq_pages: logical_index_leaf_visits + heap_seq + heap_scatter,
         io_rnd_pages: index_height,
         cpu_units: cpu_index + cpu_tuples + heap_page_cpu,
         mem_bytes: 0.0,
@@ -601,6 +631,7 @@ pub fn estimate_batched_index_lookup(
     };
     BatchedIndexLookupEstimate {
         cost,
+        logical_index_leaf_visits,
         distinct_heap_pages: (corr * physical_clustered_pages + (1.0 - corr) * scattered_pages)
             .min(pages),
         logical_heap_page_visits: heap_seq + heap_scatter,
@@ -624,6 +655,8 @@ pub fn batched_index_lookup(
         ctx,
         BatchedIndexLookupInput {
             index_height,
+            index_leaf_pages: leaf_pages,
+            probe_key_locality: 0.0,
             leaf_pages,
             matched_rows,
             probe_keys,
@@ -1931,6 +1964,8 @@ mod tests {
             &c,
             BatchedIndexLookupInput {
                 index_height: 3.0,
+                index_leaf_pages: 840.0,
+                probe_key_locality: 0.0,
                 leaf_pages: 840.0,
                 matched_rows: 300_000.0,
                 probe_keys: 75_000.0,
@@ -2019,6 +2054,8 @@ mod tests {
             &c,
             BatchedIndexLookupInput {
                 index_height: 3.0,
+                index_leaf_pages: 4_000.0,
+                probe_key_locality: 0.0,
                 leaf_pages: 4_000.0,
                 matched_rows: 2_000_000.0,
                 probe_keys: 500_000.0,
@@ -2048,10 +2085,137 @@ mod tests {
     }
 
     #[test]
+    fn sparse_batched_probes_price_leaf_population_and_revisits() {
+        let input = BatchedIndexLookupInput {
+            index_height: 4.0,
+            index_leaf_pages: 1_000_000.0,
+            probe_key_locality: 0.0,
+            leaf_pages: 20_000.0,
+            matched_rows: 8_000_000.0,
+            probe_keys: 8_000_000.0,
+            table_pages: 3_000_000.0,
+            output_width: 128.0,
+            correlation: 1.0,
+            competing_pages: 0.0,
+        };
+        let sparse = estimate_batched_index_lookup(&ctx(), input);
+        assert!(sparse.logical_index_leaf_visits > 7_000_000.0);
+        assert!(sparse.logical_index_leaf_visits <= input.probe_keys);
+        let packed_tree = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                index_leaf_pages: input.leaf_pages,
+                probe_key_locality: 0.0,
+                ..input
+            },
+        );
+        assert!(sparse.logical_index_leaf_visits > packed_tree.logical_index_leaf_visits);
+        assert!(sparse.cost.total > packed_tree.cost.total);
+
+        let clustered = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                probe_key_locality: 1.0,
+                ..input
+            },
+        );
+        let mixed = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                probe_key_locality: 0.5,
+                ..input
+            },
+        );
+        assert!(clustered.logical_index_leaf_visits < 1_100_000.0);
+        assert_eq!(
+            clustered.logical_heap_page_visits,
+            sparse.logical_heap_page_visits
+        );
+        assert_eq!(clustered.distinct_heap_pages, sparse.distinct_heap_pages);
+        assert!(clustered.cost.total < mixed.cost.total && mixed.cost.total < sparse.cost.total);
+        let uncorrelated = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                correlation: 0.0,
+                ..input
+            },
+        );
+        let ordered_uncorrelated = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                correlation: 0.0,
+                probe_key_locality: 1.0,
+                ..input
+            },
+        );
+        assert_eq!(
+            uncorrelated.logical_heap_page_visits,
+            ordered_uncorrelated.logical_heap_page_visits
+        );
+
+        // One broad equality prefix can stream many contiguous leaves; it
+        // must not be charged as one random lookup for every matching row.
+        let prefix = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                probe_keys: 1.0,
+                ..input
+            },
+        );
+        assert!((prefix.logical_index_leaf_visits - input.leaf_pages).abs() < 1.0);
+        assert!(prefix.cost.total < sparse.cost.total);
+    }
+
+    #[test]
+    fn batched_leaf_geometry_is_continuous_at_chunk_boundary() {
+        let chunk = super::super::PLANNING_INLJ_CHUNK_ROWS as f64;
+        let base = BatchedIndexLookupInput {
+            index_height: 3.0,
+            index_leaf_pages: 50_000.0,
+            probe_key_locality: 0.0,
+            leaf_pages: 50.0,
+            matched_rows: chunk,
+            probe_keys: chunk,
+            table_pages: 100_000.0,
+            output_width: 64.0,
+            correlation: 0.0,
+            competing_pages: 0.0,
+        };
+        let mut previous = 0.0;
+        for keys in [chunk - 1.0, chunk, chunk + 1.0] {
+            let estimate = estimate_batched_index_lookup(
+                &ctx(),
+                BatchedIndexLookupInput {
+                    probe_keys: keys,
+                    matched_rows: keys,
+                    ..base
+                },
+            );
+            assert!(estimate.logical_index_leaf_visits >= previous);
+            if previous > 0.0 {
+                assert!(estimate.logical_index_leaf_visits - previous <= 1.01);
+            }
+            previous = estimate.logical_index_leaf_visits;
+        }
+        let empty = estimate_batched_index_lookup(
+            &ctx(),
+            BatchedIndexLookupInput {
+                probe_keys: 0.0,
+                matched_rows: 0.0,
+                leaf_pages: 0.0,
+                ..base
+            },
+        );
+        assert_eq!(empty.logical_index_leaf_visits, 0.0);
+    }
+
+    #[test]
     fn batched_index_lookup_reports_stable_page_geometry_and_outer_pressure() {
         let c = ctx();
         let base = BatchedIndexLookupInput {
             index_height: 3.0,
+            index_leaf_pages: 1_200.0,
+            probe_key_locality: 0.0,
             leaf_pages: 1_200.0,
             matched_rows: 280_000.0,
             probe_keys: 57_000.0,

@@ -1,6 +1,118 @@
 use super::*;
 
 #[test]
+fn probe_locality_follows_only_preserved_physical_streams() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE locality_source (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO locality_source VALUES (1,3),(2,1),(3,2)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE locality_source").unwrap();
+    let mut schema = engine.db_for_tests().table("locality_source").unwrap();
+    Arc::make_mut(&mut schema)
+        .stats
+        .indexes
+        .get_mut("primary")
+        .unwrap()
+        .correlation = Some(1.0);
+    let scan = |alias: &str| PhysicalPlan::SeqScan {
+        table: PlanTable::new(schema.id, schema.clone(), Some(alias.into())),
+        filter: None,
+        estimated_rows: 100.0,
+        access_rows: 100.0,
+        cost: crate::engine::cbo::Cost::scalar(1.0),
+        possible_keys: vec![],
+        runtime_filters: vec![],
+        hint_note: None,
+        projected_columns: None,
+    };
+    let a = Expr::CompoundIdentifier(vec!["a".into(), "id".into()]);
+    let b = Expr::CompoundIdentifier(vec!["b".into(), "id".into()]);
+    let left = scan("a");
+    assert_eq!(probe_key_locality(&left, &a), 1.0);
+    assert_eq!(
+        probe_key_locality(
+            &left,
+            &Expr::CompoundIdentifier(vec!["a".into(), "v".into()])
+        ),
+        0.0
+    );
+    let mut hash = PhysicalPlan::HashJoin {
+        left: Box::new(left.clone()),
+        right: Box::new(scan("b")),
+        join_type: JoinType::Inner,
+        left_keys: vec![a.clone()],
+        right_keys: vec![b.clone()],
+        null_safe: vec![false],
+        build_side: BuildSide::Right,
+        residual: None,
+        output_projection: None,
+        estimated_rows: 100.0,
+        cost: crate::engine::cbo::Cost::scalar(2.0),
+    };
+    assert_eq!(probe_key_locality(&hash, &a), 1.0);
+    assert_eq!(probe_key_locality(&hash, &b), 0.0);
+    if let PhysicalPlan::HashJoin { cost, .. } = &mut hash {
+        cost.spill_bytes = 1_000_000.0;
+    }
+    assert_eq!(probe_key_locality(&hash, &a), 0.0);
+    // A child's spill estimate cannot cancel the current join's own spill.
+    if let PhysicalPlan::HashJoin { right, .. } = &mut hash {
+        if let PhysicalPlan::SeqScan { cost, .. } = right.as_mut() {
+            cost.spill_bytes = 2_000_000.0;
+        }
+    }
+    assert_eq!(probe_key_locality(&hash, &a), 0.0);
+    let alias = PhysicalPlan::Projection {
+        input: Box::new(left),
+        projection: vec![SelectItem::Expr {
+            expr: a,
+            alias: Some("renamed".into()),
+        }],
+        distinct: false,
+        estimated_rows: 100.0,
+        cost: crate::engine::cbo::Cost::scalar(1.0),
+    };
+    assert_eq!(
+        probe_key_locality(&alias, &Expr::Identifier("renamed".into())),
+        1.0
+    );
+}
+
+#[test]
+fn heap_primary_correlation_uses_analyzed_physical_order() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE unordered_heap (id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO unordered_heap VALUES (3,1),(1,2),(2,3)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE unordered_heap").unwrap();
+    let mut schema = engine.db_for_tests().table("unordered_heap").unwrap();
+    let index = schema
+        .indexes
+        .iter()
+        .find(|index| index.primary)
+        .unwrap()
+        .clone();
+    for correlation in [Some(0.0), Some(0.25), Some(1.0), None, Some(f64::NAN)] {
+        Arc::make_mut(&mut schema)
+            .stats
+            .indexes
+            .get_mut("primary")
+            .unwrap()
+            .correlation = correlation;
+        let expected = correlation.filter(|value| value.is_finite()).unwrap_or(0.0);
+        assert_eq!(index_cost_correlation(&schema, &index), expected);
+    }
+}
+
+#[test]
 fn hash_join_cost_prices_exact_runtime_integer_suffix_probes() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
