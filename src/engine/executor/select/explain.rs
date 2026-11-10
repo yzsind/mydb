@@ -4209,7 +4209,7 @@ fn format_plan_tree_nodes(
                     "({:.6} {:.6}, {:.6} {:.6})",
                     query_mbr[0], query_mbr[1], query_mbr[2], query_mbr[3]
                 ),
-                planner::SpatialProbe::Parameter(expr) => {
+                planner::SpatialProbe::Parameter { expr, .. } => {
                     format!("parameter {}", explain_expr(expr))
                 }
             };
@@ -6571,8 +6571,38 @@ fn partition_dml_explain_input(
     limit: Option<&LimitValue>,
     update: bool,
     single_table: bool,
-    fallback: planner::PhysicalPlan,
+    mut fallback: planner::PhysicalPlan,
 ) -> Result<DmlExplainInput, QueryError> {
+    // Single-table writers do not execute ZoneMapScan. Keep EXPLAIN honest.
+    fallback.walk_mut(|node| {
+        if let planner::PhysicalPlan::ZoneMapScan {
+            table,
+            filter,
+            estimated_rows,
+            cost,
+            possible_keys,
+            runtime_filters,
+            hint_note,
+            projected_columns,
+            ..
+        } = node.clone()
+        {
+            let access_rows =
+                crate::engine::table_stats_view::TableStatsView::for_table(db, &table.schema).rows
+                    as f64;
+            *node = planner::PhysicalPlan::SeqScan {
+                table,
+                filter,
+                estimated_rows,
+                access_rows,
+                cost,
+                possible_keys,
+                runtime_filters,
+                hint_note,
+                projected_columns,
+            };
+        }
+    });
     let table = db.table(table_name)?;
     let Some(part) = table.partitioning.as_ref().filter(|_| single_table) else {
         return Ok(DmlExplainInput::Plan(Box::new(fallback)));

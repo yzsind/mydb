@@ -1341,7 +1341,18 @@ impl VectorIndexFile {
             ));
         }
         let mut file = crate::storage::image_io::open_data_file(&path).map_err(io_err)?;
-        let meta = decode_vector_meta(&read_index_page(&mut file, VEC_META_PAGE)?)?;
+        let meta = read_index_page(&mut file, VEC_META_PAGE)
+            .and_then(|bytes| decode_vector_meta(&bytes))
+            .map_err(|err| {
+                error(
+                    crate::error::catalog::ER_INDEX_CORRUPT,
+                    format!(
+                        "cannot read persistent vector index {}: {}",
+                        path.display(),
+                        err.message()
+                    ),
+                )
+            })?;
         Self::open_with_durability(
             path,
             log,
@@ -1649,7 +1660,11 @@ impl VectorIndexFile {
                     if read_u32(bytes, 0) == VEC_NODE_MAGIC {
                         for slot in 0..read_u16(bytes, NODE_OFF_SLOT_COUNT) {
                             let offset = node_record_offset(bytes, slot)?;
-                            if bytes[offset] & REC_FLAG_INITIALIZED == 0 {
+                            if bytes[offset] & REC_FLAG_INITIALIZED == 0
+                                || bytes[offset] & REC_FLAG_TOMBSTONE != 0
+                                || (self.navigation_quantization().is_some()
+                                    && bytes[offset] & REC_FLAG_EXACT_NAV != 0)
+                            {
                                 continue;
                             }
                             vector.clear();
@@ -1751,6 +1766,9 @@ impl VectorIndexFile {
                 let mut state = self.meta_state.lock();
                 state.pristine_pages.remove(&page_id);
             }
+            // Full replacements enter the pool as finalized images. Later
+            // in-place build edits retain the pool's deferred CRC protocol.
+            stamp_vector_page(&mut after, page_id, 0);
             self.buffer_pool.store_page(key, after, 0)?;
             return Ok(());
         }
@@ -2783,11 +2801,16 @@ impl VectorIndexFile {
         Ok(())
     }
 
-    pub(crate) fn validate_hnsw_layout(dim: usize, m: usize) -> Result<(), QueryError> {
+    pub(crate) fn validate_hnsw_column_layout(
+        dim: usize,
+        logical_dim: usize,
+        m: usize,
+    ) -> Result<(), QueryError> {
         let maximum = crate::engine::vector::hnsw_paged::VEC_MAX_LAYER;
         if node_record_size(maximum, dim, m, m.saturating_mul(2)).saturating_add(2)
             > PAGE_SIZE - NODE_OFF_DIRECTORY
         {
+            let dim = logical_dim;
             return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!("paged HNSW VECTOR({dim}) with M={m} exceeds node page capacity at the supported maximum layer; use the memory backend or a smaller dimension/M")));
         }
@@ -3058,10 +3081,16 @@ impl VectorIndexFile {
                 "missing or invalid native index definition",
             ));
         }
-        let data = self.read_quantization_blob(
-            meta.native_definition_head,
-            meta.native_definition_bytes as usize,
-        )?;
+        let data = self
+            .read_quantization_blob(
+                meta.native_definition_head,
+                meta.native_definition_bytes as usize,
+            )
+            .map_err(|err| {
+                err.map_message(|message| {
+                    format!("native index definition {}: {message}", self.path.display())
+                })
+            })?;
         if data.len() != meta.native_definition_bytes as usize {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -4428,7 +4457,7 @@ mod vector_page_tests {
             }
             if metric != Metric::Dot {
                 assert!(file.navigation_quantization().is_some());
-                assert_eq!(file.meta().nav_exact_nodes, 0);
+                assert!(file.meta().nav_exact_nodes <= file.node_count() / 8);
             } else {
                 assert!(file.navigation_quantization().is_none());
             }
@@ -4448,10 +4477,9 @@ mod vector_page_tests {
                 graph.search(&outlier, 1, 258).unwrap()[0].0.page_id,
                 expected as u32
             );
+            let exact_before_refresh = file.meta().nav_exact_nodes;
             graph.refresh_query_navigation().unwrap();
-            if metric != Metric::Dot {
-                assert_eq!(file.meta().nav_exact_nodes, 0);
-            }
+            assert_eq!(file.meta().nav_exact_nodes, exact_before_refresh);
             assert_eq!(
                 graph.search(&outlier, 1, 258).unwrap()[0].0.page_id,
                 expected as u32
@@ -5799,7 +5827,7 @@ impl VectorIndexFile {
             if head >= limit || pages >= limit {
                 return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
-                    "invalid quantizer overflow chain",
+                    "invalid vector overflow chain",
                 ));
             }
             let page = self.read_page_bytes(head)?;
@@ -5813,7 +5841,7 @@ impl VectorIndexFile {
             {
                 return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
-                    "corrupt quantizer overflow page",
+                    "corrupt vector overflow page",
                 ));
             }
             out.try_reserve(len).map_err(|_| {
@@ -5827,7 +5855,7 @@ impl VectorIndexFile {
             if next >= head && next != 0 {
                 return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
-                    "cyclic quantizer overflow chain",
+                    "cyclic vector overflow chain",
                 ));
             }
             head = next;

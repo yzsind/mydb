@@ -112,20 +112,36 @@ pub(crate) fn register(reg: &mut Registry) {
         .with_access(Access::SuperReadWrite)
         .with_doc("Select db/table for INFORMATION_SCHEMA INNODB_FT_* diagnostics."),
         |_ctx| SysVarValue::String(innodb_ft_aux_table()),
-        |_ctx: &mut WriteCtx<'_>, value: SysVarValue| -> Result<(), QueryError> {
+        |ctx: &mut WriteCtx<'_>, value: SysVarValue| -> Result<(), QueryError> {
             let value = match value {
                 SysVarValue::String(value) => value,
                 other => other.to_display_string(),
             };
             let canonical = value.trim().replace('.', "/");
             if !canonical.is_empty()
-                && (canonical.split('/').count() != 2
+                && (!(2..=3).contains(&canonical.split('/').count())
                     || canonical.split('/').any(|part| part.trim().is_empty()))
             {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
-                    "Variable 'innodb_ft_aux_table' must be empty or use db/table",
+                    "Variable 'innodb_ft_aux_table' must be empty or use db/table[/index]",
                 ));
+            }
+            if !canonical.is_empty() {
+                if let Some(db) = ctx.db {
+                    let parts: Vec<_> = canonical.split('/').collect();
+                    let table = db.table(&format!("{}.{}", parts[0], parts[1]))?;
+                    if !table.iter_public_indexes().any(|index| {
+                        index.is_fulltext()
+                            && parts
+                                .get(2)
+                                .is_none_or(|name| index.name.eq_ignore_ascii_case(name))
+                    }) {
+                        return Err(crate::error::catalog::ER_WRONG_VALUE_FOR_VAR.error(
+                            "innodb_ft_aux_table requires a table with a matching FULLTEXT index",
+                        ));
+                    }
+                }
             }
             *innodb_ft_aux_table_cell().write().map_err(|_| {
                 crate::storage::error(

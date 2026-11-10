@@ -2735,6 +2735,16 @@ impl Database {
         table_id: u64,
         writes: &[HeapWrite],
     ) -> Result<(), QueryError> {
+        self.write_heap_rows_tracked(txn_id, table_id, writes, &mut 0)
+    }
+
+    fn write_heap_rows_tracked(
+        &self,
+        txn_id: u64,
+        table_id: u64,
+        writes: &[HeapWrite],
+        written: &mut usize,
+    ) -> Result<(), QueryError> {
         if writes.is_empty() {
             return Ok(());
         }
@@ -2744,6 +2754,22 @@ impl Database {
             self.publish_wal_before_eager_heap_write(txn_id)?;
             return self.with_heap_mut(table_id, |heap| {
                 for write in writes {
+                    #[cfg(test)]
+                    if TEST_HEAP_WRITE_FAILURE.with(|remaining| match remaining.get() {
+                        Some(0) => {
+                            remaining.set(None);
+                            true
+                        }
+                        Some(n) => {
+                            remaining.set(Some(n - 1));
+                            false
+                        }
+                        None => false,
+                    }) {
+                        return Err(crate::error::catalog::ER_GET_ERRNO
+                            .error("injected heap batch write failure"));
+                    }
+
                     heap.write_mvcc_ext(
                         txn_id,
                         write.row_id,
@@ -2751,6 +2777,7 @@ impl Database {
                         &write.values,
                         &write.external,
                     )?;
+                    *written += 1;
                 }
                 Ok(())
             });
@@ -2761,6 +2788,7 @@ impl Database {
                     heap.try_write_mvcc_tombstone(txn_id, write.row_id, write.header)
                 })?
             {
+                *written += 1;
                 continue;
             }
             self.publish_wal_before_eager_heap_write(txn_id)?;
@@ -2773,6 +2801,7 @@ impl Database {
                     &write.external,
                 )
             })?;
+            *written += 1;
         }
         Ok(())
     }

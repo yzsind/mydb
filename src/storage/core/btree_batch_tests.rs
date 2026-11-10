@@ -503,3 +503,37 @@ fn leaf_run_sparse_dense_search_matches_single_insert() {
         }
     }
 }
+
+#[test]
+fn audit1109_buffered_single_insert_records_online_build_log() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let log = Arc::new(parking_lot::Mutex::new(
+        LogManager::open(dir.path()).unwrap(),
+    ));
+    let pool = BufferPool::new(
+        512,
+        log.clone(),
+        DurabilityMode::Relaxed,
+        Duration::from_secs(2),
+    );
+    let mut index = IndexFile::open_with_durability(
+        crate::storage::naming::index_object_path_by_id(dir.path(), 1, 1, 1, "idx"),
+        log.clone(),
+        DurabilityMode::Relaxed,
+        pool,
+    )
+    .unwrap();
+    let build_log = Arc::new(OnlineIndexBuildLog::new());
+    index.online_build_log = Some(build_log.clone());
+    begin_txn_wal_buffering(&log, 71, 0, true);
+    let item = entry(vec![KeyPart::Int(7)], 7);
+    index
+        .insert_deferred(71, item.key.clone(), item.row_id)
+        .unwrap();
+    assert!(index.entries().unwrap().is_empty());
+    let changes = build_log.take().unwrap();
+    assert_eq!(changes.entries.len(), 1);
+    assert_eq!(changes.entries[0].key, item.key);
+    take_txn_wal_entries(&log, 71);
+    end_txn_wal_buffering(&log, 71);
+}

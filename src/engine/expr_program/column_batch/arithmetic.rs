@@ -551,7 +551,10 @@ fn exact_at(column: &ColumnVector, row: usize, expected: Exact) -> Option<i128> 
 }
 fn float_at(column: &ColumnVector, row: usize, expected: Kind, narrow: bool) -> Option<f64> {
     if let Kind::Exact(exact) = expected {
-        return Some(exact_at(column, row, exact)? as f64 / 10f64.powi(i32::from(exact.scale)));
+        return Some(crate::util::decimal::parts_to_f64(
+            exact_at(column, row, exact)?,
+            exact.scale,
+        ));
     }
     match column {
         ColumnVector::F64 { data, .. } => Some(if narrow {

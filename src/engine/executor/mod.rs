@@ -7112,6 +7112,8 @@ fn parse_error_to_query_error(err: crate::parser::ParseError) -> QueryError {
         || err.spec == crate::error::catalog::ER_PK_INDEX_CANT_BE_INVISIBLE
         || err.spec == crate::error::catalog::ER_STACK_OVERRUN_NEED_MORE
         || err.spec == crate::error::catalog::ER_TOO_HIGH_LEVEL_OF_NESTING_FOR_SELECT
+        || err.message.starts_with("invalid vector WITH ")
+        || err.message.starts_with("duplicate vector WITH ")
     {
         // This semantic validation and these resource bounds are detected
         // while parsing, but have canonical standalone messages rather than

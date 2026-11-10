@@ -1474,6 +1474,62 @@ fn derive_view_output_columns(
     select: &Select,
     out: &mut Vec<ViewColumnDef>,
 ) -> Result<(), QueryError> {
+    let start = out.len();
+    derive_view_output_columns_inner(db, current_database, select, out)?;
+    let mut session = SessionContext::default();
+    session.current_database = current_database.to_string();
+    let mut shape = select.clone();
+    crate::engine::executor::qualification::qualify_select_tables(db, &session, &mut shape)?;
+    let described = crate::engine::executor::select::describe_select_columns(db, &shape)?;
+    for (column, wire) in out[start..].iter_mut().zip(described) {
+        column.unsigned = wire.source.flags & crate::mysql::protocol::UNSIGNED_FLAG != 0;
+        column.nullable = wire.source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0;
+        let source_reference =
+            !wire.source.org_name.is_empty() && !wire.source.org_table.is_empty();
+        // Direct references preserve the declared default; NOT NULL alone
+        // does not manufacture a default for a source column.
+        if source_reference {
+            if let Ok(table) = db.table_required(&wire.source.schema, &wire.source.org_table) {
+                if let Some(index) = table.find_column_index(&wire.source.org_name) {
+                    let source = &table.columns[index];
+                    let value = crate::engine::show::column_default_value(source);
+                    column.default_value = if source.auto_increment {
+                        Some("0".to_string())
+                    } else if matches!(value, Value::Null) {
+                        None
+                    } else {
+                        Some(value.to_display_string())
+                    };
+                }
+            }
+        } else {
+            // Bound descriptors retain decimal precision/scale, temporal FSP
+            // and binary domains that the legacy expression classifier loses.
+            let definition = ctas_column_def(db, &session, &wire, column.nullable);
+            column.data_type = Some(definition.data_type.into());
+            column.charset = definition.charset;
+            column.collation = definition.collation;
+            if column.default_value.is_none() && !column.nullable {
+                column.default_value = match column.data_type.as_ref() {
+                    Some(crate::storage::DataTypeKind::Decimal {
+                        scale: Some(scale), ..
+                    }) if *scale > 0 => Some(format!("0.{}", "0".repeat(usize::from(*scale)))),
+                    kind => kind
+                        .and_then(crate::engine::executor::insert::implicit_default_for_type)
+                        .map(|value| value.to_display_string()),
+                };
+            }
+        }
+    }
+    Ok(())
+}
+
+fn derive_view_output_columns_inner(
+    db: &Arc<Database>,
+    current_database: &str,
+    select: &Select,
+    out: &mut Vec<ViewColumnDef>,
+) -> Result<(), QueryError> {
     // System relations have no storage TableSchema. Describe their real
     // projection, including joins, aliases and wildcard expansion.
     if !select.joins.is_empty()
@@ -1496,6 +1552,8 @@ fn derive_view_output_columns(
             let nullable = column.source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0;
             let definition = ctas_column_def(db, &context, &column, nullable);
             out.push(ViewColumnDef {
+                unsigned: false,
+                default_value: None,
                 name: column.name,
                 data_type: Some(definition.data_type.into()),
                 nullable,
@@ -1528,6 +1586,8 @@ fn derive_view_output_columns(
                     let nullable = column.source.flags & crate::mysql::protocol::NOT_NULL_FLAG == 0;
                     let definition = ctas_column_def(db, &context, &column, nullable);
                     input.push(ViewColumnDef {
+                        unsigned: false,
+                        default_value: None,
                         name: column.name,
                         data_type: Some(definition.data_type.into()),
                         nullable: definition.nullable,
@@ -1561,6 +1621,8 @@ fn derive_view_output_columns(
                     } else {
                         let inferred = infer_view_expr_type(db, current_database, select, expr);
                         out.push(ViewColumnDef {
+                            unsigned: false,
+                            default_value: None,
                             name: alias
                                 .clone()
                                 .or_else(|| referenced.cloned())
@@ -1591,6 +1653,8 @@ fn derive_view_output_columns(
                 if let Some(table) = &primary_table {
                     for (_, col) in table.iter_select_columns() {
                         out.push(ViewColumnDef {
+                            unsigned: false,
+                            default_value: None,
                             name: col.name.clone(),
                             data_type: Some(col.data_type.clone()),
                             nullable: col.nullable,
@@ -1609,6 +1673,8 @@ fn derive_view_output_columns(
                     // by an explicit column list, otherwise MySQL would
                     // also report `Name_exp_N`).
                     out.push(ViewColumnDef {
+                        unsigned: false,
+                        default_value: None,
                         name: format!("Name_exp_{}", idx + 1),
                         data_type: None,
                         nullable: true,
@@ -1621,6 +1687,8 @@ fn derive_view_output_columns(
                 if let Some(table) = &primary_table {
                     for (_, col) in table.iter_select_columns() {
                         out.push(ViewColumnDef {
+                            unsigned: false,
+                            default_value: None,
                             name: col.name.clone(),
                             data_type: Some(col.data_type.clone()),
                             nullable: col.nullable,
@@ -1630,6 +1698,8 @@ fn derive_view_output_columns(
                     }
                 } else {
                     out.push(ViewColumnDef {
+                        unsigned: false,
+                        default_value: None,
                         name: format!("Name_exp_{}", idx + 1),
                         data_type: None,
                         nullable: true,
@@ -1681,6 +1751,8 @@ fn derive_view_output_columns(
                     })
                     .unwrap_or((None, None));
                 out.push(ViewColumnDef {
+                    unsigned: false,
+                    default_value: None,
                     name,
                     data_type,
                     nullable,

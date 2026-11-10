@@ -243,7 +243,7 @@ fn validate_vector_index_column(
                         datatype,
                     } = c.data_type
                     {
-                        VectorIndexFile::validate_hnsw_layout(
+                        VectorIndexFile::validate_hnsw_column_layout(
                             if let Some(config) =
                                 index.vector.as_ref().filter(|v| v.quantization.enabled())
                             {
@@ -256,6 +256,7 @@ fn validate_vector_index_column(
                             } else {
                                 native_vector_geometry(datatype, dim) as usize
                             },
+                            dim as usize,
                             index.vector_meta().m as usize,
                         )?;
                     }
@@ -290,6 +291,22 @@ fn validate_vector_index_column(
 }
 
 /// Revalidate in both catalog phases; callers own locking and publication.
+fn warn_btree_descending(index_type: &str, directions: &[crate::storage::IndexColumnDirection]) {
+    if index_type.eq_ignore_ascii_case("BTREE") && directions.contains(&crate::storage::IndexColumnDirection::Desc) {
+        crate::engine::api::push_statement_warning(crate::error::ConditionLevel::Warning,
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "Descending key parts are retained as metadata; mydb stores B-tree keys ascending and uses reverse scans or sorting for ORDER BY");
+    }
+}
+
+fn implicit_spatial_index(index: &mut IndexSchema, table: &TableSchema) {
+    if index.index_type.eq_ignore_ascii_case("BTREE") && !index.unique && !index.primary
+        && !index.has_expression_parts() && index.columns.iter().any(|name| table.column_index(name).ok()
+            .is_some_and(|i| matches!(table.columns[i].data_type, DataTypeKind::Geometry { .. }))) {
+        index.index_type = "SPATIAL".into();
+    }
+}
+
 fn validate_add_index_definition(
     table: &TableSchema,
     index: &IndexSchema,
@@ -753,6 +770,12 @@ fn prepare_create_table_schema(
     spec: CreateTableSchemaSpec,
 ) -> Result<PreparedCreateTableSchema, QueryError> {
     crate::storage::schema::validate_supported_table_options(&spec.mysql_table_options)?;
+    if spec.temporary && spec.mysql_table_options.iter().any(|(name, _)|
+        name.eq_ignore_ascii_case("ZONE_MAP") || name.eq_ignore_ascii_case("ZONE_SIZE")) {
+        return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "ZONE_MAP and ZONE_SIZE are not supported on temporary tables"));
+    }
+
     let CreateTableSchemaSpec {
         database,
         table_name,
@@ -945,6 +968,13 @@ fn prepare_create_table_schema(
             &index.index_type,
         )?;
 
+        if index.index_type.eq_ignore_ascii_case("BTREE") && !index.unique && !index.name.as_deref().is_some_and(|name| name.eq_ignore_ascii_case("PRIMARY"))
+            && parser_key_expressions.iter().all(Option::is_none)
+            && column_only_parts.iter().any(|name| column_schemas.iter().any(|column| column.name.eq_ignore_ascii_case(name)
+                && matches!(column.data_type, DataTypeKind::Geometry { .. }))) {
+            index.index_type = "SPATIAL".into();
+        }
+        warn_btree_descending(&index.index_type, &directions);
         let is_spatial = index.index_type.eq_ignore_ascii_case("SPATIAL");
         let is_vector = index.index_type.eq_ignore_ascii_case("HNSW")
             || index.index_type.eq_ignore_ascii_case("VECTOR")
@@ -1672,6 +1702,10 @@ impl Database {
         let id = self.next_temp_table_id.fetch_add(1, Ordering::AcqRel);
         let internal_key = table_key("__mydb_temp", &format!("{}_{}", connection_id, id));
         let table = prepared.finish(id, &[])?;
+        if table.indexes.iter().any(IndexSchema::is_vector) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "Vector indexes on TEMPORARY tables are not supported"));
+        }
         validate_auto_increment_schema(&table)?;
         let has_auto_increment = table.auto_increment_column_index().is_some();
         let auto_increment_max = if has_auto_increment {
@@ -1967,6 +2001,9 @@ impl Database {
             }
             if let Some(table) = self.table_by_id(id) {
                 self.initialize_empty_spatial_indexes(&table)?;
+                let names = table.indexes.iter().filter(|index| index.is_vector())
+                    .map(|index| index.name.as_str()).collect::<Vec<_>>();
+                self.warm_vector_graphs_after_ddl(&table, &names)?;
             }
             self.note_catalog_table_key(&key)?;
             self.commit_ddl_catalog_txn()
@@ -2045,7 +2082,12 @@ impl Database {
                 "Cannot create temporary table with partitions",
             ));
         }
-        let parts = Self::build_like_schema_parts(source, &table_name)?;
+        let mut parts = Self::build_like_schema_parts(source, &table_name)?;
+        if parts.indexes.iter().any(IndexSchema::is_vector) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "Vector indexes on TEMPORARY tables are not supported"));
+        }
+        parts.mysql_table_options.retain(|(name, _)| !name.eq_ignore_ascii_case("ZONE_MAP") && !name.eq_ignore_ascii_case("ZONE_SIZE"));
         let id = self.next_temp_table_id.fetch_add(1, Ordering::AcqRel);
         let internal_key = table_key("__mydb_temp", &format!("{}_{}", connection_id, id));
         let mut table = parts.finish(source, id, database, table_name, None, current_unix_ms());
@@ -2416,6 +2458,10 @@ impl Database {
         internal_key: &str,
         mut index: IndexSchema,
     ) -> Result<(), QueryError> {
+        if index.is_vector() {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "Vector indexes on TEMPORARY tables are not supported"));
+        }
         index.column_prefix_lengths =
             normalized_index_prefix_lengths(index.column_prefix_lengths, index.columns.len());
         index.column_directions.resize(
@@ -4501,6 +4547,8 @@ impl Database {
         let table = self
             .table_by_key(&key)
             .ok_or_else(|| ddl_table_not_found(&table_name))?;
+        implicit_spatial_index(&mut index, &table);
+        warn_btree_descending(&index.index_type, &index.column_directions);
         validate_add_index_backend(&table, &index)?;
         if index.is_fulltext() {
             let collation = index.columns.first().and_then(|name| table.column_index(name).ok())
@@ -4831,6 +4879,16 @@ impl Database {
         table_key: &str,
         index_name: &str,
     ) -> Result<(), QueryError> {
+        let mut vector_files = Vec::new();
+        let mut vector_keys = Vec::new();
+        if let Some(table) = self.table_by_key(table_key) {
+            if let Some(index) = table.indexes.iter().find(|index| index.name.eq_ignore_ascii_case(index_name) && index.is_vector()) {
+                for sid in table.storage_ids() {
+                    vector_files.extend(self.owned_vector_files(&table, index, sid)?);
+                    vector_keys.push((table.id, sid, table.active_generation.max(1), normalize_name(index_name)));
+                }
+            }
+        }
         // Resolve physical identity before removing the descriptor. Afterwards
         // index_path() can only produce the missing-name fallback id.
         let physical_files = self
@@ -4881,6 +4939,11 @@ impl Database {
         }
         self.note_catalog_table(table_id);
         self.commit_catalog_txn()?;
+        self.evict_vector_graphs(vector_keys);
+        for path in vector_files {
+            self.buffer_pool.discard_pages_for_path(&path)?;
+            self.delete_logged_file(txn_id_for_ddl(), path)?;
+        }
         for (storage_id, path) in physical_files {
             self.remove_index_cache_entry(storage_id, index_name)?;
             match std::fs::remove_file(path) {
@@ -5477,6 +5540,12 @@ impl Database {
                     },
                 ),
             ));
+            if dropped_index.is_spatial() {
+                let path = self.index_path_for_table_schema(&table_snapshot, storage_id, &dropped_index.name);
+                for extension in ["rtree.corrupt", "rtree.failed"] {
+                    retired.files.push(self.relative_path(&path.with_extension(extension)));
+                }
+            }
             if dropped_index.is_vector() {
                 retired.vector_files.extend(
                     self.owned_vector_files(&table_snapshot, &dropped_index, storage_id)?
@@ -8295,7 +8364,7 @@ impl Database {
                         &mut mapping,
                         strict,
                         &mut warnings,
-                        None,
+                        Some(online_copy_deadline()),
                     )?;
                     self.flush_online_copy_shadow(&shadow_table)?;
                     self.flush_online_copy_shadow(&old_table)?;
@@ -8436,7 +8505,7 @@ impl Database {
                 .chain(file_swap.shadow_to_live.iter().map(|(shadow, _)| shadow))
                 .map(|path| self.relative_path(path))
                 .collect();
-            self.publish_copied_vector_owners(&candidate, shadow_id, old_table.id, &memory_graphs)?;
+            self.publish_copied_vector_owners(&candidate, &old_table, shadow_id, old_table.id, &memory_graphs)?;
             let publish = self
                 .log_copied_generation(ddl_txn_id, &file_swap)
                 .and_then(|_| {
@@ -9736,8 +9805,13 @@ impl Database {
             &row_headers,
             &rows,
         )?;
-        self.lock_rows_nonblocking(txn.txn_id, table.id, inserted.iter().copied())?;
-        self.push_insert_batch_undo_deferred(txn.txn_id, table.id, &inserted)?;
+        if let Err(err) = (|| {
+            self.lock_rows_nonblocking(txn.txn_id, table.id, inserted.iter().copied())?;
+            self.push_insert_batch_undo_deferred(txn.txn_id, table.id, &inserted)
+        })() {
+            self.rollback_inserted_rows(txn.txn_id, table.id, &inserted)?;
+            return Err(err);
+        }
         let mut index_entries = table
             .indexes
             .iter()
@@ -11383,6 +11457,9 @@ fn finish_column_change_candidate(
         validate_auto_increment_schema(candidate)?;
     }
     candidate.build_column_index();
+    for index in candidate.indexes.iter().filter(|index| index.is_spatial()) {
+        validate_spatial_columns_not_null(&index.columns, &candidate.columns)?;
+    }
     candidate.bump_schema_version();
     ensure_table_keeps_visible_column(candidate)?;
     Ok(())

@@ -5853,7 +5853,10 @@ fn execute_table_maintenance_status(
                     "online OPTIMIZE TABLE does not support temporary tables",
                 ));
             }
-            let schema = db.table(&qualify_table_name(session, tbl))?;
+            let resolved = session
+                .resolve_temp_table_name(tbl)
+                .unwrap_or_else(|| qualify_table_name(session, tbl));
+            let schema = db.table(&resolved)?;
             if op == "optimize" {
                 db.optimize_table_online(&schema.qualified_name(), session.connection_id as u64)?;
                 // Log only the targets that actually succeeded. The generic

@@ -6192,8 +6192,10 @@ fn value_f64(value: &Value) -> Result<f64, QueryError> {
         Value::Double(v) => Ok(*v),
         Value::Int(v) => Ok(*v as f64),
         Value::UInt(v) => Ok(*v as f64),
-        Value::DecimalCompact(v, scale) => Ok(*v as f64 / 10f64.powi(*scale as i32)),
-        Value::Decimal128(v, scale) => Ok(*v as f64 / 10f64.powi(*scale as i32)),
+        Value::DecimalCompact(v, scale) => {
+            Ok(crate::util::decimal::parts_to_f64(*v as i128, *scale))
+        }
+        Value::Decimal128(v, scale) => Ok(crate::util::decimal::parts_to_f64(*v as i128, *scale)),
         Value::DecimalWide(v) => {
             crate::util::decimal::format_big_decimal_parts(&v.magnitude, v.scale)
                 .parse()

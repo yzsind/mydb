@@ -5877,8 +5877,29 @@ pub(super) fn execute_spatial_scan(
     query_probe: &planner::SpatialProbe,
     filter: &Option<Expr>,
 ) -> Result<Vec<PlanRow>, QueryError> {
+    let mut stream = open_spatial_scan(db, txn, table, index, query_probe, filter)?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next()? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+pub(super) fn open_spatial_scan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    query_probe: &planner::SpatialProbe,
+    filter: &Option<Expr>,
+) -> Result<Box<dyn PlanStream>, QueryError> {
     let query_mbr = match query_probe {
-        planner::SpatialProbe::Constant { mbr, srid } => {
+        planner::SpatialProbe::Constant {
+            mbr,
+            srid,
+            function,
+            column_first,
+        } => {
             let column_srid = index
                 .columns
                 .first()
@@ -5888,23 +5909,26 @@ pub(super) fn execute_spatial_scan(
                     _ => None,
                 });
             if column_srid.is_some_and(|expected| expected != *srid) {
-                return Err(crate::storage::error(
-                    crate::error::catalog::ER_GIS_DIFFERENT_SRIDS,
-                    "Spatial index probe SRID differs from indexed column",
-                ));
+                let expected = column_srid.unwrap();
+                return Err(if *column_first {
+                    crate::engine::geo::srid_mismatch(function, expected, *srid)
+                } else {
+                    crate::engine::geo::srid_mismatch(function, *srid, expected)
+                });
             }
             *mbr
         }
-        planner::SpatialProbe::Parameter(expr) => {
+        planner::SpatialProbe::Parameter {
+            expr,
+            function,
+            column_first,
+        } => {
             let value = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])?;
             if matches!(value, Value::Null) {
-                return Ok(Vec::new());
+                return Ok(Box::new(MaterializedStream::new(Vec::new())));
             }
             let (Value::Geometry(bytes) | Value::Bytes(bytes)) = value else {
-                return Err(crate::storage::error(
-                    crate::error::catalog::ER_GIS_INVALID_DATA,
-                    "Invalid GIS data provided to the spatial index probe.",
-                ));
+                return Err(crate::engine::geo::invalid_gis_data(function));
             };
             let geometry = crate::engine::geo::read_geometry(&bytes)?;
             let column_srid = index
@@ -5917,48 +5941,174 @@ pub(super) fn execute_spatial_scan(
                 });
             if let Some(column_srid) = column_srid {
                 if geometry.srid != column_srid {
-                    return Err(crate::storage::error(
-                        crate::error::catalog::ER_GIS_DIFFERENT_SRIDS,
-                        format!(
-                            "Spatial index probe has SRID {}, but indexed column requires SRID {}.",
-                            geometry.srid, column_srid
-                        ),
-                    ));
+                    return Err(if *column_first {
+                        crate::engine::geo::srid_mismatch(function, column_srid, geometry.srid)
+                    } else {
+                        crate::engine::geo::srid_mismatch(function, geometry.srid, column_srid)
+                    });
                 }
+            }
+            if geometry
+                .geom
+                .dimension()
+                .is_some_and(|dimension| dimension > 0)
+            {
+                crate::engine::geo::sql::require_planar(function, &geometry)?;
             }
             let Some(mbr) = geometry.geom.mbr() else {
                 // Empty geometries have no pruning rectangle. Evaluate the
                 // original predicate just as the constant-probe scan does.
-                return scan_plan_table(db, txn, table, filter, &[], None, false);
+                return scan_plan_table(db, txn, table, filter, &[], None, false)
+                    .map(|rows| Box::new(MaterializedStream::new(rows)) as Box<dyn PlanStream>);
             };
             [mbr.minx, mbr.miny, mbr.maxx, mbr.maxy]
         }
     };
     let window =
         crate::engine::geo::Mbr::new(query_mbr[0], query_mbr[1], query_mbr[2], query_mbr[3]);
-    run_plan_scan_with_partition_pruning(table, filter, || {
-        let mut out = Vec::new();
-        let mut eval_ctx = EvalQueryContext::default();
-        for storage_id in db.scan_storage_ids(&table.schema) {
-            let mut physical = (*table.schema).clone();
-            physical.id = storage_id;
-            let candidates = db.spatial_search_visible(&physical, index, window, txn)?;
-            for row_id in candidates.iter().copied() {
-                let Some(stored) = db.read_row_at(&table.schema, storage_id, row_id, txn)? else {
-                    continue;
-                };
-                let row = stored_row_to_plan_row(table, stored.values)?;
-                let keep = match filter {
-                    Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
-                    None => true,
-                };
-                if keep {
-                    out.push(row);
-                }
+    let storage_ids = run_plan_scan_with_partition_pruning(table, filter, || {
+        Ok(db.scan_storage_ids(&table.schema))
+    })?;
+    Ok(Box::new(SpatialScanStream {
+        db: db.clone(),
+        txn,
+        table: table.clone(),
+        index: index.clone(),
+        filter: filter.clone(),
+        window,
+        storage_ids: storage_ids.into_iter(),
+        current: None,
+        storage_id: 0,
+        repairs: None,
+        seen: HashSet::new(),
+        seen_charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        repair_charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        eval_ctx: EvalQueryContext::default(),
+    }))
+}
+
+enum SpatialScanSource {
+    Cursor(crate::storage::SpatialCursor),
+    Snapshot(crate::storage::SpatialCandidates, usize),
+}
+impl SpatialScanSource {
+    fn next(&mut self) -> Result<Option<RowId>, QueryError> {
+        match self {
+            Self::Cursor(cursor) => cursor.next(),
+            Self::Snapshot(rows, offset) => {
+                let row = rows.get(*offset).copied();
+                *offset += usize::from(row.is_some());
+                Ok(row)
             }
         }
-        Ok(out)
-    })
+    }
+}
+
+struct SpatialScanStream {
+    db: Arc<Database>,
+    txn: TxnView,
+    table: PlanTable,
+    index: IndexSchema,
+    filter: Option<Expr>,
+    window: crate::engine::geo::Mbr,
+    storage_ids: std::vec::IntoIter<u64>,
+    storage_id: u64,
+    current: Option<SpatialScanSource>,
+    repairs: Option<std::vec::IntoIter<RowId>>,
+    seen: HashSet<RowId>,
+    seen_charge: crate::engine::executor::mem_budget::ScopedCharge,
+    repair_charge: crate::engine::executor::mem_budget::ScopedCharge,
+    eval_ctx: EvalQueryContext,
+}
+impl PlanStream for SpatialScanStream {
+    fn next(&mut self) -> Result<Option<PlanRow>, QueryError> {
+        loop {
+            crate::engine::cancel::check_cancelled()?;
+            let row_id = if let Some(cursor) = &mut self.current {
+                cursor.next()?
+            } else {
+                self.repairs.as_mut().and_then(Iterator::next)
+            };
+            if let Some(row_id) = row_id {
+                if self.seen.len() == self.seen.capacity() && !self.seen.contains(&row_id) {
+                    self.seen_charge
+                        .add_non_spillable(self.seen.capacity().max(64) * 32)?;
+                    self.seen
+                        .try_reserve(self.seen.capacity().max(64))
+                        .map_err(|_| {
+                            crate::error::catalog::ER_OUTOFMEMORY
+                                .error("spatial cursor visibility set allocation failed")
+                        })?;
+                }
+                if !self.seen.insert(row_id) {
+                    continue;
+                }
+                let Some(stored) =
+                    self.db
+                        .read_row_at(&self.table.schema, self.storage_id, row_id, self.txn)?
+                else {
+                    continue;
+                };
+                let row = stored_row_to_plan_row(&self.table, stored.values)?;
+                if let Some(filter) = &self.filter {
+                    if !eval_plan_bool_with_db(
+                        &self.db,
+                        self.txn,
+                        filter,
+                        &row,
+                        &mut self.eval_ctx,
+                    )? {
+                        continue;
+                    }
+                }
+                return Ok(Some(row));
+            }
+            if matches!(self.current.take(), Some(SpatialScanSource::Cursor(_))) {
+                // Merge repairs after navigation: a concurrent delete may have
+                // removed an unvisited entry after this cursor was opened.
+                let mut physical = (*self.table.schema).clone();
+                physical.id = self.storage_id;
+                let repairs = self.db.spatial_visibility_repairs(
+                    &physical,
+                    &self.index,
+                    self.window,
+                    self.txn,
+                )?;
+                self.repair_charge
+                    .add_non_spillable(repairs.capacity() * std::mem::size_of::<RowId>())?;
+                self.repairs = Some(repairs.into_iter());
+                continue;
+            }
+            self.repairs = None;
+            self.repair_charge
+                .release_bytes(self.repair_charge.charged());
+            let Some(storage_id) = self.storage_ids.next() else {
+                return Ok(None);
+            };
+            self.storage_id = storage_id;
+            self.seen.clear();
+            let mut physical = (*self.table.schema).clone();
+            physical.id = storage_id;
+            self.current = Some(if crate::planner::connection_thread_execution_required() {
+                SpatialScanSource::Snapshot(
+                    self.db.spatial_search_visible(
+                        &physical,
+                        &self.index,
+                        self.window,
+                        self.txn,
+                    )?,
+                    0,
+                )
+            } else {
+                SpatialScanSource::Cursor(self.db.spatial_scan_cursor(
+                    &physical,
+                    &self.index,
+                    self.window,
+                    self.txn,
+                )?)
+            });
+        }
+    }
 }
 
 /// Execute a `VectorIndexScan`: ask the HNSW graph for the nearest candidate
@@ -6121,7 +6271,7 @@ pub(super) fn execute_vector_index_scan(
     // A recovered/sealed graph contains physical current vectors. Prepared
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
-    if db.xa_status_counters().0 > 0 || db.vector_snapshot_requires_exact(txn) {
+    if db.vector_table_has_prepared_writes(&table.schema) || db.vector_snapshot_requires_exact(&table.schema, txn) {
         if order_by.len() > 1 {
             return execute_ordered_vector_fallback(
                 db, txn, table, filter, order_by, k, projection,
@@ -6643,11 +6793,11 @@ pub(super) fn execute_vector_index_scan(
                 index,
                 sid,
                 examined as u64,
-                exact_fallback || db.vector_snapshot_requires_exact(txn),
+                exact_fallback || db.vector_snapshot_requires_exact(&table.schema, txn),
             );
         }
     }
-    if exact_fallback || db.vector_snapshot_requires_exact(txn) {
+    if exact_fallback || db.vector_snapshot_requires_exact(&table.schema, txn) {
         drop(scored);
         drop(late_scores);
         drop(late_values);
@@ -7005,6 +7155,7 @@ pub(super) fn execute_vector_brute_scan(
     if k == 0 {
         return Ok(Vec::new());
     }
+    db.validate_vector_table_backend(&table.schema)?;
     let winners = db.vector_brute_knn(&table.schema, txn, col_idx, query_vector, metric, k)?;
     let partitioned = table.schema.is_partitioned();
     let mut rows = Vec::with_capacity(winners.len());

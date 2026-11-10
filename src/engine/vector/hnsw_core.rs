@@ -76,17 +76,17 @@ pub(super) fn select_diverse_ties<Id: Copy, E>(
     zero_is_coincident: bool,
     mut distance: impl FnMut(Id, Id) -> Result<f64, E>,
 ) -> Result<Vec<Scored<Id>>, E> {
-    // Ordered nonnegative scores need deferred fill only when at least two
-    // candidates coincide with the query. Preserve Algorithm 4's hot path
-    // without a second accumulator for ordinary construction candidates.
+    // Coincident candidates can be arbitrarily far from the query, but must
+    // have equal query distances. Preserve the ordinary construction hot path
+    // when the sorted pool has no ties anywhere in it.
     if !zero_is_coincident
-        || candidates
-            .get(1)
-            .is_none_or(|candidate| candidate.dist > 0.0)
+        || !candidates
+            .windows(2)
+            .any(|pair| pair[0].dist == pair[1].dist)
     {
         return select_diverse(candidates, maximum, distance);
     }
-    select_diverse_ties_by(candidates.iter().copied(), maximum, |a, b| {
+    select_diverse_recent_ties_by(candidates.iter().copied(), maximum, |a, b| {
         let pair = distance(a.id, b.id)?;
         Ok((pair < a.dist, zero_is_coincident && pair == 0.0))
     })
@@ -96,6 +96,25 @@ pub(super) fn select_diverse_ties<Id: Copy, E>(
 pub(super) fn select_diverse_ties_by<C: Copy, E>(
     candidates: impl IntoIterator<Item = C>,
     maximum: usize,
+    relation: impl FnMut(C, C) -> Result<(bool, bool), E>,
+) -> Result<Vec<C>, E> {
+    select_diverse_ties_impl(candidates, maximum, false, relation)
+}
+
+#[inline]
+pub(super) fn select_diverse_recent_ties_by<C: Copy, E>(
+    candidates: impl IntoIterator<Item = C>,
+    maximum: usize,
+    relation: impl FnMut(C, C) -> Result<(bool, bool), E>,
+) -> Result<Vec<C>, E> {
+    select_diverse_ties_impl(candidates, maximum, true, relation)
+}
+
+#[inline]
+fn select_diverse_ties_impl<C: Copy, E>(
+    candidates: impl IntoIterator<Item = C>,
+    maximum: usize,
+    recent: bool,
     mut relation: impl FnMut(C, C) -> Result<(bool, bool), E>,
 ) -> Result<Vec<C>, E> {
     let mut selected = Vec::with_capacity(maximum);
@@ -107,14 +126,17 @@ pub(super) fn select_diverse_ties_by<C: Copy, E>(
         let mut keep = true;
         for previous in &selected {
             let (redundant, duplicate) = relation(candidate, *previous)?;
-            if redundant {
+            if duplicate {
+                if coincident.len() < maximum || (recent && maximum != 0) {
+                    if coincident.len() == maximum {
+                        coincident.pop();
+                    }
+                    coincident.push(candidate);
+                }
                 keep = false;
                 break;
             }
-            if duplicate {
-                if coincident.len() < maximum {
-                    coincident.push(candidate);
-                }
+            if redundant {
                 keep = false;
                 break;
             }
@@ -124,7 +146,15 @@ pub(super) fn select_diverse_ties_by<C: Copy, E>(
         }
     }
     if !coincident.is_empty() {
-        selected.extend(coincident.into_iter().take(maximum - selected.len()));
+        // Retain the newest reverse edge before older equal-coordinate fills.
+        // Otherwise every later member points into the oldest hubs while the
+        // hubs repeatedly discard its incoming edge, isolating the live tail.
+        let remaining = maximum - selected.len();
+        if recent {
+            selected.extend(coincident.into_iter().rev().take(remaining));
+        } else {
+            selected.extend(coincident.into_iter().take(remaining));
+        }
     }
     Ok(selected)
 }
@@ -167,6 +197,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn vector_release_nonzero_coincident_candidates_preserve_bridge() {
+        let candidates = [
+            Scored { dist: 4.0, id: 0 },
+            Scored { dist: 4.0, id: 1 },
+            Scored { dist: 4.0, id: 2 },
+            Scored { dist: 9.0, id: 3 },
+        ];
+        let selected = select_diverse_ties(&candidates, 3, true, |a, b| {
+            Ok::<_, ()>(if a < 3 && b < 3 { 0.0 } else { 9.0 })
+        })
+        .unwrap();
+        assert!(selected.iter().any(|candidate| candidate.id == 3));
+    }
+
+    #[test]
     fn vector_audit_coincident_edges_leave_room_for_distinct_directions() {
         let candidates = [
             Scored { dist: 0.0, id: 0 },
@@ -178,7 +223,7 @@ mod tests {
             Ok::<_, ()>(if a < 3 && b < 3 { 0.0 } else { 9.0 })
         })
         .unwrap();
-        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [0, 3, 1]);
+        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [0, 3, 2]);
         let duplicates =
             select_diverse_ties(&candidates[..3], 3, true, |_, _| Ok::<_, ()>(0.0)).unwrap();
         assert_eq!(duplicates.len(), 3);

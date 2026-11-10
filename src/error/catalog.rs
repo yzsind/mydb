@@ -23,6 +23,12 @@ pub const MYDB_ER_VECTOR_DIMENSION_MISMATCH: ErrorSpec = ErrorSpec::new(
     *b"22023",
     "MYDB_ER_VECTOR_DIMENSION_MISMATCH",
 );
+pub const MYDB_WARN_VECTOR_FALLBACK: ErrorSpec = ErrorSpec::new(
+    ErrorDomain::MyDb,
+    50003,
+    *b"01000",
+    "MYDB_WARN_VECTOR_FALLBACK",
+);
 pub const MYDB_ER_SEQUENCE_EXISTS: ErrorSpec = ErrorSpec::new(
     ErrorDomain::MyDb,
     50010,
@@ -237,6 +243,7 @@ pub const ER_AI_KEY_ROTATION_INCOMPLETE: ErrorSpec = ErrorSpec::new(
 pub const MYDB_ERROR_SPECS: &[ErrorSpec] = &[
     MYDB_ER_INVALID_VECTOR_VALUE,
     MYDB_ER_VECTOR_DIMENSION_MISMATCH,
+    MYDB_WARN_VECTOR_FALLBACK,
     MYDB_ER_SEQUENCE_EXISTS,
     MYDB_ER_SEQUENCE_NOT_FOUND,
     MYDB_ER_SEQUENCE_LIMIT_REACHED,

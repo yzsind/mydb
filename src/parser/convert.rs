@@ -1334,15 +1334,7 @@ fn convert_create_table(
                 // single geometry column with no prefix length / direction /
                 // expression key.
                 let columns = convert_index_columns(constraint.columns)?;
-                if columns.names.len() != 1
-                    || columns.has_prefix_or_desc()
-                    || columns.has_expressions()
-                {
-                    return Ok(Statement::Unsupported {
-                        kind: "SPATIAL INDEX must be a single plain geometry column".to_string(),
-                        sql: sql.to_string(),
-                    });
-                }
+                validate_spatial_index_columns(&columns)?;
                 indexes.push(IndexDef {
                     name: constraint.opt_index_name.map(ident_value),
                     columns: columns.names,
@@ -1736,16 +1728,7 @@ fn convert_alter_table_action(
                     }
                     "FULLTEXT"
                 } else {
-                    if columns.names.len() != 1
-                        || columns.has_prefix_or_desc()
-                        || columns.has_expressions()
-                    {
-                        return Ok(ConvertedAlterAction::Unsupported(Statement::Unsupported {
-                            kind: "SPATIAL INDEX must be a single plain geometry column"
-                                .to_string(),
-                            sql: sql.to_string(),
-                        }));
-                    }
+                    validate_spatial_index_columns(&columns)?;
                     "SPATIAL"
                 };
                 AlterAction::AddIndex(IndexDef {
@@ -7122,6 +7105,33 @@ fn convert_group_by(
             Ok((group_by_keys, grouping_sets, group_by_modifier))
         }
     }
+}
+
+fn validate_spatial_index_columns(columns: &ConvertedIndexColumns) -> Result<(), ParseError> {
+    let (spec, message) = if columns.names.len() != 1 {
+        (
+            crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
+            "A SPATIAL index requires exactly one key part",
+        )
+    } else if columns.has_expressions() {
+        (
+            crate::error::catalog::ER_SPATIAL_FUNCTIONAL_INDEX,
+            "Spatial functional index is not supported",
+        )
+    } else if columns.prefix_lengths.iter().any(Option::is_some) {
+        (
+            crate::error::catalog::ER_WRONG_SUB_KEY,
+            "A SPATIAL index cannot use a column prefix",
+        )
+    } else if columns.descending.iter().any(|value| *value) {
+        (
+            crate::error::catalog::ER_WRONG_USAGE,
+            "A SPATIAL index cannot use descending key parts",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(numeric_spec_error(spec, message))
 }
 
 fn convert_index_columns(

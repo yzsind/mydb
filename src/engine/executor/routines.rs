@@ -2532,10 +2532,7 @@ pub(super) fn execute_trigger_body(
         trigger.name.to_ascii_lowercase(),
     );
     if TRIGGER_STACK.with(|stack| stack.borrow().contains(&key)) {
-        return Err(error(
-            crate::error::catalog::ER_SP_NO_RECURSION,
-            "Recursive stored functions and triggers are not allowed.",
-        ));
+        return Err(trigger_self_table_error());
     }
     struct TriggerInvocation;
     impl Drop for TriggerInvocation {

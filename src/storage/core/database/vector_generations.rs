@@ -9,7 +9,7 @@ struct VectorGenerationManifest {
     resident: bool,
     lineage: u64,
     source_lsn: u64,
-    retired: Vec<(u64, u64)>,
+    retired: Vec<(u64, u64, u64)>,
 }
 
 impl VectorGenerationManifest {
@@ -29,8 +29,9 @@ impl VectorGenerationManifest {
         writer.u64(self.lineage).map_err(io_err)?;
         writer.u64(self.source_lsn).map_err(io_err)?;
         writer.count(self.retired.len()).map_err(io_err)?;
-        for (owner, id) in &self.retired {
+        for (owner, generation, id) in &self.retired {
             writer.u64(*owner).map_err(io_err)?;
+            writer.u64(*generation).map_err(io_err)?;
             writer.u64(*id).map_err(io_err)?;
         }
         writer.finish().map_err(io_err)?;
@@ -55,7 +56,7 @@ impl VectorGenerationManifest {
         };
         let lineage = reader.u64()?;
         let source_lsn = reader.u64()?;
-        let count = reader.count(16)?;
+        let count = reader.count(24)?;
         if physical_storage_id == 0 || active == 0 || count > 64 {
             return Err(vector::persistence::corrupt());
         }
@@ -63,15 +64,17 @@ impl VectorGenerationManifest {
         let mut seen = BTreeSet::new();
         for _ in 0..count {
             let owner = reader.u64()?;
+            let retired_generation = reader.u64()?;
             let id = reader.u64()?;
             if owner == 0
+                || retired_generation == 0
                 || id == 0
-                || (owner, id) == (physical_storage_id, active)
-                || !seen.insert((owner, id))
+                || (owner, retired_generation, id) == (physical_storage_id, generation, active)
+                || !seen.insert((owner, retired_generation, id))
             {
                 return Err(vector::persistence::corrupt());
             }
-            retired.push((owner, id));
+            retired.push((owner, retired_generation, id));
         }
         reader.finish()?;
         Ok(Self {
@@ -100,6 +103,19 @@ impl Database {
             .parent()
             .expect("index directory")
             .join(format!("{}.vector", index.index_id))
+            .join(format!("{physical}.hvec"))
+    }
+    fn vector_generation_path_at(
+        &self,
+        index_id: u64,
+        owner: u64,
+        generation: u64,
+        physical: u64,
+    ) -> PathBuf {
+        self.vector_index_path_for_parts(owner, generation, index_id, "hvec")
+            .parent()
+            .expect("index directory")
+            .join(format!("{index_id}.vector"))
             .join(format!("{physical}.hvec"))
     }
     fn vector_manifest_path(
@@ -138,7 +154,7 @@ impl Database {
         file.take(2049).read_to_end(&mut bytes).map_err(io_err)?;
         Ok(Some(VectorGenerationManifest::decode(
             &bytes, storage_id, generation, index_id,
-        )?))
+        ).map_err(|err| err.map_message(|message| format!("{message}: manifest={} storage_id={storage_id} generation={generation} index_id={index_id}", path.display())))?))
     }
     fn active_native_vector_path(
         &self,
@@ -364,7 +380,11 @@ impl Database {
         if let Some(manifest) = self.read_vector_manifest(table, index, storage_id)? {
             retired = manifest.retired;
             if manifest.active != physical {
-                retired.push((manifest.physical_storage_id, manifest.active));
+                retired.push((
+                    manifest.physical_storage_id,
+                    manifest.generation,
+                    manifest.active,
+                ));
             }
         }
         if retired.len() > 64 {
@@ -428,8 +448,9 @@ impl Database {
         }
         let mut waiting = Vec::new();
         let mut changed = false;
-        for (owner, physical) in &manifest.retired {
-            let mut path = self.vector_generation_path(table, index, *owner, *physical);
+        for (owner, generation, physical) in &manifest.retired {
+            let mut path =
+                self.vector_generation_path_at(index.index_id, *owner, *generation, *physical);
             if manifest.resident {
                 path.set_extension("hnsw");
             }
@@ -439,7 +460,7 @@ impl Database {
                 .get(&path)
                 .is_some_and(|graph| graph.strong_count() != 0)
             {
-                waiting.push((*owner, *physical));
+                waiting.push((*owner, *generation, *physical));
                 continue;
             }
             if !manifest.resident {
@@ -481,6 +502,7 @@ impl Database {
     fn publish_copied_vector_owners(
         &self,
         table: &TableSchema,
+        previous: &TableSchema,
         shadow_id: u64,
         target_id: u64,
         _graphs: &[(String, Arc<VectorGraph>)],
@@ -492,6 +514,43 @@ impl Database {
             let mut manifest = self
                 .read_vector_manifest(table, index, shadow_id)?
                 .ok_or_else(vector::persistence::corrupt)?;
+            if let Some(old_index) = previous
+                .indexes
+                .iter()
+                .find(|old| old.index_id == index.index_id)
+            {
+                if let Some(old) = self.read_vector_manifest(previous, old_index, target_id)? {
+                    if old.resident == manifest.resident {
+                        for (owner, generation, physical) in old.retired {
+                            let mut path = self.vector_generation_path_at(
+                                index.index_id,
+                                owner,
+                                generation,
+                                physical,
+                            );
+                            if old.resident {
+                                path.set_extension("hnsw");
+                            }
+                            if path.try_exists().map_err(io_err)? {
+                                manifest.retired.push((owner, generation, physical));
+                            }
+                        }
+                        manifest.retired.push((
+                            old.physical_storage_id,
+                            old.generation,
+                            old.active,
+                        ));
+                        manifest.retired.sort_unstable();
+                        manifest.retired.dedup();
+                        if manifest.retired.len() > 64 {
+                            return Err(error(
+                                crate::error::catalog::ER_OUTOFMEMORY,
+                                "native vector retirement backlog exceeded its bound",
+                            ));
+                        }
+                    }
+                }
+            }
             manifest.storage_id = target_id;
             self.publish_vector_source_manifest(table, index, &manifest)?;
         }
@@ -505,7 +564,18 @@ impl Database {
         storage_id: u64,
         err: QueryError,
     ) -> QueryError {
-        if self.durability_mode() == DurabilityMode::Memory {
+        if self.durability_mode() == DurabilityMode::Memory
+            || self.mvcc_quarantined.load(Ordering::Acquire)
+            || Self::vector_maintenance_is_transient(&err)
+            || self.table_by_id(table.id).is_none_or(|current| {
+                current.active_generation != table.active_generation
+                    || !current.storage_ids().contains(&storage_id)
+                    || !current
+                        .indexes
+                        .iter()
+                        .any(|item| item.index_id == index.index_id)
+            })
+        {
             return err;
         }
         let path = self
@@ -741,17 +811,30 @@ impl Database {
         let tables = self.user_table_snapshots()?;
         let mut live = HashSet::new();
         for table in &tables {
+            for index in &table.indexes {
+                for sid in table.storage_ids() {
+                    live.insert(self.index_path_for_table_schema(table, sid, &index.name));
+                }
+            }
             for index in table.indexes.iter().filter(|index| index.is_vector()) {
                 for storage_id in table.storage_ids() {
                     let Some(manifest) = self.read_vector_manifest(table, index, storage_id)?
                     else {
                         continue;
                     };
-                    for (owner, physical) in
-                        std::iter::once((manifest.physical_storage_id, manifest.active))
-                            .chain(manifest.retired)
+                    for (owner, generation, physical) in std::iter::once((
+                        manifest.physical_storage_id,
+                        manifest.generation,
+                        manifest.active,
+                    ))
+                    .chain(manifest.retired)
                     {
-                        let mut path = self.vector_generation_path(table, index, owner, physical);
+                        let mut path = self.vector_generation_path_at(
+                            index.index_id,
+                            owner,
+                            generation,
+                            physical,
+                        );
                         if manifest.resident {
                             path.set_extension("hnsw");
                         }
@@ -797,7 +880,14 @@ impl Database {
                             id.parse::<u64>().is_ok()
                                 && matches!(suffix, "hvec" | "hnsw" | "hvec.vpub" | "hnsw.vpub")
                         });
-                if !in_generation_directory || !generated || live.contains(&path) {
+                let orphan_index = path.extension().is_some_and(|ext| ext == "idx")
+                    && path
+                        .file_stem()
+                        .and_then(|id| id.to_str())
+                        .is_some_and(|id| id.parse::<u64>().is_ok());
+                if (!(in_generation_directory && generated) && !orphan_index)
+                    || live.contains(&path)
+                {
                     continue;
                 }
                 let lsn = self.append_wal(

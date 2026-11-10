@@ -198,3 +198,28 @@ fn audit_bug2_inplace_update_returns_updated_neighbor() {
         "control: exact navigation must surface the updated row, got {exact_top5:?}"
     );
 }
+
+#[test]
+fn vector_release_cold_duplicate_run_keeps_nonduplicate_neighborhoods() {
+    let mut vectors = vec![vec![0.5; 8]; 1000];
+    vectors.extend(gen_vectors(600, 8, 0x1109));
+    let index = HnswIndex::new(Metric::L2, 8, 100);
+    for (id, vector) in vectors.iter().enumerate() {
+        index.append_node(rid(id as u32), vector.clone()).unwrap();
+    }
+    index.link_all(4);
+    let mut hits = 0;
+    for id in (1000..1600).step_by(20) {
+        let actual = index.search(&vectors[id], 10, 256);
+        let expected = brute_topk(&vectors, &vectors[id], 10);
+        hits += actual
+            .iter()
+            .filter(|(row, _)| expected.contains(&(row.page_id as usize)))
+            .count();
+    }
+    assert!(
+        hits >= 270,
+        "cold duplicate graph recall={}",
+        hits as f64 / 300.0
+    );
+}

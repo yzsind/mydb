@@ -239,8 +239,10 @@ pub(crate) fn to_f64(value: Value) -> Result<f64, QueryError> {
                 "incorrect numeric value",
             )
         }),
-        Value::DecimalCompact(mag, scale) => Ok(mag as f64 / 10f64.powi(scale as i32)),
-        Value::Decimal128(mag, scale) => Ok(mag as f64 / 10f64.powi(scale as i32)),
+        Value::DecimalCompact(mag, scale) => {
+            Ok(crate::util::decimal::parts_to_f64(mag as i128, scale))
+        }
+        Value::Decimal128(mag, scale) => Ok(crate::util::decimal::parts_to_f64(mag as i128, scale)),
         Value::DecimalWide(value) => {
             crate::util::decimal::format_big_decimal_parts(&value.magnitude, value.scale)
                 .parse::<f64>()
@@ -298,8 +300,10 @@ fn numeric_stat_value(value: &Value) -> f64 {
         Value::Float(v) => *v as f64,
         Value::Double(v) => *v,
         Value::Decimal(v) => v.parse().unwrap_or(0.0),
-        Value::DecimalCompact(mag, scale) => *mag as f64 / 10f64.powi(*scale as i32),
-        Value::Decimal128(mag, scale) => *mag as f64 / 10f64.powi(*scale as i32),
+        Value::DecimalCompact(mag, scale) => {
+            crate::util::decimal::parts_to_f64(*mag as i128, *scale)
+        }
+        Value::Decimal128(mag, scale) => crate::util::decimal::parts_to_f64(*mag as i128, *scale),
         Value::DecimalWide(value) => {
             crate::util::decimal::format_big_decimal_parts(&value.magnitude, value.scale)
                 .parse::<f64>()

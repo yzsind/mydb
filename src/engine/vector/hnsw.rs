@@ -321,6 +321,8 @@ pub(crate) struct CompactHnswStats {
     dim: usize,
     vmin: f32,
     vmax: f32,
+    means: Vec<f64>,
+    deviations: Vec<f64>,
     valid: bool,
 }
 
@@ -332,6 +334,8 @@ impl CompactHnswStats {
             dim: 0,
             vmin: f32::INFINITY,
             vmax: f32::NEG_INFINITY,
+            means: Vec::new(),
+            deviations: Vec::new(),
             valid: metric != Metric::Dot,
         }
     }
@@ -342,6 +346,8 @@ impl CompactHnswStats {
         }
         if self.dim == 0 {
             self.dim = vector.len();
+            self.means.resize(self.dim, 0.0);
+            self.deviations.resize(self.dim, 0.0);
         } else if self.dim != vector.len() {
             self.valid = false;
             return;
@@ -352,7 +358,7 @@ impl CompactHnswStats {
             1.0
         };
         let inv_norm = if norm > 0.0 { norm.recip() } else { 1.0 };
-        for &x in vector {
+        for (i, &x) in vector.iter().enumerate() {
             let x = (x as f64 * inv_norm) as f32;
             if !x.is_finite() {
                 self.valid = false;
@@ -360,6 +366,9 @@ impl CompactHnswStats {
             }
             self.vmin = self.vmin.min(x);
             self.vmax = self.vmax.max(x);
+            let delta = x as f64 - self.means[i];
+            self.means[i] += delta / (self.rows + 1) as f64;
+            self.deviations[i] += delta * (x as f64 - self.means[i]);
         }
         self.rows += 1;
     }
@@ -379,6 +388,16 @@ impl CompactHnswStats {
             && self.vmin.is_finite()
             && self.vmax.is_finite()
             && self.vmax > self.vmin
+            && self
+                .deviations
+                .iter()
+                .filter(|&&variance| variance > 0.0)
+                .all(|&variance| {
+                    // A global code step must resolve the spread on every varying
+                    // axis. Outliers and mixed units otherwise erase neighborhoods.
+                    (self.vmax as f64 - self.vmin as f64) / 254.0
+                        <= (variance / self.rows as f64).sqrt() * 0.125
+                })
     }
 
     /// Global SQ8 parameters derived from the complete first-pass range.
@@ -2423,10 +2442,7 @@ impl HnswIndex {
                         if d >= furthest {
                             // Equal-distance hops can lead out of a coincident
                             // coordinate component without entering the ef pool.
-                            if explore_ties
-                                && d == furthest
-                                && (d != 0.0 || self.metric == Metric::Dot)
-                            {
+                            if explore_ties && d == furthest {
                                 scratch.frontier.push(Reverse(s));
                             }
                             continue;
@@ -2705,6 +2721,16 @@ impl HnswIndex {
                     let dl = &mut nd[level];
                     dl.push(dist);
                     if layer.len() > m + aux.nav_slack {
+                        // A coincident run must not evict every bridge to a
+                        // different coordinate while the graph is navigated.
+                        // Keep one coincident edge and spend excess duplicate
+                        // slots before applying the ordinary farthest rule.
+                        let duplicate = if self.metric != Metric::Dot {
+                            let mut zeros = dl.iter().enumerate().filter(|(_, d)| **d == 0.0);
+                            zeros.next().and_then(|_| zeros.next()).map(|(i, _)| i)
+                        } else {
+                            None
+                        };
                         let mut worst_i = 0usize;
                         let mut worst_d = f64::NEG_INFINITY;
                         for (i, &d) in dl.iter().enumerate() {
@@ -2712,6 +2738,9 @@ impl HnswIndex {
                                 worst_d = d;
                                 worst_i = i;
                             }
+                        }
+                        if let Some(duplicate) = duplicate {
+                            worst_i = duplicate;
                         }
                         dl.swap_remove(worst_i);
                         Some(layer.swap_remove(worst_i))
@@ -3967,6 +3996,21 @@ mod tests {
             .live
             .store(vectors.len(), std::sync::atomic::Ordering::Release);
         searchable
+    }
+
+    #[test]
+    fn vector_release_sq8_rejects_resolution_erasing_outliers_and_mixed_units() {
+        let mut healthy = CompactHnswStats::new(Metric::L2);
+        let mut scaled = CompactHnswStats::new(Metric::L2);
+        for i in 0..12000 {
+            let v = [(i % 101) as f32 / 50.0 - 1.0, (i % 97) as f32 / 48.0 - 1.0];
+            healthy.observe(&v);
+            scaled.observe(&[v[0] * 1000.0, v[1]]);
+        }
+        assert!(healthy.quantization_params().is_some());
+        assert!(scaled.quantization_params().is_none());
+        healthy.observe(&[1e6, 1e6]);
+        assert!(healthy.quantization_params().is_none());
     }
 
     #[test]

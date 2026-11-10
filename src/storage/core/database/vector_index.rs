@@ -943,7 +943,7 @@ impl Database {
         if table.row_generation_txn_id != 0 {
             txn.txn_id = table.row_generation_txn_id;
         }
-        self.vector_snapshot_floor
+        self.vector_table_snapshot_floor(table.id)
             .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
         let requested = index
             .vector
@@ -1171,7 +1171,7 @@ impl Database {
         if table.row_generation_txn_id != 0 {
             txn.txn_id = table.row_generation_txn_id;
         }
-        self.vector_snapshot_floor
+        self.vector_table_snapshot_floor(table.id)
             .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
         let requested = index
             .vector
@@ -1669,21 +1669,72 @@ impl Database {
             let mut received = 0;
             let mut worker = 0;
             let mut batch = Vec::new().into_iter();
+            let mut pending = None;
+            let mut fetched = HashSet::new();
+            let mut reorder_charge = ControlledMemoryCharge::try_new_recoverable(
+                ControlledMemoryCategory::StorageScratch,
+                0,
+            )?;
             let mut next = |id: usize| -> Result<crate::vector::VectorValue, QueryError> {
                 crate::engine::cancel::check_cancelled()?;
-                if batch.len() == 0 {
-                    batch = outputs[worker]
-                        .recv()
-                        .map_err(|_| vector::vector_err("HNSW materialization scan ended early"))??
-                        .into_iter();
-                    worker = (worker + 1) % threads;
+                if id != received {
+                    return Err(vector::vector_err("HNSW materialization ordinal changed"));
                 }
-                let (row, value) = batch
-                    .next()
-                    .ok_or_else(|| vector::vector_err("empty HNSW materialization batch"))?;
-                if id != received || row != graph.row(id) {
-                    return Err(vector::vector_err("HNSW materialization input changed"));
+                // Keep the sequential scan/parallel encoder for ordinary builds.
+                // MVCC may move a row to the deferred tail between passes. Only
+                // displaced rows need point reads; their later scan copies are
+                // discarded under the same bounded, governed reservation.
+                while pending.is_none() {
+                    if batch.len() == 0 {
+                        batch = outputs[worker]
+                            .recv()
+                            .map_err(|_| {
+                                vector::vector_err("HNSW materialization scan ended early")
+                            })??
+                            .into_iter();
+                        worker = (worker + 1) % threads;
+                    }
+                    let item = batch
+                        .next()
+                        .ok_or_else(|| vector::vector_err("empty HNSW materialization batch"))?;
+                    if !fetched.remove(&item.0) {
+                        pending = Some(item);
+                    }
                 }
+                let expected = graph.row(id);
+                let value = if pending.as_ref().unwrap().0 == expected {
+                    pending.take().unwrap().1
+                } else {
+                    let values = self
+                        .read_row_columns_at(storage_id, table, expected, txn, &[col])?
+                        .ok_or_else(|| {
+                            vector::vector_err("HNSW materialization row disappeared")
+                        })?;
+                    let Some(Value::Vector(value)) = values.into_iter().next() else {
+                        return Err(vector::vector_err(
+                            "HNSW materialization vector disappeared",
+                        ));
+                    };
+                    reorder_charge.try_grow_recoverable(64)?;
+                    fetched.try_reserve(1).map_err(|_| {
+                        error(
+                            crate::error::catalog::ER_OUTOFMEMORY,
+                            "HNSW materialization reorder allocation failed",
+                        )
+                    })?;
+                    fetched.insert(expected);
+                    if let Some(q) = quantizer {
+                        let encoded = q.store_with_reserved_scratch(&value, None)?;
+                        if encoded.payload.first() != Some(&0) {
+                            return Err(vector::vector_err(
+                                "HNSW bulk input requires a lossless quantization exception",
+                            ));
+                        }
+                        encoded
+                    } else {
+                        value
+                    }
+                };
                 received += 1;
                 Ok(value)
             };
@@ -1714,6 +1765,31 @@ impl Database {
                 )
                 .map(|_| Vec::new())
             };
+            drop(next);
+            let drain_result = (|| -> Result<(), QueryError> {
+                if result.is_err() {
+                    return Ok(());
+                }
+                while !fetched.is_empty() {
+                    crate::engine::cancel::check_cancelled()?;
+                    if batch.len() == 0 {
+                        batch = outputs[worker]
+                            .recv()
+                            .map_err(|_| {
+                                vector::vector_err("HNSW deferred materialization scan ended early")
+                            })??
+                            .into_iter();
+                        worker = (worker + 1) % threads;
+                    }
+                    let (row, _) = batch.next().ok_or_else(|| {
+                        vector::vector_err("empty HNSW deferred materialization batch")
+                    })?;
+                    if !fetched.remove(&row) {
+                        return Err(vector::vector_err("HNSW materialization input changed"));
+                    }
+                }
+                Ok(())
+            })();
             drop(outputs);
             let scanned = scanner
                 .join()
@@ -1727,6 +1803,7 @@ impl Database {
             }
             let scanned = scanned??;
             let vids = result?;
+            drain_result?;
             if scanned != graph.len() || received != graph.len() {
                 return Err(vector::vector_err("HNSW materialization row count changed"));
             }
@@ -1760,7 +1837,7 @@ impl Database {
         if table.row_generation_txn_id != 0 {
             txn.txn_id = table.row_generation_txn_id;
         }
-        self.vector_snapshot_floor
+        self.vector_table_snapshot_floor(table.id)
             .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
 
         paged.file().advance_coverage(txn.snapshot_scn);
@@ -2370,7 +2447,7 @@ impl Database {
         if table.row_generation_txn_id != 0 {
             txn.txn_id = table.row_generation_txn_id;
         }
-        self.vector_snapshot_floor
+        self.vector_table_snapshot_floor(table.id)
             .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
 
         // Two-phase cold build vs incremental catch-up. A fresh graph (no nodes
@@ -2640,42 +2717,43 @@ impl Database {
         }
         let group_size = units.len().div_ceil(workers);
         let per_worker = (bytes / workers / PAGE_SIZE).max(1) * PAGE_SIZE;
-        let partials: Vec<Result<BruteTopK, QueryError>> = crate::util::thread_spawn::scope(|scope| {
-            let mut handles = Vec::new();
-            for group in units.chunks(group_size) {
-                let mut charge = envelope.split(per_worker);
-                let cols_ref = &cols;
-                handles.push(scope.spawn(move || -> Result<BruteTopK, QueryError> {
-                    let mut top = BruteTopK::new(k);
-                    for &(sid, lo, hi) in group {
-                        self.vector_brute_scan_range(
-                            table,
-                            txn,
-                            cols_ref,
-                            query,
-                            metric,
-                            sid,
-                            lo,
-                            hi,
-                            &mut charge,
-                            &mut top,
-                        )?;
-                    }
-                    Ok(top)
-                }));
-            }
-            handles
-                .into_iter()
-                .map(|handle| {
-                    handle.join().unwrap_or_else(|_| {
-                        Err(error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "brute KNN worker panicked",
-                        ))
+        let partials: Vec<Result<BruteTopK, QueryError>> =
+            crate::util::thread_spawn::scope(|scope| {
+                let mut handles = Vec::new();
+                for group in units.chunks(group_size) {
+                    let mut charge = envelope.split(per_worker);
+                    let cols_ref = &cols;
+                    handles.push(scope.spawn(move || -> Result<BruteTopK, QueryError> {
+                        let mut top = BruteTopK::new(k);
+                        for &(sid, lo, hi) in group {
+                            self.vector_brute_scan_range(
+                                table,
+                                txn,
+                                cols_ref,
+                                query,
+                                metric,
+                                sid,
+                                lo,
+                                hi,
+                                &mut charge,
+                                &mut top,
+                            )?;
+                        }
+                        Ok(top)
+                    }));
+                }
+                handles
+                    .into_iter()
+                    .map(|handle| {
+                        handle.join().unwrap_or_else(|_| {
+                            Err(error(
+                                crate::error::catalog::ER_GET_ERRNO,
+                                "brute KNN worker panicked",
+                            ))
+                        })
                     })
-                })
-                .collect()
-        });
+                    .collect()
+            });
 
         let mut merged = BruteTopK::new(k);
         for partial in partials {
@@ -2846,7 +2924,7 @@ impl Database {
         // visible version via undo and score it. Rare on a read-mostly KNN
         // workload, so the per-row `Vec<Value>` here is not on the hot path.
         for rid in deferred {
-            if let Some(values) = self.read_row_columns(table, rid, txn, cols)? {
+            if let Some(values) = self.read_row_columns_at(storage_id, table, rid, txn, cols)? {
                 let key = match values.first() {
                     Some(Value::Vector(b)) if b.dimension == query.dimension => {
                         vector::distance::typed_ordering_distance(query, b, metric)?
@@ -3121,7 +3199,7 @@ impl Database {
             )?;
             graph.prepare_query_navigation()?;
             if applied != 0 {
-                self.vector_snapshot_floor.fetch_max(
+                self.vector_table_snapshot_floor(table.id).fetch_max(
                     self.next_scn_atomic
                         .load(Ordering::Acquire)
                         .saturating_sub(1),
@@ -3267,13 +3345,7 @@ impl Database {
                         "vector index build failed for {}.{} / {} (storage_id={}): ",
                         table.database, table.name, index.name, sid
                     );
-                    if e.is(crate::error::catalog::ER_OUTOFMEMORY) {
-                        return Err(e.map_message(|message| format!("{context}{message}")));
-                    }
-                    return Err(error(
-                        crate::error::catalog::ER_GET_ERRNO,
-                        format!("{context}{}", e.message()),
-                    ));
+                    return Err(e.map_message(|message| format!("{context}{message}")));
                 }
             }
         }
@@ -3303,12 +3375,50 @@ impl Database {
     }
 
     /// Current graph ordering/cold coverage is unsuitable for an older view.
-    pub(crate) fn vector_snapshot_requires_exact(&self, txn: TxnView) -> bool {
+    fn vector_table_snapshot_floor(&self, table_id: u64) -> Arc<AtomicU64> {
+        if let Some(floor) = self.vector_table_snapshot_floors.read().get(&table_id) {
+            return Arc::clone(floor);
+        }
+        Arc::clone(
+            self.vector_table_snapshot_floors
+                .write()
+                .entry(table_id)
+                .or_insert_with(|| Arc::new(AtomicU64::new(0))),
+        )
+    }
+
+    pub(crate) fn vector_table_has_prepared_writes(&self, table: &TableSchema) -> bool {
+        if self.xa_prepared_active.load(Ordering::Acquire) == 0 {
+            return false;
+        }
+        let storage = table.storage_ids();
+        self.prepared_xa.read().values().any(|prepared| {
+            self.table_locks_sharded
+                .tables_for_txn(prepared.txn_id)
+                .iter()
+                .any(|(id, mode)| {
+                    (*id == table.id || storage.contains(id))
+                        && matches!(
+                            mode,
+                            TableLockMode::IntentExclusive
+                                | TableLockMode::ShareIntentExclusive
+                                | TableLockMode::Exclusive
+                        )
+                })
+        })
+    }
+
+    pub(crate) fn vector_snapshot_requires_exact(&self, table: &TableSchema, txn: TxnView) -> bool {
         txn.historical
             || txn.snapshot_scn
                 < self
                     .vector_snapshot_floor
                     .load(std::sync::atomic::Ordering::Acquire)
+            || self
+                .vector_table_snapshot_floors
+                .read()
+                .get(&table.id)
+                .is_some_and(|floor| txn.snapshot_scn < floor.load(Ordering::Acquire))
     }
 
     /// Per-partition k-nearest-neighbour candidate search. Returns
@@ -3509,7 +3619,7 @@ impl Database {
             // Cold-build replay also changes positions relative to old views.
             // Publish the floor even when no shared graph exists yet.
             if changed {
-                self.vector_snapshot_floor
+                self.vector_table_snapshot_floor(table.id)
                     .fetch_max(retire.commit_scn, std::sync::atomic::Ordering::AcqRel);
             }
             if changed {
@@ -3626,7 +3736,7 @@ impl Database {
                             )
                         })
                     } else {
-                        self.vector_snapshot_floor
+                        self.vector_table_snapshot_floor(table.id)
                             .fetch_max(retire.commit_scn, std::sync::atomic::Ordering::AcqRel);
                         graph.mark_deleted_by_row_id(row_id).map(|_| ())
                     };
@@ -3635,13 +3745,20 @@ impl Database {
                     })?;
                 }
                 None => {
-                    self.vector_snapshot_floor
+                    self.vector_table_snapshot_floor(table.id)
                         .fetch_max(retire.commit_scn, std::sync::atomic::Ordering::AcqRel);
                 }
             }
         }
         drop(map);
         Ok(())
+    }
+
+    fn vector_maintenance_is_transient(err: &QueryError) -> bool {
+        err.is(crate::error::catalog::ER_QUERY_INTERRUPTED)
+            || err.is(crate::error::catalog::ER_QUERY_TIMEOUT)
+            || err.is(crate::error::catalog::ER_OUTOFMEMORY)
+            || err.is(crate::error::catalog::ER_DISK_FULL_NOWAIT)
     }
 
     fn vector_maintenance_error(
@@ -3652,11 +3769,29 @@ impl Database {
         stage: &str,
         err: QueryError,
     ) -> QueryError {
+        // A stale maintenance handle must never poison a replacement table.
+        // Existing fail-stop state is recovered from WAL, not a new permanent
+        // index-corruption fence produced while unwinding another failure.
+        if self.mvcc_quarantined.load(Ordering::Acquire)
+            || self.table_by_id(table.id).is_none_or(|current| {
+                current.active_generation != table.active_generation
+                    || !current.storage_ids().contains(&storage_id)
+                    || !current
+                        .indexes
+                        .iter()
+                        .any(|item| item.index_id == index.index_id)
+            })
+        {
+            return err;
+        }
         let message = format!(
             "vector index maintenance failed: table={} index_id={} storage_id={} generation={} stage={stage}: {}",
             table.id, index.index_id, storage_id, table.active_generation.max(1), err.message()
         );
         self.quarantine_mvcc(message.clone());
+        if Self::vector_maintenance_is_transient(&err) {
+            return err.map_message(|_| message);
+        }
         if self.durability_mode() != DurabilityMode::Memory {
             let path = self
                 .vector_index_paged_path(table, &index.name, storage_id)
@@ -3983,6 +4118,7 @@ impl Database {
     /// compaction; with nothing queued it costs one atomic load.
     pub(crate) fn drain_vector_purges(&self) -> usize {
         if self.physical_replica_mode()
+            || self.mvcc_quarantined.load(Ordering::Acquire)
             || self.is_snapshot_read_only()
             || self.open_mode == DatabaseOpenMode::SealBaseline
             || self.vector_purges_pending.load(Ordering::Acquire) == 0
@@ -4309,6 +4445,17 @@ impl Database {
         self.vector_indexes.write().retain(|(tid, _, _, _), graph| {
             let keep = *tid != table_id;
             if !keep {
+                let file = match graph.as_ref() {
+                    VectorGraph::NativeHnsw(native) => native.file(),
+                    VectorGraph::NativeIvf(native) => native.file(),
+                    VectorGraph::Paged(paged) => Some(paged.file()),
+                    _ => None,
+                };
+                if let Some(file) = file {
+                    self.vector_retired_graphs
+                        .lock()
+                        .insert(file.persistent_path().to_path_buf(), Arc::downgrade(graph));
+                }
                 graph.invalidate();
             }
             keep
@@ -4609,15 +4756,15 @@ impl Database {
             // Successful retirement need not rewrite this same manifest. The
             // next publication drops completed obligations after checking the
             // files; failures still propagate and the active identity is fixed.
-            for &(owner, physical) in &old.retired {
+            for &(owner, generation, physical) in &old.retired {
                 let path = self
-                    .vector_generation_path(table, index, owner, physical)
+                    .vector_generation_path_at(index.index_id, owner, generation, physical)
                     .with_extension("hnsw");
                 if path.try_exists()? {
-                    retired.push((owner, physical));
+                    retired.push((owner, generation, physical));
                 }
             }
-            retired.push((old.physical_storage_id, old.active));
+            retired.push((old.physical_storage_id, old.generation, old.active));
         }
         let active = final_path
             .file_stem()

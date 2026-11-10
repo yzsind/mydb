@@ -1638,7 +1638,7 @@ impl NativeHnsw {
             Option<super::quantization::QuantQuery>,
             Option<ExactProbe>,
         )> = None;
-        let selected = hnsw_core::select_diverse_by(
+        let selected = hnsw_core::select_diverse_ties_by(
             candidates.iter().copied(),
             maximum,
             |candidate, previous| {
@@ -1650,20 +1650,22 @@ impl NativeHnsw {
                     let exact = self.prepare_exact_probe(&value);
                     cached = Some((candidate.id, value, prepared, exact));
                 }
-                Ok::<_, QueryError>(
-                    self.navigation_score(
-                        state,
-                        previous.id,
-                        &cached.as_ref().unwrap().1,
-                        cached.as_ref().unwrap().2.as_ref(),
-                        cached
-                            .as_ref()
-                            .unwrap()
-                            .3
-                            .as_ref()
-                            .map(|probe| &probe.distance),
-                    )? < candidate.dist,
-                )
+                let pair = self.navigation_score(
+                    state,
+                    previous.id,
+                    &cached.as_ref().unwrap().1,
+                    cached.as_ref().unwrap().2.as_ref(),
+                    cached
+                        .as_ref()
+                        .unwrap()
+                        .3
+                        .as_ref()
+                        .map(|probe| &probe.distance),
+                )?;
+                Ok::<_, QueryError>((
+                    pair < candidate.dist,
+                    self.metric != Metric::Dot && pair == 0.0,
+                ))
             },
         )?;
         Ok(selected.into_iter().map(|s| s.id).collect())

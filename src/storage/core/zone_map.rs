@@ -21,10 +21,10 @@ const ZONE_MAP_DELTA_V3_MAGIC: &[u8; 4] = b"ZMD3";
 #[cfg(test)]
 const ZONE_MAP_DELTA_V4_MAGIC: &[u8; 4] = b"ZMD4";
 pub(crate) use crate::storage::format_versions::ZONE_MAP_VERSION;
-// Semantic v5 fixes prefix completeness and MVCC membership publication.
+// Semantic v6 truncates canonical weights instead of input characters.
 // Older summaries may already contain false-negative bounds; invalidate them
 // through the schema fingerprint even though sidecar framing is unchanged.
-const ZONE_MAP_SEMANTIC_VERSION: u32 = 5;
+const ZONE_MAP_SEMANTIC_VERSION: u32 = 6;
 #[cfg(test)]
 const ZONE_MAP_LZ4_MIN_BYTES: usize = 4096;
 #[cfg(test)]
@@ -32,6 +32,7 @@ const ZONE_MAP_LZ4_SAVINGS_NUMERATOR: usize = 7;
 #[cfg(test)]
 const ZONE_MAP_LZ4_SAVINGS_DENOMINATOR: usize = 8;
 const ZONE_STRING_PREFIX_CHARS: usize = 16;
+const ZONE_TEXT_PREFIX_BYTES: usize = 64;
 /// Membership summaries complement min/max on physically unclustered
 /// columns.  A zone starts with a tiny exact fingerprint set and promotes to
 /// a fixed-size Bloom filter once its local NDV grows beyond the inline cap.
@@ -934,25 +935,6 @@ impl ZoneMembershipHasher {
 #[cfg(test)]
 mod zone_numeric_hash_tests {
     use super::*;
-
-    #[test]
-    fn short_text_prefix_matches_character_oracle_at_unicode_boundaries() {
-        for ascii_count in 0..40 {
-            for suffix in [
-                "",
-                "é中文😀",
-                "\0ABCDEFGHIJKLMNOPQRSTUVWXYZ",
-                "ßééééééééééééééééé",
-            ] {
-                let value = format!("{}{suffix}", "x".repeat(ascii_count));
-                let expected = value
-                    .chars()
-                    .take(ZONE_STRING_PREFIX_CHARS)
-                    .collect::<String>();
-                assert_eq!(zone_text_prefix_slice_normalized(&value), expected);
-            }
-        }
-    }
 
     #[test]
     fn folded_zero_bytes_preserve_every_numeric_hash_byte() {
@@ -2860,10 +2842,8 @@ fn compare_value_to_worker(
             WorkerScalar::TextWeight { weight, .. },
         ) => {
             text_scratch.clear();
-            crate::charset::collation_key_by_id_into(
-                collation_id,
-                zone_text_prefix_slice(text, collation_id),
-                text_scratch,
+            crate::charset::collation_key_prefix_by_id_into(
+                collation_id, text, ZONE_TEXT_PREFIX_BYTES, text_scratch,
             );
             Ok(Some(text_scratch[..].cmp(&weight[..])))
         }
@@ -2874,10 +2854,8 @@ fn compare_value_to_worker(
         ) => match std::str::from_utf8(bytes.as_slice()) {
             Ok(text) => {
                 text_scratch.clear();
-                crate::charset::collation_key_by_id_into(
-                    collation_id,
-                    zone_text_prefix_slice(text, collation_id),
-                    text_scratch,
+                crate::charset::collation_key_prefix_by_id_into(
+                    collation_id, text, ZONE_TEXT_PREFIX_BYTES, text_scratch,
                 );
                 Ok(Some(text_scratch[..].cmp(&weight[..])))
             }
@@ -2960,30 +2938,12 @@ fn worker_scalar_from_value(
             })
         }
         (Char { .. } | VarChar { .. } | Enum { .. } | Set { .. }, Value::String(text)) => {
-            let prefix = zone_text_prefix_slice(text, collation_id);
-            let normalized = if crate::charset::resolve_collation_id(collation_id)
-                .is_some_and(|info| info.pad_space)
-            {
-                crate::util::pad_space::pad_space_trim_end_str(text)
-            } else {
-                text
-            };
-            let truncated = prefix.len() < normalized.len();
-            let weight = crate::charset::collation_key_by_id(collation_id, prefix);
+            let (weight, truncated) = zone_text_weight(text, collation_id);
             Some(WorkerScalar::TextWeight { weight, truncated })
         }
         (Char { .. } | VarChar { .. } | Enum { .. } | Set { .. }, Value::SmallString(bytes)) => {
             let text = std::str::from_utf8(bytes.as_slice()).ok()?;
-            let prefix = zone_text_prefix_slice(text, collation_id);
-            let normalized = if crate::charset::resolve_collation_id(collation_id)
-                .is_some_and(|info| info.pad_space)
-            {
-                crate::util::pad_space::pad_space_trim_end_str(text)
-            } else {
-                text
-            };
-            let truncated = prefix.len() < normalized.len();
-            let weight = crate::charset::collation_key_by_id(collation_id, prefix);
+            let (weight, truncated) = zone_text_weight(text, collation_id);
             Some(WorkerScalar::TextWeight { weight, truncated })
         }
         _ => None,
@@ -2994,16 +2954,7 @@ fn worker_scalar_from_value(
 /// weight. Interior values must contribute this bit even if neither endpoint
 /// changes; otherwise a singleton prefix can masquerade as one exact value.
 fn zone_value_prefix_truncated(value: &Value, collation_id: u16) -> bool {
-    let text_truncated = |text: &str| {
-        let normalized = if crate::charset::resolve_collation_id(collation_id)
-            .is_some_and(|info| info.pad_space)
-        {
-            crate::util::pad_space::pad_space_trim_end_str(text)
-        } else {
-            text
-        };
-        zone_text_prefix_slice_normalized(normalized).len() < normalized.len()
-    };
+    let text_truncated = |text: &str| zone_text_weight(text, collation_id).1;
     match value {
         Value::Bytes(bytes) => bytes.len() > ZONE_STRING_PREFIX_CHARS,
         Value::String(text) => text_truncated(text),
@@ -3247,21 +3198,11 @@ impl ZoneMapWorkerColumn {
         if value.is_none_or(|value| matches!(value, Value::Null)) {
             return 0;
         }
-        let text_peak = |text: &str| {
-            let prefix = zone_text_prefix_slice(text, self.collation_id);
-            // ASCII weights are a prefix copy. General Unicode normalization
-            // has bounded expansion for a 16-character prefix; keep one
-            // column's temporary headroom, not a schema-wide bitmap reserve.
-            let weight = if prefix.is_ascii() {
-                prefix.len()
-            } else {
-                PAGE_SIZE
-            };
+        let text_peak = |_text: &str| {
+            let weight = ZONE_TEXT_PREFIX_BYTES + 1;
             let scratch = if weight > scratch_capacity {
                 weight.max(scratch_capacity.saturating_mul(2)).max(8)
-            } else {
-                0
-            };
+            } else { 0 };
             weight.saturating_mul(3).saturating_add(scratch)
         };
         let scalar = match value.expect("nonnull observation") {
@@ -5370,41 +5311,16 @@ mod paged_zone_map_handle_tests {
     }
 }
 
-/// Return a `&str` slice of the input text that (a) strips trailing spaces
-/// only for a PAD SPACE collation and (b) is truncated to at most
-/// `ZONE_STRING_PREFIX_CHARS` code
-/// points. Allocation-free — text_scalar / the WorkerScalar fast path use
-/// this in place of `chars().take(N).collect::<String>()`.
-fn zone_text_prefix_slice(text: &str, collation_id: u16) -> &str {
-    let normalized =
-        if crate::charset::resolve_collation_id(collation_id).is_some_and(|info| info.pad_space) {
-            crate::util::pad_space::pad_space_trim_end_str(text)
-        } else {
-            text
-        };
-    zone_text_prefix_slice_normalized(normalized)
-}
-
-#[inline]
-fn zone_text_prefix_slice_normalized(normalized: &str) -> &str {
-    // Byte length bounds code-point length, including non-ASCII short text.
-    if normalized.len() <= ZONE_STRING_PREFIX_CHARS {
-        return normalized;
-    }
-    let ascii_end = ZONE_STRING_PREFIX_CHARS;
-    if normalized.as_bytes()[..ascii_end].is_ascii() {
-        return &normalized[..ascii_end];
-    }
-    let mut end = normalized.len();
-    let mut count = 0;
-    for (idx, _) in normalized.char_indices() {
-        if count == ZONE_STRING_PREFIX_CHARS {
-            end = idx;
-            break;
-        }
-        count += 1;
-    }
-    &normalized[..end]
+/// Truncate canonical weights, never input characters: expansions, combining
+/// marks and ignorable characters must preserve SQL equality and ordering.
+fn zone_text_weight(text: &str, collation_id: u16) -> (Vec<u8>, bool) {
+    let mut weight = Vec::with_capacity(ZONE_TEXT_PREFIX_BYTES + 1);
+    crate::charset::collation_key_prefix_by_id_into(
+        collation_id, text, ZONE_TEXT_PREFIX_BYTES + 1, &mut weight,
+    );
+    let truncated = weight.len() > ZONE_TEXT_PREFIX_BYTES;
+    weight.truncate(ZONE_TEXT_PREFIX_BYTES);
+    (weight, truncated)
 }
 
 /// The scanner owns this scratch lease separately from any one column, so
@@ -5415,24 +5331,12 @@ fn write_zone_text_weight(
     scratch: &mut Vec<u8>,
     lease: &mut ZoneScratchLease,
 ) -> bool {
-    let bound = if prefix.is_ascii() {
-        prefix.len()
-    } else {
-        PAGE_SIZE
-    };
-    if lease.bytes() < scratch.capacity()
-        && lease.reserve(scratch.capacity() - lease.bytes()).is_err()
-    {
+    let bound = ZONE_TEXT_PREFIX_BYTES + 1;
+    if lease.bytes() < bound * 2 && lease.reserve(bound * 2 - lease.bytes()).is_err() {
         return false;
     }
-    if bound > scratch.capacity() {
-        // Include allocator growth's old/new overlap, but only for this one
-        // prefix. Large input strings are never copied into the sketch.
-        if lease.reserve(bound.saturating_mul(2).max(16)).is_err() {
-            return false;
-        }
-    }
-    crate::charset::collation_key_for_info_into(collation, prefix, scratch);
+    scratch.clear();
+    crate::charset::collation_key_prefix_by_id_into(collation.id, prefix, bound, scratch);
     if scratch.capacity() > lease.bytes() {
         *scratch = Vec::new();
         lease.shrink_to(0);
@@ -5452,8 +5356,6 @@ struct CachedZoneTextPrefix {
     raw: [u8; 32],
     len: u8,
     observed_truncations: u8,
-    hash: u64,
-    truncated_hash: u64,
 }
 
 /// Per-column running state shared between the LOAD path aggregator and
@@ -5849,8 +5751,7 @@ impl WorkerColumnState {
         } else {
             text
         };
-        let prefix = zone_text_prefix_slice_normalized(normalized);
-        let truncated = prefix.len() < normalized.len();
+        let prefix = normalized;
         let prefix_bytes = prefix.as_bytes();
         let cacheable = !self.text_weight_cache_saturated && prefix_bytes.len() <= 32;
         let hint_slot =
@@ -5870,38 +5771,15 @@ impl WorkerColumnState {
             .flatten();
         if let Some(cached) = cached {
             self.text_weight_cache_hint[hint_slot] = (cached + 1) as u8;
-            let observed_bit = 1 << u8::from(truncated);
-            if self.text_weight_cache[cached].observed_truncations & observed_bit != 0 {
-                return false;
-            }
-            // The identical zone prefix has already been fully observed, so
-            // its weight cannot extend either endpoint. Preserve the distinct
-            // truncated/non-truncated membership hashes, then skip the weight
-            // copy and both endpoint comparisons.
-            if self
-                .membership
-                .as_ref()
-                .is_some_and(|membership| !matches!(membership, ZoneMembership::Saturated))
-            {
-                let hash = if truncated {
-                    self.text_weight_cache[cached].truncated_hash
-                } else {
-                    self.text_weight_cache[cached].hash
-                };
-                if !self.insert_membership_hash(hash) {
-                    return true;
-                }
-            }
-            self.text_weight_cache[cached].observed_truncations |= observed_bit;
-            self.has_non_null = true;
-            self.state = ZoneMapState::Ready;
-            self.truncated |= truncated;
+            // The cache is keyed by the complete normalized input.
             return false;
         }
         if !write_zone_text_weight(collation, prefix, text_scratch, text_lease) {
             self.mark_unknown();
             return true;
         }
+        let truncated = text_scratch.len() > ZONE_TEXT_PREFIX_BYTES;
+        text_scratch.truncate(ZONE_TEXT_PREFIX_BYTES);
         let incoming = text_scratch.as_slice();
         let compare = |stored: &WorkerScalar| match stored {
             WorkerScalar::TextWeight { weight, .. } => Some(incoming.cmp(weight.as_slice())),
@@ -5959,8 +5837,6 @@ impl WorkerColumnState {
                 raw,
                 len: prefix_bytes.len() as u8,
                 observed_truncations: 1 << u8::from(truncated),
-                hash: zone_membership_hash_borrowed(7, text_scratch, false),
-                truncated_hash: zone_membership_hash_borrowed(7, text_scratch, true),
             });
         } else if cacheable {
             // High-cardinality text (for example lineitem.comment) gets
@@ -6875,23 +6751,9 @@ fn zone_scalar_physical(column: &ColumnSchema, value: &Value) -> Option<ZoneScal
 }
 
 fn text_scalar(column: &ColumnSchema, text: &str) -> Option<ZoneScalar> {
-    // Zone summaries are populated with `collation_key_by_id`; query bounds
-    // must use the identical representation. `WEIGHT_STRING()`'s SQL result
-    // encoder is intentionally presentation-oriented and is not byte-for-byte
-    // interchangeable with the internal collation key. Mixing the two makes
-    // a valid equality/IN bound appear outside [min,max], causing a false
-    // negative before the row evaluator sees the record.
     let collation_id =
         crate::charset::collation_id(column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"));
-    let normalized =
-        if crate::charset::resolve_collation_id(collation_id).is_some_and(|info| info.pad_space) {
-            crate::util::pad_space::pad_space_trim_end_str(text)
-        } else {
-            text
-        };
-    let prefix = zone_text_prefix_slice(text, collation_id);
-    let truncated = prefix.len() < normalized.len();
-    let weight = crate::charset::collation_key_by_id(collation_id, prefix);
+    let (weight, truncated) = zone_text_weight(text, collation_id);
     Some(ZoneScalar::Text { weight, truncated })
 }
 
@@ -7099,13 +6961,33 @@ fn like_prefix_zone_bounds(
         return Some((lower, upper));
     }
 
-    let bounded: String = prefix.chars().take(ZONE_STRING_PREFIX_CHARS).collect();
-    let lower = zone_like_scalar(column, &bounded)?;
-    let upper = crate::engine::expr::like_prefix_successor_for_collation(
-        &bounded,
-        column.collation.as_deref(),
-    )
-    .and_then(|value| zone_scalar(column, &value));
+    if !matches!(column.data_type, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. }
+        | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+        return None;
+    }
+    // LIKE matches characters rather than collation elements. A canonical
+    // prefix is safe only if adding a suffix cannot revise its weights.
+    // Accent/case-sensitive Unicode keys include level separators and NFC
+    // composition can revise the last character, so retain their SQL residual.
+    let id = crate::charset::collation_id(column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"));
+    let info = crate::charset::resolve_collation_id(id)?;
+    if !info.binary && info.case_sensitive {
+        return None;
+    }
+    let (weight, truncated) = zone_text_weight(prefix, id);
+    // PAD SPACE normalization can remove spaces that LIKE still observes;
+    // its lower bound is conservative, and the successor covers every suffix.
+    let mut upper_weight = weight.clone();
+    let upper = loop {
+        let Some(last) = upper_weight.last_mut() else { break None; };
+        if *last != u8::MAX {
+            *last += 1;
+            break Some(ZoneScalar::Text { weight: upper_weight, truncated: false });
+        }
+        upper_weight.pop();
+    };
+    let lower = ZoneScalar::Text { weight, truncated };
+
     Some((lower, upper))
 }
 
@@ -7311,6 +7193,20 @@ fn compile_zone_member_comparison(
     })
 }
 
+fn zone_comparison_compatible(table: &TableSchema, column: &ColumnSchema, operands: &[&Expr]) -> bool {
+    if matches!(column.data_type, DataTypeKind::Timestamp { .. })
+        && !crate::engine::expr::session_time_zone_is_fixed() {
+        return false;
+    }
+    if matches!(column.data_type, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. }
+        | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+        let id = crate::charset::collation_id(column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"));
+        return crate::engine::expr::aggregate_expr_collations(operands.iter().copied(), table, "comparison")
+            .ok().flatten() == Some(id);
+    }
+    true
+}
+
 fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredicateProgram> {
     use crate::parser::BinaryOp;
     match expr {
@@ -7374,6 +7270,7 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             } else {
                 return None;
             };
+            if !zone_comparison_compatible(table, column, &[left, right]) { return None; }
             if matches!(
                 column.data_type,
                 DataTypeKind::DateTime { .. } | DataTypeKind::Timestamp { .. }
@@ -7428,6 +7325,7 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             negated: false,
         } => {
             let column = expr_column(table, expr)?;
+            if !zone_comparison_compatible(table, column, &[expr, low, high]) { return None; }
             Some(ZonePredicateProgram::Between {
                 column_id: column.column_id,
                 low: zone_query_scalar(column, &literal_value(low)?)?,
@@ -7440,6 +7338,8 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             negated: false,
         } => {
             let column = expr_column(table, expr)?;
+            let operands: Vec<&Expr> = std::iter::once(expr.as_ref()).chain(list.iter()).collect();
+            if !zone_comparison_compatible(table, column, &operands) { return None; }
             let mut values = Vec::with_capacity(list.len());
             for item in list {
                 let value = literal_value(item)?;
@@ -7463,6 +7363,10 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             escape_char,
         } => {
             let column = expr_column(table, expr)?;
+            if !zone_comparison_compatible(table, column, &[expr, pattern]) { return None; }
+            if !matches!(column.data_type, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. }
+                | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }
+                | DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. }) { return None; }
             let value = literal_value(pattern)?;
             let pattern = match value {
                 Value::String(s) | Value::Decimal(s) => s,
@@ -8133,6 +8037,10 @@ impl Database {
         row_ids: &[RowId],
         rows: &[Vec<Value>],
     ) -> Result<(), QueryError> {
+        #[cfg(test)]
+        if TEST_INSERT_ZONE_FAILURE.get() == Some(storage_id) {
+            return Err(crate::error::catalog::ER_GET_ERRNO.error("injected zone merge failure"));
+        }
         let _zone_operation = self.zone_map_gate.read_recursive();
         if !self.zone_map_enabled() {
             return self.queue_zone_map_invalidation(txn_id, storage_id, row_ids.is_empty());
@@ -11515,19 +11423,13 @@ mod zone_map_tests {
             generated_expr_ast: None,
             generated_program: None,
         };
-        let scalar = zone_scalar(&column, &Value::String("abcdefghijklmnopq".into())).unwrap();
-        assert!(scalar.was_truncated());
-        let sixteen = "数".repeat(16);
-        let seventeen = "数".repeat(17);
-        assert!(!zone_scalar(&column, &Value::String(sixteen.clone()))
-            .unwrap()
-            .was_truncated());
-        assert!(zone_scalar(&column, &Value::String(seventeen))
-            .unwrap()
-            .was_truncated());
-        let padded = zone_scalar(&column, &Value::String(format!("{sixteen}   "))).unwrap();
-        let plain = zone_scalar(&column, &Value::String(sixteen)).unwrap();
-        assert_eq!(padded.compare(&plain), Some(std::cmp::Ordering::Equal));
+        let prefix = "a".repeat(ZONE_TEXT_PREFIX_BYTES);
+        assert!(!zone_scalar(&column, &Value::String(prefix.clone())).unwrap().was_truncated());
+        assert!(zone_scalar(&column, &Value::String(format!("{prefix}b"))).unwrap().was_truncated());
+        for value in ["数".repeat(16), "数".repeat(17), "aß".repeat(32)] {
+            let full = crate::charset::collation_key_by_id(crate::charset::collation_id("utf8mb4_0900_ai_ci"), &value);
+            assert_eq!(zone_scalar(&column, &Value::String(value)).unwrap().was_truncated(), full.len() > ZONE_TEXT_PREFIX_BYTES);
+        }
 
         let float_column = ColumnSchema {
             data_type: DataTypeKind::Double {
@@ -13172,8 +13074,8 @@ mod zone_map_tests {
     fn zone_text_prefix_obeys_collation_pad_attribute() {
         let no_pad = crate::charset::collation_id("utf8mb4_0900_ai_ci");
         let pad_space = crate::charset::collation_id("utf8mb4_general_ci");
-        assert_eq!(zone_text_prefix_slice("value ", no_pad), "value ");
-        assert_eq!(zone_text_prefix_slice("value ", pad_space), "value");
+        assert_ne!(zone_text_weight("value ", no_pad), zone_text_weight("value", no_pad));
+        assert_eq!(zone_text_weight("value ", pad_space), zone_text_weight("value", pad_space));
     }
 
     #[test]

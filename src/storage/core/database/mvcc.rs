@@ -1061,9 +1061,6 @@ impl Database {
                 )
                 .map(Some),
         };
-        if result.is_err() {
-            self.rollback_inserted_rows(txn_id, table_id, row_ids)?;
-        }
         result
     }
 
@@ -1465,6 +1462,7 @@ impl Database {
         let mut touched_tables = HashSet::new();
         let mut expression_compensation = None;
         let mut compensated = Vec::new();
+        let mut sync_compensation = false;
         let mut walk = UndoChainWalk::default();
         let mut batch_records = 0usize;
         let mut batch_bytes = 0usize;
@@ -1522,6 +1520,9 @@ impl Database {
             let header_only_delete = matches!(&record.kind, UndoKind::DeleteHeader);
             let owns_reclaimable = !record.before_external.is_empty()
                 || matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader);
+            sync_compensation |= owns_reclaimable;
+            let mark_compensated = owns_reclaimable
+                || matches!(record.kind, UndoKind::Insert | UndoKind::InsertBatch { .. });
             match record.kind {
                 UndoKind::Insert => {
                     self.rollback_inserted_rows(record.txn_id, record.table_id, &[record.row_id])?;
@@ -1744,7 +1745,7 @@ impl Database {
                     self.free_external_refs(record.table_id, &to_free);
                 }
             }
-            if owns_reclaimable {
+            if mark_compensated {
                 compensated.push(self.undo.read().wal_identity(record.id));
             }
             undo_ptr = record.prev_undo_ptr;
@@ -1764,9 +1765,11 @@ impl Database {
                     *recovery_cursor.get_or_insert_with(|| self.log.lock().last_txn_lsn(txn_id)),
                     (0, 0),
                     &compensated,
+                    sync_compensation,
                     true,
                 )?;
                 compensated.clear();
+                sync_compensation = false;
                 batch_records = 0;
                 batch_bytes = 0;
             }
@@ -1784,6 +1787,7 @@ impl Database {
                 undo_next_lsn,
                 undo_skip,
                 &compensated,
+                sync_compensation,
                 false,
             )?;
         }
@@ -1808,6 +1812,7 @@ impl Database {
         undo_next_lsn: u64,
         undo_skip: (u64, u64),
         compensated: &[u64],
+        sync_compensation: bool,
         intermediate: bool,
     ) -> Result<(), QueryError> {
         let undo_head = undo_head.map(|ptr| self.undo.read().wal_identity(ptr));
@@ -1824,7 +1829,7 @@ impl Database {
         // Persist each intermediate batch before starting another one. Small
         // rollbacks keep the existing final commit barrier, except when LOB /
         // delete ownership must be durable before its manifest is published.
-        if lsn != 0 && (intermediate || !compensated.is_empty()) {
+        if lsn != 0 && (intermediate || sync_compensation) {
             crate::wal::LogManager::sync_durable_to(&self.log, lsn)?;
         }
         if !compensated.is_empty() {

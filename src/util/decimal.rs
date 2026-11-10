@@ -1700,3 +1700,16 @@ pub(crate) fn checked_integer_text(text: &str, unsigned: bool) -> Option<crate::
         magnitude.to_i64().map(crate::types::Value::Int)
     }
 }
+
+/// Convert an exact compact decimal with one final binary rounding.
+pub(crate) fn parts_to_f64(magnitude: i128, scale: u8) -> f64 {
+    if scale == 0 {
+        return magnitude as f64;
+    }
+    if magnitude.unsigned_abs() <= (1u128 << 53) && scale <= 22 {
+        return magnitude as f64 / 10f64.powi(i32::from(scale));
+    }
+    format_decimal_parts(magnitude, scale)
+        .parse()
+        .expect("canonical decimal is valid floating-point input")
+}

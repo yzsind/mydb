@@ -476,7 +476,7 @@ fn dot_index_supports_pgvector_and_max_inner_product_ordering() {
         )
         .unwrap();
     assert!(matches!(response, QueryResponse::ResultSet(_)));
-    assert!(session.warnings.iter().any(|w| w.code() == 1287));
+    assert!(session.warnings.iter().any(|w| w.code() == 50003));
 }
 
 #[test]
@@ -3497,7 +3497,7 @@ fn knn_boundaries_and_vector_errors_are_consistent() {
 }
 
 #[test]
-fn hnsw_metric_mismatch_warns_1287() {
+fn hnsw_metric_mismatch_warns_vector_fallback() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
@@ -3526,8 +3526,8 @@ fn hnsw_metric_mismatch_warns_1287() {
         .unwrap();
     let codes: Vec<u16> = session.warnings.iter().map(|w| w.code()).collect();
     assert!(
-        codes.contains(&1287),
-        "metric mismatch must surface warning 1287; got {codes:?}"
+        codes.contains(&50003),
+        "metric mismatch must surface vector fallback warning; got {codes:?}"
     );
 }
 

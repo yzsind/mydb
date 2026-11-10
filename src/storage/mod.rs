@@ -194,3 +194,5 @@ pub(crate) fn fuzz_decode_storage_formats(bytes: &[u8]) {
 }
 
 pub(crate) use core::resolve_index_key;
+
+pub(crate) use core::{SpatialCandidates, SpatialCursor};

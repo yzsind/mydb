@@ -598,7 +598,10 @@ impl BatchOperator for FilteredStorageBatchStream {
             // An exact integer domain also provides a conservative storage
             // range. Keep the row membership probe and parent join unchanged;
             // missing/stale/disabled zone metadata simply declines pruning.
-            if !self.txn.dirty_read
+            if self.table.zone_map_hint != Some(false)
+                && (self.table.zone_map_hint == Some(true)
+                    || crate::storage::schema::zone_map_optimizer_enabled())
+                && !self.txn.dirty_read
                 && self.table.system_time.is_none()
                 && !self.table.schema.is_partitioned()
                 && null_safe.iter().all(|safe| !*safe)
@@ -628,7 +631,7 @@ impl BatchOperator for FilteredStorageBatchStream {
                     };
                     if let Some(ranges) = self
                         .db
-                        .zone_map_candidate_ranges(&self.table.schema, &predicate)
+                        .zone_map_candidate_ranges_for_plan(&self.table.schema, &predicate)
                     {
                         #[cfg(test)]
                         let before = self

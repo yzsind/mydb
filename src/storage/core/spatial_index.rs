@@ -212,7 +212,7 @@ fn unpack(v: u64) -> RowId {
 #[derive(Debug)]
 pub(crate) struct SpatialCandidates {
     rows: Vec<RowId>,
-    charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 impl std::ops::Deref for SpatialCandidates {
     type Target = Vec<RowId>;
@@ -238,12 +238,132 @@ impl SpatialCandidates {
         for row in rows {
             if self.rows.len() == self.rows.capacity() {
                 let extra = self.rows.capacity().max(64);
-                self.charge.try_grow(extra * std::mem::size_of::<RowId>())?;
+                self._charge
+                    .try_grow(extra * std::mem::size_of::<RowId>())?;
                 self.rows.reserve_exact(extra);
             }
             self.rows.push(row);
         }
         Ok(())
+    }
+}
+
+pub(crate) struct SpatialCursor {
+    _handle: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, IndexFile>,
+    _structure: parking_lot::ArcRwLockReadGuard<parking_lot::RawRwLock, ()>,
+    pool: Arc<BufferPool>,
+    file_key: Arc<BufferPageFileKey>,
+    query: Mbr,
+    next_page: u64,
+    stack: Vec<(u64, u16)>,
+    leaf: std::vec::IntoIter<Item>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+impl SpatialCursor {
+    pub(super) fn new(handle: IndexHandle, query: Mbr) -> Result<Self, QueryError> {
+        validate_mbr(query)?;
+        let handle = handle.read_arc_recursive();
+        handle.ensure_healthy()?;
+        let tree = handle
+            .spatial
+            .as_ref()
+            .ok_or_else(|| corrupt("not a spatial index"))?;
+        let structure = tree.structure.read_arc_recursive();
+        let meta = tree.meta()?;
+        let pool = tree.pool.clone();
+        let file_key = tree.file_key.clone();
+        let charge = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+            PAGE_SIZE * 4 + usize::from(meta.height) * CAPACITY * std::mem::size_of::<(u64, u16)>(),
+        )?;
+        Ok(Self {
+            _handle: handle,
+            _structure: structure,
+            pool,
+            file_key,
+            query,
+            next_page: meta.next,
+            stack: vec![(meta.root, meta.height - 1)],
+            leaf: Vec::new().into_iter(),
+            _charge: charge,
+        })
+    }
+    pub(crate) fn next(&mut self) -> Result<Option<RowId>, QueryError> {
+        let result = self.next_inner();
+        match result {
+            Err(err) if err.is(crate::error::catalog::ER_INDEX_CORRUPT) => {
+                Err(self._handle.fence_persistent_corruption(err))
+            }
+            other => other,
+        }
+    }
+    fn next_inner(&mut self) -> Result<Option<RowId>, QueryError> {
+        loop {
+            if let Some(item) = self.leaf.next() {
+                return Ok(Some(unpack(item.pointer)));
+            }
+            crate::engine::cancel::check_cancelled()?;
+            let Some((id, level)) = self.stack.pop() else {
+                return Ok(None);
+            };
+            if id == 0 || id >= self.next_page {
+                return Err(corrupt("invalid cursor child id"));
+            }
+            let node = self.pool.with_raw_page(
+                PageKey {
+                    file: self.file_key.clone(),
+                    page_id: id,
+                },
+                Node::decode,
+            )?;
+            if node.level != level {
+                return Err(corrupt("invalid cursor child level"));
+            }
+            if level == 0 {
+                self.leaf = node
+                    .items
+                    .into_iter()
+                    .filter(|item| item.mbr.intersects(&self.query))
+                    .collect::<Vec<_>>()
+                    .into_iter();
+            } else {
+                self.stack.extend(
+                    node.items
+                        .into_iter()
+                        .rev()
+                        .filter(|item| item.mbr.intersects(&self.query))
+                        .map(|item| (item.pointer, level - 1)),
+                );
+            }
+        }
+    }
+}
+
+#[derive(Debug, Default)]
+enum Locator {
+    #[default]
+    Uninitialized,
+    Ready {
+        rows: HashMap<u64, u64>,
+        charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    },
+    Disabled,
+}
+impl Locator {
+    fn insert(&mut self, row: u64, leaf: u64) {
+        let Self::Ready { rows, charge } = self else {
+            return;
+        };
+        if rows.len() == rows.capacity() && !rows.contains_key(&row) {
+            let additional = rows.capacity().max(64);
+            if charge.try_grow(additional.saturating_mul(40)).is_err()
+                || rows.try_reserve(additional).is_err()
+            {
+                *self = Self::Disabled;
+                return;
+            }
+        }
+        rows.insert(row, leaf);
     }
 }
 
@@ -256,10 +376,11 @@ pub(super) struct SpatialIndexFile {
     file_key: Arc<BufferPageFileKey>,
     log: Arc<crate::wal::LogMutex>,
     durability: DurabilityMode,
-    structure: parking_lot::RwLock<()>,
+    structure: Arc<parking_lot::RwLock<()>>,
     leaf_latches: Box<[parking_lot::Mutex<()>]>,
     failed: AtomicBool,
     next_page: AtomicU64,
+    locator: parking_lot::Mutex<Locator>,
 }
 impl SpatialIndexFile {
     pub(super) fn open(
@@ -278,10 +399,11 @@ impl SpatialIndexFile {
             file_key,
             log,
             durability,
-            structure: parking_lot::RwLock::new(()),
+            structure: Arc::new(parking_lot::RwLock::new(())),
             leaf_latches: (0..256).map(|_| parking_lot::Mutex::new(())).collect(),
             failed: AtomicBool::new(false),
             next_page: AtomicU64::new(2),
+            locator: parking_lot::Mutex::new(Locator::Uninitialized),
         };
         if !create && this.path.with_extension("rtree.failed").exists() {
             return Err(corrupt(
@@ -296,11 +418,7 @@ impl SpatialIndexFile {
             if let Some(parent) = this.path.parent() {
                 fs::create_dir_all(parent).map_err(io_err)?;
             }
-            for path in [
-                this.path.clone(),
-                this.path.with_extension("rtree.corrupt"),
-                this.path.with_extension("rtree.failed"),
-            ] {
+            for path in [this.path.clone(), this.path.with_extension("rtree.corrupt")] {
                 match fs::remove_file(path) {
                     Ok(()) => {}
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -337,9 +455,67 @@ impl SpatialIndexFile {
         }
         Ok(this)
     }
+    // Built only under the exclusive topology latch. It is a disposable,
+    // governed accelerator; a denied reservation retains the exact tree walk.
+    fn initialize_locator(&self) -> Result<(), QueryError> {
+        let mut locator = self.locator.lock();
+        if !matches!(*locator, Locator::Uninitialized) {
+            return Ok(());
+        }
+        let Some(charge) =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
+                2560,
+            )
+        else {
+            *locator = Locator::Disabled;
+            return Ok(());
+        };
+        *locator = Locator::Ready {
+            rows: HashMap::new(),
+            charge,
+        };
+        let meta = self.meta()?;
+        let mut stack = vec![(meta.root, meta.height - 1)];
+        let mut visited = 0u64;
+        while let Some((id, level)) = stack.pop() {
+            visited += 1;
+            if id == 0 || id >= meta.next || visited >= meta.next {
+                return Err(corrupt("invalid locator child graph"));
+            }
+            let node = self.node(id)?;
+            if node.level != level {
+                return Err(corrupt("invalid locator child level"));
+            }
+            if node.level == 0 {
+                for item in node.items {
+                    locator.insert(item.pointer, id);
+                }
+                if matches!(*locator, Locator::Disabled) {
+                    break;
+                }
+            } else {
+                stack.extend(node.items.iter().map(|item| (item.pointer, level - 1)));
+            }
+        }
+        Ok(())
+    }
+    fn known_absent(&self, row: u64) -> bool {
+        matches!(&*self.locator.lock(), Locator::Ready { rows, .. } if !rows.contains_key(&row))
+    }
+    fn cached_leaf(&self, item: Item) -> Option<Option<u64>> {
+        match &*self.locator.lock() {
+            Locator::Ready { rows, .. } => Some(rows.get(&item.pointer).copied()),
+            _ => None,
+        }
+    }
+
     pub(super) fn healthy(&self) -> Result<(), QueryError> {
         if self.failed.load(Ordering::Acquire) {
-            Err(corrupt("failed page publication; restart required"))
+            Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "spatial index page publication failed; restart to rebuild",
+            ))
         } else {
             Ok(())
         }
@@ -429,6 +605,17 @@ impl SpatialIndexFile {
             log.append_pre_encoded(record)?
         };
         let next = pages.get(&0).map(|p| read_u64(p, 72));
+        let single_leaf_id = pages
+            .iter()
+            .next()
+            .filter(|(id, bytes)| {
+                pages.len() == 1
+                    && !changes.is_empty()
+                    && **id != 0
+                    && bytes[24] == 1
+                    && read_u16(bytes, 26) == 0
+            })
+            .map(|(&id, _)| id);
         // The complete batch is in WAL before any page becomes evictable.
         #[cfg(test)]
         let inject_crash = !CRASH_STRUCTURAL_ONLY.with(|flag| flag.get())
@@ -449,6 +636,36 @@ impl SpatialIndexFile {
             #[cfg(test)]
             if inject_crash {
                 crash_point(&self.log, lsn);
+            }
+        }
+        {
+            let mut locator = self.locator.lock();
+            if let Locator::Ready { rows, .. } = &mut *locator {
+                for (kind, item) in changes {
+                    if *kind == WalIndexOpKind::Delete {
+                        rows.remove(&item.pointer);
+                    }
+                }
+            }
+            if matches!(*locator, Locator::Ready { .. }) {
+                if let Some(id) = single_leaf_id {
+                    // A leaf-only change cannot relocate existing rows. Avoid
+                    // decoding and rehashing the entire leaf on each write.
+                    for (kind, item) in changes {
+                        if *kind == WalIndexOpKind::Insert {
+                            locator.insert(item.pointer, id);
+                        }
+                    }
+                } else {
+                    for id in pages.keys().copied().filter(|id| *id != 0) {
+                        let bytes = self.read(id)?;
+                        if bytes[24] == 1 && read_u16(&bytes, 26) == 0 {
+                            for item in Node::decode(&bytes)?.items {
+                                locator.insert(item.pointer, id);
+                            }
+                        }
+                    }
+                }
             }
         }
         if let Some(next) = next {
@@ -630,6 +847,31 @@ impl SpatialIndexFile {
         }
     }
 
+    pub(super) fn estimate_fraction(&self, query: Mbr) -> Result<f64, QueryError> {
+        self.healthy()?;
+        let _guard = self.structure.read_recursive();
+        let node = self.node(self.meta()?.root)?;
+        if node.items.is_empty() {
+            return Ok(0.0);
+        }
+        let mut overlap = 0.0;
+        for item in &node.items {
+            if !item.mbr.intersects(&query) {
+                continue;
+            }
+            if node.level == 0 || item.mbr.area() == 0.0 || !item.mbr.area().is_finite() {
+                overlap += 1.0;
+            } else {
+                let width =
+                    (item.mbr.maxx.min(query.maxx) - item.mbr.minx.max(query.minx)).max(0.0);
+                let height =
+                    (item.mbr.maxy.min(query.maxy) - item.mbr.miny.max(query.miny)).max(0.0);
+                overlap += (width * height / item.mbr.area()).clamp(0.0, 1.0);
+            }
+        }
+        Ok((overlap / node.items.len() as f64).clamp(0.0, 1.0))
+    }
+
     pub(super) fn count_pages(&self) -> u64 {
         self.next_page.load(Ordering::Acquire)
     }
@@ -646,7 +888,9 @@ impl SpatialIndexFile {
     fn search_impl(&self, query: Mbr, exact: bool) -> Result<SpatialCandidates, QueryError> {
         self.healthy()?;
         validate_mbr(query)?;
-        let _guard = self.structure.read();
+        // Nested query probes may run while this thread owns a cursor lease.
+        // A queued structural writer must not prevent that lease from draining.
+        let _guard = self.structure.read_recursive();
         let meta = self.meta()?;
         let mut stack = vec![(meta.root, None)];
         let mut out = Vec::new();
@@ -708,7 +952,10 @@ impl SpatialIndexFile {
                 Ok(())
             })?;
         }
-        Ok(SpatialCandidates { rows: out, charge })
+        Ok(SpatialCandidates {
+            rows: out,
+            _charge: charge,
+        })
     }
     pub(super) fn entries(&self) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
         self.healthy()?;
@@ -740,6 +987,7 @@ impl SpatialIndexFile {
         self.healthy()?;
         for chunk in entries.chunks(16) {
             let _guard = self.structure.write();
+            self.initialize_locator()?;
             let mut edit = Edit::new(self)?;
             let mut changes = Vec::with_capacity(chunk.len());
             for (key, row) in chunk {
@@ -747,9 +995,15 @@ impl SpatialIndexFile {
                     mbr: decode_key(key)?,
                     pointer: pack(*row),
                 };
-                if edit
-                    .locate(edit.meta.root, item, &mut Vec::new())?
-                    .is_some()
+                if (!self.known_absent(item.pointer)
+                    || changes
+                        .iter()
+                        .any(|(_, previous): &(WalIndexOpKind, Item)| {
+                            previous.pointer == item.pointer
+                        }))
+                    && edit
+                        .locate(edit.meta.root, item, &mut Vec::new())?
+                        .is_some()
                 {
                     continue;
                 }
@@ -812,6 +1066,7 @@ impl SpatialIndexFile {
                 continue;
             }
             let _guard = self.structure.write();
+            self.initialize_locator()?;
             let mut edit = Edit::new(self)?;
             match entry.kind {
                 WalIndexOpKind::Insert => {
@@ -908,7 +1163,17 @@ impl SpatialIndexFile {
     ) -> Result<bool, QueryError> {
         let _structure = self.structure.read();
         let edit = Edit::new(self)?;
-        let found = edit.locate(edit.meta.root, item, &mut Vec::new())?;
+        let found = match self.cached_leaf(item) {
+            Some(Some(id)) => {
+                let node = self.node(id)?;
+                node.items
+                    .iter()
+                    .position(|entry| entry.pointer == item.pointer && entry.mbr.equals(&item.mbr))
+                    .map(|slot| (id, slot))
+            }
+            Some(None) => None,
+            None => return Ok(false),
+        };
         if kind == WalIndexOpKind::Insert && found.is_some() {
             return Ok(true);
         }
@@ -927,6 +1192,10 @@ impl SpatialIndexFile {
                 let Some(child) = node.items.iter().min_by(|a, b| {
                     enlargement(a.mbr, item.mbr)
                         .total_cmp(&enlargement(b.mbr, item.mbr))
+                        .then_with(|| {
+                            margin(a.mbr.union(&item.mbr))
+                                .total_cmp(&margin(b.mbr.union(&item.mbr)))
+                        })
                         .then_with(|| a.mbr.area().total_cmp(&b.mbr.area()))
                         .then_with(|| a.pointer.cmp(&b.pointer))
                 }) else {
@@ -1120,6 +1389,9 @@ impl<'a> Edit<'a> {
         item: Item,
         path: &mut Vec<(u64, usize)>,
     ) -> Result<Option<(u64, usize)>, QueryError> {
+        if self.pages.is_empty() && self.tree.known_absent(item.pointer) {
+            return Ok(None);
+        }
         if path.len() > 64 {
             return Err(corrupt("cyclic tree"));
         }
@@ -1157,6 +1429,10 @@ impl<'a> Edit<'a> {
                 .min_by(|(_, a), (_, b)| {
                     enlargement(a.mbr, item.mbr)
                         .total_cmp(&enlargement(b.mbr, item.mbr))
+                        .then_with(|| {
+                            margin(a.mbr.union(&item.mbr))
+                                .total_cmp(&margin(b.mbr.union(&item.mbr)))
+                        })
                         .then_with(|| a.mbr.area().total_cmp(&b.mbr.area()))
                         .then_with(|| a.pointer.cmp(&b.pointer))
                 })
@@ -1208,6 +1484,9 @@ impl<'a> Edit<'a> {
         Ok(Some(sibling))
     }
 }
+fn margin(mbr: Mbr) -> f64 {
+    (mbr.maxx - mbr.minx).abs() + (mbr.maxy - mbr.miny).abs()
+}
 fn enlargement(a: Mbr, b: Mbr) -> f64 {
     let v = a.enlargement(&b);
     if v.is_nan() {
@@ -1217,6 +1496,11 @@ fn enlargement(a: Mbr, b: Mbr) -> f64 {
     }
 }
 fn split(mut items: Vec<Item>) -> (Vec<Item>, Vec<Item>) {
+    if items.iter().all(|item| item.mbr.equals(&items[0].mbr)) {
+        items.sort_unstable_by_key(|item| item.pointer);
+        let right = items.split_off(items.len() / 2);
+        return (items, right);
+    }
     let mut seeds = (0, 1);
     let mut waste = f64::NEG_INFINITY;
     for a in 0..items.len() {
@@ -1458,11 +1742,11 @@ mod tests {
     }
 
     use super::*;
-    fn directory() -> tempfile::TempDir {
+    pub(super) fn directory() -> tempfile::TempDir {
         fs::create_dir_all("/tmp/mydb").unwrap();
         tempfile::tempdir_in("/tmp/mydb").unwrap()
     }
-    fn open(dir: &Path, create: bool) -> SpatialIndexFile {
+    pub(super) fn open(dir: &Path, create: bool) -> SpatialIndexFile {
         let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir).unwrap()));
         let pool = BufferPool::new(
             128,
@@ -1695,5 +1979,45 @@ mod tests {
         fs::remove_file(&path).unwrap();
         assert!(SpatialIndexFile::quick_validate(path.clone()).is_err());
         assert!(!path.exists());
+    }
+}
+
+#[cfg(test)]
+mod cursor_lease_tests {
+    use super::*;
+    #[test]
+    fn audit_20261109_cursor_nested_probe_drains_before_queued_writer() {
+        let dir = tests::directory();
+        let tree = Arc::new(tests::open(dir.path(), true));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (probe_tx, probe_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let reader = tree.clone();
+        let reader = std::thread::spawn(move || {
+            let lease = reader.structure.read();
+            ready_tx.send(()).unwrap();
+            probe_rx.recv().unwrap();
+            let window = Mbr::new(0.0, 0.0, 1.0, 1.0);
+            assert_eq!(reader.estimate_fraction(window).unwrap(), 0.0);
+            assert!(reader.search(window).unwrap().is_empty());
+            drop(lease);
+            done_tx.send(()).unwrap();
+        });
+        ready_rx.recv().unwrap();
+        let writer_tree = tree.clone();
+        let writer = std::thread::spawn(move || {
+            let _writer = writer_tree.structure.write();
+        });
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while tree.structure.try_read().is_some() {
+            assert!(std::time::Instant::now() < deadline, "writer did not queue");
+            std::thread::yield_now();
+        }
+        probe_tx.send(()).unwrap();
+        done_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("nested read blocked its own cursor lease");
+        reader.join().unwrap();
+        writer.join().unwrap();
     }
 }

@@ -492,6 +492,11 @@ impl Registry {
             inherit(&mut ctx, SysVarValue::Null)
                 .expect("validated global default must initialize a session");
         }
+        // Inherited defaults do not override per-index query options.
+        ctx.session.sysvars.mydb_hnsw_ef_search_explicit = false;
+        ctx.session.sysvars.mydb_hnsw_rerank_mult_explicit = false;
+        ctx.session.sysvars.mydb_ivf_nprobe_explicit = false;
+        ctx.session.sysvars.mydb_ivf_rerank_mult_explicit = false;
     }
 
     /// Distinct variable count (excludes aliases). Mostly for tests.

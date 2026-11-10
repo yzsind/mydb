@@ -1070,7 +1070,7 @@ pub(crate) fn register(reg: &mut Registry) {
         "mydb_hnsw_rerank_mult",
         |s| s.sysvars.mydb_hnsw_rerank_mult,
         |s, n| {
-            s.sysvars.mydb_hnsw_rerank_mult = n.clamp(1, 1024);
+            s.sysvars.mydb_hnsw_rerank_mult = n;
             s.sysvars.mydb_hnsw_rerank_mult_explicit = true;
         },
         "HNSW exact heap-rerank candidate multiplier vs LIMIT k.",
@@ -1097,7 +1097,7 @@ pub(crate) fn register(reg: &mut Registry) {
         "mydb_ivf_rerank_mult",
         |s| s.sysvars.mydb_ivf_rerank_mult,
         |s, n| {
-            s.sysvars.mydb_ivf_rerank_mult = n.clamp(1, 1024);
+            s.sysvars.mydb_ivf_rerank_mult = n;
             s.sysvars.mydb_ivf_rerank_mult_explicit = true;
         },
         "IVF exact heap-rerank candidate multiplier vs LIMIT k.",
@@ -1287,8 +1287,16 @@ fn register_session_uint64_aliased(
             name,
             Scope::Both,
             DataType::UInt {
-                min: 0,
-                max: u64::MAX,
+                min: if matches!(name, "mydb_hnsw_rerank_mult" | "mydb_ivf_rerank_mult") {
+                    1
+                } else {
+                    0
+                },
+                max: if matches!(name, "mydb_hnsw_rerank_mult" | "mydb_ivf_rerank_mult") {
+                    1024
+                } else {
+                    u64::MAX
+                },
             },
         )
         .with_doc(doc)

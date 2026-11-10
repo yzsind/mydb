@@ -61,7 +61,7 @@ impl QuantizationConfig {
             Self::None => 0,
             Self::Sq8 => d,
             Self::Sq4 => d.div_ceil(2),
-            Self::Bq => d.div_ceil(8) + 24,
+            Self::Bq => d.div_ceil(8) + 16,
             Self::Pq { m, bits, .. } => {
                 (m.unwrap_or(dim.div_ceil(8)) as usize * *bits as usize).div_ceil(8)
             }

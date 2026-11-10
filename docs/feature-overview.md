@@ -72,7 +72,7 @@ Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` a
 
 | Index | Capabilities |
 | --- | --- |
-| B-tree | Primary key, unique, composite, covering with INCLUDE, prefix, descending, invisible, functional/expression indexes |
+| B-tree | Primary key, unique, composite, covering with INCLUDE, prefix, descending declarations, invisible, functional/expression indexes |
 | Zone Map | Table/partition-level typed min/max, NULL, string-prefix, and selective-membership summaries; serial/parallel/vectorized scans all retain the heap residual |
 | JSON MVI | Multi-valued keys via `CAST(json_expr AS ... ARRAY)`; one MVI part can combine with a regular part to form a composite key |
 | FULLTEXT | Natural-language BM25, boolean mode, ngram parser; MATCH and safe LIKE ngram pre-filtering; [immutable backup queries](backup-and-recovery.md#51-fulltext-queries) |
@@ -162,3 +162,8 @@ Current product boundaries:
 - Data format version changes require a new data directory or a rebuild; see the README and [`mysql80-compatibility.md`](mysql80-compatibility.md) for specific versions.
 
 The current incompatible format versions are listed in [`storage-format-versions.md`](storage-format-versions.md). Version mismatches are never migrated silently.
+
+B-tree DESC declarations currently retain metadata and emit a warning. Physical
+keys use ascending encoding; reverse scans or an explicit sort preserve query
+ordering. Mixed ASC/DESC declarations do not provide mixed-direction physical
+ordering.

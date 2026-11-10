@@ -1284,7 +1284,7 @@ impl ExactDecimalAcc {
                     f64::INFINITY
                 })
         } else {
-            self.magnitude as f64 / 10f64.powi(self.scale as i32)
+            crate::util::decimal::parts_to_f64(self.magnitude as i128, self.scale)
         }
     }
 
@@ -1505,7 +1505,7 @@ pub(crate) fn accumulate_numeric_state_decimal_parts(
             });
         }
         NumericAggState::Float(total) => {
-            *total += magnitude as f64 / 10f64.powi(scale as i32);
+            *total += crate::util::decimal::parts_to_f64(magnitude as i128, scale);
         }
         NumericAggState::Exact(_) => {
             // Already handled by the hot-path return above.

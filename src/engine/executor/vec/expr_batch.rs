@@ -1722,14 +1722,39 @@ pub(crate) fn try_column_const_cmp_bitmap_parts(
             if data.len() != n {
                 return None;
             }
-            let Value::Timestamp(rhs) = crate::engine::expr::coerce_comparison_constant_for_type(
-                rhs,
-                &crate::storage::DataTypeKind::Timestamp { fsp: 6 },
-            )?
-            else {
-                return None;
-            };
-            dispatch_i64_const_cmp(op, data, rhs, &mut out)?;
+            if crate::engine::expr::session_time_zone_is_fixed()
+                || matches!(rhs, Value::Timestamp(_))
+            {
+                let Value::Timestamp(rhs) =
+                    crate::engine::expr::coerce_comparison_constant_for_type(
+                        rhs,
+                        &crate::storage::DataTypeKind::Timestamp { fsp: 6 },
+                    )?
+                else {
+                    return None;
+                };
+                dispatch_i64_const_cmp(op, data, rhs, &mut out)?;
+            } else {
+                // A DST overlap maps two UTC instants to one civil time. Convert
+                // the lane per instant instead of choosing one UTC constant.
+                let Value::DateTime(rhs) =
+                    crate::engine::expr::coerce_comparison_constant_for_type(
+                        rhs,
+                        &crate::storage::DataTypeKind::DateTime { fsp: 6 },
+                    )?
+                else {
+                    return None;
+                };
+                let mut local = vec![0; n];
+                crate::engine::expr::fill_session_timestamp_local_datetime_micros(
+                    &mut local,
+                    data,
+                    batch
+                        .visible_indices()
+                        .filter(|&row| nulls.as_ref().is_none_or(|valid| valid.get(row))),
+                )?;
+                dispatch_i64_const_cmp(op, &local, rhs, &mut out)?;
+            }
             nulls.as_ref()
         }
         (ColumnVector::Date32 { data, nulls }, Value::Date(rhs)) => {

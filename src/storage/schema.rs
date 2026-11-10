@@ -339,9 +339,7 @@ pub struct ViewSchema {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ViewColumnDef {
     pub name: String,
-    /// Source column type if the projection is a direct column reference;
-    /// `None` for arbitrary expressions (their type is derived at execute
-    /// time, matching MySQL's behaviour for expression columns in views).
+    /// Projection domain frozen at CREATE VIEW; unknown domains remain None.
     #[serde(default)]
     pub data_type: Option<DataTypeKind>,
     #[serde(default = "default_nullable")]
@@ -350,6 +348,10 @@ pub struct ViewColumnDef {
     pub charset: Option<String>,
     #[serde(default)]
     pub collation: Option<String>,
+    #[serde(default)]
+    pub unsigned: bool,
+    #[serde(default)]
+    pub default_value: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

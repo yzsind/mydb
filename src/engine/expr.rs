@@ -1608,6 +1608,16 @@ pub(crate) fn session_hnsw_config() -> Option<crate::engine::vector::session::Hn
     })
 }
 
+/// UTC ordering is interchangeable with wall-clock ordering only for fixed zones.
+pub(crate) fn session_time_zone_is_fixed() -> bool {
+    with_session_view(|view| {
+        let tz = view.map(|v| v.time_zone().to_string()).unwrap_or_default();
+        tz.starts_with('+')
+            || tz.starts_with('-')
+            || matches!(tz.as_str(), "UTC" | "Etc/UTC" | "GMT" | "Etc/GMT")
+    })
+}
+
 /// UTC offset of the session `time_zone` in effect at a specific UTC
 /// instant — named zones with DST resolve against that instant, which
 /// matters once `SET timestamp` rewinds the session clock.
@@ -20317,7 +20327,7 @@ pub(crate) fn mysql_year_equality_number(value: &Value) -> Result<Option<i64>, Q
         Value::Float(value) => (*value as f64, false, true),
         Value::Double(value) => (*value, false, true),
         Value::DecimalCompact(magnitude, scale) => (
-            *magnitude as f64 / 10f64.powi(i32::from(*scale)),
+            crate::util::decimal::parts_to_f64(*magnitude as i128, *scale),
             false,
             true,
         ),
@@ -24138,7 +24148,7 @@ pub(crate) fn cast_to_decimal(
                             Some(m) => {
                                 return finish_cast_to_decimal(m, precision, scale);
                             }
-                            None => mag as f64 / 10f64.powi(from_scale as i32),
+                            None => crate::util::decimal::parts_to_f64(mag as i128, from_scale),
                         }
                     } else {
                         let parsed = dk::parse_lenient_f64(&s);
@@ -28109,8 +28119,10 @@ pub(crate) fn numeric(value: &Value) -> Result<f64, QueryError> {
         Value::String(v) => lenient_str_to_f64(v),
         Value::SmallString(b) => lenient_str_to_f64(unsafe { std::str::from_utf8_unchecked(b) }),
         Value::Bytes(v) => lenient_str_to_f64(&String::from_utf8_lossy(v)),
-        Value::DecimalCompact(mag, scale) => Ok(*mag as f64 / 10f64.powi(*scale as i32)),
-        Value::Decimal128(mag, scale) => Ok(*mag as f64 / 10f64.powi(*scale as i32)),
+        Value::DecimalCompact(mag, scale) => {
+            Ok(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
+        }
+        Value::Decimal128(mag, scale) => Ok(crate::util::decimal::parts_to_f64(*mag, *scale)),
         Value::DecimalWide(value) => {
             crate::util::decimal::format_big_decimal_parts(&value.magnitude, value.scale)
                 .parse::<f64>()

@@ -2588,6 +2588,9 @@ fn spatial_index_search_over_persistent_pages() {
     let spatial = table.indexes.iter().find(|i| i.name == "sp").unwrap();
     let old_window = crate::engine::geo::Mbr::new(8.0, 8.0, 8.0, 8.0);
     let reader = db.begin_txn().unwrap();
+    let mut cursor = db
+        .spatial_scan_cursor(&table, spatial, old_window, reader)
+        .unwrap();
     let writer = db.begin_txn().unwrap();
     let row_id = db
         .lookup_index(&table, &primary, IndexKey::from(vec![KeyPart::Int(8)]))
@@ -2597,6 +2600,19 @@ fn spatial_index_search_over_persistent_pages() {
         .spatial_search(table_id, "sp", old_window)
         .unwrap()
         .contains(&row_id));
+    let mut cursor_rows = Vec::new();
+    while let Some(row) = cursor.next().unwrap() {
+        cursor_rows.push(row);
+    }
+    drop(cursor);
+    cursor_rows.extend(
+        db.spatial_visibility_repairs(&table, spatial, old_window, reader)
+            .unwrap(),
+    );
+    assert!(
+        cursor_rows.contains(&row_id),
+        "cursor repairs preserve an unvisited deleted key"
+    );
     let candidates = db
         .spatial_search_visible(&table, spatial, old_window, reader)
         .unwrap();

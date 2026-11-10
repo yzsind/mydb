@@ -1093,3 +1093,129 @@ fn spatial_index_temporary_and_partition_ddl() {
         .execute("ALTER TABLE spatial_parts CHECK PARTITION ALL")
         .unwrap();
 }
+
+#[test]
+fn spatial_audit_20261109_ddl_metadata_and_geographic_errors() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE audit_geo(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,KEY sg(g))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO audit_geo VALUES(1,POINT(1,1)),(2,POINT(2,2))")
+        .unwrap();
+    let indexes = rows(&engine, "SHOW INDEX FROM audit_geo");
+    let spatial = indexes
+        .iter()
+        .find(|row| row[2] == Value::String("sg".into()))
+        .unwrap();
+    assert_eq!(spatial[5], Value::String("A".into()));
+    assert_eq!(spatial[7], Value::Int(32));
+    assert_eq!(spatial[10], Value::String("SPATIAL".into()));
+    for sql in [
+        "ALTER TABLE audit_geo MODIFY g POINT NULL SRID 0",
+        "ALTER TABLE audit_geo CHANGE g g2 POINT NULL SRID 0",
+    ] {
+        assert_eq!(engine.execute(sql).unwrap_err().code(), 1252, "{sql}");
+    }
+    let plan = rows(
+        &engine,
+        "EXPLAIN FORMAT=TREE SELECT id FROM audit_geo WHERE id=1 AND MBRIntersects(g,POINT(1,1))",
+    )[0][0]
+        .to_display_string();
+    assert!(
+        plan.contains("PRIMARY") && !plan.contains("Spatial index scan"),
+        "{plan}"
+    );
+    engine
+        .execute("ALTER TABLE audit_geo ALTER INDEX sg INVISIBLE")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute("SELECT id FROM audit_geo FORCE INDEX(sg)")
+            .unwrap_err()
+            .code(),
+        1176
+    );
+    let mut session = SessionContext::default();
+    for (name, column) in [
+        ("temp_geo", "g POINT NOT NULL SRID 0"),
+        ("temp_blob", "b BLOB"),
+    ] {
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("CREATE TEMPORARY TABLE {name}(id INT PRIMARY KEY,{column})"),
+            )
+            .unwrap();
+        let QueryResponse::ResultSet(result) = engine
+            .execute_with_session(&mut session, &format!("CHECK TABLE {name}"))
+            .unwrap()
+        else {
+            panic!("expected check");
+        };
+        let check = result.rows;
+        assert_eq!(check[0][3], Value::String("OK".into()), "{check:?}");
+    }
+    let err = engine.execute("SELECT MBRIntersects(ST_GeomFromText('LINESTRING(10 170,10 -170)',4326),ST_GeomFromText('POINT(10 0)',4326))").unwrap_err();
+    assert!(err.message().contains("geographic"), "{err}");
+}
+
+#[test]
+fn spatial_audit_20261109_probe_diagnostics_match_residual() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE probe_diag(id INT PRIMARY KEY,g POINT NOT NULL SRID 0, SPATIAL KEY sg(g))").unwrap();
+    engine
+        .execute("INSERT INTO probe_diag VALUES(1,POINT(1,1))")
+        .unwrap();
+    for predicate in [
+        "MBRContains(1,g)",
+        "MBRContains(ST_GeomFromText('POINT(1 1)',4326),g)",
+        "MBRContains(g,ST_GeomFromText('POINT(1 1)',4326))",
+    ] {
+        let a = engine
+            .execute(&format!(
+                "SELECT id FROM probe_diag FORCE INDEX(sg) WHERE {predicate}"
+            ))
+            .unwrap_err();
+        let b = engine
+            .execute(&format!(
+                "SELECT id FROM probe_diag IGNORE INDEX(sg) WHERE {predicate}"
+            ))
+            .unwrap_err();
+        assert_eq!(
+            (a.code(), a.message()),
+            (b.code(), b.message()),
+            "{predicate}"
+        );
+    }
+}
+
+#[test]
+fn spatial_audit_20261109_geographic_nonpoint_probe_cannot_hide_errors() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE geo_probe(id INT PRIMARY KEY,g POINT NOT NULL SRID 4326,SPATIAL KEY sg(g))").unwrap();
+    engine
+        .execute("INSERT INTO geo_probe VALUES(1,ST_GeomFromText('POINT(65 45)',4326))")
+        .unwrap();
+    let mut session = SessionContext::default();
+    engine
+        .execute_with_session(
+            &mut session,
+            "SET @window=ST_GeomFromText('LINESTRING(60 0,60 90)',4326)",
+        )
+        .unwrap();
+    for index in ["FORCE INDEX(sg)", "IGNORE INDEX(sg)"] {
+        for probe in ["ST_GeomFromText('LINESTRING(60 0,60 90)',4326)", "@window"] {
+            let err = engine
+                .execute_with_session(
+                    &mut session,
+                    &format!("SELECT id FROM geo_probe {index} WHERE MBRIntersects(g,{probe})"),
+                )
+                .unwrap_err();
+            assert_eq!(err.code(), 3618, "{index}: {probe}");
+        }
+    }
+}

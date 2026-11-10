@@ -115,7 +115,9 @@ impl VectorIndexFile {
     /// Optional cache reclamation must not wait for a reader that may itself
     /// be requesting memory admission while holding the mapping read guard.
     pub(crate) fn evict_navigation_mapping(&self) -> bool {
-        self.mapped_navigation.try_write().is_some_and(|mut view| view.take().is_some())
+        self.mapped_navigation
+            .try_write()
+            .is_some_and(|mut view| view.take().is_some())
     }
 
     fn navigation_write(&self) -> VectorNavigationWrite<'_> {
@@ -367,7 +369,9 @@ impl MappedVectorNavigation {
             // change until all mapping readers drain and the memo is retired.
             let page = unsafe {
                 std::slice::from_raw_parts(
-                    self.address.cast::<u8>().add(vid_page(vid) as usize * PAGE_SIZE),
+                    self.address
+                        .cast::<u8>()
+                        .add(vid_page(vid) as usize * PAGE_SIZE),
                     PAGE_SIZE,
                 )
             };
@@ -407,7 +411,12 @@ impl MappedVectorNavigation {
     }
 
     #[inline]
-    pub(crate) fn neighbors(&self, vid: VecId, level: usize, out: &mut Vec<VecId>) -> Result<(), QueryError> {
+    pub(crate) fn neighbors(
+        &self,
+        vid: VecId,
+        level: usize,
+        out: &mut Vec<VecId>,
+    ) -> Result<(), QueryError> {
         let (page, offset) = self.record(vid)?;
         out.clear();
         if page[offset] & REC_FLAG_INITIALIZED == 0 || level > page[offset + 1] as usize {
@@ -718,11 +727,7 @@ impl MappedVectorNavigation {
                     .peek()
                     .map(|s: &Scored<VecId>| s.dist)
                     .unwrap_or(f64::INFINITY);
-                if results.len() >= ef
-                    && explore_ties
-                    && score == furthest
-                    && (score != 0.0 || metric == Metric::Dot)
-                {
+                if results.len() >= ef && explore_ties && score == furthest {
                     frontier.push(Reverse(Scored {
                         dist: score,
                         id: vid,

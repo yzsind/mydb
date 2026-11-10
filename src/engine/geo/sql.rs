@@ -830,7 +830,7 @@ fn geom_to_value(g: Geometry) -> Result<Value, QueryError> {
     Ok(Value::Geometry(write_geometry(&g)?))
 }
 
-fn require_planar(name: &str, geometry: &Geometry) -> Result<(), QueryError> {
+pub(crate) fn require_planar(name: &str, geometry: &Geometry) -> Result<(), QueryError> {
     if super::srs::require(geometry.srid, name)?.kind == super::srs::SrsKind::Geographic {
         return Err(geo_err(
             crate::error::catalog::ER_NOT_IMPLEMENTED_FOR_GEOGRAPHIC_SRS,
@@ -1799,6 +1799,9 @@ fn mbr_pred(name: &str, values: &[Value], op: MbrOp) -> Result<Value, QueryError
     let (a, b) = two_geoms(name, values)?;
     if a.srid != b.srid {
         return Err(srid_mismatch(name, a.srid, b.srid));
+    }
+    if a.geom.dimension().is_some_and(|d| d > 0) || b.geom.dimension().is_some_and(|d| d > 0) {
+        require_planar(name, &a)?;
     }
     Ok(mbr_predicate(op, &a.geom, &b.geom)
         .map(|t| Value::Int(t as i64))

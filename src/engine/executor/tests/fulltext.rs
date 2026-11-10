@@ -1861,3 +1861,108 @@ fn fulltext_stream_windows_preserve_filters_scores_and_column_types() {
         }
     }
 }
+
+#[test]
+fn fulltext_audit_20261109_dml_and_join_scores() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE audit_ft(id INT PRIMARY KEY,grp INT,body TEXT,FULLTEXT KEY ft(body))",
+        )
+        .unwrap();
+    engine.execute("INSERT INTO audit_ft VALUES(1,1,'alpha target'),(2,1,'beta gamma'),(3,2,'alpha beta delta')").unwrap();
+    engine
+        .execute("CREATE TABLE audit_groups(id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO audit_groups VALUES(1),(2)")
+        .unwrap();
+    for hint in ["", "/*+ HASH_JOIN(c,g) */", "/*+ NL_JOIN(c,g) */"] {
+        let result = exec_set(&engine, &format!("SELECT {hint} c.id,MATCH(c.body) AGAINST('alpha') score FROM audit_ft c JOIN audit_groups g ON c.grp=g.id ORDER BY c.id"));
+        assert_eq!(result.rows.len(), 3);
+        assert!(crate::engine::expr::numeric(&result.rows[0][1]).unwrap() > 0.0);
+        assert_eq!(
+            crate::engine::expr::numeric(&result.rows[1][1]).unwrap(),
+            0.0
+        );
+        assert!(crate::engine::expr::numeric(&result.rows[2][1]).unwrap() > 0.0);
+    }
+    let ordered = exec_set(&engine, "SELECT c.id FROM audit_ft c JOIN audit_groups g ON c.grp=g.id ORDER BY MATCH(c.body) AGAINST('alpha') DESC,c.id");
+    assert_eq!(ordered.rows.last().unwrap()[0], Value::Int(2));
+    let mut session = SessionContext::default();
+    engine
+        .execute_with_session(&mut session, "START TRANSACTION")
+        .unwrap();
+    engine
+        .execute_with_session(
+            &mut session,
+            "UPDATE audit_ft SET body='changed document' WHERE MATCH(body) AGAINST('gamma')",
+        )
+        .unwrap();
+    let QueryResponse::ResultSet(changed) = engine
+        .execute_with_session(
+            &mut session,
+            "SELECT id FROM audit_ft WHERE MATCH(body) AGAINST('changed')",
+        )
+        .unwrap()
+    else {
+        panic!("expected matches");
+    };
+    assert_eq!(changed.rows, vec![vec![Value::Int(2)]]);
+    engine
+        .execute_with_session(
+            &mut session,
+            "DELETE FROM audit_ft WHERE MATCH(body) AGAINST('delta') > 0",
+        )
+        .unwrap();
+    let QueryResponse::ResultSet(result) = engine
+        .execute_with_session(&mut session, "SELECT COUNT(*) FROM audit_ft")
+        .unwrap()
+    else {
+        panic!("expected result");
+    };
+    assert_eq!(result.rows[0][0].to_display_string(), "2");
+    engine
+        .execute_with_session(&mut session, "ROLLBACK")
+        .unwrap();
+    assert_eq!(
+        first_col(exec_set(
+            &engine,
+            "SELECT id FROM audit_ft WHERE MATCH(body) AGAINST('delta')"
+        )),
+        vec!["3"]
+    );
+    assert_eq!(first_col(exec_set(&engine, "SELECT /*+ ZONE_MAP(audit_ft) */ COUNT(*) FROM audit_ft WHERE MATCH(body) AGAINST('alpha') AND grp=1")), vec!["1"]);
+}
+
+#[test]
+fn fulltext_audit_20261109_all_indexes_are_diagnosable() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE audit_aux(id INT PRIMARY KEY,a TEXT,b TEXT,FULLTEXT KEY ft1(a),FULLTEXT KEY ft2(b))").unwrap();
+    engine
+        .execute("INSERT INTO audit_aux VALUES(1,'alphaaaa','betaaaaa')")
+        .unwrap();
+    engine
+        .execute("SET GLOBAL innodb_ft_aux_table='test/audit_aux'")
+        .unwrap();
+    assert_eq!(
+        first_col(exec_set(
+            &engine,
+            "SELECT DISTINCT WORD FROM information_schema.INNODB_FT_INDEX_TABLE ORDER BY WORD"
+        )),
+        vec!["alphaaaa", "betaaaaa"]
+    );
+    engine
+        .execute("SET GLOBAL innodb_ft_aux_table='test/audit_aux/ft2'")
+        .unwrap();
+    assert_eq!(
+        first_col(exec_set(
+            &engine,
+            "SELECT DISTINCT WORD FROM information_schema.INNODB_FT_INDEX_TABLE"
+        )),
+        vec!["betaaaaa"]
+    );
+    engine.execute("SET GLOBAL innodb_ft_aux_table=''").unwrap();
+}

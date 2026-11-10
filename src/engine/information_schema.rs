@@ -3032,8 +3032,16 @@ fn schemata_rows(db: &Database) -> Vec<Vec<Value>> {
             vec![
                 s("def"),
                 s(&schema.name),
-                s(&schema.charset),
-                s(&schema.collation),
+                s(if schema.name.eq_ignore_ascii_case("information_schema") {
+                    "utf8mb3"
+                } else {
+                    &schema.charset
+                }),
+                s(if schema.name.eq_ignore_ascii_case("information_schema") {
+                    "utf8mb3_general_ci"
+                } else {
+                    &schema.collation
+                }),
                 Value::Null,
                 s("NO"),
             ]
@@ -3308,7 +3316,11 @@ fn system_table_row(def: &SystemTableDef) -> Vec<Value> {
         } else {
             s(def.engine)
         },
-        number(pfs.and_then(|metadata| metadata.version)),
+        if def.schema.eq_ignore_ascii_case("information_schema") {
+            Value::Int(10)
+        } else {
+            number(pfs.and_then(|metadata| metadata.version))
+        },
         pfs.and_then(|metadata| metadata.row_format)
             .map(s)
             .unwrap_or(Value::Null),
@@ -3528,7 +3540,7 @@ fn base_column_row(
         mysql_character_octet_length_for_column(column),
         match (&column.data_type, column.unsigned) {
             (DataTypeKind::BigInt, true) => Value::Int(20),
-            (DataTypeKind::MediumInt, true) => Value::Int(8),
+            (DataTypeKind::MediumInt, true) => Value::Int(7),
             _ => mysql_numeric_precision(&column.data_type),
         },
         mysql_numeric_scale(&column.data_type),
@@ -3571,12 +3583,20 @@ fn view_column_row(
         s(view_name),
         s(&column.name),
         Value::Int(ordinal as i64),
-        Value::Null,
+        column
+            .default_value
+            .as_deref()
+            .map(s)
+            .unwrap_or(Value::Null),
         s(if column.nullable { "YES" } else { "NO" }),
         s(&mysql_data_type_name(data_type)),
         mysql_character_maximum_length(data_type),
         mysql_view_character_octet_length(column, data_type),
-        mysql_numeric_precision(data_type),
+        if column.unsigned && matches!(data_type, DataTypeKind::BigInt) {
+            Value::Int(20)
+        } else {
+            mysql_numeric_precision(data_type)
+        },
         mysql_numeric_scale(data_type),
         mysql_datetime_precision(data_type),
         if matches!(
@@ -3611,7 +3631,7 @@ fn view_column_row(
         } else {
             Value::Null
         },
-        s(&mysql_type_name_with_unsigned(data_type, false)),
+        s(&mysql_type_name_with_unsigned(data_type, column.unsigned)),
         s(""),
         s(""),
         s(privileges),
@@ -3774,6 +3794,9 @@ fn append_table_statistics_rows(
                 .index_prefix_cardinality(&index.name, idx + 1)
                 .filter(|c| *c > 0)
                 .unwrap_or_else(|| {
+                    if index.is_fulltext() {
+                        return table_stats.rows;
+                    }
                     crate::engine::table_stats_view::fallback_index_cardinality(
                         table_stats.rows,
                         index.unique,
@@ -3999,7 +4022,7 @@ fn views_rows(db: &Database) -> Vec<Vec<Value>> {
                         &view.definition_normalized
                     })
                 } else {
-                    Value::Null
+                    s("")
                 },
                 s(view.check_option.as_deref().unwrap_or("NONE")),
                 s(if view.is_updatable { "YES" } else { "NO" }),
@@ -4016,7 +4039,7 @@ fn views_rows(db: &Database) -> Vec<Vec<Value>> {
             continue;
         }
         if !vis.has_table_privilege(Privilege::ShowView, "sys", &name) {
-            row[3] = Value::Null;
+            row[3] = s("");
         }
         rows.push(row);
     }
@@ -4213,7 +4236,7 @@ fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
                 Value::Null,
                 Value::Null,
                 s(""),
-                s("default"),
+                s(""),
                 Value::Null,
             ]);
             continue;
@@ -4362,8 +4385,10 @@ fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
     {
         let mut row = vec![s("def"), s(&view.database), s(&view.name)];
         row.extend(std::iter::repeat_n(Value::Null, 19));
+        row[12] = Value::Int(0);
+        row[18] = mysql_time_value(view.created_ms);
         row.push(s(""));
-        row.push(Value::Null);
+        row.push(s(""));
         row.push(Value::Null);
         out.push(row);
     }
@@ -4491,6 +4516,75 @@ fn trigger_row(trigger: &TriggerSchema) -> Vec<Value> {
     ]
 }
 
+fn routine_declared_collation(
+    routine: &RoutineSchema,
+    kind: &DataTypeKind,
+    declared: &str,
+) -> Option<&'static crate::charset::CollationInfo> {
+    if matches!(character_set_for_data_type(kind), Value::Null) {
+        return None;
+    }
+    let upper = declared.to_ascii_uppercase();
+    if upper.contains("CHARACTER SET") || upper.contains("CHARSET") || upper.contains("COLLATE") {
+        if let Ok(crate::parser::Statement::CreateTable(table)) =
+            crate::parser::parse_statement(&format!("CREATE TABLE __routine_type (v {declared})"))
+        {
+            if let Some(column) = table.columns.first() {
+                if let Some(collation) = &column.collation {
+                    return crate::charset::resolve_collation(collation).ok();
+                }
+                if let Some(charset) = &column.charset {
+                    return crate::charset::resolve_charset(charset)
+                        .ok()
+                        .and_then(|info| {
+                            crate::charset::resolve_collation(info.default_collation).ok()
+                        });
+                }
+            }
+        }
+    }
+    crate::charset::resolve_collation(&routine.database_collation).ok()
+}
+
+fn routine_collation(routine: &RoutineSchema, kind: &DataTypeKind, declared: &str) -> Value {
+    routine_declared_collation(routine, kind, declared)
+        .map(|info| s(info.name))
+        .unwrap_or(Value::Null)
+}
+
+fn routine_character_set(routine: &RoutineSchema, kind: &DataTypeKind, declared: &str) -> Value {
+    routine_declared_collation(routine, kind, declared)
+        .map(|info| s(info.charset))
+        .unwrap_or(Value::Null)
+}
+
+fn routine_character_octet_length(
+    routine: &RoutineSchema,
+    kind: &DataTypeKind,
+    declared: &str,
+) -> Value {
+    // LOB limits are already byte limits; only bounded character domains
+    // scale their declared character count by the charset's maximum width.
+    if !matches!(
+        kind,
+        DataTypeKind::Char { .. }
+            | DataTypeKind::VarChar { .. }
+            | DataTypeKind::Enum { .. }
+            | DataTypeKind::Set { .. }
+    ) {
+        return mysql_character_octet_length(kind);
+    }
+    match (
+        mysql_character_maximum_length(kind),
+        routine_character_set(routine, kind, declared),
+    ) {
+        (Value::Int(length), Value::String(charset)) => crate::charset::resolve_charset(&charset)
+            .map(|info| Value::Int(length.saturating_mul(i64::from(info.max_len))))
+            .unwrap_or_else(|_| mysql_character_octet_length(kind)),
+        _ => mysql_character_octet_length(kind),
+    }
+}
+
 fn routine_row(routine: &RoutineSchema, show_definition: bool) -> Vec<Value> {
     let return_type = routine
         .return_type
@@ -4501,8 +4595,7 @@ fn routine_row(routine: &RoutineSchema, show_definition: bool) -> Vec<Value> {
         .return_type
         .as_ref()
         .map(|dt| mysql_type_name_with_unsigned(dt, routine.return_unsigned))
-        .or_else(|| routine.return_type_sql.clone())
-        .unwrap_or_default();
+        .or_else(|| routine.return_type_sql.clone());
     vec![
         s(&routine.name),
         s("def"),
@@ -4518,7 +4611,13 @@ fn routine_row(routine: &RoutineSchema, show_definition: bool) -> Vec<Value> {
         routine
             .return_type
             .as_ref()
-            .map(mysql_character_octet_length)
+            .map(|kind| {
+                routine_character_octet_length(
+                    routine,
+                    kind,
+                    routine.return_type_sql.as_deref().unwrap_or(""),
+                )
+            })
             .unwrap_or(Value::Null),
         routine
             .return_type
@@ -4538,14 +4637,26 @@ fn routine_row(routine: &RoutineSchema, show_definition: bool) -> Vec<Value> {
         routine
             .return_type
             .as_ref()
-            .map(character_set_for_data_type)
+            .map(|kind| {
+                routine_character_set(
+                    routine,
+                    kind,
+                    routine.return_type_sql.as_deref().unwrap_or(""),
+                )
+            })
             .unwrap_or(Value::Null),
         routine
             .return_type
             .as_ref()
-            .map(collation_for_data_type)
+            .map(|kind| {
+                routine_collation(
+                    routine,
+                    kind,
+                    routine.return_type_sql.as_deref().unwrap_or(""),
+                )
+            })
             .unwrap_or(Value::Null),
-        s(&dtd),
+        dtd.as_deref().map(s).unwrap_or(Value::Null),
         s("SQL"),
         if show_definition {
             s(&routine.body_sql)
@@ -4649,12 +4760,12 @@ fn parameter_row(
         name.map(s).unwrap_or(Value::Null),
         s(&mysql_data_type_name(data_type)),
         mysql_character_maximum_length(data_type),
-        mysql_character_octet_length(data_type),
+        routine_character_octet_length(routine, data_type, dtd_identifier),
         mysql_numeric_precision(data_type),
         mysql_numeric_scale(data_type),
         mysql_datetime_precision(data_type),
-        character_set_for_data_type(data_type),
-        collation_for_data_type(data_type),
+        routine_character_set(routine, data_type, dtd_identifier),
+        routine_collation(routine, data_type, dtd_identifier),
         s(&dtd),
         s(routine.kind.as_str()),
     ]
@@ -6682,80 +6793,96 @@ fn innodb_ft_default_stopword_rows() -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn selected_fulltext_index(db: &Database) -> Option<(std::sync::Arc<TableSchema>, IndexSchema)> {
+fn selected_fulltext_indexes(
+    db: &Database,
+) -> Option<(std::sync::Arc<TableSchema>, Vec<IndexSchema>)> {
     let selected = crate::engine::sysvar::builtin::mydb_storage::innodb_ft_aux_table();
-    let (database, table) = selected.split_once('/')?;
+    let mut parts = selected.split('/');
+    let database = parts.next()?;
+    let table = parts.next()?;
+    let requested = parts.next();
     let table = db.table(&format!("{database}.{table}")).ok()?;
-    let index = table
+    let mut indexes: Vec<_> = table
         .iter_public_indexes()
-        .filter(|index| index.index_type.eq_ignore_ascii_case("FULLTEXT"))
-        .min_by(|left, right| left.name.cmp(&right.name))?
-        .clone();
-    Some((table, index))
+        .filter(|index| {
+            index.is_fulltext()
+                && requested.is_none_or(|name| index.name.eq_ignore_ascii_case(name))
+        })
+        .cloned()
+        .collect();
+    indexes.sort_by(|left, right| left.name.cmp(&right.name));
+    Some((table, indexes))
 }
 
 fn innodb_ft_config_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     if !can_view_process_metadata(db) {
         return Ok(Vec::new());
     }
-    let Some((_table, index)) = selected_fulltext_index(db) else {
+    let Some((_table, indexes)) = selected_fulltext_indexes(db) else {
         return Ok(Vec::new());
     };
-    let meta = index.fulltext.unwrap_or_default();
-    let defaults = crate::storage::fulltext::tokenizer::global_config();
-    Ok(vec![
-        vec![s("index_name"), s(&index.name)],
-        vec![
-            s("parser"),
-            s(if meta.parser.is_empty() {
-                "default"
-            } else {
-                &meta.parser
-            }),
-        ],
-        vec![
-            s("min_token_size"),
-            s(&meta
-                .min_token_size
-                .map(|value| value as usize)
-                .unwrap_or(defaults.min_token_size)
-                .to_string()),
-        ],
-        vec![
-            s("max_token_size"),
-            s(&meta
-                .max_token_size
-                .map(|value| value as usize)
-                .unwrap_or(defaults.max_token_size)
-                .to_string()),
-        ],
-        vec![
-            s("ngram_size"),
-            s(&meta
-                .ngram_size
-                .map(|value| value as usize)
-                .unwrap_or(defaults.ngram_size)
-                .to_string()),
-        ],
-        vec![
-            s("use_stopword"),
-            s(if meta.use_stopwords.unwrap_or(defaults.use_stopwords) {
-                "1"
-            } else {
-                "0"
-            }),
-        ],
-    ])
+    let mut rows = Vec::new();
+    for index in indexes {
+        let meta = index.fulltext.unwrap_or_default();
+        let defaults = crate::storage::fulltext::tokenizer::global_config();
+        rows.extend(vec![
+            vec![s("index_name"), s(&index.name)],
+            vec![
+                s("parser"),
+                s(if meta.parser.is_empty() {
+                    "default"
+                } else {
+                    &meta.parser
+                }),
+            ],
+            vec![
+                s("min_token_size"),
+                s(&meta
+                    .min_token_size
+                    .map(|value| value as usize)
+                    .unwrap_or(defaults.min_token_size)
+                    .to_string()),
+            ],
+            vec![
+                s("max_token_size"),
+                s(&meta
+                    .max_token_size
+                    .map(|value| value as usize)
+                    .unwrap_or(defaults.max_token_size)
+                    .to_string()),
+            ],
+            vec![
+                s("ngram_size"),
+                s(&meta
+                    .ngram_size
+                    .map(|value| value as usize)
+                    .unwrap_or(defaults.ngram_size)
+                    .to_string()),
+            ],
+            vec![
+                s("use_stopword"),
+                s(if meta.use_stopwords.unwrap_or(defaults.use_stopwords) {
+                    "1"
+                } else {
+                    "0"
+                }),
+            ],
+        ]);
+    }
+    Ok(rows)
 }
 
 fn innodb_ft_index_table_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     if !can_view_process_metadata(db) {
         return Ok(Vec::new());
     }
-    let Some((table, index)) = selected_fulltext_index(db) else {
+    let Some((table, indexes)) = selected_fulltext_indexes(db) else {
         return Ok(Vec::new());
     };
-    let postings = db.fulltext_diagnostic_postings(&table, &index)?;
+    let mut postings = Vec::new();
+    for index in indexes {
+        postings.extend(db.fulltext_diagnostic_postings(&table, &index)?);
+    }
     let mut summaries = std::collections::BTreeMap::<String, (u64, u64, u64)>::new();
     for posting in &postings {
         let summary =
@@ -8001,17 +8128,6 @@ fn character_set_for_data_type(data_type: &DataTypeKind) -> Value {
         | DataTypeKind::Text { .. }
         | DataTypeKind::Enum { .. }
         | DataTypeKind::Set { .. } => s(crate::charset::DEFAULT_CHARSET),
-        _ => Value::Null,
-    }
-}
-
-fn collation_for_data_type(data_type: &DataTypeKind) -> Value {
-    match data_type {
-        DataTypeKind::Char { .. }
-        | DataTypeKind::VarChar { .. }
-        | DataTypeKind::Text { .. }
-        | DataTypeKind::Enum { .. }
-        | DataTypeKind::Set { .. } => s(crate::charset::DEFAULT_COLLATION),
         _ => Value::Null,
     }
 }

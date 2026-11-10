@@ -4241,6 +4241,13 @@ fn execute_plan_stream_inner(
         PhysicalPlan::SampleScan { .. } | PhysicalPlan::ParallelSampleScan { .. } => {
             super::sampling::open(db, txn, plan)
         }
+        PhysicalPlan::SpatialScan {
+            table,
+            index,
+            query_probe,
+            filter,
+            ..
+        } => open_spatial_scan(db, txn, table, index, query_probe, filter),
         PhysicalPlan::FulltextScan { .. } => fulltext_stream::open(db, txn, plan),
         PhysicalPlan::RrfFusion { .. } => super::hybrid::open_plan(db, txn, plan),
         PhysicalPlan::CteScan { .. } => open_cte_scan_stream(plan),

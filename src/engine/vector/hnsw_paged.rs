@@ -658,7 +658,7 @@ impl QueryNavScratch {
             .peek()
             .map(|item| item.dist)
             .unwrap_or(f64::INFINITY);
-        if scored.dist == furthest && furthest != 0.0 {
+        if scored.dist == furthest {
             reserve_query_heap(&mut self.frontier, &mut self.charge)?;
             self.frontier.push(Reverse(scored));
         } else if scored.dist < furthest {
@@ -2206,7 +2206,7 @@ impl PagedHnsw {
                 Ordering::Release,
             );
             if self.file.navigation_quantization().is_none()
-                || self.file.meta().nav_exact_nodes != 0
+                || self.file.meta().nav_exact_nodes > count / 8
             {
                 self.invalidate_query_navigation();
                 self.file.recalibrate_navigation(vector)?;
@@ -2597,19 +2597,25 @@ impl PagedHnsw {
                     building.store(false, Ordering::Release);
                     return;
                 }
+                let epoch = epoch_source.load(Ordering::Acquire);
                 if file.prepare_navigation_mapping().unwrap_or(false) {
-                    requested.store(false, Ordering::Release);
+                    requested.store(
+                        epoch_source.load(Ordering::Acquire) != epoch,
+                        Ordering::Release,
+                    );
                     building.store(false, Ordering::Release);
                     return;
                 }
-                let epoch = epoch_source.load(Ordering::Acquire);
                 if let Ok(Some(arena)) = Self::build_query_navigation_for(&file, m0, epoch) {
                     let mut published = query_nav.write();
                     if epoch_source.load(Ordering::Acquire) == epoch {
                         *published = Some(Arc::new(arena));
                     }
                 }
-                requested.store(false, Ordering::Release);
+                requested.store(
+                    epoch_source.load(Ordering::Acquire) != epoch,
+                    Ordering::Release,
+                );
                 building.store(false, Ordering::Release);
             })
         });
@@ -2627,6 +2633,8 @@ impl PagedHnsw {
     fn invalidate_query_topology(&self) {
         let _arena = self.query_nav.write();
         self.query_nav_epoch.fetch_add(1, Ordering::AcqRel);
+        self.query_nav_rebuild_requested
+            .store(true, Ordering::Release);
     }
 
     pub(crate) fn record_build_stats(&self, stats: HnswBuildStats) {
@@ -3727,7 +3735,7 @@ impl PagedHnsw {
                         .peek()
                         .map(|x| x.dist)
                         .unwrap_or(f64::INFINITY);
-                    if explore_ties && d == furthest && (d != 0.0 || self.metric == Metric::Dot) {
+                    if explore_ties && d == furthest {
                         scratch.frontier.push(Reverse(s));
                     } else if d < furthest {
                         if admits(nb)? {
@@ -3769,13 +3777,16 @@ impl PagedHnsw {
                 .map(|candidate| store.mapped_codes(candidate.id, mapping))
                 .collect();
             if let Some(codes) = codes {
-                let selected =
-                    super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, j| {
+                let selected = super::hnsw_core::select_diverse_recent_ties_by(
+                    0..candidates.len(),
+                    m,
+                    |i, j| {
                         let (a, na) = codes[i];
                         let (b, nb) = codes[j];
                         let pair = (na + nb - 2 * dot_i8(a, b)) as f64 * params.dist_mul as f64;
                         Ok::<_, QueryError>((pair < candidates[i].dist, pair == 0.0))
-                    })?;
+                    },
+                )?;
                 return Ok(selected.into_iter().map(|i| candidates[i]).collect());
             }
         }
@@ -3808,7 +3819,7 @@ impl PagedHnsw {
                     self.dist_nodes(a, b, scratch)
                 });
             }
-            return super::hnsw_core::select_diverse_ties_by(
+            return super::hnsw_core::select_diverse_recent_ties_by(
                 candidates.iter().copied(),
                 m,
                 |a, b| {
@@ -3864,15 +3875,16 @@ impl PagedHnsw {
                 Source::Missing
             });
         }
-        let selected = super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, r| {
-            let pair = match (parts(&sources[i], arena), parts(&sources[r], arena)) {
-                (Some((a, na)), Some((b, nb))) => {
-                    (na + nb - 2 * dot_i8(a, b)) as f64 * arena.dist_mul as f64
-                }
-                _ => return Ok::<_, QueryError>((false, false)),
-            };
-            Ok((pair < candidates[i].dist, pair == 0.0))
-        })?;
+        let selected =
+            super::hnsw_core::select_diverse_recent_ties_by(0..candidates.len(), m, |i, r| {
+                let pair = match (parts(&sources[i], arena), parts(&sources[r], arena)) {
+                    (Some((a, na)), Some((b, nb))) => {
+                        (na + nb - 2 * dot_i8(a, b)) as f64 * arena.dist_mul as f64
+                    }
+                    _ => return Ok::<_, QueryError>((false, false)),
+                };
+                Ok((pair < candidates[i].dist, pair == 0.0))
+            })?;
         Ok(selected.into_iter().map(|i| candidates[i]).collect())
     }
 
@@ -3898,11 +3910,12 @@ impl PagedHnsw {
             .iter()
             .map(|c| arena.ord_of(c.id).unwrap())
             .collect();
-        let selected = super::hnsw_core::select_diverse_ties_by(0..candidates.len(), m, |i, j| {
-            let pair = arena.ssd_nodes(ordinals[i], ordinals[j]);
-            Ok::<_, std::convert::Infallible>((pair < candidates[i].dist, pair == 0.0))
-        })
-        .unwrap();
+        let selected =
+            super::hnsw_core::select_diverse_recent_ties_by(0..candidates.len(), m, |i, j| {
+                let pair = arena.ssd_nodes(ordinals[i], ordinals[j]);
+                Ok::<_, std::convert::Infallible>((pair < candidates[i].dist, pair == 0.0))
+            })
+            .unwrap();
         Some(selected.into_iter().map(|i| candidates[i]).collect())
     }
 
@@ -4674,19 +4687,22 @@ impl PagedHnsw {
             entry,
             ef,
         )?;
-        Ok(Some(
-            found
-                .into_iter()
-                .filter(|&id| !arena.deleted[id])
-                .take(k)
-                .map(|id| {
-                    (
-                        arena.rows[id],
-                        arena.distance(&scratch.qcodes, scratch.qnorm, id),
-                    )
-                })
-                .collect(),
-        ))
+        let mut exact = Vec::with_capacity(found.len());
+        let mut vector = Vec::with_capacity(query.len());
+        for id in found {
+            if arena.deleted[id] {
+                continue;
+            }
+            if let Some((row, false)) = self
+                .file
+                .read_vector_meta_into(arena.vids[id], &mut vector)?
+            {
+                exact.push((row, ordering_distance(query, &vector, self.metric)));
+            }
+        }
+        exact.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+        exact.truncate(k);
+        Ok(Some(exact))
     }
 
     /// Advance a bounded navigation slice. Candidate distances may be SQ8
@@ -6040,7 +6056,7 @@ mod source_audit_tests {
         }
     }
     #[test]
-    fn source_audit_b6_recalibration_restores_navigation() {
+    fn source_audit_b6_recalibration_preserves_outlier_exact_navigation() {
         let (_dir, file) = crate::storage::source_audit_vector_file();
         let graph = PagedHnsw::new(file);
         for n in 0..64 {
@@ -6059,11 +6075,9 @@ mod source_audit_tests {
             graph.search(&[20000.0, 20000.0], 1, 100).unwrap()[0],
             (row(65), 0.0)
         );
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !graph.has_query_navigation_for_test() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert!(graph.has_query_navigation_for_test());
+        // A few outliers must retain lossless navigation rather than forcing
+        // a global calibration that erases the ordinary neighborhood.
+        assert!(graph.file.meta().nav_exact_nodes > 0);
         assert_eq!(
             graph.search(&[20000.0, 20000.0], 1, 100).unwrap()[0],
             (row(65), 0.0)

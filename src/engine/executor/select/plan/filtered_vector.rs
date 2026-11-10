@@ -77,8 +77,8 @@ pub(super) fn execute_filtered_vector_topk(
     let mut charge = VectorQueryCharge::try_new(0)?;
     let mut best: BinaryHeap<Scored<(u64, RowId)>> = BinaryHeap::new();
     let mut selection = None;
-    let heap_required = db.vector_snapshot_requires_exact(txn)
-        || db.xa_status_counters().0 > 0
+    let heap_required = db.vector_snapshot_requires_exact(&table.schema, txn)
+        || db.vector_table_has_prepared_writes(&table.schema)
         || db.scan_storage_ids(&table.schema).iter().any(|sid| {
             !db.pending_vector_upsert_row_ids(txn.txn_id, table.schema.id, *sid)
                 .is_empty()
@@ -320,7 +320,7 @@ pub(super) fn execute_filtered_vector_topk(
     // A commit or cold rebuild can advance the index coverage floor after
     // the initial snapshot check. Its new ordering cannot rank an older
     // visible vector version, even if the cursor opened the new graph cleanly.
-    if !heap_required && (db.vector_snapshot_requires_exact(txn) || db.xa_status_counters().0 > 0) {
+    if !heap_required && (db.vector_snapshot_requires_exact(&table.schema, txn) || db.vector_table_has_prepared_writes(&table.schema)) {
         drop(selection.take());
         best.clear();
         stats.fallbacks = stats.fallbacks.max(1);

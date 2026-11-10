@@ -33,6 +33,9 @@ fn rows(engine: &StorageQueryEngine, sql: &str) -> Vec<Vec<String>> {
 fn sqlaudit_zone_options_do_not_consume_query_identifiers() {
     let (_dir, engine) = setup(&[
         "CREATE TABLE zone_map(zone_size INT, zone_map INT)",
+        "CREATE TABLE zlike LIKE zone_map",
+        "CREATE TABLE zctas ZONE_MAP=ON ZONE_SIZE=128K AS SELECT 7 AS zone_map",
+        "CREATE TABLE IF NOT EXISTS test.zone_size ZONE_MAP=OFF AS SELECT 9 AS zone_size",
         "INSERT INTO zone_map VALUES(1,2),(2,3)",
         "CREATE VIEW zview AS SELECT COUNT(*) AS n FROM zone_map",
         "CREATE TABLE zcopy AS SELECT COUNT(*) AS n FROM zone_map",
@@ -52,6 +55,12 @@ fn sqlaudit_zone_options_do_not_consume_query_identifiers() {
             "SELECT CONCAT('x'),zone_size FROM zone_map WHERE zone_map=2"
         ),
         vec![vec!["x", "1"]]
+    );
+    assert_eq!(rows(&engine, "SELECT COUNT(*) FROM zlike"), vec![vec!["0"]]);
+    assert_eq!(rows(&engine, "SELECT zone_map FROM zctas"), vec![vec!["7"]]);
+    assert_eq!(
+        rows(&engine, "SELECT zone_size FROM zone_size"),
+        vec![vec!["9"]]
     );
     engine
         .execute("ALTER TABLE zone_map ZONE_SIZE=128K")

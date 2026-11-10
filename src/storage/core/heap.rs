@@ -1215,7 +1215,7 @@ impl HeapFile {
             // Bound tail-page waste by choosing private ranges only for
             // substantial byte batches. Tiny inserts continue to fill the
             // existing tail, independent of SQL shape or table/index types.
-            if reduced || payload_bytes >= 8 * PAGE_SIZE {
+            if (reduced || payload_bytes >= 8 * PAGE_SIZE) && self.free_pages.is_empty() {
                 return self.insert_mvcc_batch_pre_encoded_inner(
                     txn_id,
                     payloads,
@@ -1278,6 +1278,7 @@ impl HeapFile {
             self.read_page_for_modify(page_id)?
         };
         let mut touched_pages = BTreeMap::new();
+        let mut reused_pages = Vec::new();
         let mut row_ids = Vec::with_capacity(rows.len());
         let mut wal_inserts = Vec::with_capacity(rows.len());
 
@@ -1304,22 +1305,47 @@ impl HeapFile {
                 Some(slot_id) => slot_id,
                 None => {
                     touched_pages.insert(page_id, page);
-                    let next_count = page_count
-                        .checked_add(1)
-                        .filter(|count| *count <= u64::from(u32::MAX) + 1)
-                        .ok_or_else(|| {
-                            error(
-                                crate::error::catalog::ER_TOO_BIG_ROWSIZE,
-                                "heap row-id address space exhausted",
-                            )
-                        })?;
-                    page_id = page_count;
-                    page_count = next_count;
-                    take_latch_for!(page_id);
-                    page = Page::new();
-                    append_only_page = true;
-                    page.insert_append_only_with_reserve(&payload, 0)
-                        .expect("fresh page should have enough space")
+                    loop {
+                        // Reclaimed slots are useful to multi-row INSERT too.
+                        // Stage reused pages in the same atomic WAL batch.
+                        if let Some(reclaimed) = self.free_pages.take() {
+                            let reclaimed = u64::from(reclaimed);
+                            if reclaimed + 1 >= old_page_count
+                                || touched_pages.contains_key(&reclaimed)
+                            {
+                                continue;
+                            }
+                            take_latch_for!(reclaimed);
+                            page_id = reclaimed;
+                            page = self.read_page_for_modify(page_id)?;
+                            append_only_page = false;
+                            if let Some(slot) =
+                                page.insert_with_reserve(&payload, self.update_reserve_bytes)
+                            {
+                                reused_pages.push(page_id as u32);
+                                break slot;
+                            }
+                            touched_pages.insert(page_id, page);
+                            continue;
+                        }
+                        let next_count = page_count
+                            .checked_add(1)
+                            .filter(|count| *count <= u64::from(u32::MAX) + 1)
+                            .ok_or_else(|| {
+                                error(
+                                    crate::error::catalog::ER_TOO_BIG_ROWSIZE,
+                                    "heap row-id address space exhausted",
+                                )
+                            })?;
+                        page_id = page_count;
+                        page_count = next_count;
+                        take_latch_for!(page_id);
+                        page = Page::new();
+                        append_only_page = true;
+                        break page
+                            .insert_append_only_with_reserve(&payload, 0)
+                            .expect("fresh page should have enough space");
+                    }
                 }
             };
             let row_id = RowId {
@@ -1345,6 +1371,9 @@ impl HeapFile {
         }
         self.write_heap_insert_batch_logged(txn_id, wal_inserts, touched_pages, false, None)?;
         drop(latches);
+        for page_id in reused_pages {
+            self.free_pages.offer(page_id);
+        }
         Ok(row_ids)
     }
 
@@ -7118,6 +7147,10 @@ impl Page {
         };
         if slot.flags & ROW_FLAG_FREE != 0 || slot.len == 0 {
             return false;
+        }
+        // INSERT compensation tombstones the slot directory itself.
+        if slot.flags & ROW_FLAG_DELETED != 0 {
+            return true;
         }
         let start = slot.offset as usize;
         let end = start + slot.len as usize;

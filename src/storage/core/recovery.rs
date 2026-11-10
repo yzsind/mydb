@@ -718,6 +718,10 @@ fn recover_from_wal_with_options(
                                 "invalid spatial undo path",
                             ));
                         }
+                        // The heap is authoritative. A missing/corrupt derived
+                        // tree cannot prevent undo; fence it for startup repair.
+                        let inverse = spatial_index::decode_inverse(bytes)?;
+                        let undo_result = (|| -> Result<(), QueryError> {
                         if !spatial_files.contains_key(path) {
                             if spatial_files.len() >= 64 {
                                 if let Some((_, file)) = spatial_files.pop_first() {
@@ -746,7 +750,20 @@ fn recover_from_wal_with_options(
                         spatial_files
                             .get(path)
                             .expect("opened spatial undo file")
-                            .apply(0, spatial_index::decode_inverse(bytes)?)?;
+                            .apply(0, inverse)?;
+                            Ok(())
+                        })();
+                        if let Err(err) = undo_result {
+                            if !err.is_any(&[crate::error::catalog::ER_INDEX_CORRUPT, crate::error::catalog::ER_GET_ERRNO]) {
+                                return Err(err);
+                            }
+                            spatial_files.remove(path);
+                            let marker = data_dir.join(path).with_extension("rtree.corrupt");
+                            if let Some(parent) = marker.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+                            let file = File::create(&marker).map_err(io_err)?;
+                            file.sync_all().map_err(io_err)?;
+                            crate::platform::fs::sync_path(marker.parent().expect("index directory")).map_err(io_err)?;
+                        }
                     }
                     log.lock().append(
                         txn_id,
@@ -815,7 +832,7 @@ fn recover_from_wal_with_options(
                 } => {
                     let page_id_u64 = *page_id as u64;
                     let clr_lsn = log.lock().reserve_lsn()?;
-                    redo_heap_delete(data_dir, path, clr_lsn, page_id_u64, *slot_id)?;
+                    undo_heap_insert_slot(data_dir, path, clr_lsn, page_id_u64, *slot_id)?;
                     log.lock().append_reserved(
                         clr_lsn,
                         txn_id,
@@ -2141,6 +2158,24 @@ fn redo_slot_reclaim(
     }
 }
 
+fn undo_heap_insert_slot(
+    data_dir: &Path,
+    relative: &str,
+    lsn: u64,
+    page_id: u64,
+    slot_id: u16,
+) -> Result<(), QueryError> {
+    let Some(mut page) = read_recovery_heap_page_below_lsn(data_dir, relative, page_id, lsn)?
+    else {
+        return Ok(());
+    };
+    if page.read(slot_id).is_some() {
+        page.delete(slot_id)?;
+    }
+    page.try_reclaim_deleted_for_recovery(slot_id);
+    write_recovery_heap_page(data_dir, relative, page_id, lsn, page)
+}
+
 fn redo_heap_delete_batch_page(
     data_dir: &Path,
     relative: &str,
@@ -2156,6 +2191,7 @@ fn redo_heap_delete_batch_page(
         if page.read(insert.slot_id).is_some() {
             page.delete(insert.slot_id)?;
         }
+        page.try_reclaim_deleted_for_recovery(insert.slot_id);
     }
     write_recovery_heap_page(data_dir, relative, page_id, lsn, page)
 }

@@ -728,3 +728,58 @@ fn fixture_sync_batch_is_private_joined_and_removed_on_unwind() {
     assert!(result.is_err());
     assert!(private_sync::root_for(&path).is_none());
 }
+
+/// Resolve the file actually opened, rather than a pathname that can be
+/// replaced between authorization and open. Callers must validate the result.
+pub(crate) fn path_for_open_file(file: &File) -> io::Result<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        std::fs::read_link(format!("/proc/self/fd/{}", file.as_raw_fd()))
+    }
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::ffi::OsStrExt;
+        let mut path = [0u8; libc::PATH_MAX as usize];
+        // SAFETY: the descriptor is live and F_GETPATH writes at most PATH_MAX bytes.
+        if unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETPATH, path.as_mut_ptr()) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let len = path
+            .iter()
+            .position(|byte| *byte == 0)
+            .ok_or_else(|| io::Error::other("unterminated file path"))?;
+        Ok(Path::new(std::ffi::OsStr::from_bytes(&path[..len])).to_path_buf())
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+        use windows_sys::Win32::Storage::FileSystem::GetFinalPathNameByHandleW;
+        let mut buffer = vec![0u16; 32768];
+        // SAFETY: file owns the handle and the output buffer has the given length.
+        let len = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buffer.as_mut_ptr(),
+                buffer.len() as u32,
+                0,
+            )
+        } as usize;
+        if len == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if len >= buffer.len() {
+            return Err(io::Error::other("opened file path is too long"));
+        }
+        Ok(std::ffi::OsString::from_wide(&buffer[..len]).into())
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+    {
+        let _ = file;
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "opened file path resolution is unavailable",
+        ))
+    }
+}
