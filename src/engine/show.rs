@@ -404,6 +404,22 @@ pub(crate) fn show_databases(
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }
 
+fn require_show_database(db: &Database, database: &str) -> Result<(), QueryError> {
+    if database.is_empty() {
+        return Err(crate::storage::error(
+            crate::error::catalog::ER_NO_DB_ERROR,
+            "No database selected",
+        ));
+    }
+    if !db.database_exists(database) {
+        return Err(crate::storage::error(
+            crate::error::catalog::ER_BAD_DB_ERROR,
+            format!("Unknown database '{database}'"),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn show_tables(
     db: &Database,
     session: &SessionContext,
@@ -411,6 +427,7 @@ pub(crate) fn show_tables(
     full: bool,
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
+    require_show_database(db, database)?;
     let columns = show_tables_columns(database, full);
     if let Some(rows) = crate::engine::information_schema::show_tables_rows(db, database, full) {
         let mut rows = rows;
@@ -522,6 +539,7 @@ pub(crate) fn show_table_status(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
+    require_show_database(db, database)?;
     let columns = show_table_status_columns();
     let mut rows = Vec::new();
 
@@ -1220,6 +1238,7 @@ pub(crate) fn show_triggers(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
+    require_show_database(db, database)?;
     let columns = show_triggers_columns();
     let mut trigger_list = db.triggers_in_database(database);
     if database.eq_ignore_ascii_case("sys") {
@@ -1366,22 +1385,7 @@ pub(crate) fn show_events(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
-    if database.is_empty() {
-        return Err(crate::storage::error(
-            crate::error::catalog::ER_NO_DB_ERROR,
-            "No database selected",
-        ));
-    }
-    if !db
-        .catalog()
-        .databases
-        .contains_key(&crate::storage::normalize_name(database))
-    {
-        return Err(crate::storage::error(
-            crate::error::catalog::ER_BAD_DB_ERROR,
-            format!("Unknown database '{database}'"),
-        ));
-    }
+    require_show_database(db, database)?;
     let columns = show_events_columns();
     // G11: MySQL only lists events in schemas where the caller holds the
     // EVENT privilege; otherwise the result is empty (not an error).
@@ -1778,7 +1782,9 @@ pub(crate) fn show_sequences(
     database: Option<&str>,
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
-    let target_db = crate::storage::normalize_name(database.unwrap_or(&session.current_database));
+    let database = database.unwrap_or(&session.current_database);
+    require_show_database(db, database)?;
+    let target_db = crate::storage::normalize_name(database);
     let label = format!("Sequences_in_{target_db}");
     let columns = vec![col(&label, ColumnType::VarString)];
     let mut rows: Vec<Vec<Value>> = db

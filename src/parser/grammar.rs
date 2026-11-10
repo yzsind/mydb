@@ -29,3 +29,7 @@ pub(super) use users::parse_user_statement;
 
 mod privileges;
 pub(super) use privileges::{parse_definer, parse_privilege_statement};
+
+mod show;
+pub(crate) use show::validate_show_profile;
+pub(super) use show::{parse_show_engine, parse_show_profile};

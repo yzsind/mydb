@@ -437,7 +437,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             global,
             session,
         } => Ok(Statement::ShowVariables {
-            scope: show_scope(session, global),
+            scope: show_scope(session, global)?,
             filter: convert_show_filter(filter)?,
         }),
         SqlStatement::ShowStatus {
@@ -445,7 +445,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             global,
             session,
         } => Ok(Statement::ShowStatus {
-            scope: show_scope(session, global),
+            scope: show_scope(session, global)?,
             filter: convert_show_filter(filter)?,
         }),
         SqlStatement::ExplainTable {
@@ -7502,12 +7502,17 @@ fn show_options_filter(options: &ShowStatementOptions) -> Result<Option<ShowFilt
     }
 }
 
-fn show_scope(session: bool, global: bool) -> ShowScope {
-    if global && !session {
+fn show_scope(session: bool, global: bool) -> Result<ShowScope, ParseError> {
+    if session && global {
+        return Err(parse_error_at_zero(
+            "SHOW accepts only one GLOBAL or SESSION scope",
+        ));
+    }
+    Ok(if global {
         ShowScope::Global
     } else {
         ShowScope::Session
-    }
+    })
 }
 
 #[derive(Default)]

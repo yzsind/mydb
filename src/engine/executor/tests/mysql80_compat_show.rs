@@ -1115,3 +1115,146 @@ fn show_global_status_handler_counters_track_dml() {
         "Handler_commit should advance on the autocommit INSERT ({commit_before} -> {commit_after})"
     );
 }
+
+#[test]
+fn show_audit_database_validation_preserves_empty_and_system_schemas() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(&engine, &mut session, "CREATE DATABASE show_audit_empty").unwrap();
+    for noun in [
+        "TABLES",
+        "FULL TABLES",
+        "TABLE STATUS",
+        "TRIGGERS",
+        "SEQUENCES",
+        "EVENTS",
+    ] {
+        let sql = format!("SHOW {noun} FROM no_such_show_audit_db");
+        let err = exec(&engine, &mut session, &sql).unwrap_err();
+        assert_eq!(err.code(), 1049, "{sql}: {err:?}");
+        assert!(err.message().contains("no_such_show_audit_db"));
+        let sql = format!("SHOW {noun} FROM SHOW_AUDIT_EMPTY LIKE '%'");
+        let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, &sql).unwrap() else {
+            panic!("{sql}");
+        };
+        assert!(rs.rows.is_empty(), "{sql}");
+        for database in ["information_schema", "performance_schema", "mysql", "sys"] {
+            exec(
+                &engine,
+                &mut session,
+                &format!("SHOW {noun} FROM {database}"),
+            )
+            .unwrap();
+        }
+        session.current_database.clear();
+        let sql = format!("SHOW {noun}");
+        assert_eq!(
+            exec(&engine, &mut session, &sql).unwrap_err().code(),
+            1046,
+            "{sql}"
+        );
+        session.current_database = "test".into();
+    }
+    let QueryResponse::ResultSet(rs) = exec(
+        &engine,
+        &mut session,
+        "SHOW OPEN TABLES FROM no_such_show_audit_db",
+    )
+    .unwrap() else {
+        panic!("expected result set");
+    };
+    assert!(rs.rows.is_empty());
+}
+
+#[test]
+fn show_audit_index_uses_second_database() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE DATABASE show_audit_first",
+        "CREATE DATABASE show_audit_second",
+        "CREATE TABLE show_audit_first.t (id INT PRIMARY KEY)",
+        "CREATE TABLE show_audit_second.t (id INT, KEY idx_second (id))",
+    ] {
+        exec(&engine, &mut session, sql).unwrap();
+    }
+    for sql in [
+        "SHOW INDEX FROM show_audit_first.t FROM show_audit_second",
+        "SHOW KEYS IN missing_show_audit_db.t IN show_audit_second WHERE Key_name = 'idx_second'",
+    ] {
+        let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, sql).unwrap() else {
+            panic!("expected result set");
+        };
+        assert_eq!(rs.rows.len(), 1, "{sql}");
+        assert_eq!(rs.rows[0][2], Value::String("idx_second".into()));
+    }
+}
+
+#[test]
+fn show_audit_profile_validates_execution_and_prepare() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for sql in [
+        "SHOW PROFILES",
+        "SHOW PROFILE",
+        "SHOW PROFILE CPU, BLOCK IO, CONTEXT SWITCHES, PAGE FAULTS, IPC, SWAPS, SOURCE, MEMORY, ALL FOR QUERY 1 LIMIT 2 OFFSET 1",
+        "SHOW PROFILE FOR QUERY 0",
+        "SHOW PROFILE FOR QUERY 2147483647",
+        "SHOW PROFILE LIMIT 18446744073709551615",
+        "SHOW PROFILE LIMIT 1, 2",
+        "SHOW PROFILE CPU /* comment */ LIMIT 0",
+        "SHOW/* comment */PROFILE CPU,IPC FOR/* comment */QUERY 1 LIMIT 0; /* tail */",
+    ] {
+        let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, sql).unwrap() else {
+            panic!("{sql}");
+        };
+        assert!(rs.rows.is_empty(), "{sql}");
+        assert_eq!(engine.describe_prepared_statement(&mut session, sql).unwrap(), rs.columns, "{sql}");
+    }
+    for sql in [
+        "SHOW PROFILE CPU BLKXJUNK",
+        "SHOW PROFILE CPU MEMORY",
+        "SHOW PROFILE CPU,",
+        "SHOW PROFILE FOR QUERY",
+        "SHOW PROFILE FOR QUERY -1",
+        "SHOW PROFILE FOR QUERY 2147483648",
+        "SHOW PROFILE LIMIT -1",
+        "SHOW PROFILE LIMIT 1.5",
+        "SHOW PROFILE LIMIT 18446744073709551616",
+        "SHOW PROFILE OFFSET 1",
+        "SHOW PROFILE LIMIT 1 OFFSET",
+        "SHOW PROFILE LIMIT 1, 2 OFFSET 3",
+        "SHOW PROFILE BLOCK",
+        "SHOW PROFILE 'CPU'",
+        "SHOW PROFILE ALL JUNK",
+    ] {
+        assert_eq!(
+            exec(&engine, &mut session, sql).unwrap_err().code(),
+            1064,
+            "{sql}"
+        );
+        assert_eq!(
+            engine
+                .describe_prepared_statement(&mut session, sql)
+                .unwrap_err()
+                .code(),
+            1064,
+            "{sql}"
+        );
+    }
+    for sql in ["SHOW PROFILEXYZ", "SHOW PROFILE2"] {
+        assert!(exec(&engine, &mut session, sql).is_err(), "{sql}");
+        assert!(
+            engine
+                .describe_prepared_statement(&mut session, sql)
+                .is_err(),
+            "{sql}"
+        );
+    }
+}

@@ -37,7 +37,7 @@ impl AdminCommand {
     fn from_normalized(sql: &str) -> Option<Self> {
         Self::exact(sql).or_else(|| {
             Some(match sql {
-                _ if sql.starts_with("SHOW PROFILE") => Self::Profile,
+                _ if sql.starts_with("SHOW PROFILE ") => Self::Profile,
                 _ if sql.starts_with("SHOW BINLOG EVENTS") => Self::BinlogEvents,
                 _ if sql.starts_with("PURGE BINARY LOGS TO ") => {
                     Self::PurgeTo("PURGE BINARY LOGS TO")
@@ -64,12 +64,17 @@ impl AdminCommand {
     }
 
     pub(super) fn parse(sql: &str) -> Result<Self, QueryError> {
-        Self::classify(sql).ok_or_else(|| {
+        let command = Self::classify(sql).ok_or_else(|| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!("unsupported binary log admin statement: {sql}"),
             )
-        })
+        })?;
+        if command == Self::Profile {
+            crate::parser::validate_show_profile(sql)
+                .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.message))?;
+        }
+        Ok(command)
     }
 
     pub(super) fn columns(self) -> Vec<Column> {

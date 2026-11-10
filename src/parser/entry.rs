@@ -1648,6 +1648,12 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
             });
         }
         if head_is(b"SHOW") {
+            if let Some(statement) = parse_show_profile(sql)? {
+                return Ok(statement);
+            }
+            if let Some(statement) = parse_show_engine(sql)? {
+                return Ok(statement);
+            }
             if let Some(statement) = parse_manual_show_create_database_statement(sql)? {
                 return Ok(statement);
             }
@@ -1663,7 +1669,7 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
             if let Some(statement) = parse_manual_show_open_tables_statement(sql)? {
                 return Ok(statement);
             }
-            if let Some(statement) = parse_manual_show_local_scope_statement(sql)? {
+            if let Some(statement) = parse_manual_show_scope_statement(sql)? {
                 return Ok(statement);
             }
             reject_invalid_show_mydb_memory(sql)?;

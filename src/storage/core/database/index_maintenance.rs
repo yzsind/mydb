@@ -78,6 +78,35 @@ impl Drop for IndexSortTmpDir {
 
 struct IndexSpillReadFile(File);
 
+/// Merge inputs advance independently. On macOS, automatic read-ahead can
+/// repeatedly fetch megabytes for each small refill when many runs compete
+/// for the file cache. Let the explicitly budgeted buffer control read size.
+fn open_index_sort_run(
+    path: &Path,
+    capacity: usize,
+) -> Result<std::io::BufReader<IndexSpillReadFile>, QueryError> {
+    let file = File::open(path).map_err(io_err)?;
+    #[cfg(target_os = "macos")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: file owns a live descriptor; F_RDAHEAD affects only this fd.
+        // This is a best-effort performance hint, never a correctness premise.
+        unsafe { libc::fcntl(file.as_raw_fd(), libc::F_RDAHEAD, 0) };
+    }
+    // Small runs need no full-sized allocation (notably final tail runs).
+    let capacity = capacity.max(1).min(
+        file.metadata()
+            .map_err(io_err)?
+            .len()
+            .max(1)
+            .min(usize::MAX as u64) as usize,
+    );
+    Ok(std::io::BufReader::with_capacity(
+        capacity,
+        IndexSpillReadFile(file),
+    ))
+}
+
 impl Read for IndexSpillReadFile {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
         let started = Instant::now();
@@ -364,8 +393,12 @@ fn validate_unique_memory_entries(
 impl IndexEntryRunMerger {
     fn open(run_set: IndexEntryRunSet) -> Result<Self, QueryError> {
         let IndexEntryRunSet { tmp, runs } = run_set;
-        let runs =
-            consolidate_sort_runs::<IndexEntryRunCodec>(&tmp.path, runs, index_merge_fan_in())?;
+        let runs = consolidate_sort_runs::<IndexEntryRunCodec>(
+            &tmp.path,
+            runs,
+            index_merge_fan_in(),
+            8 * 1024,
+        )?;
         let mut readers = Vec::with_capacity(runs.len());
         let mut heads = Vec::with_capacity(runs.len());
         for path in runs {
@@ -621,7 +654,7 @@ trait IndexSortRunCodec {
     type Reader;
     type Writer;
 
-    fn open_reader(path: &Path) -> Result<Self::Reader, QueryError>;
+    fn open_reader(path: &Path, read_buffer_bytes: usize) -> Result<Self::Reader, QueryError>;
     fn next_entry(reader: &mut Self::Reader) -> Result<Option<Self::Entry>, QueryError>;
     fn create_writer(path: &Path) -> Result<Self::Writer, QueryError>;
     fn append(writer: &mut Self::Writer, entry: &Self::Entry) -> Result<(), QueryError>;
@@ -635,7 +668,7 @@ impl IndexSortRunCodec for IndexEntryRunCodec {
     type Reader = IndexEntryRunReader;
     type Writer = IndexEntryRunWriter;
 
-    fn open_reader(path: &Path) -> Result<Self::Reader, QueryError> {
+    fn open_reader(path: &Path, _read_buffer_bytes: usize) -> Result<Self::Reader, QueryError> {
         IndexEntryRunReader::open(path)
     }
 
@@ -672,6 +705,7 @@ fn index_merge_fan_in() -> usize {
 fn merge_sort_run_group<C: IndexSortRunCodec>(
     paths: &[PathBuf],
     output: &Path,
+    read_buffer_bytes: usize,
 ) -> Result<(), QueryError> {
     let mut readers = Vec::with_capacity(paths.len());
     let mut heap = BinaryHeap::with_capacity(paths.len());
@@ -679,7 +713,7 @@ fn merge_sort_run_group<C: IndexSortRunCodec>(
         if let Ok(meta) = fs::metadata(path) {
             record_spill_bytes_read(meta.len());
         }
-        let mut reader = C::open_reader(path)?;
+        let mut reader = C::open_reader(path, read_buffer_bytes)?;
         let Some(entry) = C::next_entry(&mut reader)? else {
             continue;
         };
@@ -716,6 +750,7 @@ fn consolidate_sort_runs<C: IndexSortRunCodec>(
     tmp_dir: &Path,
     mut runs: Vec<PathBuf>,
     fan_in: usize,
+    read_buffer_bytes: usize,
 ) -> Result<Vec<PathBuf>, QueryError> {
     debug_assert!(fan_in >= 2);
     let mut pass = 0usize;
@@ -727,7 +762,7 @@ fn consolidate_sort_runs<C: IndexSortRunCodec>(
                 continue;
             }
             let output = tmp_dir.join(format!("merge-{pass}-{group}"));
-            merge_sort_run_group::<C>(paths, &output)?;
+            merge_sort_run_group::<C>(paths, &output, read_buffer_bytes)?;
             next.push(output);
         }
         runs = next;
