@@ -320,7 +320,10 @@ pub(super) fn execute_filtered_vector_topk(
     // A commit or cold rebuild can advance the index coverage floor after
     // the initial snapshot check. Its new ordering cannot rank an older
     // visible vector version, even if the cursor opened the new graph cleanly.
-    if !heap_required && (db.vector_snapshot_requires_exact(&table.schema, txn) || db.vector_table_has_prepared_writes(&table.schema)) {
+    if !heap_required
+        && (db.vector_snapshot_requires_exact(&table.schema, txn)
+            || db.vector_table_has_prepared_writes(&table.schema))
+    {
         drop(selection.take());
         best.clear();
         stats.fallbacks = stats.fallbacks.max(1);

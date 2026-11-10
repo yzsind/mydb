@@ -5138,7 +5138,8 @@ impl UndoManager {
             if creator_rolled_back {
                 match &removed.kind {
                     UndoKind::Insert => reclaim_targets.push((removed.table_id, removed.row_id)),
-                    UndoKind::InsertBatch { row_ids } => reclaim_targets.extend(row_ids.iter().map(|row_id| (removed.table_id, *row_id))),
+                    UndoKind::InsertBatch { row_ids } => reclaim_targets
+                        .extend(row_ids.iter().map(|row_id| (removed.table_id, *row_id))),
                     _ => {}
                 }
             }

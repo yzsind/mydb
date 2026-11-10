@@ -6271,7 +6271,9 @@ pub(super) fn execute_vector_index_scan(
     // A recovered/sealed graph contains physical current vectors. Prepared
     // writers may instead expose older vectors (or deleted rows) through undo;
     // those rows need not occur in the ANN candidate pool at all.
-    if db.vector_table_has_prepared_writes(&table.schema) || db.vector_snapshot_requires_exact(&table.schema, txn) {
+    if db.vector_table_has_prepared_writes(&table.schema)
+        || db.vector_snapshot_requires_exact(&table.schema, txn)
+    {
         if order_by.len() > 1 {
             return execute_ordered_vector_fallback(
                 db, txn, table, filter, order_by, k, projection,

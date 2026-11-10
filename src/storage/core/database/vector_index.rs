@@ -1765,7 +1765,6 @@ impl Database {
                 )
                 .map(|_| Vec::new())
             };
-            drop(next);
             let drain_result = (|| -> Result<(), QueryError> {
                 if result.is_err() {
                     return Ok(());

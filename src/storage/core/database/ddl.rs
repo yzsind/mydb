@@ -8356,6 +8356,8 @@ impl Database {
                 let mut attempts = 0;
                 loop {
                     Self::check_alter_copy_cancelled(&job)?;
+                    // Catch up while writers are still admitted. Final-tail
+                    // time and byte limits apply only after taking X below.
                     self.replay_online_copy_rows(
                         &old_table,
                         &shadow_table,
@@ -8364,7 +8366,7 @@ impl Database {
                         &mut mapping,
                         strict,
                         &mut warnings,
-                        Some(online_copy_deadline()),
+                        None,
                     )?;
                     self.flush_online_copy_shadow(&shadow_table)?;
                     self.flush_online_copy_shadow(&old_table)?;

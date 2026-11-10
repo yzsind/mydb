@@ -2980,9 +2980,11 @@ fn fused_count_dual_covering_index_spills_under_tight_budget() {
 
     assert_eq!(actual, expected);
     assert_eq!(tight.used(), 0, "spilled query leaked its memory charge");
-    assert!(
-        parallel_after > parallel_before,
-        "governed Grace replay must use more than one partition worker"
+    // Two large partitions cannot share this grant without recursive spill.
+    // Replay sizing must preserve the grant by choosing serial execution.
+    assert_eq!(
+        parallel_after, parallel_before,
+        "oversized partitions should replay serially under the tight grant"
     );
     assert!(
         analyze.contains("spill_bytes="),

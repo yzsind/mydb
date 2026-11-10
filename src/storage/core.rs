@@ -4923,11 +4923,11 @@ mod tests;
 #[cfg(test)]
 mod btree_bug_audit_tests;
 #[cfg(test)]
-mod vector_release_audit_tests;
-#[cfg(test)]
 mod btree_lookup_tests;
 #[cfg(test)]
 mod read_ahead_tests;
+#[cfg(test)]
+mod vector_release_audit_tests;
 
 #[cfg(test)]
 mod dml_audit_1015_tests;

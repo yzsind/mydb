@@ -808,7 +808,10 @@ fn filtered_vector_rebuild_after_snapshot_check_preserves_visible_ranking() {
                 .db_for_tests()
                 .rebuild_vector_for_test(&schema, index, schema.id)
                 .unwrap();
-            assert!(writer.db_for_tests().vector_snapshot_requires_exact(&writer.db_for_tests().table("items").unwrap(), txn));
+            assert!(writer.db_for_tests().vector_snapshot_requires_exact(
+                &writer.db_for_tests().table("items").unwrap(),
+                txn
+            ));
         }));
     });
     let actual = filtered_vector::execute_filtered_vector_topk(db, txn, &leaf)
