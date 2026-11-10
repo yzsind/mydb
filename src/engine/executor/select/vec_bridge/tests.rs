@@ -1340,6 +1340,27 @@ fn inlj_runtime_chunk_shrinks_with_live_query_headroom() {
 }
 
 #[test]
+fn inlj_fanout_limits_matches_by_bytes_and_outer_rows_separately() {
+    use super::super::plan::inlj_chunk_rows_for_fanout;
+    let budget = Arc::new(mem_budget::MemBudget::new(1024 * 1024 * 1024));
+    budget.charge(256 * 1024 * 1024).unwrap();
+    mem_budget::with_query_budget(budget.clone(), || {
+        let rows = inlj_chunk_rows_for_fanout(131_072, 32);
+        assert_eq!(rows, 6_144);
+        assert!(rows * 32 * 4096 <= budget.remaining());
+        assert_eq!(inlj_chunk_rows_for_fanout(128, 32), 128);
+        assert_eq!(inlj_chunk_rows_for_fanout(131_072, 1), 131_072);
+        budget.charge(budget.remaining() - 4 * 1024 * 1024).unwrap();
+        assert_eq!(inlj_chunk_rows_for_fanout(131_072, 32), 32);
+        budget.charge(budget.remaining()).unwrap();
+        assert_eq!(inlj_chunk_rows_for_fanout(131_072, usize::MAX), 1);
+        assert_eq!(inlj_chunk_rows_for_fanout(0, 0), 1);
+    });
+    budget.release(budget.used());
+    assert_eq!(inlj_chunk_rows_for_fanout(131_072, 32), 4096);
+}
+
+#[test]
 fn native_cursor_preserves_primary_oom_without_consumer_tls() {
     use crate::engine::api::ResultCursor;
 
@@ -2079,6 +2100,52 @@ fn grace_parallel_worker_cap_preserves_the_operator_grant() {
     assert_eq!(worker.max_bytes, 16 * 1024 * 1024);
     assert!(worker.max_rows.saturating_mul(4) <= cap.max_rows);
     assert!(worker.max_bytes.saturating_mul(4) <= cap.max_bytes);
+}
+
+#[test]
+fn grace_replay_concurrency_uses_actual_partition_sizes() {
+    let mib = 1024 * 1024;
+    let cap = vec_hash_join::BuildCap {
+        max_rows: 0,
+        max_bytes: 256 * mib,
+    };
+    let sizes = vec![40 * mib; 128];
+    // Each decoded build needs 80 MiB. Eight workers would each receive
+    // 32 MiB and recursively spill all 128 otherwise ordinary partitions.
+    assert_eq!(
+        vec_grace_replay_workers(8, cap, 30_000_000, 80 * mib * 128, &sizes),
+        2
+    );
+    assert_eq!(
+        vec_grace_replay_workers(8, cap, 30_000_000, 8 * mib * 128, &sizes),
+        8
+    );
+    let row_cap = vec_hash_join::BuildCap {
+        max_rows: 300,
+        max_bytes: u64::MAX,
+    };
+    assert_eq!(
+        vec_grace_replay_workers(8, row_cap, 12800, 12800, &sizes),
+        3
+    );
+    assert_eq!(vec_grace_replay_workers(8, cap, 0, 0, &[0; 128]), 1);
+}
+
+#[test]
+fn grace_replay_concurrency_is_not_serialized_by_one_hot_partition() {
+    let cap = vec_hash_join::BuildCap {
+        max_rows: 0,
+        max_bytes: 1024 * 1024,
+    };
+    let mut sizes = vec![1024; 128];
+    sizes[0] = 16 * 1024 * 1024;
+    let total = sizes.iter().sum::<u64>();
+    assert_eq!(vec_grace_replay_workers(8, cap, total, total, &sizes), 8);
+    // Multiplication and summation must not wrap even at the u64 boundary.
+    assert_eq!(
+        vec_grace_replay_workers(8, cap, u64::MAX, u64::MAX, &[u64::MAX; 128]),
+        1
+    );
 }
 
 #[test]

@@ -26,7 +26,7 @@ impl<'a> AnalyzePopulationBarrier<'a> {
             {
                 TableAcquireOutcome::Acquired { .. } | TableAcquireOutcome::AlreadyHeld => {}
                 TableAcquireOutcome::Conflict { .. } | TableAcquireOutcome::SchemaChanged => {
-                    return None
+                    return None;
                 }
             }
         }
@@ -1827,7 +1827,26 @@ impl Database {
                             / rows as f64
                     })
                 } else {
-                    self.index_heap_order_correlation(table, index)
+                    let (correlation, prefixes) = self.index_leaf_statistics(
+                        table,
+                        index,
+                        row_count,
+                        page_sample_fraction < 1.0,
+                    );
+                    for (count, estimate) in stats.prefix_distinct_counts.iter_mut().zip(prefixes) {
+                        if let Some(estimate) = estimate {
+                            *count = estimate;
+                        }
+                    }
+                    // A wider prefix cannot have fewer distinct values. A
+                    // sparse heap estimate for a low-transition prefix may
+                    // exceed the more reliable wider-prefix leaf estimate.
+                    for pos in (1..stats.prefix_distinct_counts.len()).rev() {
+                        stats.prefix_distinct_counts[pos - 1] = stats.prefix_distinct_counts
+                            [pos - 1]
+                            .min(stats.prefix_distinct_counts[pos]);
+                    }
+                    correlation
                 };
                 let total_pages = if table.is_partitioned() {
                     partition_stats
@@ -2698,36 +2717,100 @@ impl Database {
 
     /// Sample the index in key order and measure how closely heap page
     /// ids follow: |Pearson r| between entry rank and heap page id over
-    /// up to 64 evenly spaced leaves. Feeds the range-scan cost model's
+    /// up to 128 stratified leaves. Also estimate prefix NDV from key-run
+    /// transitions when the heap was sampled. Feeds the range-scan cost model's
     /// correlated-vs-random heap fetch split; `None` (empty index,
     /// non-BTREE access structure, sampling failure) keeps the legacy
     /// default.
-    fn index_heap_order_correlation(
+    fn index_leaf_statistics(
         &self,
         table: &TableSchema,
         index: &IndexSchema,
-    ) -> Option<f64> {
+        row_count: u64,
+        sample_prefixes: bool,
+    ) -> (Option<f64>, Vec<Option<u64>>) {
         if !index.index_type.eq_ignore_ascii_case("BTREE") || index.fulltext.is_some() {
-            return None;
+            return (None, Vec::new());
         }
-        const MAX_SAMPLE_LEAVES: usize = 64;
-        let pages: Vec<f64> = self
-            .with_index_read(table.id, &index.name, |index_file| {
-                let leaf_ids = index_file.range_leaf_ids(None, None)?;
-                if leaf_ids.is_empty() {
-                    return Ok(Vec::new());
+        const MAX_SAMPLE_LEAVES: usize = 128;
+        // Multi-valued indexes have several entries per heap row, so their
+        // transition rate cannot be scaled by the heap row population.
+        let prefix_count = if sample_prefixes && !index.has_multi_valued_parts() {
+            index.columns.len()
+        } else {
+            0
+        };
+        let sample = self.with_index_read(table.id, &index.name, |index_file| {
+            let leaf_ids = index_file.range_leaf_ids(None, None)?;
+            let samples = leaf_ids.len().min(MAX_SAMPLE_LEAVES);
+            let mut pages = Vec::new();
+            let mut transitions = vec![0u64; prefix_count];
+            let mut weighted_transitions = vec![0u128; prefix_count];
+            let mut weighted_entries = 0u128;
+            for stratum in 0..samples {
+                crate::engine::cancel::check_cancelled()?;
+                let start = stratum * leaf_ids.len() / samples;
+                let end = (stratum + 1) * leaf_ids.len() / samples;
+                // Stable stratified jitter avoids aliasing a periodic
+                // key distribution with evenly spaced leaf samples.
+                let mut hash = (stratum as u64)
+                    .wrapping_add(table.id)
+                    .wrapping_add(0x9e3779b97f4a7c15);
+                hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+                hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
+                hash ^= hash >> 31;
+                let pos = start + (hash % (end - start) as u64) as usize;
+                let page = index_file.read_page(leaf_ids[pos])?;
+                let IndexPage::Leaf(leaf) = page.as_ref() else {
+                    continue;
+                };
+                pages.extend(leaf.entries.iter().map(|e| e.row_id.page_id as f64));
+                if prefix_count == 0 {
+                    continue;
                 }
-                let step = leaf_ids.len().div_ceil(MAX_SAMPLE_LEAVES).max(1);
-                let mut pages = Vec::new();
-                for &leaf_id in leaf_ids.iter().step_by(step) {
-                    if let IndexPage::Leaf(leaf) = index_file.read_page(leaf_id)?.as_ref() {
-                        pages.extend(leaf.entries.iter().map(|e| e.row_id.page_id as f64));
+                // Count starts of runs, including the cross-leaf boundary.
+                // A run spanning many leaves must not count once per leaf.
+                let previous = if pos > 0 {
+                    Some(index_file.read_page(leaf_ids[pos - 1])?)
+                } else {
+                    None
+                };
+                let mut previous_key = previous.as_ref().and_then(|page| match page.as_ref() {
+                    IndexPage::Leaf(leaf) => leaf.entries.last().map(|entry| &entry.key),
+                    _ => None,
+                });
+                let weight = (end - start) as u128;
+                weighted_entries += leaf.entries.len() as u128 * weight;
+                for entry in &leaf.entries {
+                    for prefix in 0..prefix_count.min(entry.key.0.len()) {
+                        if previous_key
+                            .is_none_or(|prev| prev.0.get(..=prefix) != entry.key.0.get(..=prefix))
+                        {
+                            transitions[prefix] += 1;
+                            weighted_transitions[prefix] += weight;
+                        }
                     }
+                    previous_key = Some(&entry.key);
                 }
-                Ok(pages)
-            })
-            .ok()?;
-        rank_page_correlation(&pages)
+            }
+            let estimates = transitions
+                .iter()
+                .zip(weighted_transitions)
+                .map(|(&seen, weighted)| {
+                    // Few transitions cannot identify low NDV reliably. Keep
+                    // the heap sketch in that case. Index sampling supplies
+                    // the missing evidence for scattered, repeated keys.
+                    (weighted_entries > 0 && (seen >= 32 || samples == leaf_ids.len())).then(|| {
+                        ((weighted * row_count as u128).div_ceil(weighted_entries))
+                            .min(row_count as u128) as u64
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok((rank_page_correlation(&pages), estimates))
+        });
+        // These optional physical statistics must not make ANALYZE fail when
+        // an index is unavailable. The MVCC heap-derived estimates remain.
+        sample.unwrap_or_else(|_| (None, Vec::new()))
     }
 
     #[cfg(test)]

@@ -1305,6 +1305,43 @@ pub(super) fn vec_grace_worker_cap(
     })
 }
 
+/// Choose replay concurrency after partitioning, when input cardinality and
+/// partition sizes are known. Plan estimates can be arbitrarily low. Sharing
+/// the grant among too many workers then needlessly repartitions every file.
+/// Use the upper quartile so a single skewed partition does not serialize all
+/// the ordinary partitions; the existing bounded recursive path handles skew.
+pub(super) fn vec_grace_replay_workers(
+    requested: usize,
+    cap: vec_hash_join::BuildCap,
+    build_rows: u64,
+    build_resident_bytes: u64,
+    partition_bytes: &[u64],
+) -> usize {
+    let mut sizes: Vec<u64> = partition_bytes.iter().copied().filter(|&n| n > 0).collect();
+    if sizes.is_empty() || requested <= 1 {
+        return 1;
+    }
+    let total: u128 = sizes.iter().map(|&n| n as u128).sum();
+    sizes.sort_unstable();
+    let typical = sizes[(sizes.len() - 1) * 3 / 4] as u128;
+    let rows = (build_rows as u128 * typical).div_ceil(total).max(1);
+    let bytes = (build_resident_bytes as u128 * typical)
+        .div_ceil(total)
+        .max(1);
+    // Reserve a quarter of each worker grant for capacity rounding, readers
+    // and probing. Both dimensions remain bounded by the original grant.
+    let mut workers = requested.min(sizes.len());
+    if cap.max_bytes > 0 {
+        workers = ((cap.max_bytes as u128 * 3 / 4) / bytes)
+            .max(1)
+            .min(workers as u128) as usize;
+    }
+    if cap.max_rows > 0 {
+        workers = (cap.max_rows as u128 / rows).max(1).min(workers as u128) as usize;
+    }
+    workers.max(1)
+}
+
 pub(super) fn vec_grace_partition_count(
     configured_max: usize,
     build_prefix: &[Batch],
@@ -1538,9 +1575,15 @@ pub(super) fn run_vec_grace_hash_join_stream(
     }
     let mut build_null_sequence = 0u64;
     let mut build_rows = 0u64;
+    let mut build_resident_bytes = 0u64;
     let mut probe_rows = 0u64;
     for batch in &build_prefix {
         build_rows = build_rows.saturating_add(batch.visible_rows() as u64);
+        build_resident_bytes = build_resident_bytes
+            .saturating_add(batch.memory_bytes() as u64)
+            .saturating_add(vec_hash_join::estimate_build_index_bytes(
+                batch.visible_rows() as u64,
+            ));
         spill_vec_join_batch(
             batch,
             build_keys,
@@ -1566,6 +1609,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                 .min(usize::MAX as u64) as usize,
         );
         let _batch_charge = mem_budget::force_charge_scoped(batch_bytes)?;
+        build_resident_bytes = build_resident_bytes.saturating_add(batch_bytes as u64);
         build_rows = build_rows.saturating_add(batch.visible_rows() as u64);
         spill_vec_join_batch(
             &batch,
@@ -1642,6 +1686,25 @@ pub(super) fn run_vec_grace_hash_join_stream(
         } else {
             1
         };
+    let partition_bytes = (0..partitions)
+        .map(|partition| {
+            let path = tmp.path().join(format!("build-{partition}"));
+            if tmp.charger().absent_partition(&path)? {
+                Ok(0)
+            } else {
+                std::fs::metadata(path)
+                    .map(|metadata| metadata.len())
+                    .map_err(|error| crate::error::catalog::ER_GET_ERRNO.error(error.to_string()))
+            }
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    let requested_workers = vec_grace_replay_workers(
+        requested_workers,
+        build_cap,
+        build_rows,
+        build_resident_bytes,
+        &partition_bytes,
+    );
     let parallel =
         vec_grace_worker_cap(build_cap, requested_workers).filter(|_| query_budget.is_some());
     // Each replay worker charges its actual resident batches and build index

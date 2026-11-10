@@ -16963,6 +16963,90 @@ fn analyze_computes_index_heap_order_correlation() {
 }
 
 #[test]
+fn analyze_sparse_heap_sample_preserves_repeated_composite_index_fanout() {
+    for text_keys in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open_memory_test_db(dir.path());
+        let mut second = lob_col(
+            "b",
+            if text_keys {
+                DataType::VarChar(Some(64))
+            } else {
+                DataType::Int
+            },
+            false,
+        );
+        if text_keys {
+            second.charset = Some("utf8mb4".into());
+            second.collation = Some("utf8mb4_general_ci".into());
+        }
+        db.create_table(
+            "t",
+            vec![
+                lob_col("id", DataType::Int, true),
+                lob_col("a", DataType::Int, false),
+                second,
+            ],
+            vec!["id".into()],
+            vec![crate::parser::IndexDef {
+                name: Some("ab".into()),
+                columns: vec!["a".into(), "b".into()],
+                column_prefix_lengths: if text_keys {
+                    vec![None, Some(8)]
+                } else {
+                    Vec::new()
+                },
+                column_descending: vec![false, true],
+                key_expressions: Vec::new(),
+                key_expression_multi_valued: Vec::new(),
+                unique: false,
+                included_columns: Vec::new(),
+                index_type: "BTREE".into(),
+                visible: true,
+                comment: String::new(),
+                fulltext_parser: String::new(),
+                vector_options: None,
+            }],
+        )
+        .unwrap();
+        let txn = db.begin_txn().unwrap();
+        db.insert_rows(
+            txn,
+            "test.t",
+            (0..32_768i64)
+                .map(|i| {
+                    let b = if !text_keys {
+                        Value::Int(i % 4)
+                    } else if i % 4 == 0 {
+                        Value::Null
+                    } else {
+                        let suffix = if i / 4096 % 2 == 0 {
+                            "abcdefghijk"
+                        } else {
+                            "ABCDEFGHIJK"
+                        };
+                        Value::String(format!("{}-{suffix}", i % 4))
+                    };
+                    vec![Value::Int(i), Value::Int(i % 4096 / 4), b]
+                })
+                .collect(),
+        )
+        .unwrap();
+        db.commit_txn(txn.txn_id).unwrap();
+        let table = db.table("test.t").unwrap();
+        // A short heap sample sees each composite value only once, although
+        // every value occurs eight times on widely separated heap pages.
+        let stats = db
+            .collect_table_stats_with_sample_pages_for_test(&table, &[1, 2])
+            .unwrap();
+        let counts = &stats.indexes["ab"].prefix_distinct_counts;
+        for (&actual, expected) in counts.iter().zip([1024, 4096]) {
+            assert!(actual.abs_diff(expected) < expected / 4, "{counts:?}");
+        }
+    }
+}
+
+#[test]
 fn btree_range_with_prefix_bounds_stops_at_next_prefix() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("1_prefix_range.idx");
