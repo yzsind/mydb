@@ -1143,7 +1143,22 @@ pub(in crate::engine::executor::select) fn inlj_fanout_chunk_rows(
         .map(|ndv| table.schema.stats.row_count.div_ceil(ndv).max(1))
         .unwrap_or(1)
         .min(usize::MAX as u64) as usize;
-    (inlj_runtime_chunk_rows(max_rows) / fanout).max(1)
+    inlj_chunk_rows_for_fanout(max_rows, fanout)
+}
+
+pub(in crate::engine::executor::select) fn inlj_chunk_rows_for_fanout(
+    max_rows: usize,
+    fanout: usize,
+) -> usize {
+    // max_rows caps OUTER input, whereas the live byte budget bounds the
+    // estimated matching rows. Applying the outer cap before dividing by
+    // fanout needlessly shrinks MRR windows even when the remaining query
+    // grant can accommodate them. Keep the same 4-KiB-per-match envelope and
+    // the existing one-row progress rule; no extra memory is granted here.
+    let matches = crate::engine::executor::mem_budget::current_budget()
+        .map(|budget| budget.remaining() / (4 * 1024))
+        .unwrap_or(max_rows);
+    (matches / fanout.max(1)).max(1).min(max_rows.max(1))
 }
 
 /// Tighten an already-selected INLJ morsel against the query's live

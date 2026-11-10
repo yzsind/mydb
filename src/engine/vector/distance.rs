@@ -2319,7 +2319,11 @@ pub(crate) fn typed_ordering_distance<
     use super::codec::vector_err;
     use crate::vector::VectorDataType as D;
     if a.dimension() != b.dimension() {
-        return Err(vector_err("VECTOR dimension mismatch"));
+        return Err(super::VectorError::DimensionMismatch {
+            actual: b.dimension() as usize,
+            declared: a.dimension(),
+        }
+        .into_query_error());
     }
     let binary = a.datatype() == D::Binary || b.datatype() == D::Binary;
     if binary {
@@ -2476,7 +2480,11 @@ impl PreparedNativeDistance {
         row: &V,
     ) -> Result<f64, crate::types::QueryError> {
         if row.dimension() as usize != self.query.len() {
-            return Err(super::codec::vector_err("VECTOR dimension mismatch"));
+            return Err(super::VectorError::DimensionMismatch {
+                actual: self.query.len(),
+                declared: row.dimension(),
+            }
+            .into_query_error());
         }
         if row.datatype() != self.stored_datatype {
             return Err(super::codec::vector_err(

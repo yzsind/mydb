@@ -1459,18 +1459,46 @@ impl Database {
     /// DML access to an `IndexFile`. The outer handle is held in shared
     /// mode; `IndexFile` serializes structural changes internally and lets
     /// leaf-only updates proceed through page latches.
-    fn with_index_dml<T>(
+    fn with_index_dml(
         &self,
         table_id: u64,
         index_name: &str,
-        f: impl FnOnce(&IndexFile) -> Result<T, QueryError>,
-    ) -> Result<T, QueryError> {
+        f: impl FnOnce(&IndexFile) -> Result<(), QueryError>,
+    ) -> Result<(), QueryError> {
         self.ensure_writable()?;
-        let index = self.index_handle(table_id, index_name)?;
+        let index = match self.index_handle(table_id, index_name) {
+            Ok(handle) => handle,
+            Err(err) => {
+                let path = self.index_path(table_id, index_name);
+                if path.extension().is_some_and(|extension| extension == "rtree")
+                    && err.is_any(&[crate::error::catalog::ER_INDEX_CORRUPT, crate::error::catalog::ER_GET_ERRNO]) {
+                    let marker = path.with_extension("rtree.corrupt");
+                    if let Some(parent) = marker.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+                    let file = File::create(&marker).map_err(io_err)?;
+                    file.sync_all().map_err(io_err)?;
+                    crate::platform::fs::sync_path(marker.parent().expect("index directory")).map_err(io_err)?;
+                    crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Warning, &err);
+                    return Ok(());
+                }
+                return Err(err);
+            }
+        };
         let index = index.read();
-        index.ensure_healthy()?;
-        let result = f(&index);
-        result
+        if let Err(err) = index.ensure_healthy() {
+            if index.spatial.is_some() {
+                // A fenced, non-unique derived index is never read again.
+                // Heap rollback must remain possible; startup rebuilds it.
+                crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Warning, &err);
+                return Ok(());
+            }
+            return Err(err);
+        }
+        match f(&index) {
+            Err(err) if index.spatial.is_some() && err.is(crate::error::catalog::ER_INDEX_CORRUPT) => {
+                Err(index.fence_persistent_corruption(err))
+            }
+            result => result,
+        }
     }
 
     /// Phase 2: read-only access to an `IndexFile`. Multiple readers run

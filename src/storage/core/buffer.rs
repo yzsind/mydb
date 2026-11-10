@@ -1671,6 +1671,7 @@ impl BufferPool {
                 )
             })?;
             if !frame.checksum_dirty.load(Ordering::Acquire) {
+                self.validate_vector_frame(frame, &bytes)?;
                 return f(&bytes);
             }
         }
@@ -1685,8 +1686,37 @@ impl BufferPool {
             let lsn = frame.dirty_lsn.load(Ordering::Acquire);
             set_page_lsn_if_formatted(&mut bytes, lsn);
             frame.checksum_dirty.store(false, Ordering::Release);
+            if matches!(frame.key.file.kind, BufferPageFileKind::Vector { .. }) {
+                frame
+                    .index_header_validated_epoch
+                    .store(frame.dirty_epoch.load(Ordering::Acquire), Ordering::Release);
+            }
         }
+        self.validate_vector_frame(frame, &bytes)?;
         f(&bytes)
+    }
+
+    fn validate_vector_frame(&self, frame: &Frame, bytes: &[u8]) -> Result<(), QueryError> {
+        if !matches!(frame.key.file.kind, BufferPageFileKind::Vector { .. }) {
+            return Ok(());
+        }
+        let epoch = frame.dirty_epoch.load(Ordering::Acquire);
+        if frame.index_header_validated_epoch.load(Ordering::Acquire) != epoch {
+            if bytes.len() != PAGE_SIZE || read_u32(bytes, 16) != page_checksum(bytes, 16) {
+                return Err(error(
+                    crate::error::catalog::ER_INDEX_CORRUPT,
+                    format!(
+                        "corrupt vector page checksum: {} page={}",
+                        frame.key.file.path.display(),
+                        frame.key.page_id
+                    ),
+                ));
+            }
+            frame
+                .index_header_validated_epoch
+                .store(epoch, Ordering::Release);
+        }
+        Ok(())
     }
 
     fn validate_frame_mutation_image(
@@ -1701,6 +1731,12 @@ impl BufferPool {
         let epoch = frame.dirty_epoch.load(Ordering::Acquire);
         let checksum_dirty = frame.checksum_dirty.load(Ordering::Acquire);
         match &frame.key.file.kind {
+            BufferPageFileKind::Vector { .. } => {
+                if !checksum_dirty {
+                    self.validate_vector_frame(frame, bytes)?;
+                }
+                Ok(())
+            }
             BufferPageFileKind::Index { .. } => {
                 if frame.index_header_validated_epoch.load(Ordering::Acquire) == epoch {
                     return Ok(());
@@ -1920,6 +1956,10 @@ impl BufferPool {
         let anchored = pinned.frame.dirty.load(Ordering::Acquire)
             && pinned.frame.first_dirty_lsn.load(Ordering::Acquire) != 0;
         let zone_page = matches!(key.file.kind, BufferPageFileKind::ZoneMap { .. });
+        let vector_page = matches!(key.file.kind, BufferPageFileKind::Vector { .. });
+        if vector_page {
+            self.validate_vector_frame(&pinned.frame, &bytes)?;
+        }
         let validated = zone_page
             && pinned
                 .frame
@@ -1943,10 +1983,11 @@ impl BufferPool {
             self.dirty_pages.fetch_add(1, Ordering::Relaxed);
             self.note_dirty(&pinned.frame.key, lsn);
         }
-        // Zone-map callers return a freshly encoded page or a size-preserving
-        // payload patch of a validated page. Publish that structural proof
-        // under the same byte latch, just as trusted heap/index mutators do.
-        if zone_page {
+        // Zone-map callers return checked patches. Vector callers validate the
+        // base above and stamp a finalized replacement before publication.
+        // Retain those proofs under the byte latch, avoiding another full CRC
+        // on the next probe of a page just written by this process.
+        if zone_page || vector_page {
             pinned.frame.index_header_validated_epoch.store(
                 pinned.frame.dirty_epoch.load(Ordering::Acquire),
                 Ordering::Release,

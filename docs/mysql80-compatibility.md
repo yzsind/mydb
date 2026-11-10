@@ -155,7 +155,7 @@ production-grade MySQL replacement.
 
 | Type | Status |
 |---|---|
-| B-tree (including unique, composite, covering INCLUDE, prefix, descending, functional/expression, and invisible indexes) | ✅/➕ |
+| B-tree (including unique, composite, covering INCLUDE, prefix, descending declarations, functional/expression, and invisible indexes) | ✅/➕ |
 | JSON multi-valued index | ✅ |
 | FULLTEXT (BM25 + boolean mode) | ✅ |
 | SPATIAL (persistent R-tree) | ✅ |
@@ -1279,3 +1279,8 @@ The following expression differences are retained:
 - [DML RETURNING](dml-returning.md) — PostgreSQL 18-style extension semantics
 - [Data Directory, Persistence, and Recovery](storage-format.md) — file roles, durability, and recovery boundaries
 - [docs/mysql80-metadata-compat-matrix.json](mysql80-metadata-compat-matrix.json) — machine-readable metadata compatibility matrix
+
+B-tree DESC declarations currently retain metadata and emit a warning. Physical
+keys use ascending encoding; reverse scans or an explicit sort preserve query
+ordering. Mixed ASC/DESC declarations do not provide mixed-direction physical
+ordering.

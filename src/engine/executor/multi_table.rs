@@ -1331,6 +1331,11 @@ pub(super) fn execute_multi_update(
         write_columns.extend_from_slice(&on_update);
         let changed = Some(write_columns.as_slice());
         if participant_has_update_triggers[p_idx] {
+            crate::storage::coerce_updated_row(
+                &schema,
+                &mut new_values,
+                Some(&update.user_columns),
+            )?;
             new_values = fire_before_update(
                 db,
                 session,

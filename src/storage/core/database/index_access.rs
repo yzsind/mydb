@@ -332,6 +332,28 @@ impl Database {
     /// R-tree. Keep repairs out of the shared cache: their visibility depends
     /// on the reader's snapshot. A repair version change during the probe
     /// requires a fresh physical probe while the repair directory is pinned.
+    pub(crate) fn spatial_estimate_fraction(&self, storage_id: u64, index: &str, query: crate::engine::geo::Mbr) -> Option<f64> {
+        self.with_index_read(storage_id, index, |file| file.spatial.as_ref()
+            .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "not a spatial index"))?
+            .estimate_fraction(query)).ok()
+    }
+
+    pub(crate) fn spatial_scan_cursor(&self, table: &TableSchema, index: &IndexSchema, query: crate::engine::geo::Mbr, txn: TxnView) -> Result<spatial_index::SpatialCursor, QueryError> {
+        self.check_index_read_view(table, index, txn)?;
+        spatial_index::SpatialCursor::new(self.index_handle(table.id, &index.name)?, query)
+    }
+    pub(crate) fn spatial_visibility_repairs(&self, table: &TableSchema, index: &IndexSchema, query: crate::engine::geo::Mbr, txn: TxnView) -> Result<Vec<RowId>, QueryError> {
+        let key_matches = |key: &IndexKey| decode_mbr_key(key).is_some_and(|mbr| mbr.intersects(&query));
+        let mut rows = self.txns_read()?.index_visibility_repair_row_ids(
+            txn, table.id, &index.name, key_matches,
+            |txn_id| self.temporal_history.txn_commit(txn_id).map(|entry| entry.commit_scn),
+        );
+        if txn.historical {
+            rows.extend(self.temporal_history.history_index_entries(txn, table.id, &index.name, key_matches).into_iter().map(|(_, row)| row));
+        }
+        Ok(rows)
+    }
+
     pub(crate) fn spatial_search_visible(
         &self,
         table: &TableSchema,
@@ -3375,7 +3397,7 @@ impl Database {
         };
         for storage_id in storage_ids {
             self.with_index_read(storage_id, &index.name, |index_file| {
-                for (key, row_id) in index_file.range_entries(None, None, !index.unique)? {
+                for (key, row_id) in index_file.range_entries(None, None, false)? {
                     let Some(KeyPart::String(word)) = key.0.first() else {
                         continue;
                     };

@@ -2,6 +2,33 @@
 // Included into `storage/core.rs`.
 
 impl Database {
+    pub(crate) fn validate_vector_table_backend(
+        &self,
+        table: &TableSchema,
+    ) -> Result<(), QueryError> {
+        if self.durability_mode() == DurabilityMode::Memory {
+            return Ok(());
+        }
+        for index in table.indexes.iter().filter(|index| index.is_vector()) {
+            for sid in table.storage_ids() {
+                let key = (
+                    table.id,
+                    sid,
+                    table.active_generation.max(1),
+                    normalize_name(&index.name),
+                );
+                if !self.vector_indexes.read().contains_key(&key) {
+                    self.ensure_vector_backend_compatible(
+                        table,
+                        index,
+                        sid,
+                        vector_storage_paged(),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    }
     /// Refuse to silently reinterpret an existing vector index through a
     /// different storage backend. Vector backend files are format-specific;
     /// changing `MYDB_VECTOR_STORAGE` requires an explicit DROP+CREATE so an
@@ -119,9 +146,12 @@ impl Database {
             .into_iter()
             .collect::<BTreeSet<_>>();
         if let Some(manifest) = self.read_vector_manifest_parts(storage_id, generation, index_id)? {
-            for (owner, physical) in
-                std::iter::once((manifest.physical_storage_id, manifest.active))
-                    .chain(manifest.retired)
+            for (owner, generation, physical) in std::iter::once((
+                manifest.physical_storage_id,
+                manifest.generation,
+                manifest.active,
+            ))
+            .chain(manifest.retired)
             {
                 let mut path = self
                     .vector_index_path_for_parts(owner, generation, index_id, "hvec")

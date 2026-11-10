@@ -392,6 +392,9 @@ impl Database {
     /// deleting any file. Run after the catalog commit and before the physical
     /// purge so a stray writeback cannot recreate a file we are about to unlink.
     fn evict_dropped_table_caches(&self, table: &TableSchema) -> Result<(), QueryError> {
+        // Retired readers must be invalid before their files are unlinked.
+        self.evict_table_vector_graphs(table.id);
+        self.vector_table_snapshot_floors.write().remove(&table.id);
         for sid in table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -400,10 +403,6 @@ impl Database {
                 self.remove_index_cache_entry(sid, &index.name)?;
             }
         }
-        // In-memory HNSW/IVF graphs (files are removed by the purge below).
-        self.vector_indexes
-            .write()
-            .retain(|(tid, _sid, _generation, _name), _| *tid != table.id);
         self.auto_increment.forget_table(table.id);
         Ok(())
     }
@@ -452,6 +451,12 @@ impl Database {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                     Err(err) => return Err(io_err(err)),
+                }
+            }
+            {
+                let mut handles = self.vector_retired_graphs.lock();
+                for rel in &intent.vector_files {
+                    handles.remove(&self.data_dir.join(rel));
                 }
             }
             if intent.had_auto_increment {

@@ -1611,3 +1611,83 @@ fn bug_unsorted_batch_routes_each_validated_run_and_point_lookups_match() {
             .contains(&entry.row_id));
     }
 }
+
+#[test]
+fn audit_20261109_decimal_promotion_page_fit() {
+    for count in [904, 905, 950, 1000, 1100, 1162, 1163] {
+        for (small, large) in [
+            (-2_100_000_000i128, 2_147_483_700i128),
+            (-2_147_483_700, 2_100_000_000),
+        ] {
+            let (_dir, index) = audit_index("decimal_promotion.idx");
+            let mut entries: Vec<_> = (0..count)
+                .map(|n| IndexEntry {
+                    key: IndexKey::from(vec![KeyPart::Decimal {
+                        value: small,
+                        scale: 2,
+                    }]),
+                    row_id: rid(n),
+                })
+                .collect();
+            entries.push(IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Decimal {
+                    value: large,
+                    scale: 2,
+                }]),
+                row_id: rid(count),
+            });
+            entries.sort();
+            index.read().bulk_load_sorted(0, entries.clone()).unwrap();
+            assert_eq!(
+                index.read().entries().unwrap(),
+                entries
+                    .into_iter()
+                    .map(|e| (e.key, e.row_id))
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn audit_20261109_keyed_overlapping_prefixes() {
+    let (_dir, index) = audit_index("overlapping.idx");
+    let keys: Vec<IndexKey> = [vec![1], vec![1, 3], vec![1, 3, 4], vec![2]]
+        .into_iter()
+        .map(|parts| IndexKey::from(parts.into_iter().map(KeyPart::Int).collect::<Vec<_>>()))
+        .collect();
+    let entries = keys
+        .iter()
+        .enumerate()
+        .map(|(n, key)| IndexEntry {
+            key: key.clone(),
+            row_id: rid(n),
+        })
+        .collect();
+    index.read().bulk_load_sorted(0, entries).unwrap();
+    let probes = [keys[0].clone(), keys[1].clone()];
+    let got = index
+        .read()
+        .lookup_entries_many_sorted_keyed(&probes, false, false)
+        .unwrap();
+    assert_eq!(got.iter().filter(|(offset, _)| *offset == 0).count(), 3);
+    assert_eq!(got.iter().filter(|(offset, _)| *offset == 1).count(), 2);
+}
+
+#[test]
+fn audit_20261109_invalid_key_count_and_temporal_wrap() {
+    let mut offset = 0;
+    assert!(decode_index_key_parts_from(&[0], &mut offset, u32::MAX as usize).is_err());
+    let key = IndexKey::from(vec![KeyPart::DateTime(i64::MIN)]);
+    assert!(compact_time_delta(&key, i64::MAX).is_err());
+    let key = IndexKey::from(vec![KeyPart::DateTime(i64::MAX)]);
+    assert!(compact_time_delta(&key, i64::MIN).is_err());
+}
+
+#[test]
+fn audit_20261109_unknown_tree_page_type_is_rejected() {
+    let mut image =
+        encode_index_tree_page(&IndexPage::Leaf(IndexLeafPage::new(Vec::new(), None))).unwrap();
+    image[INDEX_HEADER_BYTES] = 0;
+    assert!(validate_index_page_structure(&image).is_err());
+}

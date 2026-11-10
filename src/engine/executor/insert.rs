@@ -177,28 +177,35 @@ fn coerce_legacy_timestamp_nulls(
     Ok(())
 }
 
-fn warn_explicit_lob_default_without_value(expr: &Expr, column: &crate::storage::ColumnSchema) {
+fn explicit_lob_default(
+    expr: &Expr,
+    column: &crate::storage::ColumnSchema,
+) -> Result<Option<Value>, QueryError> {
     if !expr_is_default_for_column(expr, &column.name)
-        || insert_strict_mode()
+        || column.nullable
         || column.default.is_some()
         || column.default_expr.is_some()
         || column.auto_increment
         || column.generated_expr.is_some()
         || !matches!(
             column.data_type,
-            crate::storage::DataTypeKind::Text { .. }
-                | crate::storage::DataTypeKind::Blob { .. }
-                | crate::storage::DataTypeKind::Json
-                | crate::storage::DataTypeKind::Geometry { .. }
+            DataTypeKind::Text { .. } | DataTypeKind::Blob { .. } | DataTypeKind::Json
         )
     {
-        return;
+        return Ok(None);
     }
-    crate::engine::api::push_statement_warning(
-        crate::error::ConditionLevel::Warning,
-        crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD,
-        format!("Field '{}' doesn't have a default value", column.name),
-    );
+    let err = crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD.error(format!(
+        "Field '{}' doesn't have a default value",
+        column.name
+    ));
+    if insert_strict_mode() {
+        return Err(err);
+    }
+    crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Warning, &err);
+    Ok(Some(match &column.data_type {
+        DataTypeKind::Json => Value::String("null".into()),
+        kind => implicit_default_for_type(kind).expect("TEXT and BLOB have implicit defaults"),
+    }))
 }
 
 /// MySQL's type-implicit default used when a required column is omitted in
@@ -1899,7 +1906,7 @@ where
             .into_iter()
             .zip(column_indexes.iter().copied())
             .map(|(expr, column)| {
-                warn_explicit_lob_default_without_value(expr.borrow(), &table.columns[column]);
+                let explicit_default = explicit_lob_default(expr.borrow(), &table.columns[column])?;
                 if !simple && table.columns[column].generated_expr.is_some() {
                     if !expr_is_default_for_column(expr.borrow(), &table.columns[column].name) {
                         return Err(generated_column_assignment_error());
@@ -1917,7 +1924,10 @@ where
                     crate::engine::expr::expr_collation(expr.borrow(), &table)
                         .map_or_else(crate::engine::expr::connection_charset, |c| c.charset)
                 });
-                let mut value = evaluate(expr, &table, column, &current, simple)?;
+                let mut value = match explicit_default {
+                    Some(value) => value,
+                    None => evaluate(expr, &table, column, &current, simple)?,
+                };
                 if let Some(source_charset) = source_charset {
                     value =
                         crate::engine::expr::encode_binary_assignment_value(value, source_charset)?;

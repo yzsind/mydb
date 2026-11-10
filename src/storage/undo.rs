@@ -5135,6 +5135,14 @@ impl UndoManager {
             {
                 reclaim_targets.push((removed.table_id, removed.row_id));
             }
+            if creator_rolled_back {
+                match &removed.kind {
+                    UndoKind::Insert => reclaim_targets.push((removed.table_id, removed.row_id)),
+                    UndoKind::InsertBatch { row_ids } => reclaim_targets
+                        .extend(row_ids.iter().map(|row_id| (removed.table_id, *row_id))),
+                    _ => {}
+                }
+            }
             if !creator_rolled_back && !removed.before_external.is_empty() {
                 freed_chains.push((removed.table_id, removed.before_external));
             }

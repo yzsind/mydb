@@ -324,6 +324,7 @@ pub(super) fn execute_load_data_with_reader(
                 format!("File '{}' not found (OS errno {})", stmt.file_path, e),
             )
         })?;
+        check_secure_file_priv_opened(db, session, &stmt.file_path, Some(&file))?;
         Box::new(file)
     };
     let mut reader = BufReader::with_capacity(READ_BUF_SIZE, data);
@@ -1305,10 +1306,14 @@ fn parse_xml_rows(
         .trim_end_matches('>')
         .trim()
         .to_string();
-    if tag.is_empty() {
+    if tag.is_empty()
+        || tag
+            .chars()
+            .any(|ch| ch.is_whitespace() || matches!(ch, '/' | '<' | '>' | '='))
+    {
         return Err(error(
-            crate::error::catalog::ER_NONEXISTING_TABLE_GRANT,
-            "LOAD XML: empty ROWS IDENTIFIED BY tag",
+            crate::error::catalog::ER_PARSE_ERROR,
+            "LOAD XML: ROWS IDENTIFIED BY must name an opening element",
         ));
     }
 
@@ -1580,6 +1585,15 @@ fn check_secure_file_priv(
     session: &SessionContext,
     file_path: &str,
 ) -> Result<(), QueryError> {
+    check_secure_file_priv_opened(db, session, file_path, None)
+}
+
+fn check_secure_file_priv_opened(
+    db: &Arc<Database>,
+    session: &SessionContext,
+    file_path: &str,
+    opened: Option<&std::fs::File>,
+) -> Result<(), QueryError> {
     let value = crate::engine::sysvar::read_var(
         "secure_file_priv",
         crate::engine::sysvar::Scope::Global,
@@ -1611,15 +1625,13 @@ fn check_secure_file_priv(
     if trimmed.eq_ignore_ascii_case("NULL") {
         return Err(opt_err());
     }
-    // Otherwise the file must resolve under the configured directory.
-    // Canonicalize the directory once; canonicalize the file's parent so a
-    // not-yet-existing leaf name (irrelevant for LOAD's read) still checks
-    // its containing directory. Fall back to lexical prefix matching when
-    // canonicalization fails (e.g. the dir does not exist on this host).
-    let dir = std::path::Path::new(trimmed);
-    let file = std::path::Path::new(file_path);
-    let canon_dir = std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf());
-    let canon_file = std::fs::canonicalize(file).unwrap_or_else(|_| file.to_path_buf());
+    // Fail closed if either path cannot be resolved. After open, authorize
+    // the descriptor's path so replacing a symlink cannot change the input.
+    let canon_dir = std::fs::canonicalize(trimmed).map_err(|_| opt_err())?;
+    let canon_file = match opened {
+        Some(file) => crate::platform::fs::path_for_open_file(file).map_err(|_| opt_err())?,
+        None => std::fs::canonicalize(file_path).map_err(|_| opt_err())?,
+    };
     if canon_file.starts_with(&canon_dir) {
         Ok(())
     } else {
@@ -1813,6 +1825,11 @@ fn execute_load_data_fast(
             let mut mapped_rows = map_rows(rows, table, column_indexes, full_width_identity);
             let insert_id = assign_load_identities_before_keys(db, txn, table, &mut mapped_rows)?;
             crate::engine::api::set_statement_insert_id(insert_id);
+            if !load_fast_values_are_canonical(table) {
+                for row in &mut mapped_rows {
+                    db.coerce_row_for_load(table, row)?;
+                }
+            }
             materialize_generated_rows(db, table, &mut mapped_rows)?;
             validate_load_data_partition_set(table, partition_filter, &mapped_rows)?;
 
@@ -2690,7 +2707,7 @@ fn execute_load_data_fast_parallel_inner(
                         // encoded payload both reflect the authoritative value.
                         // The `writer_encode` branch hands decoded rows to
                         // `insert_rows_heap_only_detailed`, which coerces there.
-                        if !writer_encode {
+                        if !writer_encode || !parsed_values_are_canonical {
                             if parsed_values_are_canonical {
                                 // The identity parser's coercion plan already
                                 // enforces integer ranges and DECIMAL(P,S)
@@ -3118,6 +3135,11 @@ fn execute_preraw_load_data_fast(
         let mut mapped_rows = map_rows(rows, table, column_indexes, full_width_identity);
         let insert_id = assign_load_identities_before_keys(db, txn, table, &mut mapped_rows)?;
         crate::engine::api::set_statement_insert_id(insert_id);
+        if !load_fast_values_are_canonical(table) {
+            for row in &mut mapped_rows {
+                db.coerce_row_for_load(table, row)?;
+            }
+        }
         materialize_generated_rows(db, table, &mut mapped_rows)?;
         validate_load_data_partition_set(table, partition_filter, &mapped_rows)?;
         let index_keys = precompute_index_keys(table, &prepared_indexes, &mapped_rows)?;
@@ -4230,11 +4252,16 @@ fn load_line_auto_increment_needs_assignment(
     let mut field_idx = 0usize;
     for end in memchr::memchr_iter(format.field_terminator, line).chain(std::iter::once(line.len()))
     {
+        let field = &line[start..end];
+        // An escape before the identity can hide a delimiter and shift the
+        // naive split. Fields after it cannot affect identity assignment.
+        if format
+            .escaped_by
+            .is_some_and(|escape| memchr(escape, field).is_some())
+        {
+            return true;
+        }
         if field_idx == auto_increment_idx {
-            let field = &line[start..end];
-            if field.windows(2).any(|pair| pair == b"\\N") || memchr(b'\\', field).is_some() {
-                return true;
-            }
             if no_auto_value_on_zero {
                 return false;
             }
@@ -6710,13 +6737,10 @@ fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, Que
         CoercionOp::Date
         | CoercionOp::Time
         | CoercionOp::DateTime
-        | CoercionOp::Timestamp { .. } => Ok(str_to_string_value(load_utf8(field_bytes)?.trim())),
-        CoercionOp::Year => {
-            if let Some(v) = parse_i64_fast(field_bytes) {
-                return Ok(Value::Int(v));
-            }
-            let s = load_utf8(field_bytes)?;
-            Ok(str_to_string_value(s.trim()))
+        | CoercionOp::Timestamp { .. }
+        | CoercionOp::Year => {
+            let text = load_utf8(field_bytes)?;
+            coerce_field_borrowed_strict(text.trim().as_bytes(), op)
         }
         CoercionOp::Enum | CoercionOp::Set => Ok(str_to_string_value(load_utf8(field_bytes)?)),
         CoercionOp::Bit => {
@@ -9602,5 +9626,63 @@ mod audit1022_multibyte_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod audit1109_file_policy_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn audit1109_secure_file_policy_checks_the_open_descriptor_after_symlink_swap() {
+        use std::os::unix::fs::symlink;
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine =
+            crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path().join("db"),
+                crate::storage::StorageConfig {
+                    durability: crate::storage::DurabilityMode::Memory,
+                    buffer_pool_pages: 512,
+                    ..crate::storage::StorageConfig::from_env()
+                },
+            )
+            .unwrap();
+        let db = engine.database();
+        let session = SessionContext::default();
+        let allowed = dir.path().join("allowed");
+        std::fs::create_dir(&allowed).unwrap();
+        let good = allowed.join("good");
+        let secret = dir.path().join("secret");
+        let link = allowed.join("link");
+        std::fs::write(&good, "1\n").unwrap();
+        std::fs::write(&secret, "2\n").unwrap();
+        symlink(&good, &link).unwrap();
+        engine
+            .execute(&format!(
+                "SET GLOBAL secure_file_priv='{}'",
+                crate::util::file::sql_path(&allowed)
+            ))
+            .unwrap();
+        let path = link.to_str().unwrap();
+        check_secure_file_priv(db, &session, path).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(&secret, &link).unwrap();
+        let file = std::fs::File::open(&link).unwrap();
+        std::fs::remove_file(&link).unwrap();
+        symlink(&good, &link).unwrap();
+        assert_eq!(
+            check_secure_file_priv_opened(db, &session, path, Some(&file))
+                .unwrap_err()
+                .code(),
+            1290
+        );
+        let good_file = std::fs::File::open(&link).unwrap();
+        check_secure_file_priv_opened(db, &session, path, Some(&good_file)).unwrap();
+        assert!(
+            check_secure_file_priv(db, &session, allowed.join("missing").to_str().unwrap())
+                .is_err()
+        );
     }
 }

@@ -1291,8 +1291,17 @@ pub enum PhysicalPlan {
 
 #[derive(Debug, Clone)]
 pub enum SpatialProbe {
-    Constant { mbr: [f64; 4], srid: u32 },
-    Parameter(Expr),
+    Constant {
+        mbr: [f64; 4],
+        srid: u32,
+        function: String,
+        column_first: bool,
+    },
+    Parameter {
+        expr: Expr,
+        function: String,
+        column_first: bool,
+    },
 }
 
 /// Runtime re-resolution indices for LIMIT / OFFSET counts that were
@@ -1424,6 +1433,8 @@ pub struct PlanTable {
     pub alias: Option<String>,
     pub system_time: Option<crate::parser::SystemTimeAsOf>,
     pub sample: Option<Box<crate::parser::TableSampleSpec>>,
+    /// Statement-local permission for runtime zone pruning.
+    pub zone_map_hint: Option<bool>,
     /// Lazily-populated shared ColMeta handle for every schema
     /// column (indexed by schema column index). Shared across `PlanTable`
     /// clones via the inner `Arc`, so the cache populates once per
@@ -1461,6 +1472,7 @@ impl PlanTable {
             alias,
             system_time: None,
             sample: None,
+            zone_map_hint: None,
             column_metas: Arc::new(OnceLock::new()),
             row_schema: Arc::new(OnceLock::new()),
             stats_sidecar_delta: 0,
@@ -1524,6 +1536,7 @@ impl PlanTable {
             alias,
             system_time: None,
             sample: None,
+            zone_map_hint: None,
             column_metas: Arc::new(OnceLock::new()),
             row_schema: Arc::new(OnceLock::new()),
             stats_sidecar_delta: sidecar_delta,
@@ -2518,14 +2531,16 @@ fn apply_fulltext_needs_score_flags(
             match_fingerprint,
             needs_score,
             additional_matches,
+            restrict_to_matches,
             ..
         } = node
         {
-            if !referenced.contains(match_fingerprint) {
+            if *restrict_to_matches && !referenced.contains(match_fingerprint) {
                 *needs_score = false;
             }
             for spec in additional_matches {
-                spec.needs_score = referenced.contains(&spec.match_fingerprint);
+                spec.needs_score =
+                    !spec.restrict_to_matches || referenced.contains(&spec.match_fingerprint);
             }
         }
     });
@@ -5976,6 +5991,11 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
                     .chain(residual_predicates.iter())
                     .cloned()
                     .collect();
+                let table_matches: Vec<Expr> = fulltext_matches
+                    .iter()
+                    .filter(|expr| expr_can_resolve_in_table(db, expr, table))
+                    .cloned()
+                    .collect();
                 let per_hints = ScanHints {
                     order_by: &[],
                     group_by: &[],
@@ -5986,7 +6006,7 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
                     index_hints: table_index_hints,
                     query_hints: &select.query_hints,
                     table_name: tname,
-                    fulltext_matches: &[],
+                    fulltext_matches: &table_matches,
                     join_predicates: &possible_join_predicates,
                 };
                 choose_scan_for_source(db, source_ref, table, predicate.clone(), &per_hints)
@@ -9335,7 +9355,7 @@ fn index_order_covers_order_by(
 fn validate_table_index_hints(table: &TableRef, schema: &TableSchema) -> Result<(), QueryError> {
     for name in table.index_hints.iter().flat_map(|hint| &hint.index_names) {
         if !schema
-            .iter_public_indexes()
+            .iter_queryable_indexes()
             .any(|index| index.name.eq_ignore_ascii_case(name))
         {
             return Err(error(
@@ -10320,6 +10340,21 @@ fn find_spatial_index_scan<'a>(
             let Some(index) = find_spatial_index_for_column(table, col, hints) else {
                 continue;
             };
+            let column = &table.columns[table.column_index(col).ok()?];
+            if let DataTypeKind::Geometry {
+                srid: Some(srid),
+                subtype,
+            } = column.data_type
+            {
+                if subtype != crate::storage::schema::GeometrySubtype::Point
+                    && crate::engine::geo::srs::find(srid)
+                        .ok()
+                        .flatten()
+                        .is_some_and(|srs| srs.kind == crate::engine::geo::srs::SrsKind::Geographic)
+                {
+                    continue;
+                }
+            }
             if expr_has_column_ref(&args[const_i]) {
                 continue;
             }
@@ -10329,25 +10364,69 @@ fn find_spatial_index_scan<'a>(
             // executions probe the wrong MBR and also lets parameter values
             // change physical-plan state.
             if expr_has_placeholder(&args[const_i]) || !expr_is_deterministic(&args[const_i]) {
-                return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
+                return Some((
+                    index,
+                    SpatialProbe::Parameter {
+                        expr: args[const_i].clone(),
+                        function: name.to_ascii_uppercase(),
+                        column_first: col_i == 0,
+                    },
+                ));
             }
             // Fold the constant geometry operand and take its MBR as the
             // search window. `&[]` is safe — we just confirmed no column ref.
             let Ok(crate::types::Value::Geometry(bytes)) =
                 crate::engine::expr::eval_expr_legacy(&args[const_i], table, &[])
             else {
-                return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
+                return Some((
+                    index,
+                    SpatialProbe::Parameter {
+                        expr: args[const_i].clone(),
+                        function: name.to_ascii_uppercase(),
+                        column_first: col_i == 0,
+                    },
+                ));
             };
-            if let Some(m) = crate::engine::geo::mbr_of(&bytes) {
+            let geometry = crate::engine::geo::read_geometry(&bytes).ok()?;
+            if geometry
+                .geom
+                .dimension()
+                .is_some_and(|dimension| dimension > 0)
+                && crate::engine::geo::srs::find(geometry.srid)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|srs| srs.kind == crate::engine::geo::srs::SrsKind::Geographic)
+            {
+                // Keep validation at execution even if a planar envelope would
+                // produce no candidates and hide the unsupported-SRS error.
+                return Some((
+                    index,
+                    SpatialProbe::Parameter {
+                        expr: args[const_i].clone(),
+                        function: name.to_ascii_uppercase(),
+                        column_first: col_i == 0,
+                    },
+                ));
+            }
+            if let Some(m) = geometry.geom.mbr() {
                 return Some((
                     index,
                     SpatialProbe::Constant {
                         mbr: [m.minx, m.miny, m.maxx, m.maxy],
                         srid: crate::engine::geo::read_geometry(&bytes).ok()?.srid,
+                        function: name.to_ascii_uppercase(),
+                        column_first: col_i == 0,
                     },
                 ));
             }
-            return Some((index, SpatialProbe::Parameter(args[const_i].clone())));
+            return Some((
+                index,
+                SpatialProbe::Parameter {
+                    expr: args[const_i].clone(),
+                    function: name.to_ascii_uppercase(),
+                    column_first: col_i == 0,
+                },
+            ));
         }
     }
     None
@@ -10672,7 +10751,7 @@ fn try_knn_vector_scan(
         if match_distance_call(order_expr).is_some() {
             crate::engine::api::push_statement_warning(
                 crate::error::ConditionLevel::Warning,
-                 crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
+                 crate::error::catalog::MYDB_WARN_VECTOR_FALLBACK,
                 "descending vector distance requests farthest-first order and cannot use a nearest-neighbour vector index; falling back to a full sort",
             );
         }
@@ -10796,7 +10875,7 @@ fn try_knn_vector_scan(
     if hnsw_hint.is_some() && ivf_hint.is_some() {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
-             crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
+             crate::error::catalog::MYDB_WARN_VECTOR_FALLBACK,
             "HNSW_EF and IVF_NPROBE cannot pin the same KNN scan simultaneously; choosing the lower-cost compatible index",
         );
     }
@@ -10889,7 +10968,7 @@ fn try_knn_vector_scan(
     if index.is_none() && (hnsw_hint.is_some() || ivf_hint.is_some()) {
         crate::engine::api::push_statement_warning(
             crate::error::ConditionLevel::Warning,
-             crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
+             crate::error::catalog::MYDB_WARN_VECTOR_FALLBACK,
             "the requested algorithm-specific vector hint has no compatible index; falling back to an exact scan",
         );
     }
@@ -10905,7 +10984,7 @@ fn try_knn_vector_scan(
             if !no_vector_index_hint && idx_metric != metric {
                 crate::engine::api::push_statement_warning(
                     crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
+                    crate::error::catalog::MYDB_WARN_VECTOR_FALLBACK,
                     format!(
                         "vector index `{}` metric={} does not match query metric={}; \
                      falling back to a non-indexed scan",
@@ -11277,7 +11356,13 @@ fn choose_scan_for_source(
         }
         return Ok(scan);
     }
-    choose_scan(db, table, filter, hints)
+    let hint = query_hint_zone_map(hints.query_hints, hints.table_name, &table.schema.name);
+    if hint == table.zone_map_hint {
+        return choose_scan(db, table, filter, hints);
+    }
+    let mut table = table.clone();
+    table.zone_map_hint = hint;
+    choose_scan(db, &table, filter, hints)
 }
 
 fn sample_scan_plan(
@@ -11834,7 +11919,12 @@ fn choose_scan(
                 let costed_surviving_pages = seq_pages * surviving_fraction;
                 if surviving_fraction < 1.0 || zone_hint == Some(true) {
                     let zone_consts = crate::engine::cbo::cbo_consts();
-                    let range_jumps = estimate.ranges as f64 * zone_consts.rnd_page_cost();
+                    let range_jumps = crate::engine::cbo::cache_model::page_io_cost(
+                        crate::engine::cbo::cache_model::AccessKind::Random,
+                        estimate.ranges as f64,
+                        ctx.effective_cache_pages as f64,
+                        table_pages,
+                    );
                     // Borrowed summary evaluation touches logical records;
                     // a warm page is not another disk read per sampled zone.
                     let metadata_cpu = estimate.zones_examined as f64
@@ -11896,7 +11986,13 @@ fn choose_scan(
             crate::engine::status_counters::record_like_zone_selected();
         }
     }
-    if zone_hint == Some(true) && selected_zone_map.is_some() {
+    if zone_hint == Some(true)
+        && selected_zone_map.is_some()
+        && hints.fulltext_matches.is_empty()
+        && !filter
+            .as_ref()
+            .is_some_and(|expr| find_fulltext_match(expr).is_some())
+    {
         return Ok(materialize_seq_scan(
             table,
             filter.clone(),
@@ -12144,21 +12240,52 @@ fn choose_scan(
     // column with a constant query geometry is driven by the R-tree. The
     // residual `filter` is the full WHERE — re-checked per candidate row so
     // the R-tree's MBR superset is filtered down to the exact answer.
-    if let Some((sp_index, query_probe)) = find_spatial_index_scan(&table.schema, expr, hints) {
-        let access_rows = (total_rows * 0.3).clamp(1.0, total_rows.max(1.0));
+    if let Some((sp_index, query_probe)) =
+        find_spatial_index_scan(&table.schema, expr, hints).filter(|_| !exact_unique_lookup)
+    {
+        let fraction = match &query_probe {
+            SpatialProbe::Constant { mbr, .. } if !table.schema.is_partitioned() => db
+                .spatial_estimate_fraction(
+                    table.schema.id,
+                    &sp_index.name,
+                    crate::engine::geo::Mbr::new(mbr[0], mbr[1], mbr[2], mbr[3]),
+                )
+                .unwrap_or(0.3),
+            _ => 0.3,
+        };
+        let access_rows = (total_rows * fraction).clamp(1.0, total_rows.max(1.0));
+        let access_rows = hints
+            .row_goal
+            .map_or(access_rows, |goal| access_rows.min(goal.max(1) as f64));
         let estimated_rows = estimate_filter_rows(&table.schema, expr, access_rows);
-        return Ok(PhysicalPlan::SpatialScan {
-            table: table.clone(),
-            index: sp_index.clone(),
-            query_probe,
-            filter: filter.clone(),
-            estimated_rows,
-            access_rows,
-            cost: crate::engine::cbo::Cost::scalar(access_rows),
-            possible_keys: possible_keys.clone(),
-            hint_note: None,
-            projected_columns: None,
+        let cost = operator_cost::index_lookup(&ctx, 2.0, access_rows, table_pages, row_width);
+        let forced = hints.index_hints.iter().any(|hint| {
+            matches!(hint.hint_type, IndexHintType::Force)
+                && hint
+                    .index_names
+                    .iter()
+                    .any(|name| name.eq_ignore_ascii_case(&sp_index.name))
         });
+        if forced
+            || (total_rows <= 1000.0 && index_choice.is_none())
+            || (cost.weighted_total() < seq_cost.weighted_total()
+                && index_choice
+                    .as_ref()
+                    .is_none_or(|(_, index_cost)| cost.weighted_total() < *index_cost))
+        {
+            return Ok(PhysicalPlan::SpatialScan {
+                table: table.clone(),
+                index: sp_index.clone(),
+                query_probe,
+                filter: filter.clone(),
+                estimated_rows,
+                access_rows,
+                cost,
+                possible_keys: possible_keys.clone(),
+                hint_note: None,
+                projected_columns: None,
+            });
+        }
     }
     if let Some((ngram_index, like_prefilter)) =
         find_like_ngram_prefilter(&table.schema, expr, hints)
@@ -14619,8 +14746,12 @@ fn numeric_stat_value_opt(value: &Value) -> Option<f64> {
         Value::Float(v) => Some(*v as f64),
         Value::Double(v) => Some(*v),
         Value::Decimal(v) => v.parse().ok(),
-        Value::DecimalCompact(mag, scale) => Some(*mag as f64 / 10f64.powi(*scale as i32)),
-        Value::Decimal128(mag, scale) => Some(*mag as f64 / 10f64.powi(*scale as i32)),
+        Value::DecimalCompact(mag, scale) => {
+            Some(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
+        }
+        Value::Decimal128(mag, scale) => {
+            Some(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
+        }
         Value::DecimalWide(value) => {
             crate::util::decimal::format_big_decimal_parts(&value.magnitude, value.scale)
                 .parse()
@@ -14649,8 +14780,10 @@ fn numeric_stat_value(value: &Value) -> f64 {
         Value::Float(v) => *v as f64,
         Value::Double(v) => *v,
         Value::Decimal(v) => v.parse().unwrap_or(0.0),
-        Value::DecimalCompact(mag, scale) => *mag as f64 / 10f64.powi(*scale as i32),
-        Value::Decimal128(mag, scale) => *mag as f64 / 10f64.powi(*scale as i32),
+        Value::DecimalCompact(mag, scale) => {
+            crate::util::decimal::parts_to_f64(*mag as i128, *scale)
+        }
+        Value::Decimal128(mag, scale) => crate::util::decimal::parts_to_f64(*mag as i128, *scale),
         Value::DecimalWide(value) => {
             crate::util::decimal::format_big_decimal_parts(&value.magnitude, value.scale)
                 .parse()
@@ -21833,6 +21966,34 @@ fn expr_has_volatile_evaluation(expr: &Expr) -> bool {
     }
 }
 
+fn expr_has_only_stable_variable_reads(expr: &Expr) -> bool {
+    use crate::parser::visit::{visit_expr, AstVisitor};
+    struct Stable(bool);
+    impl AstVisitor for Stable {
+        fn enter_expr(&mut self, expr: &Expr) {
+            match expr {
+                Expr::Function { name, .. } => {
+                    let call = Expr::Function {
+                        name: name.clone(),
+                        args: Vec::new(),
+                        distinct: false,
+                    };
+                    self.0 &= expr_is_deterministic(&call);
+                }
+                Expr::SystemVariable { .. }
+                | Expr::Subquery(_)
+                | Expr::Exists { .. }
+                | Expr::InSubquery { .. }
+                | Expr::WindowFunction { .. } => self.0 = false,
+                _ => {}
+            }
+        }
+    }
+    let mut stable = Stable(true);
+    visit_expr(&mut stable, expr);
+    stable.0
+}
+
 fn extract_table_predicate(
     db: &Database,
     predicates: &mut Vec<Expr>,
@@ -21841,7 +22002,9 @@ fn extract_table_predicate(
     let mut taken = Vec::new();
     let mut remaining = Vec::new();
     for predicate in predicates.drain(..) {
-        if !expr_has_volatile_evaluation(&predicate)
+        if (!expr_has_volatile_evaluation(&predicate)
+            || (!connection_thread_execution_required()
+                && expr_has_only_stable_variable_reads(&predicate)))
             && expr_can_resolve_in_table(db, &predicate, table)
         {
             taken.push(predicate);

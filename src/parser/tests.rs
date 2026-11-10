@@ -7094,3 +7094,94 @@ fn routine_audit_1028_rejects_nul_identifiers_but_preserves_literal_nuls() {
     let _mode = ParserSqlModeGuard::activate(crate::engine::api::SQL_MODE_ANSI_QUOTES);
     assert!(parse_statement("SELECT \"\0view_function_0\"()").is_err());
 }
+
+#[test]
+fn show_audit_create_object_rejects_trailing_tokens() {
+    for kind in ["TRIGGER", "PROCEDURE", "FUNCTION", "EVENT"] {
+        for suffix in [" JUNK JUNK", ",", ")", "+other", "=other", ".extra"] {
+            let sql = format!("SHOW CREATE {kind} app.obj{suffix}");
+            let err = parse_statement(&sql).expect_err(&sql);
+            assert_eq!(err.code(), 1064, "{sql}: {err:?}");
+        }
+        assert!(
+            parse_statement(&format!("SHOW CREATE {kind} `app` . `obj,)+` /* tail */;")).is_ok()
+        );
+        assert!(parse_statement(&format!("SHOW CREATE {kind} `app`.`obj``name`;")).is_ok());
+    }
+    for name in ["1abc", "2foo", "1_abc", "应用对象"] {
+        assert!(parse_statement(&format!("SHOW CREATE TRIGGER app.{name}")).is_ok());
+        assert!(parse_statement(&format!("SHOW CREATE TRIGGER {name}")).is_ok());
+    }
+    assert!(parse_statement("SHOW CREATE TRIGGER app.123").is_ok());
+    assert!(matches!(
+        parse_statement("SHOW CREATE TRIGGER `app`.`obj``name`").unwrap(),
+        Statement::ShowCreateTrigger { name } if name == "app.obj`name"
+    ));
+}
+
+#[test]
+fn show_audit_index_explicit_database_overrides_qualifier() {
+    for noun in ["INDEX", "INDEXES", "KEYS"] {
+        for preposition in ["FROM", "IN"] {
+            let sql = format!(
+                "SHOW {noun} {preposition} `first`.t {preposition} `second` WHERE Key_name = 'idx'"
+            );
+            assert!(
+                matches!(parse_statement(&sql).unwrap(),
+                Statement::ShowIndex { table, filter: Some(ShowFilter::Where(_)) }
+                    if table == "second.t"),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn show_audit_rejects_conflicting_or_repeated_scopes() {
+    for noun in ["VARIABLES", "STATUS"] {
+        for first in ["SESSION", "GLOBAL", "LOCAL"] {
+            for second in ["SESSION", "GLOBAL", "LOCAL"] {
+                let sql = format!("SHOW {first} {second} {noun}");
+                let err = parse_statement(&sql).expect_err(&sql);
+                assert_eq!(err.code(), 1064, "{sql}: {err:?}");
+            }
+            assert!(parse_statement(&format!("SHOW {first} {noun} LIKE 'version%'")).is_ok());
+        }
+    }
+}
+
+#[test]
+fn show_audit_engine_name_uses_sql_quote_decoding() {
+    for (raw, expected) in [
+        ("MYDB", "MYDB"),
+        ("`mydb`", "mydb"),
+        ("'mydb'", "mydb"),
+        ("\"mydb\"", "mydb"),
+        ("`my``db`", "my`db"),
+        ("'my''db'", "my'db"),
+        ("'my db'", "my db"),
+    ] {
+        let sql = format!("SHOW ENGINE {raw} MUTEX");
+        assert!(
+            matches!(parse_statement(&sql).unwrap(),
+            Statement::ShowEngine { engine, kind: ShowEngineKind::Mutex }
+                if engine == expected),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn show_audit_unsupported_statement_identifies_show() {
+    for sql in [
+        "SHOW ENGINE FOO STATUSXYZ",
+        "SHOW CHARACTERS",
+        "SHOW MYDB MEMORYX",
+    ] {
+        assert!(
+            matches!(parse_statement(sql).unwrap(),
+            Statement::Unsupported { kind, .. } if kind == "SHOW statement"),
+            "{sql}"
+        );
+    }
+}

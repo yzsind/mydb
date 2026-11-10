@@ -309,7 +309,7 @@ fn spatial_release_semantics_and_input_validation() {
             .find(|i| i.name == "k")
             .unwrap()
             .index_type,
-        "BTREE"
+        "SPATIAL"
     );
     engine
         .execute("INSERT INTO geo VALUES(1,ST_GeomFromText('POINT(1 2)'))")
@@ -372,11 +372,11 @@ fn view_string_expressions_keep_their_bound_widths() {
         .db_handle()
         .view_definition("test", "view_strings")
         .unwrap();
-    // Unicode case mappings can expand; retain the engine's proven bound
-    // rather than copying MySQL's narrower twenty-character declaration.
+    // Runtime UPPER uses MySQL's simple 1:1 case mapping, so the bound
+    // retains the declared character width, including through a view.
     assert!(matches!(
         view.columns[0].data_type,
-        Some(crate::storage::schema::DataTypeKind::VarChar { len: Some(60) })
+        Some(crate::storage::schema::DataTypeKind::VarChar { len: Some(20) })
     ));
     assert!(matches!(
         view.columns[1].data_type,

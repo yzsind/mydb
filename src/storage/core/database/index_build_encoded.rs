@@ -324,6 +324,7 @@ enum EncodedSortedRecords {
         tmp: IndexSortTmpDir,
         runs: Vec<PathBuf>,
         fixed128: Option<(usize, usize)>,
+        read_buffer_bytes: usize,
     },
 }
 
@@ -707,8 +708,9 @@ fn validated_fixed128_from_sorted(
             tmp,
             runs,
             fixed128: Some((key_width, stride)),
+            read_buffer_bytes,
         } => (
-            Fixed128Source::Runs(EncodedFixed128RunMerger::open(tmp, runs)?),
+            Fixed128Source::Runs(EncodedFixed128RunMerger::open(tmp, runs, read_buffer_bytes)?),
             key_width,
             stride,
         ),
@@ -1015,9 +1017,12 @@ where
             tmp,
             runs,
             fixed128: Some((key_width, _)),
+            read_buffer_bytes,
         } => {
             let ops = program.fixed_ops.as_deref().unwrap();
-            for (position, record) in EncodedFixed128RunMerger::open(tmp, runs)?.enumerate() {
+            for (position, record) in
+                EncodedFixed128RunMerger::open(tmp, runs, read_buffer_bytes)?.enumerate()
+            {
                 if position % 4096 == 0 {
                     crate::engine::cancel::check_cancelled()?;
                 }
@@ -1613,8 +1618,18 @@ struct EncodedVariableMemoryIter {
     records: std::vec::IntoIter<EncodedVarDescriptor>,
 }
 
+const MAX_ENCODED_MERGE_FAN_IN: usize = 16;
+
+/// The caller retains its StorageScratch reservation until the sorted stream
+/// is consumed. Spilled sorters have dropped their arenas before opening any
+/// readers, so reuse at most half that envelope for all input buffers. The
+/// remainder covers the writer and merge/leaf staging without new admission.
+fn encoded_merge_read_buffer_bytes(sorter_budget: usize) -> usize {
+    (sorter_budget / 2 / MAX_ENCODED_MERGE_FAN_IN).clamp(1, 4 * 1024 * 1024)
+}
+
 struct EncodedRunReader {
-    reader: std::io::BufReader<File>,
+    reader: std::io::BufReader<IndexSpillReadFile>,
 }
 
 struct EncodedRunMerger {
@@ -1625,7 +1640,7 @@ struct EncodedRunMerger {
 }
 
 struct EncodedFixed128RunReader {
-    reader: std::io::BufReader<File>,
+    reader: std::io::BufReader<IndexSpillReadFile>,
 }
 
 struct EncodedFixed128RunMerger {
@@ -1679,8 +1694,9 @@ impl EncodedSortedRecords {
                 tmp,
                 runs,
                 fixed128: Some((key_width, _)),
+                read_buffer_bytes,
             } => EncodedSortedRecordIter::Fixed128Spilled(EncodedFixed128RunIter {
-                merger: EncodedFixed128RunMerger::open(tmp, runs)?,
+                merger: EncodedFixed128RunMerger::open(tmp, runs, read_buffer_bytes)?,
                 program,
                 key_width,
             }),
@@ -1688,7 +1704,12 @@ impl EncodedSortedRecords {
                 tmp,
                 runs,
                 fixed128: None,
-            } => EncodedSortedRecordIter::Spilled(EncodedRunMerger::open(tmp, runs)?),
+                read_buffer_bytes,
+            } => EncodedSortedRecordIter::Spilled(EncodedRunMerger::open(
+                tmp,
+                runs,
+                read_buffer_bytes,
+            )?),
         })
     }
 }
@@ -1816,12 +1837,12 @@ impl Iterator for EncodedInternedMemoryIter {
 }
 
 impl EncodedRunReader {
-    fn open(path: &Path) -> Result<Self, QueryError> {
+    fn open(path: &Path, read_buffer_bytes: usize) -> Result<Self, QueryError> {
         if let Ok(meta) = fs::metadata(path) {
             record_spill_bytes_read(meta.len());
         }
         Ok(Self {
-            reader: std::io::BufReader::with_capacity(64 * 1024, File::open(path).map_err(io_err)?),
+            reader: open_index_sort_run(path, read_buffer_bytes)?,
         })
     }
 
@@ -1862,9 +1883,9 @@ impl IndexSortRunCodec for EncodedIndexRunCodec {
     type Reader = EncodedRunReader;
     type Writer = std::io::BufWriter<File>;
 
-    fn open_reader(path: &Path) -> Result<Self::Reader, QueryError> {
+    fn open_reader(path: &Path, read_buffer_bytes: usize) -> Result<Self::Reader, QueryError> {
         Ok(EncodedRunReader {
-            reader: std::io::BufReader::with_capacity(64 * 1024, File::open(path).map_err(io_err)?),
+            reader: open_index_sort_run(path, read_buffer_bytes)?,
         })
     }
 
@@ -1899,18 +1920,23 @@ impl IndexSortRunCodec for EncodedIndexRunCodec {
 }
 
 impl EncodedRunMerger {
-    fn open(tmp: IndexSortTmpDir, runs: Vec<PathBuf>) -> Result<Self, QueryError> {
+    fn open(
+        tmp: IndexSortTmpDir,
+        runs: Vec<PathBuf>,
+        read_buffer_bytes: usize,
+    ) -> Result<Self, QueryError> {
         // Sort arenas have been dropped before this phase. Bound both open
         // files and read buffers independently of relation size/run count.
         let runs = consolidate_sort_runs::<EncodedIndexRunCodec>(
             &tmp.path,
             runs,
-            index_merge_fan_in().min(16),
+            index_merge_fan_in().min(MAX_ENCODED_MERGE_FAN_IN),
+            read_buffer_bytes,
         )?;
         let mut readers = Vec::with_capacity(runs.len());
         let mut heads = Vec::with_capacity(runs.len());
         for path in runs {
-            let mut reader = EncodedRunReader::open(&path)?;
+            let mut reader = EncodedRunReader::open(&path, read_buffer_bytes)?;
             let Some(record) = reader.next_record()? else {
                 continue;
             };
@@ -1950,12 +1976,12 @@ impl Iterator for EncodedRunMerger {
 }
 
 impl EncodedFixed128RunReader {
-    fn open(path: &Path) -> Result<Self, QueryError> {
+    fn open(path: &Path, read_buffer_bytes: usize) -> Result<Self, QueryError> {
         if let Ok(meta) = fs::metadata(path) {
             record_spill_bytes_read(meta.len());
         }
         Ok(Self {
-            reader: std::io::BufReader::with_capacity(64 * 1024, File::open(path).map_err(io_err)?),
+            reader: open_index_sort_run(path, read_buffer_bytes)?,
         })
     }
 
@@ -1976,9 +2002,9 @@ impl IndexSortRunCodec for EncodedFixed128RunCodec {
     type Reader = EncodedFixed128RunReader;
     type Writer = std::io::BufWriter<File>;
 
-    fn open_reader(path: &Path) -> Result<Self::Reader, QueryError> {
+    fn open_reader(path: &Path, read_buffer_bytes: usize) -> Result<Self::Reader, QueryError> {
         Ok(EncodedFixed128RunReader {
-            reader: std::io::BufReader::with_capacity(64 * 1024, File::open(path).map_err(io_err)?),
+            reader: open_index_sort_run(path, read_buffer_bytes)?,
         })
     }
 
@@ -2007,16 +2033,21 @@ impl IndexSortRunCodec for EncodedFixed128RunCodec {
 }
 
 impl EncodedFixed128RunMerger {
-    fn open(tmp: IndexSortTmpDir, runs: Vec<PathBuf>) -> Result<Self, QueryError> {
+    fn open(
+        tmp: IndexSortTmpDir,
+        runs: Vec<PathBuf>,
+        read_buffer_bytes: usize,
+    ) -> Result<Self, QueryError> {
         let runs = consolidate_sort_runs::<EncodedFixed128RunCodec>(
             &tmp.path,
             runs,
-            index_merge_fan_in().min(16),
+            index_merge_fan_in().min(MAX_ENCODED_MERGE_FAN_IN),
+            read_buffer_bytes,
         )?;
         let mut readers = Vec::with_capacity(runs.len());
         let mut heads = Vec::with_capacity(runs.len());
         for path in runs {
-            let mut reader = EncodedFixed128RunReader::open(&path)?;
+            let mut reader = EncodedFixed128RunReader::open(&path, read_buffer_bytes)?;
             if let Some(record) = reader.next_record()? {
                 readers.push(reader);
                 heads.push(Some(record));
@@ -2776,6 +2807,7 @@ impl EncodedIndexSorter {
             tmp: self.tmp.take().expect("encoded runs own temp dir"),
             runs: self.runs,
             fixed128,
+            read_buffer_bytes: encoded_merge_read_buffer_bytes(self.run_bytes),
         })
     }
 }
@@ -3797,7 +3829,8 @@ fn proportional_encoded_index_budgets(weights: &[usize], aggregate_budget: usize
     let distributable = aggregate_budget.saturating_sub(minimum_total);
     let total_weight = weights
         .iter()
-        .fold(0usize, |sum, weight| sum.saturating_add(*weight))
+        .map(|weight| *weight as u128)
+        .sum::<u128>()
         .max(1);
     let mut assigned = 0usize;
     let mut budgets = Vec::with_capacity(weights.len());
@@ -3805,7 +3838,10 @@ fn proportional_encoded_index_budgets(weights: &[usize], aggregate_budget: usize
         let extra = if position + 1 == weights.len() {
             distributable.saturating_sub(assigned)
         } else {
-            distributable.saturating_mul(*weight) / total_weight
+            // Byte estimates can exceed sqrt(usize::MAX). Saturating the
+            // product silently transfers most of the budget to the last
+            // index instead of preserving the relative weights.
+            ((distributable as u128) * (*weight as u128) / total_weight) as usize
         };
         assigned = assigned.saturating_add(extra);
         budgets.push(MIN_ENCODED_INDEX_SORTER_BYTES.saturating_add(extra));
@@ -5420,6 +5456,112 @@ mod encoded_index_program_tests {
     use super::*;
 
     #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn encoded_sorter_large_budgets_preserve_weights_and_total() {
+        let minimum = MIN_ENCODED_INDEX_SORTER_BYTES;
+        // Large relations used to saturate the multiplication and give the
+        // remainder to the last index, despite identical resident costs.
+        for rows in [60_000_000usize, 600_000_000, 6_000_000_000] {
+            let estimates = vec![rows * 16; 7];
+            let weights = encoded_sorter_budget_weights(Some(&estimates), 7);
+            let aggregate = 7 * 1024 * 1024 * 1024;
+            let budgets = proportional_encoded_index_budgets(&weights, aggregate);
+            assert_eq!(budgets.iter().sum::<usize>(), aggregate);
+            assert!(budgets.iter().max().unwrap() - budgets.iter().min().unwrap() <= 6);
+        }
+        // The sum of weights can overflow usize independently of the product.
+        let weights = [usize::MAX, usize::MAX, usize::MAX];
+        assert_eq!(
+            proportional_encoded_index_budgets(&weights, 3 * minimum + 3_000_000),
+            vec![minimum + 1_000_000; 3]
+        );
+        // Scaling or permuting weights must not change proportional shares.
+        let aggregate = 3 * minimum + 7 * 1024 * 1024 * 1024;
+        for weights in [[1, 2, 4], [4, 1, 2], [2, 4, 1]] {
+            let scaled = weights.map(|weight| weight * 1_000_000_000);
+            let budgets = proportional_encoded_index_budgets(&scaled, aggregate);
+            assert_eq!(
+                budgets,
+                proportional_encoded_index_budgets(&weights, aggregate)
+            );
+            for (budget, weight) in budgets.iter().zip(weights) {
+                assert_eq!(*budget, minimum + weight * 1024 * 1024 * 1024);
+            }
+        }
+    }
+
+    #[test]
+    fn encoded_merge_buffers_reuse_bounded_sorter_envelope() {
+        for budget in [
+            1024 * 1024,
+            4 * 1024 * 1024,
+            64 * 1024 * 1024,
+            1024 * 1024 * 1024,
+        ] {
+            let capacity = encoded_merge_read_buffer_bytes(budget);
+            assert!(capacity <= 4 * 1024 * 1024);
+            assert!(capacity * MAX_ENCODED_MERGE_FAN_IN <= budget / 2);
+        }
+        assert_eq!(encoded_merge_read_buffer_bytes(1024 * 1024), 32 * 1024);
+        assert_eq!(
+            encoded_merge_read_buffer_bytes(1024 * 1024 * 1024),
+            4 * 1024 * 1024
+        );
+    }
+
+    #[test]
+    fn encoded_run_readers_preserve_records_across_refills() {
+        let root = tempfile::tempdir().unwrap();
+        for capacity in [7, 64 * 1024, 1024 * 1024, 4 * 1024 * 1024] {
+            let fixed_path = root.path().join("fixed");
+            let count = capacity / 16 + 3;
+            let expected = (0..count as u128).map(|n| n * 19).collect::<Vec<_>>();
+            let bytes = expected
+                .iter()
+                .flat_map(|n| n.to_be_bytes())
+                .collect::<Vec<_>>();
+            fs::write(&fixed_path, &bytes).unwrap();
+            let mut reader = EncodedFixed128RunReader::open(&fixed_path, capacity).unwrap();
+            assert_eq!(reader.reader.capacity(), capacity);
+            for expected in expected {
+                assert_eq!(reader.next_record().unwrap(), Some(expected));
+            }
+            assert_eq!(reader.next_record().unwrap(), None);
+            drop(reader);
+            fs::write(&fixed_path, &bytes[..bytes.len() - 1]).unwrap();
+            let mut reader = EncodedFixed128RunReader::open(&fixed_path, capacity).unwrap();
+            for _ in 1..count {
+                assert!(reader.next_record().unwrap().is_some());
+            }
+            assert!(reader.next_record().is_err());
+
+            let variable_path = root.path().join("variable");
+            let key = vec![0x31; capacity + 3];
+            let payload = vec![0x72; capacity + 5];
+            let row_id = RowId {
+                page_id: 123,
+                slot_id: 45,
+            };
+            let mut bytes = Vec::new();
+            write_encoded_run_record(&mut bytes, &key, Some(&payload), row_id, true).unwrap();
+            fs::write(&variable_path, &bytes).unwrap();
+            let mut reader = EncodedRunReader::open(&variable_path, capacity).unwrap();
+            let record = reader.next_record().unwrap().unwrap();
+            assert_eq!(record.order_key, key);
+            assert_eq!(record.materialized_key.as_deref(), Some(payload.as_slice()));
+            assert_eq!(record.row_id, row_id);
+            assert!(record.has_null);
+            assert!(reader.next_record().unwrap().is_none());
+            drop(reader);
+            fs::write(&variable_path, &bytes[..bytes.len() - 1]).unwrap();
+            assert!(EncodedRunReader::open(&variable_path, capacity)
+                .unwrap()
+                .next_record()
+                .is_err());
+        }
+    }
+
+    #[test]
     fn encoded_merge_bounds_readers_and_rejects_truncated_headers() {
         let root = tempfile::tempdir().unwrap();
         let tmp = IndexSortTmpDir::create(root.path()).unwrap();
@@ -5447,7 +5589,7 @@ mod encoded_index_program_tests {
             EncodedIndexRunCodec::finish(writer).unwrap();
             runs.push(path);
         }
-        let mut merger = EncodedRunMerger::open(tmp, runs).unwrap();
+        let mut merger = EncodedRunMerger::open(tmp, runs, 64 * 1024).unwrap();
         assert!(merger.readers.len() <= 16);
         let records = merger.by_ref().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 3);
@@ -5462,12 +5604,12 @@ mod encoded_index_program_tests {
         for length in 1..15 {
             let path = root.path().join(format!("truncated-{length}"));
             fs::write(&path, vec![0; length]).unwrap();
-            let mut reader = EncodedRunReader::open(&path).unwrap();
+            let mut reader = EncodedRunReader::open(&path, 64 * 1024).unwrap();
             assert!(reader.next_record().is_err());
         }
         let path = root.path().join("empty");
         fs::write(&path, []).unwrap();
-        assert!(EncodedRunReader::open(&path)
+        assert!(EncodedRunReader::open(&path, 64 * 1024)
             .unwrap()
             .next_record()
             .unwrap()
@@ -5489,7 +5631,7 @@ mod encoded_index_program_tests {
             assert_eq!(fs::metadata(&path).unwrap().len(), 3 * 16);
             runs.push(path);
         }
-        let merged = EncodedFixed128RunMerger::open(tmp, runs)
+        let merged = EncodedFixed128RunMerger::open(tmp, runs, 64 * 1024)
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
@@ -5498,7 +5640,7 @@ mod encoded_index_program_tests {
         for length in 1..16 {
             let path = root.path().join(format!("fixed-truncated-{length}"));
             fs::write(&path, vec![0; length]).unwrap();
-            assert!(EncodedFixed128RunReader::open(&path)
+            assert!(EncodedFixed128RunReader::open(&path, 64 * 1024)
                 .unwrap()
                 .next_record()
                 .is_err());
@@ -5821,6 +5963,7 @@ mod encoded_index_program_tests {
             tmp,
             runs,
             fixed128: Some((9, 15)),
+            read_buffer_bytes: 64 * 1024,
         };
         let mut source = validated_fixed128_from_sorted(sorted, Arc::new(program), &index).unwrap();
         assert!(source.next().unwrap().is_ok());

@@ -270,7 +270,7 @@ impl Database {
             if markers.is_empty() {
                 continue;
             }
-            self.ensure_writable()?;
+            self.ensure_writable().map_err(|err| err.map_message(|message| format!("{message}; dictionary index repair required: {markers:?}")))?;
             self.rebuild_indexes(table)?;
             // Keep the fences until every replacement tree is published.
             // A crash before removal simply repeats the idempotent rebuild.
@@ -311,6 +311,7 @@ impl Database {
         let mut tasks: Vec<(usize, u64, PathBuf)> = Vec::new();
         let mut index_counts = vec![0usize; tables.len()];
         let mut important_paths = Vec::new();
+        let mut spatial_repairs = Vec::new();
         for row in self.catalog_rows_for_selector(
             crate::storage::data_dictionary::DD_INDEXES,
             CatalogRowSelector::All,
@@ -333,7 +334,10 @@ impl Database {
                         index_id,
                         "rtree",
                     );
-                    spatial_index::SpatialIndexFile::quick_validate(path)?;
+                    if let Err(err) = spatial_index::SpatialIndexFile::quick_validate(path.clone()) {
+                        crate::util::logging::log_message(format_args!("spatial index startup rebuild required at {}: {}", path.display(), err.message()));
+                        spatial_repairs.push((position, storage_id, index_id));
+                    }
                     continue;
                 }
                 tasks.push((
@@ -352,6 +356,21 @@ impl Database {
                 }
                 index_counts[position] += 1;
             }
+        }
+        for (position, storage_id, index_id) in spatial_repairs {
+            self.ensure_writable().map_err(|err| err.map_message(|message| format!("{message}; spatial startup repair required for storage {storage_id}, index {index_id}")))?;
+            let table = self.load_table_descriptor_from_dd(tables[position].id)?
+                .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "spatial repair table missing"))?;
+            let index = table.indexes.iter().find(|index| index.index_id == index_id)
+                .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "spatial repair index missing"))?;
+            let mut physical = (*table).clone();
+            physical.id = storage_id;
+            physical.active_generation = self.storage_generation(storage_id);
+            physical.partitioning = None;
+            physical.build_column_index();
+            self.rebuild_index_offline_bulk(&physical, index)?;
+            summary.repaired_indexes += 1;
+            summary.checked_index_files += 1;
         }
         for (_, _, path) in &tasks {
             if path.with_extension("idx.corrupt").try_exists().map_err(io_err)? {
@@ -387,7 +406,7 @@ impl Database {
                 if needs_rebuild[table_idx].contains(&storage_id) {
                     continue;
                 }
-                if validation.validate(path).is_err() {
+                if validation.validate(path.clone()).inspect_err(|err| crate::util::logging::log_message(format_args!("index startup rebuild required at {}: {}", path.display(), err.message()))).is_err() {
                     needs_rebuild[table_idx].insert(storage_id);
                 }
             }
@@ -407,7 +426,7 @@ impl Database {
                                 break;
                             }
                             let (table_idx, storage_id, path) = &tasks_ref[i];
-                            let bad = validation_copy.validate(path.clone()).is_err();
+                            let bad = validation_copy.validate(path.clone()).inspect_err(|err| crate::util::logging::log_message(format_args!("index startup rebuild required at {}: {}", path.display(), err.message()))).is_err();
                             if bad {
                                 local.push((*table_idx, *storage_id));
                             }
@@ -430,7 +449,7 @@ impl Database {
         for (idx, table) in tables.iter().enumerate() {
             let physical_index_count = index_counts[idx];
             if !needs_rebuild[idx].is_empty() {
-                self.ensure_writable()?;
+                self.ensure_writable().map_err(|err| err.map_message(|message| format!("{message}; B-tree startup repair required for {}", table.qualified_name())))?;
                 let storage_ids = needs_rebuild[idx].iter().copied().collect::<Vec<_>>();
                 let table = self
                     .load_table_descriptor_from_dd(table.id)?

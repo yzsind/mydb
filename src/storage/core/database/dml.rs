@@ -694,7 +694,12 @@ impl Database {
             Ok(inserted) => {
                 // Merge once per prepared batch after final RowIds are known;
                 // the zone id is a property of the forwarding root page.
-                self.merge_zone_map_rows(txn_id, table_id, &inserted, rows)?;
+                if let Err(err) = self.merge_zone_map_rows(txn_id, table_id, &inserted, rows) {
+                    self.rollback_inserted_rows(txn_id, table_id, &inserted)?;
+                    self.dml_stats
+                        .record_rollback_inserted_rows(inserted.len() as u64);
+                    return Err(err);
+                }
                 Ok(inserted)
             }
             Err(e) => {
@@ -1056,7 +1061,7 @@ impl Database {
             // propagates: the txn rollback path follows the undo chain,
             // and these rows are not yet on it.
             if let Err(err) = (|| -> Result<(), QueryError> {
-                if !hints.skip_row_lock {
+                if !hints.skip_row_lock || !table.fk_referenced_by.is_empty() {
                     self.lock_rows_nonblocking(txn.txn_id, table.id, inserted.iter().copied())?;
                 }
                 self.push_insert_batch_undo_deferred(txn.txn_id, table.id, &inserted)?;
@@ -2073,15 +2078,25 @@ impl Database {
                 // the candidate snapshot is active, so a concurrently removed
                 // candidate is handled by the post-lock
                 // read without making the early lock unsafe.
+                let held_before =
+                    txn.txn_id == 0 || self.txn_holds_row_lock(txn.txn_id, table.id, row.row_id);
                 if txn.txn_id != 0 {
                     self.lock_rows_nonblocking(txn.txn_id, table.id, std::iter::once(row.row_id))?;
                 }
                 let mut current = match self.read_mvcc_row(table.id, row.row_id)? {
                     Some(current) => current,
-                    None => continue,
+                    None => {
+                        if !held_before {
+                            self.release_new_point_row_lock(txn.txn_id, table.id, row.row_id);
+                        }
+                        continue;
+                    }
                 };
                 self.check_dml_write_allowed(txn, table.id, &current)?;
                 if current.header.is_deleted() {
+                    if !held_before {
+                        self.release_new_point_row_lock(txn.txn_id, table.id, row.row_id);
+                    }
                     continue;
                 }
                 // The raw heap read returns the row at its original
@@ -2308,6 +2323,7 @@ impl Database {
             // transfers only when that batch has finished.
             for (chunk_index, chunk) in updates.chunks(256).enumerate() {
                 crate::engine::cancel::check_cancelled()?;
+                let mut chain_ends = Vec::with_capacity(chunk.len());
                 let prepare_result = (|| -> Result<Vec<HeapWrite>, QueryError> {
                     let mut heap_writes = Vec::with_capacity(chunk.len());
                     for (offset, update) in chunk.iter().enumerate() {
@@ -2360,6 +2376,7 @@ impl Database {
                         // are still referenced by the (not-yet-overwritten)
                         // live row; freeing them on a bail-out is a UAF.
                         staged_new_chains.extend_from_slice(&newly_allocated);
+                        chain_ends.push(staged_new_chains.len());
                         heap_writes.push(HeapWrite {
                             row_id: update.row_id,
                             header: RowHeader {
@@ -2380,8 +2397,12 @@ impl Database {
                         return Err(err);
                     }
                 };
-                if let Err(err) = self.write_heap_rows(txn.txn_id, table.id, &heap_writes) {
-                    self.free_lob_chains(table.id, &staged_new_chains);
+                let mut written = 0;
+                if let Err(err) =
+                    self.write_heap_rows_tracked(txn.txn_id, table.id, &heap_writes, &mut written)
+                {
+                    let owned = written.checked_sub(1).map_or(0, |index| chain_ends[index]);
+                    self.free_lob_chains(table.id, &staged_new_chains[owned..]);
                     return Err(err);
                 }
                 staged_new_chains.clear();
@@ -2755,6 +2776,9 @@ impl Database {
             crate::parser::rls::Command::Delete,
             &predicate_values,
         )? {
+            if txn.txn_id != 0 && !held_before {
+                self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
+            }
             return Ok(false);
         }
         if !predicate(&predicate_values)? {
@@ -3336,9 +3360,8 @@ impl Database {
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         let storage_id = self.locate_row_storage_id(table, row_id)?;
-        let held_before = predicate.is_none()
-            || txn.txn_id == 0
-            || self.txn_holds_row_lock(txn.txn_id, storage_id, row_id);
+        let held_before =
+            txn.txn_id == 0 || self.txn_holds_row_lock(txn.txn_id, storage_id, row_id);
         if txn.txn_id != 0 {
             self.acquire_row_lock_blocking(txn.txn_id, storage_id, row_id, LockMode::Exclusive)?;
         }
@@ -3355,9 +3378,15 @@ impl Database {
                 },
             )?
         else {
+            if !held_before {
+                self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
+            }
             return Ok(Some(false));
         };
         if header.is_deleted() {
+            if !held_before {
+                self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
+            }
             return Ok(Some(false));
         }
         // A logical None can be a physically reserved zero undo slot. Check
@@ -3572,6 +3601,8 @@ impl Database {
             }))
         .then(|| self.statement_savepoint(txn.txn_id))
         .transpose()?;
+        let held_before =
+            txn.txn_id == 0 || self.txn_holds_row_lock(txn.txn_id, storage_id, row_id);
         let result = (|| {
             // Point UPDATE already resolved the immutable RowId. Lock first,
             // then decode the latest version once. This also makes the
@@ -3585,9 +3616,15 @@ impl Database {
                 )?;
             }
             let Some(mut current) = self.read_mvcc_row(storage_id, row_id)? else {
+                if !held_before {
+                    self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
+                }
                 return Ok(false);
             };
             if current.header.is_deleted() {
+                if !held_before {
+                    self.release_new_point_row_lock(txn.txn_id, storage_id, row_id);
+                }
                 return Ok(false);
             }
             // Pad the heap row out to the latest schema before handing
@@ -4011,23 +4048,6 @@ impl Database {
             // statements without changing SQL ordering (ORDER/LIMIT uses the
             // point-write path before reaching this batch implementation).
             rows.sort_unstable_by_key(|row| row.row_ref);
-            // Deferred migrations are not visible to index probes yet. Keep
-            // their destination keys reserved for both later migrations and
-            // in-place updates. Unaffected indexes need no extra key encoding.
-            let batch_unique_indexes = table
-                .indexes
-                .iter()
-                .filter(|index| {
-                    rows.len() > 1
-                        && index.enforces_uniqueness()
-                        && index_may_be_affected_by_columns(table, index, effective_changed_columns)
-                })
-                .collect::<Vec<_>>();
-            let mut migration_keys = batch_unique_indexes
-                .iter()
-                .map(|_| crate::util::fast_hash::AhHashSet::<(u64, IndexKey)>::default())
-                .collect::<Vec<_>>();
-            let mut migrations: Vec<(u64, RowId, Vec<Value>, Vec<Value>)> = Vec::new();
             for row in rows {
                 let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
                 crate::engine::cancel::check_cancelled()?;
@@ -4035,6 +4055,8 @@ impl Database {
                     continue;
                 }
                 let storage_id = row.row_ref.storage_id;
+                let held_before = txn.txn_id == 0
+                    || self.txn_holds_row_lock(txn.txn_id, storage_id, row.row_ref.row_id);
                 if txn.txn_id != 0 {
                     self.lock_rows_nonblocking(
                         txn.txn_id,
@@ -4043,10 +4065,16 @@ impl Database {
                     )?;
                 }
                 let Some(mut current) = self.read_mvcc_row(storage_id, row.row_ref.row_id)? else {
+                    if !held_before {
+                        self.release_new_point_row_lock(txn.txn_id, storage_id, row.row_ref.row_id);
+                    }
                     continue;
                 };
                 self.check_dml_write_allowed(txn, storage_id, &current)?;
                 if current.header.is_deleted() {
+                    if !held_before {
+                        self.release_new_point_row_lock(txn.txn_id, storage_id, row.row_ref.row_id);
+                    }
                     continue;
                 }
                 Self::pad_full_row_to_schema(&mut current.values, table);
@@ -4098,42 +4126,6 @@ impl Database {
                 }
                 let routed = table.route_row_to_partition(&new_values)?;
                 let target_storage_id = routed.storage_id;
-                let mut pending = Vec::new();
-                let mut duplicate = None;
-                for (pos, index) in batch_unique_indexes.iter().enumerate() {
-                    // If nothing is deferred, an in-place write is fully
-                    // covered by the existing index probe above.
-                    if target_storage_id == storage_id && migration_keys[pos].is_empty() {
-                        continue;
-                    }
-                    let key = table.index_key(index, &new_values)?;
-                    if !index.primary && key.0.iter().any(|part| matches!(part, KeyPart::Null)) {
-                        continue;
-                    }
-                    let entry = (target_storage_id, key);
-                    if migration_keys[pos].contains(&entry) {
-                        duplicate = Some(duplicate_entry_error(table, index, &entry.1));
-                        break;
-                    }
-                    if target_storage_id != storage_id {
-                        pending.push((pos, entry));
-                    }
-                }
-                if let Some(err) = duplicate {
-                    if ignore_check_errors {
-                        crate::engine::api::push_statement_condition(
-                            crate::error::ConditionLevel::Warning,
-                            &err,
-                        );
-                        continue;
-                    }
-                    return Err(err);
-                }
-                // Publish only after every unique index accepts this row:
-                // an IGNORE-rejected row must not reserve any other key.
-                for (pos, entry) in pending {
-                    migration_keys[pos].insert(entry);
-                }
                 self.cache_auto_increment_from_updated_values(
                     table,
                     &new_values,
@@ -4152,33 +4144,31 @@ impl Database {
                     )?;
                     total_updated += 1;
                 } else {
-                    migrations.push((
-                        storage_id,
-                        row.row_ref.row_id,
-                        current.values.clone(),
-                        new_values,
-                    ));
+                    // Publish each accepted move before probing the next row.
+                    // Its old unique keys are now available and its new keys
+                    // participate in ordinary probes, just like in-place writes.
+                    let record_rows = crate::binlog::should_record_table_rows(table);
+                    let after_image = record_rows.then(|| new_values.clone());
+                    {
+                        let _suppress = crate::binlog::SessionSqlLogBinGuard::new(false);
+                        self.delete_row_at(
+                            txn,
+                            table,
+                            storage_id,
+                            row.row_ref.row_id,
+                            &current.values,
+                        )?;
+                        self.insert_one_row_at(txn, table, target_storage_id, new_values)?;
+                    }
+                    if let Some(after_image) = after_image {
+                        crate::binlog::record_update_rows(
+                            txn.txn_id,
+                            table,
+                            vec![(current.values, after_image)],
+                        )?;
+                    }
+                    total_updated += 1;
                 }
-            }
-            for (src_sid, row_id, old_values, new_values) in migrations {
-                crate::engine::cancel::check_cancelled()?;
-                let routed = table.route_row_to_partition(&new_values)?;
-                let dst_sid = routed.storage_id;
-                let record_rows = crate::binlog::should_record_table_rows(table);
-                let after_image = record_rows.then(|| new_values.clone());
-                {
-                    let _suppress = crate::binlog::SessionSqlLogBinGuard::new(false);
-                    self.delete_row_at(txn, table, src_sid, row_id, &old_values)?;
-                    self.insert_one_row_at(txn, table, dst_sid, new_values)?;
-                }
-                if let Some(after_image) = after_image {
-                    crate::binlog::record_update_rows(
-                        txn.txn_id,
-                        table,
-                        vec![(old_values, after_image)],
-                    )?;
-                }
-                total_updated += 1;
             }
             self.record_non_temp_table_modifications(txn.txn_id, table, total_updated as u64, 0)?;
             self.dml_stats.record_updates(total_updated as u64);
@@ -4638,8 +4628,13 @@ impl Database {
             storage_id,
             std::iter::once(row_id),
         );
-        self.lock_rows_nonblocking(txn.txn_id, storage_id, std::iter::once(row_id))?;
-        self.push_insert_batch_undo_deferred(txn.txn_id, storage_id, &inserted)?;
+        if let Err(err) = (|| {
+            self.lock_rows_nonblocking(txn.txn_id, storage_id, std::iter::once(row_id))?;
+            self.push_insert_batch_undo_deferred(txn.txn_id, storage_id, &inserted)
+        })() {
+            self.rollback_inserted_rows(txn.txn_id, storage_id, &inserted)?;
+            return Err(err);
+        }
         let mut index_entries = table
             .indexes
             .iter()
@@ -4745,7 +4740,7 @@ impl Database {
             }
         }
         if any_lob_pages || table_has_externalizable_column(table) {
-            let qname = format!("{}.{}", table.database, table.name);
+            let qname = self.storage_key_for_table(table);
             if let Err(e) = self.scan_rows(
                 &qname,
                 TxnView::read_only(u64::MAX, crate::storage::IsolationLevel::ReadCommitted),

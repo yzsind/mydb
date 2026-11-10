@@ -2441,7 +2441,11 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                                 StringKind::Character
                             },
                         },
-                        true,
+                        if matches!(normalized.as_str(), "LOWER" | "LCASE" | "UPPER" | "UCASE") {
+                            operands.first().is_none_or(|arg| arg.nullable)
+                        } else {
+                            true
+                        },
                     );
                     let widths: Option<smallvec::SmallVec<[u32; 4]>> = operands
                         .iter()
@@ -2472,10 +2476,6 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                                         .unwrap_or(0)
                                         .saturating_mul(separators),
                                 )
-                        }
-                        // Unicode case mappings can expand one scalar to three.
-                        "LOWER" | "LCASE" | "UPPER" | "UCASE" if !binary => {
-                            widths.first().copied().unwrap_or(0).saturating_mul(3)
                         }
                         _ => widths.first().copied().unwrap_or(0),
                     });

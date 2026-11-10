@@ -967,7 +967,10 @@ impl BatchOperator for DeferredRowStorageBatchOperator<'_> {
         // Keep the compatibility lane pull-bounded for FULLTEXT. A large
         // decode batch would consume thousands of heap rows before a small
         // downstream LIMIT can stop the incremental posting source.
-        let target = if matches!(self.plan, PhysicalPlan::FulltextScan { .. }) {
+        let target = if matches!(
+            self.plan,
+            PhysicalPlan::FulltextScan { .. } | PhysicalPlan::SpatialScan { .. }
+        ) {
             scan_decode_batch_rows(&self.schema).min(super::plan::FULLTEXT_BATCH_ROWS)
         } else {
             scan_decode_batch_rows(&self.schema)
@@ -3954,6 +3957,7 @@ fn try_build_vec_limit_input<'a>(
 pub(super) fn scan_row_goal_pushdown_safe(plan: &PhysicalPlan) -> bool {
     match plan {
         PhysicalPlan::SeqScan { .. }
+        | PhysicalPlan::SpatialScan { .. }
         | PhysicalPlan::ZoneMapScan { .. }
         | PhysicalPlan::IndexLookup { .. }
         | PhysicalPlan::IndexMultiLookup { .. }

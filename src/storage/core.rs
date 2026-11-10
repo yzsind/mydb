@@ -1206,6 +1206,7 @@ pub struct Database {
     vector_builds_in_flight: AtomicUsize,
     /// Highest SCN whose graph position or cold image may supersede older views.
     vector_snapshot_floor: AtomicU64,
+    vector_table_snapshot_floors: parking_lot::RwLock<HashMap<u64, Arc<AtomicU64>>>,
     vector_build_epoch: AtomicU64,
     replicated_hnsw_table_cache: parking_lot::RwLock<HashMap<u64, Option<u64>>>,
     replicated_hnsw_dirty: parking_lot::Mutex<HashMap<u64, std::collections::HashSet<u64>>>,
@@ -4915,6 +4916,7 @@ mod btree_batch_tests;
 #[cfg(test)]
 mod sequence_tests;
 mod spatial_index;
+pub(crate) use spatial_index::{SpatialCandidates, SpatialCursor};
 #[cfg(test)]
 mod tests;
 
@@ -4924,6 +4926,18 @@ mod btree_bug_audit_tests;
 mod btree_lookup_tests;
 #[cfg(test)]
 mod read_ahead_tests;
+#[cfg(test)]
+mod vector_release_audit_tests;
 
 #[cfg(test)]
 mod dml_audit_1015_tests;
+
+#[cfg(test)]
+thread_local! {
+    static TEST_INSERT_ZONE_FAILURE: std::cell::Cell<Option<u64>> = const { std::cell::Cell::new(None) };
+    static TEST_HEAP_WRITE_FAILURE: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+#[path = "core/dml_metadata_audit_1109_tests.rs"]
+mod dml_metadata_audit_1109_tests;

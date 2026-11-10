@@ -15,8 +15,10 @@ pub(super) fn validate_lock_targets(stmt: &Select) -> Result<(), QueryError> {
                 .chain(stmt.joins.iter().map(|join| &join.table))
                 .any(|reference| probe.for_reference(reference).is_some())
             {
-                return Err(crate::error::catalog::ER_BAD_FIELD_ERROR
-                    .error(format!("Unknown locking target '{}'", target.table)));
+                return Err(crate::error::catalog::ER_UNKNOWN_TABLE.error(format!(
+                    "Unknown table '{}' in locking clause",
+                    target.table
+                )));
             }
         }
     }
@@ -362,19 +364,8 @@ pub(super) fn execute_locked_single_table_select(
         });
     }
 
-    let offset = select_offset(stmt)?.min(rows.len());
-    let end = stmt
-        .limit
-        .as_ref()
-        .and_then(LimitValue::as_usize)
-        .map(|limit| offset.saturating_add(limit).min(rows.len()))
-        .unwrap_or(rows.len());
-    let rows = rows
-        .into_iter()
-        .skip(offset)
-        .take(end.saturating_sub(offset))
-        .map(|(values, _)| values)
-        .collect();
+    // Candidate selection already applied OFFSET/LIMIT before acquiring locks.
+    let rows = rows.into_iter().map(|(values, _)| values).collect();
     Ok(Some(QueryResponse::ResultSet(ResultSet { columns, rows })))
 }
 
@@ -782,6 +773,7 @@ where
     A: Fn(&[Value]) -> Result<Vec<Value>, QueryError>,
     V: Fn(&[Value]) -> Result<(), QueryError>,
 {
+    let fulltext = dml_fulltext_providers(db, txn, table, stmt.selection.as_ref(), &stmt.order_by)?;
     let mut returning = super::returning::ReturningCollector::new(
         stmt.returning.as_ref(),
         table,
@@ -797,6 +789,7 @@ where
         Vec::new()
     };
     for row_ref in candidates.rows {
+        let _scores = fulltext.enter(row_ref);
         if matched_rows as usize >= candidates.limit.unwrap_or(usize::MAX) {
             break;
         }
@@ -906,6 +899,7 @@ fn execute_delete_candidates(
     outer_alias: Option<&str>,
     outer_tname: &str,
 ) -> Result<QueryResponse, QueryError> {
+    let fulltext = dml_fulltext_providers(db, txn, table, stmt.selection.as_ref(), &stmt.order_by)?;
     let mut returning = super::returning::ReturningCollector::new(
         stmt.returning.as_ref(),
         table,
@@ -915,6 +909,7 @@ fn execute_delete_candidates(
     let needs_old = has_triggers || stmt.returning.is_some();
     let mut affected_rows = 0u64;
     for row_ref in candidates.rows {
+        let _scores = fulltext.enter(row_ref);
         if affected_rows as usize >= candidates.limit.unwrap_or(usize::MAX) {
             break;
         }
@@ -1010,6 +1005,7 @@ pub(super) fn execute_update_borrowed_simple(
     let mut updates: Vec<(usize, &Expr)> = Vec::with_capacity(stmt.assignments.len());
     let mut changed_column_indexes = Vec::new();
     for assignment in &stmt.assignments {
+        validate_assignment_qualifier(assignment, &stmt.table, stmt.primary_alias.as_deref())?;
         let idx = table.column_index(&assignment.column)?;
         if table.columns[idx].generated_expr.is_some() {
             if !update_expr_is_generated_default(&assignment.value, &table.columns[idx].name) {
@@ -1424,21 +1420,22 @@ pub(super) fn apply_on_update_timestamps(
                     _ => 0,
                 };
                 if let Some(slot) = new_values.get_mut(idx) {
-                    *slot = match &column.data_type {
-                        crate::storage::schema::DataTypeKind::Timestamp { .. } => Value::Timestamp(
-                            crate::engine::expr::session_utc_now()
-                                .and_utc()
-                                .timestamp_micros(),
-                        ),
-                        _ => {
-                            let now = crate::engine::expr::session_now();
-                            let formatted = if fsp > 0 {
-                                now.format("%Y-%m-%d %H:%M:%S%.6f").to_string()
-                            } else {
-                                now.format("%Y-%m-%d %H:%M:%S").to_string()
-                            };
-                            Value::String(formatted)
-                        }
+                    // CURRENT_TIMESTAMP(fsp) truncates the statement clock;
+                    // ordinary assignment coercion may round input values.
+                    let quantum = 10_i64.pow(6 - u32::from(fsp.min(6)));
+                    *slot = if matches!(
+                        column.data_type,
+                        crate::storage::DataTypeKind::Timestamp { .. }
+                    ) {
+                        let micros = crate::engine::expr::session_utc_now()
+                            .and_utc()
+                            .timestamp_micros();
+                        Value::Timestamp(micros.div_euclid(quantum) * quantum)
+                    } else {
+                        let micros = crate::engine::expr::session_now()
+                            .and_utc()
+                            .timestamp_micros();
+                        Value::DateTime(micros.div_euclid(quantum) * quantum)
                     };
                 }
             }
@@ -1886,6 +1883,30 @@ pub(super) fn is_ignorable_delete_error(err: &QueryError) -> bool {
     ])
 }
 
+fn dml_fulltext_providers(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    selection: Option<&Expr>,
+    order_by: &[OrderBy],
+) -> Result<super::select::fulltext_row::Providers, QueryError> {
+    let has_match = |expr: &Expr| {
+        crate::parser::visit::any_expr(
+            expr,
+            |node| matches!(node, Expr::Function { name, .. } if name.eq_ignore_ascii_case(crate::parser::FT_MATCH_FUNCTION)),
+        )
+    };
+    if !selection.is_some_and(has_match) && !order_by.iter().any(|order| has_match(&order.expr)) {
+        return Ok(super::select::fulltext_row::Providers::empty());
+    }
+    let select = Select {
+        selection: selection.cloned(),
+        order_by: order_by.to_vec(),
+        ..Select::default()
+    };
+    super::select::fulltext_row::Providers::new(db, txn, &Arc::new(table.clone()), &select)
+}
+
 pub(super) fn ordered_limited_dml_candidates(
     db: &Arc<Database>,
     txn: TxnView,
@@ -1895,7 +1916,8 @@ pub(super) fn ordered_limited_dml_candidates(
     limit: Option<&LimitValue>,
     limit_counts_matches: bool,
 ) -> Result<Option<DmlCandidateSet>, QueryError> {
-    if order_by.is_empty() && limit.is_none() {
+    let fulltext = dml_fulltext_providers(db, txn, table, selection, order_by)?;
+    if order_by.is_empty() && limit.is_none() && fulltext.is_empty() {
         return Ok(None);
     }
     let _partition_scope = super::partition_router::push_filter_partition_scope(table, selection);
@@ -1906,7 +1928,7 @@ pub(super) fn ordered_limited_dml_candidates(
     // LIMIT is zero. Evaluate against a schema-shaped NULL row before any
     // early return so unknown columns and unsupported expressions cannot be
     // hidden by an empty window.
-    if !order_by.is_empty() {
+    if !order_by.is_empty() && fulltext.is_empty() {
         let schema = if crate::storage::rowid::demanded() {
             std::borrow::Cow::Owned(crate::storage::rowid::query_schema(table))
         } else {
@@ -1923,7 +1945,7 @@ pub(super) fn ordered_limited_dml_candidates(
             limit,
         }));
     }
-    if limit_counts_matches && !retain_refill_candidates {
+    if limit_counts_matches && !retain_refill_candidates && fulltext.is_empty() {
         let index_candidates = if table.is_partitioned() {
             ordered_partition_index_limited_dml_candidates(
                 db, txn, table, selection, order_by, limit,
@@ -1945,6 +1967,7 @@ pub(super) fn ordered_limited_dml_candidates(
         if let Some(limit) = limit {
             let mut matched_refs = Vec::with_capacity(limit.min(1024));
             let mut accept = |row: crate::storage::DmlStoredRow| -> Result<bool, QueryError> {
+                let _scores = fulltext.enter(row.row_ref);
                 let matches = match selection {
                     Some(expr) => eval_bool(expr, table, &row.values)?,
                     None => true,
@@ -1985,7 +2008,7 @@ pub(super) fn ordered_limited_dml_candidates(
     // CPU cost drops from O(N log N) to O(N log K). For wide LIMITs or
     // LIMIT-less queries we keep the original sort path.
     const DML_IN_MEMORY_SORT_ROWS: usize = 4096;
-    if limit_counts_matches && !retain_refill_candidates {
+    if limit_counts_matches && !retain_refill_candidates && fulltext.is_empty() {
         if let (Some(limit), false) = (limit, order_by.is_empty()) {
             if limit > 0 && limit <= DML_IN_MEMORY_SORT_ROWS {
                 return Ok(Some(DmlCandidateSet {
@@ -2007,6 +2030,7 @@ pub(super) fn ordered_limited_dml_candidates(
         .collect();
     let mut matched = Vec::new();
     for row in rows.drain(..) {
+        let _scores = fulltext.enter(row.row_ref);
         let _rowid_scope = crate::storage::rowid::RowScope::enter(table, row.row_ref)?;
         let matches = match selection {
             Some(expr) => eval_bool(expr, table, &row.values)?,
@@ -2048,7 +2072,7 @@ pub(super) fn ordered_limited_dml_candidates(
         }
         matched.into_iter().map(|row| row.row_ref).collect()
     };
-    if limit_counts_matches && !retain_refill_candidates {
+    if limit_counts_matches && !retain_refill_candidates && fulltext.is_empty() {
         if let Some(limit) = limit {
             matched_refs.truncate(limit);
         }
@@ -3059,6 +3083,11 @@ fn execute_in_subquery_values(
             "IN subquery must return rows",
         ));
     };
+    if result.columns.len() != 1 {
+        return Err(
+            crate::error::catalog::ER_OPERAND_COLUMNS.error("Operand should contain 1 column(s)")
+        );
+    }
     Ok(result
         .rows
         .into_iter()

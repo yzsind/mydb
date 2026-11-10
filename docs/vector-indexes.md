@@ -36,6 +36,8 @@ CREATE INDEX signature_ivf ON embeddings(signature)
 ```
 
 HNSW and IVF require one fixed-dimension, non-null, non-unique vector column.
+Vector indexes on temporary tables are rejected at DDL time, including indexes
+copied by `CREATE TEMPORARY TABLE ... LIKE`.
 Numeric indexes default to L2; BINARY indexes default to HAMMING. Unsupported
 metric/type combinations raise an error. `IVF` with `quantization=none` stores
 and scores native payloads. Hamming IVF uses binary majority centers; Jaccard
@@ -116,6 +118,9 @@ vectors, and declared quantized indexes retain their requested model and payload
 Construction navigation is approximate and can affect candidate coverage; visible
 heap values still determine final query distances. Unsupported calibrations and
 insufficient memory retain the ordinary construction path.
+Internal SQ8 navigation also declines calibrations whose global code step would
+erase the variation on a coordinate axis. Sparse outliers retain exact navigation
+instead of widening the calibration for every other vector.
 
 Eligible single-table distance ordering can use KNN truncation. JOIN,
 aggregation, DISTINCT and window queries retain their complete relational
@@ -366,6 +371,12 @@ replacement preserves the old valid index and a durable failed-job status.
 Failure while modifying the active object fences further service. Native
 indexes load their persisted structure on cold open. Models and exceptions share the vector container,
 page checksums and recovery lifecycle.
+
+A transient storage fail-stop, such as a full disk, does not create a permanent
+vector-corruption fence while snapshots are released. Restore storage capacity
+and restart to run WAL recovery. A persistent active-index maintenance failure
+requires preserving the failed data directory and restoring a verified backup;
+do not remove failure markers or index files to bypass the fence.
 
 ## Diagnostics
 

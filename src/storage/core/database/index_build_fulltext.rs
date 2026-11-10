@@ -157,6 +157,7 @@ fn combine_fulltext_sorters(
             tmp,
             runs,
             fixed128: None,
+            read_buffer_bytes: encoded_merge_read_buffer_bytes(memory_bytes),
         });
     }
 
@@ -267,7 +268,11 @@ fn consolidate_fulltext_sort_runs(
                         let Some(paths) = groups.get(group) else {
                             return Ok(());
                         };
-                        merge_sort_run_group::<EncodedIndexRunCodec>(paths, &outputs[group])?;
+                        merge_sort_run_group::<EncodedIndexRunCodec>(
+                            paths,
+                            &outputs[group],
+                            64 * 1024,
+                        )?;
                     }
                 }));
             }

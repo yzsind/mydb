@@ -794,6 +794,7 @@ impl Database {
             vector_build_deltas: parking_lot::Mutex::new(Default::default()),
             vector_builds_in_flight: AtomicUsize::new(0),
             vector_snapshot_floor: AtomicU64::new(0),
+            vector_table_snapshot_floors: parking_lot::RwLock::new(HashMap::new()),
             vector_build_epoch: AtomicU64::new(0),
             replicated_hnsw_table_cache: parking_lot::RwLock::new(HashMap::new()),
             replicated_hnsw_dirty: parking_lot::Mutex::new(HashMap::new()),

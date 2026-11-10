@@ -62,8 +62,8 @@ pub(crate) use entry::{
     take_large_literal_digest_sql, ParserSqlModeOverrideGuard,
 };
 pub use entry::{parse_statement, parse_statements, ParserSqlModeGuard};
-pub(crate) use grammar::strip_comments_in_explain_header;
 use grammar::*;
+pub(crate) use grammar::{strip_comments_in_explain_header, validate_show_profile};
 pub(crate) use intrinsic::IntrinsicFunction;
 pub(crate) use manual::decode_bit_string;
 pub(crate) use manual::parse_xa_statement as parse_replication_xa_statement;

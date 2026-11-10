@@ -249,14 +249,18 @@ pub(crate) fn show_columns(
                 let type_str = column
                     .data_type
                     .as_ref()
-                    .map(mysql_type_name)
+                    .map(|kind| mysql_type_name_with_unsigned(kind, column.unsigned))
                     .unwrap_or_else(|| "varchar(255)".to_string());
                 let mut row = vec![
                     Value::String(column.name.clone()),
                     Value::String(type_str),
                     Value::String(if column.nullable { "YES" } else { "NO" }.to_string()),
                     Value::String(String::new()),
-                    Value::Null,
+                    column
+                        .default_value
+                        .clone()
+                        .map(Value::String)
+                        .unwrap_or(Value::Null),
                     Value::String(String::new()),
                 ];
                 if full {
@@ -400,6 +404,22 @@ pub(crate) fn show_databases(
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }
 
+fn require_show_database(db: &Database, database: &str) -> Result<(), QueryError> {
+    if database.is_empty() {
+        return Err(crate::storage::error(
+            crate::error::catalog::ER_NO_DB_ERROR,
+            "No database selected",
+        ));
+    }
+    if !db.database_exists(database) {
+        return Err(crate::storage::error(
+            crate::error::catalog::ER_BAD_DB_ERROR,
+            format!("Unknown database '{database}'"),
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) fn show_tables(
     db: &Database,
     session: &SessionContext,
@@ -407,6 +427,7 @@ pub(crate) fn show_tables(
     full: bool,
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
+    require_show_database(db, database)?;
     let columns = show_tables_columns(database, full);
     if let Some(rows) = crate::engine::information_schema::show_tables_rows(db, database, full) {
         let mut rows = rows;
@@ -518,6 +539,7 @@ pub(crate) fn show_table_status(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
+    require_show_database(db, database)?;
     let columns = show_table_status_columns();
     let mut rows = Vec::new();
 
@@ -759,7 +781,7 @@ pub(crate) fn show_index(
                 Value::String(index.name.clone()),
                 Value::Int((seq + 1) as i64),
                 column_value,
-                if index.is_fulltext() || index.index_type.eq_ignore_ascii_case("SPATIAL") {
+                if index.is_fulltext() {
                     Value::Null
                 } else {
                     Value::String(
@@ -775,6 +797,9 @@ pub(crate) fn show_index(
                         .index_prefix_cardinality(&index.name, seq + 1)
                         .filter(|count| *count > 0)
                         .unwrap_or_else(|| {
+                            if index.is_fulltext() {
+                                return estimated_rows;
+                            }
                             crate::engine::table_stats_view::fallback_index_cardinality(
                                 estimated_rows,
                                 index.unique,
@@ -783,7 +808,9 @@ pub(crate) fn show_index(
                             )
                         }),
                 )),
-                if is_expression {
+                if index.is_spatial() {
+                    Value::Int(32)
+                } else if is_expression {
                     Value::Null
                 } else {
                     index
@@ -1211,6 +1238,7 @@ pub(crate) fn show_triggers(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
+    require_show_database(db, database)?;
     let columns = show_triggers_columns();
     let mut trigger_list = db.triggers_in_database(database);
     if database.eq_ignore_ascii_case("sys") {
@@ -1357,22 +1385,7 @@ pub(crate) fn show_events(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     let database = database.unwrap_or(&session.current_database);
-    if database.is_empty() {
-        return Err(crate::storage::error(
-            crate::error::catalog::ER_NO_DB_ERROR,
-            "No database selected",
-        ));
-    }
-    if !db
-        .catalog()
-        .databases
-        .contains_key(&crate::storage::normalize_name(database))
-    {
-        return Err(crate::storage::error(
-            crate::error::catalog::ER_BAD_DB_ERROR,
-            format!("Unknown database '{database}'"),
-        ));
-    }
+    require_show_database(db, database)?;
     let columns = show_events_columns();
     // G11: MySQL only lists events in schemas where the caller holds the
     // EVENT privilege; otherwise the result is empty (not an error).
@@ -1769,7 +1782,9 @@ pub(crate) fn show_sequences(
     database: Option<&str>,
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
-    let target_db = crate::storage::normalize_name(database.unwrap_or(&session.current_database));
+    let database = database.unwrap_or(&session.current_database);
+    require_show_database(db, database)?;
+    let target_db = crate::storage::normalize_name(database);
     let label = format!("Sequences_in_{target_db}");
     let columns = vec![col(&label, ColumnType::VarString)];
     let mut rows: Vec<Vec<Value>> = db
@@ -1849,10 +1864,6 @@ pub(crate) fn col(name: &str, column_type: ColumnType) -> Column {
         name: name.to_string(),
         column_type,
     }
-}
-
-pub(crate) fn mysql_type_name(data_type: &DataTypeKind) -> String {
-    mysql_type_name_with_unsigned(data_type, false)
 }
 
 /// Render a temporal type with its declared fsp suffix when non-zero.
@@ -2012,6 +2023,9 @@ pub(crate) fn column_default_value(column: &crate::storage::ColumnSchema) -> Val
             };
         }
     }
+    if let Some(Value::Bytes(bytes)) = &column.default {
+        return Value::String(format!("0x{}", crate::util::hex::encode_upper(bytes)));
+    }
     column.default.clone().unwrap_or(Value::Null)
 }
 
@@ -2024,7 +2038,7 @@ pub(crate) fn column_extra(column: &crate::storage::ColumnSchema) -> String {
         parts.push("DEFAULT_GENERATED".to_string());
     }
     if let Some(expr) = &column.on_update_expr {
-        parts.push(format!("on update {}", expr.to_ascii_lowercase()));
+        parts.push(format!("on update {}", expr.to_ascii_uppercase()));
     }
     if column.generated_expr.is_some() {
         parts.push(if column.generated_stored {
@@ -3923,13 +3937,13 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         "parallel_zone_map_scan_count" =>
             crate::engine::executor::select::parallel::PARALLEL_ZONE_MAP_SCAN_COUNT .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
         "zone_map_candidate_build_ns" =>
-            crate::engine::executor::select::parallel::ZONE_MAP_CANDIDATE_BUILD_NS .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
+            crate::engine::executor::select::parallel::ZONE_MAP_CANDIDATE_BUILD_NS.load(std::sync::atomic::Ordering::Relaxed).saturating_add(crate::storage::ZONE_MAP_RUNTIME_CANDIDATE_NS.load(std::sync::atomic::Ordering::Relaxed)).to_string(),
         "zone_map_scan_tasks_scheduled" =>
-            crate::engine::executor::select::parallel::ZONE_MAP_SCAN_TASKS_SCHEDULED .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
+            crate::engine::executor::select::parallel::ZONE_MAP_SCAN_TASKS_SCHEDULED.load(std::sync::atomic::Ordering::Relaxed).saturating_add(crate::storage::ZONE_MAP_RUNTIME_TASKS.load(std::sync::atomic::Ordering::Relaxed)).to_string(),
         "zone_map_scan_pages_scheduled" =>
-            crate::engine::executor::select::parallel::ZONE_MAP_SCAN_PAGES_SCHEDULED .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
+            crate::engine::executor::select::parallel::ZONE_MAP_SCAN_PAGES_SCHEDULED.load(std::sync::atomic::Ordering::Relaxed).saturating_add(crate::storage::ZONE_MAP_RUNTIME_PAGES.load(std::sync::atomic::Ordering::Relaxed)).to_string(),
         "zone_map_scan_pages_skipped" =>
-            crate::engine::executor::select::parallel::ZONE_MAP_SCAN_PAGES_SKIPPED .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
+            crate::engine::executor::select::parallel::ZONE_MAP_SCAN_PAGES_SKIPPED.load(std::sync::atomic::Ordering::Relaxed).saturating_add(crate::storage::ZONE_MAP_RUNTIME_PAGES_SKIPPED.load(std::sync::atomic::Ordering::Relaxed)).to_string(),
         "zone_map_runtime_fallbacks" =>
             crate::engine::executor::select::parallel::ZONE_MAP_RUNTIME_FALLBACKS .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
         "zone_map_batch_scan_hits" =>

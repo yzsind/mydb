@@ -24,6 +24,14 @@ pub(in crate::engine::executor) struct Providers {
     _charge: crate::engine::executor::mem_budget::ScopedCharge,
 }
 impl Providers {
+    pub(in crate::engine::executor) fn empty() -> Self {
+        Self {
+            runtimes: Vec::new(),
+            documents: None,
+            _charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        }
+    }
+
     pub(in crate::engine::executor) fn new(
         db: &Arc<Database>,
         txn: TxnView,

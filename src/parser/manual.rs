@@ -2130,10 +2130,6 @@ pub(super) fn parse_manual_mysql_admin_statement(sql: &str) -> Option<Statement>
         _ => {}
     }
 
-    // Generalised `SHOW ENGINE engine_name {STATUS | MUTEX}` — every shape
-    // except the exact `SHOW ENGINE MYDB STATUS` caught above. Non-`MYDB`
-    // engines and the `MUTEX` sub-command flow through here; the executor
-    // routes `MYDB`/`MUTEX` and rejects unknown engines with 1286.
     // `SHOW {PROCEDURE|FUNCTION} CODE name` is a debug-build-only feature in
     // MySQL (needs `-DWITH_DEBUG`); on a production server it is a recognised
     // statement that is simply unavailable. Report it as parsed-but-unexecuted
@@ -2148,24 +2144,6 @@ pub(super) fn parse_manual_mysql_admin_statement(sql: &str) -> Option<Statement>
             kind: format!("{kind} (requires a debug build)"),
             sql: sql.to_string(),
         });
-    }
-
-    if upper.starts_with("SHOW ENGINE ") {
-        let kind = if upper.ends_with(" STATUS") {
-            Some(ShowEngineKind::Status)
-        } else if upper.ends_with(" MUTEX") {
-            Some(ShowEngineKind::Mutex)
-        } else {
-            None
-        };
-        if let Some(kind) = kind {
-            let tokens: Vec<&str> = normalized.split(' ').collect();
-            // [SHOW, ENGINE, <engine_name>, STATUS|MUTEX]
-            if tokens.len() == 4 {
-                let engine = tokens[2].trim_matches('`').trim_matches('\'').to_string();
-                return Some(Statement::ShowEngine { engine, kind });
-            }
-        }
     }
 
     if upper.starts_with("ALTER SYSTEM ") {
@@ -3053,9 +3031,16 @@ pub(super) fn parse_manual_show_index_statement(
         consume_keyword_at(sql, idx, "FROM").or_else(|| consume_keyword_at(sql, idx, "IN"))
     {
         let (database, after_db) = parse_routine_object_name(sql, next)?;
-        if !table.contains('.') {
-            table = format!("{database}.{table}");
+        if database.contains('.') {
+            return Err(parse_error_at_zero(
+                "SHOW INDEX requires an unqualified database name",
+            ));
         }
+        // MySQL's explicit second FROM/IN overrides a table's database qualifier.
+        let object = table
+            .rsplit_once('.')
+            .map_or(table.as_str(), |(_, name)| name);
+        table = format!("{database}.{object}");
         idx = after_db;
     }
     let mut filter = None;
@@ -3107,32 +3092,38 @@ pub(super) fn parse_manual_metadata_show_statement(
     Ok(Some(Statement::ShowTableStatus { database, filter }))
 }
 
-pub(super) fn parse_manual_show_local_scope_statement(
+pub(super) fn parse_manual_show_scope_statement(
     sql: &str,
 ) -> Result<Option<Statement>, ParseError> {
-    // sqlparser only normalises GLOBAL/SESSION on `SHOW {VARIABLES|STATUS}`;
-    // MySQL also accepts `LOCAL` as a synonym for `SESSION`. Intercept that
-    // shape here so the rest of the pipeline sees a regular SESSION request.
+    // Own scoped SHOW syntax so mixed/repeated scopes cannot become generic SHOW.
     let sql = trim_sql_statement(strip_leading_sql_comments(sql));
     let Some(idx) = consume_keyword_at(sql, 0, "SHOW") else {
         return Ok(None);
     };
-    let Some(idx) = consume_keyword_at(sql, idx, "LOCAL") else {
+    let (scope, idx) = if let Some(next) = consume_keyword_at(sql, idx, "GLOBAL") {
+        (ShowScope::Global, next)
+    } else if let Some(next) =
+        consume_keyword_at(sql, idx, "SESSION").or_else(|| consume_keyword_at(sql, idx, "LOCAL"))
+    {
+        (ShowScope::Session, next)
+    } else {
         return Ok(None);
     };
+    if ["GLOBAL", "SESSION", "LOCAL"]
+        .iter()
+        .any(|word| consume_keyword_at(sql, idx, word).is_some())
+    {
+        return Err(parse_error_at_zero(
+            "SHOW accepts only one GLOBAL, SESSION or LOCAL scope",
+        ));
+    }
     if let Some(after) = consume_keyword_at(sql, idx, "VARIABLES") {
-        let filter = parse_optional_show_like_or_where(sql, after, "SHOW LOCAL VARIABLES")?;
-        return Ok(Some(Statement::ShowVariables {
-            scope: ShowScope::Session,
-            filter,
-        }));
+        let filter = parse_optional_show_like_or_where(sql, after, "SHOW VARIABLES")?;
+        return Ok(Some(Statement::ShowVariables { scope, filter }));
     }
     if let Some(after) = consume_keyword_at(sql, idx, "STATUS") {
-        let filter = parse_optional_show_like_or_where(sql, after, "SHOW LOCAL STATUS")?;
-        return Ok(Some(Statement::ShowStatus {
-            scope: ShowScope::Session,
-            filter,
-        }));
+        let filter = parse_optional_show_like_or_where(sql, after, "SHOW STATUS")?;
+        return Ok(Some(Statement::ShowStatus { scope, filter }));
     }
     Ok(None)
 }
@@ -4245,7 +4236,8 @@ fn parse_show_routine_statement(sql: &str) -> Result<Option<Statement>, ParseErr
         } else {
             return Ok(None);
         };
-        let (name, _) = parse_routine_object_name(sql, next)?;
+        let (name, end) = parse_routine_object_name(sql, next)?;
+        require_statement_end(sql, end)?;
         return Ok(Some(Statement::ShowCreateRoutine { kind, name }));
     }
     let (kind, next) = if let Some(next) = consume_keyword_at(sql, idx, "PROCEDURE") {
@@ -4294,7 +4286,8 @@ fn parse_show_trigger_statement(sql: &str) -> Result<Option<Statement>, ParseErr
         let Some(next) = consume_keyword_at(sql, idx, "TRIGGER") else {
             return Ok(None);
         };
-        let (name, _) = parse_routine_object_name(sql, next)?;
+        let (name, end) = parse_routine_object_name(sql, next)?;
+        require_statement_end(sql, end)?;
         return Ok(Some(Statement::ShowCreateTrigger { name }));
     }
     let Some(next) = consume_keyword_at(sql, idx, "TRIGGERS") else {
@@ -4577,7 +4570,8 @@ fn parse_show_event_statement(sql: &str) -> Result<Option<Statement>, ParseError
         let Some(next) = consume_keyword_at(sql, idx, "EVENT") else {
             return Ok(None);
         };
-        let (name, _) = parse_routine_object_name(sql, next)?;
+        let (name, end) = parse_routine_object_name(sql, next)?;
+        require_statement_end(sql, end)?;
         return Ok(Some(Statement::ShowCreateEvent { name }));
     }
     let Some(next) = consume_keyword_at(sql, idx, "EVENTS") else {
@@ -5798,48 +5792,52 @@ pub(super) fn parse_definer_account(sql: &str) -> Option<AccountIdent> {
 }
 
 fn parse_routine_object_name(sql: &str, idx: usize) -> Result<(String, usize), ParseError> {
+    use crate::sql_lex::{SqlLexMode, SqlTokenCursor, SqlTokenKind};
+    let mode = SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
     let mut idx = skip_ws(sql, idx);
-    let start = idx;
-    let mut quote = None;
-    while idx < sql.len() {
-        let ch = sql[idx..].chars().next().unwrap();
-        if let Some(q) = quote {
-            idx += ch.len_utf8();
-            if ch == q {
-                quote = None;
+    let mut parts = Vec::with_capacity(2);
+    loop {
+        let start = idx;
+        let part = if sql[idx..].starts_with(['`', '\'', '"']) {
+            let mut tokens = SqlTokenCursor::new(&sql[idx..], mode, MYSQL_VERSION_ID);
+            let token = tokens
+                .next()
+                .map_err(|err| parse_lex_error(sql, err))?
+                .ok_or_else(|| parse_error_at_zero("expected object name"))?;
+            if token.kind != SqlTokenKind::QuotedIdentifier {
+                return Err(parse_error_at_zero("expected an identifier"));
             }
-            continue;
-        }
-        match ch {
-            '`' | '\'' | '"' => {
-                quote = Some(ch);
+            idx += token.span.end;
+            tokens.decoded_quoted_text(&token).unwrap()
+        } else {
+            // A digit can begin an identifier; punctuation always ends it.
+            // After a dot MySQL also accepts numeric-looking object names.
+            for ch in sql[idx..].chars() {
+                if !(is_ident_char(ch) || (!ch.is_ascii() && !ch.is_whitespace())) {
+                    break;
+                }
                 idx += ch.len_utf8();
             }
-            '(' | ';' => break,
-            c if c.is_whitespace() => break,
-            _ => idx += ch.len_utf8(),
+            let part = &sql[start..idx];
+            if part.is_empty()
+                || (parts.is_empty()
+                    && part.as_bytes()[0].is_ascii_digit()
+                    && part.parse::<f64>().is_ok())
+            {
+                return Err(parse_error_at_zero("expected object name"));
+            }
+            part.to_owned()
+        };
+        parts.push(part);
+        let after = skip_ws(sql, idx);
+        if parts.len() == 2 || !sql[after..].starts_with('.') {
+            break;
         }
+        idx = skip_ws(sql, after + 1);
     }
-    if idx == start {
-        return Err(parse_error_at_zero("expected routine name"));
-    }
-    if split_top_level(&sql[start..idx], '.')
-        .iter()
-        .any(|part| unquote_identifier(part.trim()).contains('.'))
-    {
-        return Err(parse_error_at_zero(
-            "Dots inside quoted object identifiers are not supported",
-        ));
-    }
-    Ok((normalize_object_name_sql(&sql[start..idx]), idx))
-}
-
-fn normalize_object_name_sql(sql: &str) -> String {
-    split_top_level(sql, '.')
-        .into_iter()
-        .map(|part| unquote_identifier(part.trim()))
-        .collect::<Vec<_>>()
-        .join(".")
+    let object = parts.pop().unwrap();
+    let name = QualifiedName::new(parts.pop(), object).map_err(parse_error_at_zero)?;
+    Ok((name.to_string(), idx))
 }
 
 pub(super) fn unquote_identifier(input: &str) -> String {
@@ -6433,6 +6431,10 @@ pub(super) fn sql_statement_kind(stmt: &SqlStatement) -> &'static str {
         SqlStatement::ShowVariables { .. } => "SHOW VARIABLES",
         SqlStatement::ShowStatus { .. } => "SHOW STATUS",
         SqlStatement::ShowCollation { .. } => "SHOW COLLATION",
+        SqlStatement::ShowVariable { .. }
+        | SqlStatement::ShowFunctions { .. }
+        | SqlStatement::ShowViews { .. }
+        | SqlStatement::ShowObjects(_) => "SHOW statement",
         _ => "SQL statement",
     }
 }

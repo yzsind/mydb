@@ -1046,7 +1046,6 @@ impl Quantizer {
                     .map(|(x, c)| (x - c).abs())
                     .sum::<f64>()
                     / v.len() as f64;
-                let mut cs = 0.0;
                 let mut recon_norm = 0.0;
                 for (i, (&x, &c)) in v.iter().zip(&self.model.low).enumerate() {
                     let s = if x >= c {
@@ -1055,7 +1054,6 @@ impl Quantizer {
                     } else {
                         -1.0
                     };
-                    cs += c * s;
                     let y = c + a * s;
                     if y.abs() > f32::MAX as f64 {
                         return None;
@@ -1063,8 +1061,7 @@ impl Quantizer {
                     recon_norm += y * y;
                 }
                 code[offset..offset + 8].copy_from_slice(&a.to_le_bytes());
-                code[offset + 8..offset + 16].copy_from_slice(&cs.to_le_bytes());
-                code[offset + 16..offset + 24].copy_from_slice(&recon_norm.to_le_bytes());
+                code[offset + 8..offset + 16].copy_from_slice(&recon_norm.to_le_bytes());
             }
             QuantizationConfig::None => return None,
         }
@@ -1172,7 +1169,7 @@ impl Quantizer {
                 let d = self.model.dimension as usize;
                 let offset = d.div_ceil(8);
                 let a = f64::from_le_bytes(code[offset..offset + 8].try_into().unwrap());
-                norm = f64::from_le_bytes(code[offset + 16..offset + 24].try_into().unwrap());
+                norm = f64::from_le_bytes(code[offset + 8..offset + 16].try_into().unwrap());
                 let weighted = (0..d.div_ceil(4))
                     .map(|block| query.bq_lut[block * 16 + nibble(code, block)])
                     .sum::<f64>();
@@ -1284,6 +1281,9 @@ impl Quantizer {
         bytes: &[u8],
         file: Option<&Arc<VectorIndexFile>>,
     ) -> Result<VectorValue, QueryError> {
+        if bytes.len() < 9 {
+            return Err(super::persistence::corrupt());
+        }
         let _scratch = ControlledMemoryCharge::try_new_recoverable(
             ControlledMemoryCategory::StorageScratch,
             (self.model.datatype.payload_len(self.model.dimension) + 12) * 3,
@@ -1296,12 +1296,12 @@ impl Quantizer {
         } else {
             bytes[9..].to_vec()
         };
-        VectorValue::decode(&raw).ok_or_else(|| {
-            crate::storage::error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "corrupt quantization exception",
-            )
-        })
+        let value = VectorValue::decode(&raw).ok_or_else(super::persistence::corrupt)?;
+        codec::validate_internal(&value).map_err(|_| super::persistence::corrupt())?;
+        if value.datatype != self.model.datatype || value.dimension != self.model.dimension {
+            return Err(super::persistence::corrupt());
+        }
+        Ok(value)
     }
     pub(crate) fn score_payload(
         &self,
@@ -1420,6 +1420,34 @@ mod tests {
             QuantizationConfig::Bq,
         ]
     }
+    #[test]
+    fn vector_release_exception_rejects_wrong_geometry_and_nonfinite() {
+        let mut trainer = Trainer::new(
+            QuantizationConfig::Sq8,
+            VectorDataType::Float32,
+            2,
+            Metric::L2,
+        )
+        .unwrap();
+        trainer.observe(&codec::from_f32(&[0.0, 1.0])).unwrap();
+        let q = trainer.finish().unwrap().unwrap();
+        let (_dir, file) = crate::storage::source_audit_vector_file();
+        assert!(q.exception(&[1], None).is_err());
+        for value in [
+            codec::from_f32(&[1.0]),
+            codec::from_f32(&[f32::NAN, 1.0]),
+            codec::parse_typed_text("[1,2]", VectorDataType::Int8).unwrap(),
+        ] {
+            let mut bytes = vec![1; 9];
+            bytes.extend(value.encode());
+            assert!(q.exception(&bytes, None).is_err());
+            let head = file.append_quantization_blob(&value.encode()).unwrap();
+            bytes.truncate(9);
+            bytes[1..9].copy_from_slice(&head.to_le_bytes());
+            assert!(q.exception(&bytes, Some(&file)).is_err());
+        }
+    }
+
     #[test]
     fn pq_training_compact_and_shared_samples_are_identical_and_cancellable() {
         let sample: Vec<Vec<f64>> = (0..64)

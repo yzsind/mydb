@@ -437,7 +437,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             global,
             session,
         } => Ok(Statement::ShowVariables {
-            scope: show_scope(session, global),
+            scope: show_scope(session, global)?,
             filter: convert_show_filter(filter)?,
         }),
         SqlStatement::ShowStatus {
@@ -445,7 +445,7 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             global,
             session,
         } => Ok(Statement::ShowStatus {
-            scope: show_scope(session, global),
+            scope: show_scope(session, global)?,
             filter: convert_show_filter(filter)?,
         }),
         SqlStatement::ExplainTable {
@@ -1334,15 +1334,7 @@ fn convert_create_table(
                 // single geometry column with no prefix length / direction /
                 // expression key.
                 let columns = convert_index_columns(constraint.columns)?;
-                if columns.names.len() != 1
-                    || columns.has_prefix_or_desc()
-                    || columns.has_expressions()
-                {
-                    return Ok(Statement::Unsupported {
-                        kind: "SPATIAL INDEX must be a single plain geometry column".to_string(),
-                        sql: sql.to_string(),
-                    });
-                }
+                validate_spatial_index_columns(&columns)?;
                 indexes.push(IndexDef {
                     name: constraint.opt_index_name.map(ident_value),
                     columns: columns.names,
@@ -1736,16 +1728,7 @@ fn convert_alter_table_action(
                     }
                     "FULLTEXT"
                 } else {
-                    if columns.names.len() != 1
-                        || columns.has_prefix_or_desc()
-                        || columns.has_expressions()
-                    {
-                        return Ok(ConvertedAlterAction::Unsupported(Statement::Unsupported {
-                            kind: "SPATIAL INDEX must be a single plain geometry column"
-                                .to_string(),
-                            sql: sql.to_string(),
-                        }));
-                    }
+                    validate_spatial_index_columns(&columns)?;
                     "SPATIAL"
                 };
                 AlterAction::AddIndex(IndexDef {
@@ -7124,6 +7107,33 @@ fn convert_group_by(
     }
 }
 
+fn validate_spatial_index_columns(columns: &ConvertedIndexColumns) -> Result<(), ParseError> {
+    let (spec, message) = if columns.names.len() != 1 {
+        (
+            crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
+            "A SPATIAL index requires exactly one key part",
+        )
+    } else if columns.has_expressions() {
+        (
+            crate::error::catalog::ER_SPATIAL_FUNCTIONAL_INDEX,
+            "Spatial functional index is not supported",
+        )
+    } else if columns.prefix_lengths.iter().any(Option::is_some) {
+        (
+            crate::error::catalog::ER_WRONG_SUB_KEY,
+            "A SPATIAL index cannot use a column prefix",
+        )
+    } else if columns.descending.iter().any(|value| *value) {
+        (
+            crate::error::catalog::ER_WRONG_USAGE,
+            "A SPATIAL index cannot use descending key parts",
+        )
+    } else {
+        return Ok(());
+    };
+    Err(numeric_spec_error(spec, message))
+}
+
 fn convert_index_columns(
     columns: Vec<sqlparser::ast::IndexColumn>,
 ) -> Result<ConvertedIndexColumns, ParseError> {
@@ -7492,12 +7502,17 @@ fn show_options_filter(options: &ShowStatementOptions) -> Result<Option<ShowFilt
     }
 }
 
-fn show_scope(session: bool, global: bool) -> ShowScope {
-    if global && !session {
+fn show_scope(session: bool, global: bool) -> Result<ShowScope, ParseError> {
+    if session && global {
+        return Err(parse_error_at_zero(
+            "SHOW accepts only one GLOBAL or SESSION scope",
+        ));
+    }
+    Ok(if global {
         ShowScope::Global
     } else {
         ShowScope::Session
-    }
+    })
 }
 
 #[derive(Default)]

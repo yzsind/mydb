@@ -5455,8 +5455,8 @@ fn value_to_f64(v: &Value) -> f64 {
             .parse()
             .unwrap_or(0.0),
         Value::Bytes(b) => String::from_utf8_lossy(b).trim().parse().unwrap_or(0.0),
-        Value::DecimalCompact(mag, scale) => *mag as f64 / 10f64.powi(*scale as i32),
-        Value::Decimal128(mag, scale) => *mag as f64 / 10f64.powi(*scale as i32),
+        Value::DecimalCompact(mag, scale) => crate::util::decimal::parts_to_f64(*mag as i128, *scale),
+        Value::Decimal128(mag, scale) => crate::util::decimal::parts_to_f64(*mag as i128, *scale),
         Value::DecimalWide(value) => value_to_wide_f64(value),
         Value::Date(d) => *d as f64,
         Value::Time(t) => *t as f64,

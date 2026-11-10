@@ -393,6 +393,7 @@ pub(super) fn join_prune_walk(
     parent_is_join: bool,
 ) -> Option<Vec<JoinPruneField>> {
     match plan {
+        PhysicalPlan::FulltextScan { .. } => None,
         PhysicalPlan::SeqScan {
             table,
             projected_columns,
@@ -439,11 +440,6 @@ pub(super) fn join_prune_walk(
             ..
         }
         | PhysicalPlan::ParallelIndexRangeScan {
-            table,
-            projected_columns,
-            ..
-        }
-        | PhysicalPlan::FulltextScan {
             table,
             projected_columns,
             ..

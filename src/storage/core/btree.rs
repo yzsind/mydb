@@ -374,8 +374,8 @@ const KEY_LAYOUT_COMPACT_INT2: u8 = 7;
 /// i.e. `u64`) indexes whose page-local value span fits in 16 bits.
 /// The unsigned twin of `KEY_LAYOUT_COMPACT_INT_U16`: each entry
 /// encodes `delta = (value - base) as u16` (2 B) plus the RowId. The
-/// page `base_time` slot stores the chunk minimum reinterpreted as
-/// `i64` (`base as u64` recovers it) so the full `u64` range — past
+/// page `base_time` slot stores the chunk minimum with its high bit flipped
+/// into order-preserving `i64` order, so the full `u64` range — past
 /// `i64::MAX`, where `BIGINT UNSIGNED` auto-increment PKs live — is
 /// representable. Sequential `… UNSIGNED` PKs pack densely here.
 const KEY_LAYOUT_COMPACT_UINT_U16: u8 = 8;
@@ -3301,13 +3301,14 @@ impl IndexFile {
         buffer_pool: Arc<BufferPool>,
     ) -> Result<Self, QueryError> {
         if path.extension().is_some_and(|e| e == "rtree") {
+            Self::persist_spatial_rebuild_marker(&path, durability)?;
             let index = Self::open_spatial(path, log, durability, buffer_pool, true)?;
             index
                 .spatial
                 .as_ref()
                 .unwrap()
                 .build_sorted(entries.into_iter().map(Ok))?;
-            return Ok(index);
+            return index.finish_rebuilt_index();
         }
         let _ = fs::remove_file(&path);
         let index = Self::open_rebuilt_with_durability(path, log, durability, buffer_pool)?;
@@ -3344,9 +3345,10 @@ impl IndexFile {
         I: Iterator<Item = Result<IndexEntry, QueryError>>,
     {
         if path.extension().is_some_and(|e| e == "rtree") {
+            Self::persist_spatial_rebuild_marker(&path, durability)?;
             let index = Self::open_spatial(path, log, durability, buffer_pool, true)?;
             index.spatial.as_ref().unwrap().build_sorted(entries)?;
-            return Ok(index);
+            return index.finish_rebuilt_index();
         }
 
         let _ = fs::remove_file(&path);
@@ -3567,6 +3569,33 @@ impl IndexFile {
         record_bulk_index_build(&index, true, started);
         Ok(index)
     }
+    fn persist_spatial_rebuild_marker(path: &Path, durability: DurabilityMode) -> Result<(), QueryError> {
+        if durability != DurabilityMode::Memory {
+            if let Some(parent) = path.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+            let mut marker = File::create(path.with_extension("rtree.failed")).map_err(io_err)?;
+            marker.write_all(&u64::MAX.to_le_bytes()).map_err(io_err)?;
+            marker.sync_all().map_err(io_err)?;
+            crate::platform::fs::sync_path(path.parent().expect("index directory")).map_err(io_err)?;
+        }
+        Ok(())
+    }
+
+    /// A failed rebuild must remain fenced until its complete image is durable.
+    fn finish_rebuilt_index(self) -> Result<Self, QueryError> {
+        self.flush()?;
+        let extension = if self.spatial.is_some() { "rtree" } else { "idx" };
+        let mut removed = false;
+        for suffix in ["failed", "corrupt"] {
+            match fs::remove_file(self.path.with_extension(format!("{extension}.{suffix}"))) {
+                Ok(()) => removed = true,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {},
+                Err(e) => return Err(io_err(e)),
+            }
+        }
+        if removed { crate::platform::fs::sync_path(self.path.parent().expect("index directory")).map_err(io_err)?; }
+        Ok(self)
+    }
+
     fn open_rebuilt_with_durability(
         path: PathBuf,
         log: Arc<crate::wal::LogMutex>,
@@ -4545,7 +4574,8 @@ impl IndexFile {
         txn_id: u64,
         entries: &[IndexEntry],
     ) -> Result<Option<BufferedIndexInsert>, QueryError> {
-        if self.durability == DurabilityMode::Memory
+        if self.online_build_log.is_some()
+            || self.durability == DurabilityMode::Memory
             || !txn_wal_buffer_index_enabled()
             || !txn_wal_buffering_active(&self.log, txn_id)
             || btree_logical_wal::is_deferred()
@@ -19727,7 +19757,7 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
                     }
                     i += 1;
                 }
-                search_floor = i;
+                search_floor = lo;
                 if !saw_greater && hdr.next_leaf.is_some() {
                     continue_key_offsets.push(key_offset);
                 }
@@ -19776,7 +19806,7 @@ fn lookup_leaf_entries_many_keyed_page_bytes(
             }
             i += 1;
         }
-        search_floor = i;
+        search_floor = lo;
         if !saw_greater && hdr.next_leaf.is_some() {
             continue_key_offsets.push(key_offset);
         }
@@ -19928,7 +19958,7 @@ fn validate_index_page_structure(buf: &[u8]) -> Result<(), QueryError> {
     }
     let payload = &buf[INDEX_HEADER_BYTES..INDEX_HEADER_BYTES + payload_len];
     match payload[0] {
-        0 | 3 => {}
+        3 => {}
         1 => {
             let header = parse_leaf_payload_header(buf)?;
             validate_index_slot_bounds(
@@ -20162,7 +20192,7 @@ fn decode_validated_index_tree_page(buf: &[u8]) -> Result<IndexPage, QueryError>
                         "corrupt index: slot overflow",
                     )
                 })?;
-                if raw_slot.len == 0 || record_end > slot_array_start {
+                if raw_slot.len == 0 || cursor < offset || record_end > slot_array_start {
                     return Err(error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "corrupt index: slot record bounds",
@@ -21250,6 +21280,10 @@ fn decode_index_key_parts_from(
     offset: &mut usize,
     count: usize,
 ) -> Result<IndexKey, QueryError> {
+    // Every key part consumes at least its tag byte. Validate before allocating.
+    if count > buf.len().saturating_sub(*offset) {
+        return Err(error(crate::error::catalog::ER_GET_ERRNO, "corrupt index key part count"));
+    }
     let mut parts = smallvec::SmallVec::<[KeyPart; 4]>::with_capacity(count);
     for _ in 0..count {
         let tag = read_u8_checked(buf, offset)?;
@@ -21475,7 +21509,7 @@ fn compact_time_delta(key: &IndexKey, base_time: i64) -> Result<u32, QueryError>
             ));
         }
     };
-    let delta = (time_value.wrapping_sub(base_time)) as i128;
+    let delta = time_value as i128 - base_time as i128;
     if !(0..=(u32::MAX as i128)).contains(&delta) {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
@@ -21752,9 +21786,8 @@ fn decode_compact_int_u32_entry_from(
 // v20 COMPACT_UINT (single-column INT UNSIGNED) layout
 //
 // Mirrors COMPACT_INT but for `KeyPart::UInt`. `base` is stored in the
-// page header's i64 `base_time` slot as the bit pattern of the chunk's
-// minimum u64 (`min as i64` / `base as u64` round-trips losslessly), so
-// values above `i64::MAX` (BIGINT UNSIGNED) encode correctly. Deltas
+// page header's i64 `base_time` slot after flipping the high bit of the
+// minimum u64, preserving unsigned ordering across the entire domain. Deltas
 // are unsigned `value - base`. The byte layout — `[u16|u32 delta][RowId]`
 // — is identical to COMPACT_INT, so the entry-byte helpers are reused.
 // =================================================================
@@ -22421,8 +22454,13 @@ impl CompactChunkAccum {
                 }
             }
         }
-        let mut compact =
-            self.compact_bytes + merged_kind.entry_bytes(entry.row_id) + SLOT_OFFSET_BYTES;
+        let mut prior_bytes = self.compact_bytes;
+        if let Some(existing) = self.kind.filter(|existing| *existing != merged_kind) {
+            let row = RowId { page_id: 0, slot_id: 0 };
+            // Layout promotion changes every prior magnitude, not its RowId.
+            prior_bytes += (merged_kind.entry_bytes(row) - existing.entry_bytes(row)) * self.count;
+        }
+        let mut compact = prior_bytes + merged_kind.entry_bytes(entry.row_id) + SLOT_OFFSET_BYTES;
         // INT2: first entry in this hypothetical chunk has to also
         // budget the 20 B prefix block (the accumulator hasn't seen
         // it yet because `self.count == 0`).

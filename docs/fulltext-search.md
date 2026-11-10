@@ -67,6 +67,11 @@ excluded, or phrase condition fails. Projection, comparison, `NOT`, `OR`,
 and multiple `MATCH` expressions use the same membership rules as a bare
 `WHERE MATCH(...)` predicate.
 
+Punctuation inside one boolean operand splits it into required tokens:
+`alpha.beta` requires both `alpha` and `beta`. Whitespace-separated optional
+operands retain union semantics. The built-in stopword table exposes 35 distinct
+words. The identifier `fulltext` requires backticks when used as a column name.
+
 Grouping `()`, weights `> < ~`, and proximity `@` return error 1235.
 Malformed operands, repeated leading signs, and unclosed double quotes return
 error 1064. `WITH QUERY EXPANSION` is not supported and returns a parse error.
@@ -138,6 +143,10 @@ documents. These paths cost a corpus scan and can require more memory than
 an ordinary inverted-index lookup. `EXPLAIN` identifies the heap oracle path;
 memory admission failures return an explicit error.
 
+`MATCH` supports UPDATE/DELETE filtering and ordering, including transactional
+rollback, and ordinary JOIN filtering, score projection, and ordering. Aggregated
+MATCH in HAVING remains unsupported and returns an explicit error.
+
 Single-table `FOR UPDATE` and `FOR SHARE` reads support MATCH filtering and
 score projection through the same full-text runtime. MATCH in a locking JOIN
 query remains unsupported and returns error 1235.
@@ -160,3 +169,11 @@ repair or restore. A normal open does not silently replace a damaged FULLTEXT
 index with a heap reconstruction. A missing derived index file without a
 corruption fence can be rebuilt from the heap during recovery. A deliberately scheduled logical redo rebuild
 is a separately recorded recovery obligation whose failure prevents opening.
+
+## Diagnostic tables
+
+Set `innodb_ft_aux_table='database/table'` to inspect every FULLTEXT index on a
+table through `INNODB_FT_INDEX_TABLE` and `INNODB_FT_CONFIG`. The optional mydb
+extension `database/table/index` selects one index. DOC_ID is a diagnostic
+identity synthesized from storage and row identifiers and can change on row
+migration; POSITION counts tokens rather than InnoDB byte offsets.

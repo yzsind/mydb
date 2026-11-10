@@ -1998,9 +1998,9 @@ pub(super) fn fast_compare_typed_const(
             PredicateValue::F64(value) => Some(*value),
             PredicateValue::I64(value) if approximate => Some(*value as f64),
             PredicateValue::U64(value) if approximate => Some(*value as f64),
-            PredicateValue::Decimal(magnitude, scale) if approximate => {
-                Some(*magnitude as f64 / 10f64.powi(i32::from(*scale)))
-            }
+            PredicateValue::Decimal(magnitude, scale) if approximate => Some(
+                crate::util::decimal::parts_to_f64(*magnitude as i128, *scale),
+            ),
             _ => None,
         };
         if let Some(left_numeric) = left_numeric {
@@ -2188,7 +2188,9 @@ pub(in crate::engine::executor::select) fn value_to_f64_fast(value: &Value) -> O
             ];
             POW10.get(*scale as usize).map(|denom| *mag as f64 / *denom)
         }
-        Value::Decimal128(mag, scale) => Some(*mag as f64 / 10f64.powi(*scale as i32)),
+        Value::Decimal128(mag, scale) => {
+            Some(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
+        }
         Value::DecimalWide(value) => {
             crate::util::decimal::format_big_decimal_parts(&value.magnitude, value.scale)
                 .parse::<f64>()

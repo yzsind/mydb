@@ -3499,6 +3499,7 @@ pub(super) fn strip_zone_map_options<'a>(
     sql: &'a str,
     require_table_body: bool,
 ) -> Result<(std::borrow::Cow<'a, str>, Vec<(String, String)>), ParseError> {
+    let mut options_start = 0usize;
     if require_table_body {
         if !first_keyword_is(sql, b"CREATE") {
             return Ok((std::borrow::Cow::Borrowed(sql), Vec::new()));
@@ -3517,6 +3518,30 @@ pub(super) fn strip_zone_map_options<'a>(
         {
             return Ok((std::borrow::Cow::Borrowed(sql), Vec::new()));
         }
+        if cursor
+            .eat_keyword(b"IF")
+            .map_err(|err| parse_lex_error(sql, err))?
+        {
+            cursor
+                .eat_keyword(b"NOT")
+                .map_err(|err| parse_lex_error(sql, err))?;
+            cursor
+                .eat_keyword(b"EXISTS")
+                .map_err(|err| parse_lex_error(sql, err))?;
+        }
+        if let Some(name) = cursor.next().map_err(|err| parse_lex_error(sql, err))? {
+            options_start = name.span.end;
+            if cursor
+                .peek()
+                .map_err(|err| parse_lex_error(sql, err))?
+                .is_some_and(|token| token.kind == crate::sql_lex::SqlTokenKind::Symbol(b'.'))
+            {
+                cursor.next().map_err(|err| parse_lex_error(sql, err))?;
+                if let Some(name) = cursor.next().map_err(|err| parse_lex_error(sql, err))? {
+                    options_start = name.span.end;
+                }
+            }
+        }
     }
     if !contains_keyword_ci(sql.as_bytes(), b"ZONE_MAP")
         && !contains_keyword_ci(sql.as_bytes(), b"ZONE_SIZE")
@@ -3528,7 +3553,6 @@ pub(super) fn strip_zone_map_options<'a>(
     let mut options = Vec::new();
     let mut i = 0usize;
     let mut depth = 0usize;
-    let mut saw_body = false;
     let mut preceding_comma = None;
     let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
     let mut segments = crate::sql_lex::segments(sql, mode, MYSQL_VERSION_ID).peekable();
@@ -3560,7 +3584,9 @@ pub(super) fn strip_zone_map_options<'a>(
         // parentheses followed by an identifier named zone_map/zone_size.
         if require_table_body
             && depth == 0
-            && (keyword_at(sql, i, "AS") || keyword_at(sql, i, "SELECT"))
+            && (keyword_at(sql, i, "AS")
+                || keyword_at(sql, i, "SELECT")
+                || keyword_at(sql, i, "LIKE"))
         {
             out.extend_from_slice(&bytes[i..]);
             break;
@@ -3568,7 +3594,6 @@ pub(super) fn strip_zone_map_options<'a>(
         if b == b'(' {
             preceding_comma = None;
             depth += 1;
-            saw_body = true;
             out.push(b);
             i += 1;
             continue;
@@ -3580,7 +3605,7 @@ pub(super) fn strip_zone_map_options<'a>(
             i += 1;
             continue;
         }
-        let eligible = depth == 0 && (!require_table_body || saw_body);
+        let eligible = depth == 0 && i >= options_start;
         let boundary = i == 0 || (!bytes[i - 1].is_ascii_alphanumeric() && bytes[i - 1] != b'_');
         let matched_key = if eligible
             && boundary

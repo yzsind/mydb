@@ -248,7 +248,7 @@ fn value_to_literal(v: &Value) -> crate::parser::Literal {
         Value::Geometry(_) => Literal::Null,
         Value::Vector(_) => Literal::Null,
         Value::DecimalCompact(mag, scale) => {
-            Literal::Float(*mag as f64 / 10f64.powi(*scale as i32))
+            Literal::Float(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
         }
         Value::Decimal128(..) | Value::DecimalWide(..) => Literal::Decimal(v.to_display_string()),
         // Temporal values are routed as String literals (the

@@ -492,6 +492,9 @@ pub(crate) fn to_text_into<T: VectorInput + ?Sized>(internal: &T, out: &mut Stri
             _ => {
                 let value = internal.element(i) as f32;
                 if value == 0.0 {
+                    if value.is_sign_negative() {
+                        out.push('-');
+                    }
                     out.push('0');
                 } else {
                     write!(out, "{value}").expect("String formatting");
@@ -1004,6 +1007,12 @@ pub(crate) fn coerce_value(
             if let Some(body) = bytes.strip_prefix(VECTOR_BINLOG_MAGIC) {
                 return convert_value(&decode_value(body)?, datatype, dimension);
             }
+            if let Ok(text) = std::str::from_utf8(&bytes) {
+                if text.trim_start().starts_with('[') {
+                    let value = parse_typed_text(text, datatype)?;
+                    return convert_value(&value, datatype, dimension);
+                }
+            }
             let raw_dimension = dimension.unwrap_or_else(|| match datatype {
                 VectorDataType::Float32 => (bytes.len() / 4) as u32,
                 VectorDataType::Float16 | VectorDataType::BFloat16 => (bytes.len() / 2) as u32,
@@ -1045,6 +1054,34 @@ pub(crate) fn coerce_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn vector_release_bytes_text_and_signed_zero_round_trip() {
+        for datatype in [
+            VectorDataType::Float32,
+            VectorDataType::Float16,
+            VectorDataType::BFloat16,
+            VectorDataType::Int8,
+        ] {
+            let value = coerce_value(
+                crate::types::Value::Bytes(b"[10, 20, 30]".to_vec()),
+                datatype,
+                Some(3),
+            )
+            .unwrap();
+            assert_eq!(to_f32(&value), vec![10.0, 20.0, 30.0]);
+        }
+        for datatype in [
+            VectorDataType::Float32,
+            VectorDataType::Float16,
+            VectorDataType::BFloat16,
+        ] {
+            let value = parse_typed_text("[-0,1.5]", datatype).unwrap();
+            let text = to_text(&value);
+            assert_eq!(text, "[-0,1.5]");
+            assert_eq!(parse_typed_text(&text, datatype).unwrap(), value);
+        }
+    }
 
     #[test]
     fn ddl1108_typed_vector_accepts_native_and_mysql_wire_payloads() {

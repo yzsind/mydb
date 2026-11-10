@@ -5742,11 +5742,23 @@ impl Database {
                 self.temporal_history
                     .txn_ids_committed_since_for(retain_since.saturating_mul(1_000), &creator_ids)
             };
+            // A rolled-back creator has no commit SCN to fence candidate
+            // RowIds. Preserve its undo while registered readers can retain
+            // those identities; the implicit visibility frontier is not a reader.
+            let reader_pinned_states = oldest_registered_snapshot_scn.map(|_| {
+                let mut states = creator_states.clone();
+                for state in states.values_mut() {
+                    if *state == crate::storage::undo::UndoCreatorState::RolledBack {
+                        *state = crate::storage::undo::UndoCreatorState::Active;
+                    }
+                }
+                states
+            });
             let victims = self.undo.read().plan_purge_candidates(
                 &candidates,
                 &active_txn_heads,
                 oldest_snapshot_scn,
-                &creator_states,
+                reader_pinned_states.as_ref().unwrap_or(&creator_states),
                 committed_creator_watermark,
                 &recent_committed_txns,
             );
@@ -6294,6 +6306,27 @@ impl Database {
     }
 
     pub fn rollback_txn(&self, txn_id: u64) -> Result<(), QueryError> {
+        let head = {
+            let txns = self.txns_read()?;
+            match txns.slot(txn_id) {
+                Some(slot) if !slot.status.is_in_flight() => return Ok(()),
+                None if txn_id != 0 && txn_id < txns.next_txn_id => return Ok(()),
+                None => {
+                    return Err(crate::error::catalog::ER_WARNING_NOT_COMPLETE_ROLLBACK
+                        .error("transaction does not exist"))
+                }
+                Some(slot) => slot.undo_head.clone(),
+            }
+        };
+        let _finish_fence = head.lock_append();
+        // A concurrent retry may have finished while this call waited.
+        if self
+            .txns_read()?
+            .slot(txn_id)
+            .is_none_or(|slot| !slot.status.is_in_flight())
+        {
+            return Ok(());
+        }
         let result = crate::engine::executor::mem_budget::with_critical_memory_reservations(|| {
             self.rollback_txn_inner(txn_id)
         });
@@ -6570,7 +6603,12 @@ impl Database {
             self.restore_pending_live_row_deltas(txn_id, &savepoint.live_row_deltas);
             crate::binlog::truncate_txn(txn_id, savepoint.binlog_len);
             let mut txns = self.txns_write()?;
-            txns.restore_statement_savepoint(txn_id, &savepoint)?;
+            {
+                let undo = self.undo.read();
+                let mut canonical = savepoint.clone();
+                canonical.undo_head = canonical.undo_head.map(|head| undo.canonical_ptr(head));
+                txns.restore_statement_savepoint(txn_id, &canonical)?;
+            }
             txns.truncate_named_savepoints_after(txn_id, name);
             self.active_write_txns_atomic
                 .store(txns.active_write_count, Ordering::Release);
@@ -6644,7 +6682,12 @@ impl Database {
                 .statement_savepoint_matches(txn_id, &savepoint)?;
             if !metadata_unchanged {
                 let mut txns = self.txns_write()?;
-                txns.restore_statement_savepoint(txn_id, &savepoint)?;
+                {
+                    let undo = self.undo.read();
+                    let mut canonical = savepoint.clone();
+                    canonical.undo_head = canonical.undo_head.map(|head| undo.canonical_ptr(head));
+                    txns.restore_statement_savepoint(txn_id, &canonical)?;
+                }
                 self.active_write_txns_atomic
                     .store(txns.active_write_count, Ordering::Release);
             }
