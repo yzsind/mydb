@@ -219,7 +219,7 @@ fn correlated_sum_outer_filter_domain_preserves_distinct_keys() {
 
 #[test]
 fn scalar_integer_primary_key_domain_preserves_aggregate_multiplicity() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     for sql in [
         "CREATE TABLE domain_parent (tenant INT,k BIGINT,active INT,PRIMARY KEY(tenant,k))",
@@ -275,7 +275,7 @@ fn scalar_integer_primary_key_domain_preserves_aggregate_multiplicity() {
 
 #[test]
 fn scalar_key_domain_retains_semi_for_text_and_later_primary_publications() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     for sql in [
         "CREATE TABLE text_parent (k VARCHAR(16) PRIMARY KEY,active INT)",
@@ -844,7 +844,7 @@ fn scalar_apply_inside_semi_join_with_sibling_hash_join() {
 
 #[test]
 fn scalar_access_constants_are_execution_local_and_keep_lazy_fallbacks() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     for sql in [
         "CREATE TABLE scalar_access (tenant INT,id BIGINT,grp INT,PRIMARY KEY(tenant,id))",
@@ -909,4 +909,58 @@ fn scalar_access_constants_are_execution_local_and_keep_lazy_fallbacks() {
     // Text auto-parameters retain literal provenance and use Apply; the
     // prepared point memo has its own rebind/reuse regression coverage.
     assert!(text.contains("Apply"), "{text}");
+}
+
+#[test]
+fn materialized_cte_scalar_average_uses_grouped_decorrelation() {
+    with_test_env(
+        &[("MYDB_CTE_INLINE", Some("off")), ("MYDB_DECORRELATE", None)],
+        || {
+            let dir = tempfile::tempdir().unwrap();
+            let engine = open_test_engine(dir.path());
+            engine.execute("CREATE TABLE cte_domain_src (id INT, cat VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, amount DECIMAL(12,2))").unwrap();
+            engine.execute("INSERT INTO cte_domain_src VALUES (1,'A',10),(2,'a',20),(3,'B',50),(4,NULL,100)").unwrap();
+            let sql = "WITH totals AS (SELECT id,cat,SUM(amount) total FROM cte_domain_src GROUP BY id,cat) SELECT a.id FROM totals a WHERE a.total > (SELECT AVG(b.total)*1.2 FROM totals b WHERE b.cat=a.cat) ORDER BY a.id";
+            let QueryResponse::ResultSet(rows) =
+                engine.execute(sql).unwrap().materialize().unwrap()
+            else {
+                panic!("rows")
+            };
+            assert_eq!(rows.rows, vec![vec![Value::Int(2)]]);
+            // Test the rewrite with the same materialized output metadata.
+            // WITH EXPLAIN currently skips the normal SELECT preparation pass.
+            let QueryResponse::ResultSet(totals) = engine
+                .execute("SELECT id,cat,SUM(amount) total FROM cte_domain_src GROUP BY id,cat")
+                .unwrap()
+                .materialize()
+                .unwrap()
+            else {
+                panic!("totals")
+            };
+            engine
+                .execute("CREATE TABLE totals (id INT,cat INT,total INT)")
+                .unwrap();
+            let cte = crate::engine::api::CteResult::materialized(totals.columns, totals.rows);
+            crate::engine::executor::cte::with_cte_registry(
+                std::collections::HashMap::from([("totals".into(), Arc::new(cte))]),
+                || {
+                    let Statement::Select(mut select) = crate::parser::parse_statement("SELECT a.id FROM totals a WHERE a.total > (SELECT AVG(b.total)*1.2 FROM totals b WHERE b.cat=a.cat)").unwrap() else { panic!("select") };
+                    assert_eq!(
+                        crate::planner_decorrelate::scalar::decorrelate_scalar_subqueries(
+                            &engine.db,
+                            &mut select
+                        ),
+                        1
+                    );
+                    assert!(select
+                        .joins
+                        .last()
+                        .unwrap()
+                        .table
+                        .name
+                        .starts_with("__decor_sub"));
+                },
+            );
+        },
+    );
 }

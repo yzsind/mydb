@@ -145,7 +145,7 @@ fn memory_index_mutations_do_not_reencode_resident_leaf_for_each_entry() {
 
 #[test]
 fn batched_index_visibility_reads_each_heap_header_once() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
     db.create_table(
         "header_batch",
@@ -231,7 +231,7 @@ fn batched_index_visibility_reads_each_heap_header_once() {
 
 #[test]
 fn batched_visibility_invisible_insert_needs_no_heap_fallback() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
     db.create_table(
         "invisible_headers",
@@ -273,7 +273,7 @@ fn batched_visibility_invisible_insert_needs_no_heap_fallback() {
 
 #[test]
 fn batched_visibility_cold_page_refills_headers_once() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let mut config = test_storage_config(DurabilityMode::Relaxed, false);
     config.buffer_pool_prefetch_pages = 0;
     let db = Database::open_with_config(dir.path(), config).unwrap();
@@ -323,8 +323,7 @@ fn batched_visibility_cold_page_refills_headers_once() {
 
 #[test]
 fn contiguous_unique_insert_ranges_keep_prepared_lock_snapshots_complete() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
     db.create_table(
         "ranges",
@@ -366,8 +365,7 @@ fn contiguous_unique_insert_ranges_keep_prepared_lock_snapshots_complete() {
 
 #[test]
 fn typed_integer_column_coercion_matches_canonical_diagnostics() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
     db.create_table(
         "integers",
@@ -443,8 +441,7 @@ fn typed_integer_column_coercion_matches_canonical_diagnostics() {
 
 #[test]
 fn typed_text_column_coercion_matches_canonical_charset_and_padding() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_memory_test_db(dir.path());
     db.create_table(
         "text_coercion",
@@ -635,8 +632,7 @@ fn database_fixtures_initialize_open_files_limit() {
 
 #[test]
 fn fresh_catalog_empty_index_root_is_durable_before_open_returns() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join(".mydb-test-fresh-data-dir"), b"").unwrap();
     let db = Database::open_with_config(
         dir.path(),
@@ -658,8 +654,7 @@ fn fresh_catalog_empty_index_root_is_durable_before_open_returns() {
 #[cfg(target_os = "macos")]
 #[test]
 fn test_seed_clone_keeps_the_destination_name_reserved() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let root = tempfile::tempdir().unwrap();
     let source = root.path().join("source");
     let destination = root.path().join("destination");
     std::fs::create_dir(&source).unwrap();
@@ -689,13 +684,12 @@ fn test_seed_clone_keeps_the_destination_name_reserved() {
 
 #[test]
 fn retired_heap_drop_preserves_reopened_dirty_pages() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
     for durability in [
         DurabilityMode::Memory,
         DurabilityMode::Relaxed,
         DurabilityMode::Strict,
     ] {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let db =
             Database::open_with_config(dir.path(), test_storage_config(durability, true)).unwrap();
         create_checkpoint_test_table(&db);
@@ -720,8 +714,7 @@ fn retired_heap_drop_preserves_reopened_dirty_pages() {
 #[test]
 fn delayed_heap_open_cannot_reinstall_a_retired_generation() {
     use crate::engine::StorageQueryEngine;
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
         dir.path(),
         test_storage_config(DurabilityMode::Strict, true),
@@ -768,8 +761,7 @@ fn delayed_heap_open_cannot_reinstall_a_retired_generation() {
 #[test]
 fn delayed_heap_open_is_not_invalidated_by_unrelated_table_copy() {
     use crate::engine::StorageQueryEngine;
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
         dir.path(),
         test_storage_config(DurabilityMode::Strict, true),
@@ -827,9 +819,8 @@ fn delayed_heap_open_is_not_invalidated_by_unrelated_table_copy() {
 #[test]
 fn delayed_path_resolution_retries_index_and_lob_after_copy() {
     use crate::engine::StorageQueryEngine;
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
     for index in [true, false] {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(
             StorageQueryEngine::open_with_storage_config_without_background_workers(
                 dir.path(),
@@ -880,8 +871,7 @@ fn delayed_path_resolution_retries_index_and_lob_after_copy() {
 #[test]
 fn delayed_heap_open_retries_after_metadata_codec_refresh() {
     use crate::engine::{QueryResponse, StorageQueryEngine};
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
         dir.path(),
         test_storage_config(DurabilityMode::Strict, true),
@@ -944,8 +934,7 @@ fn delayed_heap_open_retries_after_metadata_codec_refresh() {
 
 #[test]
 fn private_added_index_keeps_identity_after_cold_open() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_relaxed_test_db(dir.path());
     create_checkpoint_test_table(&db);
     let source = db.table("test.t").unwrap();
@@ -1003,9 +992,8 @@ fn private_added_index_keeps_identity_after_cold_open() {
 #[test]
 fn private_partition_heap_codec_survives_idle_handle_eviction() {
     use crate::engine::{QueryResponse, StorageQueryEngine};
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
     for primary_key in ["PRIMARY KEY", ""] {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = Arc::new(
             StorageQueryEngine::open_with_storage_config_without_background_workers(
                 dir.path(),
@@ -1476,7 +1464,7 @@ fn heap_batch_inserts_emit_one_fpi_per_checkpoint_window() {
         0,
         "FPI image must be encoded before WAL LSN allocation"
     );
-    let replay = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let replay = tempfile::tempdir().unwrap();
     redo_page_update(replay.path(), &relative, 0, record.lsn, &image).unwrap();
     let recovered = fs::read(replay.path().join(&relative)).unwrap();
     assert_eq!(page_lsn(&recovered), record.lsn);
@@ -1643,11 +1631,21 @@ fn dense_probe_admission_bounds_amplification_and_keeps_sparse_reads() {
     assert!(dense_probe_worth_streaming(&rows, 1000, 32));
     assert!(!dense_probe_worth_streaming(&rows, 1000, 1000));
     assert!(!dense_probe_worth_streaming(&rows[..1023], 1000, 32));
+    for stride in [1, 2, 3, 5, 8] {
+        let mut coalesced = rows.clone();
+        for row in &mut coalesced {
+            row.page_id *= stride;
+        }
+        assert_eq!(
+            dense_probe_worth_streaming(&coalesced, 1000, 32),
+            stride <= 2
+        );
+    }
     let mut sparse = rows.clone();
     for row in &mut sparse {
-        row.page_id *= 3;
+        row.page_id *= 16;
     }
-    assert!(!dense_probe_worth_streaming(&sparse, 1000, 32));
+    assert!(!dense_probe_worth_streaming(&sparse, 2000, 32));
     sparse.reverse();
     assert!(!dense_probe_worth_streaming(&sparse, 1000, 32));
     let mut islands = rows.clone();
@@ -1793,6 +1791,42 @@ fn dense_probe_matches_point_reads_with_dirty_rows_undo_and_forwarding() {
         assert!(
             db.buffer_pool.read_ios_scan.load(Ordering::Relaxed) > before,
             "dense cold path was not used"
+        );
+        let before = db.buffer_pool.read_ios_scan.load(Ordering::Relaxed);
+        let mut visits = 0;
+        let mut filtered = db
+            .read_row_columns_many_predicate_first_with_handle(
+                &heap,
+                &table,
+                &ids,
+                view,
+                &[0, 2],
+                &[3, 2, 1, 0],
+                |values| {
+                    visits += 1;
+                    Ok(matches!(values[0], Value::Int(id) if id % 2 == 0)
+                        && !matches!(values[1], Value::Null))
+                },
+            )
+            .unwrap();
+        filtered.sort_by_key(|row| row.0);
+        assert_eq!(
+            visits,
+            expected.len(),
+            "visible rows invoke the predicate exactly once"
+        );
+        let expected_filtered = expected
+            .iter()
+            .filter(|(_, values)| {
+                matches!(values[3], Value::Int(id) if id % 2 == 0)
+                    && !matches!(values[1], Value::Null)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(filtered, expected_filtered);
+        assert!(
+            db.buffer_pool.read_ios_scan.load(Ordering::Relaxed) > before,
+            "predicate-first dense read must use the bounded direct path"
         );
     }
     db.rollback_txn(writer.txn_id).unwrap();
@@ -26672,7 +26706,7 @@ fn locking_point_read_watermark_avoids_unrelated_global_latches() {
     if !row_lock_sharding_enabled() {
         return;
     }
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(open_memory_test_db(dir.path()));
     let txn = db.begin_txn().unwrap();
     let txns = db.txns.write();
@@ -26698,7 +26732,7 @@ fn locking_point_read_watermark_avoids_unrelated_global_latches() {
 
 #[test]
 fn locking_point_read_error_restores_only_new_locks_and_preserves_prior_writes() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_relaxed_test_db(dir.path());
     create_checkpoint_test_table(&db);
     let txn = db.begin_txn().unwrap();
@@ -26747,7 +26781,7 @@ fn locking_point_read_error_restores_only_new_locks_and_preserves_prior_writes()
 
 #[test]
 fn check_only_unique_probe_uses_shared_global_latch() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(open_memory_test_db(dir.path()));
     let txn = db.begin_txn().unwrap();
     let shared = db.lock_manager_read();
@@ -27322,8 +27356,7 @@ fn round2_load_index_builder_reserves_unique_keys_before_publication() {
 
 #[test]
 fn release_audit_replica_restartpoint_retains_inflight_begin() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_relaxed_test_db(dir.path());
     let txn_id = 9001;
     let begin_lsn = db
@@ -27375,8 +27408,7 @@ fn release_audit_replica_restartpoint_retains_inflight_begin() {
 
 #[test]
 fn release_audit_backup_capture_blocks_physical_maintenance() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = Arc::new(open_relaxed_test_db(dir.path()));
     let guard = db.backup_maintenance_capture_guard().unwrap();
     let (send, recv) = std::sync::mpsc::channel();
@@ -28418,7 +28450,7 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
         "SELECT id FROM docs WHERE MATCH(body) AGAINST('alp*' IN BOOLEAN MODE)",
         "SELECT id FROM docs WHERE MATCH(body) AGAINST('\"alpha beta\"' IN BOOLEAN MODE)",
     ] {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         {
             let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
                 dir.path(),
@@ -28640,9 +28672,8 @@ fn spatial_index_replica_replays_pages_and_preserves_old_snapshot() {
         };
         rs.rows[0][0].to_display_string()
     }
-    fs::create_dir_all("/tmp/mydb").unwrap();
-    let master_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-    let replica_dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let master_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
     let master = open_manual(master_dir.path());
     let source = master.database_for_replication();
     master.execute("CREATE TABLE spatial_repl(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
@@ -28832,8 +28863,7 @@ fn spatial_index_crash_child() {
 
 fn check_spatial_index_split_crash_recovery(initial: usize, clear: bool, modes: &[&str]) {
     use crate::engine::{api::QueryResponse, StorageQueryEngine};
-    fs::create_dir_all("/tmp/mydb").unwrap();
-    let base = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let base = tempfile::tempdir().unwrap();
     let preparation = crate::platform::fs::FixtureSyncBatch::new(base.path()).unwrap();
     let engine = StorageQueryEngine::open(base.path()).unwrap();
     engine.execute("CREATE TABLE crash_spatial(id INT PRIMARY KEY,g POINT NOT NULL SRID 0,SPATIAL KEY sp(g))").unwrap();
@@ -28852,7 +28882,7 @@ fn check_spatial_index_split_crash_recovery(initial: usize, clear: bool, modes: 
     preparation.finish().unwrap();
     for &mode in modes {
         for point in 0..=5 {
-            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let dir = tempfile::tempdir().unwrap();
             crate::util::file::copy_fixture_tree(base.path(), dir.path()).unwrap();
             let status = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -30216,7 +30246,7 @@ fn private_heap_page_builder_matches_canonical_page_images_and_row_ids() {
 
 #[test]
 fn release1106_heap_meta_redo_allocates_extent_before_online_open() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_relaxed_test_db(dir.path());
     db.create_table(
         "test.extent",
@@ -30248,7 +30278,7 @@ fn release1106_heap_meta_redo_allocates_extent_before_online_open() {
 
 #[test]
 fn release1106_replica_vector_journal_does_not_retain_transaction_payloads() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let db = open_relaxed_test_db(dir.path());
     let bytes = VectorRecoveryMutation::encode_batch(&[VectorRecoveryMutation {
         table_id: 1,

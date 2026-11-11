@@ -3,7 +3,7 @@ use super::*;
 
 #[test]
 fn partial_batches_and_spill_replay_cover_all_aggregate_kinds() {
-    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let root = tempfile::tempdir().unwrap();
     let collation = crate::charset::resolve_collation("utf8mb4_general_ci")
         .unwrap()
         .id;
@@ -89,6 +89,7 @@ fn partial_batches_and_spill_replay_cover_all_aggregate_kinds() {
             &schema,
             &[0],
             &aggs,
+            false,
         ));
     }
     let resident = merge_partition_batches(batches.clone(), schema.clone(), &aggs).unwrap();
@@ -315,7 +316,7 @@ fn mixed_spill_slots_and_fixed_replay_match_original_inputs() {
                         buckets: vec![GroupBucket::new(vec![], vec![Value::Int(1)], partial)],
                         ..Default::default()
                     };
-                    partition_to_spill_batch(&part.buckets, &schema, &[0], &aggs)
+                    partition_to_spill_batch(&part.buckets, &schema, &[0], &aggs, false)
                 })
                 .collect::<Vec<_>>();
             let actual = if fixed {

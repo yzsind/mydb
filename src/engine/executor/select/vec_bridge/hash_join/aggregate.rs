@@ -170,7 +170,14 @@ impl HashJoinBatchOperator<'_> {
                             .as_ref()
                             .map(|index| index.all_unique())
                             .unwrap_or_else(|| {
-                                state.payload.index.values().all(|hits| hits.len() <= 1)
+                                state
+                                    .payload
+                                    .packed_index
+                                    .as_ref()
+                                    .map(|index| index.all_unique())
+                                    .unwrap_or_else(|| {
+                                        state.payload.index.values().all(|hits| hits.len() <= 1)
+                                    })
                             })
                     })
             })

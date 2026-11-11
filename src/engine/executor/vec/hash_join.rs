@@ -20,6 +20,9 @@
 //! The bridge spills the retained prefix and remaining input when the cap is
 //! exceeded, preserving the input stream without replaying consumed rows.
 
+mod packed;
+pub(crate) use packed::{collect_packed_build_payload, PackedBuildIndex};
+
 use super::join_output::JoinOutputQueue;
 use std::cell::Cell;
 use std::sync::Arc;
@@ -358,6 +361,7 @@ pub(crate) struct BuildPayload {
     /// Native two-key integer lane; mutually exclusive with the encoded byte
     /// index when the caller proved both build/probe schemas are signed-i64.
     pub(crate) i64_pair_index: Option<I64PairBuildIndex>,
+    pub(crate) packed_index: Option<PackedBuildIndex>,
 }
 
 /// Integer values and validity are bound once per batch, avoiding repeated
@@ -389,6 +393,11 @@ impl<'a> I64KeyColumn<'a> {
 /// residual evaluation remain with the caller; lookup returns SQL key
 /// usability separately from an ordinary hash miss for runtime statistics.
 pub(crate) enum PayloadProbe<'a> {
+    Packed {
+        index: &'a PackedBuildIndex,
+        batch: &'a Batch,
+        keys: &'a [usize],
+    },
     I64 {
         index: &'a I64BuildIndex,
         column: I64KeyColumn<'a>,
@@ -415,6 +424,9 @@ impl<'a> PayloadProbe<'a> {
         null_safe: &'a [bool],
         collations: &'a [Option<u16>],
     ) -> Self {
+        if let Some(index) = &payload.packed_index {
+            return Self::Packed { index, batch, keys };
+        }
         if let (Some(index), Some(&first), Some(&second)) =
             (payload.i64_pair_index.as_ref(), keys.first(), keys.get(1))
         {
@@ -446,6 +458,7 @@ impl<'a> PayloadProbe<'a> {
     #[inline]
     pub(crate) fn lookup(&self, row: usize, key: &mut Vec<u8>) -> (bool, Option<&'a [u32]>) {
         match self {
+            Self::Packed { index, batch, keys } => index.lookup(batch, keys, row),
             Self::I64 { index, column } => {
                 let usable = column.usable(row);
                 (
@@ -879,6 +892,7 @@ fn collect_build_payload_impl(
         index,
         i64_index,
         i64_pair_index,
+        packed_index: None,
     })
 }
 
@@ -949,6 +963,7 @@ pub(crate) fn collect_full_build_payload(
         index,
         i64_index,
         i64_pair_index,
+        packed_index: None,
     })
 }
 
@@ -1022,6 +1037,7 @@ pub(crate) fn collect_full_build_payload_i64_pair_only(
         index: BuildIndex::default(),
         i64_index: None,
         i64_pair_index: Some(I64PairBuildIndex::Hash(index)),
+        packed_index: None,
     })
 }
 
@@ -1667,6 +1683,7 @@ pub fn run_inner_hash_join_partitioned(
                         index,
                         i64_index: None,
                         i64_pair_index: None,
+                        packed_index: None,
                     })
                 })
             })
@@ -2687,6 +2704,7 @@ mod tests {
                 index,
                 i64_index: build_i64_index(build.columns(), &[0], &[false], &[collation]),
                 i64_pair_index: None,
+                packed_index: None,
             };
             let probe = Batch::new(
                 Arc::new(BatchSchema::new(fields("p"))),
@@ -2876,6 +2894,7 @@ mod tests {
                         i64_pair_index: typed
                             .then(|| build_i64_pair_index(&columns, &keys, &null_safe, &[]))
                             .flatten(),
+                        packed_index: None,
                     };
                     let lookup = PayloadProbe::new(&payload, &probe, &keys, &null_safe, &[]);
                     for row in 0..probe.num_rows() {
@@ -2953,8 +2972,7 @@ mod tests {
 
     #[test]
     fn streaming_hot_fanout_spills_and_bounds_each_output_batch() {
-        std::fs::create_dir_all("/tmp/mydb/join-fix").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb/join-fix").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let s = schema_kv();
         let n = DEFAULT_BATCH_ROWS * 2 + 3;
         let mut build =

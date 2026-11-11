@@ -235,6 +235,16 @@ pub(super) fn drain_vec_join_build_to_cap_impl(
     ),
     QueryError,
 > {
+    drain_vec_join_build_with_index_bytes(build, cap, work_area, replay_progress_bytes, None)
+}
+
+pub(super) fn drain_vec_join_build_with_index_bytes(
+    build: &mut dyn BatchOperator,
+    cap: vec_hash_join::BuildCap,
+    work_area: Option<&crate::engine::executor::work_area::WorkAreaHandle>,
+    replay_progress_bytes: usize,
+    index_bytes_per_row: Option<u64>,
+) -> Result<(Vec<Batch>, bool, mem_budget::ScopedCharge), QueryError> {
     let mut batches = Vec::new();
     let mut memory_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     // Pipeline borrowing can cover overlapping producers, but it must not
@@ -249,8 +259,11 @@ pub(super) fn drain_vec_join_build_to_cap_impl(
         crate::engine::cancel::check_cancelled()?;
         let batch_rows = batch.visible_rows() as u64;
         rows = rows.saturating_add(batch_rows);
-        let batch_bytes = (batch.memory_bytes() as u64)
-            .saturating_add(vec_hash_join::estimate_build_index_bytes(batch_rows));
+        let batch_bytes =
+            (batch.memory_bytes() as u64).saturating_add(index_bytes_per_row.map_or_else(
+                || vec_hash_join::estimate_build_index_bytes(batch_rows),
+                |bytes| bytes.saturating_mul(batch_rows),
+            ));
         bytes = bytes.saturating_add(batch_bytes);
         let resident_bytes = batch_bytes.min(usize::MAX as u64) as usize;
         let memory_wants_spill = match memory_charge.add(resident_bytes) {

@@ -358,3 +358,69 @@ fn shared_aggregate_preserves_exact_types_nulls_aliases_and_transaction_writes()
         initial
     );
 }
+
+#[test]
+fn scalar_aggregates_share_scan_with_independent_filters_and_nulls() {
+    use crate::engine::executor::select::SHARED_DERIVED_AGGREGATE_HITS;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE scalar_fact (k INT, v DECIMAL(12,2))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO scalar_fact VALUES (1,10),(1,NULL),(2,20),(NULL,30),(3,-2)")
+        .unwrap();
+    for sql in [
+        "SELECT CASE WHEN (SELECT COUNT(*) FROM scalar_fact WHERE k BETWEEN 1 AND 2)>0 THEN (SELECT AVG(v) FROM scalar_fact WHERE k=1) ELSE (SELECT AVG(v) FROM scalar_fact WHERE k=2) END a, (SELECT SUM(v) FROM scalar_fact WHERE k IS NULL) b, (SELECT COUNT(v) FROM scalar_fact WHERE k>9) c, (SELECT MIN(v) FROM scalar_fact WHERE k>9) d",
+        "SELECT (SELECT COUNT(*) FROM scalar_fact WHERE k>9) a,(SELECT SUM(v) FROM scalar_fact WHERE k>9) b,(SELECT AVG(v) FROM scalar_fact WHERE k>9) c",
+        "SELECT (SELECT COUNT(*) FROM scalar_fact) a,(SELECT MAX(v) FROM scalar_fact) b FROM scalar_fact WHERE k=1",
+    ] {
+        let run = |enabled| crate::util::env::with_vars(&[("MYDB_SHARED_SCALAR_AGGREGATE", Some(enabled))], || engine.execute(sql).unwrap().materialize().unwrap());
+        let expected = run("off");
+        let before = SHARED_DERIVED_AGGREGATE_HITS.load(Relaxed);
+        let actual = run("on");
+        assert_eq!(SHARED_DERIVED_AGGREGATE_HITS.load(Relaxed)-before,1,"{sql}");
+        let QueryResponse::ResultSet(expected) = expected else { panic!() };
+        let QueryResponse::ResultSet(actual) = actual else { panic!() };
+        assert_eq!(actual.rows,expected.rows,"{sql}");
+        assert_eq!(actual.columns,expected.columns,"{sql}");
+    }
+    for sql in [
+        "SELECT (SELECT COUNT(*) FROM scalar_fact) a,(SELECT MAX(v) FROM scalar_fact) b FROM scalar_fact WHERE k>999",
+        "SELECT (SELECT COUNT(*) FROM scalar_fact) a,(SELECT MAX(v) FROM scalar_fact) b FROM scalar_fact LIMIT 0",
+    ] {
+        let before = SHARED_DERIVED_AGGREGATE_HITS.load(Relaxed);
+        let actual = engine.execute(sql).unwrap().materialize().unwrap();
+        assert!(rows_of(actual).is_empty());
+        assert_eq!(SHARED_DERIVED_AGGREGATE_HITS.load(Relaxed), before);
+    }
+    engine.execute("DELETE FROM scalar_fact").unwrap();
+    let sql = "SELECT (SELECT COUNT(*) FROM scalar_fact) a,(SELECT AVG(v) FROM scalar_fact) b";
+    let actual = rows_of(engine.execute(sql).unwrap().materialize().unwrap());
+    assert_eq!(actual, vec![vec![Value::Int(0), Value::Null]]);
+}
+
+#[test]
+fn scalar_aggregate_sharing_rejects_correlations_diagnostics_and_index_paths() {
+    use crate::engine::executor::select::SHARED_DERIVED_AGGREGATE_HITS;
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE scalar_guard (k INT PRIMARY KEY, v VARCHAR(20))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO scalar_guard VALUES (1,'12'),(2,'34')")
+        .unwrap();
+    for sql in [
+        "SELECT (SELECT COUNT(*) FROM scalar_guard WHERE k=1),(SELECT COUNT(*) FROM scalar_guard WHERE k=2)",
+        "SELECT (SELECT SUM(v) FROM scalar_guard),(SELECT AVG(v) FROM scalar_guard)",
+        "SELECT (SELECT COUNT(*) FROM scalar_guard s WHERE s.k=o.k),(SELECT COUNT(*) FROM scalar_guard s WHERE s.k>o.k) FROM scalar_guard o",
+        "SELECT (SELECT COUNT(*) FROM scalar_guard LIMIT 0),(SELECT COUNT(*) FROM scalar_guard)",
+    ] {
+        let before=SHARED_DERIVED_AGGREGATE_HITS.load(Relaxed);
+        engine.execute(sql).unwrap().materialize().unwrap();
+        assert_eq!(SHARED_DERIVED_AGGREGATE_HITS.load(Relaxed),before,"{sql}");
+    }
+}

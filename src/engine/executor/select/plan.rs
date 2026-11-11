@@ -3495,6 +3495,18 @@ fn range_index_ids_visible_ordered(
 pub(super) trait PlanStream {
     fn next(&mut self) -> Result<Option<PlanRow>, QueryError>;
 
+    /// Advance a caller-owned scratch row. The caller retains the returned
+    /// metadata unchanged between calls; stable-schema streams may reuse it.
+    fn next_into(&mut self, row: &mut PlanRow) -> Result<bool, QueryError> {
+        match self.next()? {
+            Some(next) => {
+                *row = next;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
     fn install_runtime_filter(&mut self, _filter: RuntimeFilter) -> bool {
         false
     }

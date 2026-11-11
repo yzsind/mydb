@@ -11927,7 +11927,7 @@ fn derived_table_with_group_by() {
 
 #[test]
 fn alter_table_drop_column_removes_primary_key_member() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE t (id INT PRIMARY KEY, v INT)")
@@ -17628,7 +17628,7 @@ fn hash_join_bloom_filter_rejects_misses() {
 
 #[test]
 fn exact_join_domain_prunes_zones_without_losing_sparse_keys_or_null_semantics() {
-    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let root = tempfile::tempdir().unwrap();
     // The 40,000 wide rows exceed the default 512-page memory fixture. Size
     // this query fixture for its input so setup does not wait for eviction
     // of memory-only pages; eviction itself is covered by storage tests.
@@ -17692,6 +17692,56 @@ fn exact_join_domain_prunes_zones_without_losing_sparse_keys_or_null_semantics()
         )[0][0],
         Value::Int(40000)
     );
+    // The indexed probe path must use the same conservative page domains.
+    let db = engine.db_for_tests();
+    let schema = db.table("test.rz_fact").unwrap();
+    let mut table = crate::planner::PlanTable::new(schema.id, schema, None);
+    let txn = crate::storage::TxnView::read_only(
+        db.visible_scn(),
+        crate::storage::IsolationLevel::ReadCommitted,
+    );
+    let mut domain = crate::planner::RuntimeFilter::KeySet {
+        keys: vec![Expr::Identifier("k".into())],
+        null_safe: vec![false],
+        values: std::sync::Arc::new(vec![
+            vec![Value::Int(17)],
+            vec![Value::Null],
+            vec![Value::Int(19)],
+        ]),
+        filter: std::sync::Arc::new(crate::engine::executor::select::bloom::BloomFilter::new(3)),
+    };
+    use crate::engine::executor::select::plan::{
+        prune_runtime_filter_row_ids, runtime_filter_zone_ranges,
+    };
+    let ranges = runtime_filter_zone_ranges(db, txn, &table, &domain).unwrap();
+    let pages = db.heap_page_count_for_storage(table.schema.id).unwrap();
+    assert!(ranges.iter().map(|(lo, hi)| hi - lo).sum::<u64>() < pages);
+    let mut ids = (0..pages)
+        .map(|page| crate::storage::RowId {
+            page_id: page as u32,
+            slot_id: 0,
+        })
+        .collect::<Vec<_>>();
+    prune_runtime_filter_row_ids(db, txn, &table, &[domain.clone()], &mut ids);
+    assert!(!ids.is_empty());
+    assert!(ids.iter().all(|id| ranges
+        .iter()
+        .any(|&(lo, hi)| lo <= u64::from(id.page_id) && u64::from(id.page_id) < hi)));
+    table.zone_map_hint = Some(false);
+    assert!(runtime_filter_zone_ranges(db, txn, &table, &domain).is_none());
+    table.zone_map_hint = None;
+    if let crate::planner::RuntimeFilter::KeySet { null_safe, .. } = &mut domain {
+        null_safe[0] = true;
+    }
+    assert!(runtime_filter_zone_ranges(db, txn, &table, &domain).is_none());
+    if let crate::planner::RuntimeFilter::KeySet {
+        null_safe, values, ..
+    } = &mut domain
+    {
+        null_safe[0] = false;
+        *values = std::sync::Arc::new(vec![vec![Value::UInt(u64::MAX)]]);
+    }
+    assert!(runtime_filter_zone_ranges(db, txn, &table, &domain).is_none());
 }
 
 #[test]
@@ -18276,7 +18326,7 @@ fn default_safe_counter_text_shape_reuses_compiled_dml_and_checks_residual() {
 #[test]
 fn default_dml_protocol_reuse_rechecks_catalog_and_literal_domains() {
     crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = open_test_engine(dir.path());
         engine.execute("CREATE DATABASE other_shapes").unwrap();
         engine
@@ -18330,7 +18380,7 @@ fn default_dml_protocol_reuse_rechecks_catalog_and_literal_domains() {
 #[test]
 fn warmed_text_shapes_keep_syntax_errors_and_delete_residuals() {
     crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = open_test_engine(dir.path());
         engine.execute("CREATE TABLE shape_boundaries (id INT PRIMARY KEY, version INT, amount DECIMAL(10,2))").unwrap();
         engine
@@ -18382,7 +18432,7 @@ fn warmed_text_shapes_keep_syntax_errors_and_delete_residuals() {
 #[test]
 fn signed_numeric_text_updates_and_point_deletes_reuse_proven_shapes() {
     crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = open_test_engine(dir.path());
         engine.execute("CREATE TABLE signed_shapes (tenant INT, id INT, balance DECIMAL(20,2), PRIMARY KEY(tenant,id))").unwrap();
         engine
@@ -18437,7 +18487,7 @@ fn signed_numeric_text_updates_and_point_deletes_reuse_proven_shapes() {
 #[test]
 fn bounded_multirow_text_insert_reuses_parse_and_preserves_atomic_rollback() {
     crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = open_test_engine(dir.path());
         engine
             .execute(
@@ -18477,7 +18527,7 @@ fn bounded_multirow_text_insert_reuses_parse_and_preserves_atomic_rollback() {
 #[test]
 fn default_proven_dml_shapes_are_available_to_protocol_memos() {
     crate::util::env::with_vars(&[("MYDB_AUTO_PARAMETERIZE", Some("select"))], || {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = open_test_engine(dir.path());
         engine
             .execute("CREATE TABLE protocol_shapes (id BIGINT PRIMARY KEY, n BIGINT)")
@@ -21422,7 +21472,6 @@ fn reverse_hash_semi_anti_join_native_integer_keys_preserve_null_semantics() {
 
 #[test]
 fn reverse_hash_semi_anti_generic_keys_match_index_lookup() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
     for (key_type, first, second, other) in [
         (
             "BIGINT UNSIGNED",
@@ -21445,7 +21494,7 @@ fn reverse_hash_semi_anti_generic_keys_match_index_lookup() {
         ("DATE", "'2024-01-01'", "'2024-01-02'", "'2024-01-03'"),
         ("DOUBLE", "1.25", "2.5", "9.75"),
     ] {
-        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir().unwrap();
         let engine = open_test_engine(dir.path());
         engine
             .execute(&format!(
@@ -23095,9 +23144,19 @@ fn native_aggregate_consumes_derived_set_without_spooling_input() {
     engine
         .execute("INSERT INTO fused_input VALUES (1.2345,2),(9.8765,3),(NULL,4),(-2.0000,5)")
         .unwrap();
+    engine
+        .execute("CREATE TABLE fused_renamed (raw_v DECIMAL(18,4), unused INT, raw_n INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO fused_renamed SELECT v,99,n FROM fused_input")
+        .unwrap();
     for source in [
+        "SELECT raw_v AS v,raw_n AS n FROM fused_renamed UNION ALL SELECT v,n FROM fused_input",
+        "SELECT raw_n AS n,raw_v AS v FROM fused_renamed UNION SELECT n,v FROM fused_input",
         "SELECT v,n FROM fused_input UNION ALL SELECT v,n FROM fused_input WHERE n<4",
         "SELECT v,n FROM fused_input UNION SELECT v,n FROM fused_input WHERE n<4",
+        "SELECT v,n FROM fused_input EXCEPT SELECT v,n FROM fused_input WHERE n<4",
+        "SELECT v,n FROM fused_input INTERSECT SELECT v,n FROM fused_input WHERE n<4",
         "SELECT v,n FROM fused_input WHERE n<0 UNION ALL SELECT v,n FROM fused_input WHERE n<0",
     ] {
         let sql = format!("WITH a AS (SELECT AVG(v*n) av,SUM(v) su,COUNT(*) ct,COUNT(v) cn FROM ({source}) x) SELECT a.av,a.su,a.ct,a.cn FROM a JOIN a b ON a.ct=b.ct");
@@ -23117,6 +23176,19 @@ fn native_aggregate_consumes_derived_set_without_spooling_input() {
         let after = crate::engine::executor::cte::streaming_aggregate::HITS
             .load(std::sync::atomic::Ordering::Relaxed);
         assert!(after > before, "streaming aggregate did not run: {source}");
+        let direct_sql =
+            format!("SELECT AVG(v*n) av,SUM(v) su,COUNT(*) ct,COUNT(v) cn FROM ({source}) x");
+        let before_direct = crate::engine::executor::cte::streaming_aggregate::HITS
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let direct = run(VecMode::On, &direct_sql);
+        assert!(
+            crate::engine::executor::cte::streaming_aggregate::HITS
+                .load(std::sync::atomic::Ordering::Relaxed)
+                > before_direct
+        );
+        let direct_oracle = run(VecMode::Off, &format!("{direct_sql} LIMIT 1"));
+        assert_eq!(direct.columns, direct_oracle.columns);
+        assert_eq!(direct.rows, direct_oracle.rows);
         let materialized_sql = sql.replace(" x) SELECT", " x LIMIT 1) SELECT");
         let row = run(VecMode::Off, &materialized_sql);
         assert_eq!(vector.columns, row.columns);
@@ -23127,8 +23199,7 @@ fn native_aggregate_consumes_derived_set_without_spooling_input() {
 #[test]
 fn direct_build_rollup_preserves_raw_average_counts_and_null_groups() {
     use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE rollup_dim(k INT PRIMARY KEY,g VARCHAR(20))")
@@ -23713,7 +23784,7 @@ fn columnar_window_parallel_sort_large_partitions_release_query_charge() {
 
 #[test]
 fn index_order_ignores_fixed_equality_columns_in_order_by() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute(
@@ -23756,7 +23827,7 @@ fn index_order_ignores_fixed_equality_columns_in_order_by() {
 
 #[test]
 fn index_order_keeps_sort_for_numeric_equality_on_character_columns() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE order_coercion (a VARCHAR(20),b INT,PRIMARY KEY(a,b))")
@@ -23777,5 +23848,48 @@ fn index_order_keeps_sort_for_numeric_equality_on_character_columns() {
             vec![Value::Int(50)],
             vec![Value::Int(100)]
         ]
+    );
+}
+
+#[test]
+fn distinct_set_boundary_omits_only_redundant_same_domain_deduplication() {
+    use crate::engine::executor::select::vec_bridge::REDUNDANT_SET_DISTINCT_HITS;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    for table in ["set_left", "set_right"] {
+        engine.execute(&format!("CREATE TABLE {table} (label VARCHAR(20) COLLATE utf8mb4_0900_ai_ci, n DECIMAL(12,2), day DATE)")).unwrap();
+        engine.execute(&format!("INSERT INTO {table} VALUES ('A',1.25,'2000-01-01'),('A',1.25,'2000-01-01'),(NULL,2.50,NULL),(NULL,2.50,NULL),('é',NULL,'2000-01-02'),('é',NULL,'2000-01-02')")).unwrap();
+    }
+    let rows = |sql: &str| {
+        let QueryResponse::ResultSet(result) = engine.execute(sql).unwrap().materialize().unwrap()
+        else {
+            panic!("rows expected")
+        };
+        result.rows
+    };
+    let before = REDUNDANT_SET_DISTINCT_HITS.load(Ordering::Relaxed);
+    for op in ["UNION", "INTERSECT", "EXCEPT"] {
+        let query = format!("SELECT DISTINCT label,n,day FROM set_left {op} SELECT DISTINCT label,n,day FROM set_right ORDER BY 1,2,3");
+        assert_eq!(rows(&query), rows(&query.replace("DISTINCT ", "")), "{op}");
+    }
+    assert!(REDUNDANT_SET_DISTINCT_HITS.load(Ordering::Relaxed) > before);
+    assert_eq!(rows("SELECT DISTINCT label,n,day FROM set_left INTERSECT ALL SELECT DISTINCT label,n,day FROM set_right").len(), 3);
+    assert_eq!(
+        rows("SELECT label,n,day FROM set_left INTERSECT ALL SELECT label,n,day FROM set_right")
+            .len(),
+        6
+    );
+    assert_eq!(rows("(SELECT DISTINCT label FROM set_left ORDER BY label LIMIT 2) UNION SELECT label FROM set_right WHERE 1=0").len(), 2);
+    engine
+        .execute("CREATE TABLE set_binary (label VARCHAR(20) COLLATE utf8mb4_bin)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO set_left VALUES ('a',3.00,NULL)")
+        .unwrap();
+    assert_eq!(
+        rows("SELECT DISTINCT label FROM set_left UNION SELECT label FROM set_binary").len(),
+        3,
+        "a binary outer domain must retain the inner case-insensitive DISTINCT"
     );
 }

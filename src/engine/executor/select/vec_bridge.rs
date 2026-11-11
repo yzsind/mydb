@@ -66,6 +66,7 @@ mod compute;
 use compute::*;
 mod analyzed_workers;
 mod projection_parallel;
+mod rollup_preaggregate;
 
 mod compact_window;
 mod scan_batch;
@@ -469,6 +470,15 @@ fn vec_hash_agg_group_fields_from_values(
 
 /// Bind metadata-only rows without materializing any input or cloning its AST.
 fn plan_output_template(plan: &PhysicalPlan) -> Vec<PlanField> {
+    // Set operations expose each branch's projected relation, including
+    // aliases and the common comparison/output types. The legacy field
+    // collector treats Projection as transparent and would expose the left
+    // branch's pre-projection columns to an adjacent aggregate instead.
+    if matches!(plan, PhysicalPlan::SetOp { .. }) {
+        if let Ok(Some(template)) = preflight_query_output_template(plan) {
+            return template;
+        }
+    }
     let mut metas = Vec::new();
     super::plan::collect_plan_fields(plan, &mut metas);
     metas
@@ -680,6 +690,8 @@ struct ParallelIndexInBatchStream<'a> {
     /// source lets filtered IndexIn scans retain their parallel heap path
     /// instead of falling back to serial `Vec<PlanRow>` materialisation.
     predicate: Option<Arc<super::plan::CompiledRowPredicate>>,
+    runtime_filters: Vec<crate::planner::RuntimeFilter>,
+    runtime_probes: Vec<Option<super::plan::CompiledRuntimeFilterProbe>>,
     execution: ScanWorkers,
 }
 
@@ -731,7 +743,7 @@ impl ParallelIndexInBatchStream<'_> {
         else {
             unreachable!("parallel IndexIn source created for another plan node");
         };
-        let (row_ids, row_ids_charge) = super::plan::execute_index_in_lookup_ids(
+        let (mut row_ids, row_ids_charge) = super::plan::execute_index_in_lookup_ids(
             &self.db,
             self.txn,
             &table.schema,
@@ -741,6 +753,14 @@ impl ParallelIndexInBatchStream<'_> {
             subquery,
             subquery_plan,
         )?;
+
+        super::plan::prune_runtime_filter_row_ids(
+            &self.db,
+            self.txn,
+            table,
+            &self.runtime_filters,
+            &mut row_ids,
+        );
 
         let requested = crate::planner::default_parallel_degree().max(1) as usize;
         let task_count = row_ids.len().div_ceil(DEFAULT_BATCH_ROWS).max(1);
@@ -768,6 +788,7 @@ impl ParallelIndexInBatchStream<'_> {
             let columns = Arc::clone(&self.columns);
             let schema = Arc::clone(&self.schema);
             let predicate = self.predicate.clone();
+            let runtime_probes = self.runtime_probes.clone();
             let row_ids = Arc::clone(&row_ids);
             let row_ids_charge = Arc::clone(&row_ids_charge);
             self.execution
@@ -837,6 +858,14 @@ impl ParallelIndexInBatchStream<'_> {
                                         return Err(error);
                                     }
                                 }
+                                if !runtime_probes.is_empty() {
+                                    rows.retain(|(_, values)| {
+                                        super::plan::runtime_filters_admit_values_indexed(
+                                            &runtime_probes,
+                                            values,
+                                        )
+                                    });
+                                }
                                 if let Some(batch) = projected_values_batch(&schema, rows) {
                                     if !send_parallel_scan_message(&sender, &context, Ok(batch)) {
                                         return Ok(());
@@ -860,6 +889,27 @@ impl ParallelIndexInBatchStream<'_> {
 
 impl BatchOperator for ParallelIndexInBatchStream<'_> {
     batch_wrapper_method!(schema);
+
+    fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
+        let Some(PhysicalPlan::IndexInLookup { table, .. }) = self.pending_plan else {
+            return false;
+        };
+        if super::plan::runtime_filter_schema_indices(&filter, table).is_none() {
+            return false;
+        }
+        // Do not change the source's projected schema after construction.
+        // A filter on a missing column remains with the parent join.
+        let Some(probe) = super::plan::compile_runtime_filter_probe_projected(
+            &filter,
+            &table.schema,
+            &self.columns,
+        ) else {
+            return false;
+        };
+        self.runtime_filters.push(filter);
+        self.runtime_probes.push(Some(probe));
+        true
+    }
 
     fn properties(&self) -> BatchProperties {
         BatchProperties {
@@ -938,6 +988,8 @@ fn try_build_parallel_index_in_batch<'a>(
             schema,
             columns,
             predicate,
+            runtime_filters: Vec::new(),
+            runtime_probes: Vec::new(),
             execution: ScanWorkers::new(
                 super::execution_context::ExecutionContext::capture(txn).fork_worker_cancellation(),
                 "parallel IndexIn heap worker panicked",
@@ -3612,6 +3664,15 @@ fn try_build_query_output_batch<'a>(
     txn: TxnView,
     plan: &'a PhysicalPlan,
 ) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    try_build_query_output_batch_in_set_domain(db, txn, plan, None)
+}
+
+fn try_build_query_output_batch_in_set_domain<'a>(
+    db: &'a Arc<Database>,
+    txn: TxnView,
+    plan: &'a PhysicalPlan,
+    distinct_set_domain: Option<&BatchSchema>,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
     let Some(projection) = final_projection(plan) else {
         return try_native_vec_input_stream(db, txn, plan);
     };
@@ -3620,10 +3681,50 @@ fn try_build_query_output_batch<'a>(
     else {
         return Ok(None);
     };
-    let Some(mut input) = try_native_vec_input_stream(db, txn, plan)? else {
+    let Some(template) = query_projection_template(projection, &planned_template, &lowered) else {
         return Ok(None);
     };
-    let Some(template) = query_projection_template(projection, &planned_template, &lowered) else {
+    // A distinct set operator already deduplicates its projected inputs. A
+    // branch-local DISTINCT can be omitted only at this immediate boundary:
+    // LIMIT, ordering and other intervening consumers retain their semantics.
+    // Require identical comparison/coercion domains and column projections;
+    // expressions keep their original evaluation order and diagnostic count.
+    let redundant = distinct_set_domain.is_some_and(|domain| {
+        template.len() == domain.len()
+            && lowered
+                .iter()
+                .all(|item| matches!(item, VecResultProjection::Column(_)))
+            && template
+                .iter()
+                .zip(domain.fields())
+                .all(|(source, target)| {
+                    let left = &source.source;
+                    let right = &target.source;
+                    source.column_type == target.column_type
+                        && left.collation_id == right.collation_id
+                        && left.flags & 0x20 == right.flags & 0x20
+                        && left.enum_set_values == right.enum_set_values
+                        && left.vector_type == right.vector_type
+                        && !left.dynamic_parameter
+                        && !right.dynamic_parameter
+                })
+    });
+    let input_plan = match plan {
+        PhysicalPlan::Projection {
+            input,
+            distinct: true,
+            ..
+        }
+        | PhysicalPlan::StreamingDistinct { input, .. }
+            if redundant =>
+        {
+            #[cfg(test)]
+            REDUNDANT_SET_DISTINCT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            input.as_ref()
+        }
+        _ => plan,
+    };
+    let Some(mut input) = try_native_vec_input_stream(db, txn, input_plan)? else {
         return Ok(None);
     };
     if let Some(stream) = projection_parallel::try_parallel_projection(
@@ -3656,6 +3757,10 @@ fn try_build_query_output_batch<'a>(
 /// This is a compile-time hit counter used by differential tests to ensure the
 /// intended boundary was crossed rather than silently taking the row path.
 pub(crate) static VEC_PROJECTION_INPUT_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(crate) static REDUNDANT_SET_DISTINCT_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
 struct DistinctBatchOperator<'a> {
@@ -4779,12 +4884,51 @@ pub(super) fn try_native_plan_row_stream<'a>(
 pub(crate) static COLUMNAR_ROLLUP_SORT_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+struct SortedPlanRowStream<'a> {
+    input: vec_sort::ExternalSortBatchOperator<'a>,
+    template: Vec<PlanField>,
+}
+
+impl super::plan::PlanStream for SortedPlanRowStream<'_> {
+    fn next(&mut self) -> Result<Option<PlanRow>, QueryError> {
+        Ok(self.input.next_values()?.map(|values| {
+            analyze_stats::add_pending_conversion_rows(1);
+            values_to_plan_row(values, &self.template)
+        }))
+    }
+
+    fn next_into(&mut self, row: &mut PlanRow) -> Result<bool, QueryError> {
+        let Some(values) = self.input.next_values()? else {
+            return Ok(false);
+        };
+        analyze_stats::add_pending_conversion_rows(1);
+        if row.fields.len() != self.template.len() {
+            *row = values_to_plan_row(values, &self.template);
+        } else {
+            for (field, value) in row.fields.iter_mut().zip(values) {
+                field.value = match (field.column_type, value) {
+                    (ColumnType::Float, Value::Double(value)) => Value::Float(value as f32),
+                    (_, value) => value,
+                };
+            }
+        }
+        Ok(true)
+    }
+}
+
 pub(super) fn try_native_rollup_sorted_stream<'a>(
     db: &'a Arc<Database>,
     txn: TxnView,
     plan: &'a PhysicalPlan,
     group_by: &[Expr],
-) -> Result<Option<Box<dyn super::plan::PlanStream + 'a>>, QueryError> {
+    slots: &[super::aggregate::AggregateSlot],
+) -> Result<
+    Option<(
+        Box<dyn super::plan::PlanStream + 'a>,
+        Vec<super::aggregate::AggregateSlot>,
+    )>,
+    QueryError,
+> {
     let template = plan_output_template(plan);
     let Some(columns) = group_by
         .iter()
@@ -4813,8 +4957,32 @@ pub(super) fn try_native_rollup_sorted_stream<'a>(
         .map(|expr| expr_column_index_in_template(expr, &runtime_template))
         .collect::<Option<Vec<_>>>();
     if runtime_columns.as_ref() != Some(&columns) {
-        return Ok(None);
+        return Err(crate::error::catalog::ER_INTERNAL_ERROR
+            .error("ROLLUP sort schema changed after preflight"));
     }
+    let (
+        VecBatchInput {
+            stream,
+            template: runtime_template,
+        },
+        merge_slots,
+    ) = rollup_preaggregate::reduce(
+        db,
+        VecBatchInput {
+            stream,
+            template: runtime_template,
+        },
+        group_by,
+        slots,
+        crate::planner::estimated_rows(plan),
+    )?;
+    let columns = group_by
+        .iter()
+        .map(|expr| expr_column_index_in_template(expr, &runtime_template))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| {
+            crate::error::catalog::ER_INTERNAL_ERROR.error("ROLLUP partial group metadata changed")
+        })?;
     let schema = stream.schema().clone();
     let fields = columns
         .iter()
@@ -4838,14 +5006,13 @@ pub(super) fn try_native_rollup_sorted_stream<'a>(
     );
     #[cfg(test)]
     COLUMNAR_ROLLUP_SORT_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    Ok(Some(Box::new(BatchPlanRowStream {
-        input: Box::new(sorted),
-        template: runtime_template,
-        current: None,
-        visible: Vec::new(),
-        position: 0,
-        finished: false,
-    })))
+    Ok(Some((
+        Box::new(SortedPlanRowStream {
+            input: sorted,
+            template: runtime_template,
+        }),
+        merge_slots,
+    )))
 }
 
 fn request_inlj_key_locality(

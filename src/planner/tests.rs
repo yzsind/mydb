@@ -2,7 +2,7 @@ use super::*;
 
 #[test]
 fn probe_locality_follows_only_preserved_physical_streams() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE locality_source (id INT PRIMARY KEY, v INT)")
@@ -84,7 +84,7 @@ fn probe_locality_follows_only_preserved_physical_streams() {
 
 #[test]
 fn heap_primary_correlation_uses_analyzed_physical_order() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE unordered_heap (id INT PRIMARY KEY, v INT)")
@@ -114,7 +114,7 @@ fn heap_primary_correlation_uses_analyzed_physical_order() {
 
 #[test]
 fn hash_join_cost_prices_exact_runtime_integer_suffix_probes() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE key_build (id INT PRIMARY KEY)")
@@ -282,7 +282,7 @@ fn hash_join_cost_prices_exact_runtime_integer_suffix_probes() {
 
 #[test]
 fn costing_ordered_limit_prices_residual_survival_with_deferred_composite_keys() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE event_cost (tenant INT, area INT, id INT, owner INT, payload INT, PRIMARY KEY(tenant,area,id), UNIQUE KEY by_owner(tenant,area,owner,id))").unwrap();
     engine
@@ -377,7 +377,7 @@ fn costing_resolves_planning_parameters_without_execution_bindings() {
 #[test]
 fn costing_parameterized_range_matches_literal_prefix_estimate() {
     use crate::storage::ParamTarget;
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute(
@@ -441,7 +441,7 @@ fn costing_parameterized_range_matches_literal_prefix_estimate() {
 
 #[test]
 fn constant_probe_prefix_does_not_turn_rounded_values_into_equalities() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE rounded_outer (id INT PRIMARY KEY)")
@@ -470,7 +470,7 @@ fn constant_probe_prefix_does_not_turn_rounded_values_into_equalities() {
 
 #[test]
 fn dependent_lookup_uses_inner_constant_composite_prefix() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE prefix_outer (id INT PRIMARY KEY)")
@@ -522,7 +522,7 @@ fn dependent_lookup_uses_inner_constant_composite_prefix() {
 
 #[test]
 fn inner_constant_prefix_preserves_comparison_and_outer_join_results() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE constant_outer (id INT PRIMARY KEY)")
@@ -575,7 +575,7 @@ fn inner_constant_prefix_preserves_comparison_and_outer_join_results() {
 
 #[test]
 fn vector_cost_signatures_cover_nested_literals_and_output_aliases() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut first = crate::engine::api::SessionContext::default();
     first.sysvars.mydb_hnsw_ef_search = 16;
@@ -706,8 +706,7 @@ use std::time::Duration;
 
 #[test]
 fn derived_subquery_pushdown_proves_all_producers_and_rejects_hidden_other_correlations() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE binding_dim(k INT,tag VARCHAR(10))")
@@ -999,8 +998,7 @@ fn reverse_semi_anti_cost_keeps_scan_work_and_bounds_retained_state() {
 
 #[test]
 fn reverse_semi_anti_cost_selects_hash_over_broad_noncovering_lookup() {
-    std::fs::create_dir_all("/tmp/mydb").unwrap();
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE existence_probe (id INT PRIMARY KEY, category INT)")
@@ -1263,7 +1261,7 @@ fn cost_frontier_prunes_zone_expansion_for_cheap_nonunique_and_range_indexes() {
 
 #[test]
 fn zone_map_costing_preserves_empty_and_partial_tail_candidates() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE zm_match_floor (id BIGINT, pad VARCHAR(4096), INDEX idx_id(id))")
@@ -2578,7 +2576,7 @@ fn equijoin_row_estimate_does_not_cap_low_ndv_many_to_many() {
 
 #[test]
 fn equijoin_shared_keyset_uses_unindexed_unique_statistics() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute(
@@ -3841,7 +3839,7 @@ fn first_join_tables_containing(plan: &PhysicalPlan, table_name: &str) -> Option
 
 #[test]
 fn in_subquery_lookup_costs_heap_fanout_independently_of_key_count() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     setup_dual_sip_store_sales(&engine, 10, 40);
     let db = engine.db_for_tests();
@@ -3880,16 +3878,33 @@ fn in_subquery_lookup_costs_heap_fanout_independently_of_key_count() {
     );
     assert!(costed.lookup_count <= 16.0);
     assert!(costed.access_rows >= 100_000.0);
+    let tiny_heap = cost_in_subquery_index_access(
+        db,
+        &ctx,
+        &table,
+        &access,
+        &ScanHints::none(),
+        None,
+        4_000_000.0,
+        costed.lookup_count,
+        24.0,
+    );
+    assert_eq!(costed.access_rows, tiny_heap.access_rows);
     assert!(
-        costed.cost.io_rnd_pages > 100_000.0,
-        "few lookup keys must still cost the heap pages their fanout visits: {:?}",
-        costed.cost
+        costed.cost.io_seq_pages + costed.cost.io_rnd_pages
+            > tiny_heap.cost.io_seq_pages + tiny_heap.cost.io_rnd_pages,
+        "ordered RID projection still visits the full heap population"
+    );
+    assert!(costed.cost.total > tiny_heap.cost.total);
+    assert!(
+        costed.cost.mem_bytes > costed.access_rows * 8.0,
+        "costing must expose the retained RID workspace"
     );
 }
 
 #[test]
 fn distinct_set_integer_reduction_preserves_nulls_aliases_and_all_multiplicity() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE set_dim (id INT PRIMARY KEY, a INT, b INT)")
@@ -4721,7 +4736,7 @@ fn grace_unique_lookup_risk_requires_severe_build_overflow() {
 
 #[test]
 fn index_nlj_cost_respects_projected_inner_width() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE projection_outer(id INT PRIMARY KEY)")
@@ -4785,7 +4800,7 @@ fn index_nlj_cost_respects_projected_inner_width() {
 
 #[test]
 fn equijoin_uses_one_sided_ndv_for_expression_keys() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE expr_domain (id INT PRIMARY KEY, label VARCHAR(12))")
@@ -5089,7 +5104,7 @@ fn serial_producer_parallel_reduction_preserves_producer_cost_and_small_plan_pol
 
 #[test]
 fn equivalence_ranges_reach_all_inner_join_keys() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     for table in ["left_keys", "middle_keys", "right_keys"] {
         engine
@@ -5137,7 +5152,7 @@ fn equivalence_ranges_reach_all_inner_join_keys() {
 
 #[test]
 fn equivalence_ranges_keep_comparison_domains_and_outer_join_boundaries() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE domain_a (id INT, tag VARCHAR(10) COLLATE utf8mb4_bin, label ENUM('z','a'), name VARCHAR(10) COLLATE utf8mb4_0900_ai_ci)").unwrap();
     engine.execute("CREATE TABLE domain_b (id INT UNSIGNED, tag VARCHAR(10) COLLATE utf8mb4_0900_ai_ci, label VARCHAR(10), name VARCHAR(10) COLLATE utf8mb4_0900_ai_ci)").unwrap();
@@ -5165,7 +5180,7 @@ fn equivalence_ranges_keep_comparison_domains_and_outer_join_boundaries() {
 
 #[test]
 fn equivalence_ranges_accept_stable_bounds_across_ordered_types() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     for (index, (data_type, bound)) in [
         ("INT", "17"),
@@ -5219,7 +5234,7 @@ fn equivalence_ranges_accept_stable_bounds_across_ordered_types() {
 
 #[test]
 fn equivalence_ranges_do_not_use_a_shadowed_base_table_schema() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE range_shadow(k INT)").unwrap();
     engine.execute("CREATE TABLE range_base(k INT)").unwrap();
@@ -5248,4 +5263,161 @@ fn equivalence_ranges_do_not_use_a_shadowed_base_table_schema() {
             );
         },
     );
+}
+
+#[test]
+fn small_outer_nonunique_lookup_keeps_full_heap_population() {
+    use crate::engine::cbo::operator_cost;
+    let mut ctx = crate::engine::cbo::CboContext::defaults_for_test();
+    ctx.effective_cache_pages = 1024;
+    let pages = 500_000.0;
+    let keys = 6.0;
+    let fanout = 1_000_000.0;
+    let nonunique = operator_cost::index_lookup(
+        &ctx,
+        3.0,
+        fanout,
+        table_pages_for_index_nlj_lookup(false, pages, keys),
+        24.0,
+    );
+    assert!(nonunique.io_rnd_pages > 400_000.0, "{nonunique:?}");
+    let exact = operator_cost::index_lookup(
+        &ctx,
+        3.0,
+        1.0,
+        table_pages_for_index_nlj_lookup(true, pages, keys),
+        24.0,
+    );
+    assert!(exact.io_rnd_pages <= 4.0, "{exact:?}");
+    assert!(nonunique.total > exact.total * 100_000.0);
+}
+
+#[test]
+fn performance_core_detection_includes_multiple_performance_tiers() {
+    let levels = |items: &[(&str, u32)]| {
+        items
+            .iter()
+            .map(|(name, cores)| (name.to_string(), *cores))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(
+        performance_cores_from_levels(&levels(&[
+            ("Super", 2),
+            ("Performance", 4),
+            ("Efficiency", 6)
+        ])),
+        Some(6)
+    );
+    assert_eq!(
+        performance_cores_from_levels(&levels(&[("Performance", 4), ("Efficiency", 4)])),
+        Some(4)
+    );
+    assert_eq!(
+        performance_cores_from_levels(&levels(&[("Performance", 8)])),
+        Some(8)
+    );
+    assert_eq!(
+        performance_cores_from_levels(&levels(&[("Unknown", 4), ("Other", 6)])),
+        Some(4)
+    );
+    assert_eq!(performance_cores_from_levels(&[]), None);
+    assert_eq!(
+        performance_cores_from_levels(&levels(&[("Efficiency", 4)])),
+        None
+    );
+}
+
+#[test]
+fn distinct_existence_reduction_accepts_only_infallible_integer_bounds() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE existence_source (k INT)")
+        .unwrap();
+    let schema = engine.db_for_tests().table("existence_source").unwrap();
+    let scan = |alias: &str, filter: Option<Expr>| PhysicalPlan::SeqScan {
+        table: PlanTable::new(schema.id, schema.clone(), Some(alias.into())),
+        filter,
+        estimated_rows: 100.0,
+        access_rows: 100.0,
+        cost: crate::engine::cbo::Cost::scalar(1.0),
+        possible_keys: vec![],
+        runtime_filters: vec![],
+        hint_note: None,
+        projected_columns: None,
+    };
+    for (predicate, allowed) in [
+        ("b.k BETWEEN 10 AND 10 + 2 * 3", true),
+        ("b.k < 9223372036854775807 + 1", false),
+        ("b.k < 10 / 0", false),
+        ("b.k < RAND()", false),
+        ("b.k < b.k + 1", false),
+    ] {
+        let Statement::Select(select) = parse_statement(&format!(
+            "SELECT * FROM existence_source b WHERE {predicate}"
+        ))
+        .unwrap() else {
+            panic!("SELECT expected")
+        };
+        let mut join = PhysicalPlan::HashJoin {
+            left: Box::new(scan("a", None)),
+            right: Box::new(scan("b", select.selection)),
+            join_type: JoinType::Inner,
+            left_keys: vec![Expr::CompoundIdentifier(vec!["a".into(), "k".into()])],
+            right_keys: vec![Expr::CompoundIdentifier(vec!["b".into(), "k".into()])],
+            null_safe: vec![false],
+            build_side: BuildSide::Left,
+            residual: None,
+            output_projection: None,
+            estimated_rows: 1000.0,
+            cost: crate::engine::cbo::Cost::scalar(10.0),
+        };
+        reduce_distinct_join_to_existence(&mut join, &(schema.id, "a".into()));
+        assert_eq!(
+            matches!(
+                join,
+                PhysicalPlan::HashJoin {
+                    join_type: JoinType::Semi,
+                    build_side: BuildSide::Right,
+                    ..
+                }
+            ),
+            allowed,
+            "{predicate}"
+        );
+    }
+}
+
+#[test]
+fn uncertain_multicolumn_domains_keep_marginal_bounds_and_contradictions() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE domain_prior (a INT, b INT, c INT)")
+        .unwrap();
+    let values = (0..1000)
+        .map(|i| format!("({},{},{})", i % 100, i % 100, i % 100))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO domain_prior VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE domain_prior").unwrap();
+    let table = engine.db_for_tests().table("domain_prior").unwrap();
+    let estimate = |predicate: &str| {
+        let Statement::Select(select) =
+            parse_statement(&format!("SELECT * FROM domain_prior WHERE {predicate}")).unwrap()
+        else {
+            panic!("SELECT expected")
+        };
+        estimate_filter_rows(&table, select.selection.as_ref().unwrap(), 1000.0)
+    };
+    let single = estimate("a IN (1,2,3,4,5)");
+    let two = estimate("a IN (1,2,3,4,5) AND b IN (1,2,3,4,5)");
+    let three = estimate("a IN (1,2,3,4,5) AND b IN (1,2,3,4,5) AND c IN (1,2,3,4,5)");
+    assert!(three > single.powi(3) / 1000.0_f64.powi(2));
+    assert!(three <= two && two <= single);
+    assert_eq!(estimate("a IN (1,2) AND a IN (3,4)"), 0.0);
+    assert_eq!(estimate("a IN (1,2,3,4,5) AND a IN (1,2,3,4,5)"), single);
+    assert!((estimate("a=1 AND b=1") - 0.1).abs() < 0.001);
 }

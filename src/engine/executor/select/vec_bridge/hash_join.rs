@@ -1391,8 +1391,59 @@ impl HashJoinBatchOperator<'_> {
             work_area.is_some(),
         );
         let build_schema = self.build.schema().clone();
-        let (prefix, overflow, build_memory_charge) =
-            drain_vec_join_build_to_cap(self.build.as_mut(), admission_cap, work_area.as_ref())?;
+        let existence_join = matches!(self.join_type, JoinType::Semi | JoinType::Anti);
+        let packed_candidate = (2..=8).contains(&self.build_keys.len())
+            && self.null_safe.iter().all(|value| !*value)
+            && self.key_collations.iter().all(Option::is_none)
+            && self
+                .build_keys
+                .iter()
+                .all(|&column| vec_hash_join::schema_column_uses_i64_lane(&build_schema, column))
+            && self.probe_keys.iter().all(|&column| {
+                vec_hash_join::schema_column_uses_i64_lane(self.probe.schema(), column)
+            })
+            && (existence_join
+                || self.join_type == JoinType::Inner
+                || self.join_type == JoinType::Left && !self.build_is_left
+                || self.join_type == JoinType::Right && self.build_is_left);
+        let (prefix, mut overflow, mut build_memory_charge) =
+            super::grace_join::drain_vec_join_build_with_index_bytes(
+                self.build.as_mut(),
+                admission_cap,
+                work_area.as_ref(),
+                0,
+                packed_candidate.then_some(40),
+            )?;
+        let packed_rows = prefix.iter().map(Batch::visible_rows).sum::<usize>();
+        let packed_layout = (!overflow && packed_candidate && packed_rows >= 1024)
+            .then(|| vec_hash_join::PackedBuildIndex::layout(&prefix, &self.build_keys))
+            .flatten()
+            .filter(|layout| existence_join || !layout.prefers_dense_pair(packed_rows));
+        if !overflow && packed_candidate && packed_layout.is_none() {
+            // A runtime domain wider than 64 bits retains the general index
+            // and its original reservation before allocating that index.
+            let rows = prefix
+                .iter()
+                .map(|batch| batch.visible_rows() as u64)
+                .sum::<u64>();
+            let extra = vec_hash_join::estimate_build_index_bytes(rows)
+                .saturating_sub(rows.saturating_mul(40)) as usize;
+            overflow = build_memory_charge.add(extra).is_err();
+            if !overflow
+                && admission_cap.max_bytes > 0
+                && build_memory_charge.charged() as u64 > admission_cap.max_bytes
+            {
+                overflow = true;
+            }
+            if !overflow {
+                overflow = work_area.as_ref().is_some_and(|handle| {
+                    matches!(
+                        handle.try_charge(extra),
+                        crate::engine::executor::work_area::SpillHint::Spill
+                    )
+                });
+            }
+        }
         let grace_partitions = self
             .build_plan
             .map_or(limits.grace_partitions as usize, |plan| {
@@ -1460,7 +1511,25 @@ impl HashJoinBatchOperator<'_> {
                     vec_hash_join::schema_column_uses_i64_lane(self.probe.schema(), column)
                 });
             let payload = vec_hash_join::with_vec_build_cap(collector_cap, || {
-                if preserve_build
+                if let Some(layout) = packed_layout {
+                    // The retained prefix already owns the payload; account
+                    // for the temporary contiguous copy until it is released.
+                    let bytes = replay_prefix.iter().map(Batch::memory_bytes).sum();
+                    let _copy = crate::engine::executor::mem_budget::force_charge_scoped(bytes)?;
+                    let cap = vec_hash_join::BuildCap {
+                        max_rows: collector_cap.max_rows,
+                        max_bytes: collector_cap
+                            .max_bytes
+                            .min(build_memory_charge.charged() as u64),
+                    };
+                    vec_hash_join::with_vec_build_cap(cap, || {
+                        vec_hash_join::collect_packed_build_payload(
+                            &replay_prefix,
+                            &self.build_keys,
+                            layout,
+                        )
+                    })
+                } else if preserve_build
                     && self.join_type == JoinType::Full
                     && native_i64_pair
                     && self.probe_key_exprs.iter().all(is_simple_column_ref)
@@ -1623,7 +1692,8 @@ impl HashJoinBatchOperator<'_> {
                     JoinType::Inner | JoinType::Left | JoinType::Right
                 )
                 && self.null_safe.iter().all(|value| !*value)
-                && payload.i64_pair_index.is_none())
+                && payload.i64_pair_index.is_none()
+                && payload.packed_index.is_none())
             .then(|| {
                 vec_hash_join::StreamingProbe::new(&payload, &self.probe_keys, &self.key_collations)
             });
@@ -2566,7 +2636,14 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         || null_safe.iter().any(|value| *value)
         || preserved_build
         || input_contains_inlj
-        || matches!(join_type, JoinType::Semi | JoinType::Anti | JoinType::Full);
+        // A probe-preserving outer join must remain unopened until its
+        // ancestors have installed filters on the preserved input. Eager
+        // Grace partitioning here would consume that entire input before a
+        // selective dimension join can reject rows, including on disk.
+        || matches!(
+            join_type,
+            JoinType::Semi | JoinType::Anti | JoinType::Full | JoinType::Left | JoinType::Right
+        );
     let probe_schema = probe_stream.schema().clone();
     let (base_template, base_schema, visible_indices) =
         if matches!(join_type, JoinType::Semi | JoinType::Anti) {

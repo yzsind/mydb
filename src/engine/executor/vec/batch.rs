@@ -1299,6 +1299,37 @@ impl ColumnVector {
         }
     }
 
+    /// Capacity-tight fixed-width payload for a completely buffered build.
+    /// Variable-width lanes keep their ordinary append behavior.
+    pub(crate) fn empty_like_reserved(
+        &self,
+        rows: usize,
+    ) -> Result<Self, crate::types::QueryError> {
+        let mut column = self.empty_like();
+        macro_rules! reserve {
+            ($data:expr) => {
+                $data.try_reserve_exact(rows).map_err(|_| {
+                    crate::engine::executor::mem_budget::allocation_error(
+                        "unable to reserve join payload",
+                    )
+                })?
+            };
+        }
+        match &mut column {
+            Self::I64 { data, .. }
+            | Self::Time64 { data, .. }
+            | Self::DateTime64 { data, .. }
+            | Self::Timestamp64 { data, .. }
+            | Self::Decimal64 { data, .. } => reserve!(data),
+            Self::Date32 { data, .. } | Self::Decimal32 { data, .. } => reserve!(data),
+            Self::U64 { data, .. } => reserve!(data),
+            Self::F64 { data, .. } => reserve!(data),
+            Self::Decimal128 { data, .. } => reserve!(data),
+            _ => {}
+        }
+        Ok(column)
+    }
+
     /// Empty vector in the same lane as `self` (init helper for `append_rows_from`).
     fn empty_like(&self) -> ColumnVector {
         match self {

@@ -1115,6 +1115,17 @@ pub(in crate::engine::executor::select) fn inlj_fanout_chunk_rows(
     if index.unique && lookup.is_full_equality_for(index) {
         return inlj_runtime_chunk_rows(max_rows);
     }
+    inlj_chunk_rows_for_fanout(max_rows, inlj_estimated_fanout(table, index, lookup))
+}
+
+fn inlj_estimated_fanout(
+    table: &PlanTable,
+    index: &IndexSchema,
+    lookup: &IndexLookupPlan,
+) -> usize {
+    if index.unique && lookup.is_full_equality_for(index) {
+        return 1;
+    }
     let prefix = lookup.eq_exprs.len();
     let distinct = table
         .schema
@@ -1139,11 +1150,10 @@ pub(in crate::engine::executor::select) fn inlj_fanout_chunk_rows(
                     .filter(|n| *n > 0)
             })
         });
-    let fanout = distinct
+    distinct
         .map(|ndv| table.schema.stats.row_count.div_ceil(ndv).max(1))
         .unwrap_or(1)
-        .min(usize::MAX as u64) as usize;
-    inlj_chunk_rows_for_fanout(max_rows, fanout)
+        .min(usize::MAX as u64) as usize
 }
 
 pub(in crate::engine::executor::select) fn inlj_chunk_rows_for_fanout(
@@ -2480,6 +2490,17 @@ pub(super) fn try_execute_batched_index_nested_loop_join(
         .unwrap_or(256);
     if right_rows >= min_right_rows_for_small_batch && left_rows.len() >= 8 {
         min_left_rows = min_left_rows.min(8);
+    }
+    // A bounded fan-out morsel can contain fewer than eight outer keys
+    // while fetching thousands of heap rows. Keep those rows on sorted,
+    // parallel MRR instead of falling back to one random heap read per RID.
+    // Honor the existing diagnostic admission override and retain point
+    // lookup behavior for unique/low-fan-out keys.
+    if !right_covering
+        && right_rows >= min_right_rows_for_small_batch
+        && inlj_estimated_fanout(right_table, right_index, plan) >= 128
+    {
+        min_left_rows = 1;
     }
     if left_rows.len() < min_left_rows {
         return Ok(None);
@@ -4068,6 +4089,13 @@ pub(super) fn execute_batched_inlj_noncovering(
     let mut sorted_row_ids = candidate_row_ids;
     sorted_row_ids.sort_unstable();
     sorted_row_ids.dedup();
+    prune_runtime_filter_row_ids(
+        db,
+        txn,
+        right_table,
+        right_runtime_filters,
+        &mut sorted_row_ids,
+    );
     record_inlj_probe_batch(
         lookup_keys.len() as u64,
         entries.len() as u64,

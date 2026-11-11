@@ -74,6 +74,7 @@ pub(crate) use dispatch::{
     SETOP_SPILL_MAX_DEPTH, SETOP_SPILL_MERGE_PASSES, SETOP_SPILL_PARTITIONS,
     SETOP_SPILL_REPARTITIONS,
 };
+mod collation_cache;
 mod dml;
 pub(crate) mod events;
 #[path = "aggregate/mod.rs"]

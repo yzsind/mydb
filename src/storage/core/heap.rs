@@ -2220,9 +2220,10 @@ impl HeapFile {
             }
         };
         let mut forwarding = Vec::new();
-        let pinned = self
-            .buffer_pool
-            .pin_page_with_intent_ref(self.page_key_ref(first.page_id as u64), AccessIntent::Probe)?;
+        let pinned = self.buffer_pool.pin_page_with_intent_ref(
+            self.page_key_ref(first.page_id as u64),
+            AccessIntent::Probe,
+        )?;
         pinned.with_heap_raw_bytes_cached(self.verified_direct_checksums.as_ref(), |page| {
             let Some(page) = page else {
                 return Ok(());
@@ -2445,6 +2446,115 @@ impl HeapFile {
         let missing_plan = RowDecodePlan::compile_with_codec(missing_columns, &self.codec);
         let mut predicate_values = Vec::with_capacity(predicate_columns.len());
         let mut missing_values = Vec::with_capacity(missing_columns.len());
+        let mut consume_page = |rows: &[RowId], page: Option<HeapPageView<'_>>| {
+            let Some(page) = page else {
+                return Ok(());
+            };
+            for &row_id in rows {
+                let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                    continue;
+                };
+                let (header, stored_count) = match decode_heap_payload_columns_into_with_plan(
+                    payload,
+                    &predicate_plan,
+                    &self.codec,
+                    &mut predicate_values,
+                )? {
+                    HeapPayloadOutcome::Row(header, stored_count) => (header, stored_count),
+                    HeapPayloadOutcome::Forward(_) => {
+                        deferred.push(row_id);
+                        continue;
+                    }
+                    HeapPayloadOutcome::Skip => continue,
+                };
+                match predicate(row_id, header, &predicate_values, stored_count)? {
+                    PredicateFirstDecision::Reject => continue,
+                    PredicateFirstDecision::Defer => {
+                        deferred.push(row_id);
+                        continue;
+                    }
+                    PredicateFirstDecision::Accept => {}
+                }
+                let output_stored_count = if missing_columns.is_empty() {
+                    stored_count
+                } else {
+                    match decode_heap_payload_columns_into_with_plan(
+                        payload,
+                        &missing_plan,
+                        &self.codec,
+                        &mut missing_values,
+                    )? {
+                        HeapPayloadOutcome::Row(_, stored_count) => stored_count,
+                        HeapPayloadOutcome::Forward(_) => {
+                            deferred.push(row_id);
+                            continue;
+                        }
+                        HeapPayloadOutcome::Skip => continue,
+                    }
+                };
+                let mut values = Vec::with_capacity(output_columns.len());
+                for source in output_sources {
+                    values.push(match source {
+                        OutputSource::Predicate(index) => predicate_values[*index].clone(),
+                        OutputSource::Missing(index) => missing_values[*index].clone(),
+                    });
+                }
+                out.push((row_id, header, values, output_stored_count));
+            }
+            Ok(())
+        };
+        // Predicate-first probes have the same physical page locality as the
+        // ordinary projected reader. Reuse its bounded direct-read policy
+        // instead of admitting every cold page merely to evaluate a residual.
+        // The dirty-page overlay, validation, forwarding deferral and MVCC
+        // callback remain identical; no predicate is replayed on fallback.
+        if dense_probe_streaming_enabled()
+            && dense_probe_worth_streaming(row_ids, page_count, self.buffer_pool.capacity_pages())
+        {
+            const BATCH_PAGES: usize = 64;
+            if let Some(_charge) =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_optional(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    BATCH_PAGES * PAGE_SIZE,
+                )
+            {
+                let mut bytes = vec![0u8; BATCH_PAGES * PAGE_SIZE];
+                let mut start = 0;
+                while start < row_ids.len() {
+                    crate::engine::cancel::check_cancelled()?;
+                    let first = u64::from(row_ids[start].page_id);
+                    let end = dense_probe_batch_end(row_ids, start);
+                    let count = (u64::from(row_ids[end - 1].page_id) - first + 1) as usize;
+                    self.buffer_pool.read_raw_scan_batch(
+                        &self.file_key,
+                        first,
+                        &mut bytes[..count * PAGE_SIZE],
+                    )?;
+                    let mut position = start;
+                    while position < end {
+                        let page_id = row_ids[position].page_id;
+                        let mut row_end = position + 1;
+                        while row_end < end && row_ids[row_end].page_id == page_id {
+                            row_end += 1;
+                        }
+                        let offset = (u64::from(page_id) - first) as usize * PAGE_SIZE;
+                        let page_bytes = &bytes[offset..offset + PAGE_SIZE];
+                        if self.validate_heap_page_header_for_direct_scan(
+                            u64::from(page_id),
+                            page_bytes,
+                        )? {
+                            consume_page(
+                                &row_ids[position..row_end],
+                                Some(HeapPageView::from_validated(page_bytes)),
+                            )?;
+                        }
+                        position = row_end;
+                    }
+                    start = end;
+                }
+                return Ok(());
+            }
+        }
         // Predicate-first MRR consumes the same sorted RowId stream as the
         // ordinary projected reader.  Keep its cold-page path on the same
         // bounded ordered batch loader: without this window every distinct
@@ -2489,63 +2599,6 @@ impl HeapFile {
                 start = end;
                 continue;
             }
-            let mut consume_page = |page: Option<HeapPageView<'_>>| {
-                let Some(page) = page else {
-                    return Ok(());
-                };
-                for &row_id in &row_ids[start..end] {
-                    let Some(payload) = page.payload(row_id.slot_id as usize)? else {
-                        continue;
-                    };
-                    let (header, stored_count) = match decode_heap_payload_columns_into_with_plan(
-                        payload,
-                        &predicate_plan,
-                        &self.codec,
-                        &mut predicate_values,
-                    )? {
-                        HeapPayloadOutcome::Row(header, stored_count) => (header, stored_count),
-                        HeapPayloadOutcome::Forward(_) => {
-                            deferred.push(row_id);
-                            continue;
-                        }
-                        HeapPayloadOutcome::Skip => continue,
-                    };
-                    match predicate(row_id, header, &predicate_values, stored_count)? {
-                        PredicateFirstDecision::Reject => continue,
-                        PredicateFirstDecision::Defer => {
-                            deferred.push(row_id);
-                            continue;
-                        }
-                        PredicateFirstDecision::Accept => {}
-                    }
-                    let output_stored_count = if missing_columns.is_empty() {
-                        stored_count
-                    } else {
-                        match decode_heap_payload_columns_into_with_plan(
-                            payload,
-                            &missing_plan,
-                            &self.codec,
-                            &mut missing_values,
-                        )? {
-                            HeapPayloadOutcome::Row(_, stored_count) => stored_count,
-                            HeapPayloadOutcome::Forward(_) => {
-                                deferred.push(row_id);
-                                continue;
-                            }
-                            HeapPayloadOutcome::Skip => continue,
-                        }
-                    };
-                    let mut values = Vec::with_capacity(output_columns.len());
-                    for source in output_sources {
-                        values.push(match source {
-                            OutputSource::Predicate(index) => predicate_values[*index].clone(),
-                            OutputSource::Missing(index) => missing_values[*index].clone(),
-                        });
-                    }
-                    out.push((row_id, header, values, output_stored_count));
-                }
-                Ok(())
-            };
             // Consume resident pages from their authoritative image once.
             // Ordered loading is only useful after a cache miss; applying it
             // to every hot probe repeats page lookup/pin/recency work and
@@ -2553,7 +2606,7 @@ impl HeapFile {
             let cached = self.buffer_pool.with_cached_heap_view_ref(
                 self.page_key_ref(first.page_id as u64),
                 self.verified_direct_checksums.as_ref(),
-                &mut consume_page,
+                |page| consume_page(&row_ids[start..end], page),
             )?;
             if cached.is_none() {
                 if page_group >= loaded_through {
@@ -2572,7 +2625,7 @@ impl HeapFile {
                 )?;
                 pinned.with_heap_raw_bytes_cached(
                     self.verified_direct_checksums.as_ref(),
-                    consume_page,
+                    |page| consume_page(&row_ids[start..end], page),
                 )?;
             }
             start = end;
@@ -3992,11 +4045,11 @@ impl HeapFile {
         let page_count = self.page_count()?;
         let mut forwarding = Vec::new();
         let mut charge = crate::engine::executor::mem_budget::ScopedCharge::for_budget(None);
-        let mut horizon=0;
-        let scan_end=page_hi.min(page_count);
+        let mut horizon = 0;
+        let scan_end = page_hi.min(page_count);
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
-            if page_hi.saturating_sub(page_lo)>1 {
-                self.prefetch_after(page_id,scan_end,&mut horizon);
+            if page_hi.saturating_sub(page_lo) > 1 {
+                self.prefetch_after(page_id, scan_end, &mut horizon);
             }
             crate::engine::cancel::check_cancelled()?;
             self.with_scan_page(page_id, page_count, policy, |page| {
@@ -4013,10 +4066,14 @@ impl HeapFile {
                         HeapPayloadHeader::Forward => {
                             if forwarding.len() == forwarding.capacity() {
                                 if forwarding.capacity() == 0 {
-                                    charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+                                    charge =
+                                        crate::engine::executor::mem_budget::ScopedCharge::new(0);
                                 }
                                 crate::engine::executor::mem_budget::try_reserve_vec_hard(
-                                    &mut forwarding, 32, &mut charge, "root scan forwarding",
+                                    &mut forwarding,
+                                    32,
+                                    &mut charge,
+                                    "root scan forwarding",
                                 )?;
                             }
                             forwarding.push(row_id);
@@ -4506,10 +4563,9 @@ impl HeapFile {
                 if coherent {
                     // Online scans need a latched image even for a cold page:
                     // a concurrent flusher can otherwise race a direct pread.
-                    let pinned = self.buffer_pool.pin_page_with_intent_ref(
-                        self.page_key_ref(page_id),
-                        AccessIntent::Scan,
-                    )?;
+                    let pinned = self
+                        .buffer_pool
+                        .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
                     self.buffer_pool
                         .with_finalized_frame_bytes(&pinned.frame, |bytes| {
                             assert_eq!(bytes.len(), PAGE_SIZE);
@@ -5883,8 +5939,9 @@ fn dense_probe_streaming_enabled() -> bool {
 }
 
 /// Partition by physical locality, not the span of the whole batch: parallel
-/// producers can interleave distant but individually dense page ranges. One
-/// unrequested page per gap is allowed, bounding read amplification by two.
+/// producers can interleave distant but individually dense page ranges.
+/// Coalesce adjacent pages into bounded 1 MiB reads. At most one unused page
+/// may separate requested pages; sparse probes retain demand-read behavior.
 fn dense_probe_batch_end(row_ids: &[RowId], start: usize) -> usize {
     let first = u64::from(row_ids[start].page_id);
     let mut end = start + 1;
@@ -5916,7 +5973,8 @@ fn dense_probe_worth_streaming(row_ids: &[RowId], heap_pages: u64, pool_pages: u
     let mut batches = 0u64;
     let mut start = 0;
     while start < row_ids.len() {
-        start = dense_probe_batch_end(row_ids, start);
+        let end = dense_probe_batch_end(row_ids, start);
+        start = end;
         batches += 1;
     }
     // Demand probes keep their caching behavior unless coalescing saves at

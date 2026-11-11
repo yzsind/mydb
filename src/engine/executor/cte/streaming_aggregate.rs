@@ -37,6 +37,8 @@ fn prepared_source<'q>(statement: impl Into<crate::parser::QueryRef<'q>>) -> boo
     match statement {
         crate::parser::QueryRef::Select(select) => {
             select.derived.is_none()
+                && select.rls_security_context.is_none()
+                && select.rls_expression_settings.is_none()
                 && select.joins.iter().all(|join| join.derived.is_none())
                 && !select.for_update
                 && !select.sql_calc_found_rows
@@ -59,10 +61,28 @@ pub(super) fn try_materialize<'q>(
     let crate::parser::QueryRef::Select(select) = statement else {
         return Ok(None);
     };
+    let txn = cte_statement_view(db, session);
+    with_cte_materialization(|| try_execute(db, txn, select))?
+        .map(|response| route_response_to_cte_result(db, response, cte))
+        .transpose()
+}
+
+/// A scalar aggregate can consume a derived set expression directly in both
+/// CTE materialization and ordinary SELECT execution. Capability is checked
+/// before opening either branch; the same accumulator retains AVG semantics.
+pub(crate) fn try_execute(
+    db: &Arc<Database>,
+    txn: crate::storage::TxnView,
+    select: &Select,
+) -> Result<Option<QueryResponse>, QueryError> {
     let Some(crate::parser::SubQuery::SetOp(source)) = &select.derived else {
         return Ok(None);
     };
     if select.from.len() != 1
+        || select
+            .from
+            .iter()
+            .any(|table| !table.column_aliases.is_empty())
         || !select.joins.is_empty()
         || select.selection.is_some()
         || !select.group_by.is_empty()
@@ -120,10 +140,9 @@ pub(super) fn try_materialize<'q>(
     if !super::super::select::vec_bridge::preflight_query_output_supported(&plan)? {
         return Ok(None);
     }
-    let txn = cte_statement_view(db, session);
     let budget = super::super::mem_budget::current_budget()
         .unwrap_or_else(|| Arc::new(super::super::mem_budget::MemBudget::from_env()));
-    let stream = with_cte_materialization(|| {
+    let stream = {
         let context =
             super::super::select::execution_context::ExecutionContext::capture_with_budget(
                 txn, budget,
@@ -134,11 +153,11 @@ pub(super) fn try_materialize<'q>(
             Arc::new(plan),
             context,
         )
-    })?;
+    }?;
     let Some(stream) = stream else {
         return Ok(None);
     };
     #[cfg(test)]
     HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    route_response_to_cte_result(db, QueryResponse::StreamingResultSet(stream), cte).map(Some)
+    Ok(Some(QueryResponse::StreamingResultSet(stream)))
 }

@@ -1061,3 +1061,74 @@ fn cte_spill_with_multi_column_string_values_round_trips() {
     assert!(matches!(&in_mem[1][2], Value::Null));
     assert!(matches!(&in_mem[2][1], Value::Null));
 }
+
+#[test]
+fn fd_group_key_pruning_resolves_qualified_base_table_names() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE DATABASE fd_catalog",
+        "CREATE TABLE fd_catalog.dim (k INT PRIMARY KEY, label VARCHAR(30))",
+        "CREATE TABLE fd_catalog.fact (dim_k INT, stamp INT)",
+        "CREATE TABLE dim (k INT, label VARCHAR(30))",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let crate::parser::Statement::WithCte(w) = crate::parser::parse_statement(
+        "WITH grouped AS (SELECT SUBSTR(d.label,1,8) title,d.k key_id,f.stamp stamp,COUNT(*) n \
+         FROM fd_catalog.dim d,fd_catalog.fact f WHERE d.k=f.dim_k \
+         GROUP BY SUBSTR(d.label,1,8),d.k,f.stamp HAVING COUNT(*)>1) \
+         SELECT key_id FROM grouped UNION ALL SELECT key_id FROM grouped",
+    )
+    .unwrap() else {
+        panic!("WITH expected")
+    };
+    let mut ctes = w.ctes;
+    let mut body = *w.body;
+    crate::engine::executor::cte::apply_pre_materialization_rewrites(
+        engine.database(),
+        "test",
+        &mut ctes,
+        &mut body,
+        false,
+    );
+    let crate::parser::QueryExpr::Select(select) = &ctes[0].query else {
+        panic!("SELECT expected")
+    };
+    assert_eq!(select.projection.len(), 1);
+    assert_eq!(
+        select.group_by.len(),
+        2,
+        "qualified catalog identity must preserve the unique-key proof: {:?}",
+        select.group_by
+    );
+    let crate::parser::Statement::WithCte(w) = crate::parser::parse_statement(
+        "WITH grouped AS (SELECT d.k key_id,COUNT(*) n \
+         FROM fd_catalog.dim d GROUP BY RAND()+d.k,d.k) \
+         SELECT key_id FROM grouped UNION ALL SELECT key_id FROM grouped",
+    )
+    .unwrap() else {
+        panic!("WITH expected")
+    };
+    let mut ctes = w.ctes;
+    crate::engine::executor::cte::minimize_fd_group_by_keys(engine.database(), "test", &mut ctes);
+    let crate::parser::QueryExpr::Select(select) = &ctes[0].query else {
+        panic!("SELECT expected")
+    };
+    assert_eq!(select.group_by.len(), 2);
+
+    let crate::parser::Statement::WithCte(w) = crate::parser::parse_statement(
+        "WITH grouped AS (SELECT fd_catalog.dim.k key_id,COUNT(*) n \
+         FROM fd_catalog.dim GROUP BY SUBSTR(fd_catalog.dim.label,1,8),fd_catalog.dim.k) \
+         SELECT key_id FROM grouped UNION ALL SELECT key_id FROM grouped",
+    )
+    .unwrap() else {
+        panic!("WITH expected")
+    };
+    let mut ctes = w.ctes;
+    crate::engine::executor::cte::minimize_fd_group_by_keys(engine.database(), "test", &mut ctes);
+    let crate::parser::QueryExpr::Select(select) = &ctes[0].query else {
+        panic!("SELECT expected")
+    };
+    assert_eq!(select.group_by.len(), 1);
+}

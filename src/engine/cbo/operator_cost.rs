@@ -463,9 +463,36 @@ pub struct BatchedIndexLookupEstimate {
     pub probe_batches: f64,
 }
 
+impl BatchedIndexLookupEstimate {
+    /// Actual chunk-local page work, capped at one complete heap sweep for
+    /// the planner's broad-access penalty. Global distinct coverage already
+    /// includes every key: multiplying it by the chunk count would charge a
+    /// partial tail batch as if it repeated the complete key set.
+    pub fn heap_sweep_coverage(&self, table_pages: f64) -> f64 {
+        (self.logical_heap_page_visits / table_pages.max(1.0)).clamp(0.0, 1.0)
+    }
+}
+
 pub fn estimate_batched_index_lookup(
     ctx: &CboContext,
     input: BatchedIndexLookupInput,
+) -> BatchedIndexLookupEstimate {
+    estimate_index_lookup_batches(ctx, input, true)
+}
+
+/// IN-keyset access collects and sorts RIDs before heap projection. Unlike
+/// streamed INLJ, its heap pass is not restarted for every outer-key morsel.
+pub(crate) fn estimate_index_keyset_lookup(
+    ctx: &CboContext,
+    input: BatchedIndexLookupInput,
+) -> BatchedIndexLookupEstimate {
+    estimate_index_lookup_batches(ctx, input, false)
+}
+
+fn estimate_index_lookup_batches(
+    ctx: &CboContext,
+    input: BatchedIndexLookupInput,
+    fanout_bounded: bool,
 ) -> BatchedIndexLookupEstimate {
     let BatchedIndexLookupInput {
         index_height,
@@ -512,9 +539,19 @@ pub fn estimate_batched_index_lookup(
     // a page evicted (or merely revisited) between chunks pays the lookup
     // and buffer work again. The global page population below remains useful
     // for diagnostics, but cannot cap repeated chunk-local sweeps.
-    let chunk_keys = crate::engine::cbo::PLANNING_INLJ_CHUNK_ROWS as f64;
-    let probe_batches = (keys / chunk_keys).ceil().max(1.0);
     let matches_per_key = if keys > 0.0 { m / keys } else { 0.0 };
+    // The streamed executor bounds fanout by matching rows as well as
+    // outer keys (inlj_chunk_rows_for_fanout). A few hundred nonunique
+    // keys can therefore cause many independent MRR heap sweeps. Use the
+    // stable planning memory baseline, never the live query grant.
+    let match_capacity = (ctx.planning_mem_budget_bytes as f64 / 4096.0).max(1.0);
+    let chunk_keys = if fanout_bounded {
+        (crate::engine::cbo::PLANNING_INLJ_CHUNK_ROWS as f64)
+            .min((match_capacity / matches_per_key.max(1.0)).floor().max(1.0))
+    } else {
+        keys.max(1.0)
+    };
+    let probe_batches = (keys / chunk_keys).ceil().max(1.0);
     let full_batches = (keys / chunk_keys).floor();
     let tail_keys = keys - full_batches * chunk_keys;
     let locality = probe_key_locality.clamp(0.0, 1.0);
@@ -2200,6 +2237,90 @@ mod tests {
         );
         assert!((prefix.logical_index_leaf_visits - input.leaf_pages).abs() < 1.0);
         assert!(prefix.cost.total < sparse.cost.total);
+    }
+
+    #[test]
+    fn batched_fanout_costs_repeated_memory_bounded_heap_sweeps() {
+        let input = BatchedIndexLookupInput {
+            index_height: 3.0,
+            index_leaf_pages: 50_000.0,
+            probe_key_locality: 0.0,
+            leaf_pages: 5_000.0,
+            matched_rows: 1_000_000.0,
+            probe_keys: 500.0,
+            table_pages: 400_000.0,
+            output_width: 200.0,
+            correlation: 0.0,
+            competing_pages: 0.0,
+        };
+        let bounded = estimate_batched_index_lookup(&ctx(), input);
+        let mut generous = ctx();
+        generous.planning_mem_budget_bytes = 8 * 1024 * 1024 * 1024;
+        let one_batch = estimate_batched_index_lookup(&generous, input);
+        let keyset = estimate_index_keyset_lookup(&ctx(), input);
+        assert_eq!(keyset.probe_batches, 1.0);
+        assert_eq!(
+            keyset.logical_heap_page_visits,
+            one_batch.logical_heap_page_visits
+        );
+        assert_eq!(keyset.cost.total, one_batch.cost.total);
+        assert!(bounded.probe_batches > 1.0);
+        assert_eq!(one_batch.probe_batches, 1.0);
+        assert_eq!(bounded.distinct_heap_pages, one_batch.distinct_heap_pages);
+        assert!(bounded.logical_heap_page_visits > one_batch.logical_heap_page_visits * 2.0);
+        assert!(bounded.cost.total > one_batch.cost.total);
+        let point = BatchedIndexLookupInput {
+            matched_rows: 500.0,
+            ..input
+        };
+        assert_eq!(
+            estimate_batched_index_lookup(&ctx(), point).probe_batches,
+            1.0
+        );
+    }
+
+    #[test]
+    fn sparse_fanout_tail_does_not_repeat_the_global_heap_domain() {
+        let mut context = ctx();
+        context.planning_mem_budget_bytes = 256 * 1024 * 1024;
+        let per_key = 200.0;
+        let chunk = (context.planning_mem_budget_bytes as f64 / 4096.0 / per_key).floor();
+        let input = BatchedIndexLookupInput {
+            index_height: 3.0,
+            index_leaf_pages: 50_000.0,
+            probe_key_locality: 0.0,
+            leaf_pages: 400.0,
+            matched_rows: chunk * per_key,
+            probe_keys: chunk,
+            table_pages: 500_000.0,
+            output_width: 240.0,
+            correlation: 0.0,
+            competing_pages: 0.0,
+        };
+        let full = estimate_batched_index_lookup(&context, input);
+        let tail = estimate_batched_index_lookup(
+            &context,
+            BatchedIndexLookupInput {
+                matched_rows: (chunk + 1.0) * per_key,
+                probe_keys: chunk + 1.0,
+                ..input
+            },
+        );
+        assert_eq!(full.probe_batches, 1.0);
+        assert_eq!(tail.probe_batches, 2.0);
+        let coverage = tail.heap_sweep_coverage(input.table_pages);
+        assert!(coverage < 0.2);
+        assert!(coverage >= full.heap_sweep_coverage(input.table_pages));
+        assert!(coverage < full.heap_sweep_coverage(input.table_pages) * 1.01);
+        let repeated = estimate_batched_index_lookup(
+            &context,
+            BatchedIndexLookupInput {
+                matched_rows: chunk * per_key * 20.0,
+                probe_keys: chunk * 20.0,
+                ..input
+            },
+        );
+        assert_eq!(repeated.heap_sweep_coverage(input.table_pages), 1.0);
     }
 
     #[test]

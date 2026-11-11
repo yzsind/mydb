@@ -961,6 +961,31 @@ fn integer_in_const_set_truth_mask(
     if len != batch.num_rows() {
         return None;
     }
+    // Tiny exact sets are cheaper to compare directly than to hash a tagged
+    // i128 for every row. Dense domains fit in one bitset; sparse and extreme
+    // signed/unsigned values retain exact equality in a bounded stack array.
+    let mut small = [0i128; 16];
+    let small_len = (keys.len() <= small.len())
+        .then(|| {
+            for (slot, key) in small.iter_mut().zip(keys) {
+                let ValueKey::Int(value) = key else {
+                    return None;
+                };
+                *slot = *value;
+            }
+            Some(keys.len())
+        })
+        .flatten();
+    let dense = small_len.and_then(|len| {
+        let minimum = *small[..len].iter().min()?;
+        let maximum = *small[..len].iter().max()?;
+        (maximum.checked_sub(minimum)? < 128).then(|| {
+            let bits = small[..len]
+                .iter()
+                .fold(0u128, |bits, value| bits | (1u128 << (value - minimum)));
+            (minimum, bits)
+        })
+    });
     let mut truth = Bitmap::new_all_invalid(len);
     let mut null = Bitmap::new_all_invalid(len);
     for row in batch.visible_indices() {
@@ -968,7 +993,16 @@ fn integer_in_const_set_truth_mask(
             null.set_true(row);
             continue;
         }
-        let found = keys.contains(&ValueKey::Int(value_at(row)));
+        let value = value_at(row);
+        let found = if let Some((minimum, bits)) = dense {
+            value
+                .checked_sub(minimum)
+                .is_some_and(|offset| (0..128).contains(&offset) && bits & (1u128 << offset) != 0)
+        } else if let Some(len) = small_len {
+            small[..len].contains(&value)
+        } else {
+            keys.contains(&ValueKey::Int(value))
+        };
         if found {
             if !negated {
                 truth.set_true(row);
@@ -5231,6 +5265,77 @@ mod tests {
             crate::engine::executor::vec::config::VecMode::Off
         ) {
             assert_eq!(program.expression_rows(), (4, 0));
+        }
+    }
+
+    #[test]
+    fn tiny_integer_membership_preserves_extremes_nulls_and_negation() {
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "k".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }]));
+        for values in [
+            vec![
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(127),
+                Value::Int(i64::MAX),
+                Value::Null,
+            ],
+            vec![
+                Value::UInt(0),
+                Value::UInt(1),
+                Value::UInt(127),
+                Value::UInt(u64::MAX - 1),
+                Value::UInt(u64::MAX),
+                Value::Null,
+            ],
+        ] {
+            let batch = Batch::new(schema.clone(), vec![ColumnVector::from_values(values)])
+                .with_selection(Selection::Indices(vec![0, 1, 2, 4, 5]));
+            for keys in [
+                vec![Value::Int(-1), Value::UInt(0), Value::Int(126)],
+                vec![Value::Int(i64::MIN), Value::UInt(u64::MAX)],
+                (0..17).map(Value::Int).collect(),
+            ] {
+                for has_null in [false, true] {
+                    for negated in [false, true] {
+                        let mut list = keys
+                            .iter()
+                            .cloned()
+                            .map(Expr::BoundValue)
+                            .collect::<Vec<_>>();
+                        while list.len() < 4 {
+                            list.push(list[0].clone());
+                        }
+                        if has_null {
+                            list.push(Expr::BoundValue(Value::Null));
+                        }
+                        let expr = Expr::InList {
+                            expr: Box::new(Expr::Identifier("k".into())),
+                            list,
+                            negated,
+                        };
+                        let program =
+                            ExprCompiler::compile(&expr, &batch_schema_to_input(&schema)).unwrap();
+                        let native =
+                            try_column_integer_in_const_set_truth_mask(&program, &batch).unwrap();
+                        let oracle = eval_value_per_row(&program, &batch).unwrap();
+                        for row in batch.visible_indices() {
+                            assert_eq!(native.null.get(row), matches!(oracle[row], Value::Null));
+                            assert_eq!(
+                                native.truth.get(row),
+                                crate::engine::expr::truthy(&oracle[row])
+                            );
+                        }
+                        assert!(!native.truth.get(3) && !native.null.get(3));
+                    }
+                }
+            }
         }
     }
 

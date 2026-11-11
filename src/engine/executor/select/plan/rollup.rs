@@ -97,10 +97,10 @@ pub(in crate::engine::executor::select) fn execute_hash_rollup_aggregate(
     )? {
         return rollup_emit_from_vec_finest(finest, group_by, &slots, having);
     }
-    if let Some(stream) =
-        super::vec_bridge::try_native_rollup_sorted_stream(db, txn, input, group_by)?
+    if let Some((stream, merge_slots)) =
+        super::vec_bridge::try_native_rollup_sorted_stream(db, txn, input, group_by, &slots)?
     {
-        return aggregate_rollup_plan_stream_sorted(stream, group_by, having, &slots);
+        return aggregate_rollup_plan_stream_sorted(stream, group_by, having, &merge_slots);
     }
     let (input_rows, _input_charge) = match prepare_rollup_input(db, txn, input)? {
         PreparedRollupInput::Rows(rows, charge) => (rows, charge),
@@ -1651,13 +1651,87 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_spilled_
     aggregate_rollup_plan_stream_sorted(stream, group_by, having, slots)
 }
 
+// Ordered input repeats the same raw prefix many times. Byte-identical values
+// necessarily have identical canonical group keys, so collation/numeric key
+// encoding is only needed when the representation actually changes.
+fn rollup_group_value_eq(left: &Value, right: &Value, collation: Option<u16>) -> bool {
+    left.storage_eq(right)
+        || crate::engine::expr::ValueKey::from_with_collation(left, collation)
+            == crate::engine::expr::ValueKey::from_with_collation(right, collation)
+}
+
+// Exact SUM/AVG and ordinary COUNT can derive a prefix from its completed
+// children. Approximate and order-sensitive aggregates must keep their original
+// per-row update order. Prove the domain from the whole expression, never from
+// the first value (which may be NULL or one branch of a conditional).
+pub(in crate::engine::executor::select) fn ordered_rollup_can_cascade(
+    slots: &[super::aggregate::AggregateSlot],
+    row: &PlanRow,
+) -> bool {
+    fn exact(expr: &Expr, row: &PlanRow) -> bool {
+        match expr {
+            Expr::Literal(
+                crate::parser::Literal::Int(_)
+                | crate::parser::Literal::UInt(_)
+                | crate::parser::Literal::Null,
+            ) => true,
+            Expr::Identifier(_) | Expr::CompoundIdentifier(_) => matches!(
+                super::eval::plan_expr_result_type(expr, row),
+                Ok(ColumnType::Tiny
+                    | ColumnType::Short
+                    | ColumnType::MediumInt
+                    | ColumnType::Long
+                    | ColumnType::LongLong
+                    | ColumnType::Decimal { .. })
+            ),
+            Expr::Binary { left, op, right } => {
+                matches!(
+                    op,
+                    crate::parser::BinaryOp::Add
+                        | crate::parser::BinaryOp::Sub
+                        | crate::parser::BinaryOp::Mul
+                ) && exact(left, row)
+                    && exact(right, row)
+            }
+            Expr::Function {
+                name,
+                args,
+                distinct: false,
+            } if name.eq_ignore_ascii_case("COALESCE") || name.eq_ignore_ascii_case("IFNULL") => {
+                !args.is_empty() && args.iter().all(|expr| exact(expr, row))
+            }
+            _ => false,
+        }
+    }
+    slots.iter().all(|slot| {
+        !slot.distinct
+            && !slot.has_order_by()
+            && (slot.name.eq_ignore_ascii_case("COUNT")
+                || ((slot.name.eq_ignore_ascii_case("SUM")
+                    || slot.name.eq_ignore_ascii_case("AVG"))
+                    && slot.args.first().is_some_and(|expr| exact(expr, row))))
+    })
+}
+
+fn cascade_ordered_rollup_state(
+    states: &mut [Option<RollupGroupState>],
+    level: usize,
+    source: &RollupGroupState,
+) {
+    if level > 0 {
+        let parent = states[level - 1].as_mut().expect("live ROLLUP parent");
+        for (target, source) in parent.accumulators.iter_mut().zip(&source.accumulators) {
+            target.merge_from(source.clone_box().into_any());
+        }
+    }
+}
+
 pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
     mut stream: Box<dyn PlanStream + '_>,
     group_by: &[Expr],
     having: Option<&Expr>,
     slots: &[super::aggregate::AggregateSlot],
 ) -> Result<Vec<PlanRow>, QueryError> {
-    use crate::engine::expr::ValueKey;
     let group_by_len = group_by.len();
     let needs_sample_fields = aggregate_slots_need_sample_fields(slots);
     let mut out = RollupEmitTarget::new(group_by, group_by_len, slots);
@@ -1666,10 +1740,13 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
     // closes until end-of-input; level k closes when the k-prefix changes.
     let mut level_states: Vec<Option<RollupGroupState>> =
         (0..=group_by_len).map(|_| None).collect();
-    let mut prev_full: Option<Vec<ValueKey>> = None;
+    let mut prev_full: Option<Vec<Value>> = None;
     let mut prepared = None;
-    while let Some(row) = stream.next()? {
+    let mut cascade = None;
+    let mut row = PlanRow::default();
+    while stream.next_into(&mut row)? {
         crate::engine::cancel::check_cancelled()?;
+        let cascade = *cascade.get_or_insert_with(|| ordered_rollup_can_cascade(slots, &row));
         let (group_exprs, slot_exprs, collations) = prepared.get_or_insert_with(|| {
             let schema = super::eval::input_schema_for_plan_row(&row);
             let groups: Vec<_> = group_by
@@ -1696,13 +1773,13 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
         });
         let full_values = group_exprs
             .iter()
-            .map(|expr| expr.eval(&row))
+            .map(|expr| {
+                expr.try_borrow_field(&row).map_or_else(
+                    || expr.eval(&row).map(std::borrow::Cow::Owned),
+                    |value| Ok(std::borrow::Cow::Borrowed(value)),
+                )
+            })
             .collect::<Result<Vec<_>, _>>()?;
-        let full_keys: Vec<ValueKey> = full_values
-            .iter()
-            .zip(collations.iter())
-            .map(|(v, collation)| ValueKey::from_with_collation(v, *collation))
-            .collect();
         let slot_inputs = slots
             .iter()
             .zip(slot_exprs.iter())
@@ -1720,7 +1797,9 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
         let lcp = match &prev_full {
             Some(prev) => {
                 let mut n = 0;
-                while n < group_by_len && prev[n] == full_keys[n] {
+                while n < group_by_len
+                    && rollup_group_value_eq(&prev[n], &full_values[n], collations[n])
+                {
                     n += 1;
                 }
                 n
@@ -1730,6 +1809,9 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
         if prev_full.is_some() {
             for level in (lcp + 1..=group_by_len).rev() {
                 if let Some(state) = level_states[level].take() {
+                    if cascade {
+                        cascade_ordered_rollup_state(&mut level_states, level, &state);
+                    }
                     emit_rollup_group_state_to_target(
                         &mut out,
                         slots,
@@ -1744,7 +1826,10 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
             if level_states[level].is_none() {
                 level_states[level] = Some(RollupGroupState {
                     prefix_len: level,
-                    key_values: full_values[..level].to_vec(),
+                    key_values: full_values[..level]
+                        .iter()
+                        .map(|value| value.as_ref().clone())
+                        .collect(),
                     sample_fields: if needs_sample_fields {
                         row.fields.clone()
                     } else {
@@ -1753,19 +1838,35 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
                     accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
                 });
             }
-            update_rollup_accumulators_ordered(
-                level_states[level]
-                    .as_mut()
-                    .expect("level state just ensured"),
-                slots,
-                &slot_inputs,
-                &row,
-            )?;
+            if !cascade || level == group_by_len {
+                update_rollup_accumulators_ordered(
+                    level_states[level]
+                        .as_mut()
+                        .expect("level state just ensured"),
+                    slots,
+                    &slot_inputs,
+                    &row,
+                )?;
+            }
         }
-        prev_full = Some(full_keys);
+        if let Some(previous) = prev_full.as_mut() {
+            for (old, new) in previous[lcp..].iter_mut().zip(&full_values[lcp..]) {
+                old.clone_from(new.as_ref());
+            }
+        } else {
+            prev_full = Some(
+                full_values
+                    .iter()
+                    .map(|value| value.as_ref().clone())
+                    .collect(),
+            );
+        }
     }
     for level in (0..=group_by_len).rev() {
         if let Some(state) = level_states[level].take() {
+            if cascade == Some(true) {
+                cascade_ordered_rollup_state(&mut level_states, level, &state);
+            }
             emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
         }
     }
@@ -2204,6 +2305,43 @@ mod bounded_rollup_input_tests {
     use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
 
     #[test]
+    fn ordered_rollup_cascade_uses_declared_domains_not_first_values() {
+        let row = PlanRow::from_fields(vec![
+            PlanField {
+                meta: intern_col_meta(ColMeta {
+                    column: "d".into(),
+                    column_type: ColumnType::Decimal {
+                        precision: 30,
+                        scale: 6,
+                    },
+                    ..Default::default()
+                }),
+                value: Value::Null,
+            },
+            PlanField {
+                meta: intern_col_meta(ColMeta {
+                    column: "f".into(),
+                    column_type: ColumnType::Double,
+                    ..Default::default()
+                }),
+                value: Value::Null,
+            },
+        ]);
+        for (sql, expected) in [
+            ("SUM(COALESCE(d*2,0))", true),
+            ("AVG(d)", true),
+            ("COUNT(f)", true),
+            ("SUM(f)", false),
+            ("SUM(COALESCE(d,f))", false),
+            ("SUM(DISTINCT d)", false),
+        ] {
+            let expr = crate::parser::parse_expr_fragment(sql).unwrap();
+            let slots = super::super::aggregate::collect_aggregate_slots(&[&expr]);
+            assert_eq!(ordered_rollup_can_cascade(&slots, &row), expected, "{sql}");
+        }
+    }
+
+    #[test]
     fn vector_rollup_pruning_matches_complete_level_major_peer_sets() {
         use crate::engine::executor::dispatch::RankKind;
         let root = tempfile::tempdir().unwrap();
@@ -2575,5 +2713,39 @@ mod bounded_rollup_input_tests {
             drop(prepared);
             assert_eq!(budget.used(), 0);
         });
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn ordered_rollup_raw_equality_matches_canonical_keys() {
+    let values = vec![
+        Value::Null,
+        Value::Int(0),
+        Value::UInt(0),
+        Value::Double(0.0),
+        Value::Double(-0.0),
+        Value::Double(f64::NAN),
+        Value::Double(f64::INFINITY),
+        Value::DecimalCompact(100, 2),
+        Value::Decimal128(10, 1),
+        Value::Int(1),
+        Value::String("École".into()),
+        Value::String("ecole".into()),
+        Value::String("ecole ".into()),
+        Value::SmallString(crate::types::SmallStringBuf::from_slice(b"ecole")),
+        Value::Bytes(b"ecole".to_vec()),
+        Value::String("other".into()),
+    ];
+    for collation in [None, Some(255), Some(46), Some(45), Some(63)] {
+        for left in &values {
+            for right in &values {
+                assert_eq!(
+                    rollup_group_value_eq(left, right, collation),
+                    crate::engine::expr::ValueKey::from_with_collation(left, collation)
+                        == crate::engine::expr::ValueKey::from_with_collation(right, collation)
+                );
+            }
+        }
     }
 }

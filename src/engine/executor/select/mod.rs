@@ -3598,11 +3598,23 @@ fn execute_select_inner(
             // Use the caller's exact TxnView for both producer and consumers;
             // factoring a SELECT must not start a second RC read snapshot.
             let body_hint = crate::engine::cache::take_query_hint();
+            if let Some(probe) = &shared.outer_probe {
+                let response = execute_select(db, txn, probe.clone(), registry)?;
+                let (_, mut cursor) = super::dispatch::response_into_cursor(response)?;
+                if cursor.next_row()?.is_none() {
+                    return Ok(QueryResponse::ResultSet(ResultSet {
+                        columns: describe_select_columns(db, &stmt)?,
+                        rows: Vec::new(),
+                    }));
+                }
+            }
             let mut entries = std::collections::HashMap::new();
-            for (definition, consumer_count) in &shared.definitions {
+            for (definition_index, (definition, consumer_count)) in
+                shared.definitions.iter().enumerate()
+            {
                 #[cfg(test)]
                 SHARED_DERIVED_AGGREGATE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                let response = super::cte::with_cte_materialization_active(true, || {
+                let mut response = super::cte::with_cte_materialization_active(true, || {
                     crate::engine::executor::dispatch::execute_subquery_response(
                         db,
                         txn,
@@ -3610,6 +3622,20 @@ fn execute_select_inner(
                         registry,
                     )
                 })?;
+                // A conditional aggregate changes the argument expression's
+                // coercibility, not the original scalar result descriptor.
+                if let Some(columns) = shared.column_overrides.get(definition_index) {
+                    match &mut response {
+                        QueryResponse::ResultSet(result) => result.columns = columns.clone(),
+                        QueryResponse::SharedResultSet(result) => {
+                            result.columns = columns.clone().into()
+                        }
+                        QueryResponse::StreamingResultSet(result) => {
+                            result.columns = columns.clone()
+                        }
+                        _ => {}
+                    }
+                }
                 let mut result =
                     materialize_response_with_spill(response, db.data_dir().to_path_buf())?;
                 result.consumer_count = *consumer_count;
@@ -6052,6 +6078,14 @@ fn execute_derived_select(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     let _rrf_window = hybrid::window_for_select(db, &stmt)?;
+    if let Some(mut response) = super::cte::streaming_aggregate::try_execute(db, txn, &stmt)? {
+        // The native relation exposes internal descriptors. Retain the same
+        // protocol metadata as the ordinary derived SELECT boundary.
+        if let QueryResponse::StreamingResultSet(result) = &mut response {
+            result.columns = describe_select_columns(db, &stmt)?;
+        }
+        return Ok(response);
+    }
     let Some(derived) = stmt.derived.take() else {
         unreachable!();
     };

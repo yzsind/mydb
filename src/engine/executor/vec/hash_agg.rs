@@ -555,17 +555,17 @@ impl SharedHashAggSpill {
     /// Merge COUNT spill and resident tails once, retaining only a counter
     /// and representative per canonical key. The generic replay builds full
     /// AggregateState objects, snapshots them, then hashes every group again.
-    /// The enclosing Top-K needs none of those intermediate representations.
-    pub(crate) fn try_partition_count_topk(
+    /// COUNT finalization needs none of those intermediate representations.
+    pub(crate) fn try_partition_count(
         &self,
         pidx: usize,
         partials: &mut Vec<Vec<Option<PartitionPartial>>>,
-        hint: AggregateCountTopKHint,
+        hint: Option<AggregateCountTopKHint>,
+        final_filter: Option<&AggregateFinalFilter>,
     ) -> Result<Option<Vec<Vec<Value>>>, QueryError> {
-        if hint.k == 0
-            || hint.k > 4096
-            || !hint.descending
-            || hint.aggregate_index != 0
+        if hint.is_some_and(|hint| {
+            hint.k == 0 || hint.k > 4096 || !hint.descending || hint.aggregate_index != 0
+        }) || final_filter.is_some_and(|filter| filter.aggregate_index != 0)
             || !matches!(
                 self.aggs.as_slice(),
                 [AggregateSpec {
@@ -576,7 +576,11 @@ impl SharedHashAggSpill {
             || partials.iter().flatten().flatten().any(|part| {
                 part.dictionary_count
                     .as_ref()
-                    .is_none_or(|part| part.n_aggs != 1)
+                    .is_some_and(|part| part.n_aggs != 1)
+                    || part.fixed_width_decimal.is_some()
+                    || part.compressed_i64_decimal.is_some()
+                    || part.columnar_sums.is_some()
+                    || part.buckets.iter().any(|bucket| bucket.aggs.len() != 1)
             })
         {
             return Ok(None);
@@ -590,7 +594,7 @@ impl SharedHashAggSpill {
             })?
             .clone();
         let Some(dir) = dir else { return Ok(None) };
-        let generic = self.partitions[pidx].lock().map_err(|_| {
+        let mut generic = self.partitions[pidx].lock().map_err(|_| {
             crate::error::catalog::ER_GET_ERRNO
                 .error("shared hash-aggregate partition lock poisoned")
         })?;
@@ -598,8 +602,13 @@ impl SharedHashAggSpill {
             crate::error::catalog::ER_GET_ERRNO
                 .error("shared hash-aggregate dictionary partition lock poisoned")
         })?;
-        if generic.written || !dictionary.written {
+        if !generic.written && !dictionary.written {
             return Ok(None);
+        }
+        let generic_written = generic.written;
+        let dictionary_written = dictionary.written;
+        if let Some(writer) = generic.writer.take() {
+            let _ = writer.finish()?;
         }
         if let Some(writer) = dictionary.writer.take() {
             let _ = writer.finish()?;
@@ -607,8 +616,75 @@ impl SharedHashAggSpill {
         drop(generic);
         drop(dictionary);
 
+        // Fixed-width canonical keys already retain every output value. Keep
+        // one representation through COUNT merge and decode representatives
+        // only after HAVING/Top-K, instead of allocating a Value vector for
+        // each group that will subsequently be discarded.
+        let primitive_kinds = (|| {
+            self.schema.fields()[..self.group_count]
+                .iter()
+                .map(|field| {
+                    Some(match field.column_type {
+                        ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                            if field.source.flags & crate::mysql::protocol::UNSIGNED_FLAG == 0 =>
+                        {
+                            CompactKeyKind::I64
+                        }
+                        ColumnType::Date => CompactKeyKind::Date32,
+                        ColumnType::Time => CompactKeyKind::Time64,
+                        ColumnType::DateTime => CompactKeyKind::DateTime64,
+                        ColumnType::Timestamp => CompactKeyKind::Timestamp64,
+                        _ => return None,
+                    })
+                })
+                .collect::<Option<Vec<_>>>()
+        })()
+        .filter(|kinds| {
+            partials.iter().flatten().flatten().all(|part| {
+                part.buckets.iter().all(|bucket| {
+                    bucket.key_values.len() == kinds.len()
+                        && bucket.key_values.iter().zip(kinds).all(|(value, kind)| {
+                            matches!(value, Value::Null)
+                                || matches!(
+                                    (kind, value),
+                                    (CompactKeyKind::I64, Value::Int(_))
+                                        | (CompactKeyKind::Date32, Value::Date(_))
+                                        | (CompactKeyKind::Time64, Value::Time(_))
+                                        | (CompactKeyKind::DateTime64, Value::DateTime(_))
+                                        | (CompactKeyKind::Timestamp64, Value::Timestamp(_))
+                                )
+                        })
+                })
+            })
+        });
+        if let Some(kinds) = &primitive_kinds {
+            if let Some(rows) = self.try_fixed_count_merge(
+                dir.path(),
+                pidx,
+                [generic_written, dictionary_written],
+                kinds,
+                partials,
+                hint,
+                final_filter,
+            )? {
+                partials.clear();
+                return Ok(Some(rows));
+            }
+        }
+        let deferred_kinds = primitive_kinds.filter(|_| {
+            !dictionary_written
+                && partials
+                    .iter()
+                    .flatten()
+                    .flatten()
+                    .all(|part| part.dictionary_count.is_none())
+        });
         let mut merged = CompactCountMerge::new();
-        let topk_bytes = hint.k.saturating_mul(
+        let topk_bytes = hint.map_or(0, |hint| hint.k).saturating_mul(
             256usize.saturating_add(
                 self.group_count
                     .saturating_mul(std::mem::size_of::<Value>()),
@@ -619,7 +695,43 @@ impl SharedHashAggSpill {
         }
         let mut key = Vec::new();
         for partial in partials.iter().flatten().flatten() {
-            let partial = partial.dictionary_count.as_ref().expect("shape checked");
+            for bucket in &partial.buckets {
+                if let Some(entry) = merged.groups.get_mut(bucket.key.as_slice()) {
+                    entry.count = entry.count.saturating_add(bucket.aggs[0].count);
+                } else {
+                    let bytes = bucket
+                        .key
+                        .len()
+                        .saturating_add(if deferred_kinds.is_some() {
+                            0
+                        } else {
+                            bucket
+                                .key_values
+                                .iter()
+                                .map(crate::engine::executor::mem_budget::estimate_value_bytes)
+                                .sum::<usize>()
+                        });
+                    if !merged.reserve(1, bytes) {
+                        return Ok(None);
+                    }
+                    let ordinal = merged.groups.len();
+                    merged.groups.insert(
+                        CompactCountKey::from_slice(&bucket.key),
+                        CompactCountRow {
+                            count: bucket.aggs[0].count,
+                            values: if deferred_kinds.is_some() {
+                                Vec::new()
+                            } else {
+                                bucket.key_values.clone()
+                            },
+                            ordinal,
+                        },
+                    );
+                }
+            }
+            let Some(partial) = partial.dictionary_count.as_ref() else {
+                continue;
+            };
             let encoder = &partial.encoder;
             if !merged.reserve(partial.partition.keys.len(), 0) {
                 return Ok(None);
@@ -685,94 +797,463 @@ impl SharedHashAggSpill {
             }
         }
         let capacity = crate::engine::executor::spill_quota::writer_buffer_capacity(1);
-        let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
-            &dir.path().join(format!("d{pidx:03}.bin")),
-            dir.charger(),
-            capacity,
-        )?;
-        while let Some(batch) =
-            spill::read_owned_batch(&mut reader, self.dictionary_schema.clone())?
-        {
-            crate::engine::cancel::check_cancelled()?;
-            let columns = batch.columns();
-            let ColumnVector::Bytes { offsets, data, .. } = &columns[0] else {
-                // Value-tagged spill blocks can retain a Generic byte lane.
-                // Leave those on the existing decoder/merge oracle.
-                return Ok(None);
-            };
-            // Lane capacities cover canonical/representative payload copies;
-            // the per-row term covers the retained Value-vector capacities.
-            let payload = columns
-                .iter()
-                .map(ColumnVector::memory_bytes)
-                .sum::<usize>()
-                .saturating_add(
-                    batch
-                        .num_rows()
-                        .saturating_mul(self.group_count * std::mem::size_of::<Value>()),
-                );
-            if !merged.reserve(batch.num_rows(), payload) {
-                return Ok(None);
+        for (written, prefix, schema, offset) in [
+            (generic_written, "p", &self.schema, 0),
+            (dictionary_written, "d", &self.dictionary_schema, 1),
+        ] {
+            if !written {
+                continue;
             }
-            for row in 0..batch.num_rows() {
-                let key = &data[offsets[row] as usize..offsets[row + 1] as usize];
-                let count = match columns[1 + self.group_count].value_at(row) {
-                    Value::Int(count) => count.max(0) as u64,
-                    _ => {
-                        return Err(crate::error::catalog::ER_INTERNAL_ERROR
-                            .error("dictionary COUNT spill lost its count"))
+            let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                &dir.path().join(format!("{prefix}{pidx:03}.bin")),
+                dir.charger(),
+                capacity,
+            )?;
+            while let Some(batch) = spill::read_owned_batch(&mut reader, schema.clone())? {
+                crate::engine::cancel::check_cancelled()?;
+                let columns = batch.columns();
+                if columns.len() != self.group_count + offset + 1 {
+                    return Err(
+                        crate::error::catalog::ER_INTERNAL_ERROR.error("invalid COUNT spill width")
+                    );
+                }
+                if deferred_kinds.as_ref().is_some_and(|kinds| {
+                    columns.iter().zip(kinds).any(|(column, kind)| {
+                        !matches!(column, ColumnVector::Null { .. })
+                            && CompactKeyKind::from_column(column).as_ref() != Some(kind)
+                    })
+                }) {
+                    // A producer may change physical lanes between epochs.
+                    // The original spills and resident tails remain replayable.
+                    return Ok(None);
+                }
+                for row in 0..batch.num_rows() {
+                    key.clear();
+                    if offset == 1 {
+                        match &columns[0] {
+                            ColumnVector::Bytes { offsets, data, .. } => key.extend_from_slice(
+                                &data[offsets[row] as usize..offsets[row + 1] as usize],
+                            ),
+                            _ => match columns[0].value_at(row) {
+                                Value::Bytes(bytes) => key.extend_from_slice(&bytes),
+                                _ => {
+                                    return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                                        .error("COUNT spill lost canonical key"))
+                                }
+                            },
+                        }
+                    } else {
+                        for (column, field) in
+                            columns.iter().zip(schema.fields()).take(self.group_count)
+                        {
+                            super::key_encode::encode_from_column_row_with_collation(
+                                column,
+                                row,
+                                field.source.collation_id,
+                                &mut key,
+                            );
+                        }
                     }
-                };
-                if let Some(entry) = merged.groups.get_mut(key) {
-                    entry.count = entry.count.saturating_add(count);
-                } else {
-                    let ordinal = merged.groups.len();
-                    merged.groups.insert(
-                        CompactCountKey::from_slice(key),
-                        CompactCountRow {
-                            count,
-                            values: columns[1..1 + self.group_count]
+                    let count = match columns[offset + self.group_count].value_at(row) {
+                        Value::Int(count) => count.max(0) as u64,
+                        _ => {
+                            return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                                .error("COUNT spill lost count"))
+                        }
+                    };
+                    if let Some(entry) = merged.groups.get_mut(key.as_slice()) {
+                        entry.count = entry.count.saturating_add(count);
+                    } else {
+                        // Charge only retained representatives. Duplicate epochs
+                        // update their counter without allocating aggregate state.
+                        let values = if deferred_kinds.is_some() {
+                            Vec::new()
+                        } else {
+                            columns[offset..offset + self.group_count]
                                 .iter()
                                 .map(|column| column.value_at(row))
-                                .collect(),
-                            ordinal,
-                        },
-                    );
+                                .collect::<Vec<_>>()
+                        };
+                        let payload = key.len().saturating_add(
+                            values
+                                .iter()
+                                .map(crate::engine::executor::mem_budget::estimate_value_bytes)
+                                .sum::<usize>(),
+                        );
+                        if !merged.reserve(1, payload) {
+                            return Ok(None);
+                        }
+                        let ordinal = merged.groups.len();
+                        merged.groups.insert(
+                            CompactCountKey::from_slice(&key),
+                            CompactCountRow {
+                                count,
+                                values,
+                                ordinal,
+                            },
+                        );
+                    }
                 }
             }
         }
-        use std::cmp::Reverse;
-        let mut best = std::collections::BinaryHeap::with_capacity(hint.k);
-        for entry in merged.groups.values() {
-            let candidate = (entry.count.min(i64::MAX as u64), entry.ordinal);
-            if best.len() < hint.k {
-                best.push(Reverse(candidate));
-            } else if best.peek().is_some_and(|worst| candidate > worst.0) {
-                best.pop();
-                best.push(Reverse(candidate));
-            }
+        if !merged.reserve(
+            0,
+            merged.groups.len().saturating_mul(
+                std::mem::size_of::<Vec<Value>>()
+                    + if deferred_kinds.is_some() {
+                        (self.group_count + 1) * std::mem::size_of::<Value>()
+                    } else {
+                        0
+                    },
+            ),
+        ) {
+            return Ok(None);
         }
-        let selected: hashbrown::HashSet<usize, ahash::RandomState> = best
-            .into_iter()
-            .map(|Reverse((_, ordinal))| ordinal)
-            .collect();
-        let rows = merged
-            .groups
-            .into_values()
-            .filter_map(|mut entry| {
-                if !selected.contains(&entry.ordinal) {
-                    return None;
+        let keeps = |entry: &CompactCountRow| -> Result<bool, QueryError> {
+            final_filter.map_or(Ok(true), |filter| {
+                filter.keeps(0, &Value::Int(entry.count.min(i64::MAX as u64) as i64))
+            })
+        };
+        let selected = if let Some(hint) = hint {
+            use std::cmp::Reverse;
+            let mut best = std::collections::BinaryHeap::with_capacity(hint.k);
+            for entry in merged.groups.values() {
+                if !keeps(entry)? {
+                    continue;
+                }
+                let candidate = (entry.count.min(i64::MAX as u64), entry.ordinal);
+                if best.len() < hint.k {
+                    best.push(Reverse(candidate));
+                } else if best.peek().is_some_and(|worst| candidate > worst.0) {
+                    best.pop();
+                    best.push(Reverse(candidate));
+                }
+            }
+            Some(
+                best.into_iter()
+                    .map(|Reverse((_, ordinal))| ordinal)
+                    .collect::<hashbrown::HashSet<usize, ahash::RandomState>>(),
+            )
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        for (key, mut entry) in merged.groups {
+            if selected
+                .as_ref()
+                .map_or(keeps(&entry)?, |selected| selected.contains(&entry.ordinal))
+            {
+                if let Some(kinds) = &deferred_kinds {
+                    let Some(values) = decode_fixed_count_key(kinds, &key) else {
+                        return Ok(None);
+                    };
+                    entry.values = values;
                 }
                 entry
                     .values
                     .push(Value::Int(entry.count.min(i64::MAX as u64) as i64));
-                Some(entry.values)
-            })
-            .collect();
+                rows.push(entry.values);
+            }
+        }
         partials.clear();
         Ok(Some(rows))
     }
+
+    /// Reuse the typed arena for primitive COUNT spill partitions. The
+    /// original files/tails remain untouched until the complete merge succeeds.
+    #[allow(clippy::too_many_arguments)]
+    fn try_fixed_count_merge(
+        &self,
+        path: &std::path::Path,
+        pidx: usize,
+        written: [bool; 2],
+        kinds: &[CompactKeyKind],
+        partials: &[Vec<Option<PartitionPartial>>],
+        hint: Option<AggregateCountTopKHint>,
+        filter: Option<&AggregateFinalFilter>,
+    ) -> Result<Option<Vec<Vec<Value>>>, QueryError> {
+        if kinds.is_empty() || kinds.len() > 8 {
+            return Ok(None);
+        }
+        let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+        // Include simultaneous old/new buffers during geometric growth, not
+        // just retained capacity. Refusal leaves the ordinary merger available.
+        let reserve = |charge: &mut crate::engine::executor::mem_budget::ScopedCharge,
+                       groups: usize|
+         -> bool {
+            let Some(capacity) = groups.max(1).checked_next_power_of_two() else {
+                return false;
+            };
+            let bound = capacity
+                .saturating_mul(kinds.len() * 32 + 128)
+                .saturating_add(65536);
+            let extra = bound.saturating_sub(charge.charged());
+            extra == 0 || charge.add(extra).is_ok()
+        };
+        if !reserve(&mut charge, 0) {
+            return Ok(None);
+        }
+        let mut arena = FixedWidthStateArena::new_with_decimal_columns(
+            kinds.to_vec(),
+            vec![AggregateKind::CountStar],
+            0,
+            vec![None],
+        );
+        let mut keys = [0i64; 8];
+        let merge = |arena: &mut FixedWidthStateArena, keys: &[i64], mask: u8, count: u64| {
+            let group = arena.probe_or_insert(keys, mask);
+            let target = &mut arena.count_states.as_mut().expect("COUNT arena")[group];
+            let count = i64::try_from(count).ok()?;
+            *target = target.checked_add(count)?;
+            Some(())
+        };
+        for partial in partials.iter().flatten().flatten() {
+            if !reserve(
+                &mut charge,
+                arena.hashes.len().saturating_add(partial.buckets.len()),
+            ) {
+                return Ok(None);
+            }
+            for (row, bucket) in partial.buckets.iter().enumerate() {
+                if row % DEFAULT_BATCH_ROWS == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
+                let mut mask = 0;
+                for (column, value) in bucket.key_values.iter().enumerate() {
+                    keys[column] = match value {
+                        Value::Null => {
+                            mask |= 1 << column;
+                            0
+                        }
+                        Value::Int(value)
+                        | Value::Time(value)
+                        | Value::DateTime(value)
+                        | Value::Timestamp(value) => *value,
+                        Value::Date(value) => i64::from(*value),
+                        _ => return Ok(None),
+                    };
+                }
+                if merge(&mut arena, &keys[..kinds.len()], mask, bucket.aggs[0].count).is_none() {
+                    return Ok(None);
+                }
+            }
+            if let Some(partial) = &partial.dictionary_count {
+                if !reserve(
+                    &mut charge,
+                    arena
+                        .hashes
+                        .len()
+                        .saturating_add(partial.partition.keys.len()),
+                ) {
+                    return Ok(None);
+                }
+                for (group, &local) in partial.partition.keys.iter().enumerate() {
+                    if group % DEFAULT_BATCH_ROWS == 0 {
+                        crate::engine::cancel::check_cancelled()?;
+                    }
+                    let values = partial.encoder.direct_key_values(local, &[]);
+                    if values.len() != kinds.len() {
+                        return Ok(None);
+                    }
+                    let mut mask = 0;
+                    for (column, (value, kind)) in values.iter().zip(kinds).enumerate() {
+                        keys[column] = match (kind, value) {
+                            (_, Value::Null) => {
+                                mask |= 1 << column;
+                                0
+                            }
+                            (CompactKeyKind::I64, Value::Int(raw))
+                            | (CompactKeyKind::Time64, Value::Time(raw))
+                            | (CompactKeyKind::DateTime64, Value::DateTime(raw))
+                            | (CompactKeyKind::Timestamp64, Value::Timestamp(raw)) => *raw,
+                            (CompactKeyKind::Date32, Value::Date(raw)) => i64::from(*raw),
+                            _ => return Ok(None),
+                        };
+                    }
+                    if merge(
+                        &mut arena,
+                        &keys[..kinds.len()],
+                        mask,
+                        partial.partition.count(group, 0, 1),
+                    )
+                    .is_none()
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let capacity = crate::engine::executor::spill_quota::writer_buffer_capacity(1);
+        for (offset, (prefix, schema)) in [("p", &self.schema), ("d", &self.dictionary_schema)]
+            .into_iter()
+            .enumerate()
+        {
+            if !written[offset] {
+                continue;
+            }
+            let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                &path.join(format!("{prefix}{pidx:03}.bin")),
+                self.dir
+                    .lock()
+                    .map_err(|_| {
+                        crate::error::catalog::ER_GET_ERRNO
+                            .error("shared hash-aggregate spill lock poisoned")
+                    })?
+                    .as_ref()
+                    .expect("spill directory exists")
+                    .charger(),
+                capacity,
+            )?;
+            while let Some(batch) = spill::read_owned_batch(&mut reader, schema.clone())? {
+                crate::engine::cancel::check_cancelled()?;
+                let columns = batch.columns();
+                if columns.len() != offset + kinds.len() + 1
+                    || columns[offset..].iter().zip(kinds).any(|(column, kind)| {
+                        !matches!(column, ColumnVector::Null { .. })
+                            && CompactKeyKind::from_column(column).as_ref() != Some(kind)
+                    })
+                {
+                    return Ok(None);
+                }
+                let Some(counts) = columns[offset + kinds.len()].as_i64_slice() else {
+                    return Ok(None);
+                };
+                if !reserve(
+                    &mut charge,
+                    arena.hashes.len().saturating_add(batch.num_rows()),
+                ) {
+                    return Ok(None);
+                }
+                for (row, &count) in counts.iter().enumerate() {
+                    if columns[offset + kinds.len()].is_null(row) {
+                        return Ok(None);
+                    }
+                    let mut mask = 0;
+                    for (column, kind) in kinds.iter().enumerate() {
+                        let Some((raw, null)) = kind.raw_at(&columns[offset + column], row) else {
+                            return Ok(None);
+                        };
+                        keys[column] = raw;
+                        if null {
+                            mask |= 1 << column;
+                        }
+                    }
+                    if merge(&mut arena, &keys[..kinds.len()], mask, count.max(0) as u64).is_none()
+                    {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
+        let retained = arena.allocated_bytes();
+        if retained > charge.charged() && charge.add(retained - charge.charged()).is_err() {
+            return Ok(None);
+        }
+        charge.release_bytes(charge.charged().saturating_sub(retained));
+        let counts = arena.count_states.as_ref().expect("COUNT arena");
+        let keeps =
+            |count: i64| filter.map_or(Ok(true), |filter| filter.keeps(0, &Value::Int(count)));
+        let selected = if let Some(hint) = hint {
+            if charge.add(hint.k.saturating_mul(96)).is_err() {
+                return Ok(None);
+            }
+            let mut best = std::collections::BinaryHeap::with_capacity(hint.k);
+            for (group, &count) in counts.iter().enumerate() {
+                if group % DEFAULT_BATCH_ROWS == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
+                if !keeps(count)? {
+                    continue;
+                }
+                let candidate = (count, group);
+                if best.len() < hint.k {
+                    best.push(std::cmp::Reverse(candidate));
+                } else if best.peek().is_some_and(|worst| candidate > worst.0) {
+                    best.pop();
+                    best.push(std::cmp::Reverse(candidate));
+                }
+            }
+            let mut selected = best.into_iter().map(|entry| entry.0 .1).collect::<Vec<_>>();
+            selected.sort_unstable();
+            Some(selected)
+        } else {
+            None
+        };
+        let mut rows = Vec::new();
+        let mut output_charge = 0usize;
+        for (group, &count) in counts.iter().enumerate() {
+            if group % DEFAULT_BATCH_ROWS == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            if selected
+                .as_ref()
+                .map_or(keeps(count)?, |groups| groups.binary_search(&group).is_ok())
+            {
+                let bytes = (rows.len() + 1).saturating_mul(
+                    (kinds.len() + 1) * std::mem::size_of::<Value>()
+                        + 2 * std::mem::size_of::<Vec<Value>>(),
+                );
+                if bytes > output_charge {
+                    let extra = (bytes - output_charge).saturating_add(65535) / 65536 * 65536;
+                    if charge.add(extra).is_err() {
+                        return Ok(None);
+                    }
+                    output_charge += extra;
+                }
+                let mut values = Vec::with_capacity(kinds.len() + 1);
+                for (column, kind) in kinds.iter().enumerate() {
+                    values.push(if arena.nulls[group] & (1 << column) != 0 {
+                        Value::Null
+                    } else {
+                        kind.to_value(arena.keys[group * kinds.len() + column])
+                    });
+                }
+                values.push(Value::Int(count));
+                rows.push(values);
+            }
+        }
+        #[cfg(test)]
+        FIXED_COUNT_MERGE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Some(rows))
+    }
+
+    #[cfg(test)]
+    fn try_partition_count_topk(
+        &self,
+        pidx: usize,
+        partials: &mut Vec<Vec<Option<PartitionPartial>>>,
+        hint: AggregateCountTopKHint,
+    ) -> Result<Option<Vec<Vec<Value>>>, QueryError> {
+        self.try_partition_count(pidx, partials, Some(hint), None)
+    }
 }
+
+/// Decode exactly the canonical integer/NULL domains admitted above. Other
+/// types retain their original representatives and comparison semantics.
+fn decode_fixed_count_key(kinds: &[CompactKeyKind], mut key: &[u8]) -> Option<Vec<Value>> {
+    let mut values = Vec::with_capacity(kinds.len() + 1);
+    for kind in kinds {
+        let (&tag, rest) = key.split_first()?;
+        key = rest;
+        if tag == 0 {
+            values.push(Value::Null);
+        } else if tag == 1 {
+            let raw = i128::from_le_bytes(key.get(..16)?.try_into().ok()?);
+            let raw = i64::try_from(raw).ok()?;
+            if matches!(kind, CompactKeyKind::Date32) {
+                i32::try_from(raw).ok()?;
+            }
+            values.push(kind.to_value(raw));
+            key = &key[16..];
+        } else {
+            return None;
+        }
+    }
+    key.is_empty().then_some(values)
+}
+
+#[cfg(test)]
+static FIXED_COUNT_MERGE_HITS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 struct CompactCountRow {
     count: u64,
@@ -2246,7 +2727,7 @@ impl DictionaryGroupEncoder {
                     merge_tokens.clear();
                     merge_tokens.reserve(raw_values.len());
                     for &value in raw_values.iter() {
-                        let mut bytes = Vec::with_capacity(9);
+                        let mut bytes = Vec::with_capacity(17);
                         super::key_encode::encode(&Value::Int(value), &mut bytes);
                         merge_tokens.push(intern(Arc::from(bytes)));
                     }
@@ -2259,7 +2740,7 @@ impl DictionaryGroupEncoder {
                     merge_tokens.clear();
                     merge_tokens.reserve(raw_values.len());
                     for &value in raw_values.iter() {
-                        let mut bytes = Vec::with_capacity(9);
+                        let mut bytes = Vec::with_capacity(17);
                         super::key_encode::encode(&Value::UInt(value), &mut bytes);
                         merge_tokens.push(intern(Arc::from(bytes)));
                     }
@@ -3892,6 +4373,9 @@ struct FixedWidthStateArena {
     keys: Vec<i64>,
     nulls: Vec<u8>,
     state_chunks: Vec<Vec<InlineAggState>>,
+    /// Pure COUNT layouts retain eight bytes per slot instead of the largest
+    /// general aggregate enum. Keys and spill codecs remain unchanged.
+    count_states: Option<Vec<i64>>,
     /// Columnar state for the common fixed-width-key + single DECIMAL SUM
     /// shape. Keeping the common i64 magnitude and status in separate dense arrays
     /// avoids paying the 64-byte general-purpose enum (whose largest variant
@@ -4232,6 +4716,54 @@ impl NarrowDecimalStateColumn {
 }
 
 impl FixedWidthStateArena {
+    fn count_keys_warrant_compact_state(
+        group_columns: &[usize],
+        aggs: &[AggregateSpec],
+        batch: &Batch,
+    ) -> bool {
+        if group_columns.is_empty()
+            || group_columns.len() > 8
+            || aggs.is_empty()
+            || !aggs
+                .iter()
+                .all(|spec| matches!(spec.func, AggregateKind::Count | AggregateKind::CountStar))
+        {
+            return false;
+        }
+        let mut kinds = [CompactKeyKind::I64; 8];
+        for (index, &column) in group_columns.iter().enumerate() {
+            let Some(kind) = CompactKeyKind::from_column(&batch.columns()[column]) else {
+                return false;
+            };
+            kinds[index] = kind;
+        }
+        // Bounded sampling distinguishes a broad key domain from tiny dense
+        // groups, whose existing direct-update kernel is cheaper. Fingerprints
+        // affect layout selection only; full keys still determine equality.
+        let mut seen = [0u64; 128];
+        let mut count = 0;
+        for row in batch.visible_indices().take(256) {
+            let mut keys = [0i64; 8];
+            let mut nulls = 0u8;
+            for (index, &column) in group_columns.iter().enumerate() {
+                let Some((value, null)) = kinds[index].raw_at(&batch.columns()[column], row) else {
+                    return false;
+                };
+                keys[index] = value;
+                nulls |= u8::from(null) << index;
+            }
+            let hash = Self::hash_key(&keys[..group_columns.len()], nulls);
+            if !seen[..count].contains(&hash) {
+                seen[count] = hash;
+                count += 1;
+                if count == seen.len() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     fn try_new(group_columns: &[usize], aggs: &[AggregateSpec], batch: &Batch) -> Option<Self> {
         Self::try_new_internal(group_columns, aggs, batch)
     }
@@ -4342,6 +4874,11 @@ impl FixedWidthStateArena {
         let wanted = ((seed.max(1) * 10).saturating_add(6) / 7).max(1024);
         let capacity = wanted.next_power_of_two();
         let n_aggs = funcs.len();
+        let count_states = (!funcs.is_empty()
+            && funcs
+                .iter()
+                .all(|func| matches!(func, AggregateKind::Count | AggregateKind::CountStar)))
+        .then(|| Vec::with_capacity(seed.saturating_mul(n_aggs)));
         let monotonic_i64_unindexed = matches!(key_kinds.as_slice(), [CompactKeyKind::I64]);
         let decimal_state_columns = decimal_column_scales
             .into_iter()
@@ -4359,6 +4896,7 @@ impl FixedWidthStateArena {
             keys: Vec::with_capacity(seed.saturating_mul(key_kinds.len())),
             nulls: Vec::with_capacity(seed),
             state_chunks: Vec::new(),
+            count_states,
             decimal_state_columns,
             decimal_state_slots,
             groups_per_chunk: 8 * 1024,
@@ -4460,6 +4998,10 @@ impl FixedWidthStateArena {
 
     #[inline]
     fn append_group_states(&mut self, group: usize) {
+        if let Some(counts) = self.count_states.as_mut() {
+            counts.resize(counts.len() + self.n_aggs, 0);
+            return;
+        }
         for &slot in &self.decimal_state_slots {
             self.decimal_state_columns[slot]
                 .as_mut()
@@ -4713,6 +5255,16 @@ impl FixedWidthStateArena {
                 }
             }
             let group = self.probe_or_insert(&keys, nullmask);
+            if let Some(counts) = self.count_states.as_mut() {
+                for (slot, spec) in aggs.iter().enumerate() {
+                    if spec.func == AggregateKind::CountStar
+                        || !batch.columns()[spec.input_column].is_null(row)
+                    {
+                        counts[group * self.n_aggs + slot] += 1;
+                    }
+                }
+                continue;
+            }
             if self.decimal_state_slots.is_empty() {
                 for (slot, spec) in aggs.iter().enumerate() {
                     if matches!(spec.func, AggregateKind::CountStar) {
@@ -5132,6 +5684,16 @@ impl FixedWidthStateArena {
             }
             let group = self.probe_or_insert(&keys, nullmask);
             for (slot, layout_slot) in layout.slots.iter().enumerate() {
+                if let Some(counts) = self.count_states.as_mut() {
+                    let target = &mut counts[group * self.n_aggs + slot];
+                    let mut state = InlineAggState::Count(*target);
+                    layout_slot.merge_fixed(&mut state, batch.columns(), row)?;
+                    let InlineAggState::Count(count) = state else {
+                        unreachable!()
+                    };
+                    *target = count;
+                    continue;
+                }
                 crate::engine::expr::with_optional_compare_collation(
                     aggs[slot].comparison_collation,
                     || layout_slot.merge_fixed(self.state_mut(group, slot), batch.columns(), row),
@@ -5177,6 +5739,9 @@ impl FixedWidthStateArena {
                     }),
             )
             .saturating_add(self.compressed_i64_decimal_allocated_bytes)
+            .saturating_add(self.count_states.as_ref().map_or(0, |counts| {
+                counts.capacity().saturating_mul(std::mem::size_of::<i64>())
+            }))
             .saturating_add(self.state_chunks.iter().fold(0usize, |bytes, chunk| {
                 bytes.saturating_add(
                     chunk
@@ -5251,6 +5816,9 @@ impl FixedWidthStateArena {
     }
 
     fn finalized_value(&self, group: usize, aggregate: usize) -> Value {
+        if let Some(counts) = &self.count_states {
+            return Value::Int(counts[group * self.n_aggs + aggregate]);
+        }
         if let Some(decimal_state_column) = &self.decimal_state_columns[aggregate] {
             return numeric_state_to_value(&decimal_state_column.state(group));
         }
@@ -5258,6 +5826,12 @@ impl FixedWidthStateArena {
     }
 
     fn state_snapshot(&self, group: usize, aggregate: usize) -> AggStateSnapshot {
+        if let Some(counts) = &self.count_states {
+            return AggStateSnapshot {
+                count: counts[group * self.n_aggs + aggregate] as u64,
+                ..AggStateSnapshot::default()
+            };
+        }
         if let Some(decimal_state_column) = &self.decimal_state_columns[aggregate] {
             let sum = decimal_state_column.state(group);
             return AggStateSnapshot {
@@ -6710,6 +7284,7 @@ impl HashAggregateCore {
                 // the generic bucket kernel. Keep its compact set layout even
                 // with a large grant instead of allocating a Vec per group.
                 self.aggs.is_empty()
+                    || FixedWidthStateArena::count_keys_warrant_compact_state(&self.group_columns, &self.aggs, batch)
                     || FixedWidthStateArena::has_decimal_state_column(&self.aggs, batch)
                     || self
                         .mem_budget
@@ -7747,17 +8322,35 @@ impl HashAggregateCore {
             .expect("spill called on HashAgg without a spill schema");
         let part = std::mem::take(&mut self.partitions[pidx]);
         if let Some(shared) = self.shared_spill.clone() {
+            // Keep the canonical key already computed during grouping. COUNT
+            // replay needs neither another collation pass nor general states.
+            let canonical = matches!(
+                self.aggs.as_slice(),
+                [AggregateSpec {
+                    func: AggregateKind::CountStar | AggregateKind::Count,
+                    ..
+                }]
+            );
+            let schema = if canonical {
+                &shared.dictionary_schema
+            } else {
+                &spill_schema
+            };
             let mut start = 0;
             while start < part.buckets.len() {
-                let (end, _charge) =
-                    spill_partition_chunk(&part.buckets, start, spill_schema.len())?;
+                let (end, _charge) = spill_partition_chunk(&part.buckets, start, schema.len())?;
                 let batch = partition_to_spill_batch(
                     &part.buckets[start..end],
-                    &spill_schema,
+                    schema,
                     &self.group_columns,
                     &self.aggs,
+                    canonical,
                 );
-                let (bytes, first_file_write) = shared.append(pidx, &batch)?;
+                let (bytes, first_file_write) = if canonical {
+                    shared.append_dictionary(pidx, &batch)?
+                } else {
+                    shared.append(pidx, &batch)?
+                };
                 self.spill_bytes_total = self.spill_bytes_total.saturating_add(bytes);
                 self.shared_spilled_partitions[pidx] = true;
                 if first_file_write {
@@ -7798,6 +8391,7 @@ impl HashAggregateCore {
                 &spill_schema,
                 &self.group_columns,
                 &self.aggs,
+                false,
             );
             spill::write_batch(&mut w, &batch)?;
             start = end;
@@ -8290,7 +8884,7 @@ impl CompressedI64DecimalPartial {
                 } else {
                     Value::Int(key)
                 };
-                let mut encoded = Vec::with_capacity(9);
+                let mut encoded = Vec::with_capacity(17);
                 super::key_encode::encode(&key_value, &mut encoded);
                 let mut state = NumericAggState::Empty;
                 if let Some(sum) = sum {
@@ -8365,7 +8959,7 @@ impl FixedWidthDecimalPartitionPartial {
         let mut buckets = Vec::with_capacity(self.len());
         for group in 0..self.len() {
             let key_values = self.key_values(group);
-            let mut key = Vec::with_capacity(key_values.len().saturating_mul(9));
+            let mut key = Vec::with_capacity(key_values.len().saturating_mul(17));
             for value in &key_values {
                 super::key_encode::encode(value, &mut key);
             }
@@ -8617,7 +9211,7 @@ fn fixed_width_partition_partial(
     for &group in groups {
         let group = group as usize;
         let key_values = arena.group_key_values(group);
-        let mut key = Vec::with_capacity(key_values.len().saturating_mul(9));
+        let mut key = Vec::with_capacity(key_values.len().saturating_mul(17));
         for value in &key_values {
             super::key_encode::encode(value, &mut key);
         }
@@ -8669,7 +9263,7 @@ fn merge_fixed_width_spill_path(
     let mut buckets = Vec::with_capacity(arena.hashes.len());
     for group in 0..arena.hashes.len() {
         let key_values = arena.group_key_values(group);
-        let mut key = Vec::with_capacity(key_values.len().saturating_mul(9));
+        let mut key = Vec::with_capacity(key_values.len().saturating_mul(17));
         for value in &key_values {
             super::key_encode::encode(value, &mut key);
         }
@@ -9783,15 +10377,20 @@ fn partition_to_spill_batch(
     schema: &Arc<BatchSchema>,
     group_cols: &[usize],
     aggs: &[AggregateSpec],
+    canonical: bool,
 ) -> Batch {
-    let layout = SpillLayout::new(group_cols.len(), aggs);
+    let offset = usize::from(canonical);
+    let layout = SpillLayout::new(group_cols.len() + offset, aggs);
     debug_assert_eq!(layout.width, schema.len());
     let n = buckets.len();
     let total_cols = schema.fields().len();
     let mut col_values: Vec<Vec<Value>> = (0..total_cols).map(|_| Vec::with_capacity(n)).collect();
     for bucket in buckets {
+        if canonical {
+            col_values[0].push(Value::Bytes(bucket.key.clone()));
+        }
         for (i, _) in group_cols.iter().enumerate() {
-            col_values[i].push(bucket.key_values[i].clone());
+            col_values[i + offset].push(bucket.key_values[i].clone());
         }
         for (slot, layout_slot) in layout.slots.iter().enumerate() {
             layout_slot.write(&bucket.aggs[slot], &mut col_values);
@@ -12836,7 +13435,7 @@ mod tests {
         use crate::engine::executor::mem_budget::{
             controlled_memory_snapshot, with_query_budget, with_test_effective_memory_limit,
         };
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let schema = Arc::new(BatchSchema::new(vec![BatchField {
             table: "t".into(),
             alias: None,
@@ -13175,6 +13774,315 @@ mod tests {
     }
 
     #[test]
+    fn fixed_count_merge_combines_dictionary_resident_tail_with_generic_spill() {
+        use crate::engine::executor::mem_budget::with_query_budget;
+        let schema = Arc::new(BatchSchema::new(
+            [ColumnType::LongLong, ColumnType::Date]
+                .into_iter()
+                .enumerate()
+                .map(|(i, column_type)| BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: format!("k{i}"),
+                    column_type,
+                    source: Default::default(),
+                })
+                .collect(),
+        ));
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(vec![
+                    Value::Int(7),
+                    Value::Int(7),
+                    Value::Null,
+                    Value::Int(-2),
+                ]),
+                ColumnVector::from_values(vec![
+                    Value::Date(23),
+                    Value::Date(23),
+                    Value::Date(23),
+                    Value::Null,
+                ]),
+            ],
+        );
+        let aggs = vec![AggregateSpec {
+            comparison_collation: None,
+            func: AggregateKind::CountStar,
+            input_column: 0,
+        }];
+        // The automatic selector requires a text lane. Construct a valid
+        // primitive handoff directly to exercise the merge-format contract
+        // independently of that selector's current profitability gate.
+        let mut encoder = DictionaryGroupEncoder {
+            columns: vec![
+                DictionaryColumn {
+                    source: DictionaryColumnSource::I64 {
+                        column: 0,
+                        values: Default::default(),
+                        dense_tokens: None,
+                        raw_values: Vec::new(),
+                        merge_tokens: Vec::new(),
+                    },
+                    shift: 0,
+                    null_bit: 64,
+                    direct: true,
+                    token_mask: u32::MAX,
+                },
+                DictionaryColumn {
+                    source: DictionaryColumnSource::Date32 {
+                        column: 1,
+                        values: Default::default(),
+                        raw_values: Vec::new(),
+                        merge_tokens: Vec::new(),
+                    },
+                    shift: 65,
+                    null_bit: 97,
+                    direct: true,
+                    token_mask: u32::MAX,
+                },
+            ],
+            direct_primitives: true,
+            compact_count_eligible: true,
+            current_raw_tokens: smallvec::SmallVec::new(),
+            merge_token_bytes: 0,
+            _merge_token_charge: None,
+        };
+        let mut arena = DictionaryCountArena::new(4, 0, 1, false);
+        arena
+            .consume_batch(&mut encoder, &aggs, &batch, &mut Vec::new())
+            .unwrap();
+        let encoder = Arc::new(encoder);
+        let root = temp_root();
+        let shared = SharedHashAggSpill::new(root.clone(), schema, &[0, 1], aggs);
+        shared
+            .append(
+                0,
+                &Batch::new(
+                    shared.schema.clone(),
+                    vec![
+                        ColumnVector::from_values(vec![Value::Int(7), Value::Null, Value::Int(-2)]),
+                        ColumnVector::from_values(vec![
+                            Value::Date(23),
+                            Value::Date(23),
+                            Value::Null,
+                        ]),
+                        ColumnVector::from_values(vec![
+                            Value::Int(1),
+                            Value::Int(4),
+                            Value::Int(2),
+                        ]),
+                    ],
+                ),
+            )
+            .unwrap();
+        let mut tails = (0..NUM_PARTITIONS)
+            .map(|pidx| {
+                vec![Some(PartitionPartial {
+                    buckets: Vec::new(),
+                    fixed_width_decimal: None,
+                    compressed_i64_decimal: None,
+                    columnar_sums: None,
+                    dictionary_count: Some(DictionaryCountPartitionPartial {
+                        partition: arena.take_partition(pidx),
+                        encoder: encoder.clone(),
+                        raw_token_width: 0,
+                        n_aggs: 1,
+                    }),
+                })]
+            })
+            .collect::<Vec<_>>();
+        let filter = AggregateFinalFilter {
+            aggregate_index: 0,
+            comparison: AggregateFinalComparison::Gt,
+            literal: Value::Int(3),
+            decimal_literal: Some((3, 0)),
+        };
+        let hits = FIXED_COUNT_MERGE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let budget = Arc::new(MemBudget::new(16 << 20));
+        with_query_budget(budget.clone(), || {
+            let rows = shared
+                .try_partition_count(0, &mut tails, None, Some(&filter))
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                rows,
+                vec![vec![Value::Null, Value::Date(23), Value::Int(5)]]
+            );
+            assert!(FIXED_COUNT_MERGE_HITS.load(std::sync::atomic::Ordering::Relaxed) > hits);
+            assert!(tails.is_empty());
+        });
+        assert_eq!(budget.used(), 0);
+        drop(shared);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn compact_count_spill_defers_fixed_keys_until_after_having() {
+        let hits = FIXED_COUNT_MERGE_HITS.load(std::sync::atomic::Ordering::Relaxed);
+        use crate::engine::executor::mem_budget::with_query_budget;
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ColumnType::LongLong,
+                ColumnType::Date,
+                ColumnType::Time,
+                ColumnType::DateTime,
+                ColumnType::Timestamp,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(i, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: format!("k{i}"),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let representatives = vec![
+            vec![
+                Value::Int(i64::MIN),
+                Value::Date(i32::MIN),
+                Value::Time(-17),
+                Value::DateTime(i64::MAX),
+                Value::Timestamp(0),
+            ],
+            vec![
+                Value::Int(i64::MAX),
+                Value::Date(i32::MAX),
+                Value::Time(i64::MIN),
+                Value::DateTime(-1),
+                Value::Timestamp(i64::MAX),
+            ],
+            vec![Value::Null; 5],
+        ];
+        let aggs = vec![AggregateSpec {
+            comparison_collation: None,
+            func: AggregateKind::CountStar,
+            input_column: 0,
+        }];
+        let root = temp_root();
+        let shared = SharedHashAggSpill::new(root.clone(), schema, &[0, 1, 2, 3, 4], aggs);
+        let mut columns = (0..5)
+            .map(|column| {
+                ColumnVector::from_values(
+                    representatives
+                        .iter()
+                        .map(|row| row[column].clone())
+                        .collect(),
+                )
+            })
+            .collect::<Vec<_>>();
+        columns.push(ColumnVector::from_values(vec![
+            Value::Int(2),
+            Value::Int(1),
+            Value::Int(4),
+        ]));
+        let mut dictionary_columns = vec![ColumnVector::from_values(
+            representatives
+                .iter()
+                .map(|values| {
+                    let mut key = Vec::new();
+                    for value in values {
+                        super::super::key_encode::encode(value, &mut key);
+                    }
+                    Value::Bytes(key)
+                })
+                .collect(),
+        )];
+        dictionary_columns.extend_from_slice(&columns[..5]);
+        dictionary_columns.push(ColumnVector::from_values(vec![
+            Value::Int(7),
+            Value::Int(2),
+            Value::Int(1),
+        ]));
+        shared
+            .append_dictionary(
+                0,
+                &Batch::new(shared.dictionary_schema.clone(), dictionary_columns),
+            )
+            .unwrap();
+        shared
+            .append(0, &Batch::new(shared.schema.clone(), columns))
+            .unwrap();
+        let tails = || {
+            vec![vec![Some(PartitionPartial {
+                buckets: representatives
+                    .iter()
+                    .enumerate()
+                    .map(|(i, values)| {
+                        let mut key = Vec::new();
+                        for value in values {
+                            super::super::key_encode::encode(value, &mut key);
+                        }
+                        GroupBucketSnapshot {
+                            key,
+                            key_values: values.clone(),
+                            aggs: vec![AggStateSnapshot {
+                                count: [3, 1, 5][i],
+                                ..Default::default()
+                            }],
+                        }
+                    })
+                    .collect(),
+                fixed_width_decimal: None,
+                compressed_i64_decimal: None,
+                dictionary_count: None,
+                columnar_sums: None,
+            })]]
+        };
+        let filter = AggregateFinalFilter {
+            aggregate_index: 0,
+            comparison: AggregateFinalComparison::Gt,
+            literal: Value::Int(4),
+            decimal_literal: Some((4, 0)),
+        };
+        let budget = Arc::new(MemBudget::new(16 << 20));
+        with_query_budget(budget.clone(), || {
+            let mut partials = tails();
+            let mut rows = shared
+                .try_partition_count(0, &mut partials, None, Some(&filter))
+                .unwrap()
+                .unwrap();
+            rows.sort_by_key(|row| row[5].to_display_string());
+            let mut expected = vec![representatives[2].clone(), representatives[0].clone()];
+            expected[0].push(Value::Int(10));
+            expected[1].push(Value::Int(12));
+            assert_eq!(rows, expected);
+            assert!(FIXED_COUNT_MERGE_HITS.load(std::sync::atomic::Ordering::Relaxed) > hits);
+            assert!(partials.is_empty());
+            assert_eq!(budget.used(), 0);
+            let mut partials = tails();
+            let rows = shared
+                .try_partition_count(
+                    0,
+                    &mut partials,
+                    Some(AggregateCountTopKHint {
+                        aggregate_index: 0,
+                        k: 1,
+                        descending: true,
+                    }),
+                    Some(&filter),
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(rows, vec![expected[1].clone()]);
+        });
+        assert_eq!(budget.used(), 0);
+        with_query_budget(Arc::new(MemBudget::new(1)), || {
+            let mut partials = tails();
+            assert!(shared
+                .try_partition_count(0, &mut partials, None, Some(&filter))
+                .unwrap()
+                .is_none());
+            assert_eq!(partials.len(), 1);
+        });
+        drop(shared);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
     fn compact_count_spill_topk_merges_resident_overlap_and_releases_budget() {
         use crate::engine::executor::mem_budget::with_query_budget;
         let schema = Arc::new(BatchSchema::new(
@@ -13240,14 +14148,45 @@ mod tests {
                 &aggs,
             )
             .unwrap();
-            // Two disk epochs and the resident tail must be summed before K
+            // All disk epochs and the resident tail must be summed before K
             // is applied; selecting each epoch's K independently is invalid.
             shared.append_dictionary(partition, &batch).unwrap();
             shared.append_dictionary(partition, &batch).unwrap();
+            // A worker can fall back to generic keys while other epochs keep
+            // dictionary keys. The compact finalizer must merge both formats.
+            let generic = Batch::new(shared.schema.clone(), batch.columns()[1..].to_vec());
+            shared.append(partition, &generic).unwrap();
         }
         let (actual_encoder, mut actual_arena) = build();
         let (oracle_encoder, mut oracle_arena) = build();
-        let partial = |partition, encoder| {
+        let partial = |partition: DictionaryCountPartition,
+                       encoder: Arc<DictionaryGroupEncoder>| {
+            if partition.keys.first().is_some_and(|key| key & 1 != 0) {
+                let buckets = partition
+                    .keys
+                    .iter()
+                    .enumerate()
+                    .map(|(group, &key)| {
+                        let mut canonical = Vec::new();
+                        encoder.write_direct_canonical_key(key, &mut canonical);
+                        GroupBucketSnapshot {
+                            key: canonical,
+                            key_values: encoder.direct_key_values(key, &[]),
+                            aggs: vec![AggStateSnapshot {
+                                count: partition.count(group, 0, 1),
+                                ..Default::default()
+                            }],
+                        }
+                    })
+                    .collect();
+                return Some(PartitionPartial {
+                    buckets,
+                    columnar_sums: None,
+                    fixed_width_decimal: None,
+                    compressed_i64_decimal: None,
+                    dictionary_count: None,
+                });
+            }
             Some(PartitionPartial {
                 buckets: Vec::new(),
                 columnar_sums: None,
@@ -13305,6 +14244,48 @@ mod tests {
                 expected.truncate(3);
                 rows.sort_by_key(order);
                 assert_eq!(rows, expected);
+            }
+        });
+        assert_eq!(budget.used(), 0);
+        // HAVING must see the complete count across resident and disk epochs.
+        let (encoder, mut actual_arena) = build();
+        let (oracle_encoder, mut oracle_arena) = build();
+        let filter = AggregateFinalFilter {
+            aggregate_index: 0,
+            comparison: AggregateFinalComparison::Gt,
+            literal: Value::Int(150),
+            decimal_literal: Some((150, 0)),
+        };
+        with_query_budget(budget.clone(), || {
+            for partition in 0..NUM_PARTITIONS {
+                let mut tails = vec![vec![partial(
+                    actual_arena.take_partition(partition),
+                    encoder.clone(),
+                )]];
+                let mut expected = merge_worker_partition_snapshots_filtered(
+                    vec![
+                        vec![partial(
+                            oracle_arena.take_partition(partition),
+                            oracle_encoder.clone(),
+                        )],
+                        vec![shared.partition_snapshot(partition).unwrap()],
+                    ],
+                    &aggs,
+                    Some(&filter),
+                )
+                .unwrap();
+                let Some(mut actual) = shared
+                    .try_partition_count(partition, &mut tails, None, Some(&filter))
+                    .unwrap()
+                else {
+                    assert!(expected.is_empty());
+                    continue;
+                };
+                let order = |row: &Vec<Value>| row.last().unwrap().to_display_string();
+                expected.sort_by_key(order);
+                actual.sort_by_key(order);
+                assert_eq!(actual, expected);
+                assert!(tails.is_empty());
             }
         });
         assert_eq!(budget.used(), 0);
@@ -14665,6 +15646,83 @@ mod tests {
         std::fs::remove_dir_all(root).unwrap();
     }
 
+    #[test]
+    fn high_cardinality_counts_choose_compact_state_with_large_grants() {
+        let schema = schema_kv();
+        let pairs = (0..4096).map(|i| (i - 2048, i % 17)).collect::<Vec<_>>();
+        let batch = make_batch(&schema, &pairs);
+        let nullable = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(vec![Value::Null, Value::Null, Value::Int(0)]),
+                ColumnVector::from_values(vec![Value::Int(1), Value::Null, Value::Null]),
+            ],
+        );
+        let specs = vec![
+            AggregateSpec {
+                func: AggregateKind::CountStar,
+                input_column: 1,
+                comparison_collation: None,
+            },
+            AggregateSpec {
+                func: AggregateKind::Count,
+                input_column: 1,
+                comparison_collation: None,
+            },
+        ];
+        assert!(FixedWidthStateArena::count_keys_warrant_compact_state(
+            &[0],
+            &specs,
+            &batch
+        ));
+        let dense = make_batch(
+            &schema,
+            &(0..4096).map(|i| (i % 4, i % 17)).collect::<Vec<_>>(),
+        );
+        assert!(!FixedWidthStateArena::count_keys_warrant_compact_state(
+            &[0],
+            &specs,
+            &dense
+        ));
+        let root = temp_root();
+        let budget = Arc::new(MemBudget::new(1024 * 1024 * 1024));
+        let mut agg = HashAggregateCore::with_budget(
+            vec![0],
+            specs.clone(),
+            schema.clone(),
+            budget.clone(),
+            &root,
+        );
+        for input in [&batch, &nullable, &batch] {
+            agg.consume_batch(input).unwrap();
+        }
+        let arena = agg.fixed_width.as_ref().unwrap();
+        assert!(
+            arena.state_chunks.is_empty(),
+            "COUNT must not retain general aggregate enums"
+        );
+        assert_eq!(
+            arena.count_states.as_ref().unwrap().len(),
+            arena.hashes.len() * 2
+        );
+        let mut expected = agg.finalize().unwrap();
+        assert_eq!(budget.used(), 0);
+        let (mut spilled, metrics) = run_with_budget(
+            schema,
+            vec![batch.clone(), nullable, batch],
+            vec![0],
+            specs,
+            32 * 1024,
+        );
+        assert!(metrics.did_spill);
+        expected.sort_by_key(|r| format!("{r:?}"));
+        spilled.sort_by_key(|r| format!("{r:?}"));
+        assert_eq!(spilled, expected);
+        let null = expected.iter().find(|r| r[0] == Value::Null).unwrap();
+        assert_eq!(&null[1..], &[Value::Int(2), Value::Int(1)]);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     fn temp_root() -> PathBuf {
         let pid = std::process::id();
         let nanos = std::time::SystemTime::now()
@@ -14734,7 +15792,7 @@ mod tests {
             ],
         );
         for budget_bytes in [128 * 1024, 64 * 1024 * 1024] {
-            let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let root = tempfile::tempdir().unwrap();
             let budget = Arc::new(MemBudget::new(budget_bytes));
             let mut agg = HashAggregateCore::with_budget(
                 vec![0],

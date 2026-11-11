@@ -6,7 +6,7 @@ use super::*;
 fn final_1107_lane_fallback_retains_prior_spills_nulls_and_unsigned_domain() {
     for dictionary in [false, true] {
         for spill_first in [false, true] {
-            let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let root = tempfile::tempdir().unwrap();
             let schema = Arc::new(BatchSchema::new(vec![
                 BatchField {
                     table: "t".into(),
@@ -120,7 +120,7 @@ fn final_1107_lane_fallback_retains_prior_spills_nulls_and_unsigned_domain() {
 
 #[test]
 fn final_1107_dictionary_group_lane_drift_preserves_prefix() {
-    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let root = tempfile::tempdir().unwrap();
     let schema = Arc::new(BatchSchema::new(vec![
         BatchField {
             table: "t".into(),

@@ -94,3 +94,45 @@ fn small_batch_inlj_per_row_fallback_counter_advances_when_disabled() {
         "inlj_per_row_executions did not advance (before={before}, after={after})"
     );
 }
+
+#[test]
+fn high_fanout_single_key_uses_mrr_and_preserves_outer_semantics() {
+    use crate::engine::executor::select::plan::INLJ_PER_ROW_EXECUTIONS;
+    use std::sync::atomic::Ordering;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE fan_l(k INT)").unwrap();
+    engine
+        .execute("INSERT INTO fan_l VALUES(1),(1),(99),(NULL)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE fan_r(k INT,v INT,KEY by_k(k))")
+        .unwrap();
+    let values = (0..2000)
+        .map(|i| format!("({},{i})", i % 4))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO fan_r VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE fan_r, fan_l").unwrap();
+    for join in ["JOIN", "LEFT JOIN"] {
+        let sql = format!("SELECT /*+ INDEX_NLJ(fan_l,fan_r) NO_HASH_JOIN(fan_l,fan_r) */ fan_l.k,fan_r.v FROM fan_l {join} fan_r ON fan_l.k=fan_r.k");
+        // One outer key per morsel exercises the fan-out admission boundary.
+        with_test_env(&[("MYDB_HASH_JOIN_STREAM_INLJ_CHUNK", Some("1"))], || {
+            let reference = with_test_env(
+                &[("MYDB_INLJ_BATCH_MIN_RIGHT_ROWS", Some("4294967295"))],
+                || sorted_rows(&engine, &sql),
+            );
+            let before = INLJ_PER_ROW_EXECUTIONS.load(Ordering::Relaxed);
+            let actual = sorted_rows(&engine, &sql);
+            let after = INLJ_PER_ROW_EXECUTIONS.load(Ordering::Relaxed);
+            assert_eq!(actual, reference);
+            assert_eq!(
+                before, after,
+                "high fan-out must retain sorted MRR even for one key"
+            );
+            assert_eq!(actual.len(), if join == "JOIN" { 1000 } else { 1002 });
+        });
+    }
+}
