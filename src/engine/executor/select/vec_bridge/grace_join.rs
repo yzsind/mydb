@@ -983,6 +983,7 @@ impl GraceJoinOutput {
         db: &Arc<Database>,
         schema: Arc<BatchSchema>,
         produce: impl FnOnce(&mut dyn FnMut(Batch) -> Result<(), QueryError>) -> Result<(), QueryError>,
+        output_columns: Option<&[bool]>,
     ) -> Result<Self, QueryError> {
         let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
             db.data_dir(),
@@ -993,7 +994,29 @@ impl GraceJoinOutput {
             dir.charger(),
             32 * 1024,
         )?;
-        produce(&mut |batch| {
+        produce(&mut |mut batch| {
+            if let Some(retained) = output_columns {
+                if retained.len() != batch.columns().len() {
+                    return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                        .error("Grace output projection width mismatch"));
+                }
+                // Dead columns are never observed above the planned projection.
+                // Null lanes preserve its indices with constant-size encoding,
+                // without copying retained buffers or encoding unused values.
+                let selection = batch.selection().cloned();
+                let schema = batch.schema().clone();
+                let rows = batch.num_rows();
+                let mut columns = batch.take_columns()?;
+                for (column, &keep) in columns.iter_mut().zip(retained) {
+                    if !keep {
+                        *column = ColumnVector::Null { len: rows };
+                    }
+                }
+                batch = Batch::from_owned_columns(schema, columns);
+                if let Some(selection) = selection {
+                    batch = batch.with_selection(selection);
+                }
+            }
             let _charge = mem_budget::force_charge_scoped(batch.memory_bytes())?;
             if batch.selection().is_some() {
                 let indices = batch
@@ -1098,6 +1121,7 @@ pub(super) fn run_vec_grace_partition(
     build_cap: vec_hash_join::BuildCap,
     max_depth: u32,
     depth: u32,
+    output_columns: Option<&[bool]>,
 ) -> Result<GraceJoinOutput, QueryError> {
     let output_schema = match join_type {
         crate::parser::JoinType::Semi | crate::parser::JoinType::Anti => semi_out_schema.clone(),
@@ -1131,25 +1155,30 @@ pub(super) fn run_vec_grace_partition(
             drop(build_memory_charge);
             drop(build);
             drop(probe);
-            return GraceJoinOutput::write_from(db, output_schema, |emit| {
-                run_vec_hot_partition_chunked(
-                    &build_path,
-                    &probe_path,
-                    build_schema,
-                    probe_schema,
-                    charger,
-                    build_keys,
-                    probe_keys,
-                    null_safe,
-                    key_collations,
-                    join_type,
-                    spec,
-                    semi_out_schema,
-                    semi_residual,
-                    build_cap,
-                    emit,
-                )
-            });
+            return GraceJoinOutput::write_from(
+                db,
+                output_schema,
+                |emit| {
+                    run_vec_hot_partition_chunked(
+                        &build_path,
+                        &probe_path,
+                        build_schema,
+                        probe_schema,
+                        charger,
+                        build_keys,
+                        probe_keys,
+                        null_safe,
+                        key_collations,
+                        join_type,
+                        spec,
+                        semi_out_schema,
+                        semi_residual,
+                        build_cap,
+                        emit,
+                    )
+                },
+                output_columns,
+            );
         }
         return run_vec_grace_hash_join_stream(
             db,
@@ -1171,54 +1200,61 @@ pub(super) fn run_vec_grace_partition(
             max_depth,
             depth + 1,
             false,
+            output_columns,
         );
     }
 
     let mut build = MaterializedBatchOperator::new(build_schema.clone(), build_prefix);
     let batch_rows = probe.batch_rows;
     let result = vec_hash_join::with_vec_build_cap(build_cap, || {
-        GraceJoinOutput::write_from(db, output_schema.clone(), |emit| match join_type {
-            crate::parser::JoinType::Inner => vec_hash_join::run_inner_hash_join_into(
-                &mut build,
-                &mut probe,
-                spec.expect("inner grace spec"),
-                batch_rows,
-                emit,
-            ),
-            crate::parser::JoinType::Left
-            | crate::parser::JoinType::Right
-            | crate::parser::JoinType::Full => {
-                let spec = spec.expect("outer grace spec");
-                let preserve_build = join_type == crate::parser::JoinType::Full
-                    || (join_type == crate::parser::JoinType::Left && spec.build_cols_first)
-                    || (join_type == crate::parser::JoinType::Right && !spec.build_cols_first);
-                let preserve_probe = join_type == crate::parser::JoinType::Full || !preserve_build;
-                vec_hash_join::run_outer_hash_join_into(
+        GraceJoinOutput::write_from(
+            db,
+            output_schema.clone(),
+            |emit| match join_type {
+                crate::parser::JoinType::Inner => vec_hash_join::run_inner_hash_join_into(
                     &mut build,
                     &mut probe,
-                    spec,
-                    preserve_probe,
-                    preserve_build,
+                    spec.expect("inner grace spec"),
                     batch_rows,
                     emit,
-                )
-            }
-            crate::parser::JoinType::Semi | crate::parser::JoinType::Anti => {
-                vec_hash_join::run_semi_anti_hash_join_into(
-                    &mut build,
-                    &mut probe,
-                    build_keys,
-                    probe_keys,
-                    key_collations,
-                    null_safe,
-                    join_type == crate::parser::JoinType::Anti,
-                    semi_out_schema.clone(),
-                    semi_residual.clone(),
-                    emit,
-                )
-            }
-            _ => unreachable!("preflighted vec grace join type"),
-        })
+                ),
+                crate::parser::JoinType::Left
+                | crate::parser::JoinType::Right
+                | crate::parser::JoinType::Full => {
+                    let spec = spec.expect("outer grace spec");
+                    let preserve_build = join_type == crate::parser::JoinType::Full
+                        || (join_type == crate::parser::JoinType::Left && spec.build_cols_first)
+                        || (join_type == crate::parser::JoinType::Right && !spec.build_cols_first);
+                    let preserve_probe =
+                        join_type == crate::parser::JoinType::Full || !preserve_build;
+                    vec_hash_join::run_outer_hash_join_into(
+                        &mut build,
+                        &mut probe,
+                        spec,
+                        preserve_probe,
+                        preserve_build,
+                        batch_rows,
+                        emit,
+                    )
+                }
+                crate::parser::JoinType::Semi | crate::parser::JoinType::Anti => {
+                    vec_hash_join::run_semi_anti_hash_join_into(
+                        &mut build,
+                        &mut probe,
+                        build_keys,
+                        probe_keys,
+                        key_collations,
+                        null_safe,
+                        join_type == crate::parser::JoinType::Anti,
+                        semi_out_schema.clone(),
+                        semi_residual.clone(),
+                        emit,
+                    )
+                }
+                _ => unreachable!("preflighted vec grace join type"),
+            },
+            output_columns,
+        )
     });
     match result {
         Ok(output) => Ok(output),
@@ -1238,25 +1274,30 @@ pub(super) fn run_vec_grace_partition(
             drop(build_memory_charge);
             drop(probe);
             if depth >= max_depth {
-                return GraceJoinOutput::write_from(db, output_schema, |emit| {
-                    run_vec_hot_partition_chunked(
-                        &build_path,
-                        &probe_path,
-                        build_schema,
-                        probe_schema,
-                        charger,
-                        build_keys,
-                        probe_keys,
-                        null_safe,
-                        key_collations,
-                        join_type,
-                        spec,
-                        semi_out_schema,
-                        semi_residual,
-                        build_cap,
-                        emit,
-                    )
-                });
+                return GraceJoinOutput::write_from(
+                    db,
+                    output_schema,
+                    |emit| {
+                        run_vec_hot_partition_chunked(
+                            &build_path,
+                            &probe_path,
+                            build_schema,
+                            probe_schema,
+                            charger,
+                            build_keys,
+                            probe_keys,
+                            null_safe,
+                            key_collations,
+                            join_type,
+                            spec,
+                            semi_out_schema,
+                            semi_residual,
+                            build_cap,
+                            emit,
+                        )
+                    },
+                    output_columns,
+                );
             }
             let mut build =
                 VecJoinSpillBatchStream::open(&build_path, build_schema, charger.clone())?;
@@ -1281,6 +1322,7 @@ pub(super) fn run_vec_grace_partition(
                 max_depth,
                 depth + 1,
                 false,
+                output_columns,
             )
         }
         Err(error) => Err(error),
@@ -1428,6 +1470,7 @@ pub(super) fn run_vec_grace_hash_join(
         max_depth,
         depth,
         false,
+        None,
     )?
     .collect()
 }
@@ -1453,6 +1496,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
     max_depth: u32,
     depth: u32,
     prefer_key_locality: bool,
+    output_columns: Option<&[bool]>,
 ) -> Result<GraceJoinOutput, QueryError> {
     crate::engine::executor::select::plan::HASH_JOIN_GRACE_MAX_DEPTH
         .fetch_max(depth as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1488,13 +1532,10 @@ pub(super) fn run_vec_grace_hash_join_stream(
             1,
         );
 
-    // Size from the already materialised crossing prefix.  It is a stable
+    // Size from the already materialised crossing prefix. It is a stable
     // lower bound available without rescanning or consulting live memory.
-    // Capping the estimate bounds this optional filter at 16 MiB (the Bloom
-    // layout is a power of two); a larger actual build only raises the false
-    // positive rate and can never change results. The reservation is attached
-    // to the bitmap and follows every pushed runtime-filter Arc until its last
-    // owner releases it.
+    // A bounded filter may admit false positives on larger builds, but it
+    // never discards a matching row. Its charge follows pushed filter Arcs.
     let prefix_rows = build_prefix
         .iter()
         .map(|batch| batch.visible_rows())
@@ -1752,6 +1793,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                 replay_cap,
                 max_depth,
                 depth,
+                output_columns,
             )?;
             output.append(batches);
         }
@@ -1805,6 +1847,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                                     replay_cap,
                                     max_depth,
                                     depth,
+                                    output_columns,
                                 )?;
                                 local.push((partition, batches));
                             }

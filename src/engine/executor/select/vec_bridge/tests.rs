@@ -535,6 +535,7 @@ fn grace_locality_sampling_covers_late_rows_between_prefix_bands() {
                     1,
                     0,
                     true,
+                    None,
                 )
                 .unwrap();
                 let rows = vec_hash_join::flatten_batches_to_rows(output.collect().unwrap());
@@ -912,6 +913,7 @@ fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
                                         1,
                                         0,
                                         true,
+                                        None,
                                     )
                                     .unwrap()
                                     .collect()
@@ -1743,6 +1745,80 @@ fn grace_materialization_boundary_stops_reading_at_budget() {
         );
     });
     assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn grace_output_prunes_dead_payload_before_spilling_selected_rows() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(Database::open(root.path()).unwrap());
+    let schema = Arc::new(BatchSchema::new(vec![
+        test_batch_field(ColumnType::LongLong),
+        test_batch_field(ColumnType::VarString),
+        test_batch_field(ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        }),
+    ]));
+    for retained in [[true, false, true], [false, false, false]] {
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::I64 {
+                    data: (0..32).collect(),
+                    nulls: None,
+                },
+                ColumnVector::from_values(
+                    (0..32).map(|_| Value::String("x".repeat(4096))).collect(),
+                ),
+                ColumnVector::from_values(
+                    (0..32)
+                        .map(|row| {
+                            if row == 3 {
+                                Value::Null
+                            } else {
+                                Value::DecimalCompact(row * 125, 2)
+                            }
+                        })
+                        .collect(),
+                ),
+            ],
+        )
+        .with_selection(Selection::Indices(vec![1, 3, 17]));
+        let expected = [1, 3, 17].map(|row| {
+            batch
+                .columns()
+                .iter()
+                .zip(retained)
+                .map(|(column, keep)| {
+                    if keep {
+                        column.value_at(row)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut output =
+            GraceJoinOutput::write_from(&db, schema.clone(), |emit| emit(batch), Some(&retained))
+                .unwrap();
+        let Some(GraceJoinPart::Disk { dir, .. }) = output.parts.front() else {
+            panic!("output must exercise the spill codec");
+        };
+        assert!(std::fs::metadata(dir.path().join("output")).unwrap().len() < 512);
+        let batch = output.next_batch().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        for (row, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| column.value_at(row))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(output.next_batch().unwrap().is_none());
+    }
 }
 
 #[test]

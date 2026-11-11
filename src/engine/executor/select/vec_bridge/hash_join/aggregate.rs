@@ -138,6 +138,14 @@ impl HashJoinBatchOperator<'_> {
         let aggregate_sources = aggregate_sources;
         aggregate.set_input_schema(self.schema.clone());
 
+        if preserve_build
+            && !aggregate.direct_build_rollup
+            && computed_expressions.is_none()
+            && self.try_dense_build_count(aggregate, &build_group_sources, &aggregate_sources)?
+        {
+            return Ok(true);
+        }
+
         self.initialize()?;
         // With unique build keys, probe-only groups have no join
         // multiplicity to fold. Keep the initialized join and feed ordinary

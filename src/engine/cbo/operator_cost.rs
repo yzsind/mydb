@@ -736,6 +736,25 @@ pub fn estimated_btree_height(entries: f64) -> f64 {
     (entries.log(fanout)).ceil().max(1.0)
 }
 
+/// Probe CPU after the optional runtime filter, shared with parallel costing.
+pub(crate) fn hash_join_probe_cpu(probe_rows: f64, match_rate: f64, filtered: bool) -> f64 {
+    let consts = cbo_consts();
+    let matches = match_rate.clamp(0.0, 1.0);
+    let ordinary = consts.hash_probe_cost() + matches * consts.cpu_operator_cost();
+    let per_row = if filtered {
+        // A runtime filter tests every key, but only survivors hash/probe the
+        // payload. Charge the same conservative false positives as Grace I/O.
+        let pass = matches + (1.0 - matches) * 0.125;
+        (consts.cpu_operator_cost()
+            + pass * consts.hash_probe_cost()
+            + matches * consts.cpu_operator_cost())
+        .min(ordinary)
+    } else {
+        ordinary
+    };
+    probe_rows * per_row
+}
+
 /// Cost of a hash join. The build side feeds a hash table, the probe
 /// side streams through it. Returns a [`Cost`] whose `startup` reflects
 /// the build phase (must complete before probing emits any rows).
@@ -788,27 +807,27 @@ pub fn hash_join(
         probe_rows * probe_width * probe_spill_pass_rate,
         ctx.planning_mem_budget_bytes as f64,
     );
-    let cpu_build = build_rows * (consts.hash_build_cost() + consts.cpu_tuple_cost());
-    let cpu_probe = probe_rows
-        * (consts.hash_probe_cost() + match_rate.clamp(0.0, 1.0) * consts.cpu_operator_cost());
-    let cpu_output = output_rows.max(0.0) * per_row_decode_cost(output_width);
-    let bloom_savings = if bloom_filter_applicable {
-        // Bloom prefilter discards (1 - match_rate) of probe rows
-        // before they hit the hash table. Phase 6 calibration may
-        // refine this 0.7 efficiency factor.
-        probe_rows * (1.0 - match_rate.clamp(0.0, 1.0)) * consts.cpu_operator_cost() * 0.7
+    // Grace currently materializes joined batches before its parent can pull
+    // them. Charge that write/read as well as partitioning the two inputs;
+    // otherwise a wide intermediate looks as cheap as a narrow one.
+    let spill_output = if spill > 0.0 {
+        output_rows.max(0.0) * output_width.max(0.0) / PAGE_SIZE_BYTES as f64
+            * 2.0
+            * consts.spill_page_cost()
     } else {
         0.0
     };
-    let startup = build_cost.total + cpu_build + spill;
-    let total = startup + probe_cost.total + cpu_probe + cpu_output - bloom_savings;
+    let cpu_build = build_rows * (consts.hash_build_cost() + consts.cpu_tuple_cost());
+    let cpu_probe = hash_join_probe_cpu(probe_rows, match_rate, bloom_filter_applicable);
+    let cpu_output = output_rows.max(0.0) * per_row_decode_cost(output_width);
+    let startup = build_cost.total + cpu_build + spill + spill_output;
+    let total = startup + probe_cost.total + cpu_probe + cpu_output;
     Cost {
         startup,
         total: total.max(startup),
         io_seq_pages: build_cost.io_seq_pages + probe_cost.io_seq_pages,
         io_rnd_pages: build_cost.io_rnd_pages + probe_cost.io_rnd_pages,
-        cpu_units: build_cost.cpu_units + probe_cost.cpu_units + cpu_build + cpu_probe + cpu_output
-            - bloom_savings,
+        cpu_units: build_cost.cpu_units + probe_cost.cpu_units + cpu_build + cpu_probe + cpu_output,
         mem_bytes: build_cost
             .mem_bytes
             .max(probe_cost.mem_bytes)
@@ -1810,6 +1829,23 @@ mod tests {
             true,
         );
         assert!(with_bloom.total <= no_bloom.total);
+    }
+
+    #[test]
+    fn hash_join_runtime_filter_prices_surviving_hash_probes() {
+        let all = hash_join_probe_cpu(1_000_000.0, 1.0, false);
+        assert_eq!(all, hash_join_probe_cpu(1_000_000.0, 1.0, true));
+        let selective = hash_join_probe_cpu(1_000_000.0, 0.01, true);
+        assert!(selective > 0.0 && selective < all * 0.5);
+        for filtered in [false, true] {
+            let mut previous = 0.0;
+            for rate in [0.0, 0.01, 0.1, 0.5, 1.0] {
+                let cost = hash_join_probe_cpu(1_000_000.0, rate, filtered);
+                assert!(cost >= previous);
+                assert_eq!(hash_join_probe_cpu(2_000_000.0, rate, filtered), cost * 2.0);
+                previous = cost;
+            }
+        }
     }
 
     #[test]

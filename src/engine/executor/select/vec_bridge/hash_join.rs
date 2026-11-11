@@ -33,6 +33,7 @@ use crate::types::QueryError;
 
 mod aggregate;
 mod build_domain;
+mod dense_count;
 #[cfg(test)]
 mod tests;
 
@@ -358,6 +359,7 @@ pub(in crate::engine::executor::select) fn try_vec_hash_join(
             hj_limits.grace_max_depth,
             0,
             false,
+            None,
         )?;
         VEC_HASH_JOIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         return Ok(Some(materialize_join_batches(
@@ -500,6 +502,7 @@ pub(in crate::engine::executor::select) fn try_vec_hash_join(
                 hj_limits.grace_max_depth,
                 0,
                 false,
+                None,
             )?;
             VEC_HASH_JOIN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             return Ok(Some(materialize_join_batches(
@@ -534,6 +537,7 @@ pub(crate) struct HashJoinBatchOperator<'a> {
     state: Option<HashJoinState>,
     output: Option<std::vec::IntoIter<Batch>>,
     grace_output: Option<GraceJoinOutput>,
+    spill_output_columns: Option<Vec<bool>>,
     work_area: Option<crate::engine::executor::work_area::WorkAreaHandle>,
     build_memory_charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
     finished: bool,
@@ -1436,6 +1440,7 @@ impl HashJoinBatchOperator<'_> {
                 limits.grace_max_depth,
                 0,
                 self.prefer_spill_key_locality,
+                self.spill_output_columns.as_deref(),
             )?;
             self.grace_output = Some(batches);
         } else {
@@ -1561,6 +1566,7 @@ impl HashJoinBatchOperator<'_> {
                         limits.grace_max_depth,
                         0,
                         self.prefer_spill_key_locality,
+                        self.spill_output_columns.as_deref(),
                     )?;
                     self.grace_output = Some(batches);
                     return Ok(());
@@ -2576,11 +2582,34 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
                 original_output_indices.clone(),
             )
         };
+    // The external projection still owns SQL-visible column order. Grace
+    // can omit dead payloads from its files while keeping physical positions
+    // stable for that projection and for direct aggregate delegation.
+    let spill_output_columns =
+        if scalar_residual.is_none() && !matches!(join_type, JoinType::Semi | JoinType::Anti) {
+            let mut retained = vec![false; out_schema.len()];
+            match output_projection.as_deref() {
+                Some(projection) => {
+                    for &index in projection.iter() {
+                        retained[original_output_indices[index]] = true;
+                    }
+                }
+                None => {
+                    for &index in &original_output_indices {
+                        retained[index] = true;
+                    }
+                }
+            }
+            retained.iter().any(|keep| !keep).then_some(retained)
+        } else {
+            None
+        };
     let mut operator = HashJoinBatchOperator {
         build_plan: Some(build_plan),
         pushed_runtime_rejected: None,
         prefer_spill_key_locality: false,
         grace_output: None,
+        spill_output_columns,
         db: Arc::clone(db),
         txn,
         build: build_stream,
@@ -2761,6 +2790,7 @@ pub(super) fn try_build_vec_nested_loop_join_input<'a>(
         pushed_runtime_rejected: None,
         prefer_spill_key_locality: false,
         grace_output: None,
+        spill_output_columns: None,
         db: Arc::clone(db),
         txn,
         build: build_stream,

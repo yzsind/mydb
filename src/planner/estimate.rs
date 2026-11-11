@@ -2617,14 +2617,13 @@ pub(super) fn estimate_hash_join_operator_cost(
     // joins use the adaptive in-memory filter, while the vector Grace path
     // builds one before spilling the probe partitions. The adaptive sampler
     // enables at a >=50% miss rate, hence the stable selectivity gate here.
-    // The Grace bitmap caps its sizing input at 8M rows and rounds to a
-    // 134M-bit allocation; beyond roughly 32M inserted keys its false-positive
-    // rate no longer supports the conservative 12.5% costing assumption.
+    // Keep the cost credit conservative at larger cardinalities: bounded
+    // Grace filters can saturate, so a 12.5% false-positive rate is not
+    // justified for arbitrarily large builds.
     const BLOOM_COST_MAX_BUILD_ROWS: f64 = 32_000_000.0;
-    let bloom_applicable = build_rows <= 1_000_000.0
-        || (matches!(join_type, JoinType::Inner | JoinType::Semi)
-            && build_rows <= BLOOM_COST_MAX_BUILD_ROWS
-            && match_rate <= 0.5);
+    let bloom_applicable = matches!(join_type, JoinType::Inner | JoinType::Semi)
+        && (build_rows <= 1_000_000.0
+            || (build_rows <= BLOOM_COST_MAX_BUILD_ROWS && match_rate <= 0.5));
     let runtime_probe = if join_type == JoinType::Inner
         && residual.is_none()
         && left_keys.len() == 1
@@ -2664,8 +2663,16 @@ pub(super) fn estimate_hash_join_operator_cost(
     );
     if runtime_probe.is_none() {
         apply_hash_join_parallel_probe_cost_adjustment(
-            &mut cost, probe_plan, probe_cost, build_rows, probe_rows, join_type, build_side,
-            residual, match_rate,
+            &mut cost,
+            probe_plan,
+            probe_cost,
+            build_rows,
+            probe_rows,
+            join_type,
+            build_side,
+            residual,
+            match_rate,
+            bloom_applicable,
         );
     }
     (cost, build_side, output_est)

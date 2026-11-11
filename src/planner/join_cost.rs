@@ -441,6 +441,7 @@ pub(super) fn apply_hash_join_parallel_probe_cost_adjustment(
     build_side: BuildSide,
     residual: Option<&Expr>,
     match_rate: f64,
+    bloom_applicable: bool,
 ) {
     // The executor's parallel probe (C1) serves Inner joins and
     // probe-preserved outer joins: LEFT with build=right / RIGHT with
@@ -456,14 +457,18 @@ pub(super) fn apply_hash_join_parallel_probe_cost_adjustment(
     if !probe_preserved || residual.is_some() {
         return;
     }
-    let degree = hash_join_parallel_probe_degree_for_cost(build_rows, probe_rows);
-    if degree <= 1 {
-        return;
-    }
-    let d = degree as f64;
-
-    if let Some(parallel_probe_cost) =
-        parallelized_probe_scan_cost_for_hash_join(probe_plan, degree)
+    // Scan workers are independent of hash-probe workers. A large build may
+    // use a serial hash kernel while its scan still runs through Exchange.
+    // Previously the small-build parallel-probe gate also suppressed the
+    // scan discount, charging a serial scan that the final plan never runs.
+    let scan_degree = if parallel_planner_config().disabled {
+        1
+    } else {
+        cpu_bound_parallel_degree(default_parallel_degree())
+    };
+    if let Some(parallel_probe_cost) = (scan_degree > 1)
+        .then(|| parallelized_probe_scan_cost_for_hash_join(probe_plan, scan_degree))
+        .flatten()
     {
         let saved = (probe_cost.total - parallel_probe_cost.total).max(0.0);
         cost.total = (cost.total - saved).max(cost.startup);
@@ -475,9 +480,16 @@ pub(super) fn apply_hash_join_parallel_probe_cost_adjustment(
         .max(0.0);
     }
 
-    let consts = crate::engine::cbo::cbo_consts();
-    let cpu_probe = probe_rows
-        * (consts.hash_probe_cost() + match_rate.clamp(0.0, 1.0) * consts.cpu_operator_cost());
+    let degree = hash_join_parallel_probe_degree_for_cost(build_rows, probe_rows);
+    if degree <= 1 {
+        return;
+    }
+    let d = degree as f64;
+    let cpu_probe = crate::engine::cbo::operator_cost::hash_join_probe_cpu(
+        probe_rows,
+        match_rate,
+        bloom_applicable,
+    );
     let cpu_saved = cpu_probe * (1.0 - 1.0 / d);
     cost.total = (cost.total - cpu_saved).max(cost.startup);
     cost.cpu_units = (cost.cpu_units - cpu_saved).max(0.0);
@@ -608,11 +620,11 @@ pub(crate) fn adaptive_candidate_cost(
 /// while the ordinary Grace I/O term prices the logical bytes written/read.
 /// That is sufficient when hash is the only bounded algorithm, but it omits
 /// the executor's per-partition routing and per-value encoding/decoding work:
-/// rows are routed among the default 16 writer streams and replayed through
-/// the typed row codec. A unique point lookup does neither and has bounded
-/// output (`<= outer rows`), so use the remaining partition fanout as a
-/// deterministic severe-spill risk envelope. This factor represents omitted
-/// codec/routing work; it is not a claim that the bytes are written 16 times.
+/// each row is routed to one writer and replayed through the typed row codec.
+/// Partition fanout does not multiply this work: charging fifteen additional
+/// full passes discarded useful hash candidates before join enumeration.
+/// Price the encode/decode bytes using the same public byte CPU coefficient
+/// as scans. Output materialization is charged by the ordinary hash cost.
 ///
 /// This does not globally raise `cbo_spill_page_cost`: joins without a safe
 /// unique lookup alternative, or whose build is below the severe-overflow
@@ -621,13 +633,7 @@ pub(super) fn grace_hash_unique_lookup_risk_surcharge(cost: crate::engine::cbo::
     if cost.spill_bytes <= 0.0 {
         return 0.0;
     }
-    const PAGE_BYTES: f64 = (16 * 1024) as f64;
-    const GRACE_PARTITIONS: f64 = 16.0;
-    let build_pages = (cost.spill_bytes / PAGE_BYTES).ceil();
-    build_pages
-        * 2.0
-        * crate::engine::cbo::cbo_consts().spill_page_cost()
-        * (GRACE_PARTITIONS - 1.0)
+    cost.spill_bytes * 2.0 * crate::engine::cbo::cbo_consts().cpu_byte_decode_cost()
 }
 
 /// Cost-side mirror of `engine::executor::select::plan::inlj_outer_parallelism`.
