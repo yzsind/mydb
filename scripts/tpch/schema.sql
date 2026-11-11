@@ -57,7 +57,7 @@ CREATE TABLE partsupp (
 );
 
 CREATE TABLE orders (
-  o_orderkey     INTEGER NOT NULL PRIMARY KEY,
+  o_orderkey     BIGINT NOT NULL PRIMARY KEY,
   o_custkey      INTEGER NOT NULL,
   o_orderstatus  CHAR(1) NOT NULL,
   o_totalprice   DECIMAL(15,2) NOT NULL,
@@ -69,7 +69,7 @@ CREATE TABLE orders (
 );
 
 CREATE TABLE lineitem (
-  l_orderkey      INTEGER NOT NULL,
+  l_orderkey      BIGINT NOT NULL,
   l_partkey       INTEGER NOT NULL,
   l_suppkey       INTEGER NOT NULL,
   l_linenumber    INTEGER NOT NULL,
