@@ -9979,6 +9979,179 @@ fn txn_buffering_loser_update_rolled_back_on_crash() {
     );
 }
 
+// A hot heap page whose rows are updated by overlapping txn-buffered
+// transactions always carries a deferred WAL pin, so it can never be written
+// back and its recLSN (the first post-load change) pinned every fuzzy
+// checkpoint's redo floor: crash recovery replayed the whole history. The age
+// cleaner now asks pinning transactions to drain at their next statement
+// boundary; the floor must advance and recovery must stay exact, including a
+// loser that still holds a deferred pin at the crash.
+#[test]
+fn fuzzy_checkpoint_redo_floor_advances_past_hot_txn_buffered_page() {
+    std::env::set_var("MYDB_WAL_TXN_BUFFER", "1");
+    let dir = tempfile::tempdir().unwrap();
+    let int_col = |name: &str, pk: bool| ColumnDef {
+        name: name.into(),
+        data_type: DataType::Int,
+        unsigned: false,
+        zerofill: false,
+        display_width: None,
+        invisible: false,
+        nullable: false,
+        primary_key: pk,
+        unique: false,
+        auto_increment: false,
+        default: None,
+        on_update: None,
+        checks: Vec::new(),
+        generated: None,
+        charset: None,
+        collation: None,
+    };
+    const ROWS: i64 = 8;
+    const ROUNDS: i64 = 40;
+    let mut expected: Vec<i64> = (0..ROWS).map(|id| id * 1000).collect();
+    let loser_id;
+    {
+        let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+        // Background cleaners would race the deterministic interleaving.
+        db.buffer_pool.shutdown_flusher();
+        db.create_table(
+            "t",
+            vec![int_col("id", true), int_col("v", false)],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let load = db.begin_dml_txn().unwrap();
+        db.insert_rows(
+            load,
+            "test.t",
+            (0..ROWS)
+                .map(|id| vec![Value::Int(id), Value::Int(id * 1000)])
+                .collect(),
+        )
+        .unwrap();
+        db.commit_txn(load.txn_id).unwrap();
+        let row_ids: HashMap<i64, RowId> = db
+            .scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| match row.values[0] {
+                Value::Int(id) => (id, row.row_id),
+                _ => unreachable!(),
+            })
+            .collect();
+        let table = db.table("test.t").unwrap();
+        let bump = |txn: TxnView, id: i64| {
+            db.statement_savepoint(txn.txn_id).unwrap();
+            db.update_row_by_id_with_changed_columns(
+                txn,
+                &table,
+                row_ids[&id],
+                Some(&[1]),
+                |old| {
+                    let Value::Int(v) = old[1] else {
+                        unreachable!()
+                    };
+                    Ok(vec![old[0].clone(), Value::Int(v + 1)])
+                },
+            )
+            .unwrap();
+        };
+        let cleaner_tick = |db: &Database| {
+            db.buffer_pool
+                .observe_redo_age(db.log_state_atomics.next_lsn(), Duration::ZERO);
+            db.buffer_pool
+                .flush_oldest_dirty_striped_limited(0, 1, 4, true)
+                .unwrap();
+        };
+        let fuzzy_checkpoint = |db: &Database| {
+            db.checkpoint_locked(false, CHECKPOINT_TRIGGER_TIME)
+                .unwrap();
+            db.last_checkpoint_redo_lsn_atomic.load(Ordering::Acquire)
+        };
+        let first_round_lsn = db.log_state_atomics.next_lsn();
+        let mut previous = db.begin_dml_txn().unwrap();
+        bump(previous, 0);
+        let mut floors = Vec::new();
+        for round in 1..=ROUNDS {
+            // The next transaction pins the page before the previous one
+            // commits: at every point some transaction holds a deferred pin.
+            let next = db.begin_dml_txn().unwrap();
+            let id = round % ROWS;
+            bump(next, id);
+            db.commit_txn(previous.txn_id).unwrap();
+            expected[((round - 1) % ROWS) as usize] += 1;
+            // The next transaction reaches its second statement boundary.
+            db.statement_savepoint(next.txn_id).unwrap();
+            cleaner_tick(&db);
+            previous = next;
+            if round % 10 == 0 {
+                floors.push(fuzzy_checkpoint(&db));
+            }
+        }
+        assert!(
+            db.buffer_pool
+                .deferred_drain_requests
+                .load(Ordering::Relaxed)
+                > 0,
+            "the blocked hot page must request a drain"
+        );
+        assert!(
+            floors.windows(2).all(|pair| pair[1] > pair[0]),
+            "redo floor must advance with every checkpoint: {floors:?}"
+        );
+        assert!(
+            *floors.last().unwrap() > first_round_lsn,
+            "redo floor stuck at the first hot-page change: {floors:?} (start {first_round_lsn})"
+        );
+        // Crash with `previous` uncommitted: its change is a loser.
+        loser_id = ROUNDS % ROWS;
+        db.buffer_pool.shutdown_flusher();
+        std::mem::forget(db);
+    }
+    let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    let mut rows: Vec<(i64, i64)> = db
+        .scan_rows(
+            "test.t",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| match (&row.values[0], &row.values[1]) {
+            (Value::Int(id), Value::Int(v)) => (*id, *v),
+            _ => unreachable!(),
+        })
+        .collect();
+    rows.sort();
+    let expected: Vec<(i64, i64)> = (0..ROWS).map(|id| (id, expected[id as usize])).collect();
+    assert_eq!(rows, expected, "loser id={loser_id} must be rolled back");
+}
+
+#[test]
+fn index_rebuild_marker_distinguishes_planned_rebuild_from_failure() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("planned.idx");
+    IndexFile::persist_planned_rebuild_marker(&path).unwrap();
+    let planned = IndexFile::check_rebuild_marker(&path).unwrap_err();
+    assert!(
+        planned.message().contains("planned by crash recovery"),
+        "{}",
+        planned.message()
+    );
+    IndexFile::persist_rebuild_marker(&path).unwrap();
+    let failed = IndexFile::check_rebuild_marker(&path).unwrap_err();
+    assert!(
+        failed.message().contains("failed structural recovery"),
+        "{}",
+        failed.message()
+    );
+}
+
 #[test]
 fn relaxed_wal_redoes_committed_heap_without_heap_flush() {
     let dir = tempfile::tempdir().unwrap();

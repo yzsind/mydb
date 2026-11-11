@@ -170,6 +170,11 @@ struct TxnWalBuffer {
     reusable_boundary: Option<Arc<crate::storage::txn::WalSavepointBoundary>>,
     entries: Vec<TxnWalEntry>,
     page_reservation: Option<DeferredWalPageReservation>,
+    /// A parked record pins a frame whose write-back the age cleaner needs
+    /// (see `Frame::flush_wanted`). The next statement boundary appends the
+    /// buffer early so overlapping transactions cannot keep a hot page
+    /// unflushable, and with it the checkpoint redo floor, indefinitely.
+    drain_requested: bool,
     boundaries: Vec<(
         usize,
         std::sync::Weak<crate::storage::txn::WalSavepointBoundary>,
@@ -436,6 +441,7 @@ fn push_reserved_txn_wal_record(
     }
     buf.hold_page_reservation(reservation);
     buf.entries.push((payload, keys));
+    buf.drain_requested |= btree_logical_wal::take_txn_wal_drain_request();
     Ok(())
 }
 
@@ -482,6 +488,7 @@ where
     };
     buffer.hold_page_reservation(Some(reservation));
     buffer.entries.push((payload, keys));
+    buffer.drain_requested |= btree_logical_wal::take_txn_wal_drain_request();
     let result = write(0);
     drop(shard);
     Ok(result)
@@ -3866,6 +3873,7 @@ impl Database {
             mut entries,
             mut boundaries,
             page_reservation: _page_reservation,
+            drain_requested: _,
         } = take_txn_wal_entries(&self.log, txn_id);
         if let Some(begin) = begin {
             entries.insert(0, (begin, Vec::new()));
@@ -4210,6 +4218,8 @@ impl Database {
     /// checkpoint only when a trigger condition fired AND no other
     /// checkpoint is currently in progress.
     pub fn maybe_checkpoint(&self) -> Result<(), QueryError> {
+        self.buffer_pool
+            .observe_redo_age(self.log_state_atomics.next_lsn(), self.redo_age_lag());
         let Some(trigger) = self.should_checkpoint() else {
             return Ok(());
         };
@@ -4878,6 +4888,20 @@ impl Database {
         tracker.needs_full_sync = false;
         tracker.clear_and_release();
         Ok(())
+    }
+
+    /// How far the buffer pool's age-flush target trails the WAL head. A
+    /// quarter of the checkpoint interval keeps each fuzzy checkpoint's redo
+    /// floor close to its Begin, so crash replay stays within about
+    /// 1.25 intervals of WAL, while hot pages are written at most a few
+    /// times per interval.
+    fn redo_age_lag(&self) -> Duration {
+        let interval = if self.config.checkpoint_interval.is_zero() {
+            Duration::from_millis(DEFAULT_CHECKPOINT_INTERVAL_MS)
+        } else {
+            self.config.checkpoint_interval
+        };
+        (interval / 4).max(Duration::from_secs(1))
     }
 
     fn should_checkpoint(&self) -> Option<u8> {
@@ -5562,6 +5586,8 @@ impl Database {
             buffer_pool_checkpoint_preflush_us: buffer_pool.checkpoint_preflush_us,
             buffer_pool_prefetch_queue_depth_peak: buffer_pool.prefetch_queue_depth_peak,
             buffer_pool_oldest_dirty_lsn: buffer_pool.oldest_dirty_lsn,
+            buffer_pool_redo_age_target_lsn: buffer_pool.redo_age_target_lsn,
+            buffer_pool_deferred_drain_requests: buffer_pool.deferred_drain_requests,
             bulk_index_direct_builds: bulk_index.direct_builds,
             bulk_index_direct_pages: bulk_index.direct_pages,
             bulk_index_direct_us: bulk_index.direct_us,
@@ -6525,6 +6551,15 @@ impl Database {
         if self.config.durability != DurabilityMode::Memory {
             let key = txn_wal_buffer_key(&self.log, txn_id);
             let mut shard = txn_wal_buffer_shard(key).lock();
+            if shard.get(&key).is_some_and(|buf| buf.drain_requested) {
+                // An earlier statement pinned a page the age cleaner must
+                // write back. Append the parked records now, in order, before
+                // this statement's boundary is cut; the drain releases every
+                // pin this transaction holds.
+                drop(shard);
+                self.flush_txn_wal_buffer(txn_id, None)?;
+                shard = txn_wal_buffer_shard(key).lock();
+            }
             if let Some(buf) = shard.get_mut(&key) {
                 // Statements of one transaction are serialized by the caller.
                 // Every completed eager append has published its allocated LSN;
