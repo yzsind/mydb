@@ -181,8 +181,8 @@ plan cache failures; it does not affect SQL semantics.
 
 Parsed-statement and shared SELECT plan caches also have independent byte
 admission ceilings: each is sized at 1% of the startup working-set target,
-clamped to 1–64 MiB. Byte pressure evicts cached entries; an entry larger than
-its cache ceiling executes normally without being retained. Byte estimates
+clamped to 1 MiB–4 GiB per cache. Byte pressure evicts cached entries; an entry
+larger than its cache ceiling executes normally without being retained. Byte estimates
 include AST payloads and compiled-plan structures, so entry-count caps cannot
 retain an unbounded number of large SQL statements.
 
@@ -383,7 +383,7 @@ This is a best-effort eviction policy, not an additional SQL error threshold. Ex
 `memory_reclaim_attempts` and `memory_reclaim_buffer_bytes` include this work.
 
 The default ceiling of the catalog descriptor cache is 2% when
-`MYDB_MEMORY_TARGET<=1GiB` and 5% for larger targets, never exceeding 256 MiB;
+`MYDB_MEMORY_TARGET<=1GiB` and 5% for larger targets, never exceeding 4 GiB;
 the startup environment variable `MYDB_CATALOG_CACHE_MB` can override the value,
 and at runtime it can be adjusted with `SET GLOBAL mydb_catalog_cache_mb=N`. At
 v46 startup only object headers and the ID→name index are resident; column,

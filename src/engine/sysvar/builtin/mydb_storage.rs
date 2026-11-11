@@ -833,7 +833,7 @@ pub(crate) fn register(reg: &mut Registry) {
             },
         )
         .with_doc(
-            "Catalog descriptor/name/auth cache target in MB; defaults to 5% of MYDB_MEMORY_TARGET capped at 256 MB.",
+            "Catalog descriptor/name/auth cache target in MiB; defaults to 2% of MYDB_MEMORY_TARGET up to 1 GiB and 5% above, capped at 4 GiB.",
         ),
         |ctx| SysVarValue::UInt(ctx.db.map(|db| db.catalog_cache_mb()).unwrap_or(0)),
         |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {

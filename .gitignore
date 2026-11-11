@@ -19,7 +19,6 @@ logs/
 !/tests/fixtures/mysql80/
 !/tests/fixtures/xml-functions-mysql80.json
 docs/benchmark-results/
-docs/benchmarks/
 docs/performance
 docs/validation
 artifacts/

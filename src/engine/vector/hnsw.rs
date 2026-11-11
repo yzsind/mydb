@@ -757,6 +757,17 @@ thread_local! {
     static SCRATCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::new());
 }
 
+#[cfg(test)]
+thread_local! {
+    static NODE_RESERVED_TEST_HOOK: RefCell<Option<Box<dyn FnOnce(u32)>>> = const {
+        RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[path = "hnsw_publication_tests.rs"]
+mod publication_tests;
+
 /// Per-node state. Stored **inline** in the [`NodeSlab`] at a stable address
 /// (segments never move once allocated), so navigation borrows `&Node`
 /// lock-free — no `Arc` clone, no slab lock per distance.
@@ -882,6 +893,21 @@ impl NodeSlab {
         }
     }
 
+    /// Borrow a claimed slot only after initialization. Callers must exclude
+    /// slab reclamation, just as for `get`.
+    fn get_initialized(&self, id: u32) -> Option<&Node> {
+        let (bucket, off) = slab_slot(id as usize);
+        let flags = self.ready[bucket].load(Ordering::Acquire);
+        // SAFETY: the flag bucket, if allocated, remains live under the
+        // caller's structural guard. Acquire publishes the node before any
+        // reference to its bytes is formed.
+        if flags.is_null() || !unsafe { &*flags.add(off) }.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.get(id))
+        }
+    }
+
     /// Append a node, returning its id. The node is built by `make` from its
     /// freshly-assigned id (the HNSW level assignment is seeded by it). Lock-
     /// free except for the at-most-once-per-bucket allocation.
@@ -897,6 +923,13 @@ impl NodeSlab {
                     format!("HNSW graph exceeded its {SLAB_CAPACITY} node id space"),
                 )
             })?;
+        #[cfg(test)]
+        NODE_RESERVED_TEST_HOOK.with(|hook| {
+            let hook = hook.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook(id as u32);
+            }
+        });
         let node = make(id as u32);
         let (bucket, off) = slab_slot(id);
         let mut base = self.dir[bucket].load(Ordering::Acquire);
@@ -934,9 +967,9 @@ impl NodeSlab {
     ///
     /// Invariant (upheld by every caller): `id` was produced by a prior `push`
     /// and reached here either through a neighbour list / entry point (so its
-    /// slot is written and visible), through `published_len`'s acquire edge,
-    /// or in a structural write-locked full scan. All callers also exclude
-    /// concurrent `clear` with structural or exclusive ownership.
+    /// slot is written and visible), through `published_len` / `get_initialized`'s
+    /// acquire edge, or in a structural write-locked full scan. All callers
+    /// also exclude concurrent `clear` with structural or exclusive ownership.
     #[inline]
     fn get(&self, id: u32) -> &Node {
         let id = id as usize;
@@ -944,6 +977,14 @@ impl NodeSlab {
         let (bucket, off) = slab_slot(id);
         let base = self.dir[bucket].load(Ordering::Acquire);
         debug_assert!(!base.is_null());
+        #[cfg(debug_assertions)]
+        {
+            let flags = self.ready[bucket].load(Ordering::Acquire);
+            assert!(
+                !flags.is_null() && unsafe { &*flags.add(off) }.load(Ordering::Acquire),
+                "hnsw node id {id} is not initialized"
+            );
+        }
         // SAFETY: see method invariant. The bucket is allocated (id < len) and
         // never moves; the slot was written before publication.
         unsafe { &*base.add(off) }
@@ -3385,6 +3426,7 @@ impl HnswIndex {
     /// k-nearest-neighbour search. Returns up to `k` `(row_id, ordering_dist)`
     /// pairs ascending by distance, skipping tombstoned nodes. `ef_search` is
     /// the dynamic candidate-list size at layer 0 (clamped to ≥ k).
+    #[inline]
     pub(crate) fn advance_cursor(
         &self,
         cursor: &mut super::cursor::VectorSearchCursor,
@@ -3438,11 +3480,16 @@ impl HnswIndex {
                 cursor.work.distances += 1;
             }
         }
-        if effort >= self.nodes.len() {
-            let end = cursor
-                .scan_position
-                .saturating_add(1024)
-                .min(self.nodes.len());
+        let node_count = self.nodes.len();
+        if effort >= node_count {
+            // Claimed slots may still be under construction. A cursor cannot
+            // skip a hole and then prove exhaustion: request heap completion
+            // instead. New appends beyond this captured range belong to a
+            // later view, or invalidate this cursor through mutation_epoch.
+            if self.nodes.published_len() < node_count {
+                return Ok(false);
+            }
+            let end = cursor.scan_position.saturating_add(1024).min(node_count);
             for id in cursor.scan_position as u32..end as u32 {
                 if cursor.hnsw.visited.contains(&(id as u64)) {
                     continue;
@@ -3465,12 +3512,12 @@ impl HnswIndex {
                 crate::engine::cancel::check_cancelled()?;
             }
             cursor.scan_position = end;
-            if end < self.nodes.len() {
+            if end < node_count {
                 cursor.resume_work = true;
                 return Ok(epoch == self.mutation_epoch.load(Ordering::Acquire));
             }
             cursor.hnsw.frontier.clear();
-            cursor.hnsw.expanded = self.nodes.len();
+            cursor.hnsw.expanded = node_count;
             return Ok(epoch == self.mutation_epoch.load(Ordering::Acquire));
         }
         let mut neighbors = Vec::new();
@@ -3538,12 +3585,16 @@ impl HnswIndex {
             // scores the slab directly, covering such components and avoiding
             // graph/quantization work without changing bounded ANN searches.
             let mut out = Vec::with_capacity(node_count);
-            for id in 0..node_count as u32 {
-                let node = self.node_at(id);
-                if !node.deleted.load(Ordering::Acquire) {
-                    let distance =
-                        self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
-                    out.push((node.row_id, distance));
+            if self.nodes.published_len() < node_count {
+                self.score_initialized_nodes(query, node_count, &mut out);
+            } else {
+                for id in 0..node_count as u32 {
+                    let node = self.node_at(id);
+                    if !node.deleted.load(Ordering::Acquire) {
+                        let distance =
+                            self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                        out.push((node.row_id, distance));
+                    }
                 }
             }
             if out.len() > k {
@@ -3617,6 +3668,36 @@ impl HnswIndex {
         }
         out.sort_unstable_by(cmp);
         out
+    }
+
+    /// Score an incomplete publication range without adding another live loop
+    /// bound or per-node flag checks to the fully published fast path.
+    #[cold]
+    fn score_initialized_nodes(
+        &self,
+        query: &[f32],
+        node_count: usize,
+        out: &mut Vec<(RowId, f64)>,
+    ) {
+        let initialized = self.nodes.published_len().min(node_count);
+        for id in 0..initialized as u32 {
+            let node = self.node_at(id);
+            if !node.deleted.load(Ordering::Acquire) {
+                let distance =
+                    self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                out.push((node.row_id, distance));
+            }
+        }
+        for id in initialized as u32..node_count as u32 {
+            let Some(node) = self.nodes.get_initialized(id) else {
+                continue;
+            };
+            if !node.deleted.load(Ordering::Acquire) {
+                let distance =
+                    self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                out.push((node.row_id, distance));
+            }
+        }
     }
 
     // ---- serialization ----

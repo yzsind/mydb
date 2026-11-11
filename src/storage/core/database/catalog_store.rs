@@ -85,7 +85,7 @@ impl CatalogManager {
         let default_limit = memory_target
             .saturating_mul(default_pct)
             .saturating_div(100)
-            .min(256 * 1024 * 1024);
+            .min(4 * 1024 * 1024 * 1024);
         let configured = crate::util::env::var("MYDB_CATALOG_CACHE_MB")
             .ok()
             .and_then(|value| value.parse::<usize>().ok())
