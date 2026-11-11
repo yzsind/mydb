@@ -86,6 +86,16 @@ pub(crate) const INSERT_UNDO_PER_ROW_BYTES: u64 = 6;
 /// the WAL group commit at the steady state.
 pub(crate) const DEFAULT_UNDO_BUFFER_BYTES: u64 = 1024 * 1024;
 
+/// Written undo bytes a shard accumulates before asking the kernel to start
+/// writeback. Hinting every tail flush resubmits the same partially filled
+/// block once per small flush; on IOPS-limited block storage those requests
+/// queue ahead of the WAL durability write and stall every committer.
+const UNDO_WRITEBACK_AFTER_BYTES: u64 = 1024 * 1024;
+
+/// Writeback hints end on this boundary so the block that later appends
+/// will rewrite is not submitted until it is complete.
+const UNDO_WRITEBACK_ALIGN: u64 = 4096;
+
 fn default_undo_buffer_bytes() -> u64 {
     std::env::var("MYDB_UNDO_BUFFER_BYTES")
         .ok()
@@ -997,6 +1007,9 @@ pub(crate) struct UndoWriteShard {
     pub(crate) write_frame_latency: LatencyHistogram,
     pub(crate) flush_latency: LatencyHistogram,
     pub(crate) buffer_flushes: u64,
+    /// Bytes at the end of the flushed prefix whose writeback has not been
+    /// requested yet (see `UNDO_WRITEBACK_AFTER_BYTES`).
+    unhinted_bytes: u64,
     /// Segments written since the last checkpoint barrier, including rotated ones.
     pending_sync: BTreeSet<u32>,
     /// The current checkpoint's obligations while its I/O releases this latch.
@@ -1041,6 +1054,7 @@ impl UndoWriteShard {
             write_frame_latency: LatencyHistogram::default(),
             flush_latency: LatencyHistogram::default(),
             buffer_flushes: 0,
+            unhinted_bytes: 0,
             pending_sync: BTreeSet::new(),
             syncing_segments: None,
             next_seg_seq: 1,
@@ -1104,6 +1118,9 @@ impl UndoWriteShard {
         self.active_file = Some(file);
         self.tail_buffer.clear();
         self.buffer_start = self.active_offset;
+        // The previous segment's unhinted suffix is left to its checkpoint
+        // sync; hint offsets must never be applied to a different file.
+        self.unhinted_bytes = 0;
         Ok(())
     }
 
@@ -1177,15 +1194,28 @@ impl UndoWriteShard {
             .map_err(io_err)?;
         file.write_all(&self.tail_buffer).map_err(io_err)?;
         file.flush().map_err(io_err)?;
-        // Undo segments are only fsynced by checkpoints. Start writeback now
-        // so the page cache does not accumulate them into an expiry burst
-        // that stalls WAL fsyncs; a failed hint leaves them to the flusher.
-        let _ = crate::util::file::start_file_writeback(
-            file,
-            self.buffer_start,
-            self.tail_buffer.len(),
-        );
-        self.buffer_start += self.tail_buffer.len() as u64;
+        let flushed_end = self.buffer_start + self.tail_buffer.len() as u64;
+        // Undo segments are only fsynced by checkpoints. Start writeback in
+        // large complete-block ranges so the page cache does not accumulate
+        // them into an expiry burst that stalls WAL fsyncs, without issuing
+        // one small device write per flush. A failed hint leaves the range
+        // to the kernel flusher.
+        self.unhinted_bytes = self
+            .unhinted_bytes
+            .saturating_add(self.tail_buffer.len() as u64);
+        if self.unhinted_bytes >= UNDO_WRITEBACK_AFTER_BYTES {
+            let start = flushed_end.saturating_sub(self.unhinted_bytes);
+            let end = flushed_end - flushed_end % UNDO_WRITEBACK_ALIGN;
+            if end > start {
+                let _ = crate::util::file::start_file_writeback(
+                    file,
+                    start,
+                    usize::try_from(end - start).unwrap_or(usize::MAX),
+                );
+                self.unhinted_bytes = flushed_end - end;
+            }
+        }
+        self.buffer_start = flushed_end;
         self.tail_buffer.clear();
         self.buffer_flushes = self.buffer_flushes.saturating_add(1);
         self.flush_latency
@@ -1297,6 +1327,12 @@ pub(crate) struct UndoManager {
     /// separate from retention history prevents rescanning evicted metadata on
     /// every append when the metadata floor alone exceeds the cache limit.
     eviction_candidates: BTreeSet<(u64, u64)>,
+    /// Releasable payload bytes that became eviction candidates since the
+    /// last eviction pass. A pass has to flush every shard tail first, so it
+    /// runs only once this reaches `eviction_batch_bytes`: when the metadata
+    /// floor alone exceeds the cache limit, each append would otherwise pay
+    /// a tail flush to evict just the record it added.
+    evictable_since_pass: u64,
     pub(crate) current_bytes: u64,
     /// Capacity-based bytes actually owned by the undo directory: fixed
     /// metadata plus any currently resident payload. `current_bytes` remains
@@ -1306,7 +1342,8 @@ pub(crate) struct UndoManager {
     pub(crate) resident_bytes: u64,
     /// Phase 2 — in-memory payload cap (bytes; 0 = unbounded, no eviction).
     /// Once `resident_bytes` exceeds it the append path evicts the oldest
-    /// flushed payloads down to a low-water mark or the metadata floor.
+    /// payloads, in batches of one eighth of the cap, down to a low-water
+    /// mark or the metadata floor. The cap is therefore soft by one batch.
     /// Reads page full records back in without caching them.
     pub(crate) mem_cache_limit_bytes: u64,
     /// Phase 2 — cumulative count of payload evictions (SHOW STATUS).
@@ -1610,6 +1647,7 @@ impl Default for UndoManager {
             records: FastHashMap::default(),
             created_index: BTreeMap::new(),
             eviction_candidates: BTreeSet::new(),
+            evictable_since_pass: 0,
             current_bytes: 0,
             resident_bytes: 0,
             mem_cache_limit_bytes: 0,
@@ -2583,7 +2621,7 @@ impl UndoManager {
         undo.load_manifest_mode(false)?;
         undo.scan_segments(None)?;
         undo.refresh_metrics();
-        undo.evict_to_cache_budget();
+        undo.evict_to_cache_budget_now();
         Ok(undo)
     }
 
@@ -2802,7 +2840,7 @@ impl UndoManager {
         // Phase 3 — WAL repair may have re-inserted a few resident
         // records; trim back to the cap so the post-recovery resident
         // footprint honors `mem_cache_limit_bytes` (no-op when unset).
-        undo.evict_to_cache_budget();
+        undo.evict_to_cache_budget_now();
         undo.persist_manifest()?;
         Ok(undo)
     }
@@ -3018,7 +3056,7 @@ impl UndoManager {
             record.encoded_len = bytes.len() as u32;
             self.insert_reserved(record, resident_reservation)?;
             // Phase 2 — keep the resident payload within the cache cap.
-            // Cheap no-op (one branch) until the cap is exceeded.
+            // Cheap no-op (one branch) until a batch is evictable.
             self.evict_to_cache_budget();
             Ok((ptr, bytes, pressure))
         } else {
@@ -3191,9 +3229,10 @@ impl UndoManager {
             .saturating_sub(old_end)
             .saturating_add(new_end);
         self.insert_reserved(record, resident_reservation)?;
-        // Match `append_record_preencoded`: usually one cheap limit branch;
-        // after crossing the high-water, flush the shard tails and evict an
-        // oldest prefix down to the 87.5% low-water in one batch.
+        // Match `append_record_preencoded`: usually one cheap branch; once a
+        // batch of releasable payload has accumulated above the high-water,
+        // flush the shard tails and evict an oldest prefix down to the 87.5%
+        // low-water.
         self.evict_to_cache_budget();
         Ok((ptr, bytes, pressure))
     }
@@ -3507,7 +3546,7 @@ impl UndoManager {
                 validate_scanned_undo_tail(&decoded, &writable_tails, force_recover)?;
                 self.apply_decoded_segment(decoded)?;
                 if bounded {
-                    self.evict_to_cache_budget();
+                    self.evict_to_cache_budget_now();
                 }
             }
         } else {
@@ -3722,6 +3761,9 @@ impl UndoManager {
             && resident_size(&record) > metadata_resident_bytes(&record)
         {
             self.eviction_candidates.insert((created_ms, id));
+            self.evictable_since_pass = self
+                .evictable_since_pass
+                .saturating_add(resident_size(&record) - metadata_resident_bytes(&record));
         }
         self.records.insert(id, UndoRecord { id, ..record });
         reservation.commit();
@@ -3731,6 +3773,7 @@ impl UndoManager {
     fn refresh_metrics(&mut self) {
         self.created_index.clear();
         self.eviction_candidates.clear();
+        self.evictable_since_pass = 0;
         self.segment_live_records.clear();
         self.txn_bytes.clear();
         self.longest_chain_depth = 0;
@@ -3770,6 +3813,9 @@ impl UndoManager {
             {
                 self.eviction_candidates
                     .insert((record.created_unix_ms, *id));
+                self.evictable_since_pass = self
+                    .evictable_since_pass
+                    .saturating_add(resident_size(record) - metadata_resident_bytes(record));
             }
             self.created_index
                 .entry(record.created_unix_ms)
@@ -4371,11 +4417,28 @@ impl UndoManager {
     /// triggers a history scan or a flush when there is nothing left to evict.
     /// Flush shard tails before removing candidates so failed I/O retains both
     /// payloads and candidates for a later retry.
+    ///
+    /// The append path batches passes (see `evictable_since_pass`); callers
+    /// that change the cap or rebuild the directory evict immediately.
     fn evict_to_cache_budget(&mut self) {
+        if self.evictable_since_pass >= self.eviction_batch_bytes() {
+            self.evict_to_cache_budget_now();
+        }
+    }
+
+    /// Releasable payload a batched pass waits for. One eighth of the cap
+    /// matches the distance between the cap and its low-water mark, so a
+    /// pass frees about as much as the regular over-cap pass does.
+    fn eviction_batch_bytes(&self) -> u64 {
+        self.mem_cache_limit_bytes / 8
+    }
+
+    fn evict_to_cache_budget_now(&mut self) {
         let limit = self.mem_cache_limit_bytes;
         if limit == 0 || self.resident_bytes <= limit || self.eviction_candidates.is_empty() {
             return;
         }
+        self.evictable_since_pass = 0;
         // Make every persistent frame durable on its segment file so an
         // evicted payload can always be paged back in. If the flush fails
         // we keep payloads resident rather than risk an unrecoverable
@@ -4431,7 +4494,7 @@ impl UndoManager {
     /// Phase 2 — in-memory payload cap setter (bytes; 0 = unbounded).
     pub(crate) fn set_mem_cache_limit_bytes(&mut self, bytes: u64) {
         self.mem_cache_limit_bytes = bytes;
-        self.evict_to_cache_budget();
+        self.evict_to_cache_budget_now();
     }
 
     pub(crate) fn mem_cache_limit_bytes(&self) -> u64 {
@@ -8372,6 +8435,91 @@ mod buffer_tests {
         let id = undo.append_record(insert, true).unwrap().0;
         assert!(undo.records[&id].resident);
         assert!(undo.eviction_candidates.is_empty());
+    }
+
+    /// Once retained metadata alone exceeds the cache cap, an append must not
+    /// flush every shard tail just to evict the record it added: passes run
+    /// per batch of releasable payload, and evicted payloads stay readable.
+    #[test]
+    fn eviction_above_metadata_floor_batches_tail_flushes() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut undo = open(dir.path());
+        undo.set_mem_cache_limit_bytes(0);
+        for i in 1..=512 {
+            undo.append_record(record(i), true).unwrap();
+        }
+        let limit = 64 * 1024;
+        undo.set_mem_cache_limit_bytes(limit);
+        assert!(undo.eviction_candidates.is_empty());
+        assert!(undo.resident_bytes > limit, "metadata exceeds the cap");
+
+        let flushes_before = undo.buffer_flushes_total();
+        let evicted_before = undo.evicted_records;
+        let appends = 2_000u64;
+        let mut passes = 0u64;
+        let mut ids = Vec::new();
+        for i in 0..appends {
+            let pending = undo.eviction_candidates.len();
+            ids.push(undo.append_record(record(1_000 + i), true).unwrap().0);
+            if undo.eviction_candidates.len() <= pending {
+                passes += 1;
+                assert!(undo.eviction_candidates.is_empty());
+            }
+            assert!(
+                undo.evictable_since_pass <= undo.eviction_batch_bytes() + 4096,
+                "releasable payload stays within one batch of the cap"
+            );
+        }
+        assert!(passes >= 2, "batched passes still evict: {passes}");
+        assert!(
+            passes < appends / 8,
+            "one pass per batch, not per append: {passes}"
+        );
+        let shards = undo.write_shards.len() as u64;
+        assert!(undo.buffer_flushes_total() - flushes_before <= passes * shards);
+        assert!(undo.evicted_records > evicted_before);
+        for id in ids {
+            assert!(undo.load_owned(id).unwrap().before_values.is_some());
+        }
+    }
+
+    /// Small tail flushes must not each request device writeback: hints are
+    /// issued per megabyte and never cover the partially filled last block.
+    #[test]
+    fn tail_flush_writeback_hints_are_coalesced() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut undo = open(dir.path());
+        undo.set_buffer_limit(4096).unwrap();
+        let mut hinted = 0u64;
+        let mut flushes = 0u64;
+        for i in 1..=40_000u64 {
+            undo.next_shard.store(0, Ordering::Relaxed);
+            let mut r = record(i);
+            r.before_values = Some(vec![Value::String("u".repeat(64))]);
+            let before = {
+                let shard = undo.write_shards[0].lock();
+                (shard.unhinted_bytes, shard.buffer_flushes)
+            };
+            undo.append_record(r, true).unwrap();
+            let shard = undo.write_shards[0].lock();
+            assert!(shard.unhinted_bytes < UNDO_WRITEBACK_AFTER_BYTES + 2 * 4096);
+            if shard.buffer_flushes > before.1 {
+                flushes += 1;
+                if shard.unhinted_bytes < before.0 {
+                    hinted += 1;
+                    assert!(shard.unhinted_bytes < UNDO_WRITEBACK_ALIGN);
+                    assert_eq!(
+                        (shard.buffer_start - shard.unhinted_bytes) % UNDO_WRITEBACK_ALIGN,
+                        0
+                    );
+                }
+            }
+        }
+        assert!(hinted >= 1, "more than a megabyte was flushed");
+        assert!(
+            hinted * 64 < flushes,
+            "{hinted} hints for {flushes} flushes"
+        );
     }
 
     fn active_segment_len(undo: &UndoManager) -> u64 {

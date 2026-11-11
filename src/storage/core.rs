@@ -3141,6 +3141,15 @@ struct BufferPageFileKey {
     owner_error: Option<String>,
 }
 
+/// Outcome of `BufferPool::defer_page_image_while_unlogged`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PageImageDecision {
+    /// Log the image now; `owed` means an owed image is settled by it.
+    LogNow { owed: bool },
+    /// Unlogged changes remain on the page; the image is owed.
+    Deferred,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PageKey {
     file: Arc<BufferPageFileKey>,
@@ -3258,6 +3267,15 @@ struct Frame {
     /// committer expose a second writer's still-unlogged change). Always 0
     /// unless txn-buffering is enabled.
     deferred_pins: AtomicU32,
+    /// A full-page image this page still owes. A writer that needs a
+    /// post-checkpoint image while other transactions hold unlogged
+    /// (txn-buffered) changes on the page must not log the current bytes:
+    /// recovery would replay those changes from the image, with no record in
+    /// their transactions' undo chains to compensate a crash loser. The owed
+    /// image holds one `deferred_pins` reference, so the page stays
+    /// unflushable until the last owner has appended its WAL and the image is
+    /// logged under the page's heap latch.
+    fpi_owed: AtomicBool,
     dirty_epoch: AtomicU64,
     /// Raw mutations defer the 16 KiB CRC until a full page image is exposed
     /// or flushed. Resident readers validate structural bounds under the byte

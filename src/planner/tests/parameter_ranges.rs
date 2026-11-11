@@ -118,3 +118,59 @@ fn parameter_interval_tiers_preserve_skew_and_character_domains() {
         "retain text value skew"
     );
 }
+
+#[test]
+fn static_selectivity_matches_every_signature_it_replaces() {
+    let dir = tempfile::Builder::new()
+        .prefix("parameter-static-")
+        .tempdir_in("/tmp/mydb")
+        .unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE static_sel (id INT PRIMARY KEY, grp INT, note VARCHAR(8), KEY (grp))",
+        )
+        .unwrap();
+    let values = (1..=1000)
+        .map(|id| format!("({id}, {}, 'n')", id % 3))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO static_sel VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE static_sel").unwrap();
+    let db = engine.db_for_tests();
+    let bindings = [
+        vec![Value::Int(1), Value::Int(2)],
+        vec![Value::Int(-5), Value::Int(5000)],
+        vec![Value::Null, Value::Int(0)],
+    ];
+    // Unique single-column equality never contributes, whatever the
+    // bindings.
+    for sql in [
+        "SELECT note FROM static_sel WHERE id = ? AND id <> 0 AND ? IS NOT NULL",
+        "SELECT note FROM static_sel WHERE ? = id OR id = ?",
+    ] {
+        let select = parameterized_select(sql);
+        assert!(parameter_selectivity_is_static(db, &select), "{sql}");
+        for params in &bindings {
+            assert_eq!(
+                parameter_selectivity_signature(db, &select, params),
+                "",
+                "{sql}"
+            );
+        }
+    }
+    // A skewed or ranged statistics-bearing column is parameter dependent.
+    for sql in [
+        "SELECT id FROM static_sel WHERE grp = ? AND id > ?",
+        "SELECT id FROM static_sel WHERE id BETWEEN ? AND ?",
+        "SELECT id FROM static_sel WHERE id = ? AND note = ?",
+    ] {
+        let select = parameterized_select(sql);
+        assert!(!parameter_selectivity_is_static(db, &select), "{sql}");
+        assert!(bindings
+            .iter()
+            .any(|params| !parameter_selectivity_signature(db, &select, params).is_empty()));
+    }
+}

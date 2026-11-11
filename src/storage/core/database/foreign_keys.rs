@@ -1307,11 +1307,16 @@ impl Database {
         else {
             return Ok(false);
         };
+        // The lock-free status mirror answers for every published slot; only
+        // a miss (begin window or a reclaimed slot) needs the directory.
         let newest_is_visible = header.last_txn_id == txn.txn_id
-            || matches!(
-                self.txns_read()?.status(header.last_txn_id),
-                Some(TxnStatus::Committed) | None
-            );
+            || match self.slot_status_cache.lookup(header.last_txn_id) {
+                Some((status, _)) => matches!(status, TxnStatus::Committed),
+                None => matches!(
+                    self.txns_read()?.status(header.last_txn_id),
+                    Some(TxnStatus::Committed) | None
+                ),
+            };
         if !newest_is_visible {
             if self.fk_row_key_matches(parent, index, row_id, key, txn)? {
                 return Ok(true);

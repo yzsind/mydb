@@ -689,12 +689,15 @@ impl Database {
             }
         }
         match self.with_heap_mut(table_id, |heap| {
-            heap.insert_mvcc_batch(txn_id, headers, rows, &externals)
+            let inserted = heap.insert_mvcc_batch(txn_id, headers, rows, &externals)?;
+            Ok((inserted, heap.page_count_relaxed()))
         }) {
-            Ok(inserted) => {
+            Ok((inserted, heap_pages)) => {
                 // Merge once per prepared batch after final RowIds are known;
                 // the zone id is a property of the forwarding root page.
-                if let Err(err) = self.merge_zone_map_rows(txn_id, table_id, &inserted, rows) {
+                if let Err(err) =
+                    self.merge_inserted_zone_map_rows(txn_id, table_id, &inserted, rows, heap_pages)
+                {
                     self.rollback_inserted_rows(txn_id, table_id, &inserted)?;
                     self.dml_stats
                         .record_rollback_inserted_rows(inserted.len() as u64);
@@ -2422,6 +2425,7 @@ impl Database {
                 &zone_row_ids,
                 &zone_rows,
                 effective_changed_columns,
+                Some(table.as_ref()),
             )?;
             // Ownership transferred to the heap rows — staging cleared.
             staged_new_chains.clear();
@@ -3528,8 +3532,7 @@ impl Database {
             storage_id,
             &[row_id],
             &[current_values.as_slice()],
-            Some(effective_changed_columns),
-        )?;
+            Some(effective_changed_columns), Some(table))?;
         if let Some(before) = index_before_values.as_ref() {
             self.update_changed_indexes_deferred_at(
                 txn.txn_id,
@@ -3935,8 +3938,7 @@ impl Database {
                 storage_id,
                 &[row_id],
                 &[new_values.as_slice()],
-                effective_changed_columns,
-            )?;
+                effective_changed_columns, Some(table))?;
             self.update_changed_indexes_deferred_at(
                 txn.txn_id,
                 storage_id,
@@ -4298,8 +4300,7 @@ impl Database {
                         storage_id,
                         &[row_id],
                         &[new_values.as_slice()],
-                        effective_changed_columns,
-                    )?;
+                        effective_changed_columns, Some(table))?;
                     self.update_changed_indexes_deferred_at(
                         txn.txn_id,
                         storage_id,
@@ -4371,8 +4372,7 @@ impl Database {
             storage_id,
             &[row_id],
             &[new_values.as_slice()],
-            effective_changed_columns,
-        )?;
+            effective_changed_columns, Some(table))?;
         self.update_changed_indexes_deferred_at(
             txn.txn_id,
             storage_id,

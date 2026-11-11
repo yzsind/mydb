@@ -484,6 +484,14 @@ pub(crate) struct TxnSlot {
     /// the retention floor.
     #[serde(default)]
     pub(crate) begin_lsn: u64,
+    /// Commit frontier observed when this transaction finished rolling back.
+    /// Every reader registered before that moment has a snapshot at or below
+    /// it, so once the oldest registered snapshot is above this value no
+    /// reader can still hold a row identity or header written by the
+    /// rolled-back transaction and its undo may be purged. `None` (slots
+    /// rebuilt from the WAL) keeps the conservative any-reader rule.
+    #[serde(default)]
+    pub(crate) rollback_fence_scn: Option<u64>,
 }
 
 fn default_wal_logged() -> bool {
@@ -3210,6 +3218,7 @@ impl TransactionManager {
                             wal_logged: true,
                             xa_xid: None,
                             begin_lsn: header.lsn,
+                            rollback_fence_scn: None,
                         })
                         .undo_head
                         .set(Some((*undo_id).max(undo.id)));
@@ -3253,6 +3262,7 @@ impl TransactionManager {
                         wal_logged: true,
                         xa_xid: None,
                         begin_lsn: record.lsn,
+                        rollback_fence_scn: None,
                     });
                 }
                 WalPayload::CommitTxn { commit_scn, .. } => {
@@ -3276,6 +3286,7 @@ impl TransactionManager {
                             wal_logged: true,
                             xa_xid: None,
                             begin_lsn: 0,
+                            rollback_fence_scn: None,
                         });
                 }
                 WalPayload::AbortTxn => {
@@ -3302,6 +3313,7 @@ impl TransactionManager {
                             wal_logged: true,
                             xa_xid: None,
                             begin_lsn: 0,
+                            rollback_fence_scn: None,
                         });
                 }
                 WalPayload::EndTxn => {
@@ -3337,6 +3349,7 @@ impl TransactionManager {
                         wal_logged: true,
                         xa_xid: None,
                         begin_lsn: record.lsn,
+                        rollback_fence_scn: None,
                     });
                     // WAL replay is ordered: a subsequent commit, abort
                     // intent or end overrides this preparation. Never turn
@@ -3637,6 +3650,7 @@ impl TransactionManager {
             wal_logged,
             xa_xid: None,
             begin_lsn,
+            rollback_fence_scn: None,
         }))
     }
 
@@ -3818,6 +3832,7 @@ impl TransactionManager {
             self.active_write_count = self.active_write_count.saturating_sub(1);
         }
         slot.status = TxnStatus::RolledBack;
+        slot.rollback_fence_scn = Some(self.commit_frontier);
         self.advance_oldest_write_capable_after_finish(txn_id);
         self.clear_index_repairs(txn_id);
         self.named_savepoints.remove(&txn_id);
@@ -5340,6 +5355,27 @@ impl TransactionManager {
                 };
                 (slot.txn_id, state)
             })
+            .collect()
+    }
+
+    /// Rolled-back creators whose undo a registered reader may still need:
+    /// a reader with a snapshot at or below the rollback fence can have been
+    /// registered while the transaction's versions were still in the heap.
+    pub(crate) fn rolled_back_creators_pinned_by(
+        &self,
+        creator_ids: &[u64],
+        oldest_registered_snapshot_scn: u64,
+    ) -> Vec<u64> {
+        creator_ids
+            .iter()
+            .filter_map(|txn_id| self.slots.get(txn_id))
+            .filter(|slot| {
+                slot.status == TxnStatus::RolledBack
+                    && slot
+                        .rollback_fence_scn
+                        .is_none_or(|fence| oldest_registered_snapshot_scn <= fence)
+            })
+            .map(|slot| slot.txn_id)
             .collect()
     }
 }

@@ -423,12 +423,13 @@ impl WalRecordSource for ReplayRecords {
     fn record(&self, index: usize) -> Result<RecordLease<'_>, QueryError> {
         let loc = self.locations.get(index).ok_or_else(corrupt_directory)?;
         let header = loc.header()?;
-        let charge = self.reserve_decode(if loc.segment_and_type & COMPRESSED_LOCATION != 0 {
-            MAX_COMPRESSED_TXN_BATCH_BYTES
-        } else {
-            loc.len as usize
-        })?;
+        // Reserve for the record's own encoded bytes. `payload` governs the
+        // transient decompression of a compressed batch itself; sizing this
+        // lease by the batch limit instead charged ~2 MiB per record, so a
+        // caller holding a bounded batch of small records (undo segment
+        // repair holds ~8 MiB of them) could exhaust the process budget.
         let bytes = self.payload(loc)?;
+        let charge = self.reserve_decode(bytes.len())?;
         Ok(RecordLease {
             record: Cow::Owned(WalRecord {
                 source_time_us: header.source_time_us,
@@ -445,12 +446,12 @@ impl WalRecordSource for ReplayRecords {
         if loc.header()?.record_type != WalRecordType::UndoRecord {
             return Ok(None);
         }
-        let charge = if loc.segment_and_type & COMPRESSED_LOCATION != 0 {
-            Some(self.reserve_decode(MAX_COMPRESSED_TXN_BATCH_BYTES)?)
-        } else {
-            None
-        };
         let bytes = self.payload(loc)?;
+        // Only an extracted (owned) record holds memory beyond the mapping.
+        let charge = match &bytes {
+            Cow::Owned(bytes) => Some(self.reserve_decode(bytes.len())?),
+            Cow::Borrowed(_) => None,
+        };
         if bytes.len() < 12 {
             return Err(corrupt_directory());
         }
@@ -1392,6 +1393,49 @@ mod tests {
         );
         snapshot.refresh(dir.path()).unwrap();
         assert_eq!(snapshot.records.len(), expected.records.len());
+    }
+
+    /// Leases for records extracted from a compressed transaction batch are
+    /// charged by the record's size, not by the batch limit. Recovery holds
+    /// thousands of small undo records at once while repairing undo segments.
+    #[test]
+    fn compressed_batch_record_leases_charge_their_own_size() {
+        std::env::set_var("MYDB_WAL_TXN_COMPRESSION", "1");
+        let records = (0..64)
+            .map(|i| WalPayload::FileCreate {
+                path: format!("objects/lease-{i}.marker"),
+                after: vec![0x5a; 256],
+            })
+            .collect();
+        let pre = LogManager::pre_encode_record(7, WalPayload::TxnBatch { records }).unwrap();
+        assert_ne!(
+            read_u32(&pre.bytes[WAL_FRAME_HEADER_LEN..], 0) & COMPRESSED_TXN_BATCH,
+            0
+        );
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let end = LogManager::append_pre_encoded_to(&log, pre).unwrap();
+        LogManager::sync_durable_to(&log, end).unwrap();
+        drop(log);
+        let replay = LogManager::scan_replay(dir.path()).unwrap();
+        let scratch = || {
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().2
+                [ControlledMemoryCategory::StorageScratch as usize]
+        };
+        let before = scratch();
+        let leases = (0..replay.records.len())
+            .map(|index| replay.records.record(index).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(leases.len(), 64);
+        let held = scratch().saturating_sub(before);
+        // 32x decode headroom for ~300-byte records, plus one pooled budget.
+        assert!(
+            held <= 64 * (32 * 512 + 4096) + 4 * 1024 * 1024,
+            "64 small leases held {held} bytes"
+        );
+        drop(leases);
     }
 
     #[test]

@@ -1082,6 +1082,7 @@ impl Database {
             wal_logged: true,
             xa_xid: None,
             begin_lsn,
+            rollback_fence_scn: None,
         };
         let txn = {
             let mut txns = self.txns_write()?;
@@ -3990,7 +3991,8 @@ impl Database {
                 }
             };
             // Publish real LSNs and release deferred pins OUTSIDE the WAL mutex.
-            self.buffer_pool.finalize_deferred_batch(&finalize)?;
+            let owed = self.buffer_pool.finalize_deferred_batch(&finalize)?;
+            self.log_owed_page_images(&owed)?;
             Ok(final_lsn)
         })();
         match result {
@@ -4017,6 +4019,23 @@ impl Database {
                 Err(err)
             }
         }
+    }
+
+    /// Log full-page images that waited for buffered WAL now appended (see
+    /// `Frame::fpi_owed`). Only heap pages owe images; a page another
+    /// transaction still holds unlogged changes on is logged by that owner.
+    fn log_owed_page_images(&self, keys: &[PageKey]) -> Result<(), QueryError> {
+        for key in keys {
+            let BufferPageFileKind::Heap { table_id } = key.file.kind else {
+                continue;
+            };
+            match self.heap_handle(table_id) {
+                Ok(heap) => heap.read().log_owed_page_image(key)?,
+                // The table is gone; its frames are discarded with the file.
+                Err(_) => self.buffer_pool.settle_page_image(key, 0),
+            }
+        }
+        Ok(())
     }
 
     /// Drain the txn-buffer mid-transaction once it crosses the pin-bounding
@@ -5743,16 +5762,27 @@ impl Database {
                     .txn_ids_committed_since_for(retain_since.saturating_mul(1_000), &creator_ids)
             };
             // A rolled-back creator has no commit SCN to fence candidate
-            // RowIds. Preserve its undo while registered readers can retain
-            // those identities; the implicit visibility frontier is not a reader.
-            let reader_pinned_states = oldest_registered_snapshot_scn.map(|_| {
-                let mut states = creator_states.clone();
-                for state in states.values_mut() {
-                    if *state == crate::storage::undo::UndoCreatorState::RolledBack {
-                        *state = crate::storage::undo::UndoCreatorState::Active;
-                    }
+            // RowIds. Preserve its undo while a registered reader can retain
+            // those identities, i.e. one that may predate the end of the
+            // rollback; the implicit visibility frontier is not a reader.
+            // Readers registered afterwards never saw its versions. Pinning
+            // on any registered reader instead would, under a steady stream
+            // of short statements, retain the first rolled-back transaction
+            // forever, freeze `min_retained_txn_id` behind its slot and stop
+            // all later undo from being purged.
+            let reader_pinned_states = oldest_registered_snapshot_scn.and_then(|oldest| {
+                let pinned = self
+                    .txns
+                    .read()
+                    .rolled_back_creators_pinned_by(&creator_ids, oldest);
+                if pinned.is_empty() {
+                    return None;
                 }
-                states
+                let mut states = creator_states.clone();
+                for txn_id in pinned {
+                    states.insert(txn_id, crate::storage::undo::UndoCreatorState::Active);
+                }
+                Some(states)
             });
             let victims = self.undo.read().plan_purge_candidates(
                 &candidates,

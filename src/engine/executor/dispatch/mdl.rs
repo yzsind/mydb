@@ -388,13 +388,16 @@ fn acquire_prepared_mdl_requests(
     };
     // Transaction-duration fast path: tickets granted earlier in this
     // transaction are held until commit/rollback, so a statement whose
-    // requests were all granted for the *current* txn id can skip the
-    // (global-mutex) MDL manager entirely. The memo self-invalidates when
-    // the txn id or lazy transaction generation changes. Plain BEGIN /
-    // SET autocommit=0 read-only transactions may never allocate a storage
-    // txn id, so they use the session-local generation as the memo key.
+    // requests were all granted for the *current* transaction can skip the
+    // (global-mutex) MDL manager entirely. The memo is keyed by the
+    // session-local transaction generation, which every session-side
+    // release of transaction-duration MDL advances (COMMIT, ROLLBACK, XA
+    // PREPARE, implicit commit). It must not be keyed by the storage txn id:
+    // a transaction that reads first allocates that id lazily at its first
+    // write, and re-keying there would discard grants that are still held
+    // and re-enter the manager for every table already locked.
     if duration == MdlDuration::Transaction {
-        let txn_memo_key = session.current_txn.unwrap_or(session.mdl_txn_generation);
+        let txn_memo_key = session.mdl_txn_generation;
         if txn_memo_key != 0 {
             let mut memo = session.mdl_txn_grants.borrow_mut();
             let (memo_txn, granted) = &mut *memo;

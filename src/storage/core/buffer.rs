@@ -1335,7 +1335,10 @@ impl BufferPool {
     /// oltp_update_index (20 threads, 1M rows): fixing this doubles TPS and
     /// cuts WAL bytes ~10×. The raw frame image receives the LSN immediately;
     /// its checksum remains deferred until full-image exposure or flush.
-    fn finalize_deferred(self: &Arc<Self>, key: &PageKey, lsn: u64) {
+    ///
+    /// Returns whether the page still owes a full-page image (see
+    /// `Frame::fpi_owed`) after this release.
+    fn finalize_deferred(self: &Arc<Self>, key: &PageKey, lsn: u64) -> bool {
         if let Ok(Some(frame)) = self.lookup_frame(key) {
             if lsn != 0 {
                 frame.dirty_lsn.fetch_max(lsn, Ordering::AcqRel);
@@ -1345,19 +1348,29 @@ impl BufferPool {
                     frame.checksum_dirty.store(true, Ordering::Release);
                 }
             }
-            frame.deferred_pins.fetch_sub(1, Ordering::AcqRel);
+            // SeqCst pairs with `defer_page_image_while_unlogged`: either it
+            // observes this release, or this load observes its owed flag.
+            frame.deferred_pins.fetch_sub(1, Ordering::SeqCst);
+            return frame.fpi_owed.load(Ordering::SeqCst);
         }
+        false
     }
 
+    /// Release a transaction's deferred pins at their real LSNs. Returns the
+    /// pages that still owe a full-page image; the caller logs each once its
+    /// owners are gone (`HeapFile::log_owed_page_image`).
     fn finalize_deferred_batch(
         self: &Arc<Self>,
         finalized: &[(PageKey, u64)],
-    ) -> Result<(), QueryError> {
+    ) -> Result<Vec<PageKey>, QueryError> {
         // Publish every real LSN and release every pin first. The same page
         // may occur in several records; scheduling before the final release
         // lets a cleaner consume the hint while that page is still deferred.
+        let mut owed: Vec<PageKey> = Vec::new();
         for (key, lsn) in finalized {
-            self.finalize_deferred(key, *lsn);
+            if self.finalize_deferred(key, *lsn) && !owed.contains(key) {
+                owed.push(key.clone());
+            }
         }
         // Fresh-page initialization makes large heap batches resident, so they
         // can now use deferred WAL. Retain the ordinary append path's bounded
@@ -1378,7 +1391,58 @@ impl BufferPool {
             )?;
             start = end;
         }
-        Ok(())
+        Ok(owed)
+    }
+
+    /// Decide whether a full-page image of `key` may be logged now. While
+    /// other transactions hold unlogged (txn-buffered) changes on the page,
+    /// the image is owed instead: it takes one deferred pin of its own so the
+    /// page cannot be written back before the image exists. The caller holds
+    /// the page's heap latch, which excludes new buffered writers and every
+    /// other image decision for this page.
+    fn defer_page_image_while_unlogged(
+        self: &Arc<Self>,
+        key: &PageKey,
+    ) -> Result<PageImageDecision, QueryError> {
+        let Some(frame) = self.lookup_frame(key)? else {
+            return Ok(PageImageDecision::LogNow { owed: false });
+        };
+        if !frame.fpi_owed.load(Ordering::SeqCst) {
+            if frame.deferred_pins.load(Ordering::SeqCst) == 0 {
+                return Ok(PageImageDecision::LogNow { owed: false });
+            }
+            // A frame that can no longer be pinned is being evicted, which
+            // requires zero deferred pins: no unlogged change remains.
+            if !self.add_deferred_pin(key) {
+                return Ok(PageImageDecision::LogNow { owed: false });
+            }
+            frame.fpi_owed.store(true, Ordering::SeqCst);
+        }
+        // Once only the image's own pin remains, every owner has appended its
+        // WAL and the latch holder logs the image immediately.
+        Ok(if frame.deferred_pins.load(Ordering::SeqCst) == 1 {
+            PageImageDecision::LogNow { owed: true }
+        } else {
+            PageImageDecision::Deferred
+        })
+    }
+
+    /// Whether `key` owes a full-page image that no unlogged change blocks.
+    fn page_image_ready(&self, key: &PageKey) -> Result<bool, QueryError> {
+        Ok(self.lookup_frame(key)?.is_some_and(|frame| {
+            frame.fpi_owed.load(Ordering::SeqCst)
+                && frame.deferred_pins.load(Ordering::SeqCst) == 1
+        }))
+    }
+
+    /// Release an owed full-page image after it was logged at `lsn`, or with
+    /// `lsn == 0` when the page's file no longer exists.
+    fn settle_page_image(self: &Arc<Self>, key: &PageKey, lsn: u64) {
+        if let Ok(Some(frame)) = self.lookup_frame(key) {
+            if frame.fpi_owed.swap(false, Ordering::SeqCst) {
+                self.finalize_deferred(key, lsn);
+            }
+        }
     }
 
     /// Remove an evicted/discarded frame's registration. The caller must hold
@@ -4038,6 +4102,24 @@ impl BufferPool {
                     .count()
             })
             .unwrap_or(0)
+    }
+
+    /// Test probe: resident frames that owe a full-page image, and how many
+    /// deferred pins they hold in total.
+    #[cfg(test)]
+    fn owed_page_images_for_test(&self) -> (usize, u32) {
+        let mut owed = 0;
+        let mut pins = 0;
+        for shard in &self.shards {
+            let frames = shard.frames.read().unwrap();
+            for frame in frames.values() {
+                if frame.fpi_owed.load(Ordering::SeqCst) {
+                    owed += 1;
+                    pins += frame.deferred_pins.load(Ordering::SeqCst);
+                }
+            }
+        }
+        (owed, pins)
     }
 
     fn snapshot(&self) -> BufferPoolSnapshot {
@@ -11406,6 +11488,7 @@ impl Frame {
             dirty_lsn: AtomicU64::new(0),
             first_dirty_lsn: AtomicU64::new(0),
             deferred_pins: AtomicU32::new(0),
+            fpi_owed: AtomicBool::new(false),
             dirty_epoch: AtomicU64::new(0),
             checksum_dirty: AtomicBool::new(false),
             packed_leaf: parking_lot::Mutex::new(None),
@@ -11472,6 +11555,7 @@ impl Frame {
             dirty_lsn: AtomicU64::new(dirty_lsn),
             first_dirty_lsn: AtomicU64::new(dirty_lsn),
             deferred_pins: AtomicU32::new(0),
+            fpi_owed: AtomicBool::new(false),
             dirty_epoch: AtomicU64::new(1),
             checksum_dirty: AtomicBool::new(false),
             packed_leaf: parking_lot::Mutex::new(None),

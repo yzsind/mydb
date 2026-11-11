@@ -2083,8 +2083,51 @@ impl HeapFile {
         row_id: RowId,
         columns: &[usize],
     ) -> Result<CachedProjectedRead, QueryError> {
-        let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+        let plan = self.decode_plan(columns);
         self.read_mvcc_columns_cached_with_plan(row_id, columns, &plan)
+    }
+
+    /// Projection plan for `columns` under this heap's codec. Point reads
+    /// that arrive without a caller-compiled plan (constraint probes,
+    /// single-row fetches) repeat the same few projections, so compiled
+    /// plans are kept per thread, keyed by codec identity and columns. A
+    /// heap's codec is fixed for its lifetime; the weak handle keeps a dead
+    /// codec's address from being reused while its entry exists.
+    fn decode_plan(&self, columns: &[usize]) -> Arc<RowDecodePlan> {
+        const SLOTS: usize = 16;
+        type Entry = (
+            std::sync::Weak<RowCodec>,
+            smallvec::SmallVec<[usize; 8]>,
+            Arc<RowDecodePlan>,
+        );
+        thread_local! {
+            static PLANS: std::cell::RefCell<(Vec<Entry>, usize)> =
+                const { std::cell::RefCell::new((Vec::new(), 0)) };
+        }
+        let codec = Arc::as_ptr(&self.codec);
+        let cached = PLANS.try_with(|plans| {
+            let mut plans = plans.borrow_mut();
+            if let Some((_, _, plan)) = plans.0.iter().find(|(owner, owned, _)| {
+                std::sync::Weak::as_ptr(owner) == codec && owned.as_slice() == columns
+            }) {
+                return Arc::clone(plan);
+            }
+            let plan = Arc::new(RowDecodePlan::compile_with_codec(columns, &self.codec));
+            let entry = (
+                Arc::downgrade(&self.codec),
+                smallvec::SmallVec::from_slice(columns),
+                Arc::clone(&plan),
+            );
+            let (entries, next) = &mut *plans;
+            if entries.len() < SLOTS {
+                entries.push(entry);
+            } else {
+                entries[*next] = entry;
+                *next = (*next + 1) % SLOTS;
+            }
+            plan
+        });
+        cached.unwrap_or_else(|_| Arc::new(RowDecodePlan::compile_with_codec(columns, &self.codec)))
     }
 
     fn read_mvcc_columns_cached_with_plan(
@@ -2595,7 +2638,7 @@ impl HeapFile {
         // rebuilding it inside `decode_row_schema_columns_into` per
         // row. Saves a `SmallVec<[i16; 32]>` allocation + setup loop
         // per heap row read.
-        let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+        let plan = self.decode_plan(columns);
         self.read_mvcc_columns_many_cached_with_plan(row_ids, &plan, hits, missing)
     }
 
@@ -2693,7 +2736,7 @@ impl HeapFile {
             return Ok(true);
         }
         let page_count = self.page_count()?;
-        let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+        let plan = self.decode_plan(columns);
         let mut start = 0usize;
         while start < row_ids.len() {
             let first = row_ids[start];
@@ -5075,7 +5118,7 @@ impl HeapFile {
         // this helper runs before the post-mutation raw bytes are
         // installed, so the buffer-pool frame still carries the image
         // FPI's `after` payload.
-        let Some(mut after) = self.buffer_pool.read_page_bytes(&key)? else {
+        let Some(after) = self.buffer_pool.read_page_bytes(&key)? else {
             return Ok(());
         };
         // The disk image's `page_lsn` field tells us when this page
@@ -5088,6 +5131,67 @@ impl HeapFile {
         if !reduced && (last_checkpoint_lsn == 0 || page_lsn(&after) > last_checkpoint_lsn) {
             return Ok(());
         }
+        // Another transaction's buffered change may sit on this page without
+        // a WAL record yet. Its bytes must not enter a system image: owe the
+        // image until that WAL is appended (see `Frame::fpi_owed`).
+        match self.buffer_pool.defer_page_image_while_unlogged(&key)? {
+            PageImageDecision::Deferred => Ok(()),
+            PageImageDecision::LogNow { owed: false } => {
+                self.log_heap_page_image(&key, page_id as u64, after, false)?;
+                Ok(())
+            }
+            PageImageDecision::LogNow { owed: true } => {
+                // The last owner appended its WAL meanwhile; log current bytes.
+                let after = self
+                    .buffer_pool
+                    .read_page_bytes(&key)?
+                    .ok_or_else(owed_page_image_not_resident)?;
+                let lsn = self.log_heap_page_image(&key, page_id as u64, after, true)?;
+                self.buffer_pool.settle_page_image(&key, lsn);
+                Ok(())
+            }
+        }
+    }
+
+    /// Log the full-page image a page owes once its last unlogged change has
+    /// reached the WAL. Called by the transaction that appended it, after its
+    /// deferred pins were released.
+    fn log_owed_page_image(&self, key: &PageKey) -> Result<(), QueryError> {
+        if key.file != self.file_key {
+            // The file was replaced; its frames are discarded with it.
+            self.buffer_pool.settle_page_image(key, 0);
+            return Ok(());
+        }
+        let _page_guard = self
+            .page_latch(key.page_id)
+            .lock()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+        if !self.buffer_pool.page_image_ready(key)? {
+            return Ok(());
+        }
+        let after = self
+            .buffer_pool
+            .read_page_bytes(key)?
+            .ok_or_else(owed_page_image_not_resident)?;
+        let lsn = self.log_heap_page_image(key, key.page_id, after, true)?;
+        self.buffer_pool.settle_page_image(key, lsn);
+        Ok(())
+    }
+
+    /// Append a system full-page image of `after` and stamp its LSN as the
+    /// page's coverage for the current checkpoint window. The caller holds
+    /// the page latch and guarantees every change in `after` is already in
+    /// the WAL. An owed image completes already admitted deferred redo: like
+    /// that redo it is `admitted_drain`, so WAL budget pressure, which may
+    /// reject new DML, cannot strand the page unflushable.
+    fn log_heap_page_image(
+        &self,
+        key: &PageKey,
+        page_id: u64,
+        mut after: Vec<u8>,
+        admitted_drain: bool,
+    ) -> Result<u64, QueryError> {
+        let reduced = read_u16(&after, 6) & HEAP_PAGE_REDUCED_REDO != 0;
         write_u16(&mut after, 6, 0);
         // Compression, frame encoding and CRC must not serialize unrelated
         // appenders behind a 16 KiB page. Recovery stamps the actual record
@@ -5095,20 +5199,24 @@ impl HeapFile {
         // The page latch held by our caller keeps this pre-image stable until
         // the following logical mutation; WAL ordering remains FPI first.
         set_page_lsn(&mut after, 0);
-        let pre = crate::wal::LogManager::pre_encode_record(
+        let mut pre = crate::wal::LogManager::pre_encode_record(
             0, // FPI is a system record, not part of the transaction chain
-            WalPayload::full_page_image(self.relative_path(), page_id as u64, after),
+            WalPayload::full_page_image(self.relative_path(), page_id, after),
         )?;
+        if admitted_drain {
+            pre = pre.for_admitted_drain();
+        }
         let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
         // Stamp FPI coverage before any deferred mutation. Otherwise another
-        // mutation can emit a system FPI containing an unlogged row version.
-        self.buffer_pool.with_raw_page_mut(key, lsn, |bytes| {
+        // mutation in this window would emit an image containing an unlogged
+        // row version.
+        self.buffer_pool.with_raw_page_mut(key.clone(), lsn, |bytes| {
             if reduced {
                 write_u16(bytes, 6, 0);
             }
             Ok(())
         })?;
-        Ok(())
+        Ok(lsn)
     }
 
     fn write_heap_insert_logged(
@@ -6500,6 +6608,15 @@ impl Drop for HeapFile {
             self.discard_without_flush();
         }
     }
+}
+
+
+/// An owed full-page image keeps its page deferred-pinned, hence resident.
+fn owed_page_image_not_resident() -> QueryError {
+    error(
+        crate::error::catalog::ER_GET_ERRNO,
+        "page owing a full-page image is not resident",
+    )
 }
 
 #[cfg(test)]
