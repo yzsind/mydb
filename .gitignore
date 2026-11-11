@@ -11,6 +11,7 @@ logs/
 # Machine-local benchmarks, profiling tools, and private experiment drivers.
 /scripts-internal/
 /tests/*
+!/tests/fuzz/
 !/tests/fixtures/
 /tests/fixtures/*
 !/tests/fixtures/storage-format-v1/

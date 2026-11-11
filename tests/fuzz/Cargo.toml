@@ -1,0 +1,85 @@
+[package]
+name = "mydb-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+mydb = { path = "../..", default-features = false, features = ["fuzzing"] }
+
+[patch.crates-io]
+openssl-src = { path = "../../vendor/openssl-src" }
+
+[[bin]]
+name = "mysql_packet"
+path = "fuzz_targets/mysql_packet.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "row_codec"
+path = "fuzz_targets/row_codec.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "jsonb"
+path = "fuzz_targets/jsonb.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wal_frame"
+path = "fuzz_targets/wal_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "expression_differential"
+path = "fuzz_targets/expression_differential.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "native_repl_protocol"
+path = "fuzz_targets/native_repl_protocol.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_parser"
+path = "fuzz_targets/sql_parser.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sql_lex"
+path = "fuzz_targets/sql_lex.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parser_roundtrip"
+path = "fuzz_targets/parser_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "parser_fast_path_differential"
+path = "fuzz_targets/parser_fast_path_differential.rs"
+test = false
+doc = false
+bench = false

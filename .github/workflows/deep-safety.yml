@@ -36,6 +36,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: fuzz
+      - run: cargo metadata --manifest-path tests/fuzz/Cargo.toml --locked --format-version 1 > /dev/null
       - run: cargo fuzz build --fuzz-dir tests/fuzz
       - run: cargo fuzz run --fuzz-dir tests/fuzz mysql_packet -- -runs=1000
       - run: cargo fuzz run --fuzz-dir tests/fuzz row_codec -- -runs=1000
