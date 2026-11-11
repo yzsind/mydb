@@ -3311,6 +3311,8 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         "buffer_pool_checkpoint_preflush_us" => status.buffer_pool_checkpoint_preflush_us.to_string(),
         "buffer_pool_prefetch_queue_depth_peak" => status.buffer_pool_prefetch_queue_depth_peak.to_string(),
         "buffer_pool_oldest_dirty_lsn" => status.buffer_pool_oldest_dirty_lsn.to_string(),
+        "buffer_pool_redo_age_target_lsn" => status.buffer_pool_redo_age_target_lsn.to_string(),
+        "buffer_pool_deferred_drain_requests" => status.buffer_pool_deferred_drain_requests.to_string(),
         "bulk_index_direct_builds" => status.bulk_index_direct_builds.to_string(),
         "bulk_index_direct_pages" => status.bulk_index_direct_pages.to_string(),
         "bulk_index_direct_us" => status.bulk_index_direct_us.to_string(),

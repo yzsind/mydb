@@ -3254,6 +3254,19 @@ struct Frame {
     /// LSN for WAL-before-data; fuzzy checkpoint recovery needs this oldest
     /// value so redo never skips an earlier unflushed update on the same page.
     first_dirty_lsn: AtomicU64,
+    /// Lowest WAL LSN noted since the current write-back snapshot. Each flush
+    /// resets it under the byte write latch that freezes the image it writes.
+    /// When writers re-dirty the frame while that image is being written, the
+    /// write still makes every pre-snapshot change durable, so the frame's
+    /// recLSN advances to this value instead of keeping the ancient one. A
+    /// continuously modified page would otherwise pin the redo floor forever.
+    redirty_first_lsn: AtomicU64,
+    /// Set by the age cleaner when this frame's recLSN holds back the redo
+    /// target but deferred (txn-buffered) WAL pins prevent write-back. Writers
+    /// that pin the frame then ask their transaction to drain its WAL buffer at
+    /// the next statement boundary, so the pins cannot overlap indefinitely.
+    /// Cleared by the next successful write-back.
+    flush_wanted: AtomicBool,
     /// Transaction-local WAL buffering (`MYDB_WAL_TXN_BUFFER`): count of
     /// in-flight transactions that have dirtied this page but have NOT yet
     /// written its WAL record (the record sits in a thread-local buffer to be
@@ -3614,6 +3627,16 @@ struct BufferPool {
     /// on contended OLTP pages (measured -36 % tpmC on TPC-C
     /// 4w20t/1m before this gate landed).
     last_checkpoint_lsn: AtomicU64,
+    /// Age-flush target: pages whose recLSN is below this LSN are written by
+    /// the background cleaners ahead of the per-tick maintenance budget, so
+    /// the next checkpoint can move its redo floor past them. Derived from
+    /// `redo_age_samples` (see `observe_redo_age`).
+    redo_age_target_lsn: AtomicU64,
+    /// `(pool-relative microseconds, next WAL LSN)` samples, oldest first.
+    redo_age_samples: parking_lot::Mutex<VecDeque<(u64, u64)>>,
+    /// Frames flagged `flush_wanted` because deferred WAL pins blocked an
+    /// age-target write-back.
+    deferred_drain_requests: AtomicU64,
     /// Dependent page redo and dirty registration form one publication
     /// window. Checkpoints freeze this short window, not whole metadata scans.
     pub(crate) page_wal_publish_gate: parking_lot::RwLock<()>,
@@ -3853,6 +3876,16 @@ impl BufferPageFileKind {
             BufferPageFileKind::ZoneMap { .. } => 4,
         }
     }
+
+    /// Kinds whose dependent page redo requires every dirty epoch to begin
+    /// with a logged full-page image (`with_logged_page_replacement`). Their
+    /// recLSN is that anchor and must not advance while the frame stays dirty.
+    fn anchors_dirty_epochs(&self) -> bool {
+        matches!(
+            self,
+            BufferPageFileKind::Vector { .. } | BufferPageFileKind::ZoneMap { .. }
+        )
+    }
 }
 
 impl std::fmt::Debug for BufferPool {
@@ -3970,6 +4003,8 @@ struct BufferPoolSnapshot {
     /// P0-2 - dirty frames deferred by the background cleaners' write-back
     /// cooldown (flushed and re-dirtied within the window).
     cooldown_deferred_flushes: u64,
+    redo_age_target_lsn: u64,
+    deferred_drain_requests: u64,
     /// D-2 - worker flush rounds triggered by capacity pressure.
     headroom_flushes: u64,
     /// D-3 - size + duration of the most recent full dirty flush.
@@ -4298,6 +4333,8 @@ pub struct StorageStatus {
     pub buffer_pool_checkpoint_preflush_us: u64,
     pub buffer_pool_prefetch_queue_depth_peak: u64,
     pub buffer_pool_oldest_dirty_lsn: u64,
+    pub buffer_pool_redo_age_target_lsn: u64,
+    pub buffer_pool_deferred_drain_requests: u64,
     pub bulk_index_direct_builds: u64,
     pub bulk_index_direct_pages: u64,
     pub bulk_index_direct_us: u64,
@@ -4721,6 +4758,18 @@ pub(crate) mod btree_logical_wal {
         /// at commit. `None` ⇒ ordinary eager index stamping.
         static DEFERRED_KEYS: RefCell<Option<Vec<super::PageKey>>> =
             const { RefCell::new(None) };
+        /// Set when this thread took a deferred WAL pin on a frame whose
+        /// write-back the age cleaner requested (`Frame::flush_wanted`). The
+        /// transaction WAL buffer consumes it when the record is parked.
+        static TXN_WAL_DRAIN_REQUESTED: Cell<bool> = const { Cell::new(false) };
+    }
+
+    pub(super) fn request_txn_wal_drain() {
+        TXN_WAL_DRAIN_REQUESTED.with(|c| c.set(true));
+    }
+
+    pub(super) fn take_txn_wal_drain_request() -> bool {
+        TXN_WAL_DRAIN_REQUESTED.with(|c| c.replace(false))
     }
 
     pub(crate) fn current() -> Option<u64> {
