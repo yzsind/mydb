@@ -825,3 +825,47 @@ fn hybrid_rrf_vector_ties_sort_full_rerank_pool_before_limit() {
         }
     }
 }
+
+#[test]
+fn hybrid_rrf_audit_alias_window_partition_and_grouping() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE audit_rank(id INT PRIMARY KEY,a INT,b INT) PARTITION BY RANGE(id) (PARTITION p0 VALUES LESS THAN (5),PARTITION p1 VALUES LESS THAN MAXVALUE)").unwrap();
+    engine
+        .execute("INSERT INTO audit_rank VALUES(1,2,1),(2,1,2),(8,0,8),(9,9,0)")
+        .unwrap();
+    let fusion = "(SELECT id FROM audit_rank ORDER BY a LIMIT 4) RRF (SELECT id FROM audit_rank ORDER BY b LIMIT 4)";
+    let rows = query(&engine, &format!("SELECT rrf_score FROM ({fusion}) h(rrf_score,id,best_rank,match_count) ORDER BY rrf_score DESC LIMIT 2"));
+    assert_eq!(
+        rows.rows
+            .iter()
+            .map(|r| r[0].to_display_string())
+            .collect::<Vec<_>>(),
+        ["9", "8"]
+    );
+    let partition = query(&engine, "SELECT id FROM ((SELECT id FROM audit_rank PARTITION(p0) ORDER BY a LIMIT 10) RRF (SELECT id FROM audit_rank WHERE FALSE ORDER BY a LIMIT 0)) h ORDER BY id");
+    assert_eq!(partition.rows.len(), 2);
+    let aliases = query(&engine, "SELECT idd FROM ((SELECT b AS a,a AS x,id AS idd FROM audit_rank PARTITION(p0) ORDER BY x LIMIT 4) RRF (SELECT b AS a,a AS x,id AS idd FROM audit_rank WHERE FALSE ORDER BY x LIMIT 0)) h ORDER BY best_rank");
+    assert_eq!(aliases.rows[0][0].to_display_string(), "2");
+    assert_eq!(query(&engine, &format!("SELECT id FROM ({fusion}) h ORDER BY rrf_score DESC,best_rank,id LIMIT 18446744073709551615 OFFSET 2")).rows.len(), 2);
+    for tail in ["WHERE id>1", "GROUP BY id", "HAVING id>1"] {
+        assert!(engine.execute(&format!("{fusion} {tail}")).is_err());
+    }
+    assert!(engine.execute("(SELECT a,b FROM audit_rank GROUP BY a ORDER BY a LIMIT 4) RRF (SELECT a,b FROM audit_rank GROUP BY a ORDER BY a LIMIT 4)").is_err());
+    engine
+        .execute(&format!(
+            "CREATE TABLE audit_rank_ctas AS SELECT * FROM ({fusion} WITH(RANK_CONSTANT=10)) h"
+        ))
+        .unwrap();
+}
+
+#[test]
+fn hybrid_rrf_audit_analyze_marks_fused_scans_and_skipped_branches() {
+    let (_dir, engine) = table_engine();
+    let sql = "EXPLAIN ANALYZE FORMAT=TREE SELECT id FROM ((SELECT id FROM rrft ORDER BY id+0 LIMIT 2) RRF (SELECT id FROM rrft ORDER BY id+0 DESC LIMIT 2)) h";
+    let text = query(&engine, sql).rows[0][0].to_display_string();
+    assert!(!text.contains("never executed"), "{text}");
+    let text = query(&engine, &sql.replace(") h", " WITH(WEIGHTS=(1,0))) h")).rows[0][0]
+        .to_display_string();
+    assert!(text.contains("never executed"), "{text}");
+}

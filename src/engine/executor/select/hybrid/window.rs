@@ -25,6 +25,7 @@ fn enter_window(window: Option<OutputWindow>) -> WindowScope {
 fn transparent(select: &Select) -> bool {
     select.joins.is_empty()
         && select.from.len() == 1
+        && select.from[0].column_aliases.is_empty()
         && select.selection.is_none()
         && select.having.is_none()
         && select.group_by.is_empty()

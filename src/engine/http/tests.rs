@@ -184,3 +184,30 @@ fn http_null_inputs_need_no_runtime_or_network_admission() {
         assert!(call("HTTP_REQUEST", &[Value::Null]).is_err());
     });
 }
+
+#[test]
+fn http_audit_executable_comment_and_vertical_tab_detection() {
+    for sql in [
+        "SELECT HTTP_GET\u{b}('x')",
+        "SELECT /*!50000 HTTP_GET*/('x')",
+        "SELECT /*!50000HTTP_GET('x')*/",
+        "/*!HTTP_GET*/('x')",
+    ] {
+        assert!(mentions(sql), "{sql}");
+    }
+    let policy = config::Policy::default();
+    for ip in ["192.0.78.9", "192.0.43.10", "192.0.3.1"] {
+        assert!(policy.check_ip(ip.parse().unwrap()).is_ok(), "{ip}");
+    }
+    for ip in [
+        "192.0.0.1",
+        "192.0.2.1",
+        "198.51.100.1",
+        "203.0.113.1",
+        "2001:20::1",
+        "100::1",
+        "3fff::1",
+    ] {
+        assert!(policy.check_ip(ip.parse().unwrap()).is_err(), "{ip}");
+    }
+}

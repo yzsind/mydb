@@ -25,11 +25,37 @@ impl std::fmt::Debug for AiStatement {
             .finish_non_exhaustive()
     }
 }
-struct Tokens {
+struct Tokens<'a> {
+    sql: &'a str,
     v: Vec<Token>,
     i: usize,
+    positions: Vec<(usize, usize)>,
+    end: (usize, usize),
 }
-impl Tokens {
+impl Tokens<'_> {
+    fn error(&self) -> crate::parser::ParseError {
+        let mut error = crate::parser::ParseError::at_zero("invalid AI statement syntax");
+        (error.line, error.column) = self.positions.get(self.i).copied().unwrap_or(self.end);
+        let (mut line, mut column) = (1, 1);
+        let mut offset = self.sql.len();
+        for (i, ch) in self.sql.char_indices() {
+            if (line, column) == (error.line, error.column) {
+                offset = i;
+                break;
+            }
+            if ch == '\n' {
+                line += 1;
+                column = 1;
+            } else {
+                column += 1;
+            }
+        }
+        error.span = crate::parser::Span {
+            start: offset,
+            end: offset,
+        };
+        error
+    }
     fn eat(&mut self, s: &str) -> bool {
         if self
             .v
@@ -46,14 +72,14 @@ impl Tokens {
         if self.eat(s) {
             Ok(())
         } else {
-            Err(parse_error())
+            Err(self.error())
         }
     }
     fn name(&mut self) -> Result<String, crate::parser::ParseError> {
         let mut s = String::new();
         loop {
             let Some(Token::Word(w)) = self.v.get(self.i) else {
-                return Err(parse_error());
+                return Err(self.error());
             };
             if w.value.is_empty()
                 || w.value.len() > 64
@@ -61,7 +87,7 @@ impl Tokens {
                     b.is_ascii_alphanumeric() && (i > 0 || !b.is_ascii_digit()) || b == b'_'
                 })
             {
-                return Err(parse_error());
+                return Err(self.error());
             }
             if !s.is_empty() {
                 s.push('.');
@@ -78,10 +104,10 @@ impl Tokens {
     }
     fn schema_name(&mut self) -> Result<String, crate::parser::ParseError> {
         let Some(Token::Word(word)) = self.v.get(self.i) else {
-            return Err(parse_error());
+            return Err(self.error());
         };
         if word.value.is_empty() || word.value.chars().count() > 64 {
-            return Err(parse_error());
+            return Err(self.error());
         }
         self.i += 1;
         Ok(word.value.to_ascii_lowercase())
@@ -99,7 +125,7 @@ impl Tokens {
                 b == b'_' || b.is_ascii_alphanumeric() && (i > 0 || !b.is_ascii_digit())
             })
         {
-            return Err(parse_error());
+            return Err(self.error());
         }
         Ok(schema.map_or_else(|| object.clone(), |schema| format!("{schema}.{object}")))
     }
@@ -108,12 +134,9 @@ impl Tokens {
             self.i += 1;
             Ok(v.clone())
         } else {
-            Err(parse_error())
+            Err(self.error())
         }
     }
-}
-fn parse_error() -> crate::parser::ParseError {
-    crate::parser::parse_expr_fragment("(").unwrap_err()
 }
 pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseError>> {
     let trimmed = sql.trim_start();
@@ -135,15 +158,33 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
         return None;
     }
     let dialect = crate::parser::MydbDialect::default();
-    let tokens = Tokenizer::new(&dialect, sql).tokenize().ok()?;
-    let mut tokens: Vec<_> = tokens
+    let located = Tokenizer::new(&dialect, sql)
+        .tokenize_with_location()
+        .ok()?;
+    let end = located.last().map_or((1, 1), |t| {
+        (t.span.end.line as usize, t.span.end.column as usize)
+    });
+    let (mut tokens, mut positions): (Vec<_>, Vec<_>) = located
         .into_iter()
-        .filter(|t| !matches!(t, Token::Whitespace(_) | Token::EOF))
-        .collect();
+        .filter(|t| !matches!(t.token, Token::Whitespace(_) | Token::EOF))
+        .map(|t| {
+            (
+                t.token,
+                (t.span.start.line as usize, t.span.start.column as usize),
+            )
+        })
+        .unzip();
     if tokens.last() == Some(&Token::SemiColon) {
         tokens.pop();
+        positions.pop();
     }
-    let mut c = Tokens { v: tokens, i: 0 };
+    let mut c = Tokens {
+        sql,
+        v: tokens,
+        i: 0,
+        positions,
+        end,
+    };
     let action = if c.eat("CREATE") {
         "create"
     } else if c.eat("ALTER") {
@@ -183,13 +224,27 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
         let result = (|| {
             c.expect("MODEL")?;
             a.name = c.model_name()?;
-            a.tail = Some(
-                c.v[c.i..]
-                    .iter()
-                    .map(ToString::to_string)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            );
+            // Keep original quoting and escaping. Token Display implementations
+            // are not SQL serializers for decoded account names.
+            let mut line = 1usize;
+            let mut column = 1usize;
+            let position = c.positions.get(c.i).copied().unwrap_or(c.end);
+            let offset = sql
+                .char_indices()
+                .find_map(|(offset, ch)| {
+                    if (line, column) == position {
+                        return Some(offset);
+                    }
+                    if ch == '\n' {
+                        line += 1;
+                        column = 1;
+                    } else {
+                        column += 1;
+                    }
+                    None
+                })
+                .unwrap_or(sql.len());
+            a.tail = Some(sql[offset..].to_owned());
             Ok(Statement::Ai(a))
         })();
         return Some(result);
@@ -204,7 +259,7 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
                 if c.i == c.v.len() {
                     Ok(Statement::Ai(a))
                 } else {
-                    Err(parse_error())
+                    Err(c.error())
                 }
             }));
         }
@@ -217,7 +272,7 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
                         if c.i == c.v.len() {
                             Ok(Statement::Ai(a))
                         } else {
-                            Err(parse_error())
+                            Err(c.error())
                         }
                     }),
             );
@@ -231,18 +286,21 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
         return None;
     }
     let result = (|| {
-        a.kind = if c.eat("SECRET") || c.eat("SECRETS") {
+        a.kind = if c.eat("SECRET") || (a.action == "show" && c.eat("SECRETS")) {
             "secret"
-        } else if c.eat("CONNECTION") || c.eat("CONNECTIONS") {
+        } else if c.eat("CONNECTION") || (a.action == "show" && c.eat("CONNECTIONS")) {
             "connection"
-        } else if c.eat("MODEL") || c.eat("MODELS") {
+        } else if c.eat("MODEL") || (a.action == "show" && c.eat("MODELS")) {
             "model"
         } else {
-            return Err(parse_error());
+            return Err(c.error());
         }
         .into();
         if a.action == "show" {
             if c.eat("FROM") {
+                if a.kind != "model" {
+                    return Err(c.error());
+                }
                 a.name = c.schema_name()?;
             }
         } else {
@@ -273,7 +331,7 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
                         Some(Token::SingleQuotedString(_)) => {
                             Expr::Literal(crate::parser::Literal::String(c.literal()?))
                         }
-                        _ => return Err(parse_error()),
+                        _ => return Err(c.error()),
                     });
                 } else {
                     c.expect("WITH")?;
@@ -283,7 +341,7 @@ pub(crate) fn parse(sql: &str) -> Option<Result<Statement, crate::parser::ParseE
             }
         }
         if c.i != c.v.len() {
-            return Err(parse_error());
+            return Err(c.error());
         }
         Ok(Statement::Ai(a))
     })();
@@ -303,6 +361,22 @@ pub(crate) fn statement_has_ai(statement: &Statement) -> bool {
             }
         }
     }
+    let has_index_call = |expressions: &[Option<String>]| {
+        expressions
+            .iter()
+            .flatten()
+            .any(|sql| crate::parser::parse_expr_fragment(sql).is_ok_and(|expr| expr_has_ai(&expr)))
+    };
+    let index_call = match statement {
+        Statement::CreateTableAsSelect { table, .. } => table.indexes.iter().any(|index| has_index_call(&index.key_expressions)),
+        Statement::CreateTable(table) => table.indexes.iter().any(|index| has_index_call(&index.key_expressions)),
+        Statement::CreateIndex(index) => has_index_call(&index.key_expressions),
+        Statement::AlterTable(table) => table.actions.iter().any(|action| matches!(action, crate::parser::AlterAction::AddIndex(index) if has_index_call(&index.key_expressions))),
+        _ => false,
+    };
+    if index_call {
+        return true;
+    }
     let mut f = Find(false);
     crate::parser::visit::visit_statement(&mut f, statement);
     f.0
@@ -314,7 +388,7 @@ pub(crate) fn expr_has_ai(expr: &Expr) -> bool {
     )
 }
 /// Conservative raw-text routing also protects malformed sensitive statements.
-pub(crate) fn sql_may_have_ai(sql: &str) -> bool {
+fn ai_tokens_sensitive(sql: &str) -> bool {
     let bytes = sql.as_bytes();
     let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
     for i in memchr::memchr2_iter(b'A', b'a', bytes) {
@@ -403,4 +477,76 @@ pub(crate) fn sql_may_have_ai(sql: &str) -> bool {
         }
     }
     false
+}
+
+/// Inspect executable SQL, excluding literal data and ordinary comments.
+pub(crate) fn sql_calls_ai(sql: &str, mode: crate::sql_lex::SqlLexMode) -> bool {
+    use crate::sql_lex::{segments, SqlSegmentKind};
+    if !ai_tokens_sensitive(sql) && !sql.contains("/*!") {
+        return false;
+    }
+    let mut code = String::with_capacity(sql.len().min(4096));
+    for segment in segments(sql, mode, u32::MAX) {
+        let Ok(segment) = segment else {
+            return false;
+        };
+        match segment.kind {
+            SqlSegmentKind::Code => code.push_str(&sql[segment.range]),
+            SqlSegmentKind::ExecutableComment { body, .. } => code.push_str(&sql[body]),
+            SqlSegmentKind::Quoted { quote: b'`' } => code.push_str(&sql[segment.range]),
+            SqlSegmentKind::Quoted { quote: b'"' } if mode.ansi_quotes => {
+                code.push_str(&sql[segment.range])
+            }
+            _ => code.push(' '),
+        }
+    }
+    ai_tokens_sensitive(&code)
+}
+
+pub(crate) fn sql_may_have_ai(sql: &str) -> bool {
+    let trimmed = sql.trim_start();
+    // Common malformed credential statements are still sensitive before parse.
+    let mut words = trimmed.split_whitespace();
+    if let (Some(first), Some(second)) = (words.next(), words.next()) {
+        if ["CREATE", "ALTER"]
+            .iter()
+            .any(|v| first.eq_ignore_ascii_case(v))
+            && ["AI_SECRET", "AISECRET", "SECRET"]
+                .iter()
+                .any(|v| second.eq_ignore_ascii_case(v))
+        {
+            return true;
+        }
+    }
+    if !ai_tokens_sensitive(sql) && !sql.contains("/*!") {
+        return false;
+    }
+    // Credential-bearing SQL remains sensitive when stored in a string, even
+    // if the nested statement is misspelled. This does not affect execution routing.
+    for segment in crate::sql_lex::segments(sql, Default::default(), u32::MAX).flatten() {
+        if matches!(
+            segment.kind,
+            crate::sql_lex::SqlSegmentKind::Quoted {
+                quote: b'\'' | b'"'
+            }
+        ) {
+            let literal = &sql[segment.range];
+            let upper = literal.to_ascii_uppercase();
+            if (upper.contains("CREATE") || upper.contains("ALTER"))
+                && upper.contains("AI")
+                && upper.contains("SECR")
+            {
+                return true;
+            }
+        }
+    }
+    [false, true].into_iter().any(|no_backslash_escapes| {
+        sql_calls_ai(
+            sql,
+            crate::sql_lex::SqlLexMode {
+                no_backslash_escapes,
+                ..Default::default()
+            },
+        )
+    })
 }

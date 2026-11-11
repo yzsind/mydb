@@ -68,6 +68,15 @@ fn contains(sql: &str, names: &BTreeSet<String>) -> bool {
     if names.is_empty() {
         return false;
     }
+    if sql.contains("/*!") {
+        for segment in crate::sql_lex::segments(sql, Default::default(), u32::MAX).flatten() {
+            if let crate::sql_lex::SqlSegmentKind::ExecutableComment { body, .. } = segment.kind {
+                if contains(&sql[body], names) {
+                    return true;
+                }
+            }
+        }
+    }
     // False positives inside literals are deliberate: they redact more and
     // route one query away from the ordinary worker pool without executing it.
     if sql

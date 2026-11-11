@@ -871,6 +871,16 @@ fn ai_timeouts_incomplete_output_and_retry_ambiguity_are_explicit() {
             crate::engine::json::to_serde(bytes).unwrap()["error"]["code"],
             "ER_AI_TIMEOUT"
         );
+        // The timeout above now contributes to the breaker. Reset its health
+        // independently before testing the SQL-level deadline.
+        exec(
+            engine,
+            session,
+            &format!(
+                "ALTER AI CONNECTION local WITH CONFIG '{}'",
+                json!({"protocol":"ollama","base_url":format!("http://127.0.0.1:{}",mock.port),"auth":{"type":"none"}})
+            ),
+        );
         exec(engine, session, "SET SESSION max_execution_time=10");
         let error=engine.execute_with_session(session,"SELECT AI_GENERATE_DETAIL('test.chat','__slow__',JSON_OBJECT('on_error','return'))").unwrap_err();
         assert_eq!(
@@ -992,3 +1002,130 @@ fn ai_model_grammar_preserves_sql_modes_quoted_names_and_unicode_schemas() {
 
 #[path = "ai_regression.rs"]
 mod regression;
+
+#[test]
+fn ai_audit_projection_preserves_enum_set_and_rejects_invalid_ddl() {
+    let mock = Mock::new();
+    let dir = temp();
+    crate::util::env::with_vars(&[("MYDB_AI_LOCAL_CONFIG", None)], || {
+        let engine = open_test_engine(dir.path());
+        let mut session = SessionContext::default();
+        exec(
+            &engine,
+            &mut session,
+            &format!(
+                "CREATE AI CONNECTION audit_local WITH CONFIG '{}'",
+                json!({"protocol":"ollama","base_url":format!("http://127.0.0.1:{}",mock.port),"auth":{"type":"none"}})
+            ),
+        );
+        exec(
+            &engine,
+            &mut session,
+            r#"CREATE AI MODEL test.audit_chat USING audit_local WITH CONFIG '{"kind":"text_generation","remote_model":"mock-chat","model_revision":"v1"}'"#,
+        );
+        exec(
+            &engine,
+            &mut session,
+            "CREATE TABLE audit_types(id INT,e ENUM('a','b'),s SET('a','b','c'))",
+        );
+        exec(
+            &engine,
+            &mut session,
+            "INSERT INTO audit_types VALUES(1,'b','a,c')",
+        );
+        let plain = materialize(exec(
+            &engine,
+            &mut session,
+            "SELECT id+e,e+0,s+0 FROM audit_types",
+        ));
+        let external = materialize(exec(
+            &engine,
+            &mut session,
+            "SELECT id+e,e+0,s+0,AI_GENERATE('audit_chat','x') FROM audit_types",
+        ));
+        assert_eq!(&external.rows[0][..3], plain.rows[0].as_slice());
+        exec(
+            &engine,
+            &mut session,
+            "CREATE TABLE audit_join(id INT,title TEXT)",
+        );
+        exec(
+            &engine,
+            &mut session,
+            "INSERT INTO audit_join VALUES(1,'joined')",
+        );
+        for join in ["JOIN audit_join USING(id)", "NATURAL JOIN audit_join"] {
+            let result = materialize(exec(
+                &engine,
+                &mut session,
+                &format!("SELECT id, AI_GENERATE('audit_chat',title) FROM audit_types {join}"),
+            ));
+            assert_eq!(result.rows.len(), 1);
+            assert_eq!(result.rows[0][0], Value::Int(1));
+        }
+
+        assert!(engine
+            .execute_with_session(
+                &mut session,
+                "SET @@session.max_execution_time=AI_GENERATE('audit_chat','1')"
+            )
+            .is_err());
+        assert!(engine
+            .execute_with_session(
+                &mut session,
+                "CREATE TABLE audit_index(a TEXT,KEY k((AI_GENERATE('audit_chat',a))))"
+            )
+            .is_err());
+        for metadata in [
+            r#""provider_options_allowed":["x"],"provider_options_schema":{"x":{"type":"nonsense"}}"#,
+            r#""provider_options_allowed":["model"]"#,
+        ] {
+            assert!(engine.execute_with_session(&mut session, &format!(r#"CREATE AI MODEL test.bad USING audit_local WITH CONFIG '{{"kind":"text_generation","remote_model":"m","model_revision":"v1",{metadata}}}'"#)).is_err());
+        }
+        exec(&engine, &mut session, "DROP AI MODEL audit_chat");
+    });
+}
+
+#[test]
+fn audit_numeric_projection_widens_narrow_abs_and_negation_wire_types() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    exec(
+        &engine,
+        &mut session,
+        "CREATE TABLE numeric_audit(t TINYINT,u TINYINT UNSIGNED,s SMALLINT)",
+    );
+    exec(
+        &engine,
+        &mut session,
+        "INSERT INTO numeric_audit VALUES(-128,255,-32768)",
+    );
+    let result = materialize(exec(
+        &engine,
+        &mut session,
+        "SELECT ABS(t),-t,-u,ABS(s),-s FROM numeric_audit",
+    ));
+    assert!(result
+        .columns
+        .iter()
+        .all(|column| column.column_type == crate::types::ColumnType::LongLong));
+    assert_eq!(
+        result.rows[0],
+        vec![
+            Value::Int(128),
+            Value::Int(128),
+            Value::Int(-255),
+            Value::Int(32768),
+            Value::Int(32768)
+        ]
+    );
+    let mut packet = Vec::new();
+    crate::mysql::protocol::binary_row_packet_into_with_charset(
+        &result.columns,
+        &result.rows[0],
+        &mut packet,
+        None,
+    );
+    assert_eq!(packet.len(), 42);
+}

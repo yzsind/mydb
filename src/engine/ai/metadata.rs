@@ -32,7 +32,11 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
                     Value::String(object.into()),
                     Value::UInt(m.id),
                     Value::String(m.kind.clone()),
-                    Value::String(m.remote_model.clone()),
+                    if admin {
+                        Value::String(m.remote_model.clone())
+                    } else {
+                        Value::Null
+                    },
                     Value::String(m.model_revision.clone()),
                     Value::UInt(m.generation),
                     Value::Int(i64::from(m.enabled)),

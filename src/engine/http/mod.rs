@@ -61,6 +61,21 @@ pub(crate) fn is_function(name: &str) -> bool {
 }
 /// Conservative allocation-free scheduling hint; authoritative checks use ASTs.
 pub(crate) fn mentions(sql: &str) -> bool {
+    if sql.contains("/*!") {
+        for segment in crate::sql_lex::segments(sql, Default::default(), u32::MAX).flatten() {
+            if let crate::sql_lex::SqlSegmentKind::ExecutableComment { body, .. } = segment.kind {
+                // A function name can end at the comment boundary and its arguments
+                // can start outside it. Treat that boundary conservatively.
+                if mentions(&sql[body.clone()])
+                    || sql[body]
+                        .split(|c: char| !c.is_alphanumeric() && c != '_')
+                        .any(is_function)
+                {
+                    return true;
+                }
+            }
+        }
+    }
     let bytes = sql.as_bytes();
     for i in memchr::memchr2_iter(b'h', b'H', bytes) {
         if i > 0 && (bytes[i - 1].is_ascii_alphanumeric() || matches!(bytes[i - 1], b'_' | b'$')) {
@@ -87,7 +102,10 @@ pub(crate) fn mentions(sql: &str) -> bool {
             {
                 end += 1;
             }
-            while bytes.get(end).is_some_and(u8::is_ascii_whitespace) {
+            while bytes
+                .get(end)
+                .is_some_and(|b| b.is_ascii_whitespace() || *b == 0x0b)
+            {
                 end += 1;
             }
             if bytes.get(end) == Some(&b'(')

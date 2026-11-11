@@ -21,7 +21,8 @@ pub fn function_call_cost(name: &str) -> f64 {
 /// because a same-named stored function exists in the current schema.
 pub(crate) fn is_known_builtin_function(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    crate::engine::builtin_catalog::is_declared_builtin(&name.to_ascii_uppercase())
+    name.eq_ignore_ascii_case("GET_FORMAT")
+        || crate::engine::builtin_catalog::is_declared_builtin(&name.to_ascii_uppercase())
         || function_class(&lower) != FunctionClass::Unknown
         || crate::engine::expr_type::builtin_spec(&name.to_ascii_uppercase()).is_some()
         || crate::engine::geo::sql::is_geo_function(&name.to_ascii_uppercase())

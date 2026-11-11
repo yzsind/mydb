@@ -139,11 +139,13 @@ pub(in crate::engine::executor) fn validate_shape(statement: &Statement) -> Resu
         Statement::Ai(_) => Ok(()),
         Statement::Explain { target, .. } => validate_shape(target),
         Statement::WithCte(with) => {
-            if with.recursive
-                || with
-                    .ctes
-                    .iter()
-                    .any(|cte| statement_has_ai(&cte.query.clone().into_statement()))
+            if with.recursive {
+                return Err(fail("AI external projection over recursive CTEs is not supported; materialize the pure query first"));
+            }
+            if with
+                .ctes
+                .iter()
+                .any(|cte| statement_has_ai(&cte.query.clone().into_statement()))
             {
                 return Err(fail("AI calls cannot appear inside CTE definitions"));
             }
@@ -181,7 +183,10 @@ pub(in crate::engine::executor) fn validate_shape(statement: &Statement) -> Resu
                     } = item
                     {
                         if expr_has_ai(expr)
-                            && matches!(&order.expr,Expr::Identifier(n)if n.eq_ignore_ascii_case(alias))
+                            && crate::parser::visit::any_expr(
+                                &order.expr,
+                                |node| matches!(node,Expr::Identifier(n)if n.eq_ignore_ascii_case(alias)),
+                            )
                         {
                             return Err(fail("ORDER BY cannot depend on AI output"));
                         }
@@ -195,7 +200,12 @@ pub(in crate::engine::executor) fn validate_shape(statement: &Statement) -> Resu
             }
             Ok(())
         }
-        Statement::Set(a) if a.len() == 1 && a[0].scope.is_none() && a[0].name.starts_with('@') => {
+        Statement::Set(a)
+            if a.len() == 1
+                && a[0].scope.is_none()
+                && a[0].name.starts_with('@')
+                && !a[0].name.starts_with("@@") =>
+        {
             validate_expr(&a[0].value)
         }
         _ => Err(fail(
@@ -277,12 +287,27 @@ pub(super) fn admin(
         ));
     }
     if matches!(a.action.as_str(), "grant" | "revoke") {
-        let model = db
-            .ai_catalog()?
-            .models
-            .get(&name(session, &a.name))
-            .cloned()
-            .ok_or_else(|| ai::error("ER_AI_MODEL_NOT_FOUND", "model does not exist"))?;
+        let catalog = db.ai_catalog()?;
+        let model = catalog.models.get(&name(session, &a.name));
+        let required = crate::engine::auth::RequiredPrivilege {
+            privilege: crate::engine::auth::Privilege::Dynamic(format!(
+                "AI_MODEL_{}_USE",
+                model.map_or(0, |m| m.id)
+            )),
+            scope: crate::engine::auth::PrivilegeScope::Global,
+        };
+        if !db.auth_catalog().account_has_privilege(
+            &session.authorization_context(),
+            &required,
+            true,
+        ) {
+            return Err(ai::error(
+                "ER_AI_ACCESS_DENIED",
+                "AI model grant privilege required",
+            ));
+        }
+        let model = model
+            .ok_or_else(|| ai::runtime::missing_model(db, &session.authorization_context()))?;
         let verb = if a.action == "grant" {
             "GRANT"
         } else {
@@ -296,6 +321,22 @@ pub(super) fn admin(
         let translated = crate::parser::parse_statement(&sql)
             .map_err(|_| ai::error("ER_AI_INVALID_ARGUMENT", "invalid model grant"))?;
         return execute_qualified_statement(db, session, translated, registry);
+    }
+    if a.kind == "model"
+        && a.action == "show"
+        && !a.name.is_empty()
+        && !db.catalog().databases.contains_key(&a.name)
+    {
+        return Err(
+            crate::error::catalog::ER_BAD_DB_ERROR.error(format!("Unknown database '{}'", a.name))
+        );
+    }
+    if a.kind == "model"
+        && a.action != "show"
+        && !a.name.contains('.')
+        && session.current_database.is_empty()
+    {
+        return Err(crate::error::catalog::ER_NO_DB_ERROR.error("No database selected"));
     }
     if a.action == "show"
         && a.kind == "model"
@@ -335,7 +376,7 @@ pub(super) fn admin(
     }
     if a.action == "show" || a.action == "show_create" {
         let catalog = db.ai_catalog()?;
-        let rows = match a.kind.as_str() {
+        let rows: Vec<Vec<Value>> = match a.kind.as_str() {
             "secret" => catalog
                 .secrets
                 .iter()
@@ -380,6 +421,12 @@ pub(super) fn admin(
                 .collect(),
             _ => return Err(ai::error("ER_AI_INVALID_ARGUMENT", "unknown AI object")),
         };
+        if a.action == "show_create" && rows.is_empty() {
+            return Err(ai::error(
+                "ER_AI_INVALID_ARGUMENT",
+                "AI object does not exist",
+            ));
+        }
         return Ok(result(&["Name", "Definition"], rows));
     }
     if crate::binlog::enabled() {
@@ -445,14 +492,35 @@ pub(super) fn admin(
         };
         if (a.action == "create" && exists) || (a.action == "drop" && !exists) {
             if a.if_exists {
+                crate::engine::api::push_sql_warning(crate::error::SqlCondition::known(
+                    crate::error::ConditionLevel::Note,
+                    crate::error::catalog::ER_AI_INVALID_ARGUMENT,
+                    if exists {
+                        "AI object already exists"
+                    } else {
+                        "AI object does not exist"
+                    },
+                ));
                 return Ok(());
             }
             return Err(ai::error(
                 "ER_AI_INVALID_ARGUMENT",
-                "AI object already exists or was not found",
+                if exists {
+                    "AI object already exists"
+                } else {
+                    "AI object does not exist"
+                },
             ));
         }
         if a.action == "alter" && !exists {
+            if a.if_exists {
+                crate::engine::api::push_sql_warning(crate::error::SqlCondition::known(
+                    crate::error::ConditionLevel::Note,
+                    crate::error::catalog::ER_AI_INVALID_ARGUMENT,
+                    "AI object does not exist",
+                ));
+                return Ok(());
+            }
             return Err(ai::error(
                 "ER_AI_INVALID_ARGUMENT",
                 "AI object does not exist",
@@ -615,13 +683,22 @@ pub(super) fn project(
     let Statement::Select(mut s) = statement else {
         unreachable!()
     };
+    crate::planner::resolve_join_using_natural(db, &mut s)?;
     let calls = ai::runtime::prepare_calls(db.clone(), session)?;
     bind_models_from_catalog(db, session, &s, calls.catalog())?;
-    let output_columns = super::super::select::describe_statement_columns(
+    let mut output_columns = super::super::select::describe_statement_columns(
         db,
         session,
         &Statement::Select(s.clone()),
     )?;
+    for (item, column) in s.projection.iter().zip(&mut output_columns) {
+        if matches!(item, SelectItem::Expr { expr, .. } if expr_has_ai(expr))
+            && matches!(column.column_type, ColumnType::VarString | ColumnType::Blob)
+            && column.source.collation_id != Some(crate::charset::BINARY_COLLATION_ID)
+        {
+            column.source.flags &= !crate::mysql::protocol::BINARY_FLAG;
+        }
+    }
     let mut input_memory = ai::admission::Memory::reserve(0)?;
     let mut ast_bytes = 0usize;
     for item in &s.projection {
@@ -656,6 +733,25 @@ pub(super) fn project(
             return Err(fail("explicit projection columns required"));
         };
         crate::parser::visit::try_rewrite_value_expr(expr, |node| {
+            if !expr_has_ai(node)
+                && !matches!(
+                    node,
+                    Expr::UserVariable(_)
+                        | Expr::SystemVariable { .. }
+                        | Expr::Placeholder(_)
+                        | Expr::Literal(_)
+                )
+            {
+                let index = inputs
+                    .iter()
+                    .position(|input| input == node)
+                    .unwrap_or_else(|| {
+                        inputs.push(node.clone());
+                        inputs.len() - 1
+                    });
+                *node = Expr::Identifier(format!("__ai_input_{index}"));
+                return Ok(false);
+            }
             match node {
                 Expr::UserVariable(name) => {
                     let bytes = session.user_variable(name).map_or(0, Value::heap_capacity);
@@ -731,17 +827,22 @@ pub(super) fn project(
     let budget = crate::engine::executor::mem_budget::current_budget()
         .unwrap_or_else(|| crate::engine::executor::mem_budget::MemBudget::for_database(db));
     for order in &mut s.order_by {
-        for item in &s.projection {
-            if let SelectItem::Expr {
-                expr,
-                alias: Some(alias),
-            } = item
-            {
-                if matches!(&order.expr,Expr::Identifier(name)if name.eq_ignore_ascii_case(alias)) {
-                    order.expr = expr.clone();
+        crate::parser::visit::try_rewrite_value_expr(&mut order.expr, |node| {
+            if let Expr::Identifier(name) = node {
+                if let Some(expr) = s.projection.iter().find_map(|item| match item {
+                    SelectItem::Expr {
+                        expr,
+                        alias: Some(alias),
+                    } if alias.eq_ignore_ascii_case(name) => Some(expr),
+                    _ => None,
+                }) {
+                    *node = expr.clone();
+                    return Ok::<_, QueryError>(false);
                 }
             }
-        }
+            Ok(true)
+        })?;
+        order.names_bound = true;
     }
     s.projection = inputs
         .into_iter()
@@ -760,6 +861,23 @@ pub(super) fn project(
     apply_sql_select_limit(session, &mut s);
     let response = run_select_response(db, session, s, registry)?;
     let (columns, mut cursor) = response_into_cursor(response)?;
+    for (item, column) in projection.iter().zip(&mut output_columns) {
+        if let SelectItem::Expr {
+            expr: Expr::Identifier(name),
+            ..
+        } = item
+        {
+            if let Some(source) = name
+                .strip_prefix("__ai_input_")
+                .and_then(|i| i.parse::<usize>().ok())
+                .and_then(|i| columns.get(i))
+            {
+                let name = column.name.clone();
+                *column = source.clone();
+                column.name = name;
+            }
+        }
+    }
     let mut rows = Vec::new();
     while let Some(row) = cursor.next_row()? {
         if rows.len() >= 100 {
@@ -781,10 +899,32 @@ pub(super) fn project(
     }
     drop(cursor);
     let schema = synthetic_set_op_schema(&columns);
-    let only_embeddings=projection.iter().all(|item|matches!(item,SelectItem::Expr{expr:Expr::Function{name,..},..}if name.eq_ignore_ascii_case("AI_EMBED"))||matches!(item,SelectItem::Expr{expr,..}if !crate::engine::ai::sql::expr_has_ai(expr)));
+    let mut known_items = 0usize;
+    for item in &projection {
+        let SelectItem::Expr { expr, .. } = item else {
+            continue;
+        };
+        if let Some(Expr::Function { name, args, .. }) = eager_external_call(expr) {
+            for row in &rows {
+                let model = crate::engine::expr::eval_expr(&args[0], &schema, row)?;
+                let input = crate::engine::expr::eval_expr(&args[1], &schema, row)?;
+                if !matches!(model, Value::Null) && !matches!(input, Value::Null) {
+                    known_items = known_items.saturating_add(match &input {
+                        Value::Json(bytes) if name.eq_ignore_ascii_case("AI_EMBED_DETAIL") => {
+                            crate::engine::json::to_serde(bytes)?
+                                .as_array()
+                                .map_or(1, Vec::len)
+                        }
+                        _ => 1,
+                    });
+                }
+            }
+        }
+    }
+    calls.validate_item_count(known_items)?;
+    let only_embeddings = projection.iter().all(|item| matches!(item, SelectItem::Expr { expr, .. } if !expr_has_ai(expr) || matches!(eager_external_call(expr), Some(Expr::Function { name, .. }) if name.eq_ignore_ascii_case("AI_EMBED"))));
     let direct_calls = projection.iter().all(|item| {
-        matches!(item,SelectItem::Expr{expr:Expr::Function{name,..},..}if ai::is_function(name))
-            || matches!(item,SelectItem::Expr{expr,..}if !crate::engine::ai::sql::expr_has_ai(expr))
+        matches!(item, SelectItem::Expr { expr, .. } if !expr_has_ai(expr) || eager_external_call(expr).is_some())
     });
     Ok(QueryResponse::StreamingResultSet(StreamingResultSet {
         columns: output_columns,
@@ -871,7 +1011,7 @@ impl ExternalCursor {
             &self.catalog,
             &self.projection,
             &self.schema,
-            rows,
+            &rows,
             Arc::get_mut(&mut memory).unwrap(),
         )?;
         self.buffer = output.into();
@@ -932,14 +1072,88 @@ impl crate::engine::api::ResultCursor for ExternalCursor {
     }
 }
 
+fn eager_external_call(expr: &Expr) -> Option<Expr> {
+    let mut found = None;
+    let mut safe = true;
+    crate::parser::visit::inspect_value_expr(
+        expr,
+        |node| {
+            if let Expr::Function { name, .. } = node {
+                if ai::is_function(name) {
+                    if found.is_some() {
+                        safe = false;
+                    }
+                    found = Some(node.clone());
+                    return false;
+                }
+                if ["IF", "IFNULL", "COALESCE", "NULLIF"]
+                    .iter()
+                    .any(|n| name.eq_ignore_ascii_case(n))
+                {
+                    safe = false;
+                }
+            }
+            if matches!(
+                node,
+                Expr::Case { .. }
+                    | Expr::Binary {
+                        op: crate::parser::BinaryOp::And | crate::parser::BinaryOp::Or,
+                        ..
+                    }
+            ) {
+                safe = false;
+            }
+            true
+        },
+        |_| {},
+    );
+    safe.then_some(found).flatten()
+}
+
 fn evaluate_rows(
     database: &str,
     catalog: &AiCatalog,
     projection: &[SelectItem],
     schema: &TableSchema,
-    rows: Vec<Vec<Value>>,
+    rows: &[Vec<Value>],
     charge: &mut ai::admission::Memory,
 ) -> Result<Vec<Vec<Value>>, QueryError> {
+    let wrapped = projection.iter().any(|item| matches!(item, SelectItem::Expr { expr, .. } if eager_external_call(expr).is_some_and(|call| &call != expr)));
+    if wrapped {
+        let direct: Vec<_> = projection
+            .iter()
+            .map(|item| match item {
+                SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                    expr: eager_external_call(expr).unwrap_or_else(|| expr.clone()),
+                    alias: alias.clone(),
+                },
+                item => item.clone(),
+            })
+            .collect();
+        let mut values = evaluate_rows(database, catalog, &direct, schema, rows, charge)?;
+        for (row, output) in rows.iter().zip(&mut values) {
+            for (item, value) in projection.iter().zip(output) {
+                let SelectItem::Expr { expr, .. } = item else {
+                    continue;
+                };
+                let Some(call) = eager_external_call(expr).filter(|call| call != expr) else {
+                    continue;
+                };
+                let mut wrapper = expr.clone();
+                crate::parser::visit::try_rewrite_value_expr(&mut wrapper, |node| {
+                    if *node == call {
+                        *node = Expr::BoundValue(value.clone());
+                        return Ok::<_, QueryError>(false);
+                    }
+                    Ok(true)
+                })?;
+                let result = crate::engine::expr::eval_expr(&wrapper, schema, row)?;
+                charge.grow(result.heap_capacity())?;
+                *value = result;
+            }
+        }
+        return Ok(values);
+    }
     let mut ready: Vec<Vec<Option<Value>>> = (0..rows.len())
         .map(|_| vec![None; projection.len()])
         .collect();
@@ -1046,7 +1260,20 @@ fn evaluate_rows(
             let value = match ready[index][column].take() {
                 Some(value) => value,
                 None => {
-                    let value = crate::engine::expr::eval_expr(expr, &schema, &row)?;
+                    // The inner SELECT already evaluated pure projections.
+                    // Preserve their typed values instead of applying display
+                    // coercions (notably ZEROFILL) a second time.
+                    let input = match expr {
+                        Expr::Identifier(name) => name
+                            .strip_prefix("__ai_input_")
+                            .and_then(|index| index.parse::<usize>().ok())
+                            .and_then(|index| row.get(index)),
+                        _ => None,
+                    };
+                    let value = match input {
+                        Some(value) => value.clone(),
+                        None => crate::engine::expr::eval_expr(expr, &schema, &row)?,
+                    };
                     charge.grow(value.heap_capacity())?;
                     value
                 }
@@ -1098,9 +1325,13 @@ fn bind_models_from_catalog(
                             let raw = crate::types::value_str(&value).ok_or_else(|| {
                                 ai::error("ER_AI_INVALID_ARGUMENT", "model must be text")
                             })?;
+                            if !raw.contains('.') && session.current_database.is_empty() {
+                                return Err(crate::error::catalog::ER_NO_DB_ERROR
+                                    .error("No database selected"));
+                            }
                             let model =
                                 catalog.models.get(&name(session, raw)).ok_or_else(|| {
-                                    ai::error("ER_AI_MODEL_NOT_FOUND", "model does not exist")
+                                    ai::runtime::missing_model(db, &session.authorization_context())
                                 })?;
                             if ai::runtime::authorize(
                                 db,
@@ -1144,13 +1375,18 @@ fn bind_models_from_catalog(
 pub(super) fn explain(
     db: &Arc<Database>,
     session: &mut SessionContext,
-    target: Statement,
+    mut target: Statement,
     format: crate::parser::ExplainFormat,
     analyze: bool,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
-    validate(session, &target)?;
-    if let Statement::Select(select) = &target {
+    if analyze {
+        validate(session, &target)?;
+    } else {
+        validate_shape(&target)?;
+    }
+    if let Statement::Select(select) = &mut target {
+        crate::planner::resolve_join_using_natural(db, select)?;
         bind_models(db, session, select)?;
     }
     let _columns = super::super::select::describe_statement_columns(db, session, &target)?;
@@ -1271,7 +1507,10 @@ fn external_explain_result(
             let text = if format == ExplainFormat::Json {
                 serde_json::json!({"query_block":{"operator":"ExternalProject","external_io":true,"max_call_items":100,"max_http_attempts":100,"actual_rows":actual_rows,"logical_items":counts.0,"attempts":counts.1,"total_ms":if analyze{Some(elapsed)}else{None}}}).to_string()
             } else {
-                format!("-> {details}; actual_rows={actual_rows:?}; total_ms={elapsed:.3}")
+                format!(
+                    "-> {details}; actual_rows={}; total_ms={elapsed:.3}",
+                    actual_rows.map_or_else(|| "not executed".into(), |n| n.to_string())
+                )
             };
             Ok(result(&["EXPLAIN"], vec![vec![Value::String(text)]]))
         }

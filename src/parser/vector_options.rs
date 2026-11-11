@@ -39,10 +39,8 @@ pub(super) fn strip_vector_options(
             continue;
         }
         if i < 2 || !word(i - 2, "USING") {
-            return Err(parse_error_full_span(
-                sql,
-                "vector WITH must immediately follow USING HNSW or IVF",
-            ));
+            i += 1;
+            continue;
         }
         if !word(i - 1, "HNSW") && !word(i - 1, "IVF") {
             return Err(parse_error_full_span(

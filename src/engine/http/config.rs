@@ -342,7 +342,8 @@ impl Policy {
                     || v.octets()[0] >= 240
                     || (v.octets()[0] == 100 && (64..=127).contains(&v.octets()[1]))
                     || (v.octets()[0] == 198 && (18..=19).contains(&v.octets()[1]))
-                    || (v.octets()[0] == 192 && v.octets()[1] == 0)
+                    || v.is_documentation()
+                    || (v.octets()[..2] == [192, 0] && v.octets()[2] == 0)
             }
             IpAddr::V6(v) => {
                 v.is_loopback()
@@ -352,6 +353,12 @@ impl Policy {
                     || v.is_unicast_link_local()
                     || (v.segments()[0] & 0xffc0) == 0xfec0
                     || (v.segments()[0] == 0x2001 && v.segments()[1] == 0xdb8)
+                    || (v.segments()[0] == 0x2001
+                        && matches!(v.segments()[1] & 0xfff0, 0x10 | 0x20))
+                    || v.segments()[..4] == [0x100, 0, 0, 0]
+                    || (v.segments()[0] == 0x3fff && v.segments()[1] & 0xf000 == 0)
+                    || v.segments()[..2] == [0x2001, 0]
+                    || v.segments()[..3] == [0x64, 0xff9b, 1]
                     || v.segments()[0] == 0x2002
                     || v.segments()[..6] == [0x64, 0xff9b, 0, 0, 0, 0]
                     || v.segments()[..6] == [0, 0, 0, 0, 0, 0]

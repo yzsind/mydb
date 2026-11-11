@@ -110,3 +110,8 @@ pub fn initialize_server_status_clock() {
 }
 
 pub mod user_variables;
+
+/// Validate external HTTP node policy before accepting client connections.
+pub fn validate_http_startup_config() -> Result<(), crate::types::QueryError> {
+    http::reload().map(|_| ())
+}

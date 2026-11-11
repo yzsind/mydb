@@ -507,7 +507,7 @@ impl OsSignals {
     }
 }
 
-fn is_fd_pressure_error(err: &std::io::Error) -> bool {
+pub(crate) fn is_fd_pressure_error(err: &std::io::Error) -> bool {
     matches!(err.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE))
 }
 
@@ -519,7 +519,7 @@ fn is_fd_pressure_error(err: &std::io::Error) -> bool {
 /// spurious; `ENOBUFS`/`ENOMEM`/`EPERM` are transient kernel/firewall
 /// pressure. Matches how MySQL and nginx treat these errnos: log and keep
 /// accepting. `EMFILE`/`ENFILE` are handled separately with a backoff.
-fn is_transient_accept_error(err: &std::io::Error) -> bool {
+pub(crate) fn is_transient_accept_error(err: &std::io::Error) -> bool {
     matches!(
         err.raw_os_error(),
         Some(libc::ECONNABORTED)

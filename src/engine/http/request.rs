@@ -185,7 +185,10 @@ pub(crate) fn prepare(
                 .map_err(|_| invalid("invalid native JSON options"))?;
             std::borrow::Cow::Owned(crate::engine::json::to_text(v))
         }
-        Some(v) => std::borrow::Cow::Borrowed(text(v)?),
+        Some(v) => std::borrow::Cow::Borrowed(
+            crate::types::value_str(v)
+                .ok_or_else(|| invalid("options require a JSON object or JSON text"))?,
+        ),
     };
     let opts = parse_json(&options_text, 65536)?;
     let map = opts
@@ -289,7 +292,12 @@ pub(crate) fn prepare(
                 Some(crate::engine::json::to_text(j).into_bytes())
             }
             Value::Bytes(b) => Some(b.clone()),
-            v => Some(text(v)?.as_bytes().to_vec()),
+            v => Some(
+                crate::types::value_str(v)
+                    .ok_or_else(|| invalid("body requires string, bytes or JSON"))?
+                    .as_bytes()
+                    .to_vec(),
+            ),
         }
     } else if let Some(s) = o.body {
         Some(s.into_bytes())

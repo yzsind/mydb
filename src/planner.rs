@@ -21620,6 +21620,12 @@ pub(crate) fn expr_is_deterministic(expr: &Expr) -> bool {
                 }
                 let upper = name.to_ascii_uppercase();
                 if crate::storage::schema::is_nondeterministic_function(name)
+                    || matches!(
+                        crate::engine::cbo::function_cost::function_class(
+                            &name.to_ascii_lowercase()
+                        ),
+                        crate::engine::builtin_catalog::CostClass::Volatile
+                    )
                     || name.contains('.')
                     || !(crate::engine::cbo::function_cost::is_known_builtin_function(name)
                         || crate::parser::is_aggregate_function(name)

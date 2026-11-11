@@ -744,6 +744,15 @@ pub(crate) fn show_index(
         apply_show_filter(&mut rows, &columns, filter, "Key_name")?;
         return Ok(QueryResponse::ResultSet(ResultSet { columns, rows }));
     }
+    if db
+        .view_definition(&session.current_database, &table_name)
+        .is_some()
+    {
+        return Ok(QueryResponse::ResultSet(ResultSet {
+            columns: show_index_columns(),
+            rows: Vec::new(),
+        }));
+    }
     let table = db.table(&table_name)?;
     let estimated_rows =
         crate::engine::table_stats_view::TableStatsView::for_table(db, &table).rows;
@@ -4598,29 +4607,50 @@ pub(crate) fn show_grants_result(
         }
     }
 
-    for row in &mut rows {
-        if let Some(Value::String(sql)) = row.first_mut() {
-            if let Some((privilege, tail)) = sql
-                .strip_prefix("GRANT ")
-                .and_then(|s| s.split_once(" ON *.* "))
-            {
-                if let Some(id) = crate::engine::auth::ai_model_privilege_id(privilege) {
-                    if let Some((name, _)) =
-                        db.ai_catalog()?.models.iter().find(|(_, m)| m.id == id)
-                    {
-                        if let Some((schema, model)) = name.rsplit_once('.') {
-                            *sql = format!(
-                                "GRANT AI_USE ON AI MODEL `{}`.`{}` {}",
-                                schema.replace('`', "``"),
-                                model.replace('`', "``"),
-                                tail
-                            );
-                        }
+    let mut portable = Vec::with_capacity(rows.len());
+    for row in rows {
+        let Some(Value::String(sql)) = row.first() else {
+            portable.push(row);
+            continue;
+        };
+        let Some((privileges, tail)) = sql
+            .strip_prefix("GRANT ")
+            .and_then(|s| s.split_once(" ON *.* "))
+        else {
+            portable.push(row);
+            continue;
+        };
+        if !privileges.contains("AI_MODEL_") {
+            portable.push(row);
+            continue;
+        }
+        let catalog = db.ai_catalog()?;
+        let mut ordinary = Vec::new();
+        for privilege in privileges.split(',').map(str::trim) {
+            if let Some(id) = crate::engine::auth::ai_model_privilege_id(privilege) {
+                if let Some((name, _)) = catalog.models.iter().find(|(_, model)| model.id == id) {
+                    if let Some((schema, model)) = name.rsplit_once('.') {
+                        portable.push(vec![Value::String(format!(
+                            "GRANT AI_USE ON AI MODEL `{}`.`{}` {}",
+                            schema.replace('`', "``"),
+                            model.replace('`', "``"),
+                            tail
+                        ))]);
                     }
                 }
+            } else {
+                ordinary.push(privilege);
             }
         }
+        if !ordinary.is_empty() {
+            portable.push(vec![Value::String(format!(
+                "GRANT {} ON *.* {}",
+                ordinary.join(","),
+                tail
+            ))]);
+        }
     }
+    let mut rows = portable;
     if rows.is_empty() {
         rows.push(vec![Value::String(format!(
             "GRANT USAGE ON *.* TO {}",

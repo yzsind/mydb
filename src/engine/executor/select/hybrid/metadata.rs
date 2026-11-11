@@ -2,8 +2,21 @@
 use super::*;
 
 pub(crate) fn describe_columns(db: &Database, rrf: &RrfFusion) -> Result<Vec<Column>, QueryError> {
+    describe_columns_inner(db, rrf).map_err(|error| {
+        if error.is(crate::error::catalog::ER_BAD_FIELD_ERROR) {
+            let message = format!("RRF branches require self-contained queries and cannot reference outer columns: {}", error.message());
+            error.with_message(message)
+        } else { error }
+    })
+}
+fn describe_columns_inner(db: &Database, rrf: &RrfFusion) -> Result<Vec<Column>, QueryError> {
     if !(2..=8).contains(&rrf.branches.len()) {
         return Err(invalid("requires 2..8 branches"));
+    }
+    let unbound =
+        |expr: &Expr| crate::parser::visit::any_expr(expr, |e| matches!(e, Expr::Placeholder(_)));
+    if !unbound(&rrf.rank_constant) && !rrf.weights.iter().any(unbound) {
+        bind_options(rrf)?;
     }
     let first = rrf
         .branches

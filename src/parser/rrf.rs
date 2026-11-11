@@ -15,6 +15,7 @@ pub(super) fn convert(
         }
         let query = QueryExpr::try_from(convert::convert_query_ref(sql, query)?)?;
         validate_branch(&query)?;
+        validate_branch_qualifiers(&query)?;
         branches.push(RrfBranch {
             name: name.clone(),
             query,
@@ -65,6 +66,66 @@ pub(super) fn convert(
     })
 }
 
+/// Fusion inputs are independent scopes. Catch qualified outer references
+/// before a correlated-query rewrite obscures their original qualifier.
+fn validate_branch_qualifiers(query: &QueryExpr) -> Result<(), ParseError> {
+    let Some(select) = query.leftmost_select() else {
+        return Ok(());
+    };
+    let tables: Vec<_> = select
+        .from
+        .iter()
+        .chain(select.joins.iter().map(|join| &join.table))
+        .collect();
+    let mut outer = false;
+    let expressions = select
+        .projection
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr { expr, .. } => Some(expr),
+            _ => None,
+        })
+        .chain(select.selection.iter())
+        .chain(select.having.iter())
+        .chain(select.group_by.iter())
+        .chain(select.order_by.iter().map(|order| &order.expr))
+        .chain(
+            select
+                .joins
+                .iter()
+                .filter_map(|join| join.condition.as_ref()),
+        );
+    for expr in expressions {
+        visit::inspect_value_expr(
+            expr,
+            |node| {
+                if let Expr::CompoundIdentifier(parts) = node {
+                    if let Some(qualifier) = parts.len().checked_sub(2).and_then(|i| parts.get(i)) {
+                        outer |= !tables.iter().any(|table| {
+                            let name = table.alias.as_deref().unwrap_or(&table.name);
+                            name.eq_ignore_ascii_case(qualifier)
+                                || name
+                                    .rsplit('.')
+                                    .next()
+                                    .is_some_and(|name| name.eq_ignore_ascii_case(qualifier))
+                        });
+                    }
+                }
+                true
+            },
+            |_| {},
+        );
+    }
+    if outer {
+        Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "RRF branches cannot reference outer query columns; use self-contained inputs",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 pub(crate) fn validate_branch(query: &QueryExpr) -> Result<(), ParseError> {
     use visit::{visit_query, AstVisitor};
     struct Check {
@@ -111,6 +172,30 @@ pub(crate) fn validate_branch(query: &QueryExpr) -> Result<(), ParseError> {
             .ok_or_else(|| parse_error_at_zero("RRF: expected ordered SELECT"))?,
         _ => return Err(parse_error_at_zero("RRF: expected ordered SELECT")),
     };
+    if select.projection.iter().any(|item| matches!(item, SelectItem::Expr { expr, .. } if visit::any_expr(expr, |e| matches!(e, Expr::WindowFunction { .. })))) || select.order_by.iter().any(|order| visit::any_expr(&order.expr, |e| matches!(e, Expr::WindowFunction { .. }))) {
+        return Err(parse_error_with_spec_at_zero(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "RRF: branch-local window functions require a derived SELECT"));
+    }
+    if select
+        .from
+        .iter()
+        .any(|t| t.name == "$nested_join_preserve")
+        || select
+            .joins
+            .iter()
+            .any(|j| j.table.name == "$nested_join_preserve" || j.lateral)
+    {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "RRF: LATERAL and unaliased nested joins require a derived SELECT",
+        ));
+    }
+    if select.sql_calc_found_rows {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "RRF: SQL_CALC_FOUND_ROWS is not supported inside branches",
+        ));
+    }
     if select.order_by.is_empty() || select.limit.is_none() {
         return Err(parse_error_at_zero(
             "RRF: every branch requires ORDER BY and LIMIT",

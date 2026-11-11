@@ -107,15 +107,21 @@ impl<E: QueryEngine> RestServer<E> {
         // when SQL occupies every execution slot on the client's connection.
         let control_streams = if self.mcp.is_some() { 8 } else { 0 };
         let mut sweep = tokio::time::interval(Duration::from_millis(100));
+        let mut sweeping: Option<tokio::task::JoinHandle<()>> = None;
         loop {
             tokio::select! {
              _=crate::mysql::shutdown::shutdown_notified()=>break,
-             _=sweep.tick()=>self.state.sweep().await,
+             _=sweep.tick()=>{
+                if sweeping.as_ref().is_none_or(|task| task.is_finished()) {
+                    let state = self.state.clone();
+                    sweeping = Some(tokio::spawn(async move { state.sweep().await; }));
+                }
+             },
              accepted=listener.accept()=>{
-              let(stream,addr)=match accepted{Ok(v)=>v,Err(e)if matches!(e.kind(),std::io::ErrorKind::Interrupted|std::io::ErrorKind::ConnectionAborted)=>continue,Err(e)=>{crate::mysql::shutdown::request_shutdown(crate::mysql::shutdown::ShutdownSource::Signal("REST listener failure"),crate::mysql::shutdown::ShutdownIntent::Halt);return Err(e)}};
+              let(stream,addr)=match accepted{Ok(v)=>v,Err(e)if matches!(e.kind(),std::io::ErrorKind::Interrupted|std::io::ErrorKind::ConnectionAborted)=>continue,Err(e) if crate::mysql::server::is_fd_pressure_error(&e) || crate::mysql::server::is_transient_accept_error(&e) => {crate::util::logging::log_message(format_args!("REST transient accept failure: {e}"));tokio::time::sleep(Duration::from_millis(100)).await;continue}, Err(e) => return Err(e)};
               let Ok(permit)=sockets.clone().try_acquire_owned()else{drop(stream);continue};
               let tls=self.tls.clone();let app=router.clone();let config=self.state.config.clone();
-              crate::util::connection_dispatch::spawn(move||async move{
+              if let Err(error) = crate::util::connection_dispatch::spawn(move||async move{
                let _permit=permit;let _=stream.set_nodelay(true);
                let mut peer=Peer{host:addr.ip().to_string(),cipher:None,version:None,subject:None,issuer:None};
                if let Some(tls)=tls{
@@ -126,9 +132,13 @@ impl<E: QueryEngine> RestServer<E> {
                 if let Some(cert)=connection.peer_certificates().and_then(|v|v.first()){if let Ok((_,cert))=x509_parser::parse_x509_certificate(cert.as_ref()){peer.subject=Some(crate::mysql::session::tls_names::distinguished_name(cert.subject()));peer.issuer=Some(crate::mysql::session::tls_names::distinguished_name(cert.issuer()));}}
                 serve(stream,app.layer(Extension(peer)),config,control_streams).await;
                }else{serve(stream,app.layer(Extension(peer)),config,control_streams).await;}
-              })?;
+              }) { crate::util::logging::log_message(format_args!("REST connection dispatch failed: {error}")); }
+
              }
             }
+        }
+        if let Some(task) = sweeping {
+            let _ = task.await;
         }
         self.state.close_all().await;
         Ok(())
@@ -150,6 +160,12 @@ async fn serve<I>(io: I, app: Router, config: RestConfig, control_streams: usize
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    use tokio::io::AsyncBufReadExt;
+    let mut io = tokio::io::BufReader::with_capacity(24, io);
+    if !matches!(tokio::time::timeout(Duration::from_secs(5), io.fill_buf()).await, Ok(Ok(bytes)) if !bytes.is_empty())
+    {
+        return;
+    }
     let io = hyper_util::rt::TokioIo::new(io);
     let abort = ConnectionAbort::default();
     let service =
@@ -163,6 +179,9 @@ where
         .max_buf_size(config.max_header_bytes.max(8192));
     builder
         .http2()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .keep_alive_interval(Duration::from_secs(5))
+        .keep_alive_timeout(Duration::from_secs(5))
         .max_concurrent_streams(
             config
                 .max_inflight
@@ -228,11 +247,15 @@ async fn endpoint<E: QueryEngine>(
     if parts.get(2) == Some(&"requests") {
         let record = state.request(parts[3], &identity.key_id)?;
         if parts.len() == 5 {
-            record.cancel();
-            state
-                .cancelled
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            return Ok((StatusCode::ACCEPTED, Json(record.state.lock().clone())).into_response());
+            let requested = record.cancel();
+            if requested {
+                state
+                    .cancelled
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let mut value = record.state.lock().clone();
+            value["cancel_requested"] = json!(requested);
+            return Ok((StatusCode::ACCEPTED, Json(value)).into_response());
         }
         let value = record.state.lock().clone();
         return Ok(Json(value).into_response());
@@ -465,6 +488,7 @@ async fn sql<E: QueryEngine>(
     } else {
         format!("rq_{}", crate::engine::access_keys::random_id()?)
     };
+    let connection = request.extensions().get::<ConnectionAbort>().cloned();
     let (bytes, memory) = body(&state, request).await?;
     strict(&bytes, state.config.max_request_bytes)?;
     let parsed: codec::SqlRequest =
@@ -496,6 +520,7 @@ async fn sql<E: QueryEngine>(
         id.clone(),
         stream,
         memory,
+        connection,
     )
     .await;
     if temporary && response.is_err() {
@@ -516,7 +541,9 @@ async fn execute<E: QueryEngine>(
     id: String,
     stream: bool,
     memory: runtime::Memory,
+    connection: Option<ConnectionAbort>,
 ) -> Result<Response> {
+    let delivery_session = session.clone();
     let execution = runtime::start(
         state,
         session,
@@ -534,10 +561,40 @@ async fn execute<E: QueryEngine>(
     )
     .await?;
     let status = execution.status();
-    let chunks = execution.map(|chunk| {
-        chunk.map(|chunk| match chunk.payload {
-            runtime::Payload::Encoded(bytes) => bytes,
-            _ => unreachable!(),
+    let delivery = Arc::new(RestDelivery {
+        deadline: parking_lot::Mutex::new(
+            std::time::Instant::now() + Duration::from_millis(timeout_ms) + Duration::from_secs(30),
+        ),
+    });
+    let weak = Arc::downgrade(&delivery);
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(Duration::from_millis(100));
+        loop {
+            tick.tick().await;
+            let Some(delivery) = weak.upgrade() else {
+                break;
+            };
+            if std::time::Instant::now() >= *delivery.deadline.lock() {
+                if let Some(connection) = &connection {
+                    connection.close();
+                }
+                delivery_session.close().await;
+                break;
+            }
+        }
+    });
+    let chunks = execution.map(move |chunk| {
+        chunk.map(|chunk| {
+            if chunk.terminal {
+                *delivery.deadline.lock() = std::time::Instant::now() + Duration::from_secs(30);
+            }
+            match chunk.payload {
+                runtime::Payload::Encoded(bytes) => axum::body::Bytes::from_owner(RestBytes {
+                    bytes,
+                    _delivery: delivery.clone(),
+                }),
+                _ => unreachable!(),
+            }
         })
     });
     let mut response = (status, Body::from_stream(chunks)).into_response();
@@ -569,3 +626,16 @@ pub fn validate_credentials(
 
 #[cfg(test)]
 mod tests;
+
+struct RestDelivery {
+    deadline: parking_lot::Mutex<std::time::Instant>,
+}
+struct RestBytes {
+    bytes: axum::body::Bytes,
+    _delivery: Arc<RestDelivery>,
+}
+impl AsRef<[u8]> for RestBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}

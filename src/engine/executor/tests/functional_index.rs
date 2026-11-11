@@ -31,7 +31,7 @@ fn refactor_functional_index_numeric_types_match_expression_metadata() {
                 scale: Some(3),
             },
         ),
-        ("idx_int", crate::storage::DataTypeKind::Int),
+        ("idx_int", crate::storage::DataTypeKind::BigInt),
     ] {
         let index = table
             .indexes

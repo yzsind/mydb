@@ -200,6 +200,7 @@ async fn audit_unpolled_delivery_expires_and_releases_transaction() {
         delivery: AtomicU8::new(DELIVERY_PENDING),
         delivery_frames: AtomicUsize::new(0),
         supervisor: Mutex::new(None),
+        ready_at: Mutex::new(Some(Instant::now())),
         persistent_created: AtomicBool::new(false),
         connection: None,
     });
@@ -875,6 +876,7 @@ async fn audit_completed_delivery_cannot_cancel_a_subsequent_transaction() {
         delivery: AtomicU8::new(DELIVERY_PENDING),
         delivery_frames: AtomicUsize::new(0),
         supervisor: Mutex::new(None),
+        ready_at: Mutex::new(Some(Instant::now())),
         persistent_created: AtomicBool::new(false),
         connection: None,
     });
@@ -972,6 +974,7 @@ async fn audit_eof_with_queued_network_frame_still_expires() {
         delivery: AtomicU8::new(DELIVERY_PENDING),
         delivery_frames: AtomicUsize::new(0),
         supervisor: Mutex::new(None),
+        ready_at: Mutex::new(Some(Instant::now())),
         persistent_created: AtomicBool::new(false),
         connection: None,
     });

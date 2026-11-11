@@ -261,13 +261,6 @@ pub(crate) fn authorize(db: &Database, s: &SessionContext, c: &Command) -> Resul
     }
     let owner = c.owner().unwrap_or(&s.authenticated_as);
     db.with_auth_catalog(|a| {
-        let account = a
-            .accounts
-            .get(&auth::account_id(owner))
-            .ok_or_else(|| error("API key owner does not exist"))?;
-        if account.is_role || owner.user.is_empty() {
-            return Err(error("Roles and anonymous accounts cannot own API keys"));
-        }
         if owner != &s.authenticated_as || matches!(c, Command::Rotate) {
             let required = RequiredPrivilege {
                 privilege: Privilege::Dynamic("API_KEY_ADMIN".into()),
@@ -276,6 +269,13 @@ pub(crate) fn authorize(db: &Database, s: &SessionContext, c: &Command) -> Resul
             if !a.account_has_privilege(&s.authorization_context(), &required, false) {
                 return Err(auth::privilege_denied(&required.privilege, &required.scope));
             }
+        }
+        let account = a
+            .accounts
+            .get(&auth::account_id(owner))
+            .ok_or_else(|| error("API key owner does not exist"))?;
+        if account.is_role || owner.user.is_empty() {
+            return Err(error("Roles and anonymous accounts cannot own API keys"));
         }
         if owner != &s.authenticated_as
             && a.account_is_system_user(owner)

@@ -107,6 +107,7 @@ geometry and vector values. Native SQL JSON is represented as JSON text.
 Pass large integers and exact decimals as typed decimal strings when the
 client's JSON number implementation cannot retain their precision.
 
+Omitting `database` leaves no default database selected.
 Use `session_id` instead of `database` to reuse a SQL session. Use SQL `USE`
 to change that session's database. BEGIN, COMMIT, ROLLBACK, SAVEPOINT, session
 variables, roles and temporary tables work through the session. Without a
@@ -143,7 +144,8 @@ when the inspected SQL request failed; its stored `error` is execution status
 data. `cancel_requested` is false when no cancellation was issued, including
 when the request was already complete.
 
-Completed responses have a 30-second delivery deadline independent of body
+The delivery deadline begins after tool completion; it does not shorten the
+SQL execution timeout. Completed responses have a 30-second delivery deadline independent of body
 polling. An expired or abandoned response closes its SQL session and rolls back
 unfinished transactions. A stalled network response closes its HTTP connection,
 which also interrupts other streams on that connection. Bytes retained by the

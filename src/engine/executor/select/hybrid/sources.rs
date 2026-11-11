@@ -65,7 +65,19 @@ pub(super) fn with_branch_scope<R>(
     body: impl FnOnce(&Select) -> Result<R, QueryError>,
 ) -> Result<R, QueryError> {
     match query {
-        QueryExpr::Select(select) => body(select),
+        QueryExpr::Select(select) => {
+            let _partitions = if select.from.len() == 1 && select.joins.is_empty() {
+                crate::engine::executor::partition_clause::resolve_partition_clause(
+                    db,
+                    &select.from[0].name,
+                    &select.from[0].partitions,
+                )?
+                .map(crate::engine::executor::partition_router::push_pruned_partitions)
+            } else {
+                None
+            };
+            body(select)
+        }
         QueryExpr::WithCte(with) => {
             let registry =
                 super::super::current_session_registry().unwrap_or_else(SessionRegistry::new);
