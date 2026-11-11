@@ -77,6 +77,10 @@ static ZONE_MAP_RETRY_MS: AtomicU64 = AtomicU64::new(30_000);
 const ZONE_MAP_MAINTENANCE_MAX_ZONES_PER_PASS: usize = 64;
 const ZONE_MAP_MAINTENANCE_PASSES_PER_ROUND: usize = 10;
 const ZONE_MAP_MERGE_LATCHES: usize = 64;
+/// Append statements a growing zone absorbs with exact foreground widening
+/// before it defers its summary to maintenance.
+const GROWING_ZONE_EXACT_APPENDS: u64 = 256;
+const GROWING_ZONE_COUNT_BITS: u32 = 16;
 #[cfg(test)]
 static ZONE_MAP_TEST_MAINTENANCE_QUIET_MS: AtomicU64 =
     AtomicU64::new(ZONE_MAP_MAINTENANCE_QUIET_MS);
@@ -3826,6 +3830,10 @@ pub(crate) struct ZoneMap {
     neutral_mutations: Mutex<NeutralMutations>,
     invalidation_epoch: AtomicU64,
     last_mutation_ms: AtomicU64,
+    /// Append statements seen by the zone that currently holds the heap's
+    /// last page: zone id in the high bits, a saturating count in the low
+    /// [`GROWING_ZONE_COUNT_BITS`]. See [`ZoneMap::note_growing_append`].
+    growing_appends: AtomicU64,
     maintenance_cursor: AtomicU64,
     // Presence-only prefix proof for an Unknown-hole root. Both fields are
     // read/updated under data_gate; a reset invalidates the proof by epoch.
@@ -3902,6 +3910,7 @@ impl ZoneMap {
             neutral_mutations: Mutex::new(NeutralMutations::default()),
             invalidation_epoch: AtomicU64::new(0),
             last_mutation_ms: AtomicU64::new(0),
+            growing_appends: AtomicU64::new(u64::MAX),
             maintenance_cursor: AtomicU64::new(0),
             maintenance_coverage_cursor: AtomicU64::new(0),
             maintenance_coverage_epoch: AtomicU64::new(0),
@@ -4840,6 +4849,52 @@ impl ZoneMap {
             .iter()
             .try_fold(0, |mask, &column| Some(mask | 1u64.checked_shl(column)?))
             .filter(|mask| *mask != 0)
+    }
+
+    /// Count one append statement into growing zone `id` and report whether
+    /// the zone is under sustained appends. A table that receives a handful
+    /// of inserts keeps exact foreground summaries; only a zone that keeps
+    /// taking appends defers its summary to maintenance.
+    fn note_growing_append(&self, id: u64) -> bool {
+        let mask = (1u64 << GROWING_ZONE_COUNT_BITS) - 1;
+        let mut count = 0;
+        let _ = self
+            .growing_appends
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |packed| {
+                count = if packed >> GROWING_ZONE_COUNT_BITS == id && packed != u64::MAX {
+                    (packed & mask).saturating_add(1).min(mask)
+                } else {
+                    1
+                };
+                Some((id << GROWING_ZONE_COUNT_BITS) | count)
+            });
+        count > GROWING_ZONE_EXACT_APPENDS
+    }
+
+    /// Append into a growing zone whose `columns` are already Unknown: publish
+    /// only the mutation fence, exactly as an update of Unknown columns does,
+    /// so a concurrent rebuild of this zone cannot install a summary that
+    /// misses the new rows. Returns false when the zone still needs its
+    /// Unknown transition (or any other summary change) to be merged.
+    fn note_growing_zone_append(&self, id: u64, columns: &[u32]) -> Result<bool, QueryError> {
+        let _zone = self.merge_latches[id as usize % ZONE_MAP_MERGE_LATCHES]
+            .lock()
+            .map_err(|_| Self::access_error("zone-map merge lock poisoned"))?;
+        let _gate = self
+            .data_gate
+            .read()
+            .map_err(|_| Self::access_error("zone map gate poisoned"))?;
+        if !self.cached_unknown_columns(id, columns) {
+            if !self
+                .zone_update_status(id, columns)?
+                .is_some_and(|(_, _, unknown)| unknown)
+            {
+                return Ok(false);
+            }
+            self.remember_unknown_columns(id, columns);
+        }
+        self.note_summary_neutral_mutations_locked(&[id])?;
+        Ok(true)
     }
 
     /// Caller holds data_gate. Only durable Unknown observations are cached;
@@ -8030,12 +8085,35 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn merge_zone_map_rows(
         &self,
         txn_id: u64,
         storage_id: u64,
         row_ids: &[RowId],
         rows: &[Vec<Value>],
+    ) -> Result<(), QueryError> {
+        self.merge_inserted_zone_map_rows(txn_id, storage_id, row_ids, rows, 0)
+    }
+
+    /// Widen zone summaries for freshly inserted rows. `heap_pages` is the
+    /// heap's page count after the insert (0 when unknown).
+    ///
+    /// The zone holding the heap's last page is still being filled. Every
+    /// append into it would move an endpoint or a membership set and rewrite
+    /// its summary, so instead its columns are marked Unknown once and later
+    /// appends only publish the mutation fence. Pruning then always keeps
+    /// that one zone, which is never wrong; once appends move on to the next
+    /// zone it becomes quiet and background maintenance rebuilds it with
+    /// exact bounds. Inserts into earlier zones (reused free space) keep the
+    /// exact foreground widening.
+    pub(crate) fn merge_inserted_zone_map_rows(
+        &self,
+        txn_id: u64,
+        storage_id: u64,
+        row_ids: &[RowId],
+        rows: &[Vec<Value>],
+        heap_pages: u64,
     ) -> Result<(), QueryError> {
         #[cfg(test)]
         if TEST_INSERT_ZONE_FAILURE.get() == Some(storage_id) {
@@ -8077,6 +8155,13 @@ impl Database {
                 zone_map_relevant_columns(&table)
             };
             let membership_columns = map.cached_membership_columns();
+            let growing_zone = heap_pages
+                .checked_sub(1)
+                .map(|last| last / u64::from(map.zone_pages));
+            let relevant_ids = relevant_columns
+                .iter()
+                .map(|(_, id)| *id)
+                .collect::<smallvec::SmallVec<[u32; 8]>>();
             let mut batch = ChargedZoneBatch::new(&map);
             let mut i = 0;
             while i < row_ids.len() {
@@ -8088,10 +8173,26 @@ impl Database {
                 {
                     i += 1;
                 }
-                batch.admit_zone(&map, id)?;
                 let count = (i - start) as u64;
+                let growing = growing_zone == Some(id)
+                    && !defer_all
+                    && !relevant_ids.is_empty()
+                    && map.note_growing_append(id);
+                if growing && map.note_growing_zone_append(id, &relevant_ids)? {
+                    continue;
+                }
+                batch.admit_zone(&map, id)?;
                 let zone = batch.zones.get_mut(&id).unwrap();
                 zone.row_count_estimate = zone.row_count_estimate.saturating_add(count);
+                if growing {
+                    // First append seen for this growing zone: publish its
+                    // columns as Unknown. Later appends take the fence-only
+                    // path above once that state is durable.
+                    for &column_id in &relevant_ids {
+                        batch.unknown_column(id, column_id)?;
+                    }
+                    continue;
+                }
                 if defer_all {
                     zone.state = Some(ZoneMapState::Unknown);
                     zone.stale_mutations = zone.stale_mutations.saturating_add(count);
@@ -8140,6 +8241,7 @@ impl Database {
         row_ids: &[RowId],
         rows: &[R],
         changed_columns: Option<&[usize]>,
+        known_table: Option<&TableSchema>,
     ) -> Result<(), QueryError> {
         let _zone_operation = self.zone_map_gate.read_recursive();
         if !self.zone_map_enabled() {
@@ -8148,14 +8250,24 @@ impl Database {
         if row_ids.is_empty() {
             return Ok(());
         }
-        let Some(table) = self.table_by_id(storage_id) else {
-            return Ok(());
+        // DML callers hold the table's MDL and pass the descriptor they
+        // mutated; resolve by id only when it is absent or a bare header.
+        let resolved;
+        let table: &TableSchema = match known_table {
+            Some(table) if !table.columns.is_empty() => table,
+            _ => {
+                let Some(table) = self.table_by_id(storage_id) else {
+                    return Ok(());
+                };
+                resolved = table;
+                &resolved
+            }
         };
-        let Some(map) = self.zone_map_for(storage_id, &table) else {
+        let Some(map) = self.zone_map_for(storage_id, table) else {
             return self.invalidate_unavailable_zone_map(
                 txn_id,
                 storage_id,
-                &table,
+                table,
                 row_ids.is_empty(),
             );
         };
@@ -8188,7 +8300,7 @@ impl Database {
                         })
                         .collect()
                 } else {
-                    zone_map_relevant_columns(&table).into_iter().collect()
+                    zone_map_relevant_columns(table).into_iter().collect()
                 };
             if touch_columns.is_empty() {
                 return Ok(());
@@ -11098,6 +11210,64 @@ mod zone_map_tests {
         assert!(db
             .zone_map_candidate_ranges(&table, &predicate)
             .is_none_or(|ranges| !ranges.is_empty()));
+    }
+
+    #[test]
+    fn zone_map_sustained_appends_defer_growing_zone_and_maintenance_restores_it() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine =
+            crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(),
+                StorageConfig::from_env(),
+            )
+            .unwrap();
+        engine.execute("CREATE TABLE t (v INT)").unwrap();
+        let db = engine.db_for_tests();
+        let table = db.snapshot_table_schema("test.t").unwrap();
+        let column_id = table.columns[0].column_id;
+        let predicate = |value: i64| Expr::Binary {
+            left: Box::new(Expr::Identifier("v".into())),
+            op: BinaryOp::Eq,
+            right: Box::new(Expr::Literal(Literal::Int(value))),
+        };
+        let bounds = |db: &Database| {
+            let map = db.zone_map_for(table.id, &table).unwrap();
+            map.snapshot_for_tests()[&0].columns[&column_id].clone()
+        };
+        // A few appends keep exact foreground summaries.
+        for value in 1..=GROWING_ZONE_EXACT_APPENDS as i64 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({value})"))
+                .unwrap();
+        }
+        let exact = bounds(&db);
+        assert_eq!(exact.state, ZoneMapState::Ready);
+        assert_eq!(exact.max, Some(ZoneScalar::Signed(GROWING_ZONE_EXACT_APPENDS as i64)));
+        // Sustained appends into the growing zone defer it to maintenance.
+        for value in 1_000..1_100 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({value})"))
+                .unwrap();
+        }
+        assert_eq!(bounds(&db).state, ZoneMapState::Unknown);
+        // An Unknown zone is always a candidate: no appended row is missed.
+        assert!(db
+            .zone_map_candidate_ranges(&table, &predicate(1_099))
+            .is_none_or(|ranges| !ranges.is_empty()));
+        let rows = engine.execute("SELECT COUNT(*) FROM t WHERE v = 1099").unwrap();
+        assert_eq!(format!("{rows:?}").matches("Int(1)").count(), 1, "{rows:?}");
+        // Once quiet, maintenance rebuilds exact bounds that cover every row.
+        db.set_zone_map_maintenance_quiet_ms_for_tests(0);
+        let outcome = db.maintain_zone_maps();
+        db.set_zone_map_maintenance_quiet_ms_for_tests(30_000);
+        outcome.unwrap();
+        let rebuilt = bounds(&db);
+        assert_eq!(rebuilt.state, ZoneMapState::Ready);
+        assert_eq!(rebuilt.min, Some(ZoneScalar::Signed(1)));
+        assert_eq!(rebuilt.max, Some(ZoneScalar::Signed(1_099)));
+        assert!(db
+            .zone_map_candidate_ranges(&table, &predicate(5_000))
+            .is_some_and(|ranges| ranges.is_empty()));
     }
 
     #[test]
@@ -14467,7 +14637,7 @@ mod zone_map_tests {
         db.log.lock().flush().unwrap();
         let before = db.log.lock().last_lsn();
         ZONE_MAP_TEST_DML_MAX_ZONES.store(0, Ordering::Release);
-        db.merge_zone_map_updated_rows(txn.txn_id, table.id, &ids, &rows, Some(&[1]))
+        db.merge_zone_map_updated_rows(txn.txn_id, table.id, &ids, &rows, Some(&[1]), None)
             .unwrap();
         db.log.lock().flush().unwrap();
         let records = LogManager::scan(dir.path())
@@ -15117,7 +15287,7 @@ mod zone_map_tests {
             let rows = [vec![Value::Int(1000)]];
             let outcome = match operation {
                 0 => db.merge_zone_map_rows(4242, table.id, &row_ids, &rows),
-                1 => db.merge_zone_map_updated_rows(4242, table.id, &row_ids, &rows, None),
+                1 => db.merge_zone_map_updated_rows(4242, table.id, &row_ids, &rows, None, None),
                 2 => db.note_zone_map_deletes(4242, table.id, &row_ids),
                 _ => {
                     let mut batch = ZoneMapWorkerBatch::for_table(&table);

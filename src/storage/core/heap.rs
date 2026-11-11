@@ -2083,8 +2083,51 @@ impl HeapFile {
         row_id: RowId,
         columns: &[usize],
     ) -> Result<CachedProjectedRead, QueryError> {
-        let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+        let plan = self.decode_plan(columns);
         self.read_mvcc_columns_cached_with_plan(row_id, columns, &plan)
+    }
+
+    /// Projection plan for `columns` under this heap's codec. Point reads
+    /// that arrive without a caller-compiled plan (constraint probes,
+    /// single-row fetches) repeat the same few projections, so compiled
+    /// plans are kept per thread, keyed by codec identity and columns. A
+    /// heap's codec is fixed for its lifetime; the weak handle keeps a dead
+    /// codec's address from being reused while its entry exists.
+    fn decode_plan(&self, columns: &[usize]) -> Arc<RowDecodePlan> {
+        const SLOTS: usize = 16;
+        type Entry = (
+            std::sync::Weak<RowCodec>,
+            smallvec::SmallVec<[usize; 8]>,
+            Arc<RowDecodePlan>,
+        );
+        thread_local! {
+            static PLANS: std::cell::RefCell<(Vec<Entry>, usize)> =
+                const { std::cell::RefCell::new((Vec::new(), 0)) };
+        }
+        let codec = Arc::as_ptr(&self.codec);
+        let cached = PLANS.try_with(|plans| {
+            let mut plans = plans.borrow_mut();
+            if let Some((_, _, plan)) = plans.0.iter().find(|(owner, owned, _)| {
+                std::sync::Weak::as_ptr(owner) == codec && owned.as_slice() == columns
+            }) {
+                return Arc::clone(plan);
+            }
+            let plan = Arc::new(RowDecodePlan::compile_with_codec(columns, &self.codec));
+            let entry = (
+                Arc::downgrade(&self.codec),
+                smallvec::SmallVec::from_slice(columns),
+                Arc::clone(&plan),
+            );
+            let (entries, next) = &mut *plans;
+            if entries.len() < SLOTS {
+                entries.push(entry);
+            } else {
+                entries[*next] = entry;
+                *next = (*next + 1) % SLOTS;
+            }
+            plan
+        });
+        cached.unwrap_or_else(|_| Arc::new(RowDecodePlan::compile_with_codec(columns, &self.codec)))
     }
 
     fn read_mvcc_columns_cached_with_plan(
@@ -2595,7 +2638,7 @@ impl HeapFile {
         // rebuilding it inside `decode_row_schema_columns_into` per
         // row. Saves a `SmallVec<[i16; 32]>` allocation + setup loop
         // per heap row read.
-        let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+        let plan = self.decode_plan(columns);
         self.read_mvcc_columns_many_cached_with_plan(row_ids, &plan, hits, missing)
     }
 
@@ -2693,7 +2736,7 @@ impl HeapFile {
             return Ok(true);
         }
         let page_count = self.page_count()?;
-        let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
+        let plan = self.decode_plan(columns);
         let mut start = 0usize;
         while start < row_ids.len() {
             let first = row_ids[start];

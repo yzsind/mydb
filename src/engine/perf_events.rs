@@ -863,12 +863,27 @@ struct TextStatementMemo {
     class: StatementEventClass,
 }
 
+/// Slots in the per-thread text identity memo. Drivers interleave several
+/// short texts within every transaction (session-variable probes, `SET`
+/// statements, `COMMIT`), so a single remembered text misses on almost every
+/// statement; a small direct-mapped table keeps that whole rotation.
+const TEXT_STATEMENT_MEMO_SLOTS: usize = 16;
+
 thread_local! {
-    static TEXT_STATEMENT_MEMO: RefCell<Option<TextStatementMemo>> = const { RefCell::new(None) };
+    static TEXT_STATEMENT_MEMO: RefCell<[Option<TextStatementMemo>; TEXT_STATEMENT_MEMO_SLOTS]> =
+        const { RefCell::new([const { None }; TEXT_STATEMENT_MEMO_SLOTS]) };
 }
 
 /// Longer texts are literal-heavy batches that never repeat verbatim.
 const TEXT_STATEMENT_MEMO_MAX_LEN: usize = 1024;
+
+fn text_statement_memo_slot(sql: &str) -> usize {
+    let mut key = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in sql.as_bytes() {
+        key = (key ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    (key % TEXT_STATEMENT_MEMO_SLOTS as u64) as usize
+}
 
 /// Redacted, trimmed text and instrument class of a text-protocol statement.
 /// `begin_statement` and `record_statement` both need them for the same
@@ -879,9 +894,14 @@ const TEXT_STATEMENT_MEMO_MAX_LEN: usize = 1024;
 fn text_statement_identity(sql: &str) -> (Arc<str>, StatementEventClass) {
     let generation = crate::engine::http::dependency_generation();
     let memoizable = sql.len() <= TEXT_STATEMENT_MEMO_MAX_LEN;
+    let slot = if memoizable {
+        text_statement_memo_slot(sql)
+    } else {
+        0
+    };
     if memoizable {
         let hit = TEXT_STATEMENT_MEMO.with(|memo| {
-            memo.borrow()
+            memo.borrow()[slot]
                 .as_ref()
                 .filter(|memo| memo.generation == generation && memo.raw.as_ref() == sql)
                 .map(|memo| (Arc::clone(&memo.trimmed), memo.class))
@@ -895,7 +915,7 @@ fn text_statement_identity(sql: &str) -> (Arc<str>, StatementEventClass) {
     let class = statement_event_class(&trimmed);
     if memoizable {
         TEXT_STATEMENT_MEMO.with(|memo| {
-            *memo.borrow_mut() = Some(TextStatementMemo {
+            memo.borrow_mut()[slot] = Some(TextStatementMemo {
                 raw: if trimmed.as_ref() == sql {
                     Arc::clone(&trimmed)
                 } else {
@@ -2621,7 +2641,7 @@ mod tests {
 
     #[test]
     fn text_statement_identity_memo_matches_uncached_redaction() {
-        TEXT_STATEMENT_MEMO.with(|memo| memo.borrow_mut().take());
+        TEXT_STATEMENT_MEMO.with(|memo| memo.borrow_mut().iter_mut().for_each(|slot| *slot = None));
         for raw in [
             "  COMMIT ",
             "  COMMIT ",
@@ -2639,9 +2659,40 @@ mod tests {
         text_statement_identity("SELECT 42");
         TEXT_STATEMENT_MEMO.with(|memo| {
             let memo = memo.borrow();
-            let memo = memo.as_ref().unwrap();
+            let memo = memo[text_statement_memo_slot("SELECT 42")]
+                .as_ref()
+                .unwrap();
             assert!(Arc::ptr_eq(&memo.raw, &memo.trimmed));
         });
+    }
+
+    #[test]
+    fn text_statement_identity_memo_keeps_an_interleaved_rotation() {
+        TEXT_STATEMENT_MEMO.with(|memo| memo.borrow_mut().iter_mut().for_each(|slot| *slot = None));
+        let texts = [
+            "SET SQL_SELECT_LIMIT=1",
+            "SET SQL_SELECT_LIMIT=DEFAULT",
+            "SELECT @@session.transaction_read_only",
+            "commit",
+        ];
+        let first: Vec<_> = texts
+            .iter()
+            .map(|sql| text_statement_identity(sql).0)
+            .collect();
+        let distinct_slots = texts
+            .iter()
+            .map(|sql| text_statement_memo_slot(sql))
+            .collect::<std::collections::BTreeSet<_>>();
+        for (sql, first) in texts.iter().zip(&first) {
+            let (again, class) = text_statement_identity(sql);
+            assert_eq!(class.name, statement_event_class(sql).name);
+            // A memo hit returns the very allocation stored on the first call.
+            if distinct_slots.len() == texts.len() {
+                assert!(Arc::ptr_eq(first, &again), "{sql} was evicted");
+            } else {
+                assert_eq!(first, &again);
+            }
+        }
     }
 
     #[test]

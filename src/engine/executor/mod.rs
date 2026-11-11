@@ -4646,11 +4646,14 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
-        self.attach_expression_registry(session);
-        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
+        // Callers try this memo first for every prepared statement. Reject
+        // non-SELECT statements before capturing the statement's
+        // authorization snapshot; their own path captures it again.
         if !matches!(parsed.as_ref(), Statement::Select(_)) {
             return None;
         }
+        self.attach_expression_registry(session);
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);

@@ -58,7 +58,11 @@ const MAX_SAMPLE_BYTES: usize = MAX_TEXT_LEN * 4;
 const HISTOGRAM_BUCKETS: usize = 450;
 const WRITER_STRIPES: usize = 64;
 const DIRECTORY_SHARDS: usize = 64;
-const WRITER_CACHE_SIZE: usize = 8;
+/// Slots in each writer thread's identity cache. A connection thread runs a
+/// workload's whole statement mix, typically a few dozen distinct digests,
+/// so the cache must hold that working set or every miss falls back to the
+/// shared directory lock and a shared reference-count update.
+const WRITER_CACHE_SIZE: usize = 64;
 
 /// One aggregated digest bucket. All timer fields are picoseconds (MySQL's
 /// `*_TIMER_WAIT` unit); `min_timer_wait` starts at `u64::MAX` so the first
@@ -364,9 +368,31 @@ struct CachedOverflowKey {
 struct DigestWriterCache {
     writer: usize,
     generation: u64,
-    entries: Vec<CachedDigest>,
+    /// Open-addressed by [`cache_slot`]; an identity lives in its home slot
+    /// or the next one.
+    entries: Vec<Option<CachedDigest>>,
     next: usize,
     _memory_charge: Option<ControlledMemoryCharge>,
+}
+
+/// Home slot of a `(schema, digest hash)` identity: FNV-1a over both
+/// strings, so it does not rely on how the hash text was produced.
+fn cache_slot(schema: &str, hash: &str) -> usize {
+    let mut key = 0xcbf2_9ce4_8422_2325_u64;
+    for &byte in hash.as_bytes().iter().chain(schema.as_bytes()) {
+        key = (key ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+    }
+    (key % WRITER_CACHE_SIZE as u64) as usize
+}
+
+impl CachedDigest {
+    fn matches(&self, schema: &str, hash: &str) -> bool {
+        if let Some(key) = &self.overflow_key {
+            key.schema.as_ref() == schema && key.hash.as_ref() == hash
+        } else {
+            self.entry.schema.as_ref() == schema && self.entry.hash.as_deref() == Some(hash)
+        }
+    }
 }
 
 impl DigestWriterCache {
@@ -380,6 +406,22 @@ impl DigestWriterCache {
         }
     }
 
+    fn clear(&mut self) {
+        self.entries.iter_mut().for_each(|slot| *slot = None);
+        self.next = 0;
+    }
+
+    fn find(&self, schema: &str, hash: &str) -> Option<&CachedDigest> {
+        if self.entries.is_empty() {
+            return None;
+        }
+        let home = cache_slot(schema, hash);
+        [home, (home + 1) % WRITER_CACHE_SIZE]
+            .into_iter()
+            .filter_map(|slot| self.entries[slot].as_ref())
+            .find(|cached| cached.matches(schema, hash))
+    }
+
     fn insert(&mut self, entry: Arc<DigestEntry>, stripe: usize, schema: &str, hash: &str) {
         if self._memory_charge.is_none() {
             let Some(charge) = ControlledMemoryCharge::try_new_optional(
@@ -388,7 +430,7 @@ impl DigestWriterCache {
             ) else {
                 return;
             };
-            self.entries = Vec::with_capacity(WRITER_CACHE_SIZE);
+            self.entries = (0..WRITER_CACHE_SIZE).map(|_| None).collect();
             self._memory_charge = Some(charge);
         }
         // Registered identities already own their lookup strings. Only the
@@ -413,12 +455,23 @@ impl DigestWriterCache {
             stripe,
             overflow_key,
         };
-        if self.entries.len() < WRITER_CACHE_SIZE {
-            self.entries.push(cached);
+        let home = cache_slot(schema, hash);
+        let second = (home + 1) % WRITER_CACHE_SIZE;
+        let slot = if self.entries[home].is_none() {
+            home
+        } else if self.entries[second].is_none() {
+            second
         } else {
-            self.entries[self.next] = cached;
-            self.next = (self.next + 1) % WRITER_CACHE_SIZE;
-        }
+            // Both candidates are taken: alternate victims so two hot
+            // identities sharing a home slot do not evict each other forever.
+            self.next ^= 1;
+            if self.next == 0 {
+                home
+            } else {
+                second
+            }
+        };
+        self.entries[slot] = Some(cached);
     }
 }
 
@@ -512,18 +565,10 @@ impl DigestCollector {
         loop {
             let generation = self.generation.load(Ordering::Acquire);
             if cache.generation != generation {
-                cache.entries.clear();
-                cache.next = 0;
+                cache.clear();
                 cache.generation = generation;
             }
-            if let Some(cached) = cache.entries.iter().rev().find(|cached| {
-                if let Some(key) = &cached.overflow_key {
-                    key.schema.as_ref() == schema && key.hash.as_ref() == hash
-                } else {
-                    cached.entry.schema.as_ref() == schema
-                        && cached.entry.hash.as_deref() == Some(hash)
-                }
-            }) {
+            if let Some(cached) = cache.find(schema, hash) {
                 if cached.entry.record(self, cached.stripe, sample) {
                     return;
                 }
@@ -1218,11 +1263,38 @@ mod tests {
                 .sum::<u64>(),
             20
         );
-        let weak = Arc::downgrade(&cache.entries.last().unwrap().entry);
+        let weak = Arc::downgrade(&cache.find("db", "hash-19").unwrap().entry);
         collector.reset();
         assert!(weak.upgrade().is_some());
         drop(cache);
         assert!(weak.upgrade().is_none());
+    }
+
+    #[test]
+    fn writer_cache_holds_a_statement_mix_without_directory_lookups() {
+        let collector = DigestCollector::new(1_000);
+        let mut cache = DigestWriterCache::new(1);
+        let hashes: Vec<_> = (0..40).map(|n| format!("{n:064x}")).collect();
+        for hash in &hashes {
+            collector.record(&mut cache, "db", hash, "SELECT ?", &observation(0, 1));
+        }
+        let resident = hashes
+            .iter()
+            .filter(|hash| cache.find("db", hash).is_some())
+            .count();
+        // Two candidate slots per identity keep nearly all of a 40-digest
+        // working set resident in 64 slots.
+        assert!(resident >= 36, "only {resident} of 40 digests cached");
+        assert!(cache.find("other", &hashes[0]).is_none());
+        for hash in &hashes {
+            collector.record(&mut cache, "db", hash, "SELECT ?", &observation(0, 1));
+        }
+        let counts: u64 = collector
+            .snapshot()
+            .iter()
+            .map(|row| row.2.metrics.count_star)
+            .sum();
+        assert_eq!(counts, 80);
     }
 
     #[test]

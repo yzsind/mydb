@@ -3612,19 +3612,31 @@ where
     /// Keep the compiled batch/cache and physical row coalescing route, but
     /// encode one OK from each logical statement's own metadata.
     async fn try_handle_text_dml_batch(&mut self, sql: String) -> io::Result<Option<String>> {
-        let engine = Arc::clone(&self.engine);
-        let mut context = self.park_context();
-        let (context, sql, batch) =
-            crate::util::blocking_pool::spawn_session(self.blocking_affinity.as_ref(), move || {
-                let batch = engine.execute_text_dml_batch(&mut context, &sql);
-                (context, sql, batch)
-            })
+        // A reactor that owns only this connection may block in the batch's
+        // row-lock waits without stalling any peer; new connections are still
+        // admitted to another reactor. Otherwise use the independent pool so
+        // this reactor keeps driving its other sessions.
+        let (sql, batch) = if crate::util::connection_dispatch::can_inline_transaction_control() {
+            let batch = self.engine.execute_text_dml_batch(&mut self.context, &sql);
+            (sql, batch)
+        } else {
+            let engine = Arc::clone(&self.engine);
+            let mut context = self.park_context();
+            let (context, sql, batch) = crate::util::blocking_pool::spawn_session(
+                self.blocking_affinity.as_ref(),
+                move || {
+                    let batch = engine.execute_text_dml_batch(&mut context, &sql);
+                    (context, sql, batch)
+                },
+            )
             .await
             .map_err(|err| {
                 self.recover_parked_context();
                 io::Error::other(err.to_string())
             })?;
-        self.restore_context(context);
+            self.restore_context(context);
+            (sql, batch)
+        };
         self.context.refresh_cancel_generations();
         let Some((statements, result)) = batch else {
             return Ok(Some(sql));
@@ -3861,7 +3873,7 @@ where
                 || is_simple_session_set_sql(sql.as_str()))
         {
             let result = if crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
-                && crate::util::connection_dispatch::current_worker_has_sibling_connections()
+                && !crate::util::connection_dispatch::can_inline_transaction_control()
             {
                 self.execute_engine_blocking(sql).await
             } else {
