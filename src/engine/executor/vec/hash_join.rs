@@ -1459,13 +1459,33 @@ pub(crate) fn run_inner_hash_join_into(
         spec.probe_keys.len(),
         "key arity mismatch"
     );
-    let payload = collect_build_payload_with_collations(
+    // Partition replay has the same typed schema guarantees as streaming
+    // execution. Do not rebuild a duplicate encoded index for native keys.
+    let native_keys = matches!(spec.build_keys.len(), 1 | 2)
+        && spec.null_safe.iter().all(|safe| !*safe)
+        && spec.key_collations.iter().all(Option::is_none)
+        && spec
+            .build_keys
+            .iter()
+            .zip(spec.probe_keys)
+            .all(|(&build_key, &probe_key)| {
+                schema_column_uses_i64_lane(build.schema(), build_key)
+                    && schema_column_uses_i64_lane(probe.schema(), probe_key)
+            });
+    let payload = collect_build_payload_impl(
         build,
         spec.build_keys,
         spec.null_safe,
         spec.key_collations,
+        native_keys,
     )?;
-    if payload.index.is_empty() {
+    if payload.index.is_empty()
+        && (!native_keys
+            || payload
+                .columns
+                .first()
+                .is_none_or(|column| column.len() == 0))
+    {
         return Ok(());
     }
     let mut kernel = ProbeKernel::new(
@@ -1487,7 +1507,30 @@ pub(crate) fn run_inner_hash_join_into(
             pair_build: &mut pair_build,
             pair_probe: &mut pair_probe,
         };
-        kernel.probe_batch(&payload.index, &batch, &mut sink)?;
+        if native_keys {
+            let lookup = PayloadProbe::new(
+                &payload,
+                &batch,
+                spec.probe_keys,
+                spec.null_safe,
+                spec.key_collations,
+            );
+            let mut rejected = 0;
+            for (position, row) in batch.visible_indices().enumerate() {
+                if position & 1023 == 0 {
+                    crate::engine::cancel::check_cancelled()?;
+                }
+                let (usable, hits) = lookup.lookup(row, &mut kernel.key_buf);
+                rejected += u64::from(usable && hits.is_none());
+                sink.accept(row as u32, hits)?;
+            }
+            crate::engine::executor::select::analyze_stats::add_pending_runtime_filter_rejected(
+                rejected,
+            );
+            sink.finish()?;
+        } else {
+            kernel.probe_batch(&payload.index, &batch, &mut sink)?;
+        }
     }
     Ok(())
 }
@@ -2452,6 +2495,117 @@ mod tests {
     use std::cell::{Cell, RefCell};
     use std::rc::Rc;
     use std::sync::Arc;
+
+    #[test]
+    fn materialized_inner_native_replay_matches_encoded_key_oracle() {
+        let schema = schema_kv();
+        let input = |rows: &[(Option<i64>, Option<i64>)]| {
+            Batch::new(
+                schema.clone(),
+                (0..2)
+                    .map(|column| {
+                        ColumnVector::from_values(
+                            rows.iter()
+                                .map(|row| {
+                                    (if column == 0 { row.0 } else { row.1 })
+                                        .map_or(Value::Null, Value::Int)
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect(),
+            )
+        };
+        let build = input(&[
+            (Some(-1), Some(7)),
+            (Some(i64::MIN), Some(9)),
+            (Some(-1), Some(7)),
+            (Some(i64::MAX), Some(8)),
+            (None, Some(7)),
+            (Some(0), None),
+        ]);
+        let probe = input(&[
+            (Some(-1), Some(7)),
+            (Some(-1), Some(8)),
+            (Some(i64::MAX), Some(8)),
+            (Some(i64::MIN), Some(9)),
+            (None, Some(7)),
+            (Some(0), None),
+            (Some(99), Some(3)),
+        ])
+        .with_selection(Selection::Indices(vec![0, 2, 3, 4, 5, 6]));
+        let nulls = input(&[(None, None)]);
+        for keys in [vec![0], vec![0, 1]] {
+            for null_safe in [vec![false; keys.len()], vec![true; keys.len()]] {
+                for build_first in [false, true] {
+                    let mut expected = Vec::new();
+                    for p in [&probe, &nulls] {
+                        for row in p.visible_indices() {
+                            let mut pk = Vec::new();
+                            if !encode_join_key_with_collations(
+                                p,
+                                &keys,
+                                &null_safe,
+                                &[],
+                                row,
+                                &mut pk,
+                            ) {
+                                continue;
+                            }
+                            for b in [&build, &nulls] {
+                                for br in b.visible_indices() {
+                                    let mut bk = Vec::new();
+                                    if encode_join_key_with_collations(
+                                        b,
+                                        &keys,
+                                        &null_safe,
+                                        &[],
+                                        br,
+                                        &mut bk,
+                                    ) && bk == pk
+                                    {
+                                        let (first, second) = if build_first {
+                                            (b.row(br), p.row(row))
+                                        } else {
+                                            (p.row(row), b.row(br))
+                                        };
+                                        expected.push(
+                                            first.into_iter().chain(second).collect::<Vec<_>>(),
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    let mut b = MaterializedBatchOperator::new(
+                        schema.clone(),
+                        vec![build.clone(), nulls.clone()],
+                    );
+                    let mut p = MaterializedBatchOperator::new(
+                        schema.clone(),
+                        vec![probe.clone(), nulls.clone()],
+                    );
+                    let spec = VecJoinSpec {
+                        build_keys: &keys,
+                        probe_keys: &keys,
+                        null_safe: &null_safe,
+                        key_collations: &[],
+                        out_schema: joined_schema(&schema),
+                        build_cols_first: build_first,
+                        residual: None,
+                    };
+                    let mut output = Vec::new();
+                    run_inner_hash_join_into(&mut b, &mut p, &spec, 2, &mut |batch| {
+                        assert!(batch.visible_rows() <= 2);
+                        output.push(batch);
+                        Ok(())
+                    })
+                    .unwrap();
+                    assert_eq!(flatten_batches_to_rows(output), expected);
+                }
+            }
+        }
+    }
 
     #[test]
     fn sqlaudit_duplicate_probe_yields_one_batch_and_resumes_all_key_domains() {

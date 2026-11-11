@@ -3600,6 +3600,43 @@ mod zone_map_worker_budget_tests {
     }
 
     #[test]
+    fn zone_map_text_scratch_reuses_admission_for_all_collations() {
+        for name in [
+            "utf8mb4_0900_ai_ci",
+            "utf8mb4_general_ci",
+            "utf8mb4_bin",
+            "utf8mb4_0900_as_cs",
+        ] {
+            let info =
+                crate::charset::resolve_collation_id(crate::charset::collation_id(name)).unwrap();
+            let mut scratch = Vec::new();
+            let mut lease = ZoneScratchLease::default();
+            assert!(write_zone_text_weight(
+                info,
+                "seed",
+                &mut scratch,
+                &mut lease
+            ));
+            let capacity = scratch.capacity();
+            let limit = Limit::set(lease.bytes() as u64);
+            for text in ["", "ASCII  ", "École Straße 東京", &"z".repeat(1024)] {
+                assert!(write_zone_text_weight(info, text, &mut scratch, &mut lease));
+                let mut expected = Vec::new();
+                crate::charset::collation_key_prefix_by_id_into(
+                    info.id,
+                    text,
+                    ZONE_TEXT_PREFIX_BYTES + 1,
+                    &mut expected,
+                );
+                assert_eq!(scratch, expected);
+                assert_eq!(scratch.capacity(), capacity);
+                assert_eq!(lease.bytes(), capacity);
+            }
+            drop(limit);
+        }
+    }
+
+    #[test]
     fn zone_map_scanner_interior_text_needs_no_allocation_admission() {
         let baseline = scratch_bytes();
         let info =
@@ -5332,10 +5369,21 @@ fn write_zone_text_weight(
     lease: &mut ZoneScratchLease,
 ) -> bool {
     let bound = ZONE_TEXT_PREFIX_BYTES + 1;
-    if lease.bytes() < bound * 2 && lease.reserve(bound * 2 - lease.bytes()).is_err() {
-        return false;
-    }
     scratch.clear();
+    if scratch.capacity() < bound {
+        // Reserve the old and replacement allocations before growing. Once
+        // this bounded scratch is large enough, reuse both its allocation
+        // and its lease: reserving 2 * bound and shrinking on every value
+        // contends on the process-wide memory counters in parallel scans.
+        let peak = scratch.capacity().saturating_add(bound);
+        if lease.bytes() < peak && lease.reserve(peak - lease.bytes()).is_err() {
+            return false;
+        }
+        if scratch.try_reserve_exact(bound).is_err() {
+            lease.shrink_to(scratch.capacity());
+            return false;
+        }
+    }
     crate::charset::collation_key_prefix_by_id_into(collation.id, prefix, bound, scratch);
     if scratch.capacity() > lease.bytes() {
         *scratch = Vec::new();

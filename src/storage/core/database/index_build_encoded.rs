@@ -3498,6 +3498,15 @@ fn parallel_msd_sort_fixed_ordinals(bytes: &[u8], stride: usize, order: &mut [u3
     if order.len() < 2 {
         return;
     }
+    // Ordered imports and ordered DDL scans already carry the full key/RowId
+    // order. Avoid radix partitioning those runs, just as the compact u128
+    // sorter does. Compare the complete record so duplicate keys still sort
+    // by physical identity and unique validation remains unchanged.
+    if order.windows(2).all(|pair| {
+        fixed_ordinal_cmp(bytes, stride, pair[0], pair[1]) != std::cmp::Ordering::Greater
+    }) {
+        return;
+    }
     let target_tasks = degree.max(1).saturating_mul(8);
     let mut tasks = vec![FixedOrdinalSortTask {
         lo: 0,
@@ -7187,6 +7196,47 @@ mod encoded_index_program_tests {
             count += 1;
         }
         assert_eq!(count, 40_000);
+    }
+
+    #[test]
+    fn wide_fixed_ordered_runs_preserve_row_id_ties_and_unique_validation() {
+        let (program, _) = record_for(
+            vec![ParamTarget::Int, ParamTarget::Int],
+            IndexKey::from(vec![KeyPart::Int(0), KeyPart::Int(0)]),
+            RowId::new(0, 0),
+        );
+        let program = Arc::new(program);
+        for reverse_ties in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let mut sorter =
+                EncodedIndexSorter::new(program.clone(), 1024 * 1024).with_sort_degree(4);
+            for value in 0..2048 {
+                for tie in 0..2 {
+                    sorter
+                        .push(
+                            root.path(),
+                            program
+                                .encode_key(&IndexKey::from(vec![
+                                    KeyPart::Int(value),
+                                    KeyPart::Int(-value),
+                                ]))
+                                .unwrap(),
+                            RowId::new(value as u32 + 1, if reverse_ties { 1 - tie } else { tie }),
+                        )
+                        .unwrap();
+                }
+            }
+            let sorted = sorter.finish(root.path()).unwrap();
+            let mut index = dummy_index();
+            index.unique = true;
+            let mut records =
+                validated_encoded_index_iter(sorted, program.clone(), &index).unwrap();
+            assert_eq!(records.next().unwrap().unwrap().row_id.slot_id, 0);
+            assert!(
+                records.next().unwrap().is_err(),
+                "ordered runs still reject duplicate unique keys"
+            );
+        }
     }
 
     #[test]

@@ -1,5 +1,7 @@
 use std::hash::{Hash, Hasher};
 
+mod dense;
+
 /// Exact membership state for a single integer-shaped runtime join key.
 ///
 /// Dense domains use a bitmap; sparse domains retain a sorted key array and
@@ -228,6 +230,7 @@ pub struct BloomFilter {
     // of canonical integers. Typed modes let fact scans avoid ValueKey slice
     // construction and generic Hash framing on every probe.
     int_key_arity: u8,
+    dense_int: Option<std::sync::Arc<dense::DenseIntFilter>>,
     // Optional filters must keep their governor reservation until the last
     // runtime-filter clone releases the bitmap.  Most existing callers charge
     // their containing operator and therefore leave this empty.
@@ -289,6 +292,7 @@ impl BloomFilter {
                 "1" | "on" | "true" | "yes"
             ),
             int_key_arity: 0,
+            dense_int: None,
             _charge: None,
         }
     }
@@ -301,6 +305,22 @@ impl BloomFilter {
         let mut filter = Self::new(expected_entries);
         filter.int_key_arity = 1;
         filter
+    }
+
+    /// Enable before the first insertion. An optional exact candidate avoids
+    /// hashing on bounded integer domains.
+    /// The ordinary Bloom is still populated, so sparse domains can fall back
+    /// without retaining keys or rereading the build input.
+    pub(crate) fn enable_dense_int(
+        &mut self,
+        budget: std::sync::Arc<crate::engine::executor::mem_budget::MemBudget>,
+    ) {
+        if self.uses_int_keys() {
+            self.dense_int = Some(std::sync::Arc::new(dense::DenseIntFilter::new(
+                budget,
+                16 * 1024 * 1024,
+            )));
+        }
     }
 
     /// Build a filter over an ordered pair of canonical integer components.
@@ -400,12 +420,25 @@ impl BloomFilter {
 
     pub(crate) fn insert_int(&mut self, key: i128) {
         debug_assert!(self.uses_int_keys());
+        if let Some(candidate) = self.dense_int.as_mut() {
+            // A cloned filter keeps its immutable snapshot. Further insertion
+            // into either clone falls back to its independently maintained Bloom.
+            if std::sync::Arc::get_mut(candidate)
+                .and_then(|filter| filter.insert(key))
+                .is_none()
+            {
+                self.dense_int = None;
+            }
+        }
         let (h1, h2) = hash_pair_int(key, self.legacy_double_hash);
         self.insert_hash_pair(h1, h2);
     }
 
     pub(crate) fn contains_int(&self, key: i128) -> bool {
         debug_assert!(self.uses_int_keys());
+        if let Some(filter) = &self.dense_int {
+            return filter.contains(key);
+        }
         let (h1, h2) = hash_pair_int(key, self.legacy_double_hash);
         self.contains_hash_pair(h1, h2)
     }
@@ -639,6 +672,71 @@ mod tests {
     use super::*;
     use crate::engine::expr::ValueKey;
     use crate::storage::schema::{IndexKey, KeyPart};
+
+    #[test]
+    fn streaming_dense_filter_matches_signed_domains_and_arrival_orders() {
+        use crate::engine::executor::mem_budget::MemBudget;
+        for base in [i128::MIN, -20_000, 0, i128::MAX - 40_000] {
+            for reverse in [false, true] {
+                let budget = std::sync::Arc::new(MemBudget::new(1024 * 1024));
+                let mut filter = BloomFilter::new_int(5000);
+                filter.enable_dense_int(budget.clone());
+                let mut keys = (0..10_000).step_by(3).map(|i| base + i).collect::<Vec<_>>();
+                if reverse {
+                    keys.reverse();
+                }
+                for &key in keys.iter().chain(keys.iter()) {
+                    filter.insert_int(key);
+                }
+                assert!(filter.dense_int.is_some());
+                for i in 0..12_000 {
+                    assert_eq!(filter.contains_int(base + i), i < 10_000 && i % 3 == 0);
+                }
+                assert!(budget.used() > 0);
+                let clone = filter.clone();
+                drop(filter);
+                assert!(budget.used() > 0);
+                drop(clone);
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+
+    #[test]
+    fn streaming_dense_filter_falls_back_without_false_negatives_or_leaks() {
+        use crate::engine::executor::mem_budget::MemBudget;
+        for limit in [1, 1024, 64 * 1024 * 1024] {
+            let budget = std::sync::Arc::new(MemBudget::new(limit));
+            let mut filter = BloomFilter::new_int(1000);
+            filter.enable_dense_int(budget.clone());
+            let keys = [-17, 0, 64, 300_000_000, i128::MIN, i128::MAX];
+            for key in keys {
+                filter.insert_int(key);
+            }
+            assert!(filter.dense_int.is_none());
+            for key in keys {
+                assert!(filter.contains_int(key));
+            }
+            assert_eq!(budget.used(), 0);
+            assert!(budget.terminal_oom().is_none());
+        }
+    }
+
+    #[test]
+    fn streaming_dense_filter_clone_retains_snapshot_during_insertion() {
+        let budget = std::sync::Arc::new(crate::engine::executor::mem_budget::MemBudget::new(4096));
+        let mut filter = BloomFilter::new_int(10);
+        filter.enable_dense_int(budget.clone());
+        filter.insert_int(7);
+        let clone = filter.clone();
+        filter.insert_int(9);
+        assert!(filter.dense_int.is_none());
+        assert!(filter.contains_int(7) && filter.contains_int(9));
+        assert!(clone.contains_int(7));
+        assert!(!clone.contains_int(9));
+        drop(clone);
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn contiguous_exact_filter_handles_signed_edges_and_duplicates() {

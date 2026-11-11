@@ -17203,10 +17203,11 @@ fn vector_grace_bloom_rejects_probe_misses_before_spill() {
         "gb",
         &(0..100).map(|key| (key, key)).collect::<Vec<_>>(),
     );
+    // Amortize fixed columnar block headers when comparing filtering bytes.
     bulk_insert(
         &engine,
         "gp",
-        &(0..1_000).map(|key| (key, key)).collect::<Vec<_>>(),
+        &(0..10_000).map(|key| (key, key)).collect::<Vec<_>>(),
     );
     engine.execute("ANALYZE TABLE gb").unwrap();
     engine.execute("ANALYZE TABLE gp").unwrap();

@@ -25326,6 +25326,104 @@ fn batched_existence_falls_back_when_leaf_writer_is_above_watermark() {
 }
 
 #[test]
+fn index_count_snapshot_prefix_accepts_recent_commit_without_gc() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_memory_test_db(dir.path());
+    pmtx_test_table(&db);
+    let writer = db.begin_txn().unwrap();
+    db.insert_rows(
+        writer,
+        "test.pmtx",
+        (0..32)
+            .map(|i| vec![Value::Int(i), Value::String("v".into())])
+            .collect(),
+    )
+    .unwrap();
+    db.commit_txn(writer.txn_id).unwrap();
+    assert!(db.storage_status().min_retained_txn_id < writer.txn_id);
+    let (table, primary) = pmtx_primary(&db);
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let upper = db.index_page_id_upper_bound(&table, &primary).unwrap();
+    assert_eq!(
+        db.count_visible_index_leaf_prefix_page_range(&table, &primary, 0, upper, view)
+            .unwrap(),
+        (32, upper)
+    );
+}
+
+#[test]
+fn index_count_snapshot_prefix_rejects_active_and_late_lower_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_memory_test_db(dir.path()));
+    pmtx_test_table(&db);
+    let delayed = db.begin_txn().unwrap();
+    db.insert_rows(
+        delayed,
+        "test.pmtx",
+        vec![vec![Value::Int(1), Value::String("late".into())]],
+    )
+    .unwrap();
+    let newer = db.begin_txn().unwrap();
+    db.commit_txn(newer.txn_id).unwrap();
+    let (old_view, _guard) =
+        db.read_only_statement_view_with_guard(IsolationLevel::RepeatableRead, None);
+    let (table, primary) = pmtx_primary(&db);
+    let upper = db.index_page_id_upper_bound(&table, &primary).unwrap();
+    for committed in [false, true] {
+        if committed {
+            db.commit_txn(delayed.txn_id).unwrap();
+        }
+        let (count, resume) = db
+            .count_visible_index_leaf_prefix_page_range(&table, &primary, 0, upper, old_view)
+            .unwrap();
+        assert_eq!(count, 0);
+        assert!(resume < upper);
+        assert_eq!(
+            db.count_index_entries_visible(&table, &primary, None, None, old_view, None)
+                .unwrap(),
+            0
+        );
+    }
+    let current = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    assert_eq!(
+        db.count_visible_index_leaf_prefix_page_range(&table, &primary, 0, upper, current)
+            .unwrap(),
+        (1, upper)
+    );
+}
+
+#[test]
+fn index_count_snapshot_prefix_stops_at_registration_hole() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_memory_test_db(dir.path());
+    pmtx_test_table(&db);
+    // Model a begin paused between allocating its id and registering its slot.
+    let gap = db.next_txn_id_atomic.fetch_add(1, Ordering::AcqRel);
+    let writer = db.begin_txn().unwrap();
+    assert!(writer.txn_id > gap);
+    db.insert_rows(
+        writer,
+        "test.pmtx",
+        vec![vec![Value::Int(1), Value::String("committed".into())]],
+    )
+    .unwrap();
+    db.commit_txn(writer.txn_id).unwrap();
+    let view = db.read_only_statement_view(IsolationLevel::ReadCommitted, None);
+    let (table, primary) = pmtx_primary(&db);
+    let upper = db.index_page_id_upper_bound(&table, &primary).unwrap();
+    let (count, resume) = db
+        .count_visible_index_leaf_prefix_page_range(&table, &primary, 0, upper, view)
+        .unwrap();
+    assert_eq!(count, 0);
+    assert!(resume < upper);
+    assert_eq!(
+        db.count_index_entries_visible(&table, &primary, None, None, view, None)
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
 fn page_max_trx_shortcut_restores_watermark_after_clean_restart() {
     let dir = tempfile::tempdir().unwrap();
     {
