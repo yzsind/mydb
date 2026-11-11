@@ -4675,7 +4675,7 @@ fn validate_select_column_references_inner(
     validate_select_in_column_scope(db, select, &scope)
 }
 
-/// DISTINCT removes the source row identity. An ORDER BY expression must be
+/// Under ONLY_FULL_GROUP_BY, DISTINCT requires an ORDER BY expression to be
 /// evaluable entirely from selected expressions (or constants).
 fn distinct_order_is_selected(
     db: &Database,
@@ -4833,9 +4833,12 @@ fn validate_select_in_column_scope(
     if let Some(having) = &select.having {
         validate_expr_columns(db, having, &scope, Some(&aliases), true)?;
     }
+    // MySQL permits hidden sort keys when ONLY_FULL_GROUP_BY is disabled.
+    // Name resolution remains mandatory in either mode, including nested scopes.
+    let check_distinct_order = select.distinct && crate::engine::expr::session_only_full_group_by();
     for (index, order_by) in select.order_by.iter().enumerate() {
         validate_expr_columns(db, &order_by.expr, &scope, Some(&aliases), true)?;
-        if select.distinct && !distinct_order_is_selected(db, &order_by.expr, select, scope) {
+        if check_distinct_order && !distinct_order_is_selected(db, &order_by.expr, select, scope) {
             return Err(error(crate::error::catalog::ER_FIELD_IN_ORDER_NOT_SELECT,
                 format!("Expression #{} of ORDER BY clause is not in SELECT list; this is incompatible with DISTINCT", index + 1)));
         }

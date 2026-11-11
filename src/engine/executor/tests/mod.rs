@@ -3,6 +3,7 @@ mod bug_report_1107;
 mod collated_constant_in;
 mod critical_audit;
 mod ddl_lock_contract;
+mod distinct_order_by;
 mod dml_metadata_audit_1109;
 mod final_release_audit_1107;
 mod fresh_release_audit;
