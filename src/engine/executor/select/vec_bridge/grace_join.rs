@@ -877,17 +877,19 @@ pub(super) fn spill_vec_join_batch(
     Ok(filtered)
 }
 
-pub(super) fn vec_grace_probe_bloom_safe(join_type: crate::parser::JoinType) -> bool {
-    matches!(
-        join_type,
-        crate::parser::JoinType::Inner | crate::parser::JoinType::Semi
-    ) && !matches!(
-        crate::util::env::var("MYDB_VEC_GRACE_BLOOM")
-            .unwrap_or_default()
-            .to_ascii_lowercase()
-            .as_str(),
-        "0" | "off" | "false" | "no"
-    )
+pub(super) fn vec_grace_probe_bloom_safe(
+    join_type: crate::parser::JoinType,
+    build_is_left: Option<bool>,
+    null_safe: &[bool],
+) -> bool {
+    super::hash_join::can_filter_hash_probe(join_type, build_is_left, null_safe)
+        && !matches!(
+            crate::util::env::var("MYDB_VEC_GRACE_BLOOM")
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str(),
+            "0" | "off" | "false" | "no"
+        )
 }
 
 pub(super) fn push_vec_grace_probe_bloom(
@@ -1953,7 +1955,9 @@ pub(super) fn run_vec_grace_hash_join_stream(
     let bloom_bytes =
         crate::engine::executor::select::bloom::BloomFilter::estimated_byte_size(bloom_entries)
             .saturating_mul(component_count);
-    let mut grace_bloom = if vec_grace_probe_bloom_safe(join_type) {
+    let may_filter_probe =
+        vec_grace_probe_bloom_safe(join_type, spec.map(|spec| spec.build_cols_first), null_safe);
+    let mut grace_bloom = if may_filter_probe {
         query_budget.as_ref().and_then(|budget| {
             crate::engine::executor::mem_budget::OwnedMemCharge::new_optional_pipeline(
                 budget.clone(),

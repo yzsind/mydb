@@ -59,6 +59,7 @@ pub(super) struct RuntimeIndexScan<'a> {
     probes: Vec<Option<super::super::super::plan::CompiledRuntimeFilterProbe>>,
     opened: bool,
     allowed: bool,
+    residual: Option<Arc<expr_batch::BatchExprProgram>>,
 }
 
 impl RuntimeIndexScan<'_> {
@@ -499,9 +500,13 @@ impl BatchOperator for RuntimeIndexScan<'_> {
             return self.original.next_batch();
         };
         loop {
-            let Some(batch) = indexed.next_batch()? else {
+            let Some(mut batch) = indexed.next_batch()? else {
                 return Ok(None);
             };
+            if let Some(residual) = self.residual.as_ref() {
+                let mask = residual.eval_predicate_bitmap(&batch)?;
+                batch = batch.with_selection(Selection::Mask(mask));
+            }
             let selected: Vec<u32> = batch
                 .visible_indices()
                 .filter(|&row| {
@@ -540,7 +545,42 @@ pub(super) fn wrap<'a>(
         probes: Vec::new(),
         opened: false,
         allowed: true,
+        residual: None,
     })
+}
+
+/// A local predicate must remain authoritative when optional RID access
+/// bypasses its original storage reader. Decline if it needs private columns.
+pub(super) fn wrap_filtered<'a>(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    columns: Vec<usize>,
+    filters: &[RuntimeFilter],
+    original: Box<dyn BatchOperator + 'a>,
+    predicate: &Expr,
+) -> Result<Box<dyn BatchOperator + 'a>, QueryError> {
+    if !crate::planner::expr_is_deterministic(predicate) {
+        return Ok(original);
+    }
+    let schema = original.schema().clone();
+    let Some(residual) = expr_batch::BatchExprProgram::compile(predicate, &schema)? else {
+        return Ok(original);
+    };
+    Ok(Box::new(RuntimeIndexScan {
+        db: db.clone(),
+        txn,
+        table: table.clone(),
+        columns,
+        schema,
+        original,
+        filters: filters.to_vec(),
+        indexed: None,
+        probes: Vec::new(),
+        opened: false,
+        allowed: true,
+        residual: Some(residual),
+    }))
 }
 
 #[cfg(test)]
@@ -671,6 +711,7 @@ mod integration_tests {
                     probes: Vec::new(),
                     opened: false,
                     allowed: true,
+                    residual: None,
                 };
                 assert!(
                     source.benefits_from_runtime_key_components(&[Expr::CompoundIdentifier(vec![
@@ -897,6 +938,7 @@ mod integration_tests {
                     probes: Vec::new(),
                     opened: false,
                     allowed: true,
+                    residual: None,
                 };
                 if pages == 10 {
                     assert!(
@@ -945,5 +987,118 @@ mod integration_tests {
             drop(filter);
             assert_eq!(budget.used(), 0);
         });
+    }
+}
+
+#[cfg(test)]
+mod residual_tests {
+    use super::*;
+    use crate::engine::{executor::select::bloom::ExactIntKeySetBuilder, StorageQueryEngine};
+    struct Original {
+        schema: Arc<BatchSchema>,
+        pulls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+    impl BatchOperator for Original {
+        fn schema(&self) -> &Arc<BatchSchema> {
+            &self.schema
+        }
+        fn install_runtime_filter(&mut self, _: RuntimeFilter) -> bool {
+            true
+        }
+        fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+            self.pulls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(None)
+        }
+    }
+    #[test]
+    fn filtered_rid_candidates_recheck_local_predicate_and_decline_private_columns() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE filtered_rids(k BIGINT,v BIGINT,INDEX by_k(k))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO filtered_rids SELECT MOD(n,10),n FROM generate_series(0,99) g(n)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO filtered_rids VALUES(1,NULL),(NULL,91)")
+            .unwrap();
+        engine.execute("ANALYZE TABLE filtered_rids").unwrap();
+        let db = engine.db_for_tests();
+        db.set_undo_retention_ms(0).unwrap();
+        db.gc_committed_txn_slots();
+        let budget = Arc::new(mem_budget::MemBudget::new(64 << 20));
+        mem_budget::with_query_budget(budget.clone(), || {
+            for columns in [vec![0, 1], vec![0]] {
+                let mut table = PlanTable::new(1, db.table("filtered_rids").unwrap(), None);
+                let stats = &mut Arc::make_mut(&mut table.schema).stats;
+                stats.row_count = 10_000;
+                stats.heap_page_count = 1000;
+                stats
+                    .indexes
+                    .get_mut("by_k")
+                    .unwrap()
+                    .prefix_distinct_counts = vec![1000];
+                let schema = build_scan_batch_schema(&table, &columns);
+                let pulls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                let original = Box::new(Original {
+                    schema,
+                    pulls: pulls.clone(),
+                });
+                let crate::parser::Statement::Select(query) = crate::parser::parse_statement(
+                    "SELECT k FROM filtered_rids WHERE v>=50 AND k IS NOT NULL",
+                )
+                .unwrap() else {
+                    panic!()
+                };
+                let txn = TxnView::read_only(
+                    db.visible_scn(),
+                    crate::storage::IsolationLevel::ReadCommitted,
+                );
+                let mut stream = wrap_filtered(
+                    &db,
+                    txn,
+                    &table,
+                    columns.clone(),
+                    &[],
+                    original,
+                    query.selection.as_ref().unwrap(),
+                )
+                .unwrap();
+                let mut keys = ExactIntKeySetBuilder::with_capacity(2).unwrap();
+                keys.insert(1);
+                keys.insert(2);
+                assert!(stream.install_runtime_filter(RuntimeFilter::ExactIntKey {
+                    keys: vec![Expr::Identifier("k".into())],
+                    null_safe: vec![false],
+                    filter: Arc::new(keys.finish().unwrap()),
+                    rejected: Arc::new(std::sync::OnceLock::new())
+                }));
+                let mut rows = Vec::new();
+                while let Some(batch) = stream.next_batch().unwrap() {
+                    rows.extend(batch.visible_indices().map(|r| batch.row(r)));
+                }
+                if columns.len() == 2 {
+                    rows.sort_by_key(|r| match r[1] {
+                        Value::Int(n) => n,
+                        _ => panic!(),
+                    });
+                    let expected = (50..100)
+                        .filter(|n| n % 10 == 1 || n % 10 == 2)
+                        .map(|n| vec![Value::Int(n % 10), Value::Int(n)])
+                        .collect::<Vec<_>>();
+                    assert_eq!(rows, expected);
+                    assert_eq!(pulls.load(std::sync::atomic::Ordering::Relaxed), 0);
+                } else {
+                    assert_eq!(
+                        pulls.load(std::sync::atomic::Ordering::Relaxed),
+                        1,
+                        "private predicate columns retain their reader"
+                    );
+                }
+            }
+        });
+        assert_eq!(budget.used(), 0);
     }
 }

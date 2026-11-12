@@ -474,6 +474,16 @@ fn vec_hash_agg_group_fields_from_values(
 
 /// Bind metadata-only rows without materializing any input or cloning its AST.
 fn plan_output_template(plan: &PhysicalPlan) -> Vec<PlanField> {
+    // These nodes preserve their input relation's schema. In particular, a
+    // filter above a set expression must retain its projected output names,
+    // rather than collecting the first branch's pre-projection join fields.
+    match plan {
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Materialize { input, .. }
+        | PhysicalPlan::Exchange { input, .. } => return plan_output_template(input),
+        _ => {}
+    }
     // Set operations expose each branch's projected relation, including
     // aliases and the common comparison/output types. The legacy field
     // collector treats Projection as transparent and would expose the left
@@ -4398,15 +4408,7 @@ fn try_build_vec_filter_input<'a>(
     // input subtree. In particular, a HashJoin child can start scan workers
     // while constructing its BatchOperator; discovering an unsupported
     // expression after that point would violate the no-I/O fallback contract.
-    let mut planned_metas = Vec::new();
-    super::plan::collect_plan_fields(input, &mut planned_metas);
-    let planned_template: Vec<PlanField> = planned_metas
-        .into_iter()
-        .map(|meta| PlanField {
-            meta: super::plan::intern_col_meta(meta),
-            value: Value::Null,
-        })
-        .collect();
+    let planned_template = plan_output_template(input);
     let schema = template_to_batch_schema(&planned_template);
     let resolved_predicate = if is_apply {
         let outer_template = PlanRow::from_fields(planned_template.clone());
@@ -4451,6 +4453,7 @@ fn try_build_vec_filter_input<'a>(
     };
     if let Some(bound) = runtime_index_bound.as_ref() {
         let _ = stream.install_runtime_index_bound(bound);
+        install_materialized_integer_domains(stream.as_mut(), bound, &planned_template);
     }
     let properties = stream.properties();
     stream = join_domain::wrap_disjunction(input, predicate, stream)?;
@@ -4484,6 +4487,78 @@ fn try_build_vec_filter_input<'a>(
         })
     };
     Ok(Some(VecBatchInput { stream, template }))
+}
+
+/// Positive conjunctive IN domains are necessary conditions, never replacements
+/// for the parent predicate. Integer-only binding avoids lossy SQL coercions.
+fn install_materialized_integer_domains(
+    stream: &mut dyn BatchOperator,
+    predicate: &Expr,
+    template: &[PlanField],
+) {
+    if let Expr::Binary {
+        left,
+        op: crate::parser::BinaryOp::And,
+        right,
+    } = predicate
+    {
+        install_materialized_integer_domains(stream, left, template);
+        install_materialized_integer_domains(stream, right, template);
+        return;
+    }
+    let Expr::InList {
+        expr,
+        list,
+        negated: false,
+    } = predicate
+    else {
+        return;
+    };
+    let Some(column) = expr_column_index_in_template(expr, template) else {
+        return;
+    };
+    if !matches!(
+        template[column].column_type,
+        ColumnType::Tiny
+            | ColumnType::Short
+            | ColumnType::MediumInt
+            | ColumnType::Long
+            | ColumnType::LongLong
+    ) {
+        return;
+    }
+    let integer = |expr: &Expr| -> Option<Option<i128>> {
+        match expr {
+            Expr::BoundValue(Value::Int(v)) | Expr::Literal(crate::parser::Literal::Int(v)) => {
+                Some(Some(i128::from(*v)))
+            }
+            Expr::BoundValue(Value::UInt(v)) | Expr::Literal(crate::parser::Literal::UInt(v)) => {
+                Some(Some(i128::from(*v)))
+            }
+            Expr::BoundValue(Value::Null) | Expr::Literal(crate::parser::Literal::Null) => {
+                Some(None)
+            }
+            _ => None,
+        }
+    };
+    if list.iter().any(|value| integer(value).is_none()) {
+        return;
+    }
+    let Ok(mut builder) = super::bloom::ExactIntKeySetBuilder::with_capacity(list.len()) else {
+        return;
+    };
+    for value in list {
+        if let Some(Some(value)) = integer(value) {
+            builder.insert(value);
+        }
+    }
+    let Ok(filter) = builder.finish() else { return };
+    stream.install_runtime_filter(crate::planner::RuntimeFilter::ExactIntKey {
+        keys: vec![expr.as_ref().clone()],
+        null_safe: vec![false],
+        filter: Arc::new(filter),
+        rejected: Arc::new(std::sync::OnceLock::new()),
+    });
 }
 
 /// Count of times the native vec `Filter`-over-join leaf engaged (once per

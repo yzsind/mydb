@@ -835,6 +835,10 @@ fn setop_partition_for_cached(
 }
 
 fn setop_partition_for_key(key: &SetRowKey, depth: u32) -> usize {
+    setop_partition_hash(key, depth) & (SETOP_SPILL_FANOUT - 1)
+}
+
+fn setop_partition_hash(key: &SetRowKey, depth: u32) -> usize {
     use std::hash::{BuildHasher, Hash, Hasher};
     // All runs are temporary and replayed in this process. One randomized
     // state keeps initial routing and recursive replay consistent without
@@ -843,7 +847,28 @@ fn setop_partition_for_key(key: &SetRowKey, depth: u32) -> usize {
     let mut hasher = STATE.get_or_init(ahash::RandomState::new).build_hasher();
     depth.hash(&mut hasher);
     key.hash(&mut hasher);
-    (hasher.finish() as usize) & (SETOP_SPILL_FANOUT - 1)
+    hasher.finish() as usize
+}
+
+/// Plan estimates choose only an initial routing width, never a memory grant.
+/// Keep lazy, bounded-open writers and exact recursive overflow handling.
+fn initial_setop_partitions(estimated_rows: f64, ncols: usize, query_limit: usize) -> usize {
+    let bytes_per_group = ncols.saturating_mul(16).saturating_add(96);
+    let target = (query_limit / 4).max(1 << 20);
+    let desired = (estimated_rows.max(0.0) * bytes_per_group as f64 / target as f64)
+        .ceil()
+        .clamp(SETOP_SPILL_FANOUT as f64, 256.0) as usize;
+    let descriptor_cap =
+        crate::platform::file::bounded_file_cache_capacity(256, 16).max(SETOP_SPILL_FANOUT);
+    let buffer_cap = (query_limit
+        / 8
+        / crate::engine::executor::spill_quota::writer_buffer_capacity(usize::MAX))
+    .max(SETOP_SPILL_FANOUT);
+    let mut partitions = desired.next_power_of_two();
+    while partitions > descriptor_cap.min(buffer_cap) {
+        partitions /= 2;
+    }
+    partitions
 }
 
 struct SetOpMergeItem {
@@ -1541,6 +1566,7 @@ where
         ncols,
         data_dir,
         preserve_order,
+        0.0,
         |_| next_left(),
         |_| next_right(),
     )
@@ -1553,6 +1579,7 @@ pub(crate) fn combine_buffered_unordered_set_sources_spillable<L, R>(
     all: bool,
     ncols: usize,
     data_dir: &std::path::Path,
+    estimated_rows: f64,
     next_left: L,
     next_right: R,
 ) -> Result<IncrementalSetOutput, QueryError>
@@ -1561,7 +1588,15 @@ where
     R: FnMut(Vec<Value>) -> Result<Option<Vec<Value>>, QueryError>,
 {
     combine_set_sources_spillable_buffered(
-        collations, op, all, ncols, data_dir, false, next_left, next_right,
+        collations,
+        op,
+        all,
+        ncols,
+        data_dir,
+        false,
+        estimated_rows,
+        next_left,
+        next_right,
     )
 }
 
@@ -1573,6 +1608,7 @@ fn combine_set_sources_spillable_buffered<L, R>(
     ncols: usize,
     data_dir: &std::path::Path,
     preserve_order: bool,
+    estimated_rows: f64,
     mut next_left: L,
     mut next_right: R,
 ) -> Result<IncrementalSetOutput, QueryError>
@@ -1607,11 +1643,12 @@ where
         .max(1 << 20);
     let work_handle = crate::engine::executor::work_area::WorkAreaHandle::register();
     let mut memory_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
-    let partitions = SETOP_SPILL_FANOUT;
+    let partitions = initial_setop_partitions(estimated_rows, ncols, query_limit);
     let mut key_cache = super::super::collation_cache::CollationKeyCache::new();
     let partition_for =
         |row: &[Value], cache: &mut super::super::collation_cache::CollationKeyCache| {
-            setop_partition_for_cached(collations, row, 0, Some(cache))
+            setop_partition_hash(&set_row_key_cached(collations, row, Some(cache)), 0)
+                & (partitions - 1)
         };
     // Set operators hash every projected value of every input row.  SipHash's
     // DOS-resistant rounds are a poor fit for this trusted, statement-local
@@ -1721,7 +1758,7 @@ where
             partitions,
             ncols.saturating_add(3),
             dir.charger(),
-            16,
+            partitions,
         );
         let mut new_spill = SpillState {
             dir,
@@ -3501,6 +3538,7 @@ mod buffered_set_tests {
                         all,
                         2,
                         root.path(),
+                        0.0,
                         |buffer| fill(buffer, left.next()),
                         |buffer| fill(buffer, right.next()),
                     )
@@ -3522,5 +3560,55 @@ mod buffered_set_tests {
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod adaptive_partition_tests {
+    use super::*;
+    #[test]
+    fn adaptive_set_partition_fanout_keeps_writer_opens_bounded() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let budget = Arc::new(crate::engine::executor::mem_budget::MemBudget::new(
+            16 << 20,
+        ));
+        crate::engine::executor::mem_budget::with_query_budget(budget.clone(), || {
+            assert_eq!(
+                initial_setop_partitions(20_000_000.0, 2, 1 << 20),
+                SETOP_SPILL_FANOUT
+            );
+            let parts = initial_setop_partitions(20_000_000.0, 2, budget.limit());
+            let before = SETOP_SPILL_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut next = 0;
+            let mut output = combine_buffered_unordered_set_sources_spillable(
+                &[],
+                SetOp::Union,
+                false,
+                2,
+                dir.path(),
+                20_000_000.0,
+                |mut row| {
+                    if next == 20000 {
+                        return Ok(None);
+                    }
+                    row.clear();
+                    row.push(Value::String(format!("{}:{next}", "x".repeat(1024))));
+                    row.push(Value::Int(next));
+                    next += 1;
+                    Ok(Some(row))
+                },
+                |_| Ok(None),
+            )
+            .unwrap();
+            let mut rows = 0;
+            while output.next_row().unwrap().is_some() {
+                rows += 1
+            }
+            assert_eq!(rows, 20000);
+            let opens = SETOP_SPILL_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+            assert!(opens<=4*parts as u64+4,"{opens} opens for {parts} partitions: routing must not thrash an undersized writer pool");
+        });
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.spill_bytes(), 0);
     }
 }

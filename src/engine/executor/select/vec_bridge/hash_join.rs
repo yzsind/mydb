@@ -38,6 +38,24 @@ mod existence;
 #[cfg(test)]
 mod tests;
 
+/// A necessary build-key condition may discard an unmatched probe row only
+/// when that row is not part of the join result. Outer joins require a proven
+/// build orientation; NULL-safe outer/existence keys keep their usual path.
+pub(super) fn can_filter_hash_probe(
+    join_type: crate::parser::JoinType,
+    build_is_left: Option<bool>,
+    null_safe: &[bool],
+) -> bool {
+    use crate::parser::JoinType;
+    match join_type {
+        JoinType::Inner => true,
+        JoinType::Semi => !null_safe.iter().any(|safe| *safe),
+        JoinType::Left => build_is_left == Some(true) && !null_safe.iter().any(|safe| *safe),
+        JoinType::Right => build_is_left == Some(false) && !null_safe.iter().any(|safe| *safe),
+        _ => false,
+    }
+}
+
 /// Resolve the canonical comparison collation for each join-key pair.
 fn join_key_collations(
     build_template: &[PlanField],
@@ -519,6 +537,7 @@ pub(in crate::engine::executor::select) fn try_vec_hash_join(
 
 pub(crate) struct HashJoinBatchOperator<'a> {
     build_plan: Option<&'a PhysicalPlan>,
+    probe_estimated_rows: u64,
     pushed_runtime_rejected: Option<Arc<std::sync::atomic::AtomicU64>>,
     db: Arc<Database>,
     txn: TxnView,
@@ -811,10 +830,10 @@ impl HashJoinBatchOperator<'_> {
     fn install_probe_runtime_filter(&mut self, payload: &vec_hash_join::BuildPayload) {
         use crate::engine::executor::select::bloom::BloomFilter;
         use crate::engine::expr::ValueKey;
-        use crate::parser::{Expr, JoinType};
+        use crate::parser::Expr;
         use crate::planner::RuntimeFilter;
 
-        if self.join_type != JoinType::Inner
+        if !can_filter_hash_probe(self.join_type, Some(self.build_is_left), &self.null_safe)
             || self.build_keys.is_empty()
             || self.build_keys.len() != self.probe_keys.len()
         {
@@ -848,10 +867,11 @@ impl HashJoinBatchOperator<'_> {
             keys
         };
 
-        if let Some(filter) = vec_hash_join::build_exact_int_runtime_filter(
+        if let Some(filter) = vec_hash_join::build_exact_int_runtime_filter_for_probes(
             payload,
             &self.build_keys,
             &self.key_collations,
+            self.probe_estimated_rows,
         ) {
             let rejected = Arc::new(std::sync::OnceLock::new());
             let installed = self
@@ -974,6 +994,33 @@ impl HashJoinBatchOperator<'_> {
         // RuntimeFilter has no collation metadata; encoded join keys remain
         // authoritative for collated text.
         if self.key_collations.iter().any(Option::is_some) {
+            // A collated component prevents an untyped complete-tuple Bloom,
+            // but it does not invalidate an exact integer necessary condition
+            // on another component. The ordinary join checks the full tuple.
+            if self.build_keys.len() > 1
+                && crate::engine::executor::mem_budget::current_budget()
+                    .is_some_and(|budget| rows.saturating_mul(16) <= budget.limit() / 64)
+            {
+                for (slot, &column) in self.build_keys.iter().enumerate() {
+                    if self.key_collations[slot].is_none()
+                        && !self.null_safe.get(slot).copied().unwrap_or(false)
+                    {
+                        if let Some(filter) = vec_hash_join::build_exact_int_runtime_filter(
+                            payload,
+                            &[column],
+                            &[None],
+                        ) {
+                            self.probe
+                                .install_runtime_filter(RuntimeFilter::ExactIntKey {
+                                    keys: vec![keys[slot].clone()],
+                                    null_safe: vec![false],
+                                    filter,
+                                    rejected: Arc::new(std::sync::OnceLock::new()),
+                                });
+                        }
+                    }
+                }
+            }
             return;
         }
         let (bloom, inserted) = {
@@ -2743,6 +2790,7 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         };
     let mut operator = HashJoinBatchOperator {
         build_plan: Some(build_plan),
+        probe_estimated_rows: crate::planner::estimated_rows(probe_plan).max(0.0) as u64,
         pushed_runtime_rejected: None,
         prefer_spill_key_locality: false,
         grace_output: None,
@@ -2925,6 +2973,7 @@ pub(super) fn try_build_vec_nested_loop_join_input<'a>(
     };
     let operator: Box<dyn BatchOperator + 'a> = Box::new(HashJoinBatchOperator {
         build_plan: None,
+        probe_estimated_rows: 0,
         pushed_runtime_rejected: None,
         prefer_spill_key_locality: false,
         grace_output: None,

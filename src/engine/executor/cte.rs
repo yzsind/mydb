@@ -21,6 +21,7 @@ use crate::parser::{
 use crate::storage::{error, Database, IsolationLevel, TxnView};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
+mod consumer_domain;
 pub(crate) mod spool;
 
 thread_local! {
@@ -5800,6 +5801,7 @@ pub(super) fn apply_pre_materialization_rewrites(
         inline_in_subquery_only_ctes(db, current_db, ctes, &mut *body);
     }
     push_in_subquery_consumer_domains_into_ctes(ctes, &mut *body);
+    consumer_domain::share(db, current_db, ctes, body);
     push_common_predicates_into_ctes(ctes, &mut *body);
 }
 

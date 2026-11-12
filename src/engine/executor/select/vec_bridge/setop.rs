@@ -1,6 +1,7 @@
 //! setop execution and preparation.
 
 use super::*;
+mod dictionary;
 mod fixed;
 
 thread_local! {
@@ -67,6 +68,7 @@ pub(super) struct SetOpBatchOperator<'a> {
     pub(super) left_done: bool,
     pub(super) blocking_output: Option<crate::engine::executor::dispatch::IncrementalSetOutput>,
     compact_output: Option<std::collections::VecDeque<Batch>>,
+    dictionary_output: Option<dictionary::Output>,
     pub(super) started: Option<std::time::Instant>,
     pub(super) io_start: Option<(u64, u64)>,
     pub(super) batches: u64,
@@ -180,6 +182,14 @@ impl SetOpBatchOperator<'_> {
             return;
         }
         self.stats_recorded = true;
+        if self.all && matches!(self.plan, PhysicalPlan::SetOp { all: false, .. }) {
+            analyze_stats::add_expression_runtime(
+                self.plan,
+                "concat_parent_distinct",
+                self.output_rows,
+                0,
+            );
+        }
         if let (Some(started), Some(io_start)) = (self.started, self.io_start) {
             analyze_stats::add_vector_runtime(self.plan, self.batches, 0, 1);
             analyze_stats::record_with_io_snapshot(
@@ -266,10 +276,29 @@ impl SetOpBatchOperator<'_> {
     }
 
     pub(super) fn initialize_blocking(&mut self) -> Result<(), QueryError> {
-        if self.blocking_output.is_some() || self.compact_output.is_some() {
+        if self.blocking_output.is_some()
+            || self.compact_output.is_some()
+            || self.dictionary_output.is_some()
+        {
             return Ok(());
         }
         if !self.all {
+            let build_right = matches!(self.plan, PhysicalPlan::SetOp { left, right, .. }
+                if crate::planner::estimated_rows(right) < crate::planner::estimated_rows(left));
+            if let Some(output) = dictionary::prepare(
+                &mut self.left,
+                &mut self.right,
+                self.schema.clone(),
+                self.op,
+                build_right,
+                &self.data_dir,
+            )? {
+                let (peak, rows) = output.metrics();
+                analyze_stats::add_peak_memory(self.plan, peak);
+                analyze_stats::add_expression_runtime(self.plan, "dictionary_set", rows, 0);
+                self.dictionary_output = Some(output);
+                return Ok(());
+            }
             if let Some(output) = fixed::prepare(
                 &mut self.left,
                 &mut self.right,
@@ -319,6 +348,7 @@ impl SetOpBatchOperator<'_> {
                 self.all,
                 self.schema.len(),
                 &self.data_dir,
+                crate::planner::estimated_rows(self.plan),
                 |buffer| {
                     let result = left
                         .as_mut()
@@ -427,6 +457,16 @@ impl SetOpBatchOperator<'_> {
             };
         }
         self.initialize_blocking()?;
+        if let Some(output) = self.dictionary_output.as_mut() {
+            let batch = output.next_batch()?;
+            if let Some(batch) = &batch {
+                self.batches += 1;
+                self.output_rows += batch.visible_rows() as u64;
+            } else {
+                self.record_stats();
+            }
+            return Ok(batch);
+        }
         if let Some(output) = self.compact_output.as_mut() {
             let batch = output.pop_front();
             if let Some(batch) = &batch {
@@ -509,6 +549,15 @@ fn try_build_setop_batch_checked<'a>(
     txn: TxnView,
     plan: &'a PhysicalPlan,
 ) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    build_setop_batch(db, txn, plan, false)
+}
+
+fn build_setop_batch<'a>(
+    db: &'a Arc<Database>,
+    txn: TxnView,
+    plan: &'a PhysicalPlan,
+    deduplicated_by_parent: bool,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
     let PhysicalPlan::SetOp {
         left,
         right,
@@ -521,15 +570,38 @@ fn try_build_setop_batch_checked<'a>(
     };
     let domain =
         SET_DOMAINS.with(|domains| domains.borrow().get(&(plan as *const _ as usize)).cloned());
-    let distinct_domain = if *all { None } else { domain.as_deref() };
-    let Some(left_input) =
-        try_build_query_output_batch_in_set_domain(db, txn, left, distinct_domain)?
-    else {
+    let distinct_domain = if *all && !deduplicated_by_parent {
+        None
+    } else {
+        domain.as_deref()
+    };
+    // DISTINCT UNION is associative in the query expression's common domain.
+    // A direct UNION child need only concatenate; the enclosing DISTINCT
+    // kernel performs the one deduplication. Sort/LIMIT/SELECT boundaries are
+    // deliberately opaque, and INTERSECT/EXCEPT retain their own kernels.
+    let flatten = *op == crate::parser::SetOp::Union && (!*all || deduplicated_by_parent);
+    let build_child = |child: &'a PhysicalPlan| {
+        if flatten
+            && matches!(
+                child,
+                PhysicalPlan::SetOp {
+                    op: crate::parser::SetOp::Union,
+                    ..
+                }
+            )
+        {
+            crate::util::stack::with_stack(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+                || build_setop_batch(db, txn, child, true),
+            )?
+        } else {
+            try_build_query_output_batch_in_set_domain(db, txn, child, distinct_domain)
+        }
+    };
+    let Some(left_input) = build_child(left)? else {
         return Ok(None);
     };
-    let Some(right_input) =
-        try_build_query_output_batch_in_set_domain(db, txn, right, distinct_domain)?
-    else {
+    let Some(right_input) = build_child(right)? else {
         return Ok(None);
     };
     #[cfg(test)]
@@ -566,11 +638,12 @@ fn try_build_setop_batch_checked<'a>(
             right: Some(right_input.stream),
             schema,
             op: *op,
-            all: *all,
+            all: *all || deduplicated_by_parent,
             data_dir: db.data_dir().to_path_buf(),
             left_done: false,
             blocking_output: None,
             compact_output: None,
+            dictionary_output: None,
             started: None,
             io_start: None,
             batches: 0,

@@ -680,6 +680,29 @@ fn grace_range_sample_is_bounded_and_preserves_outliers_and_fallbacks() {
 
 #[test]
 fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
+    assert!(vec_grace_probe_bloom_safe(
+        crate::parser::JoinType::Right,
+        Some(false),
+        &[false]
+    ));
+    assert!(vec_grace_probe_bloom_safe(
+        crate::parser::JoinType::Left,
+        Some(true),
+        &[false]
+    ));
+    for join in [
+        crate::parser::JoinType::Left,
+        crate::parser::JoinType::Right,
+    ] {
+        assert!(!vec_grace_probe_bloom_safe(join, None, &[false]));
+        for build_is_left in [false, true] {
+            assert!(!vec_grace_probe_bloom_safe(
+                join,
+                Some(build_is_left),
+                &[true]
+            ));
+        }
+    }
     let root = tempfile::tempdir().unwrap();
     let db = Arc::new(
         Database::open_with_config(
@@ -688,7 +711,10 @@ fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
         )
         .unwrap(),
     );
-    for kind in ["signed", "unsigned", "decimal", "date", "text"] {
+    for (kind, build_is_left) in ["signed", "unsigned", "decimal", "date", "text"]
+        .into_iter()
+        .flat_map(|kind| [(kind, false), (kind, true)])
+    {
         let value = |key: i64| match kind {
             "unsigned" => Value::UInt(key as u64),
             "decimal" => Value::DecimalCompact(key * 100, 2),
@@ -731,8 +757,13 @@ fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
         };
         let build_schema = schema("b");
         let probe_schema = schema("p");
-        let mut fields = probe_schema.fields().to_vec();
-        fields.extend(build_schema.fields().iter().cloned());
+        let (first, second) = if build_is_left {
+            (&build_schema, &probe_schema)
+        } else {
+            (&probe_schema, &build_schema)
+        };
+        let mut fields = first.fields().to_vec();
+        fields.extend(second.fields().iter().cloned());
         let joined = Arc::new(BatchSchema::new(fields));
         let residual = Expr::Binary {
             left: Box::new(Expr::CompoundIdentifier(vec!["p".into(), "v".into()])),
@@ -813,7 +844,7 @@ fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
                         probe_keys: &[0],
                         key_collations: &[None],
                         null_safe: &[null_safe],
-                        build_cols_first: false,
+                        build_cols_first: build_is_left,
                         out_schema: joined.clone(),
                         residual: Some(&program),
                     };
@@ -832,6 +863,16 @@ fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
                             let result = match join {
                                 crate::parser::JoinType::Inner => {
                                     vec_hash_join::run_inner_hash_join(
+                                        &mut build, &mut probe, &spec,
+                                    )
+                                }
+                                crate::parser::JoinType::Left if build_is_left => {
+                                    vec_hash_join::run_preserved_build_hash_join(
+                                        &mut build, &mut probe, &spec,
+                                    )
+                                }
+                                crate::parser::JoinType::Right if build_is_left => {
+                                    vec_hash_join::run_preserved_probe_hash_join(
                                         &mut build, &mut probe, &spec,
                                     )
                                 }
@@ -3545,4 +3586,75 @@ fn large_outer_join_stays_unopened_for_ancestor_runtime_filter() {
             },
         );
     }
+}
+
+#[test]
+fn materialized_integer_domains_only_publish_safe_positive_conjuncts() {
+    struct Capture {
+        schema: Arc<BatchSchema>,
+        filters: Vec<crate::planner::RuntimeFilter>,
+    }
+    impl BatchOperator for Capture {
+        fn schema(&self) -> &Arc<BatchSchema> {
+            &self.schema
+        }
+        fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+            Ok(None)
+        }
+        fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
+            self.filters.push(filter);
+            true
+        }
+    }
+    let template = vec![PlanField::new(
+        "t",
+        None,
+        "k",
+        ColumnType::LongLong,
+        Value::Null,
+    )];
+    let mut source = Capture {
+        schema: template_to_batch_schema(&template),
+        filters: Vec::new(),
+    };
+    let parse = |sql| {
+        let crate::parser::Statement::Select(s) = crate::parser::parse_statement(sql).unwrap()
+        else {
+            panic!()
+        };
+        s.selection.unwrap()
+    };
+    for sql in [
+        "SELECT k FROM t WHERE k NOT IN (1,2)",
+        "SELECT k FROM t WHERE k IN (1,2) OR k=9",
+        "SELECT k FROM t WHERE k IN ('1',2)",
+        "SELECT k FROM t WHERE k IN (1.5,2)",
+        "SELECT k FROM t WHERE k+1 IN (1,2)",
+    ] {
+        install_materialized_integer_domains(&mut source, &parse(sql), &template);
+        assert!(source.filters.is_empty(), "{sql}");
+    }
+    install_materialized_integer_domains(&mut source, &parse("SELECT k FROM t WHERE k IN (-9223372036854775808,18446744073709551615,NULL,4,4) AND k>0"), &template);
+    // Negative constants can retain an unevaluated unary node and decline;
+    // bound subquery constants are already typed values.
+    let expr = Expr::InList {
+        expr: Box::new(Expr::Identifier("k".into())),
+        negated: false,
+        list: vec![
+            Expr::BoundValue(Value::Int(i64::MIN)),
+            Expr::BoundValue(Value::UInt(u64::MAX)),
+            Expr::BoundValue(Value::Null),
+            Expr::BoundValue(Value::Int(4)),
+        ],
+    };
+    source.filters.clear();
+    install_materialized_integer_domains(&mut source, &expr, &template);
+    let [crate::planner::RuntimeFilter::ExactIntKey { filter, .. }] = source.filters.as_slice()
+    else {
+        panic!("one exact domain")
+    };
+    assert!(filter.contains(i128::from(i64::MIN)));
+    assert!(filter.contains(i128::from(u64::MAX)));
+    assert!(filter.contains(4));
+    assert!(!filter.contains(0));
 }

@@ -1962,6 +1962,29 @@ pub(super) fn try_build_direct_batch_scan<'a>(
                     }
                     _ => Box::new(stream),
                 };
+                let stream = if use_zone_map
+                    || matches!(
+                        inner,
+                        PhysicalPlan::SeqScan {
+                            hint_note: Some(_),
+                            ..
+                        } | PhysicalPlan::ParallelSeqScan {
+                            hint_note: Some(_),
+                            ..
+                        }
+                    ) {
+                    stream
+                } else {
+                    runtime_index::wrap_filtered(
+                        db,
+                        txn,
+                        table,
+                        scan_projection_columns(table, proj),
+                        runtime_filters,
+                        stream,
+                        f,
+                    )?
+                };
                 return Ok(Some(VecBatchInput { stream, template }));
             }
             // The local predicate was not selective enough to justify its

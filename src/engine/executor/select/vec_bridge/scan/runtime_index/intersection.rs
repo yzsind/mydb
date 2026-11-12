@@ -16,6 +16,67 @@ pub(super) struct IntersectionChoice {
     second: Domain,
     max_ids: usize,
     bytes: usize,
+    workspace: usize,
+    first_buffer_ids: usize,
+}
+
+/// Exact RID bits retain the physical locality lost by hashing each RID.
+/// Sparse/high-slot address spaces decline before allocating the bitmap.
+struct RidBitmap {
+    first_page: u32,
+    last_page: u32,
+    stride: usize,
+    words: Vec<u64>,
+}
+impl RidBitmap {
+    fn layout(ids: &[RowId]) -> Option<(u32, u32, usize, usize)> {
+        let first = ids.iter().map(|id| id.page_id).min()?;
+        let last = ids.iter().map(|id| id.page_id).max()?;
+        let stride = (usize::from(ids.iter().map(|id| id.slot_id).max()?) + 1)
+            .checked_next_power_of_two()?;
+        let bits = usize::try_from(u64::from(last) - u64::from(first) + 1)
+            .ok()?
+            .checked_mul(stride)?;
+        Some((first, last, stride, bits.checked_add(63)? / 64))
+    }
+    fn build(ids: &[RowId], layout: (u32, u32, usize, usize)) -> Option<Self> {
+        let (first_page, last_page, stride, len) = layout;
+        let mut words = Vec::new();
+        words.try_reserve_exact(len).ok()?;
+        words.resize(len, 0);
+        for id in ids {
+            let bit = (id.page_id - first_page) as usize * stride + usize::from(id.slot_id);
+            words[bit / 64] |= 1 << (bit % 64);
+        }
+        Some(Self {
+            first_page,
+            last_page,
+            stride,
+            words,
+        })
+    }
+    fn contains(&self, id: RowId) -> bool {
+        if id.page_id < self.first_page
+            || id.page_id > self.last_page
+            || usize::from(id.slot_id) >= self.stride
+        {
+            return false;
+        }
+        let bit = (id.page_id - self.first_page) as usize * self.stride + usize::from(id.slot_id);
+        self.words[bit / 64] & (1 << (bit % 64)) != 0
+    }
+}
+enum RidFilter {
+    Bitmap(RidBitmap),
+    Bloom(BloomFilter),
+}
+impl RidFilter {
+    fn contains(&self, id: RowId) -> bool {
+        match self {
+            Self::Bitmap(bits) => bits.contains(id),
+            Self::Bloom(bits) => bits.contains_int(rid_key(id)),
+        }
+    }
 }
 
 fn index_keys(keys: &ExactIntKeySet, unsigned: bool) -> Option<Vec<crate::storage::IndexKey>> {
@@ -48,9 +109,9 @@ fn intersection_cardinality(rows: u64, pages: u64, first: usize, second: usize) 
         return None;
     }
     let matched = (first as f64 * second as f64 / rows.max(1) as f64).ceil() as usize;
-    // Predicted RIDs may share pages. Keep the same half-heap ceiling as the
-    // mandatory physical-page proof after the complete bounded intersection.
-    (matched <= usize::try_from(pages / 2).unwrap_or(usize::MAX)
+    // RIDs are not distinct pages. Admit bounded locality discovery and keep
+    // the mandatory half-heap proof on actual sorted pages before any output.
+    (matched <= usize::try_from(pages.saturating_mul(2)).unwrap_or(usize::MAX)
         && matched <= usize::try_from(rows / 128).unwrap_or(usize::MAX))
     .then_some(matched)
 }
@@ -102,7 +163,7 @@ impl RuntimeIndexScan<'_> {
             if keys.len() != 1
                 || null_safe.iter().any(|value| *value)
                 || filter.len() == 0
-                || filter.len() > 4096
+                || filter.len() > workspace / 256
             {
                 continue;
             }
@@ -146,11 +207,11 @@ impl RuntimeIndexScan<'_> {
                 else {
                     continue;
                 };
-                // Keep the established small-domain path. Both inputs here
-                // must exceed the complete-RID workspace on their own.
-                let rid_bytes =
-                    std::mem::size_of::<(u32, RowId)>() + 2 * std::mem::size_of::<RowId>() + 8;
-                if entries <= workspace / rid_bytes || entries > (rows / 4) as usize {
+                // Even a materializable domain can touch many heap pages.
+                // When another exact domain rejects most of those RIDs,
+                // intersect before fetching rather than decoding the larger
+                // candidate list only to discard it in the parent.
+                if entries > (rows / 4) as usize {
                     continue;
                 }
                 domains.push(Domain {
@@ -174,6 +235,9 @@ impl RuntimeIndexScan<'_> {
                 else {
                     continue;
                 };
+                if matches > a.entries.min(b.entries) / 4 {
+                    continue;
+                }
                 // Summarize the smaller input to bound bitmap cache traffic.
                 // The larger input can reject most RIDs after its first bit.
                 let (a, b) = if a.entries <= b.entries {
@@ -214,13 +278,25 @@ impl RuntimeIndexScan<'_> {
                     column: domain.column,
                     entries: domain.entries,
                 };
+                let base_bytes =
+                    bloom_bytes + overhead + max_ids * (2 * std::mem::size_of::<RowId>() + 8);
+                let first_buffer_ids = a
+                    .entries
+                    .saturating_mul(2)
+                    .min(workspace.saturating_sub(base_bytes) / std::mem::size_of::<RowId>());
+                let first_buffer_ids = if first_buffer_ids >= a.entries / 4 {
+                    first_buffer_ids
+                } else {
+                    0
+                };
+                let first_bytes = first_buffer_ids.saturating_mul(std::mem::size_of::<RowId>());
                 best = Some(IntersectionChoice {
                     first: copy(a),
                     second: copy(b),
                     max_ids,
-                    bytes: bloom_bytes
-                        + overhead
-                        + max_ids * (2 * std::mem::size_of::<RowId>() + 8),
+                    bytes: base_bytes + first_bytes,
+                    workspace,
+                    first_buffer_ids,
                 });
             }
         }
@@ -231,7 +307,7 @@ impl RuntimeIndexScan<'_> {
         &mut self,
         choice: IntersectionChoice,
     ) -> Result<(), QueryError> {
-        let Some(workspace) = mem_budget::ControlledMemoryCharge::try_new_optional(
+        let Some(mut workspace) = mem_budget::ControlledMemoryCharge::try_new_optional(
             mem_budget::ControlledMemoryCategory::Executor,
             choice.bytes,
         ) else {
@@ -250,7 +326,17 @@ impl RuntimeIndexScan<'_> {
             return Ok(());
         };
         let version = self.db.index_repair_version();
-        let mut bloom = BloomFilter::new_int(choice.first.entries.saturating_mul(2));
+        let bloom_bytes = BloomFilter::estimated_byte_size(choice.first.entries.saturating_mul(2));
+        let mut first_ids = Vec::new();
+        if choice.first_buffer_ids > 0
+            && first_ids
+                .try_reserve_exact(choice.first_buffer_ids)
+                .is_err()
+        {
+            return Ok(());
+        }
+        let mut bloom = (choice.first_buffer_ids == 0)
+            .then(|| BloomFilter::new_int(choice.first.entries.saturating_mul(2)));
         let Some(first_count) = self.db.visit_index_prefix_row_ids_bounded(
             &self.table.schema,
             &choice.first.index,
@@ -258,13 +344,57 @@ impl RuntimeIndexScan<'_> {
             self.txn,
             choice.first.entries.saturating_mul(2),
             |id| {
-                bloom.insert_int(rid_key(id));
+                if let Some(bloom) = bloom.as_mut() {
+                    bloom.insert_int(rid_key(id));
+                } else if first_ids.len() < choice.first_buffer_ids {
+                    first_ids.push(id);
+                } else {
+                    // Statistics may overestimate the domain. Buffer only
+                    // available workspace and retain a one-pass Bloom fallback
+                    // if the actual domain crosses that smaller reservation.
+                    let mut bits = BloomFilter::new_int(choice.first.entries.saturating_mul(2));
+                    for buffered in &first_ids {
+                        bits.insert_int(rid_key(*buffered));
+                    }
+                    bits.insert_int(rid_key(id));
+                    first_ids = Vec::new();
+                    bloom = Some(bits);
+                }
                 true
             },
         )?
         else {
             return Ok(());
         };
+        let filter = if let Some(bloom) = bloom {
+            RidFilter::Bloom(bloom)
+        } else {
+            let bitmap = RidBitmap::layout(&first_ids).and_then(|layout| {
+                let bytes = layout.3.checked_mul(std::mem::size_of::<u64>())?;
+                let extra = bytes.saturating_sub(bloom_bytes);
+                if extra > choice.workspace.saturating_sub(choice.bytes)
+                    || !workspace.try_grow_optional(extra)
+                {
+                    return None;
+                }
+                let result = RidBitmap::build(&first_ids, layout);
+                if result.is_none() {
+                    workspace.shrink(extra);
+                }
+                result
+            });
+            match bitmap {
+                Some(bitmap) => RidFilter::Bitmap(bitmap),
+                None => {
+                    let mut bloom = BloomFilter::new_int(choice.first.entries.saturating_mul(2));
+                    for id in &first_ids {
+                        bloom.insert_int(rid_key(*id));
+                    }
+                    RidFilter::Bloom(bloom)
+                }
+            }
+        };
+        drop(first_ids);
         let mut ids = Vec::new();
         if ids.try_reserve_exact(choice.max_ids).is_err() {
             return Ok(());
@@ -276,7 +406,7 @@ impl RuntimeIndexScan<'_> {
             self.txn,
             choice.second.entries.saturating_mul(2),
             |id| {
-                if bloom.contains_int(rid_key(id)) {
+                if filter.contains(id) {
                     if ids.len() == choice.max_ids {
                         return false;
                     }
@@ -309,7 +439,7 @@ impl RuntimeIndexScan<'_> {
             ids.len() as u64,
             false,
         );
-        drop(bloom);
+        drop(filter);
         let indexed = vec_index_scan::IndexBatchStream::from_row_ids(
             &self.db,
             self.txn,
@@ -342,12 +472,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn intersection_estimates_and_physical_pages_use_the_same_ceiling() {
+    fn exact_rid_bitmap_keeps_page_gaps_slots_and_full_page_id_range() {
+        for ids in [
+            vec![RowId::new(3, 0), RowId::new(3, 5), RowId::new(5, 2)],
+            vec![RowId::new(u32::MAX - 1, 0), RowId::new(u32::MAX, u16::MAX)],
+        ] {
+            let bitmap = RidBitmap::build(&ids, RidBitmap::layout(&ids).unwrap()).unwrap();
+            for id in &ids {
+                assert!(bitmap.contains(*id));
+            }
+            assert!(!bitmap.contains(RowId::new(0, 0)));
+            assert!(!bitmap.contains(RowId::new(ids[0].page_id, 1)));
+        }
+        assert!(RidBitmap::layout(&[]).is_none());
+    }
+
+    #[test]
+    fn intersection_estimates_admit_bounded_locality_discovery() {
         assert_eq!(
             intersection_cardinality(200_000_000, 3_000_000, 20_000_000, 10_000_000),
             Some(1_000_000)
         );
-        assert!(intersection_cardinality(200_000_000, 1_000_000, 20_000_000, 10_000_000).is_none());
+        assert_eq!(
+            intersection_cardinality(200_000_000, 1_000_000, 20_000_000, 10_000_000),
+            Some(1_000_000)
+        );
+        assert!(intersection_cardinality(200_000_000, 200_000, 20_000_000, 10_000_000).is_none());
         assert!(intersection_cardinality(200_000_000, 3_000_000, 50_000_000, 50_000_000).is_none());
     }
 
@@ -413,6 +563,7 @@ mod tests {
                 probes: Vec::new(),
                 opened: false,
                 allowed: true,
+                residual: None,
             };
             assert!(scan.choice().is_none());
             assert!(scan.intersection_choice().is_some());

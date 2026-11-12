@@ -402,6 +402,7 @@ impl<'a> HashJoinBatchOperator<'a> {
             probe_schema: probe.schema().clone(),
             probe,
             build_plan: None,
+            probe_estimated_rows: 0,
             build_keys: build_keys.to_vec(),
             probe_keys: probe_keys.to_vec(),
             probe_key_exprs: Vec::new(),
@@ -1539,6 +1540,187 @@ fn runtime_filter_on_optional_probe_keeps_unmatched_preserved_build_rows() {
                 drop(operator);
             });
             assert_eq!(budget.used(), 0);
+        }
+    }
+}
+
+#[test]
+fn mixed_collation_join_publishes_integer_necessary_condition_only() {
+    struct Probe {
+        input: MaterializedBatchOperator,
+        filters: Arc<std::sync::Mutex<Vec<crate::planner::RuntimeFilter>>>,
+    }
+    impl BatchOperator for Probe {
+        fn schema(&self) -> &Arc<BatchSchema> {
+            self.input.schema()
+        }
+        fn install_runtime_filter(&mut self, f: crate::planner::RuntimeFilter) -> bool {
+            self.filters.lock().unwrap().push(f);
+            true
+        }
+        fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+            self.input.next_batch()
+        }
+    }
+    let schema = Arc::new(BatchSchema::new(vec![
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "id".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        },
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "tag".into(),
+            column_type: ColumnType::VarString,
+            source: crate::types::ColumnSource {
+                collation_id: Some(255),
+                ..Default::default()
+            },
+        },
+    ]));
+    let out = Arc::new(BatchSchema::new(
+        schema
+            .fields()
+            .iter()
+            .chain(schema.fields())
+            .cloned()
+            .collect(),
+    ));
+    let budget = Arc::new(crate::engine::executor::mem_budget::MemBudget::new(
+        64 << 20,
+    ));
+    crate::engine::executor::mem_budget::with_query_budget(budget.clone(), || {
+        let batch = |ids: Vec<Value>, tags: Vec<&str>| {
+            Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(ids),
+                    ColumnVector::from_values(
+                        tags.into_iter().map(|s| Value::String(s.into())).collect(),
+                    ),
+                ],
+            )
+        };
+        let mut build = MaterializedBatchOperator::new(
+            schema.clone(),
+            vec![batch(vec![Value::Int(1), Value::Int(2)], vec!["A", "bé"])],
+        );
+        let filters = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let probe = Probe {
+            input: MaterializedBatchOperator::new(
+                schema.clone(),
+                vec![batch(
+                    vec![Value::Int(1), Value::Int(1), Value::Int(2), Value::Null],
+                    vec!["a", "b", "BE", "a"],
+                )],
+            ),
+            filters: filters.clone(),
+        };
+        let mut join = HashJoinBatchOperator::for_test_uninitialized(
+            &mut build,
+            Box::new(probe),
+            &[0, 1],
+            &[0, 1],
+            &[None, Some(255)],
+            out,
+            false,
+            vec_hash_join::VecJoinType::Inner,
+        )
+        .unwrap();
+        let mut rows = 0;
+        while let Some(batch) = join.next_batch().unwrap() {
+            rows += batch.visible_rows();
+        }
+        assert_eq!(
+            rows, 2,
+            "the integer condition never replaces full collated matching"
+        );
+        let published = filters.lock().unwrap();
+        assert_eq!(published.len(), 1);
+        assert!(
+            matches!(&published[0],crate::planner::RuntimeFilter::ExactIntKey{keys,..} if keys.len()==1)
+        );
+    });
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn positive_semi_filter_keeps_anti_and_null_safe_joins_on_their_semantic_path() {
+    struct Probe {
+        input: MaterializedBatchOperator,
+        filters: Arc<std::sync::Mutex<Vec<crate::planner::RuntimeFilter>>>,
+    }
+    impl BatchOperator for Probe {
+        fn schema(&self) -> &Arc<BatchSchema> {
+            self.input.schema()
+        }
+        fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+            self.input.next_batch()
+        }
+        fn install_runtime_filter(&mut self, f: crate::planner::RuntimeFilter) -> bool {
+            self.filters.lock().unwrap().push(f);
+            true
+        }
+    }
+    let schema = Arc::new(BatchSchema::new(vec![BatchField {
+        table: "t".into(),
+        alias: None,
+        name: "k".into(),
+        column_type: ColumnType::LongLong,
+        source: Default::default(),
+    }]));
+    for (kind, ordinary, null_safe) in [
+        (crate::parser::JoinType::Semi, 1, 2),
+        (crate::parser::JoinType::Anti, 2, 1),
+    ] {
+        for safe in [false, true] {
+            let filters = Arc::new(std::sync::Mutex::new(Vec::new()));
+            let mut build = MaterializedBatchOperator::new(
+                schema.clone(),
+                vec![Batch::new(
+                    schema.clone(),
+                    vec![ColumnVector::from_values(vec![Value::Int(1), Value::Null])],
+                )],
+            );
+            let probe = Probe {
+                input: MaterializedBatchOperator::new(
+                    schema.clone(),
+                    vec![Batch::new(
+                        schema.clone(),
+                        vec![ColumnVector::from_values(vec![
+                            Value::Int(1),
+                            Value::Int(2),
+                            Value::Null,
+                        ])],
+                    )],
+                ),
+                filters: filters.clone(),
+            };
+            let mut join = HashJoinBatchOperator::for_test_uninitialized(
+                &mut build,
+                Box::new(probe),
+                &[0],
+                &[0],
+                &[None],
+                schema.clone(),
+                false,
+                vec_hash_join::VecJoinType::Inner,
+            )
+            .unwrap();
+            join.join_type = kind;
+            join.null_safe = vec![safe];
+            let mut rows = 0;
+            while let Some(batch) = join.next_batch().unwrap() {
+                rows += batch.visible_rows();
+            }
+            assert_eq!(rows, if safe { null_safe } else { ordinary });
+            assert_eq!(
+                filters.lock().unwrap().len(),
+                usize::from(matches!(kind, crate::parser::JoinType::Semi) && !safe)
+            );
         }
     }
 }
