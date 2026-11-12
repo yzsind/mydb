@@ -331,7 +331,7 @@ impl RuntimeIndexScan<'_> {
                     )
                 })
                 .collect();
-            self.indexed = Some(indexed);
+            self.adopt_indexed(indexed, pages)?;
         }
         Ok(())
     }

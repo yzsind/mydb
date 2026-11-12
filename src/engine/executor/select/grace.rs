@@ -852,6 +852,34 @@ impl ValueRowWriter {
         self.append_prefixed(&[], row)
     }
 
+    /// Append a trusted payload produced by the scalar spill encoder. The
+    /// caller retains its column count; framing and quota accounting remain
+    /// identical to append_prefixed, without decoding immutable values again.
+    pub(crate) fn append_encoded_prefixed(
+        &mut self,
+        prefix: &[Value],
+        width: usize,
+        payload: &[u8],
+    ) -> Result<(), QueryError> {
+        if prefix.len().saturating_add(width) != self.ncols {
+            return Err(crate::error::catalog::ER_UNKNOWN_ERROR
+                .error("encoded spill row width does not match its schema"));
+        }
+        let mut staged = StagedRowWriter::<_, SPILL_ROW_STAGING_BYTES>::new(&mut self.writer);
+        if !self.header_written {
+            write_u32(&mut staged, self.ncols as u32).map_err(io_err)?;
+            self.header_written = true;
+        }
+        if self.ncols == 0 {
+            staged.write_all(&[VALUE_NULL]).map_err(io_err)?;
+        }
+        for value in prefix {
+            write_value(&mut staged, value).map_err(io_err)?;
+        }
+        staged.write_all(payload).map_err(io_err)?;
+        staged.finish_row().map_err(io_err)
+    }
+
     /// Frame a small metadata prefix and payload without allocating a joined row.
     pub(crate) fn append_prefixed(
         &mut self,
@@ -984,6 +1012,17 @@ impl LazyValueRowWriterPool {
             .append_batch_row(batch, row)
     }
 
+    pub(crate) fn append_encoded_prefixed(
+        &mut self,
+        partition: usize,
+        prefix: &[Value],
+        width: usize,
+        payload: &[u8],
+    ) -> Result<(), QueryError> {
+        self.writer_for_partition(partition)?
+            .append_encoded_prefixed(prefix, width, payload)
+    }
+
     // Preserve the original per-row call boundary for both append formats.
     #[inline(always)]
     fn writer_for_partition(
@@ -1077,6 +1116,25 @@ impl ValueRowReader {
     }
 
     pub(crate) fn next(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+        self.next_with_buffer(Vec::new(), false)
+    }
+
+    /// Internal reducers can keep short UTF-8 values inline and lend back the
+    /// row buffer. Neither representation escapes into the public cursor.
+    pub(crate) fn next_inline_reuse(
+        &mut self,
+        row: Vec<Value>,
+    ) -> Result<Option<Vec<Value>>, QueryError> {
+        self.next_with_buffer(row, true)
+    }
+
+    fn next_with_buffer(
+        &mut self,
+        mut row: Vec<Value>,
+        inline_strings: bool,
+    ) -> Result<Option<Vec<Value>>, QueryError> {
+        // Drop the previous payload before returning its decode reservation.
+        row.clear();
         self.decoded = self.reader.memory_charge();
         let mut peek = [0u8; 1];
         match self.reader.read(&mut peek) {
@@ -1084,24 +1142,27 @@ impl ValueRowReader {
             Ok(_) => {}
             Err(e) => return Err(io_err(e)),
         }
-        self.decoded
-            .add_force(self.ncols.saturating_mul(std::mem::size_of::<Value>()))?;
-        let mut row = crate::engine::executor::mem_budget::try_vec_with_capacity(
+        self.decoded.add_force(
+            row.capacity()
+                .max(self.ncols)
+                .saturating_mul(std::mem::size_of::<Value>()),
+        )?;
+        crate::engine::executor::mem_budget::try_reserve_vec_exact(
+            &mut row,
             self.ncols,
             "spill value row",
         )?;
         for i in 0..self.ncols {
-            let v = if i == 0 {
-                crate::engine::executor::spill_value::read_payload_accounted(
-                    &mut self.reader,
-                    peek[0],
-                    false,
-                    io_err,
-                    Some(&mut self.decoded),
-                )?
-            } else {
-                read_value_accounted(&mut self.reader, &mut self.decoded)?
-            };
+            if i > 0 {
+                self.reader.read_exact(&mut peek).map_err(io_err)?;
+            }
+            let v = crate::engine::executor::spill_value::read_payload_accounted(
+                &mut self.reader,
+                peek[0],
+                inline_strings,
+                io_err,
+                Some(&mut self.decoded),
+            )?;
             row.push(v);
         }
         Ok(Some(row))

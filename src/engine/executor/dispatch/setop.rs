@@ -1,7 +1,9 @@
 //! Set operations, spillable combination and subquery dispatch.
 use super::*;
 
+mod compact_key;
 mod external_reduce;
+mod packed_row;
 
 /// Turn a branch response into `(columns, cursor)` without materialising:
 /// a `StreamingResultSet` hands over its cursor directly, an in-memory
@@ -771,8 +773,8 @@ fn unify_setop_numeric_columns(
 }
 
 #[derive(Debug)]
-struct SetCountEntry {
-    row: Vec<Value>,
+struct SetCountEntry<Row = Vec<Value>> {
+    row: Row,
     left: u64,
     right: u64,
     first_ordinal: u64,
@@ -829,6 +831,10 @@ fn setop_partition_for_cached(
     depth: u32,
     cache: Option<&mut super::super::collation_cache::CollationKeyCache>,
 ) -> usize {
+    setop_partition_for_key(&set_row_key_cached(collations, row, cache), depth)
+}
+
+fn setop_partition_for_key(key: &SetRowKey, depth: u32) -> usize {
     use std::hash::{BuildHasher, Hash, Hasher};
     // All runs are temporary and replayed in this process. One randomized
     // state keeps initial routing and recursive replay consistent without
@@ -836,7 +842,7 @@ fn setop_partition_for_cached(
     static STATE: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
     let mut hasher = STATE.get_or_init(ahash::RandomState::new).build_hasher();
     depth.hash(&mut hasher);
-    set_row_key_cached(collations, row, cache).hash(&mut hasher);
+    key.hash(&mut hasher);
     (hasher.finish() as usize) & (SETOP_SPILL_FANOUT - 1)
 }
 
@@ -1053,24 +1059,34 @@ fn reduce_setop_spill_partition(
         );
     }
 
-    let mut state = hashbrown::HashMap::<SetRowKey, SetCountEntry, ahash::RandomState>::with_hasher(
-        ahash::RandomState::new(),
-    );
+    let mut state = hashbrown::HashMap::<
+        SetRowKey,
+        SetCountEntry<packed_row::PackedRow>,
+        ahash::RandomState,
+    >::with_hasher(ahash::RandomState::new());
     let mut state_bytes = 0usize;
     let cap = replay_cap;
     let mut key_cache = super::super::collation_cache::CollationKeyCache::new();
+    let table_bytes = |capacity| {
+        crate::engine::executor::memory_footprint::hash_table_capacity_bytes::<(
+            SetRowKey,
+            SetCountEntry<packed_row::PackedRow>,
+        )>(capacity)
+    };
 
-    while let Some(mut tagged) = reader.next()? {
+    let mut buffer = Vec::new();
+    while let Some(tagged) = reader.next_inline_reuse(std::mem::take(&mut buffer))? {
         crate::engine::cancel::check_cancelled()?;
         let left = setop_u64(&tagged, 0)?;
         let right = setop_u64(&tagged, 1)?;
         let ordinal = setop_u64(&tagged, 2)?;
-        tagged.drain(..tagged.len().min(3));
-        let key = set_row_key_cached(collations, &tagged, Some(&mut key_cache));
+        let row = &tagged[3..];
+        let key = set_row_key_cached(collations, row, Some(&mut key_cache));
         if let Some(entry) = state.get_mut(&key) {
             entry.left = entry.left.saturating_add(left);
             entry.right = entry.right.saturating_add(right);
             entry.first_ordinal = entry.first_ordinal.min(ordinal);
+            buffer = tagged;
             continue;
         }
         if left == 0 && matches!(op, SetOp::Intersect | SetOp::Except) {
@@ -1078,22 +1094,37 @@ fn reduce_setop_spill_partition(
             // Input files preserve left-before-right order, including after
             // recursive repartition, so a right-only key never needs a row or
             // hash entry.
+            buffer = tagged;
             continue;
         }
         let key_heap_bytes = key.spilled().then_some(key.capacity()).unwrap_or(0);
-        let bucket_bytes = if state.len() == state.capacity() {
-            state
-                .capacity()
-                .max(2)
-                .saturating_mul(std::mem::size_of::<(SetRowKey, SetCountEntry)>())
+        let (old_table_bytes, replacement_bytes) = if state.len() == state.capacity() {
+            let next_capacity = if state.capacity() == 0 {
+                3
+            } else {
+                state.capacity().saturating_mul(2)
+            };
+            (table_bytes(state.capacity()), table_bytes(next_capacity))
         } else {
-            0
+            (0, 0)
         };
-        let grow_bytes = set_row_capacity_bytes(&tagged)
+        let packed_bytes = packed_row::PackedRow::encoded_len(row)?;
+        // Table capacity already includes key/entry headers. Reserve only
+        // owned payloads and the eventual exact-sized compact output array,
+        // rather than charging another complete entry for every key.
+        let grow_bytes = packed_bytes
             .saturating_add(key_heap_bytes)
-            .saturating_add(96)
-            .saturating_add(bucket_bytes);
-        if state_bytes.saturating_add(grow_bytes) > cap {
+            .saturating_add(std::mem::size_of::<(u64, u64, packed_row::PackedRow)>())
+            .saturating_add(replacement_bytes);
+        let transient_bytes = state_bytes.saturating_add(grow_bytes);
+        let resident_bytes = transient_bytes.saturating_sub(old_table_bytes);
+        // Growth briefly owns both arrays. A resident state that fits its
+        // unchanged cap may use idle query headroom for that overlap, but may
+        // not extend the query watermark or borrow from a busy parent.
+        let overlap_fits = transient_bytes <= cap
+            || crate::engine::executor::mem_budget::current_budget()
+                .is_some_and(|budget| grow_bytes <= budget.limit().saturating_sub(budget.used()));
+        if resident_bytes > cap || !overlap_fits {
             let child_prefix = format!("setop-r{}-{partition_tag}", depth + 1);
             let mut writers = crate::engine::executor::select::grace::LazyValueRowWriterPool::new(
                 dir.path(),
@@ -1105,35 +1136,39 @@ fn reduce_setop_spill_partition(
             );
             let append =
                 |writers: &mut crate::engine::executor::select::grace::LazyValueRowWriterPool,
-                 row: Vec<Value>,
+                 row: &[Value],
                  left: u64,
                  right: u64,
                  ordinal: u64|
                  -> Result<(), QueryError> {
-                    let partition = setop_partition_for(collations, &row, depth + 1);
+                    let partition = setop_partition_for(collations, row, depth + 1);
                     writers.append_prefixed(
                         partition,
                         &[Value::UInt(left), Value::UInt(right), Value::UInt(ordinal)],
-                        &row,
+                        row,
                     )
                 };
-            for entry in state.drain().map(|(_, entry)| entry) {
-                append(
-                    &mut writers,
-                    entry.row,
-                    entry.left,
-                    entry.right,
-                    entry.first_ordinal,
+            for (key, entry) in state.drain() {
+                writers.append_encoded_prefixed(
+                    setop_partition_for_key(&key, depth + 1),
+                    &[
+                        Value::UInt(entry.left),
+                        Value::UInt(entry.right),
+                        Value::UInt(entry.first_ordinal),
+                    ],
+                    ncols,
+                    entry.row.encoded(),
                 )?;
             }
-            append(&mut writers, tagged, left, right, ordinal)?;
-            while let Some(mut remaining) = reader.next()? {
+            append(&mut writers, row, left, right, ordinal)?;
+            buffer = tagged;
+            while let Some(remaining) = reader.next_inline_reuse(std::mem::take(&mut buffer))? {
                 crate::engine::cancel::check_cancelled()?;
                 let left = setop_u64(&remaining, 0)?;
                 let right = setop_u64(&remaining, 1)?;
                 let ordinal = setop_u64(&remaining, 2)?;
-                remaining.drain(..remaining.len().min(3));
-                append(&mut writers, remaining, left, right, ordinal)?;
+                append(&mut writers, &remaining[3..], left, right, ordinal)?;
+                buffer = remaining;
             }
             drop(reader);
             metrics.file_opens = metrics.file_opens.saturating_add(writers.opens());
@@ -1177,22 +1212,40 @@ fn reduce_setop_spill_partition(
             work_handle.release(grow_bytes);
             return Err(error);
         }
+        if replacement_bytes > 0 && state.try_reserve(1).is_err() {
+            memory_charge.release_bytes(grow_bytes);
+            work_handle.release(grow_bytes);
+            return Err(crate::engine::executor::mem_budget::allocation_error(
+                "set-operation replay table",
+            ));
+        }
         state_bytes = state_bytes.saturating_add(grow_bytes);
         *peak_state_bytes = (*peak_state_bytes).max(state_bytes);
+        if replacement_bytes > 0 {
+            let actual = table_bytes(state.capacity());
+            debug_assert!(actual <= replacement_bytes);
+            let released = old_table_bytes
+                .saturating_add(replacement_bytes)
+                .saturating_sub(actual);
+            memory_charge.release_bytes(released);
+            work_handle.release(released);
+            state_bytes = state_bytes.saturating_sub(released);
+        }
         state.insert(
             key,
             SetCountEntry {
-                row: tagged,
+                row: packed_row::PackedRow::encode(row, packed_bytes)?,
                 left,
                 right,
                 first_ordinal: ordinal,
             },
         );
+        buffer = tagged;
     }
 
     drop(reader);
     crate::engine::executor::spill_quota::remove_spill_file(path, &dir.charger())?;
-    let entries = compact_set_count_state(op, all, state);
+    let entries = compact_set_count_state(op, all, state)?;
     if !entries.is_empty() {
         let run_path = dir.path().join(format!("setrun-{}", *next_run));
         *next_run = (*next_run).saturating_add(1);
@@ -1204,11 +1257,11 @@ fn reduce_setop_spill_partition(
         metrics.file_opens = metrics.file_opens.saturating_add(1);
         for (ordinal, repeats, row) in entries {
             crate::engine::cancel::check_cancelled()?;
-            let mut tagged = Vec::with_capacity(ncols.saturating_add(2));
-            tagged.push(Value::UInt(ordinal));
-            tagged.push(Value::UInt(repeats));
-            tagged.extend(row);
-            writer.append(&tagged)?;
+            writer.append_encoded_prefixed(
+                &[Value::UInt(ordinal), Value::UInt(repeats)],
+                ncols,
+                row.encoded(),
+            )?;
         }
         metrics.bytes_written = metrics.bytes_written.saturating_add(writer.finish()?);
         output_runs.push(run_path);
@@ -1263,13 +1316,13 @@ fn set_row_key_cached(
             let length = (key.len() - length_offset - 4) as u32;
             key[length_offset..length_offset + 4].copy_from_slice(&length.to_le_bytes());
         } else {
-            crate::engine::expr::write_value_inline_key(value, &mut key);
+            compact_key::write_value(value, &mut key);
         }
     }
     key
 }
 
-fn set_count_repeats(op: SetOp, all: bool, entry: &SetCountEntry) -> u64 {
+fn set_count_repeats<Row>(op: SetOp, all: bool, entry: &SetCountEntry<Row>) -> u64 {
     match (op, all) {
         (SetOp::Union, false) => u64::from(entry.left > 0 || entry.right > 0),
         (SetOp::Intersect, false) => u64::from(entry.left > 0 && entry.right > 0),
@@ -1280,20 +1333,27 @@ fn set_count_repeats(op: SetOp, all: bool, entry: &SetCountEntry) -> u64 {
     }
 }
 
-fn compact_set_count_state(
+fn compact_set_count_state<Row>(
     op: SetOp,
     all: bool,
-    state: hashbrown::HashMap<SetRowKey, SetCountEntry, ahash::RandomState>,
-) -> Vec<(u64, u64, Vec<Value>)> {
-    let mut entries = state
-        .into_values()
-        .filter_map(|entry| {
-            let repeats = set_count_repeats(op, all, &entry);
-            (repeats > 0).then_some((entry.first_ordinal, repeats, entry.row))
-        })
-        .collect::<Vec<_>>();
+    state: hashbrown::HashMap<SetRowKey, SetCountEntry<Row>, ahash::RandomState>,
+) -> Result<Vec<(u64, u64, Row)>, QueryError> {
+    let winners = state
+        .values()
+        .filter(|entry| set_count_repeats(op, all, entry) > 0)
+        .count();
+    // The producer reserved one output slot per group. Exact allocation
+    // avoids geometric Vec growth and its additional old/new-array overlap.
+    let mut entries =
+        crate::engine::executor::mem_budget::try_vec_with_capacity(winners, "compact set output")?;
+    for entry in state.into_values() {
+        let repeats = set_count_repeats(op, all, &entry);
+        if repeats > 0 {
+            entries.push((entry.first_ordinal, repeats, entry.row));
+        }
+    }
     entries.sort_unstable_by_key(|(ordinal, _, _)| *ordinal);
-    entries
+    Ok(entries)
 }
 
 struct SpilledSetOutput {
@@ -1725,7 +1785,7 @@ where
     drop(key_cache);
     let Some(spill) = spill else {
         return Ok(IncrementalSetOutput::in_memory(
-            compact_set_count_state(op, all, state),
+            compact_set_count_state(op, all, state)?,
             Some(memory_charge),
             Some(work_handle),
         ));
@@ -1964,6 +2024,215 @@ fn combine_set_rows_spillable(
 
 #[cfg(test)]
 mod set_count_spill_tests {
+    #[test]
+    fn integer_set_keys_keep_small_tuples_inline_without_changing_equality() {
+        let values = [
+            Value::Int(-129),
+            Value::Int(-128),
+            Value::Int(0),
+            Value::Int(127),
+            Value::Int(128),
+            Value::Int(i64::MIN),
+            Value::UInt(u64::MAX),
+            Value::Decimal("128.000".into()),
+            Value::DecimalCompact(12800, 2),
+            Value::Decimal128(i128::MIN, 0),
+            Value::Double(128.0),
+            Value::Date(128),
+            Value::Time(128),
+            Value::Null,
+            Value::String("128".into()),
+            Value::Bytes(vec![128]),
+        ];
+        for a in &values {
+            for b in &values {
+                let oracle = |v| {
+                    let mut key = SetRowKey::new();
+                    crate::engine::expr::write_value_inline_key(v, &mut key);
+                    key
+                };
+                assert_eq!(
+                    set_row_key(&[], &[a.clone()]) == set_row_key(&[], &[b.clone()]),
+                    oracle(a) == oracle(b),
+                    "{a:?} / {b:?}"
+                );
+            }
+        }
+        let key = set_row_key(
+            &[],
+            &[
+                Value::Int(2002),
+                Value::Int(44),
+                Value::Int(-12),
+                Value::Int(1),
+                Value::Int(37),
+                Value::DecimalCompact(12345, 2),
+            ],
+        );
+        assert!(
+            !key.spilled(),
+            "small exact tuples should not allocate: {} bytes",
+            key.len()
+        );
+    }
+
+    #[test]
+    fn set_replay_keeps_wide_numeric_representatives_within_one_partition() {
+        use crate::engine::executor::{mem_budget, select::grace};
+        for (rows, replay_cap) in [(3000, 1 << 20), (3500, 700 << 10)] {
+            let budget = Arc::new(mem_budget::MemBudget::new(8 << 20));
+            mem_budget::with_query_budget(budget.clone(), || {
+                let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+                let dir = grace::SpillTmpDir::create_kind(root.path(), "setop").unwrap();
+                let path = dir.path().join("numeric");
+                let mut writer = grace::ValueRowWriter::create(&path, 10, dir.charger()).unwrap();
+                let row = |id| {
+                    vec![
+                        Value::Int(id),
+                        Value::Int(id % 71),
+                        Value::Date(18000),
+                        Value::Int(-4),
+                        Value::Null,
+                        Value::DecimalCompact(id * 3, 2),
+                        Value::UInt(9),
+                    ]
+                };
+                for id in 0..rows {
+                    writer
+                        .append_prefixed(
+                            &[Value::UInt(2), Value::UInt(1), Value::UInt(id as u64)],
+                            &row(id),
+                        )
+                        .unwrap();
+                }
+                writer.finish().unwrap();
+                let mut runs = Vec::new();
+                let mut next = 0;
+                let mut charge = mem_budget::ScopedCharge::new(0);
+                let mut peak = 0;
+                let mut metrics = SetOpReplayMetrics::default();
+                let work = crate::engine::executor::work_area::WorkAreaHandle::register();
+                reduce_setop_spill_partition(
+                    &[None; 7],
+                    SetOp::Except,
+                    true,
+                    7,
+                    &path,
+                    "numeric",
+                    0,
+                    replay_cap,
+                    &dir,
+                    &mut runs,
+                    &mut next,
+                    &work,
+                    &mut charge,
+                    &mut peak,
+                    &mut metrics,
+                )
+                .unwrap();
+                assert_eq!(
+                    metrics.repartitions, 0,
+                    "representative storage must fit the replay cap"
+                );
+                assert!(peak <= replay_cap);
+                let mut actual = Vec::new();
+                for path in runs {
+                    let mut reader = grace::ValueRowReader::open(&path, dir.charger())
+                        .unwrap()
+                        .unwrap();
+                    while let Some(tagged) = reader.next().unwrap() {
+                        assert_eq!(setop_u64(&tagged, 1).unwrap(), 1);
+                        actual.push(tagged[2..].to_vec());
+                    }
+                }
+                assert_eq!(actual, (0..rows).map(row).collect::<Vec<_>>());
+                assert_eq!(charge.charged(), 0);
+            });
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn replay_table_overlap_uses_only_free_query_headroom() {
+        use crate::engine::executor::{mem_budget, select::grace};
+        for busy in [false, true] {
+            let budget = Arc::new(mem_budget::MemBudget::new(8 << 20));
+            mem_budget::with_query_budget(budget.clone(), || {
+                let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+                let dir = grace::SpillTmpDir::create_kind(root.path(), "setop").unwrap();
+                let path = dir.path().join("growth");
+                let mut writer = grace::ValueRowWriter::create(&path, 5, dir.charger()).unwrap();
+                for id in 0..2000 {
+                    writer
+                        .append_prefixed(
+                            &[Value::UInt(2), Value::UInt(1), Value::UInt(id)],
+                            &[
+                                Value::String(format!("{id:08}{}", "x".repeat(160))),
+                                Value::UInt(id),
+                            ],
+                        )
+                        .unwrap();
+                }
+                writer.finish().unwrap();
+                let mut parent = mem_budget::ScopedCharge::new(0);
+                if busy {
+                    parent.add(7 << 20).unwrap();
+                }
+                let mut runs = Vec::new();
+                let mut next = 0;
+                let mut charge = mem_budget::ScopedCharge::new(0);
+                let mut peak = 0;
+                let mut metrics = SetOpReplayMetrics::default();
+                let area = crate::engine::executor::work_area::WorkAreaHandle::register();
+                let cap = 1_350_000;
+                reduce_setop_spill_partition(
+                    &[None; 2],
+                    SetOp::Except,
+                    true,
+                    2,
+                    &path,
+                    "growth",
+                    0,
+                    cap,
+                    &dir,
+                    &mut runs,
+                    &mut next,
+                    &area,
+                    &mut charge,
+                    &mut peak,
+                    &mut metrics,
+                )
+                .unwrap();
+                if busy {
+                    assert!(
+                        metrics.repartitions > 0,
+                        "a busy parent must not fund table overlap"
+                    );
+                } else {
+                    assert_eq!(metrics.repartitions, 0);
+                    assert!(peak > cap, "fixture must exercise transient table overlap");
+                    assert!(peak < budget.limit());
+                }
+                let mut rows = 0;
+                for path in runs {
+                    let mut reader = grace::ValueRowReader::open(&path, dir.charger())
+                        .unwrap()
+                        .unwrap();
+                    while let Some(row) = reader.next().unwrap() {
+                        assert_eq!(setop_u64(&row, 1).unwrap(), 1);
+                        rows += 1;
+                    }
+                }
+                assert_eq!(rows, 2000);
+                assert_eq!(charge.charged(), 0);
+                assert!(budget.terminal_oom().is_none());
+            });
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        }
+    }
+
     #[test]
     fn spill_partition_cache_preserves_collation_and_null_domains() {
         let collation = crate::charset::collation_id(crate::charset::DEFAULT_COLLATION);

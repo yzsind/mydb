@@ -141,10 +141,26 @@ pub(crate) fn read_exact_bytes_accounted<R: Read>(
             .add_force(len)
             .map_err(super::spill_quota::quota_as_io)?;
     }
+    // Most temporary strings/keys are short. Do not clear an 8 KiB scratch
+    // array for each of them. Keep the large decoder outlined so its stack
+    // initialization cannot be hoisted into the common short-payload path.
+    if len <= 256 {
+        read_exact_bytes_chunked::<R, 256>(r, len, budget)
+    } else {
+        read_exact_bytes_chunked::<R, 8192>(r, len, budget)
+    }
+}
+
+#[inline(never)]
+fn read_exact_bytes_chunked<R: Read, const CHUNK: usize>(
+    r: &mut R,
+    len: usize,
+    budget: Option<&mut super::mem_budget::ScopedCharge>,
+) -> std::io::Result<Vec<u8>> {
     // A corrupt length must not allocate/touch the entire declared payload
     // before discovering EOF. Grow only after each bounded read succeeds.
     let mut buf = Vec::new();
-    let mut chunk = [0; 8192];
+    let mut chunk = [0; CHUNK];
     while buf.len() < len {
         if len > chunk.len() {
             crate::engine::cancel::check_cancelled().map_err(super::spill_quota::quota_as_io)?;

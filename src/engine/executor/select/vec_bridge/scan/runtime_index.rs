@@ -55,13 +55,44 @@ pub(super) struct RuntimeIndexScan<'a> {
     schema: Arc<BatchSchema>,
     original: Box<dyn BatchOperator + 'a>,
     filters: Vec<RuntimeFilter>,
-    indexed: Option<vec_index_scan::IndexBatchStream>,
+    indexed: Option<Box<dyn BatchOperator + 'a>>,
     probes: Vec<Option<super::super::super::plan::CompiledRuntimeFilterProbe>>,
     opened: bool,
     allowed: bool,
 }
 
 impl RuntimeIndexScan<'_> {
+    fn adopt_indexed(
+        &mut self,
+        indexed: vec_index_scan::IndexBatchStream,
+        pages: u64,
+    ) -> Result<(), QueryError> {
+        // Retain the planner's concurrency ceiling. Small domains keep the
+        // serial lane; large page-disjoint domains reuse bounded scan queues,
+        // captured snapshots, cancellation and the existing MRR governor.
+        let degree = if pages >= 4096 && self.original.is_native_parallel_scan() {
+            match self.original.properties().partitioning {
+                BatchPartitioning::RoundRobin { partitions } => partitions,
+                _ => 1,
+            }
+        } else {
+            1
+        };
+        let mut workers = indexed.into_row_id_workers(degree)?;
+        self.indexed = Some(if workers.len() > 1 {
+            Box::new(super::ParallelIndexBatchStream::new(
+                &self.db, self.txn, workers,
+            ))
+        } else {
+            Box::new(
+                workers
+                    .pop()
+                    .expect("RID source retains at least one reader"),
+            )
+        });
+        Ok(())
+    }
+
     fn other_exact_survival(&self, selected: &RuntimeFilter, column: usize) -> f64 {
         let mut survival = 1.0;
         for other in &self.filters {
@@ -344,7 +375,7 @@ impl RuntimeIndexScan<'_> {
                 )
             })
             .collect();
-        self.indexed = Some(indexed);
+        self.adopt_indexed(indexed, pages)?;
         Ok(())
     }
 }
