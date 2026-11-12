@@ -5351,6 +5351,9 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
                 s.index_entries_examined, s.heap_rows_fetched, s.heap_page_probes
             ));
         }
+        if s.runtime_index_probes > 0 {
+            extra.push_str(&format!(", \"runtime_index_probes\": {}, \"runtime_index_candidates\": {}, \"runtime_index_fallbacks\": {}", s.runtime_index_probes, s.runtime_index_candidates, s.runtime_index_fallbacks));
+        }
         if s.index_merge_branches > 0 {
             extra.push_str(&format!(
                 ", \"index_merge_branches\": {}, \"candidate_rowids\": {}, \"duplicates_removed\": {}",

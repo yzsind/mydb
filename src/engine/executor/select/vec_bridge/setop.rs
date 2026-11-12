@@ -87,12 +87,21 @@ pub(super) struct SetOpRowPuller<'a> {
 }
 
 impl SetOpRowPuller<'_> {
-    pub(super) fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+    pub(super) fn next_row_reuse(
+        &mut self,
+        mut row: Vec<Value>,
+    ) -> Result<Option<Vec<Value>>, QueryError> {
+        row.clear();
         loop {
             if let Some(batch) = self.batch.as_ref() {
                 if let Some(&row_index) = self.visible.get(self.position) {
                     self.position += 1;
-                    let mut row = batch.row(row_index);
+                    row.extend(
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| column.value_at(row_index)),
+                    );
                     for (column_index, (value, field)) in
                         row.iter_mut().zip(self.schema.fields()).enumerate()
                     {
@@ -299,7 +308,7 @@ impl SetOpBatchOperator<'_> {
             position: 0,
         });
         self.blocking_output = Some(
-            crate::engine::executor::dispatch::combine_unordered_set_sources_spillable(
+            crate::engine::executor::dispatch::combine_buffered_unordered_set_sources_spillable(
                 &self
                     .schema
                     .fields()
@@ -310,11 +319,11 @@ impl SetOpBatchOperator<'_> {
                 self.all,
                 self.schema.len(),
                 &self.data_dir,
-                || {
+                |buffer| {
                     let result = left
                         .as_mut()
                         .expect("set-op left input requested after EOF")
-                        .next_row()?;
+                        .next_row_reuse(buffer)?;
                     if result.is_none() {
                         // EOF is a lifetime boundary: completed HashJoin,
                         // HashAgg and scan work areas must not remain live
@@ -323,11 +332,11 @@ impl SetOpBatchOperator<'_> {
                     }
                     Ok(result)
                 },
-                || {
+                |buffer| {
                     let result = right
                         .as_mut()
                         .expect("set-op right input requested after EOF")
-                        .next_row()?;
+                        .next_row_reuse(buffer)?;
                     if result.is_none() {
                         right = None;
                     }

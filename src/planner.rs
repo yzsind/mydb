@@ -6071,6 +6071,18 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         scans.sort_by_key(|scan| !is_mysql_const_scan(scan));
     }
     let has_straight_edge = select.joins.iter().any(|join| join.straight);
+    let preserved_candidate = if !all_inner && !has_ordered && !has_straight_edge {
+        try_plan_preserved_join_island(
+            &cbo_ctx,
+            select,
+            &tables,
+            &scans,
+            &join_conditions,
+            &residual_predicates,
+        )
+    } else {
+        None
+    };
     let mut plan = if all_inner && has_straight_edge && !has_ordered {
         let mut cross_preds = Vec::new();
         for cond in join_conditions.drain(..).flatten() {
@@ -6254,7 +6266,116 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
     if let Some(predicate) = combine_conjuncts(residual_predicates) {
         plan = attach_filter(plan, predicate);
     }
+    if let Some(candidate) = preserved_candidate {
+        if plan_cost(&candidate).total < plan_cost(&plan).total {
+            plan = candidate;
+        }
+    }
     finish_plan(db, &cbo_ctx, select, plan)
+}
+
+/// (A LEFT/SEMI/ANTI B) INNER C = (A INNER C) LEFT/SEMI/ANTI B
+/// when C's conditions never reference B. Enumerate the preserved-side inner
+/// island as an additional costed candidate, retaining the original plan too.
+fn try_plan_preserved_join_island(
+    ctx: &crate::engine::cbo::CboContext,
+    select: &Select,
+    tables: &[PlanTable],
+    scans: &[PhysicalPlan],
+    conditions: &[Option<Expr>],
+    residuals: &[Expr],
+) -> Option<PhysicalPlan> {
+    let first = select.joins.first()?;
+    if select.joins.len() < 2
+        || !matches!(
+            first.join_type,
+            JoinType::Left | JoinType::Semi | JoinType::Anti
+        )
+        || select.for_update
+        || select.lock_clause.is_some()
+        || select_has_wildcard_projection(select)
+        || first.lateral
+        || first.natural
+        || !first.using_columns.is_empty()
+        || select.joins.iter().skip(1).any(|join| {
+            !matches!(join.join_type, JoinType::Inner | JoinType::Cross)
+                || join.lateral
+                || join.natural
+                || !join.using_columns.is_empty()
+        })
+    {
+        return None;
+    }
+    let unsafe_expr =
+        |expr: &Expr| sip_expr_has_subquery(expr) || expr_has_volatile_evaluation(expr);
+    if conditions
+        .iter()
+        .flatten()
+        .chain(residuals.iter())
+        .chain(select.group_by.iter())
+        .chain(select.having.iter())
+        .chain(select.order_by.iter().map(|order| &order.expr))
+        .chain(select.projection.iter().filter_map(|item| match item {
+            SelectItem::Expr { expr, .. } => Some(expr),
+            _ => None,
+        }))
+        .any(unsafe_expr)
+    {
+        return None;
+    }
+    let optional = &tables[1];
+    if conditions[0]
+        .as_ref()
+        .is_some_and(|expr| !expr_columns_resolved_across(expr, &tables[..2], &[]))
+    {
+        return None;
+    }
+    if conditions
+        .iter()
+        .skip(1)
+        .flatten()
+        .any(|expr| expr_touches_table_set(expr, std::slice::from_ref(optional)))
+    {
+        return None;
+    }
+    let island_tables = tables
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, table)| table.clone())
+        .collect::<Vec<_>>();
+    let mut remaining = residuals.to_vec();
+    let mut predicates = drain_join_predicates_for_tables(&mut remaining, &island_tables);
+    for condition in conditions.iter().skip(1).flatten() {
+        split_conjuncts(condition, &mut predicates);
+    }
+    // Ambiguous/unresolved columns must not gain a different binding when the
+    // optional relation leaves the inner scope.
+    if predicates.iter().any(|expr| {
+        expr_touches_table_set(expr, std::slice::from_ref(optional))
+            || !expr_columns_resolved_across(expr, &island_tables, &[])
+    }) {
+        return None;
+    }
+    let island_scans = scans
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| *index != 1)
+        .map(|(_, scan)| scan.clone())
+        .collect();
+    let island = plan_inner_join_island(ctx, island_scans, predicates, select);
+    let mut candidate = choose_join_with_hints(
+        ctx,
+        island,
+        scans[1].clone(),
+        first.join_type,
+        conditions[0].clone(),
+        &select.query_hints,
+    );
+    if let Some(predicate) = combine_conjuncts(remaining) {
+        candidate = attach_filter(candidate, predicate);
+    }
+    Some(candidate)
 }
 
 /// Remove unused right payload from one LEFT/IS NULL edge surrounded by

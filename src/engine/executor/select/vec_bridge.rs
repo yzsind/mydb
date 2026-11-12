@@ -65,6 +65,7 @@ pub(super) use aggregation::*;
 mod compute;
 use compute::*;
 mod analyzed_workers;
+mod join_domain;
 mod projection_parallel;
 mod rollup_preaggregate;
 
@@ -137,6 +138,9 @@ macro_rules! batch_wrapper_method {
         }
     };
     (install_runtime_filter) => {
+        fn benefits_from_runtime_key_components(&self, keys: &[Expr]) -> bool {
+            self.upstream.benefits_from_runtime_key_components(keys)
+        }
         fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
             self.upstream.install_runtime_filter(filter)
         }
@@ -2577,6 +2581,10 @@ impl BatchOperator for AnalyzedBatchOperator<'_> {
         self.inner.sample_scan_pages(max_pages)
     }
 
+    fn benefits_from_runtime_key_components(&self, keys: &[Expr]) -> bool {
+        self.inner.benefits_from_runtime_key_components(keys)
+    }
+
     fn install_runtime_filter(&mut self, mut filter: crate::planner::RuntimeFilter) -> bool {
         // ANALYZE is observational only and must never form an execution
         // boundary. In particular, a parent hash join installs its build-side
@@ -2776,7 +2784,9 @@ fn try_native_vec_input_stream_checked<'a>(
                         .flatten(),
                     range_plan_key: matches!(
                         plan,
-                        PhysicalPlan::IndexMerge { .. }
+                        PhysicalPlan::SeqScan { .. }
+                            | PhysicalPlan::ParallelSeqScan { .. }
+                            | PhysicalPlan::IndexMerge { .. }
                             | PhysicalPlan::IndexLookup { .. }
                             | PhysicalPlan::IndexMultiLookup { .. }
                             | PhysicalPlan::IndexRangeScan { .. }
@@ -4443,6 +4453,7 @@ fn try_build_vec_filter_input<'a>(
         let _ = stream.install_runtime_index_bound(bound);
     }
     let properties = stream.properties();
+    stream = join_domain::wrap_disjunction(input, predicate, stream)?;
     if template.is_empty() {
         return Ok(Some(VecBatchInput { stream, template }));
     }
@@ -5209,6 +5220,16 @@ fn try_build_inlj_batch_input<'a>(
 /// (`projected_columns`) is honoured; the filter still reads the full row, so a
 /// predicate column pruned from the output projection is evaluated correctly.
 fn try_build_cte_batch_scan<'a>(
+    plan: &'a PhysicalPlan,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    let Some(mut input) = try_build_cte_batch_scan_unfiltered(plan)? else {
+        return Ok(None);
+    };
+    input.stream = join_domain::filterable_cte(input.stream, &input.template);
+    Ok(Some(input))
+}
+
+fn try_build_cte_batch_scan_unfiltered<'a>(
     plan: &'a PhysicalPlan,
 ) -> Result<Option<VecBatchInput<'a>>, QueryError> {
     let inner = peel_projection(plan);

@@ -2702,6 +2702,38 @@ pub(super) fn estimate_hash_join_operator_cost(
             match_rate,
             bloom_applicable,
         );
+        if bloom_applicable
+            && join_type == JoinType::Inner
+            && residual.is_none()
+            && left_keys.len() == 1
+            && right_keys.len() == 1
+            && !null_safe.iter().any(|safe| *safe)
+        {
+            let probe_key = match build_side {
+                BuildSide::Left => &right_keys[0],
+                BuildSide::Right => &left_keys[0],
+            };
+            if let Some((work, latency)) =
+                runtime_filter_apply_qualification_cpu(probe_plan, probe_key)
+            {
+                // Match the conservative false-positive allowance used by
+                // hash-probe/Grace costing. This changes only avoidable CPU;
+                // the standalone child retains its complete fallback cost.
+                let rejected = (1.0 - match_rate.clamp(0.0, 1.0)) * (1.0 - 0.125);
+                let saved =
+                    (latency * rejected).min((probe_cost.total - probe_cost.startup).max(0.0));
+                cost.total = (cost.total - saved).max(cost.startup);
+                cost.cpu_units = (cost.cpu_units - work * rejected).max(0.0);
+                crate::engine::cbo::trace::event(
+                    "hash_join_runtime_apply_cost",
+                    serde_json::json!({
+                        "rejected_fraction": rejected,
+                        "saved_latency": saved,
+                        "saved_cpu_work": work * rejected,
+                    }),
+                );
+            }
+        }
     }
     (cost, build_side, output_est)
 }

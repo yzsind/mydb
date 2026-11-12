@@ -547,7 +547,7 @@ pub(crate) struct HashJoinBatchOperator<'a> {
     /// as a streaming mode instead of manufacturing an empty hash payload
     /// and one selection vector per probe batch.
     empty_build_probe_passthrough: bool,
-    reverse_semi_anti: bool,
+    reduce_build_from_probe: bool,
     pushed_exact_runtime_rejected:
         Option<Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>>>,
     pushed_runtime_rejected_reported: u64,
@@ -917,6 +917,30 @@ impl HashJoinBatchOperator<'_> {
                     rejected: rejected.clone(),
                 }) {
                     self.pushed_runtime_rejected = rejected;
+                    // A complete tuple still checks correlation. Bounded
+                    // component domains only supply physical index candidates
+                    // to sources that explicitly request them.
+                    let component_bytes = rows.saturating_mul(2 * std::mem::size_of::<i128>());
+                    if self.probe.benefits_from_runtime_key_components(&keys)
+                        && crate::engine::executor::mem_budget::current_budget()
+                            .is_some_and(|budget| component_bytes <= budget.limit() / 64)
+                    {
+                        for (component, &column) in self.build_keys.iter().enumerate() {
+                            if let Some(filter) = vec_hash_join::build_exact_int_runtime_filter(
+                                payload,
+                                &[column],
+                                &[None],
+                            ) {
+                                self.probe
+                                    .install_runtime_filter(RuntimeFilter::ExactIntKey {
+                                        keys: vec![keys[component].clone()],
+                                        null_safe: vec![false],
+                                        filter,
+                                        rejected: Arc::new(std::sync::OnceLock::new()),
+                                    });
+                            }
+                        }
+                    }
                     return;
                 }
             }
@@ -989,18 +1013,23 @@ impl HashJoinBatchOperator<'_> {
         }
     }
 
-    /// SEMI/ANTI joins only need existence, not build payload.  When the
-    /// preserved probe is materially smaller, consume it first into a bounded
-    /// key set and stream the nominal build through that set.  This is the
-    /// batch equivalent of a dynamic runtime filter: existence joins retain
-    /// only matching build keys instead of constructing a payload for every
-    /// qualifying fact row.
-    fn try_initialize_reverse_semi_anti(&mut self) -> Result<bool, QueryError> {
+    /// Consume a smaller preserved domain first within the query quota. Reduce
+    /// only build keys; outer joins and residuals keep their ordinary payload
+    /// and pair kernel, while pure SEMI/ANTI joins need only existence state.
+    /// A quota crossing retains and replays the complete consumed prefix.
+    fn try_initialize_probe_domain(&mut self) -> Result<bool, QueryError> {
         use crate::engine::executor::mem_budget;
         use crate::engine::executor::work_area::{SpillHint, WorkAreaHandle};
         use crate::parser::JoinType;
 
-        if !self.reverse_semi_anti || !matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
+        if !self.reduce_build_from_probe
+            || !matches!(
+                self.join_type,
+                JoinType::Semi | JoinType::Anti | JoinType::Left | JoinType::Right
+            )
+            || (self.join_type == JoinType::Left && self.build_is_left)
+            || (self.join_type == JoinType::Right && !self.build_is_left)
+        {
             return Ok(false);
         }
 
@@ -1093,7 +1122,7 @@ impl HashJoinBatchOperator<'_> {
             return Ok(true);
         }
 
-        if self.residual.is_some() {
+        if self.residual.is_some() || !matches!(self.join_type, JoinType::Semi | JoinType::Anti) {
             // A residual is a property of each pair, not of the equality key.
             // Reduce only the build domain here; the existing kernel remains
             // responsible for three-valued residual evaluation and output.
@@ -1379,7 +1408,7 @@ impl HashJoinBatchOperator<'_> {
         {
             return Ok(());
         }
-        if self.try_initialize_reverse_semi_anti()? {
+        if self.try_initialize_probe_domain()? {
             return Ok(());
         }
         if self.try_initialize_pair_existence()? {
@@ -2198,6 +2227,19 @@ impl BatchOperator for HashJoinBatchOperator<'_> {
 
     fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
         if self.probe.install_runtime_filter(filter.clone()) {
+            // A newly filtered preserved CTE domain may be orders of magnitude
+            // smaller than the nominal build. Buffer it within the existing
+            // quota and reduce only build keys, retaining full LEFT/RIGHT and
+            // residual semantics in the ordinary pair kernel. Crossing the
+            // quota replays every consumed probe batch into the original path.
+            if ((self.join_type == crate::parser::JoinType::Left && !self.build_is_left)
+                || (self.join_type == crate::parser::JoinType::Right && self.build_is_left))
+                && self.build_plan.is_some_and(plan_is_cte_only)
+                && self.state.is_none()
+                && self.grace_output.is_none()
+            {
+                self.reduce_build_from_probe = true;
+            }
             true
         } else {
             self.build.install_runtime_filter(filter)
@@ -2726,7 +2768,7 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         build_memory_charge: None,
         finished: false,
         empty_build_probe_passthrough: false,
-        reverse_semi_anti: crate::planner::semi_anti_probe_reduction_eligible(
+        reduce_build_from_probe: crate::planner::semi_anti_probe_reduction_eligible(
             *join_type,
             crate::planner::estimated_rows(probe_plan),
             crate::planner::estimated_rows(build_plan),
@@ -2910,7 +2952,7 @@ pub(super) fn try_build_vec_nested_loop_join_input<'a>(
         build_memory_charge: None,
         finished: false,
         empty_build_probe_passthrough: false,
-        reverse_semi_anti: false,
+        reduce_build_from_probe: false,
         pushed_exact_runtime_rejected: None,
         pushed_runtime_rejected_reported: 0,
     });

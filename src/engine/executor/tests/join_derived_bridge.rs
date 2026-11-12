@@ -149,7 +149,8 @@ fn explain_tree_lowers_join_derived_to_cte_scan() {
     // side (the in-memory fallback could not express this — it would degrade
     // to a post-filtered cartesian).
     assert!(
-        tree.contains("keys: SUBSTRING(f.zip,1,2)=SUBSTRING(v.zip,1,2)"),
+        tree.contains("keys: SUBSTRING(f.zip,1,2)=SUBSTRING(v.zip,1,2)")
+            || tree.contains("keys: SUBSTRING(v.zip,1,2)=SUBSTRING(f.zip,1,2)"),
         "derived table should join on the substr key, got:\n{tree}"
     );
 }

@@ -1,6 +1,109 @@
 use super::*;
 
 #[test]
+fn independent_inner_join_can_precede_a_preserved_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE island_fact (id INT, d INT, INDEX by_d(d))",
+        "CREATE TABLE island_optional (id INT, v INT, INDEX by_id(id))",
+        "CREATE TABLE island_dim (d INT PRIMARY KEY, flag INT)",
+        "INSERT INTO island_fact SELECT n,MOD(n,100) FROM generate_series(1,10000) g(n)",
+        "INSERT INTO island_optional SELECT n,n FROM generate_series(1,1000) g(n)",
+        "INSERT INTO island_dim SELECT n,IF(n=1,1,0) FROM generate_series(0,99) g(n)",
+        "ANALYZE TABLE island_fact,island_optional,island_dim",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let Statement::Select(select) = crate::parser::parse_statement(
+        "SELECT f.id,o.v FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1"
+    ).unwrap() else { panic!("SELECT") };
+    let plan = plan_select(engine.db_for_tests(), &select)
+        .unwrap()
+        .physical;
+    let mut below_preserved = false;
+    plan.any(|node| {
+        if let PhysicalPlan::HashJoin {
+            left,
+            join_type: JoinType::Left,
+            ..
+        }
+        | PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            join_type: JoinType::Left,
+            ..
+        } = node
+        {
+            below_preserved |= left.any(|node| {
+                collect_physical_plan_tables(node)
+                    .iter()
+                    .any(|table| table.schema.name.ends_with("island_dim"))
+            });
+        }
+        false
+    });
+    assert!(
+        below_preserved,
+        "the selective independent dimension must be available below the preserved join: {plan:?}"
+    );
+    engine
+        .execute("INSERT INTO island_optional VALUES(1,-1),(NULL,22),(101,NULL)")
+        .unwrap();
+    for sql in [
+        "SELECT f.id,o.v,d.flag FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1 ORDER BY f.id,o.v",
+        "SELECT f.id,o.v,d.flag FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1 AND o.v IS NULL ORDER BY f.id,o.v",
+        "SELECT f.*,o.*,d.* FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1 ORDER BY f.id,o.v",
+        "SELECT f.id,o.v,d.flag FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON o.id=d.d WHERE d.flag=1 ORDER BY f.id,o.v",
+    ] {
+        let QueryResponse::ResultSet(actual) = engine.execute(sql).unwrap().materialize().unwrap() else { panic!("rows") };
+        let QueryResponse::ResultSet(expected) = engine.execute(&sql.replacen("SELECT", "SELECT STRAIGHT_JOIN", 1)).unwrap().materialize().unwrap() else { panic!("rows") };
+        assert_eq!(actual.rows, expected.rows, "{sql}");
+        assert_eq!(actual.columns.iter().map(|column| (&column.name, column.column_type)).collect::<Vec<_>>(),
+            expected.columns.iter().map(|column| (&column.name, column.column_type)).collect::<Vec<_>>(), "{sql}");
+    }
+}
+
+#[test]
+fn sideways_dimension_filter_survives_an_unrelated_materialized_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE sip_dim (k INT PRIMARY KEY, flag INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO sip_dim SELECT n, MOD(n,10) FROM generate_series(1,100) g(n)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE sip_fact (k INT, v INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO sip_fact SELECT MOD(n,100)+1,n FROM generate_series(1,1000) g(n)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE sip_dim,sip_fact").unwrap();
+    let spool = crate::engine::api::CteResult::materialized(
+        vec![Column {
+            name: "v".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }],
+        vec![vec![Value::Int(1)]],
+    );
+    crate::engine::executor::cte::with_cte_registry_extended(
+        HashMap::from([("side".into(), Arc::new(spool))]),
+        || {
+            let Statement::Select(mut select) = crate::parser::parse_statement(
+                "SELECT f.v FROM sip_fact f JOIN sip_dim d ON f.k=d.k CROSS JOIN side s WHERE d.flag=1 AND f.v=s.v"
+            ).unwrap() else { panic!("SELECT") };
+            propagate_sideways_dimension_filters(engine.db_for_tests(), &mut select);
+            assert!(
+                select.selection.as_ref().is_some_and(sip_expr_has_subquery),
+                "a materialized sibling must not hide the base dimension filter"
+            );
+        },
+    );
+}
+
+#[test]
 fn inlj_constant_probe_prefix_does_not_reapply_its_equality_selectivity() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -5677,4 +5780,119 @@ fn uncertain_multicolumn_domains_keep_marginal_bounds_and_contradictions() {
     assert_eq!(estimate("a IN (1,2) AND a IN (3,4)"), 0.0);
     assert_eq!(estimate("a IN (1,2,3,4,5) AND a IN (1,2,3,4,5)"), single);
     assert!((estimate("a=1 AND b=1") - 0.1).abs() < 0.001);
+}
+
+#[test]
+fn runtime_hash_filter_cost_credits_only_deferred_apply_cpu() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE qual_probe(k BIGINT,v INT,s VARCHAR(10))")
+        .unwrap();
+    let schema = engine.db_for_tests().table("qual_probe").unwrap();
+    let key = Expr::CompoundIdentifier(vec!["qual_probe".into(), "k".into()]);
+    let predicate = parsed_filter("SELECT 1 WHERE k IN (SELECT k FROM qual_probe)");
+    let work = 100_000.0 * crate::engine::cbo::cbo_consts().cpu_operator_cost();
+    let mut plan = PhysicalPlan::SeqScan {
+        table: PlanTable::new(schema.id, schema, None),
+        filter: Some(predicate),
+        estimated_rows: 100.0,
+        access_rows: 100_000.0,
+        cost: crate::engine::cbo::Cost::scalar(100_000.0),
+        possible_keys: vec![],
+        runtime_filters: vec![],
+        hint_note: None,
+        projected_columns: None,
+    };
+    let (actual, latency) = runtime_filter_apply_qualification_cpu(&plan, &key).unwrap();
+    assert_eq!(actual, work);
+    assert!(latency > 0.0 && latency <= work);
+    assert!(runtime_filter_apply_qualification_cpu(&plan, &Expr::Identifier("s".into())).is_none());
+    assert!(runtime_filter_apply_qualification_cpu(
+        &plan,
+        &Expr::CompoundIdentifier(vec!["other".into(), "k".into()])
+    )
+    .is_none());
+    let parallel = PhysicalPlan::Exchange {
+        input: Box::new(plan.clone()),
+        degree: 4,
+        output_order: ExchangeOrder::Unordered,
+        merge_keys: vec![],
+        estimated_rows: 100.0,
+        cost: plan_cost(&plan),
+    };
+    assert_eq!(
+        runtime_filter_apply_qualification_cpu(&parallel, &key),
+        Some((work, work / 4.0))
+    );
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE k IN (SELECT k FROM qual_probe) AND k IN (SELECT v FROM qual_probe)",
+    ));
+    assert_eq!(
+        runtime_filter_apply_qualification_cpu(&plan, &key)
+            .unwrap()
+            .0,
+        work,
+        "later Apply conjuncts may short-circuit; only the first test is guaranteed"
+    );
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE v>0 AND k IN (SELECT k FROM qual_probe)",
+    ));
+    let qualified = runtime_filter_apply_qualification_cpu(&plan, &key)
+        .unwrap()
+        .0;
+    assert!(
+        qualified > 0.0 && qualified < work,
+        "scan-local predicates reduce Apply's input population"
+    );
+    for predicate in [
+        "k IN (SELECT a.k FROM qual_probe a JOIN qual_probe b ON a.k=b.k)",
+        "k IN (SELECT MAX(k) FROM qual_probe GROUP BY v)",
+        "k IN (SELECT k+v FROM qual_probe)",
+        "k IN (SELECT k FROM (SELECT k FROM qual_probe) a)",
+        "k IN (SELECT k FROM qual_probe WHERE v IN (SELECT v FROM qual_probe))",
+        "s IN (SELECT s FROM qual_probe)",
+    ] {
+        let predicate = parsed_filter(&format!("SELECT 1 WHERE {predicate}"));
+        let expected = 100_000.0 * qual_cost_per_row(&predicate);
+        let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+            unreachable!()
+        };
+        *filter = Some(predicate);
+        assert_eq!(
+            runtime_filter_apply_qualification_cpu(&plan, &key)
+                .unwrap()
+                .0,
+            expected,
+            "computed or compound domains retain the generic estimate"
+        );
+    }
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE FALSE AND k IN (SELECT k FROM qual_probe)",
+    ));
+    assert!(runtime_filter_apply_qualification_cpu(&plan, &key).is_none());
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE v>0 OR k IN (SELECT k FROM qual_probe)",
+    ));
+    assert!(
+        runtime_filter_apply_qualification_cpu(&plan, &key).is_none(),
+        "an earlier OR arm can skip the subquery altogether"
+    );
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter("SELECT 1 WHERE v>0 AND SHA2(s,512)<>''"));
+    assert!(runtime_filter_apply_qualification_cpu(&plan, &key).is_none());
 }

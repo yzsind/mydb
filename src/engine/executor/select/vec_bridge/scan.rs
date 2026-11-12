@@ -1,6 +1,7 @@
 //! scan execution and preparation.
 
 use super::*;
+mod runtime_index;
 
 /// A `BatchOperator` that reads directly from storage into columnar
 /// `Batch`es, bypassing the `PlanRow` intermediate representation.
@@ -2095,6 +2096,28 @@ pub(super) fn try_build_direct_batch_scan<'a>(
     if use_zone_map {
         ZONE_MAP_BATCH_SCAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let fixed_access = matches!(
+        inner,
+        PhysicalPlan::SeqScan {
+            hint_note: Some(_),
+            ..
+        } | PhysicalPlan::ParallelSeqScan {
+            hint_note: Some(_),
+            ..
+        }
+    );
+    let stream = if use_zone_map || fixed_access {
+        stream
+    } else {
+        runtime_index::wrap(
+            db,
+            txn,
+            table,
+            scan_projection_columns(table, proj),
+            runtime_filters,
+            stream,
+        )
+    };
     Ok(Some(VecBatchInput { stream, template }))
 }
 

@@ -163,7 +163,7 @@ pub(super) fn read_value_payload<R: Read>(r: &mut R, tag: u8) -> Result<Value, Q
     read_value_with_first_tag(r, tag)
 }
 
-/// Serialize one typed batch cell in the exact legacy `Value` spill format
+/// Serialize one typed batch cell in the shared `Value` spill format
 /// without materialising an owned `Value`.
 fn write_column_value<W: Write>(
     w: &mut W,
@@ -175,18 +175,9 @@ fn write_column_value<W: Write>(
     }
     match column {
         ColumnVector::Null { .. } => w.write_all(&[VALUE_NULL]),
-        ColumnVector::Bool { values, .. } => {
-            w.write_all(&[VALUE_INT])?;
-            w.write_all(&(values.get(row) as i64).to_le_bytes())
-        }
-        ColumnVector::I64 { data, .. } => {
-            w.write_all(&[VALUE_INT])?;
-            w.write_all(&data[row].to_le_bytes())
-        }
-        ColumnVector::U64 { data, .. } => {
-            w.write_all(&[VALUE_UINT])?;
-            w.write_all(&data[row].to_le_bytes())
-        }
+        ColumnVector::Bool { values, .. } => write_int(w, values.get(row) as i64),
+        ColumnVector::I64 { data, .. } => write_int(w, data[row]),
+        ColumnVector::U64 { data, .. } => write_uint(w, data[row]),
         ColumnVector::F64 { data, .. } => {
             w.write_all(&[VALUE_DOUBLE])?;
             w.write_all(&data[row].to_bits().to_le_bytes())
@@ -858,7 +849,16 @@ impl ValueRowWriter {
     }
 
     pub(crate) fn append(&mut self, row: &[Value]) -> Result<(), QueryError> {
-        if row.len() != self.ncols {
+        self.append_prefixed(&[], row)
+    }
+
+    /// Frame a small metadata prefix and payload without allocating a joined row.
+    pub(crate) fn append_prefixed(
+        &mut self,
+        prefix: &[Value],
+        row: &[Value],
+    ) -> Result<(), QueryError> {
+        if prefix.len().saturating_add(row.len()) != self.ncols {
             return Err(crate::error::catalog::ER_UNKNOWN_ERROR
                 .error("spill row width does not match its schema"));
         }
@@ -870,7 +870,7 @@ impl ValueRowWriter {
         if self.ncols == 0 {
             staged.write_all(&[VALUE_NULL]).map_err(io_err)?;
         }
-        for v in row {
+        for v in prefix.iter().chain(row) {
             write_value(&mut staged, v).map_err(io_err)?;
         }
         staged.finish_row().map_err(io_err)?;
@@ -959,8 +959,19 @@ impl LazyValueRowWriterPool {
         self.opens
     }
 
+    #[cfg(test)]
     pub(crate) fn append(&mut self, partition: usize, row: &[Value]) -> Result<(), QueryError> {
         self.writer_for_partition(partition)?.append(row)
+    }
+
+    pub(crate) fn append_prefixed(
+        &mut self,
+        partition: usize,
+        prefix: &[Value],
+        row: &[Value],
+    ) -> Result<(), QueryError> {
+        self.writer_for_partition(partition)?
+            .append_prefixed(prefix, row)
     }
 
     pub(crate) fn append_batch_row(

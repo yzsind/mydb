@@ -820,10 +820,23 @@ struct SetOpReplayMetrics {
 }
 
 fn setop_partition_for(collations: &[Option<u16>], row: &[Value], depth: u32) -> usize {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    setop_partition_for_cached(collations, row, depth, None)
+}
+
+fn setop_partition_for_cached(
+    collations: &[Option<u16>],
+    row: &[Value],
+    depth: u32,
+    cache: Option<&mut super::super::collation_cache::CollationKeyCache>,
+) -> usize {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    // All runs are temporary and replayed in this process. One randomized
+    // state keeps initial routing and recursive replay consistent without
+    // paying SipHash rounds for every spilled row.
+    static STATE: std::sync::OnceLock<ahash::RandomState> = std::sync::OnceLock::new();
+    let mut hasher = STATE.get_or_init(ahash::RandomState::new).build_hasher();
     depth.hash(&mut hasher);
-    set_row_key(collations, row).hash(&mut hasher);
+    set_row_key_cached(collations, row, cache).hash(&mut hasher);
     (hasher.finish() as usize) & (SETOP_SPILL_FANOUT - 1)
 }
 
@@ -1098,12 +1111,11 @@ fn reduce_setop_spill_partition(
                  ordinal: u64|
                  -> Result<(), QueryError> {
                     let partition = setop_partition_for(collations, &row, depth + 1);
-                    let mut record = Vec::with_capacity(ncols.saturating_add(3));
-                    record.push(Value::UInt(left));
-                    record.push(Value::UInt(right));
-                    record.push(Value::UInt(ordinal));
-                    record.extend(row);
-                    writers.append(partition, &record)
+                    writers.append_prefixed(
+                        partition,
+                        &[Value::UInt(left), Value::UInt(right), Value::UInt(ordinal)],
+                        &row,
+                    )
                 };
             for entry in state.drain().map(|(_, entry)| entry) {
                 append(
@@ -1428,7 +1440,8 @@ where
 
 /// Native set operators publish unordered output. Their consumers do not
 /// require a global first-occurrence merge of already-reduced partitions.
-pub(crate) fn combine_unordered_set_sources_spillable<L, R>(
+#[cfg(test)]
+fn combine_unordered_set_sources_spillable<L, R>(
     collations: &[Option<u16>],
     op: SetOp,
     all: bool,
@@ -1461,22 +1474,67 @@ where
     L: FnMut() -> Result<Option<Vec<Value>>, QueryError>,
     R: FnMut() -> Result<Option<Vec<Value>>, QueryError>,
 {
+    combine_set_sources_spillable_buffered(
+        collations,
+        op,
+        all,
+        ncols,
+        data_dir,
+        preserve_order,
+        |_| next_left(),
+        |_| next_right(),
+    )
+}
+
+/// Native producers reuse the row buffer after a duplicate or spill append.
+pub(crate) fn combine_buffered_unordered_set_sources_spillable<L, R>(
+    collations: &[Option<u16>],
+    op: SetOp,
+    all: bool,
+    ncols: usize,
+    data_dir: &std::path::Path,
+    next_left: L,
+    next_right: R,
+) -> Result<IncrementalSetOutput, QueryError>
+where
+    L: FnMut(Vec<Value>) -> Result<Option<Vec<Value>>, QueryError>,
+    R: FnMut(Vec<Value>) -> Result<Option<Vec<Value>>, QueryError>,
+{
+    combine_set_sources_spillable_buffered(
+        collations, op, all, ncols, data_dir, false, next_left, next_right,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combine_set_sources_spillable_buffered<L, R>(
+    collations: &[Option<u16>],
+    op: SetOp,
+    all: bool,
+    ncols: usize,
+    data_dir: &std::path::Path,
+    preserve_order: bool,
+    mut next_left: L,
+    mut next_right: R,
+) -> Result<IncrementalSetOutput, QueryError>
+where
+    L: FnMut(Vec<Value>) -> Result<Option<Vec<Value>>, QueryError>,
+    R: FnMut(Vec<Value>) -> Result<Option<Vec<Value>>, QueryError>,
+{
     crate::engine::cancel::check_cancelled()?;
     if op == SetOp::Union && all {
         let mut output = Vec::new();
         let mut ordinal = 0u64;
-        while let Some(row) = next_left()? {
+        while let Some(row) = next_left(Vec::new())? {
             output.push((ordinal, 1, row));
             ordinal = ordinal.saturating_add(1);
         }
-        while let Some(row) = next_right()? {
+        while let Some(row) = next_right(Vec::new())? {
             output.push((ordinal, 1, row));
             ordinal = ordinal.saturating_add(1);
         }
         return Ok(IncrementalSetOutput::in_memory(output, None, None));
     }
 
-    use std::hash::{Hash, Hasher};
     struct SpillState {
         dir: crate::engine::executor::select::grace::SpillTmpDir,
         writers: crate::engine::executor::select::grace::LazyValueRowWriterPool,
@@ -1493,9 +1551,7 @@ where
     let mut key_cache = super::super::collation_cache::CollationKeyCache::new();
     let partition_for =
         |row: &[Value], cache: &mut super::super::collation_cache::CollationKeyCache| {
-            let mut hasher = std::collections::hash_map::DefaultHasher::new();
-            set_row_key_cached(collations, row, Some(cache)).hash(&mut hasher);
-            (hasher.finish() as usize) & (partitions - 1)
+            setop_partition_for_cached(collations, row, 0, Some(cache))
         };
     // Set operators hash every projected value of every input row.  SipHash's
     // DOS-resistant rounds are a poor fit for this trusted, statement-local
@@ -1511,34 +1567,37 @@ where
 
     let append_spill = |spill: &mut SpillState,
                         cache: &mut super::super::collation_cache::CollationKeyCache,
-                        row: Vec<Value>,
+                        row: &[Value],
                         left: u64,
                         right: u64,
                         ordinal: u64|
      -> Result<(), QueryError> {
         let partition = partition_for(&row, cache);
-        let mut tagged = Vec::with_capacity(ncols.saturating_add(3));
-        tagged.push(Value::UInt(left));
-        tagged.push(Value::UInt(right));
-        tagged.push(Value::UInt(ordinal));
-        tagged.extend(row);
-        spill.writers.append(partition, &tagged)
+        spill.writers.append_prefixed(
+            partition,
+            &[Value::UInt(left), Value::UInt(right), Value::UInt(ordinal)],
+            row,
+        )
     };
 
-    let mut push = |row: Vec<Value>, left: u64, right: u64, ordinal: u64| {
+    let mut push = |mut row: Vec<Value>, left: u64, right: u64, ordinal: u64| {
         crate::engine::cancel::check_cancelled()?;
         if let Some(spill) = spill.as_mut() {
-            return append_spill(spill, &mut key_cache, row, left, right, ordinal);
+            append_spill(spill, &mut key_cache, &row, left, right, ordinal)?;
+            row.clear();
+            return Ok(row);
         }
         let key = set_row_key_cached(collations, &row, Some(&mut key_cache));
         if let Some(entry) = state.get_mut(&key) {
             entry.left = entry.left.saturating_add(left);
             entry.right = entry.right.saturating_add(right);
             entry.first_ordinal = entry.first_ordinal.min(ordinal);
-            return Ok(());
+            row.clear();
+            return Ok(row);
         }
         if spill.is_none() && left == 0 && matches!(op, SetOp::Intersect | SetOp::Except) {
-            return Ok(());
+            row.clear();
+            return Ok(row);
         }
         // Inline bytes live inside the hash-table entry.  Only a spilled
         // SmallVec owns a separate allocation; charge that allocation by
@@ -1588,7 +1647,7 @@ where
                     first_ordinal: ordinal,
                 },
             );
-            return Ok(());
+            return Ok(Vec::new());
         }
         if query_granted {
             memory_charge.release_bytes(grow_bytes);
@@ -1613,7 +1672,7 @@ where
             append_spill(
                 &mut new_spill,
                 &mut key_cache,
-                entry.row,
+                &entry.row,
                 entry.left,
                 entry.right,
                 entry.first_ordinal,
@@ -1625,21 +1684,43 @@ where
         memory_charge.release_bytes(state_bytes);
         work_handle.release(state_bytes);
         state_bytes = 0;
-        append_spill(&mut new_spill, &mut key_cache, row, left, right, ordinal)?;
+        append_spill(&mut new_spill, &mut key_cache, &row, left, right, ordinal)?;
         spill = Some(new_spill);
-        Ok(())
+        row.clear();
+        Ok(row)
     };
 
+    let mut buffer = Vec::new();
+    let mut buffer_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     let mut left_rows = 0u64;
-    while let Some(row) = next_left()? {
-        push(row, 1, 0, left_rows)?;
+    while let Some(row) = next_left(std::mem::take(&mut buffer))? {
+        buffer = push(row, 1, 0, left_rows)?;
+        let bytes = buffer
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>());
+        if bytes > buffer_charge.charged() {
+            buffer_charge.add_force(bytes - buffer_charge.charged())?;
+        } else {
+            buffer_charge.release_bytes(buffer_charge.charged() - bytes);
+        }
         left_rows = left_rows.saturating_add(1);
     }
+    buffer_charge.release_bytes(buffer_charge.charged());
     let mut right_rows = 0u64;
-    while let Some(row) = next_right()? {
-        push(row, 0, 1, left_rows.saturating_add(right_rows))?;
+    while let Some(row) = next_right(std::mem::take(&mut buffer))? {
+        buffer = push(row, 0, 1, left_rows.saturating_add(right_rows))?;
+        let bytes = buffer
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Value>());
+        if bytes > buffer_charge.charged() {
+            buffer_charge.add_force(bytes - buffer_charge.charged())?;
+        } else {
+            buffer_charge.release_bytes(buffer_charge.charged() - bytes);
+        }
         right_rows = right_rows.saturating_add(1);
     }
+    drop(buffer);
+    drop(buffer_charge);
     drop(push);
     drop(key_cache);
     let Some(spill) = spill else {
@@ -1883,6 +1964,25 @@ fn combine_set_rows_spillable(
 
 #[cfg(test)]
 mod set_count_spill_tests {
+    #[test]
+    fn spill_partition_cache_preserves_collation_and_null_domains() {
+        let collation = crate::charset::collation_id(crate::charset::DEFAULT_COLLATION);
+        let collations = [Some(collation), None];
+        let first = vec![Value::String("Alpha".into()), Value::Null];
+        let second = vec![Value::String("alpha".into()), Value::Null];
+        assert_eq!(
+            set_row_key(&collations, &first),
+            set_row_key(&collations, &second)
+        );
+        let mut cache = crate::engine::executor::collation_cache::CollationKeyCache::new();
+        for depth in 0..=SETOP_SPILL_MAX_REPARTITION_DEPTH {
+            assert_eq!(
+                setop_partition_for(&collations, &first, depth),
+                setop_partition_for_cached(&collations, &second, depth, Some(&mut cache)),
+            );
+        }
+    }
+
     #[test]
     fn exec_audit_legacy_union_numeric_keys() {
         let make = |column_type, value| ResultSet {
@@ -2450,13 +2550,8 @@ mod set_count_spill_tests {
         let root = tempfile::tempdir().expect("temporary data directory");
         // Concentrate distinct keys in one first-level partition: it exceeds
         // the 1 MiB replay floor with a small fixture and must split again.
-        use std::hash::{Hash, Hasher};
         let keys = (0..)
-            .filter(|value| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                set_row_key(&[], &wide_row(*value)).hash(&mut hasher);
-                (hasher.finish() as usize) & (SETOP_SPILL_FANOUT - 1) == 0
-            })
+            .filter(|value| setop_partition_for(&[], &wide_row(*value), 0) == 0)
             .take(4_500)
             .collect::<Vec<_>>();
         let mut left = keys[..3_000].iter().copied().map(wide_row);
@@ -2520,14 +2615,9 @@ mod set_count_spill_tests {
     #[test]
     fn materialized_set_adapter_uses_bounded_recursive_partition_replay() {
         use crate::engine::executor::memory_footprint::AllocatedBytes;
-        use std::hash::{Hash, Hasher};
         let root = tempfile::tempdir().unwrap();
         let keys = (0..)
-            .filter(|value| {
-                let mut hasher = std::collections::hash_map::DefaultHasher::new();
-                set_row_key(&[], &wide_row(*value)).hash(&mut hasher);
-                (hasher.finish() as usize) & (SETOP_SPILL_FANOUT - 1) == 0
-            })
+            .filter(|value| setop_partition_for(&[], &wide_row(*value), 0) == 0)
             .take(4500)
             .collect::<Vec<_>>();
         let left = keys[..3000].iter().copied().map(wide_row).collect();
@@ -3096,5 +3186,72 @@ fn set_operation_order_index(pos: u64, width: usize) -> Result<usize, QueryError
             crate::error::catalog::ER_BAD_FIELD_ERROR,
             format!("Unknown column '{pos}' in 'order clause'"),
         ))
+    }
+}
+
+#[cfg(test)]
+mod buffered_set_tests {
+    use super::*;
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+
+    #[test]
+    fn buffered_set_sources_reuse_spilled_rows_and_preserve_counts() {
+        for limit in [1024, 1 << 20] {
+            for (op, all, expected) in [
+                (SetOp::Union, false, vec!["A", "B", "C", "D", "NULL"]),
+                (SetOp::Intersect, false, vec!["A", "B", "NULL"]),
+                (SetOp::Except, false, vec!["C"]),
+                (SetOp::Intersect, true, vec!["A", "B", "NULL"]),
+                (SetOp::Except, true, vec!["A", "C", "NULL"]),
+            ] {
+                let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let budget = Arc::new(MemBudget::new(limit));
+                let reused = std::cell::Cell::new(0);
+                with_query_budget(budget.clone(), || {
+                    let mut left =
+                        [Some("A"), Some("a"), None, None, Some("B"), Some("C")].into_iter();
+                    let mut right = [Some("a"), None, Some("b"), Some("D"), Some("D")].into_iter();
+                    let fill = |mut buffer: Vec<Value>, value: Option<Option<&str>>| {
+                        let Some(value) = value else {
+                            return Ok(None);
+                        };
+                        if buffer.capacity() > 0 {
+                            reused.set(reused.get() + 1);
+                        }
+                        buffer.clear();
+                        buffer.push(value.map_or(Value::Null, |value| Value::String(value.into())));
+                        buffer.push(Value::Bytes(vec![3; 2048]));
+                        Ok(Some(buffer))
+                    };
+                    let mut output = combine_buffered_unordered_set_sources_spillable(
+                        &[
+                            Some(crate::charset::collation_id("utf8mb4_0900_ai_ci")),
+                            Some(crate::charset::BINARY_COLLATION_ID),
+                        ],
+                        op,
+                        all,
+                        2,
+                        root.path(),
+                        |buffer| fill(buffer, left.next()),
+                        |buffer| fill(buffer, right.next()),
+                    )
+                    .unwrap();
+                    let mut actual = Vec::new();
+                    while let Some(row) = output.next_row().unwrap() {
+                        assert_eq!(row[1], Value::Bytes(vec![3; 2048]));
+                        actual.push(crate::storage::value_to_string(&row[0]));
+                    }
+                    actual.sort();
+                    assert_eq!(actual, expected);
+                    drop(output);
+                    assert_eq!(budget.used(), 0);
+                    assert_eq!(budget.spill_bytes(), 0);
+                });
+                assert!(
+                    reused.get() > 0,
+                    "duplicate/spill buffers must return to the producer"
+                );
+            }
+        }
     }
 }

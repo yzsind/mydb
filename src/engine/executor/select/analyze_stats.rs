@@ -207,6 +207,9 @@ pub(crate) struct NodeStats {
     pub probe_rows: u64,
     pub match_rows: u64,
     pub index_entries_examined: u64,
+    pub runtime_index_probes: u64,
+    pub runtime_index_candidates: u64,
+    pub runtime_index_fallbacks: u64,
     pub index_merge_branches: u64,
     pub index_merge_candidate_rowids: u64,
     pub index_merge_duplicates_removed: u64,
@@ -864,6 +867,25 @@ fn add_range_scan_work_key(
                     .saturating_add(index_entries_examined);
                 entry.heap_rows_fetched = entry.heap_rows_fetched.saturating_add(heap_rows_fetched);
                 entry.heap_page_probes = entry.heap_page_probes.saturating_add(heap_page_probes);
+            }
+        }
+    });
+}
+
+pub(crate) fn add_runtime_index_candidates(probes: u64, candidates: u64, fallback: bool) {
+    let Some(key) = current_range_scan_plan_key() else {
+        return;
+    };
+    STATS_COLLECTOR.with(|cell| {
+        if let Some(collector) = cell.borrow().as_ref().cloned() {
+            if let Ok(mut map) = collector.stats.lock() {
+                let entry = map.entry(key).or_default();
+                entry.runtime_index_probes = entry.runtime_index_probes.saturating_add(probes);
+                entry.runtime_index_candidates =
+                    entry.runtime_index_candidates.saturating_add(candidates);
+                entry.runtime_index_fallbacks = entry
+                    .runtime_index_fallbacks
+                    .saturating_add(u64::from(fallback));
             }
         }
     });
@@ -1790,6 +1812,15 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
                     entry.index_entries_examined = entry
                         .index_entries_examined
                         .saturating_add(stats.index_entries_examined);
+                    entry.runtime_index_probes = entry
+                        .runtime_index_probes
+                        .saturating_add(stats.runtime_index_probes);
+                    entry.runtime_index_candidates = entry
+                        .runtime_index_candidates
+                        .saturating_add(stats.runtime_index_candidates);
+                    entry.runtime_index_fallbacks = entry
+                        .runtime_index_fallbacks
+                        .saturating_add(stats.runtime_index_fallbacks);
                     entry.index_merge_branches =
                         entry.index_merge_branches.max(stats.index_merge_branches);
                     entry.index_merge_candidate_rowids = entry
@@ -2034,6 +2065,9 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                     " index_entries_examined={}",
                     s.index_entries_examined
                 ));
+            }
+            if s.runtime_index_probes > 0 {
+                suffix.push_str(&format!(" runtime_index_probes={} runtime_index_candidates={} runtime_index_fallbacks={}", s.runtime_index_probes, s.runtime_index_candidates, s.runtime_index_fallbacks));
             }
             if s.rowid_access {
                 suffix.push_str(&format!(" rowid_candidates={} rowid_unique_candidates={} rowid_duplicates_removed={} rowid_misses={} rowid_rows_fetched={}",
