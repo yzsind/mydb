@@ -28,6 +28,7 @@ const ADMISSION_RETRY: Duration = Duration::from_millis(1);
 struct WorkerState {
     connections: AtomicUsize,
     polling: AtomicBool,
+    worker_count: usize,
 }
 
 struct Worker {
@@ -149,6 +150,27 @@ pub fn current_worker_has_sibling_connections() -> bool {
     WORKER_LOAD.with(|load| {
         load.get()
             .is_some_and(|load| load.load(Ordering::Acquire) > 1)
+    })
+}
+
+/// Complete transactions on an exclusive reactor while another reactor remains
+/// available for new connections. Once the pool is saturated, new completion
+/// attempts use the independent blocking pool. A later admission cannot acquire
+/// locks on this single-threaded reactor before its current poll returns.
+pub fn can_inline_transaction_control() -> bool {
+    CURRENT_WORKER.with(|worker| {
+        worker.get().map_or_else(
+            || !current_worker_has_sibling_connections(),
+            |worker| {
+                let load = WORKER_LOAD.with(|load| {
+                    load.get()
+                        .expect("connection reactor membership")
+                        .load(Ordering::Acquire)
+                });
+                worker.connections.load(Ordering::Acquire) == 1
+                    && (load == 1 || load < worker.worker_count)
+            },
+        )
     })
 }
 
@@ -539,7 +561,10 @@ impl Dispatcher {
             let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
             workers.push(Worker {
                 sender,
-                state: Arc::new(WorkerState::default()),
+                state: Arc::new(WorkerState {
+                    worker_count: count,
+                    ..WorkerState::default()
+                }),
             });
             receivers.push(receiver);
         }
@@ -709,6 +734,165 @@ pub(crate) fn test_set_worker_connection_count(connections: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transaction_completion_uses_reactor_ownership_and_observes_new_peers() {
+        for workers in [1, 2, 3] {
+            let dispatcher = Dispatcher::new(workers, || {}).unwrap();
+            let (entered, entries) = mpsc::channel();
+            let (completed, completions) = mpsc::channel();
+            let finish = Arc::new(tokio::sync::Barrier::new(2));
+            let mut releases = Vec::new();
+            for index in 0..2 {
+                let entered = entered.clone();
+                let completed = completed.clone();
+                let finish = Arc::clone(&finish);
+                let (release, start) = tokio::sync::oneshot::channel();
+                let (resume, polling) = mpsc::sync_channel(1);
+                releases.push((resume, release));
+                dispatcher
+                    .spawn(Box::new(move || {
+                        Box::pin(async move {
+                            entered.send(can_inline_transaction_control()).unwrap();
+                            // Keep distinct reactors occupied during admission.
+                            // A single reactor must still poll both connections.
+                            if workers > 1 {
+                                polling.recv_timeout(Duration::from_secs(2)).unwrap();
+                            }
+                            start.await.unwrap();
+                            completed
+                                .send((
+                                    current_worker_has_sibling_connections(),
+                                    can_inline_transaction_control(),
+                                ))
+                                .unwrap();
+                            // Retain both reservations until both observations finish.
+                            finish.wait().await;
+                        })
+                    }))
+                    .unwrap();
+                assert_eq!(
+                    entries.recv_timeout(Duration::from_secs(2)).unwrap(),
+                    index == 0 || workers == 3
+                );
+            }
+            for (resume, release) in releases {
+                resume.send(()).unwrap();
+                release.send(()).unwrap();
+            }
+            dispatcher.stop();
+            assert_eq!(
+                completions.try_iter().collect::<Vec<_>>(),
+                vec![(true, workers == 3); 2]
+            );
+        }
+    }
+
+    #[test]
+    fn transaction_completion_keeps_a_reactor_available_for_new_connections() {
+        let dispatcher = Dispatcher::new(3, || {}).unwrap();
+        let (entered, entries) = mpsc::channel();
+        let (completed, completions) = mpsc::channel();
+        let mut starts = Vec::new();
+        let mut finishes = Vec::new();
+        for _ in 0..2 {
+            let entered = entered.clone();
+            let completed = completed.clone();
+            let (start, started) = mpsc::sync_channel(1);
+            let (finish, finished) = mpsc::channel();
+            starts.push(start);
+            finishes.push(finish);
+            dispatcher
+                .spawn(Box::new(move || {
+                    Box::pin(async move {
+                        entered.send(false).unwrap();
+                        // Keep this poll active until both connections enter,
+                        // so admission retries cannot place them on one reactor.
+                        started.recv_timeout(Duration::from_secs(2)).unwrap();
+                        let inline = can_inline_transaction_control();
+                        entered.send(inline).unwrap();
+                        let released = finished.recv_timeout(Duration::from_secs(2)).is_ok();
+                        completed.send(inline && released).unwrap();
+                    })
+                }))
+                .unwrap();
+            assert!(!entries.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        for start in starts {
+            start.send(()).unwrap();
+        }
+        for _ in 0..2 {
+            assert!(entries.recv_timeout(Duration::from_secs(2)).unwrap());
+        }
+        dispatcher
+            .spawn(Box::new(move || {
+                Box::pin(async move {
+                    let inline = can_inline_transaction_control();
+                    for finish in finishes {
+                        finish.send(()).unwrap();
+                    }
+                    completed.send(!inline).unwrap();
+                })
+            }))
+            .unwrap();
+        dispatcher.stop();
+        assert_eq!(completions.try_iter().collect::<Vec<_>>(), vec![true; 3]);
+    }
+
+    #[test]
+    fn transaction_completion_keeps_shared_peers_offloaded_after_other_connections_close() {
+        let dispatcher = Dispatcher::new(3, || {}).unwrap();
+        let (entered, entries) = mpsc::channel();
+        let (observed, observations) = mpsc::channel();
+        let finish = Arc::new(tokio::sync::Barrier::new(2));
+        let mut clients = Vec::new();
+        for _ in 0..4 {
+            let entered = entered.clone();
+            let observed = observed.clone();
+            let finish = Arc::clone(&finish);
+            let (release, action) = tokio::sync::oneshot::channel();
+            dispatcher
+                .spawn(Box::new(move || {
+                    Box::pin(async move {
+                        let owner = CURRENT_WORKER
+                            .with(|worker| Arc::as_ptr(worker.get().unwrap()) as usize);
+                        entered.send(owner).unwrap();
+                        if action.await.unwrap() {
+                            observed.send(can_inline_transaction_control()).unwrap();
+                            finish.wait().await;
+                        }
+                    })
+                }))
+                .unwrap();
+            clients.push((
+                entries.recv_timeout(Duration::from_secs(2)).unwrap(),
+                release,
+            ));
+        }
+        let shared = clients
+            .iter()
+            .map(|(owner, _)| *owner)
+            .find(|owner| clients.iter().filter(|(other, _)| other == owner).count() >= 2)
+            .expect("four connections on three reactors share one owner");
+        let mut peers = Vec::new();
+        for (owner, release) in clients {
+            if owner == shared && peers.len() < 2 {
+                peers.push(release);
+            } else {
+                release.send(false).unwrap();
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while dispatcher.load.load(Ordering::Acquire) != 2 && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(dispatcher.load.load(Ordering::Acquire), 2);
+        for release in peers {
+            release.send(true).unwrap();
+        }
+        dispatcher.stop();
+        assert_eq!(observations.try_iter().collect::<Vec<_>>(), vec![false; 2]);
+    }
 
     #[test]
     fn ready_connection_can_use_an_idle_worker_while_another_worker_blocks() {
