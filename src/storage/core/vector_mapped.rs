@@ -207,22 +207,44 @@ impl VectorIndexFile {
             return Ok(false);
         }
         let words = (len / PAGE_SIZE).div_ceil(64);
-        // A lazy checksum bitmap plus the same bounded exact-query memo used
-        // by the compact path. File-backed clean pages remain OS-reclaimable.
-        let bytes =
-            words.saturating_mul(8).saturating_add(
-                512usize.saturating_mul(
-                    native_geometry(meta.dim as usize)
-                        .map_or(meta.dim as usize * 4, |(datatype, dim)| {
-                            datatype.payload_len(dim)
-                        })
-                        + 128 * 16
-                        + 128,
-                ),
-            );
-        let Some(charge) =
-            ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, bytes)
-        else {
+        // Grow the FLOAT32 query memo under the native path's bounded budget.
+        // A larger optional memo must never prevent the mapping's admission:
+        // retain the compact path's small cache when its reservation is denied.
+        use crate::engine::vector::hnsw_paged::{
+            QueryNavCache, QUERY_CACHE_ENTRIES, QUERY_CACHE_MAX_K,
+        };
+        let geometry = native_geometry(meta.dim as usize);
+        let entry_bytes = geometry.map_or(meta.dim as usize * 4, |(datatype, dim)| {
+            datatype.payload_len(dim)
+        }) + QUERY_CACHE_MAX_K * std::mem::size_of::<(RowId, f64)>()
+            + 128;
+        let (entries, cache_bytes) = geometry
+            .is_none()
+            .then(|| {
+                QueryNavCache::allocation(
+                    meta.dim as usize,
+                    QUERY_CACHE_MAX_K,
+                    crate::engine::executor::mem_budget::memory_target_bytes() / 4,
+                )
+            })
+            .flatten()
+            .filter(|(entries, _)| *entries > QUERY_CACHE_ENTRIES)
+            .unwrap_or((QUERY_CACHE_ENTRIES, (QUERY_CACHE_ENTRIES + 1) * entry_bytes));
+        let reserve = |bytes| {
+            ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::DerivedCache,
+                words.saturating_mul(8).saturating_add(bytes),
+            )
+        };
+        let reservation = reserve(cache_bytes)
+            .map(|charge| (entries, charge))
+            .or_else(|| {
+                (entries > QUERY_CACHE_ENTRIES)
+                    .then(|| reserve((QUERY_CACHE_ENTRIES + 1) * entry_bytes))
+                    .flatten()
+                    .map(|charge| (QUERY_CACHE_ENTRIES, charge))
+            });
+        let Some((cache_entries, charge)) = reservation else {
             return Ok(false);
         };
         // SAFETY: all local writers revoke this view before modifying the
@@ -246,7 +268,7 @@ impl VectorIndexFile {
             source_revision: revision,
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
             records,
-            cache: crate::engine::vector::hnsw_paged::QueryNavCache::new(),
+            cache: QueryNavCache::with_capacity(QUERY_CACHE_MAX_K, cache_entries),
             _charge: charge,
         };
         if self.navigation_writers.load(Ordering::Acquire) != 0
@@ -460,6 +482,29 @@ impl MappedVectorNavigation {
         Ok((row, deleted, query.score_bytes(bytes)))
     }
 
+    #[inline]
+    fn exact_payload(&self, vid: VecId, dimension: usize) -> Result<&[u8], QueryError> {
+        let (page, offset) = self.record(vid)?;
+        let start = offset + 10;
+        Ok(&page[start..start + dimension * 4])
+    }
+
+    fn exact_distances4(
+        &self,
+        vids: &[VecId],
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+    ) -> Result<[f64; 4], QueryError> {
+        // Navigation needs only distances. Row identity and tombstones are
+        // still read when publishing the final exact candidate pool.
+        let rows = [
+            self.exact_payload(vids[0], query.dimension())?,
+            self.exact_payload(vids[1], query.dimension())?,
+            self.exact_payload(vids[2], query.dimension())?,
+            self.exact_payload(vids[3], query.dimension())?,
+        ];
+        Ok(query.score_batch4(rows))
+    }
+
     fn exact_batch4(
         &self,
         vids: &[VecId],
@@ -510,7 +555,7 @@ impl MappedVectorNavigation {
                     * (self.meta.nav_dist_mul as f64));
             }
         }
-        Ok(self.exact(vid, query)?.2)
+        Ok(query.score_bytes(self.exact_payload(vid, query.dimension())?))
     }
 
     fn distances(
@@ -536,9 +581,7 @@ impl MappedVectorNavigation {
         let mut chunks = vids.chunks_exact(4);
         for chunk in &mut chunks {
             if codes.is_empty() {
-                for (_, _, score) in self.exact_batch4(chunk, query)? {
-                    out.push(score);
-                }
+                out.extend(self.exact_distances4(chunk, query)?);
                 continue;
             }
             if !codes.is_empty() {
@@ -556,9 +599,7 @@ impl MappedVectorNavigation {
                     continue;
                 }
                 if rows.iter().all(Option::is_none) {
-                    for (_, _, score) in self.exact_batch4(chunk, query)? {
-                        out.push(score);
-                    }
+                    out.extend(self.exact_distances4(chunk, query)?);
                     continue;
                 }
             }

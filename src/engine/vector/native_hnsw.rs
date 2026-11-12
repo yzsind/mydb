@@ -135,12 +135,7 @@ impl NativeSearchScratch {
 /// Reserve both full entries and one replacement. Capacity follows memory
 /// headroom and vector width, independently of any query corpus or dataset.
 fn native_query_memo_allocation(dimension: usize, limit: usize) -> Option<(usize, usize)> {
-    let budget = (limit / 16).min(64 * 1024 * 1024);
-    let entry = dimension
-        .checked_mul(4)?
-        .checked_add(12 + NATIVE_MEMO_MAX_CANDIDATES * 16 + 128)?;
-    let entries = (budget / entry).saturating_sub(1).min(4096) / 8 * 8;
-    (entries >= 8).then(|| (entries, (entries + 1) * entry))
+    super::hnsw_paged::QueryNavCache::allocation(dimension, NATIVE_MEMO_MAX_CANDIDATES, limit)
 }
 
 #[derive(Debug)]

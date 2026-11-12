@@ -437,6 +437,12 @@ construction graph is admitted; only compressed payloads survive publication. Th
   The small validation bitmap and bounded query memo are charged to the memory
   governor; clean mapped pages remain reclaimable by the OS. This does not pin
   the entire index in RAM or guarantee a warm filesystem cache after restart.
+  Finalized FLOAT32 mappings size their candidate memo by vector width and the
+  working-set target, with at most 4096 entries and a 64 MiB reservation cap.
+  Smaller targets and declined larger reservations retain the original small
+  memo when it can be admitted.
+  Memo hits reuse graph candidates; heap visibility and exact row scoring still
+  run for every statement. Graph mutations revoke the mapping and its memo.
 - INSERT, UPDATE and DELETE revoke the mapping before changing index pages and
   drain in-flight mapped readers. Subsequent queries use the live WAL/buffer-pool
   path and see incremental maintenance immediately; no navigation rebuild is
