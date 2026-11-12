@@ -1645,7 +1645,7 @@ dependencies = [
 
 [[package]]
 name = "mydb"
-version = "1.2.0"
+version = "1.2.1"
 dependencies = [
  "aes",
  "aes-gcm",
@@ -1662,6 +1662,7 @@ dependencies = [
  "half",
  "hashbrown 0.14.5",
  "httpdate",
+ "hyper",
  "hyper-util",
  "imbl",
  "ipnet",
