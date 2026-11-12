@@ -123,6 +123,13 @@ use super::stream::{BatchOperator, BatchProperties};
 pub const NUM_PARTITIONS: usize = 64;
 const PARTITION_MASK: u64 = (NUM_PARTITIONS as u64) - 1;
 
+#[inline]
+fn compact_lookup_slot(hash: u64, mask: usize) -> usize {
+    // Spill replay contains only one radix partition, so the low bits are
+    // constant there. Use independent bits for the local lookup table.
+    (hash >> NUM_PARTITIONS.ilog2()) as usize & mask
+}
+
 // A compact prefix may already have spilled. Keep its radix domain when a
 // later batch requires canonical keys, so equal groups still meet on replay.
 enum CompactPartitionHash {
@@ -4945,7 +4952,7 @@ impl FixedWidthStateArena {
         let new_mask = new_len - 1;
         let mut slots = vec![0u32; new_len];
         for (group, &hash) in self.hashes.iter().enumerate() {
-            let mut slot = hash as usize & new_mask;
+            let mut slot = compact_lookup_slot(hash, new_mask);
             while slots[slot] != 0 {
                 slot = (slot + 1) & new_mask;
             }
@@ -4961,7 +4968,7 @@ impl FixedWidthStateArena {
         let mask = capacity - 1;
         let mut slots = vec![0u32; capacity];
         for (group, &hash) in self.hashes.iter().enumerate() {
-            let mut slot = hash as usize & mask;
+            let mut slot = compact_lookup_slot(hash, mask);
             while slots[slot] != 0 {
                 slot = (slot + 1) & mask;
             }
@@ -5064,7 +5071,7 @@ impl FixedWidthStateArena {
         }
         let hash = Self::hash_key(keys, nullmask);
         let n_keys = self.key_kinds.len();
-        let mut slot = hash as usize & self.mask;
+        let mut slot = compact_lookup_slot(hash, self.mask);
         loop {
             let stored = self.slots[slot];
             if stored == 0 {
@@ -5134,7 +5141,7 @@ impl FixedWidthStateArena {
         }
 
         let hash = Self::hash_i64(key, nullmask);
-        let mut slot = hash as usize & self.mask;
+        let mut slot = compact_lookup_slot(hash, self.mask);
         loop {
             let stored = self.slots[slot];
             if stored == 0 {
@@ -10164,10 +10171,12 @@ fn merge_partial_batch_into(
     let cols = batch.columns();
     for r_idx in 0..n {
         key_buf.clear();
-        let key_values: Vec<Value> = (0..group_cnt).map(|i| cols[i].value_at(r_idx)).collect();
-        for (index, value) in key_values.iter().enumerate() {
-            super::key_encode::encode_with_collation(
-                value,
+        // Spilled epochs commonly repeat a wide group. Probe borrowed lanes
+        // first; only a new group needs owned representative values.
+        for (index, column) in cols[..group_cnt].iter().enumerate() {
+            super::key_encode::encode_from_column_row_with_collation(
+                column,
+                r_idx,
                 schema.fields()[index].source.collation_id,
                 key_buf,
             );
@@ -10176,6 +10185,10 @@ fn merge_partial_batch_into(
             i
         } else {
             let i = buckets.len();
+            let key_values = cols[..group_cnt]
+                .iter()
+                .map(|column| column.value_at(r_idx))
+                .collect();
             buckets.push(GroupBucket::new(
                 key_buf.clone(),
                 key_values,
@@ -15647,6 +15660,47 @@ mod tests {
     }
 
     #[test]
+    fn compact_radix_partition_lookup_uses_independent_hash_bits() {
+        // A spill merger sees one radix partition at a time. Exercise both
+        // composite keys and the single-key index's monotonic fallback/growth.
+        for width in [1, 2] {
+            let mut arena = FixedWidthStateArena::new(
+                vec![CompactKeyKind::I64; width],
+                vec![AggregateKind::CountStar],
+                0,
+            );
+            let keys = (0i64..)
+                .map(|key| vec![key, key.wrapping_mul(17)][..width].to_vec())
+                .filter(|key| FixedWidthStateArena::hash_key(key, 0) & PARTITION_MASK == 0)
+                .take(4096)
+                .collect::<Vec<_>>();
+            for key in keys.iter().rev() {
+                arena.probe_or_insert(key, 0);
+            }
+            assert_eq!(arena.hashes.len(), keys.len());
+            for key in &keys {
+                let group = arena.probe_or_insert(key, 0);
+                assert_eq!(&arena.keys[group * width..(group + 1) * width], key);
+            }
+            let distance = arena
+                .slots
+                .iter()
+                .enumerate()
+                .filter(|(_, group)| **group != 0)
+                .map(|(slot, group)| {
+                    let hash = arena.hashes[*group as usize - 1];
+                    slot.wrapping_sub(compact_lookup_slot(hash, arena.mask)) & arena.mask
+                })
+                .sum::<usize>();
+            assert!(
+                distance < keys.len() * 4,
+                "{width} keys: {distance} probes for {} groups",
+                keys.len()
+            );
+        }
+    }
+
+    #[test]
     fn high_cardinality_counts_choose_compact_state_with_large_grants() {
         let schema = schema_kv();
         let pairs = (0..4096).map(|i| (i - 2048, i % 17)).collect::<Vec<_>>();
@@ -16261,6 +16315,134 @@ mod spill_contract_regressions {
 #[cfg(test)]
 mod spill_comparison_domain_tests {
     use super::*;
+
+    #[test]
+    fn generic_replay_borrowed_keys_preserve_collation_aliases_and_representatives() {
+        let collation = crate::charset::resolve_collation("utf8mb4_0900_ai_ci")
+            .unwrap()
+            .id;
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ColumnType::VarString,
+                ColumnType::LongLong,
+                ColumnType::Blob,
+                ColumnType::Date,
+                ColumnType::LongLong,
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(column, column_type)| BatchField {
+                table: "partial".into(),
+                alias: None,
+                name: format!("c{column}"),
+                column_type,
+                source: crate::types::ColumnSource {
+                    collation_id: (column == 0).then_some(collation),
+                    ..Default::default()
+                },
+            })
+            .collect(),
+        ));
+        let aggs = vec![AggregateSpec {
+            func: AggregateKind::CountStar,
+            input_column: 0,
+            comparison_collation: None,
+        }];
+        let layout = SpillLayout::new(4, &aggs);
+        let mut expected = std::collections::HashMap::<Vec<u8>, (Vec<Value>, u64)>::new();
+        let mut by_key = GroupMap::default();
+        let mut buckets = Vec::new();
+        let mut scratch = Vec::new();
+        for epoch in 0..3 {
+            let labels = vec!["École", "ecole", "Other", "", "ECOLE", ""]
+                .into_iter()
+                .enumerate()
+                .map(|(row, label)| {
+                    if row == 3 {
+                        Value::Null
+                    } else {
+                        Value::String(label.into())
+                    }
+                })
+                .collect::<Vec<_>>();
+            let labels = if epoch == 1 {
+                ColumnVector::Generic { values: labels }
+            } else {
+                ColumnVector::from_values(labels)
+            };
+            let batch = Batch::new(
+                schema.clone(),
+                vec![
+                    labels,
+                    ColumnVector::Generic {
+                        values: vec![
+                            Value::Int(1),
+                            Value::UInt(1),
+                            Value::DecimalCompact(200, 2),
+                            Value::Null,
+                            Value::Decimal128(1000, 3),
+                            Value::Int(1),
+                        ],
+                    },
+                    ColumnVector::from_values(vec![
+                        Value::Bytes(vec![0, 255]),
+                        Value::Bytes(vec![0, 255]),
+                        Value::Bytes(vec![1]),
+                        Value::Bytes(Vec::new()),
+                        Value::Bytes(vec![0, 255]),
+                        Value::Bytes(Vec::new()),
+                    ]),
+                    ColumnVector::Generic {
+                        values: vec![
+                            Value::Date(20000),
+                            Value::DateTime(20000),
+                            Value::Null,
+                            Value::Null,
+                            Value::Int(20000),
+                            Value::Timestamp(20000),
+                        ],
+                    },
+                    ColumnVector::I64 {
+                        data: vec![1, 2, 3, 4, 5, 6],
+                        nulls: None,
+                    },
+                ],
+            );
+            for row in 0..batch.num_rows() {
+                let values = batch.row(row);
+                let mut key = Vec::new();
+                for (column, value) in values[..4].iter().enumerate() {
+                    super::super::key_encode::encode_with_collation(
+                        value,
+                        schema.fields()[column].source.collation_id,
+                        &mut key,
+                    );
+                }
+                let entry = expected
+                    .entry(key)
+                    .or_insert_with(|| (values[..4].to_vec(), 0));
+                entry.1 += (row + 1) as u64;
+            }
+            merge_partial_batch_into(
+                &batch,
+                &schema,
+                &aggs,
+                &layout,
+                &mut by_key,
+                &mut buckets,
+                &mut scratch,
+            )
+            .unwrap();
+        }
+        assert_eq!(expected.len(), 4);
+        assert_eq!(buckets.len(), expected.len());
+        for bucket in buckets {
+            let (representative, count) = expected.remove(&bucket.key).unwrap();
+            assert_eq!(bucket.key_values, representative);
+            assert_eq!(bucket.aggs[0].count, count);
+        }
+        assert!(expected.is_empty());
+    }
 
     #[test]
     fn shared_spill_replay_uses_declared_minmax_collation_without_worker_context() {

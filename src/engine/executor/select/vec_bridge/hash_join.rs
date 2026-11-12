@@ -34,6 +34,7 @@ use crate::types::QueryError;
 mod aggregate;
 mod build_domain;
 mod dense_count;
+mod existence;
 #[cfg(test)]
 mod tests;
 
@@ -535,6 +536,7 @@ pub(crate) struct HashJoinBatchOperator<'a> {
     probe_schema: Arc<BatchSchema>,
     residual: Option<(Arc<expr_batch::BatchExprProgram>, Arc<BatchSchema>)>,
     state: Option<HashJoinState>,
+    pair_existence: Option<existence::PairExistenceState>,
     output: Option<std::vec::IntoIter<Batch>>,
     grace_output: Option<GraceJoinOutput>,
     spill_output_columns: Option<Vec<bool>>,
@@ -782,6 +784,7 @@ impl HashJoinBatchOperator<'_> {
     /// Release resident data before relinquishing its governed reservation.
     fn finish_input(&mut self) {
         self.state = None;
+        self.pair_existence = None;
         self.output = None;
         self.grace_output = None;
         self.work_area = None;
@@ -1372,10 +1375,14 @@ impl HashJoinBatchOperator<'_> {
             || self.output.is_some()
             || self.grace_output.is_some()
             || self.state.is_some()
+            || self.pair_existence.is_some()
         {
             return Ok(());
         }
         if self.try_initialize_reverse_semi_anti()? {
+            return Ok(());
+        }
+        if self.try_initialize_pair_existence()? {
             return Ok(());
         }
         let limits = crate::engine::executor::select::plan::hash_join_limits();
@@ -1509,6 +1516,14 @@ impl HashJoinBatchOperator<'_> {
                 })
                 && self.probe_keys.iter().all(|&column| {
                     vec_hash_join::schema_column_uses_i64_lane(self.probe.schema(), column)
+                })
+                && replay_prefix.iter().all(|batch| {
+                    self.build_keys.iter().all(|&column| {
+                        matches!(
+                            batch.columns()[column],
+                            ColumnVector::I64 { .. } | ColumnVector::Null { .. }
+                        )
+                    })
                 });
             let payload = vec_hash_join::with_vec_build_cap(collector_cap, || {
                 if let Some(layout) = packed_layout {
@@ -2221,6 +2236,9 @@ impl BatchOperator for HashJoinBatchOperator<'_> {
             }
             return Ok(next);
         }
+        if self.pair_existence.is_some() {
+            return self.next_pair_existence_batch();
+        }
         self.report_pushed_runtime_rejections();
         if let Some(output) = self.grace_output.as_mut() {
             let next = output.next_batch()?;
@@ -2702,6 +2720,7 @@ pub(super) fn try_build_vec_hash_join_input<'a>(
         probe_schema,
         residual: residual_program,
         state: None,
+        pair_existence: None,
         output: None,
         work_area: None,
         build_memory_charge: None,
@@ -2885,6 +2904,7 @@ pub(super) fn try_build_vec_nested_loop_join_input<'a>(
         probe_schema,
         residual,
         state: None,
+        pair_existence: None,
         output: None,
         work_area: None,
         build_memory_charge: None,

@@ -2300,3 +2300,45 @@ fn projected_distinct_spills_saved_keys_and_preserves_first_hidden_payload() {
         assert_eq!(budget.spill_bytes(), 0);
     });
 }
+
+#[test]
+fn large_projected_in_set_matches_scalar_null_and_numeric_semantics() {
+    let mut schema = decimal_fact_schema();
+    schema.columns[0].data_type = DataTypeKind::BigInt;
+    for include_null in [false, true] {
+        for negated in [false, true] {
+            let mut list: Vec<Expr> = (-100..100)
+                .map(|n| Expr::BoundValue(Value::Int(n)))
+                .collect();
+            list.push(Expr::BoundValue(Value::UInt(u64::MAX)));
+            list.push(Expr::BoundValue(Value::Double(200.5)));
+            if include_null {
+                list.push(Expr::BoundValue(Value::Null));
+            }
+            let expr = Expr::InList {
+                expr: Box::new(Expr::Identifier("quantity".into())),
+                list,
+                negated,
+            };
+            let compiled = compile_projected_row_predicate(&expr, &schema).unwrap();
+            assert!(matches!(&compiled, CompiledRowPredicate::ConstantSet(_)));
+            for value in [
+                Value::Null,
+                Value::Int(-101),
+                Value::Int(-100),
+                Value::Int(0),
+                Value::Int(99),
+                Value::Int(100),
+                Value::Int(200),
+                Value::UInt(u64::MAX),
+            ] {
+                let values = [value.clone()];
+                assert_eq!(
+                    compiled.eval(&values).unwrap(),
+                    crate::engine::expr::eval_bool(&expr, &schema, &values).unwrap(),
+                    "null={include_null} negated={negated} value={value:?}"
+                );
+            }
+        }
+    }
+}

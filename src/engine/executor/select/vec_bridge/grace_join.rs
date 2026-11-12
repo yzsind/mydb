@@ -523,8 +523,9 @@ impl GraceRangePartitioning {
     }
 }
 
-/// Partition files contain bounded columnar blocks. Only the active writer
-/// buffers are retained; LRU reopening preserves the file quota and checksums.
+/// Partition files contain bounded columnar blocks. Small fixed-width inputs
+/// share a governed coalescing budget; LRU reopening bounds active writers
+/// while preserving the file quota and checksums.
 pub(super) struct VecJoinSpillWriterPool {
     paths: Vec<std::path::PathBuf>,
     charger: crate::engine::executor::spill_quota::SpillCharger,
@@ -537,6 +538,14 @@ pub(super) struct VecJoinSpillWriterPool {
     max_open: usize,
     epoch: u64,
     bytes: u64,
+    pending: Vec<Option<PendingSpillBatch>>,
+    buffer_charge: mem_budget::ScopedCharge,
+    buffer_cap: usize,
+}
+
+struct PendingSpillBatch {
+    batch: Batch,
+    bytes: usize,
 }
 
 impl VecJoinSpillWriterPool {
@@ -547,6 +556,16 @@ impl VecJoinSpillWriterPool {
         charger: crate::engine::executor::spill_quota::SpillCharger,
         max_open: usize,
     ) -> Self {
+        let buffer_cap = mem_budget::current_budget()
+            .map_or(8 * 1024 * 1024, |budget| budget.limit() / 64)
+            .min(8 * 1024 * 1024);
+        let mut buffer_charge = mem_budget::ScopedCharge::new(0);
+        let metadata = partitions.saturating_mul(std::mem::size_of::<Option<PendingSpillBatch>>());
+        let pending = if buffer_charge.add_within(metadata, buffer_cap) {
+            (0..partitions).map(|_| None).collect()
+        } else {
+            Vec::new()
+        };
         Self {
             paths: (0..partitions)
                 .map(|index| dir.join(format!("{prefix}-{index}")))
@@ -556,12 +575,15 @@ impl VecJoinSpillWriterPool {
             max_open: max_open.max(1).min(partitions.max(1)),
             epoch: 0,
             bytes: 0,
+            pending,
+            buffer_charge,
+            buffer_cap,
         }
     }
     fn len(&self) -> usize {
         self.slots.len()
     }
-    fn append(&mut self, partition: usize, batch: &Batch) -> Result<(), QueryError> {
+    fn write(&mut self, partition: usize, batch: &Batch) -> Result<(), QueryError> {
         self.epoch = self.epoch.wrapping_add(1);
         if self.slots[partition].is_none() {
             if self.slots.iter().filter(|slot| slot.is_some()).count() >= self.max_open {
@@ -588,7 +610,151 @@ impl VecJoinSpillWriterPool {
         *epoch = self.epoch;
         crate::engine::executor::vec::spill::write_batch(writer, batch)
     }
+
+    fn flush_pending(&mut self, partition: usize) -> Result<(), QueryError> {
+        if let Some(pending) = self.pending[partition].take() {
+            self.write(partition, &pending.batch)?;
+            let bytes = pending.bytes;
+            drop(pending);
+            self.buffer_charge.release_bytes(bytes);
+        }
+        Ok(())
+    }
+
+    fn reserve_buffer(&mut self, bytes: usize) -> Result<bool, QueryError> {
+        if bytes > self.buffer_cap {
+            return Ok(false);
+        }
+        loop {
+            if self.buffer_charge.add_within(bytes, self.buffer_cap) {
+                return Ok(true);
+            }
+            let Some((largest, _)) = self
+                .pending
+                .iter()
+                .enumerate()
+                .filter_map(|(index, pending)| {
+                    pending.as_ref().map(|pending| (index, pending.bytes))
+                })
+                .max_by_key(|(_, bytes)| *bytes)
+            else {
+                return Ok(false);
+            };
+            self.flush_pending(largest)?;
+        }
+    }
+
+    /// Radix routing commonly emits only a handful of rows per block.
+    /// Coalesce predictable typed lanes before encoding, so replay does not
+    /// allocate and charge every column once per tiny input fragment.
+    fn append(&mut self, partition: usize, batch: Batch) -> Result<(), QueryError> {
+        if self.pending.is_empty() {
+            return self.write(partition, &batch);
+        }
+        let fixed = batch.selection().is_none()
+            && batch.columns().iter().all(|column| {
+                matches!(
+                    column,
+                    ColumnVector::Null { .. }
+                        | ColumnVector::Bool { .. }
+                        | ColumnVector::I64 { .. }
+                        | ColumnVector::U64 { .. }
+                        | ColumnVector::F64 { .. }
+                        | ColumnVector::Date32 { .. }
+                        | ColumnVector::Time64 { .. }
+                        | ColumnVector::DateTime64 { .. }
+                        | ColumnVector::Timestamp64 { .. }
+                        | ColumnVector::Decimal32 { .. }
+                        | ColumnVector::Decimal64 { .. }
+                        | ColumnVector::Decimal128 { .. }
+                )
+            });
+        let target_rows = DEFAULT_BATCH_ROWS.min(1024);
+        if !fixed || batch.num_rows() >= target_rows {
+            self.flush_pending(partition)?;
+            return self.write(partition, &batch);
+        }
+        let compatible = self.pending[partition].as_ref().is_none_or(|pending| {
+            Arc::ptr_eq(pending.batch.schema(), batch.schema())
+                && pending.batch.columns().len() == batch.columns().len()
+                && pending
+                    .batch
+                    .columns()
+                    .iter()
+                    .zip(batch.columns())
+                    .all(|(left, right)| {
+                        std::mem::discriminant(left) == std::mem::discriminant(right)
+                            && left.decimal_scale() == right.decimal_scale()
+                    })
+        });
+        if !compatible {
+            self.flush_pending(partition)?;
+        }
+        let metadata = batch
+            .columns()
+            .len()
+            .saturating_mul(std::mem::size_of::<ColumnVector>())
+            .saturating_add(128);
+        let bytes = batch.memory_bytes().saturating_add(metadata);
+        if let Some(pending) = self.pending[partition].take() {
+            // The old arrays and their replacements may coexist during Vec
+            // growth. The incoming block is still covered by the caller's
+            // gather reservation; reserve the old/new overlap before copying.
+            let rows = pending.batch.num_rows().saturating_add(batch.num_rows());
+            let extra = rows
+                .saturating_mul(batch.columns().len())
+                // Reserve geometric growth at the widest admitted lane,
+                // including new validity masks and column metadata.
+                .saturating_mul(2 * std::mem::size_of::<i128>() + 2)
+                .saturating_add(metadata.saturating_mul(2))
+                .saturating_add(
+                    batch
+                        .num_rows()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+            if self.reserve_buffer(extra)? {
+                let schema = pending.batch.schema().clone();
+                let old = pending.bytes;
+                let (mut columns, owner) = pending.batch.into_columns()?.into_parts();
+                let indices = (0..batch.num_rows()).collect::<Vec<_>>();
+                for (target, input) in columns.iter_mut().zip(batch.columns()) {
+                    target.append_rows_from(input, &indices);
+                }
+                drop(owner);
+                let merged = Batch::with_row_count(schema, columns, rows);
+                let retained = merged.memory_bytes().saturating_add(metadata);
+                debug_assert!(retained <= old.saturating_add(extra));
+                self.buffer_charge
+                    .release_bytes(old.saturating_add(extra).saturating_sub(retained));
+                self.pending[partition] = Some(PendingSpillBatch {
+                    batch: merged,
+                    bytes: retained,
+                });
+                if rows >= target_rows {
+                    self.flush_pending(partition)?;
+                }
+                return Ok(());
+            }
+            // No optional workspace remains. Persist the retained prefix and
+            // the new block directly without retrying or dropping either.
+            self.write(partition, &pending.batch)?;
+            let bytes = pending.bytes;
+            drop(pending);
+            self.buffer_charge.release_bytes(bytes);
+            return self.write(partition, &batch);
+        }
+        if self.reserve_buffer(bytes)? {
+            self.pending[partition] = Some(PendingSpillBatch { batch, bytes });
+            Ok(())
+        } else {
+            self.write(partition, &batch)
+        }
+    }
+
     fn finish(mut self) -> Result<u64, QueryError> {
+        for partition in 0..self.pending.len() {
+            self.flush_pending(partition)?;
+        }
         for slot in &mut self.slots {
             if let Some((writer, _)) = slot.take() {
                 self.bytes = self.bytes.saturating_add(writer.finish()?);
@@ -706,7 +872,7 @@ pub(super) fn spill_vec_join_batch(
                 .collect(),
             indices.len(),
         );
-        writers.append(partition, &compact)?;
+        writers.append(partition, compact)?;
     }
     Ok(filtered)
 }
@@ -2135,6 +2301,200 @@ pub(crate) static VEC_HASH_JOIN_GRACE_PARALLEL_WORKERS: std::sync::atomic::Atomi
 #[cfg(test)]
 mod columnar_partition_tests {
     use super::*;
+
+    #[test]
+    fn tiny_fixed_partition_blocks_coalesce_before_encoding_and_release_memory() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let budget = Arc::new(mem_budget::MemBudget::new(8 * 1024 * 1024));
+        mem_budget::with_query_budget(budget.clone(), || {
+            let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                root.path(),
+                "coalesced-partitions",
+            )
+            .unwrap();
+            let schema = Arc::new(BatchSchema::new(
+                [
+                    ColumnType::LongLong,
+                    ColumnType::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                    ColumnType::Date,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, column_type)| BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: format!("c{index}"),
+                    column_type,
+                    source: Default::default(),
+                })
+                .collect(),
+            ));
+            let batch = Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(
+                        (0..16)
+                            .map(|i| {
+                                if i == 3 {
+                                    Value::Null
+                                } else {
+                                    Value::Int(i - 8)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values(
+                        (0..16)
+                            .map(|i| {
+                                if i == 7 {
+                                    Value::Null
+                                } else {
+                                    Value::DecimalCompact(i * 19, 2)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values((0..16).map(|i| Value::Date(19000 + i)).collect()),
+                ],
+            )
+            .with_selection(Selection::Indices(vec![
+                15, 0, 3, 1, 7, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13,
+            ]));
+            let mut expected = Vec::new();
+            let mut writers = VecJoinSpillWriterPool::new(dir.path(), "build", 1, dir.charger(), 1);
+            for _ in 0..65 {
+                spill_vec_join_batch(
+                    &batch,
+                    &[0],
+                    &[false],
+                    &[None],
+                    &mut writers,
+                    &mut 0,
+                    0,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert!(writers.buffer_charge.charged() <= writers.buffer_cap);
+                expected.extend(
+                    batch
+                        .visible_indices()
+                        .map(|row| format!("{:?}", batch.row(row))),
+                );
+            }
+            writers.finish().unwrap();
+            let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                &dir.path().join("build-0"),
+                dir.charger(),
+                4096,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            let mut blocks = 0;
+            while let Some(batch) =
+                crate::engine::executor::vec::spill::read_owned_batch(&mut reader, schema.clone())
+                    .unwrap()
+            {
+                blocks += 1;
+                actual.extend(
+                    batch
+                        .visible_indices()
+                        .map(|row| format!("{:?}", batch.row(row))),
+                );
+            }
+            assert_eq!(
+                blocks, 2,
+                "65 tiny blocks must be encoded as two bounded blocks"
+            );
+            assert_eq!(actual, expected);
+        });
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.spill_bytes(), 0);
+    }
+
+    #[test]
+    fn partition_coalescing_flushes_type_and_scale_changes_with_small_budgets() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        for memory in [32 * 1024, 8 * 1024 * 1024] {
+            let budget = Arc::new(mem_budget::MemBudget::new(memory));
+            mem_budget::with_query_budget(budget.clone(), || {
+                let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                    root.path(),
+                    "coalesced-drift",
+                )
+                .unwrap();
+                let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "v".into(),
+                    column_type: ColumnType::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                    source: Default::default(),
+                }]));
+                let columns = [
+                    ColumnVector::Decimal64 {
+                        data: vec![1, -7],
+                        scale: 1,
+                        nulls: None,
+                    },
+                    ColumnVector::Decimal64 {
+                        data: vec![20, -9],
+                        scale: 2,
+                        nulls: None,
+                    },
+                    ColumnVector::Generic {
+                        values: vec![Value::Null, Value::Int(7)],
+                    },
+                    ColumnVector::Decimal64 {
+                        data: vec![30, 99],
+                        scale: 2,
+                        nulls: None,
+                    },
+                ];
+                let mut expected = Vec::new();
+                let mut writers =
+                    VecJoinSpillWriterPool::new(dir.path(), "build", 1, dir.charger(), 1);
+                for column in columns {
+                    let batch = Batch::new(schema.clone(), vec![column]);
+                    expected.extend(
+                        batch
+                            .visible_indices()
+                            .map(|row| format!("{:?}", batch.row(row))),
+                    );
+                    writers.append(0, batch).unwrap();
+                }
+                writers.finish().unwrap();
+                let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                    &dir.path().join("build-0"),
+                    dir.charger(),
+                    256,
+                )
+                .unwrap();
+                let mut actual = Vec::new();
+                while let Some(batch) = crate::engine::executor::vec::spill::read_owned_batch(
+                    &mut reader,
+                    schema.clone(),
+                )
+                .unwrap()
+                {
+                    actual.extend(
+                        batch
+                            .visible_indices()
+                            .map(|row| format!("{:?}", batch.row(row))),
+                    );
+                }
+                assert_eq!(actual, expected);
+            });
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        }
+    }
 
     #[test]
     fn partition_blocks_preserve_selected_values_reopen_and_release_budget() {

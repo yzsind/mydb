@@ -5089,13 +5089,14 @@ fn try_build_native_inlj_row_stream<'a>(
     else {
         unreachable!("INLJ shape checked above")
     };
-    let lookup_plan = super::plan::compile_index_lookup_plan(
+    let mut lookup_plan = super::plan::compile_index_lookup_plan(
         condition
             .as_ref()
             .expect("chunk-stream-applicable INLJ has a condition"),
         right_table,
         right_index,
     )?;
+    super::plan::prepare_index_lookup_residual(db, txn, left, right_table, &mut lookup_plan)?;
     let left_stream = if let Some(stream) = try_build_native_inlj_row_stream(db, txn, left)? {
         stream
     } else {

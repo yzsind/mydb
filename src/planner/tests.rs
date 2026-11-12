@@ -1,6 +1,182 @@
 use super::*;
 
 #[test]
+fn inlj_constant_probe_prefix_does_not_reapply_its_equality_selectivity() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE probe_outer (id INT PRIMARY KEY)")
+        .unwrap();
+    engine.execute("CREATE TABLE probe_inner (bucket INT, id INT, v INT, PRIMARY KEY(bucket,id), INDEX by_bucket(bucket))").unwrap();
+    engine
+        .execute("INSERT INTO probe_inner VALUES (7,1,1),(8,2,2)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE probe_inner").unwrap();
+    let db = engine.db_for_tests();
+    let mut schema = db.table("probe_inner").unwrap();
+    let stats = &mut Arc::make_mut(&mut schema).stats;
+    stats.row_count = 10_000;
+    stats.heap_page_count = 100;
+    stats.multi_column_stats.clear();
+    stats.conditional_key_domains.clear();
+    let column = stats.columns.get_mut("bucket").unwrap();
+    column.distinct_count = 100;
+    column.null_count = 0;
+    column.min = Some(Value::Int(1));
+    column.max = Some(Value::Int(100));
+    column.top_values.clear();
+    column.histogram.clear();
+    column.frequency = Default::default();
+    stats
+        .indexes
+        .get_mut("primary")
+        .unwrap()
+        .prefix_distinct_counts = vec![100, 10_000];
+    stats
+        .indexes
+        .get_mut("by_bucket")
+        .unwrap()
+        .prefix_distinct_counts = vec![100];
+    let scan = |schema: Arc<TableSchema>, rows, filter| PhysicalPlan::SeqScan {
+        table: PlanTable::new(schema.id, schema, None),
+        filter,
+        estimated_rows: rows,
+        access_rows: rows,
+        cost: crate::engine::cbo::Cost::scalar(100.0),
+        possible_keys: vec![],
+        runtime_filters: vec![],
+        hint_note: None,
+        projected_columns: None,
+    };
+    let outer = scan(db.table("probe_outer").unwrap(), 100.0, None);
+    for equality in ["probe_inner.bucket=7", "7=probe_inner.bucket"] {
+        let inner = scan(
+            schema.clone(),
+            100.0,
+            Some(parsed_filter(&format!("SELECT 1 WHERE {equality}"))),
+        );
+        let condition = parsed_filter("SELECT 1 WHERE probe_inner.v<probe_outer.id");
+        let (table, index, prefix, _, _) =
+            dependent_range_join_index(&outer, &inner, Some(&condition), &[]).unwrap();
+        let base = estimate_index_nlj_rows(
+            &outer,
+            &table,
+            &index,
+            prefix,
+            100.0,
+            JoinType::Inner,
+            Some(&condition),
+        );
+        assert_eq!(base, 10_000.0);
+        let kept = apply_inlj_right_only_residual_selectivity(
+            base,
+            Some(&condition),
+            &outer,
+            &inner,
+            &table,
+            &index,
+            prefix,
+            JoinType::Inner,
+            100.0,
+        );
+        assert_eq!(kept,base,"an exact constant probe already implements {equality}; do not charge its selectivity twice");
+    }
+    let condition = parsed_filter("SELECT 1 WHERE probe_inner.id=probe_outer.id");
+    let inner = scan(
+        schema.clone(),
+        100.0,
+        Some(parsed_filter("SELECT 1 WHERE probe_inner.bucket=7")),
+    );
+    let (table, index, prefix, _, _) =
+        dependent_range_join_index(&outer, &inner, Some(&condition), &[]).unwrap();
+    assert_eq!(prefix, 2);
+    let base = estimate_index_nlj_rows(
+        &outer,
+        &table,
+        &index,
+        prefix,
+        100.0,
+        JoinType::Inner,
+        Some(&condition),
+    );
+    assert_eq!(
+        apply_inlj_right_only_residual_selectivity(
+            base,
+            Some(&condition),
+            &outer,
+            &inner,
+            &table,
+            &index,
+            prefix,
+            JoinType::Inner,
+            100.0
+        ),
+        base
+    );
+
+    // A competing outer binding does not guarantee the constant predicate.
+    let condition = parsed_filter("SELECT 1 WHERE probe_inner.bucket=probe_outer.id");
+    let (table, index, prefix, _, _) =
+        dependent_range_join_index(&outer, &inner, Some(&condition), &[]).unwrap();
+    let base = estimate_index_nlj_rows(
+        &outer,
+        &table,
+        &index,
+        prefix,
+        100.0,
+        JoinType::Inner,
+        Some(&condition),
+    );
+    assert!(
+        apply_inlj_right_only_residual_selectivity(
+            base,
+            Some(&condition),
+            &outer,
+            &inner,
+            &table,
+            &index,
+            prefix,
+            JoinType::Inner,
+            100.0
+        ) < base
+    );
+
+    // Other residual attributes still reduce matches after the prefix seek.
+    let condition = parsed_filter("SELECT 1 WHERE probe_inner.v<probe_outer.id");
+    let inner = scan(
+        schema,
+        100.0,
+        Some(parsed_filter(
+            "SELECT 1 WHERE probe_inner.bucket=7 AND probe_inner.v=1",
+        )),
+    );
+    let (table, index, prefix, _, _) =
+        dependent_range_join_index(&outer, &inner, Some(&condition), &[]).unwrap();
+    let base = estimate_index_nlj_rows(
+        &outer,
+        &table,
+        &index,
+        prefix,
+        100.0,
+        JoinType::Inner,
+        Some(&condition),
+    );
+    assert!(
+        apply_inlj_right_only_residual_selectivity(
+            base,
+            Some(&condition),
+            &outer,
+            &inner,
+            &table,
+            &index,
+            prefix,
+            JoinType::Inner,
+            100.0
+        ) < base
+    );
+}
+
+#[test]
 fn probe_locality_follows_only_preserved_physical_streams() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -2804,6 +2980,12 @@ fn sip_keyset_prefilter_makes_matching_unique_join_lossless() {
         &nation,
         &region,
         region_table,
+        region_table
+            .schema
+            .iter_queryable_indexes()
+            .find(|index| index.primary)
+            .unwrap(),
+        1,
         JoinType::Inner,
         estimated_rows(&nation),
     );
@@ -4859,6 +5041,81 @@ fn equijoin_uses_one_sided_ndv_for_expression_keys() {
         rows,
         10_000.0 * crate::engine::cbo::cbo_consts().default_join_selectivity()
     );
+}
+
+#[test]
+fn equijoin_unique_tuple_ndv_survives_additional_dependent_attributes() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    for table in ["unique_tuple_left", "unique_tuple_right"] {
+        engine
+            .execute(&format!(
+                "CREATE TABLE {table} (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b))"
+            ))
+            .unwrap();
+        let rows = (0..1000)
+            .map(|i| format!("({i},{},{})", i + 17, i + 31))
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO {table} VALUES {rows}"))
+            .unwrap();
+        engine.execute(&format!("ANALYZE TABLE {table}")).unwrap();
+    }
+    let scan = |sql| {
+        let Statement::Select(select) = parse_statement(sql).unwrap() else {
+            unreachable!()
+        };
+        build_physical_plan(engine.db_for_tests(), &select).unwrap()
+    };
+    let left = scan("SELECT * FROM unique_tuple_left l");
+    let right = scan("SELECT * FROM unique_tuple_right r");
+    let key =
+        |alias: &str, column: &str| Expr::CompoundIdentifier(vec![alias.into(), column.into()]);
+    let pair_left = [key("l", "a"), key("l", "b")];
+    let pair_right = [key("r", "a"), key("r", "b")];
+    let pair = estimate_equijoin_rows(&left, &right, &pair_left, &pair_right, 1000.0, 1000.0);
+    assert!((pair - 1000.0).abs() < 1.0);
+    for order in [["a", "b", "c"], ["c", "b", "a"]] {
+        let lk = order.map(|column| key("l", column));
+        let rk = order.map(|column| key("r", column));
+        let extended = estimate_equijoin_rows(&left, &right, &lk, &rk, 1000.0, 1000.0);
+        assert!((extended - pair).abs() < 1.0,
+            "adding attributes determined by a complete unique key must not invent a larger tuple domain: {extended} vs {pair}");
+    }
+    let mixed = scan("SELECT * FROM unique_tuple_left l CROSS JOIN unique_tuple_right r");
+    assert!(
+        composite_ndv_in_plan(&mixed, &[key("l", "a"), key("l", "b"), key("r", "c")]).is_none(),
+        "an attribute from a multiplying relation is not determined by the first relation's key"
+    );
+}
+
+#[test]
+fn unique_tuple_ndv_does_not_infer_dependency_from_nullable_or_prefix_keys() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE nullable_tuple_ndv (a INT, b INT, c INT, UNIQUE KEY ab(a,b))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO nullable_tuple_ndv VALUES (1,1,1),(NULL,2,3),(NULL,2,4)")
+        .unwrap();
+    engine.execute("CREATE TABLE prefix_tuple_ndv (a VARCHAR(8) NOT NULL, b INT NOT NULL, c INT, UNIQUE KEY ab(a(3),b))").unwrap();
+    engine
+        .execute("INSERT INTO prefix_tuple_ndv VALUES ('aaa1',1,1),('aaa2',2,2),('aab3',3,3)")
+        .unwrap();
+    for table in ["nullable_tuple_ndv", "prefix_tuple_ndv"] {
+        engine.execute(&format!("ANALYZE TABLE {table}")).unwrap();
+        let Statement::Select(select) =
+            parse_statement(&format!("SELECT * FROM {table} t")).unwrap()
+        else {
+            unreachable!()
+        };
+        let plan = build_physical_plan(engine.db_for_tests(), &select).unwrap();
+        let keys =
+            ["a", "b", "c"].map(|column| Expr::CompoundIdentifier(vec!["t".into(), column.into()]));
+        assert!(composite_ndv_in_plan(&plan, &keys).is_none(), "{table}");
+    }
 }
 
 #[test]

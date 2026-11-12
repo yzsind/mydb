@@ -17746,6 +17746,8 @@ pub(crate) fn choose_join_with_hints(
                 &left,
                 &right,
                 rt,
+                ri,
+                *eql,
                 join_type,
                 left_rows,
             );
@@ -18953,8 +18955,8 @@ fn key_numeric_min_max_in_plan(plan: &PhysicalPlan, col: &str) -> Option<(f64, f
 
 /// Return the joint NDV (`prefix_distinct_counts[len-1]`) of any
 /// composite index on a base scan inside `plan` whose leading columns
-/// match `keys` in order. Falls back to `None` when no such index
-/// exists.
+/// match `keys` in order. A complete non-null unique key also determines
+/// additional attributes from that same relation, in any key order.
 fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
     if keys.iter().any(|key| expr_column_name(key).is_none()) {
         return None;
@@ -18964,6 +18966,33 @@ fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
         for index in table.schema.iter_queryable_indexes().filter(|i| {
             !i.is_fulltext() && !i.is_spatial() && !i.is_vector() && !i.has_multi_valued_parts()
         }) {
+            // Adding a dependent attribute cannot expand a unique tuple's
+            // domain. Independent column selectivities would multiply that
+            // attribute again and can collapse a large join to almost zero.
+            // Every key must resolve to this relation: a different relation
+            // may multiply its rows and introduce new attribute values.
+            if table.schema.stats.row_count > 0
+                && index.unique
+                && !index.columns.is_empty()
+                && !index.has_prefix_columns()
+                && index.columns.iter().all(|column| {
+                    table.schema.column_index(column).ok().is_some_and(|slot| {
+                        !table.schema.columns[slot].nullable
+                            && keys.iter().any(|key| {
+                                plan_key_equivalent_to_table_column(
+                                    plan, &tables, key, table, column,
+                                )
+                            })
+                    })
+                })
+                && keys.iter().all(|key| {
+                    table.schema.columns.iter().any(|column| {
+                        plan_key_equivalent_to_table_column(plan, &tables, key, table, &column.name)
+                    })
+                })
+            {
+                return Some(table.schema.stats.row_count);
+            }
             if index.columns.len() < keys.len()
                 || !keys.iter().zip(index.columns.iter()).all(|(key, column)| {
                     plan_key_equivalent_to_table_column(plan, &tables, key, table, column)
@@ -19401,6 +19430,8 @@ fn apply_inlj_right_only_residual_selectivity(
     left_plan: &PhysicalPlan,
     right_plan: &PhysicalPlan,
     right_table: &PlanTable,
+    right_index: &IndexSchema,
+    eq_prefix_len: usize,
     join_type: JoinType,
     left_rows: f64,
 ) -> f64 {
@@ -19419,6 +19450,69 @@ fn apply_inlj_right_only_residual_selectivity(
     {
         return base_est;
     }
+    // A constant equality consumed by the probe prefix has already reduced
+    // rows_per_lookup. It remains an execution-time correctness recheck, but
+    // applying its base-table selectivity again squares that restriction.
+    // Only discard this costing factor when every possible binding of that
+    // part is the same losslessly represented constant. An outer-dependent
+    // binding or a lossy cast still needs ordinary residual selectivity.
+    let scan_filter = extract_scan_filter(right_plan);
+    let mut probe_conjuncts = condition.map(expr_conjuncts).unwrap_or_default();
+    if let Some(filter) = &scan_filter {
+        probe_conjuncts.extend(expr_conjuncts(filter));
+    }
+    let lossless_constant = |expr: &Expr, pos: usize| -> Option<Value> {
+        let crate::storage::IndexKeyPart::Column(column) = right_index.key_part(pos)? else {
+            return None;
+        };
+        let slot = right_table.schema.column_index(column).ok()?;
+        let original = expr_literal_value(expr)?;
+        if matches!(original, Value::Null) {
+            return None;
+        }
+        let constraint = expr_to_plan_constraint(expr)?;
+        let target = index_bounds::target_for_index_column(&right_table.schema, right_index, pos);
+        let part = constraint_key_part_for_index(&constraint, target, right_index, pos)?;
+        let stored = concrete_key_part_value(&part, &right_table.schema.columns[slot].data_type)?;
+        (stored == original).then_some(stored)
+    };
+    let residuals = expr_conjuncts(&combined)
+        .into_iter()
+        .filter(|conjunct| {
+            !(0..eq_prefix_len).any(|pos| {
+                let Some(bound) = equality_between_index_part_and_left_plan(
+                    conjunct,
+                    right_table,
+                    right_index,
+                    pos,
+                    left_plan,
+                ) else {
+                    return false;
+                };
+                let Some(constant) = lossless_constant(&bound, pos) else {
+                    return false;
+                };
+                probe_conjuncts
+                    .iter()
+                    .filter_map(|candidate| {
+                        equality_between_index_part_and_left_plan(
+                            candidate,
+                            right_table,
+                            right_index,
+                            pos,
+                            left_plan,
+                        )
+                    })
+                    .all(|binding| {
+                        lossless_constant(&binding, pos).is_some_and(|value| value == constant)
+                    })
+            })
+        })
+        .cloned()
+        .collect();
+    let Some(combined) = combine_conjuncts(residuals) else {
+        return base_est;
+    };
     let total = (right_table.schema.stats.row_count.max(1) as f64).max(1.0);
     use crate::engine::cbo::selectivity::Selectivity;
     let kept = crate::engine::cbo::selectivity::default_selectivity().predicate_rows(

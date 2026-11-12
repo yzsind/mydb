@@ -299,7 +299,7 @@ impl SetOpBatchOperator<'_> {
             position: 0,
         });
         self.blocking_output = Some(
-            crate::engine::executor::dispatch::combine_set_sources_spillable(
+            crate::engine::executor::dispatch::combine_unordered_set_sources_spillable(
                 &self
                     .schema
                     .fields()

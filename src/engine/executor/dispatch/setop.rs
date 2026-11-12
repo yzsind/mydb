@@ -1287,6 +1287,7 @@ fn compact_set_count_state(
 struct SpilledSetOutput {
     dir: crate::engine::executor::select::grace::SpillTmpDir,
     output_path: Option<std::path::PathBuf>,
+    remaining_paths: std::vec::IntoIter<std::path::PathBuf>,
     reader: Option<crate::engine::executor::select::grace::ValueRowReader>,
     output_spill_bytes: u64,
     output_read_recorded: bool,
@@ -1299,8 +1300,8 @@ enum IncrementalSetOutputInner {
 
 /// Pull-based result of a blocking set operation. Multiplicity stays compact
 /// until `next_row`, so `INTERSECT ALL`/`EXCEPT ALL` never allocate N clones of
-/// the same row. A spilled hash-count state produces range-partitioned output
-/// and re-opens only one ordered range at a time.
+/// the same row. A spilled hash-count state opens one reduced run at a time;
+/// consumers requiring first-occurrence order merge those runs beforehand.
 pub(crate) struct IncrementalSetOutput {
     inner: IncrementalSetOutputInner,
     repeated: Option<(Vec<Value>, u64)>,
@@ -1329,15 +1330,21 @@ impl IncrementalSetOutput {
     fn next_compact(&mut self) -> Result<Option<(u64, u64, Vec<Value>)>, QueryError> {
         match &mut self.inner {
             IncrementalSetOutputInner::InMemory(entries) => Ok(entries.next()),
-            IncrementalSetOutputInner::Spilled(output) => {
+            IncrementalSetOutputInner::Spilled(output) => loop {
                 if output.reader.is_none() {
                     let Some(path) = output.output_path.as_ref() else {
                         return Ok(None);
                     };
-                    output.reader = crate::engine::executor::select::grace::ValueRowReader::open(
-                        path,
-                        output.dir.charger(),
-                    )?;
+                    output.reader = Some(
+                        crate::engine::executor::select::grace::ValueRowReader::open(
+                            path,
+                            output.dir.charger(),
+                        )?
+                        .ok_or_else(|| {
+                            crate::error::catalog::ER_UNKNOWN_ERROR
+                                .error("missing set-operation output run")
+                        })?,
+                    );
                     if output.reader.is_some() {
                         SETOP_SPILL_FILE_OPENS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     }
@@ -1353,7 +1360,17 @@ impl IncrementalSetOutput {
                         );
                         output.output_read_recorded = true;
                     }
-                    return Ok(None);
+                    // Unordered consumers can drain reduced partitions
+                    // directly, retaining only one reader at a time.
+                    output.reader = None;
+                    output.output_path = output.remaining_paths.next();
+                    output.output_spill_bytes = output
+                        .output_path
+                        .as_ref()
+                        .and_then(|path| path.metadata().ok())
+                        .map_or(0, |metadata| metadata.len());
+                    output.output_read_recorded = false;
+                    continue;
                 };
                 let ordinal = setop_u64(&tagged, 0)?;
                 let repeats = setop_u64(&tagged, 1)?;
@@ -1362,8 +1379,8 @@ impl IncrementalSetOutput {
                         .error("invalid zero set-operation output count"));
                 }
                 tagged.drain(..2);
-                Ok(Some((ordinal, repeats, tagged)))
-            }
+                return Ok(Some((ordinal, repeats, tagged)));
+            },
         }
     }
 
@@ -1397,6 +1414,46 @@ pub(crate) fn combine_set_sources_spillable<L, R>(
     all: bool,
     ncols: usize,
     data_dir: &std::path::Path,
+    next_left: L,
+    next_right: R,
+) -> Result<IncrementalSetOutput, QueryError>
+where
+    L: FnMut() -> Result<Option<Vec<Value>>, QueryError>,
+    R: FnMut() -> Result<Option<Vec<Value>>, QueryError>,
+{
+    combine_set_sources_spillable_with_order(
+        collations, op, all, ncols, data_dir, true, next_left, next_right,
+    )
+}
+
+/// Native set operators publish unordered output. Their consumers do not
+/// require a global first-occurrence merge of already-reduced partitions.
+pub(crate) fn combine_unordered_set_sources_spillable<L, R>(
+    collations: &[Option<u16>],
+    op: SetOp,
+    all: bool,
+    ncols: usize,
+    data_dir: &std::path::Path,
+    next_left: L,
+    next_right: R,
+) -> Result<IncrementalSetOutput, QueryError>
+where
+    L: FnMut() -> Result<Option<Vec<Value>>, QueryError>,
+    R: FnMut() -> Result<Option<Vec<Value>>, QueryError>,
+{
+    combine_set_sources_spillable_with_order(
+        collations, op, all, ncols, data_dir, false, next_left, next_right,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn combine_set_sources_spillable_with_order<L, R>(
+    collations: &[Option<u16>],
+    op: SetOp,
+    all: bool,
+    ncols: usize,
+    data_dir: &std::path::Path,
+    preserve_order: bool,
     mut next_left: L,
     mut next_right: R,
 ) -> Result<IncrementalSetOutput, QueryError>
@@ -1627,8 +1684,27 @@ where
             &mut replay_metrics,
         )?;
     }
-    let output_path =
-        merge_setop_runs(ncols, &dir, output_runs, &work_handle, &mut replay_metrics)?;
+    let output_paths = if preserve_order {
+        merge_setop_runs(ncols, &dir, output_runs, &work_handle, &mut replay_metrics)?
+            .into_iter()
+            .collect::<Vec<_>>()
+    } else {
+        output_runs
+    };
+    // The output owns this directory listing until its final partition is
+    // consumed. Keep the path buffers governed along with the lazy reader.
+    let path_bytes = output_paths
+        .capacity()
+        .saturating_mul(std::mem::size_of::<std::path::PathBuf>())
+        .saturating_add(
+            output_paths
+                .iter()
+                .map(|path| path.capacity())
+                .sum::<usize>(),
+        );
+    memory_charge.add_force(path_bytes)?;
+    let mut remaining_paths = output_paths.into_iter();
+    let output_path = remaining_paths.next();
     let output_spill_bytes = output_path
         .as_ref()
         .and_then(|path| path.metadata().ok())
@@ -1663,6 +1739,7 @@ where
         inner: IncrementalSetOutputInner::Spilled(SpilledSetOutput {
             dir,
             output_path,
+            remaining_paths,
             reader: None,
             output_spill_bytes,
             output_read_recorded: false,
@@ -1836,6 +1913,152 @@ mod set_count_spill_tests {
 
     fn wide_row(value: usize) -> Vec<Value> {
         vec![Value::String(format!("{value:05}-{}", "x".repeat(400)))]
+    }
+
+    #[test]
+    fn unordered_spilled_sets_preserve_bags_and_avoid_global_output_merge() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        use std::sync::atomic::Ordering;
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let collation = crate::charset::resolve_collation("utf8mb4_0900_ai_ci")
+            .unwrap()
+            .id;
+        let row = |id: usize, right: bool| {
+            vec![
+                if id % 7 == 0 {
+                    Value::Null
+                } else {
+                    Value::String(format!(
+                        "{id:05}-{}",
+                        if right { "abé" } else { "ABÉ" }.repeat(120)
+                    ))
+                },
+                if id % 13 == 0 {
+                    Value::Null
+                } else if right {
+                    Value::DecimalCompact((id % 11) as i64 * 10, 1)
+                } else {
+                    Value::Int((id % 11) as i64)
+                },
+                if id % 17 == 0 {
+                    Value::Null
+                } else {
+                    Value::Bytes(vec![id as u8, 255])
+                },
+            ]
+        };
+        for (op, all) in [
+            (SetOp::Union, false),
+            (SetOp::Intersect, false),
+            (SetOp::Intersect, true),
+            (SetOp::Except, false),
+            (SetOp::Except, true),
+        ] {
+            let collect = |ordered: bool| {
+                let budget = Arc::new(MemBudget::new(1024));
+                let before_passes = SETOP_SPILL_MERGE_PASSES.load(Ordering::Relaxed);
+                let before_bytes = SETOP_SPILL_BYTES_WRITTEN.load(Ordering::Relaxed);
+                let rows = with_query_budget(budget.clone(), || {
+                    let mut left = (0..600)
+                        .flat_map(|id| std::iter::repeat_n(id, 2))
+                        .map(|id| row(id, false));
+                    let mut right = (300..900)
+                        .flat_map(|id| std::iter::repeat_n(id, 3))
+                        .map(|id| row(id, true));
+                    let mut output = combine_set_sources_spillable_with_order(
+                        &[Some(collation), None, None],
+                        op,
+                        all,
+                        3,
+                        root.path(),
+                        ordered,
+                        || Ok(left.next()),
+                        || Ok(right.next()),
+                    )
+                    .unwrap();
+                    let IncrementalSetOutputInner::Spilled(spilled) = &output.inner else {
+                        panic!("wide rows must spill")
+                    };
+                    let path = spilled.dir.path().to_path_buf();
+                    if !ordered {
+                        assert!(spilled.remaining_paths.len() > 0);
+                    }
+                    let mut rows = Vec::new();
+                    while let Some(row) = output.next_row().unwrap() {
+                        rows.push(format!("{row:?}"));
+                    }
+                    drop(output);
+                    assert!(!path.exists());
+                    rows.sort();
+                    rows
+                });
+                assert_eq!(budget.used(), 0);
+                assert_eq!(budget.spill_bytes(), 0);
+                (
+                    rows,
+                    SETOP_SPILL_MERGE_PASSES.load(Ordering::Relaxed) - before_passes,
+                    SETOP_SPILL_BYTES_WRITTEN.load(Ordering::Relaxed) - before_bytes,
+                )
+            };
+            let stable = collect(true);
+            let unordered = collect(false);
+            assert_eq!(stable.0, unordered.0, "{op:?} all={all}");
+            assert!(stable.1 > 0);
+            assert_eq!(unordered.1, 0, "no global first-occurrence merge is needed");
+            assert!(
+                unordered.2 < stable.2,
+                "reduced runs must not be copied into another file"
+            );
+        }
+    }
+
+    #[test]
+    fn unordered_spilled_output_cancellation_and_missing_runs_release_resources() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        for missing in [false, true] {
+            let budget = Arc::new(MemBudget::new(1024));
+            with_query_budget(budget.clone(), || {
+                let token = crate::engine::cancel::QueryCancelToken::noop().fork_local();
+                let _scope = crate::engine::cancel::enter(token.clone());
+                let mut left = (0..600).map(wide_row);
+                let mut right = (300..900).map(wide_row);
+                let mut output = combine_unordered_set_sources_spillable(
+                    &[],
+                    SetOp::Union,
+                    false,
+                    1,
+                    root.path(),
+                    || Ok(left.next()),
+                    || Ok(right.next()),
+                )
+                .unwrap();
+                let IncrementalSetOutputInner::Spilled(spilled) = &output.inner else {
+                    panic!("must spill")
+                };
+                let dir = spilled.dir.path().to_path_buf();
+                if missing {
+                    crate::engine::executor::spill_quota::remove_spill_file(
+                        spilled.output_path.as_ref().unwrap(),
+                        &spilled.dir.charger(),
+                    )
+                    .unwrap();
+                    assert!(output
+                        .next_row()
+                        .unwrap_err()
+                        .message()
+                        .contains("missing set-operation output run"));
+                } else {
+                    assert!(output.next_row().unwrap().is_some());
+                    token.cancel_local();
+                    assert_eq!(output.next_row().unwrap_err().code(), 1317);
+                }
+                drop(output);
+                assert!(!dir.exists());
+            });
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        }
     }
 
     #[test]
@@ -2084,6 +2307,7 @@ mod set_count_spill_tests {
             inner: IncrementalSetOutputInner::Spilled(SpilledSetOutput {
                 dir,
                 output_path: Some(path),
+                remaining_paths: Vec::new().into_iter(),
                 reader: None,
                 output_spill_bytes: bytes,
                 output_read_recorded: false,

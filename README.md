@@ -99,7 +99,7 @@ cd mydb
 cargo build --release --locked --bin mydb
 
 MYDB_DATA_DIR=/tmp/mydb/data \
-  ./target/release/mydb --host 127.0.0.1 --port 8738
+  ./target/release/mydb --port 8738
 ```
 
 When the server is ready, connect from another terminal:
