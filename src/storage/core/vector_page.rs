@@ -3917,6 +3917,69 @@ mod vector_page_tests {
     }
 
     #[test]
+    fn mapped_exact_candidates_preserve_distances_and_tombstone_visibility() {
+        use crate::engine::vector::distance::{ordering_distance, Metric};
+        for dimension in [8, 65, 129] {
+            for (metric_id, metric) in [(0, Metric::L2), (1, Metric::Cosine), (2, Metric::Dot)] {
+                let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let mut vectors = gen_vectors(96, dimension, 19862);
+                // More equal-distance rows than k must retain RowId ordering
+                // even when only the selected prefix is sorted.
+                for i in 31..51 {
+                    vectors[i] = vectors[0].clone();
+                }
+                let (graph, vids) = build_paged_with_wal_mode(
+                    dir.path(),
+                    "exact-candidates",
+                    dimension as u32,
+                    metric_id,
+                    &vectors,
+                    true,
+                );
+                graph.set_navigation_quantization(None).unwrap();
+                for deleted in [false, true] {
+                    if deleted {
+                        graph.file().set_tombstone(0, vids[17], true).unwrap();
+                    }
+                    assert!(graph.file().prepare_navigation_mapping().unwrap());
+                    graph
+                        .file()
+                        .with_navigation_mapping(|view| {
+                            assert!(!view.meta.nav_quant_valid);
+                            for query in [&vectors[0], &vectors[17], &vectors[39]] {
+                                let mut expected: Vec<_> = vectors
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(i, _)| !deleted || *i != 17)
+                                    .map(|(i, vector)| {
+                                        (
+                                            RowId {
+                                                page_id: i as u32,
+                                                slot_id: 0,
+                                            },
+                                            ordering_distance(query, vector, metric),
+                                        )
+                                    })
+                                    .collect();
+                                expected.sort_unstable_by(|a, b| {
+                                    a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0))
+                                });
+                                expected.truncate(10);
+                                let actual = view.search(query, 10, 128).unwrap();
+                                assert_eq!(actual.len(), expected.len());
+                                for (actual, expected) in actual.iter().zip(&expected) {
+                                    assert_eq!(actual.0, expected.0);
+                                    assert_eq!(actual.1.to_bits(), expected.1.to_bits());
+                                }
+                            }
+                        })
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
     fn mapped_cosine_norms_preserve_scores_and_revoke_on_vector_updates() {
         use crate::engine::vector::distance::{ordering_distance, Metric, PreparedF32Distance};
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();

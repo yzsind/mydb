@@ -762,6 +762,22 @@ impl MappedVectorNavigation {
         k: usize,
         ef: usize,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        if !self.meta.nav_quant_valid || self.meta.nav_exact_nodes >= self.meta.node_count {
+            self.search_impl::<true>(query, k, ef)
+        } else {
+            self.search_impl::<false>(query, k, ef)
+        }
+    }
+
+    // Keep exact-only finalization out of the approximate navigator's hot
+    // loop, including its register lifetimes and existing scoring pipeline.
+    #[inline(never)]
+    fn search_impl<const EXACT: bool>(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<(RowId, f64)>, QueryError> {
         use crate::engine::vector::distance::{dot_i8, quantize_into, Metric};
         use crate::engine::vector::hnsw_core::Scored;
         use std::cmp::Reverse;
@@ -783,7 +799,7 @@ impl MappedVectorNavigation {
         let explore_ties = metric != Metric::Dot || query.iter().any(|value| *value != 0.0);
         let mut normalized = Vec::new();
         let quantized_navigation =
-            self.meta.nav_quant_valid && self.meta.nav_exact_nodes < self.meta.node_count;
+            !EXACT && self.meta.nav_quant_valid && self.meta.nav_exact_nodes < self.meta.node_count;
         let src = if quantized_navigation && metric == Metric::Cosine {
             normalized.extend_from_slice(query);
             crate::engine::vector::distance::normalize_in_place(&mut normalized);
@@ -935,22 +951,40 @@ impl MappedVectorNavigation {
         }
         let candidates = results.into_vec();
         let mut out = Vec::with_capacity(candidates.len());
-        let mut chunks = candidates.chunks_exact(4);
-        for chunk in &mut chunks {
-            let ids = [chunk[0].id, chunk[1].id, chunk[2].id, chunk[3].id];
-            for (row, deleted, distance) in self.exact_batch4(&ids, &prepared)? {
+        if EXACT {
+            // These scores already use the same immutable FLOAT32 payloads
+            // and prepared scorer. Only row identity and deletion state need
+            // to be read again; quantized navigation still needs exact scoring.
+            for candidate in candidates {
+                let (page, offset) = self.record(candidate.id)?;
+                if page[offset] & REC_FLAG_TOMBSTONE == 0 {
+                    out.push((vec_unpack_row(read_u64(page, offset + 2)), candidate.dist));
+                }
+            }
+        } else {
+            let mut chunks = candidates.chunks_exact(4);
+            for chunk in &mut chunks {
+                let ids = [chunk[0].id, chunk[1].id, chunk[2].id, chunk[3].id];
+                for (row, deleted, distance) in self.exact_batch4(&ids, &prepared)? {
+                    if !deleted {
+                        out.push((row, distance));
+                    }
+                }
+            }
+            for candidate in chunks.remainder() {
+                let (row, deleted, distance) = self.exact(candidate.id, &prepared)?;
                 if !deleted {
                     out.push((row, distance));
                 }
             }
         }
-        for candidate in chunks.remainder() {
-            let (row, deleted, distance) = self.exact(candidate.id, &prepared)?;
-            if !deleted {
-                out.push((row, distance));
-            }
+        let compare =
+            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if EXACT && out.len() > k {
+            out.select_nth_unstable_by(k, compare);
+            out.truncate(k);
         }
-        out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        out.sort_unstable_by(compare);
         out.truncate(k);
         self.cache.insert(query, k, ef, &out);
         Ok(out)
