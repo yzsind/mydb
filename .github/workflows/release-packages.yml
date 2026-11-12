@@ -3,6 +3,10 @@ name: Release packages
 on:
   workflow_dispatch:
     inputs:
+      source_ref:
+        description: Source commit or tag to package
+        type: string
+        default: ""
       build_linux:
         description: Build the Linux package as well as Windows
         type: boolean
@@ -27,6 +31,8 @@ jobs:
     steps:
       - run: git config --global core.autocrlf false
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
@@ -42,6 +48,23 @@ jobs:
             C:/Users/runneradmin/.cargo/registry
           key: release-windows-rust195-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock') }}-${{ github.run_id }}
           restore-keys: release-windows-rust195-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock') }}-
+      - name: Seed isolated build cache
+        run: |
+          @'
+          import os
+          from pathlib import Path
+          import shutil
+          import sys
+          sys.path.insert(0, "scripts")
+          from build_linux_glibc217 import source_hash
+          root = Path("/tmp/mydb/release-build")
+          destination = root / source_hash(Path.cwd())
+          candidates = [p for p in root.iterdir() if p.is_dir() and p != destination] if root.exists() else []
+          if not destination.exists() and candidates:
+              source = max(candidates, key=lambda p: p.stat().st_mtime)
+              print(f"Seeding {destination} from {source}", flush=True)
+              shutil.copytree(source, destination)
+          '@ | python
       - name: Build portable package
         run: |
           python -c "from pathlib import Path; Path('C:/tmp/mydb').mkdir(parents=True, exist_ok=True)"
@@ -78,6 +101,8 @@ jobs:
     timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.ref }}
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.95.0
