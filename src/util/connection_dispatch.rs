@@ -748,11 +748,17 @@ mod tests {
                 let completed = completed.clone();
                 let finish = Arc::clone(&finish);
                 let (release, start) = tokio::sync::oneshot::channel();
-                releases.push(release);
+                let (resume, polling) = mpsc::sync_channel(1);
+                releases.push((resume, release));
                 dispatcher
                     .spawn(Box::new(move || {
                         Box::pin(async move {
                             entered.send(can_inline_transaction_control()).unwrap();
+                            // Keep distinct reactors occupied during admission.
+                            // A single reactor must still poll both connections.
+                            if workers > 1 {
+                                polling.recv_timeout(Duration::from_secs(2)).unwrap();
+                            }
                             start.await.unwrap();
                             completed
                                 .send((
@@ -770,7 +776,8 @@ mod tests {
                     index == 0 || workers == 3
                 );
             }
-            for release in releases {
+            for (resume, release) in releases {
+                resume.send(()).unwrap();
                 release.send(()).unwrap();
             }
             dispatcher.stop();
@@ -791,7 +798,7 @@ mod tests {
         for _ in 0..2 {
             let entered = entered.clone();
             let completed = completed.clone();
-            let (start, started) = tokio::sync::oneshot::channel();
+            let (start, started) = mpsc::sync_channel(1);
             let (finish, finished) = mpsc::channel();
             starts.push(start);
             finishes.push(finish);
@@ -799,7 +806,9 @@ mod tests {
                 .spawn(Box::new(move || {
                     Box::pin(async move {
                         entered.send(false).unwrap();
-                        started.await.unwrap();
+                        // Keep this poll active until both connections enter,
+                        // so admission retries cannot place them on one reactor.
+                        started.recv_timeout(Duration::from_secs(2)).unwrap();
                         let inline = can_inline_transaction_control();
                         entered.send(inline).unwrap();
                         let released = finished.recv_timeout(Duration::from_secs(2)).is_ok();

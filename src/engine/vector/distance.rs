@@ -716,6 +716,66 @@ impl<'a> PreparedF32Distance<'a> {
         }
         rows.map(|row| self.score_bytes(row))
     }
+
+    /// Reuse only row-derived, immutable cosine norms. Dot products keep the
+    /// existing eight-lane reductions; missing/exceptional norms are recomputed.
+    pub(crate) fn score_batch8(&self, rows: [&[u8]; 8], norms: &mut [f32; 8]) -> [f64; 8] {
+        #[cfg(target_endian = "little")]
+        if rows.iter().all(|row| row.len() / 4 == self.query.len()) {
+            if let Some((query_squared, query_norm)) = self.cosine {
+                let pointers = rows.map(|row| row.as_ptr().cast::<f32>());
+                let parts: [(f32, f32); 8] = if norms.iter().all(|norm| norm.is_normal()) {
+                    // SAFETY: all rows contain query.len() unaligned f32s.
+                    let dots = unsafe {
+                        cosine_dot_batch8_ptr(self.query.as_ptr(), pointers, self.query.len())
+                    };
+                    std::array::from_fn(|j| (dots[j], norms[j]))
+                } else {
+                    let first = unsafe {
+                        cosine_dot_norm_batch4_ptr(
+                            self.query.as_ptr(),
+                            [pointers[0], pointers[1], pointers[2], pointers[3]],
+                            self.query.len(),
+                        )
+                    };
+                    let second = unsafe {
+                        cosine_dot_norm_batch4_ptr(
+                            self.query.as_ptr(),
+                            [pointers[4], pointers[5], pointers[6], pointers[7]],
+                            self.query.len(),
+                        )
+                    };
+                    std::array::from_fn(|j| if j < 4 { first[j] } else { second[j - 4] })
+                };
+                return std::array::from_fn(|j| {
+                    let (dot, row_squared) = parts[j];
+                    if row_squared.is_normal() {
+                        norms[j] = row_squared;
+                    }
+                    if dot.is_finite() && row_squared.is_normal() {
+                        let similarity = if dot == query_squared && query_squared == row_squared {
+                            1.0
+                        } else {
+                            (dot / (query_norm * row_squared.sqrt())).clamp(-1.0, 1.0)
+                        };
+                        (1.0 - similarity) as f64
+                    } else {
+                        unsafe {
+                            wide_ordering_distance_ptr(
+                                self.query.as_ptr(),
+                                pointers[j],
+                                self.query.len(),
+                                Metric::Cosine,
+                            )
+                        }
+                    }
+                });
+            }
+        }
+        let first = self.score_batch4([rows[0], rows[1], rows[2], rows[3]]);
+        let second = self.score_batch4([rows[4], rows[5], rows[6], rows[7]]);
+        std::array::from_fn(|j| if j < 4 { first[j] } else { second[j - 4] })
+    }
 }
 
 /// Dot product directly over little-endian byte vectors — no allocation.
@@ -1814,6 +1874,90 @@ unsafe fn cosine_dot_norm_batch4_avx2(
     out
 }
 
+unsafe fn cosine_dot_batch8_ptr(query: *const f32, rows: [*const f32; 8], n: usize) -> [f32; 8] {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+        return cosine_dot_batch8_avx2(query, rows, n);
+    }
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let mut low = [vdupq_n_f32(0.0); 8];
+        let mut high = [vdupq_n_f32(0.0); 8];
+        let mut i = 0;
+        while i + 8 <= n {
+            let q0 = vld1q_f32(query.add(i));
+            let q1 = vld1q_f32(query.add(i + 4));
+            macro_rules! row {
+                ($j:literal) => {{
+                    low[$j] = vfmaq_f32(low[$j], q0, vld1q_f32(rows[$j].add(i)));
+                    high[$j] = vfmaq_f32(high[$j], q1, vld1q_f32(rows[$j].add(i + 4)));
+                }};
+            }
+            row!(0);
+            row!(1);
+            row!(2);
+            row!(3);
+            row!(4);
+            row!(5);
+            row!(6);
+            row!(7);
+            i += 8;
+        }
+        let mut out = std::array::from_fn(|j| vaddvq_f32(vaddq_f32(low[j], high[j])));
+        while i < n {
+            let q = read_unaligned(query.add(i));
+            for j in 0..8 {
+                out[j] += q * read_unaligned(rows[j].add(i));
+            }
+            i += 1;
+        }
+        return out;
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    std::array::from_fn(|j| {
+        let mut dot = 0.0;
+        for i in 0..n {
+            dot += read_unaligned(query.add(i)) * read_unaligned(rows[j].add(i));
+        }
+        dot
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn cosine_dot_batch8_avx2(query: *const f32, rows: [*const f32; 8], n: usize) -> [f32; 8] {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm256_setzero_ps(); 8];
+    let mut i = 0;
+    while i + 8 <= n {
+        let q = _mm256_loadu_ps(query.add(i));
+        macro_rules! row {
+            ($j:literal) => {{
+                sums[$j] = _mm256_fmadd_ps(q, _mm256_loadu_ps(rows[$j].add(i)), sums[$j]);
+            }};
+        }
+        row!(0);
+        row!(1);
+        row!(2);
+        row!(3);
+        row!(4);
+        row!(5);
+        row!(6);
+        row!(7);
+        i += 8;
+    }
+    let mut out = std::array::from_fn(|j| hsum256(sums[j]));
+    while i < n {
+        let q = read_unaligned(query.add(i));
+        for j in 0..8 {
+            out[j] += q * read_unaligned(rows[j].add(i));
+        }
+        i += 1;
+    }
+    out
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 #[inline]
@@ -2004,6 +2148,63 @@ mod tests {
                             actual[j].to_bits(),
                             expected.to_bits(),
                             "n={n} case={scenario} row={j} metric={metric:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn prepared_f32_batch8_preserves_bits_for_unaligned_rows_and_tails() {
+        for n in [0, 1, 7, 8, 9, 31, 63, 64, 65, 127, 128, 769, 1536] {
+            for scenario in 0..5 {
+                let mut query = pseudo(n, 17);
+                let mut rows: [Vec<f32>; 8] = std::array::from_fn(|j| pseudo(n, 21 + j as u64));
+                match scenario {
+                    1 => {
+                        rows[1].fill(0.0);
+                        rows[2].fill(f32::MAX);
+                        rows[3].fill(f32::NAN);
+                    }
+                    2 => {
+                        query.fill(f32::MIN_POSITIVE);
+                        rows[0].fill(f32::from_bits(1));
+                        rows[1].fill(f32::INFINITY);
+                    }
+                    3 => {
+                        query.fill(f32::MAX);
+                        rows[1].fill(-f32::MAX);
+                    }
+                    4 if n > 0 => {
+                        rows[7].pop();
+                    }
+                    _ => {}
+                }
+                let storage: [Vec<u8>; 8] = std::array::from_fn(|j| {
+                    let mut bytes = vec![0; j];
+                    bytes.extend(to_bytes(&rows[j]));
+                    bytes
+                });
+                let bytes = std::array::from_fn(|j| &storage[j][j..]);
+                for metric in [Metric::L2, Metric::Dot, Metric::Cosine] {
+                    let mut norms = [0.0; 8];
+                    let scorer = PreparedF32Distance::new(&query, metric);
+                    let actual = scorer.score_batch8(bytes, &mut norms);
+                    let warmed = scorer.score_batch8(bytes, &mut norms);
+                    assert_eq!(actual.map(f64::to_bits), warmed.map(f64::to_bits));
+                    let other_query = pseudo(n, 419);
+                    let changed = PreparedF32Distance::new(&other_query, metric)
+                        .score_batch8(bytes, &mut norms);
+                    for j in 0..8 {
+                        assert_eq!(
+                            actual[j].to_bits(),
+                            ordering_distance_f32_bytes(&query, bytes[j], metric).to_bits(),
+                            "n={n} case={scenario} row={j} metric={metric:?}"
+                        );
+                        assert_eq!(
+                            changed[j].to_bits(),
+                            ordering_distance_f32_bytes(&other_query, bytes[j], metric).to_bits()
                         );
                     }
                 }

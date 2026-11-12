@@ -502,7 +502,7 @@ impl Drop for CacheByteLease {
 }
 fn cache_byte_limit() -> u64 {
     (crate::engine::executor::mem_budget::memory_target_bytes() / 100)
-        .clamp(1024 * 1024, 64 * 1024 * 1024) as u64
+        .clamp(1024 * 1024, 4 * 1024 * 1024 * 1024) as u64
 }
 
 #[derive(Default)]

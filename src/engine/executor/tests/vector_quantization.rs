@@ -798,6 +798,72 @@ fn quantized_rerank_batch_transfers_wide_values_and_handles_empty_filters() {
 }
 
 #[test]
+fn cosine_heap_rerank_preserves_extreme_domains_and_reopened_rows() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    for quantization in ["sq8", "bq"] {
+        for scale in [1e-30f32, 1.0, 1e30] {
+            let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let mut engine = open_strict_test_engine(dir.path());
+            engine
+                .execute("CREATE TABLE items(id INT PRIMARY KEY,v VECTOR(33) NOT NULL)")
+                .unwrap();
+            let rows = (0..64)
+                .map(|id| {
+                    let values = (0..33)
+                        .map(|j| {
+                            (((id * (2 * j + 3) + j * j * j) % 97 - 48) as f32 * scale).to_string()
+                        })
+                        .collect::<Vec<_>>()
+                        .join(",");
+                    format!("({id},'[{values}]')")
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            engine
+                .execute(&format!("INSERT INTO items VALUES{rows}"))
+                .unwrap();
+            engine.execute(&format!("CREATE INDEX vx ON items(v) USING HNSW WITH(metric=COSINE,quantization={quantization},m=4,ef_construction=64,rerank_mult=64)")).unwrap();
+            let vector = (0..33)
+                .map(|j| ((j as f32 * 0.271 - 4.123) * scale).to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            let sql = format!("SELECT /*+ HNSW_EF(256) */ id FROM items ORDER BY DISTANCE(v,'[{vector}]','COSINE') LIMIT 7");
+            let expected = query_rows(&engine, &sql.replace("HNSW_EF(256)", "NO_VECTOR_INDEX"));
+            assert_eq!(
+                query_rows(&engine, &sql),
+                expected,
+                "{quantization} {scale}"
+            );
+            drop(engine);
+            engine = open_strict_test_engine(dir.path());
+            for _ in 0..2 {
+                assert_eq!(
+                    query_rows(&engine, &sql),
+                    expected,
+                    "reopened {quantization} {scale}"
+                );
+            }
+            engine
+                .execute("ALTER TABLE items ADD COLUMN extra INT NOT NULL DEFAULT 21")
+                .unwrap();
+            let projected = sql.replace("*/ id FROM", "*/ id,extra FROM");
+            assert_eq!(
+                query_rows(&engine, &projected),
+                query_rows(
+                    &engine,
+                    &projected.replace("HNSW_EF(256)", "NO_VECTOR_INDEX")
+                ),
+                "old layout {quantization} {scale}"
+            );
+        }
+    }
+}
+
+#[test]
 fn quantized_late_materialization_matches_oracle_across_native_types_and_layouts() {
     let _env = HnswEnv::set(&[
         ("MYDB_VECTOR_STORAGE", "paged"),

@@ -181,8 +181,8 @@ plan cache failures; it does not affect SQL semantics.
 
 Parsed-statement and shared SELECT plan caches also have independent byte
 admission ceilings: each is sized at 1% of the startup working-set target,
-clamped to 1–64 MiB. Byte pressure evicts cached entries; an entry larger than
-its cache ceiling executes normally without being retained. Byte estimates
+clamped to 1 MiB–4 GiB per cache. Byte pressure evicts cached entries; an entry
+larger than its cache ceiling executes normally without being retained. Byte estimates
 include AST payloads and compiled-plan structures, so entry-count caps cannot
 retain an unbounded number of large SQL statements.
 
@@ -383,7 +383,7 @@ This is a best-effort eviction policy, not an additional SQL error threshold. Ex
 `memory_reclaim_attempts` and `memory_reclaim_buffer_bytes` include this work.
 
 The default ceiling of the catalog descriptor cache is 2% when
-`MYDB_MEMORY_TARGET<=1GiB` and 5% for larger targets, never exceeding 256 MiB;
+`MYDB_MEMORY_TARGET<=1GiB` and 5% for larger targets, never exceeding 4 GiB;
 the startup environment variable `MYDB_CATALOG_CACHE_MB` can override the value,
 and at runtime it can be adjusted with `SET GLOBAL mydb_catalog_cache_mb=N`. At
 v46 startup only object headers and the ID→name index are resident; column,
@@ -437,6 +437,20 @@ construction graph is admitted; only compressed payloads survive publication. Th
   The small validation bitmap and bounded query memo are charged to the memory
   governor; clean mapped pages remain reclaimable by the OS. This does not pin
   the entire index in RAM or guarantee a warm filesystem cache after restart.
+  Finalized FLOAT32 mappings size their candidate memo by vector width and the
+  working-set target, with at most 4096 entries and a 64 MiB reservation cap.
+  Smaller targets and declined larger reservations retain the original small
+  memo when it can be admitted.
+  Memo hits reuse graph candidates; heap visibility and exact row scoring still
+  run for every statement. Graph mutations revoke the mapping and its memo.
+  Eligible cosine mappings can also admit a lazy exact FLOAT32 norm cache,
+  bounded by 1/256 of the working-set target and 64 MiB. It uses four bytes per
+  addressable node slot and is revoked with the mapping; admission failure keeps
+  the original distance path. Cached norms preserve the existing SIMD reduction.
+- `MYDB_HNSW_QUERY_MEMO` / `hnsw_query_memo` defaults to `ON`. Set it to `OFF`
+  to measure graph searches without candidate-memo hits or publication. Index
+  mappings, navigation payloads, exact row norms, and heap caching remain enabled.
+  This diagnostic switch does not change search effort or the rerank pool.
 - INSERT, UPDATE and DELETE revoke the mapping before changing index pages and
   drain in-flight mapped readers. Subsequent queries use the live WAL/buffer-pool
   path and see incremental maintenance immediately; no navigation rebuild is

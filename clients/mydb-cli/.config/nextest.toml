@@ -1,2 +1,4 @@
+nextest-version = { required = "0.9.150", recommended = "0.9.151" }
+
 [profile.default]
 test-threads = 8

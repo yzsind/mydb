@@ -4962,6 +4962,16 @@ pub(super) fn describe_select_columns(
     stmt: &Select,
 ) -> Result<Vec<Column>, QueryError> {
     planner::validate_outer_aggregate_nesting(db, stmt)?;
+    // Metadata fast paths must apply the same DISTINCT/ORDER BY binding rules
+    // as execution, without running the query or costing a physical plan.
+    if stmt.distinct
+        && !stmt.order_by.is_empty()
+        && stmt.values.is_none()
+        && stmt.json_table.is_none()
+        && !select_references_system_table(stmt)
+    {
+        planner::validate_select_column_references(db, stmt)?;
+    }
     if stmt.values.is_some() {
         return describe_values_select_columns(stmt);
     }

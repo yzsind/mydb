@@ -31,7 +31,7 @@ jobs:
           workspaces: clients/mydb-cli
       - uses: taiki-e/install-action@v2
         with:
-          tool: cargo-nextest@0.9.149
+          tool: cargo-nextest@0.9.151
       - name: Isolate temporary test files
         shell: bash
         run: |

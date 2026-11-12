@@ -3917,6 +3917,57 @@ mod vector_page_tests {
     }
 
     #[test]
+    fn mapped_cosine_norms_preserve_scores_and_revoke_on_vector_updates() {
+        use crate::engine::vector::distance::{ordering_distance, Metric, PreparedF32Distance};
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let vectors = gen_vectors(96, 65, 19861);
+        let (graph, vids) = build_paged_with_wal_mode(dir.path(), "norms", 65, 1, &vectors, true);
+        assert!(graph.file().prepare_navigation_mapping().unwrap());
+        graph
+            .file()
+            .with_navigation_mapping(|view| {
+                let norms = view.norms.as_ref().unwrap();
+                assert!(norms.values.iter().all(|n| n.load(Ordering::Relaxed) == 0));
+                for query in [&vectors[17], &vectors[39]] {
+                    let scorer = PreparedF32Distance::new(query, Metric::Cosine);
+                    for _ in 0..2 {
+                        let actual = view.exact_distances8(&vids[..8], &scorer).unwrap();
+                        for i in 0..8 {
+                            assert_eq!(
+                                actual[i].to_bits(),
+                                ordering_distance(query, &vectors[i], Metric::Cosine).to_bits()
+                            );
+                        }
+                    }
+                }
+                assert!(norms.values.iter().any(|n| n.load(Ordering::Relaxed) != 0));
+            })
+            .unwrap();
+        let replacement = vec![0.125; 65];
+        graph.file().write_vector(0, vids[0], &replacement).unwrap();
+        assert!(graph.file().with_navigation_mapping(|_| ()).is_none());
+        assert!(graph.file().prepare_navigation_mapping().unwrap());
+        graph
+            .file()
+            .with_navigation_mapping(|view| {
+                assert!(view
+                    .norms
+                    .as_ref()
+                    .unwrap()
+                    .values
+                    .iter()
+                    .all(|n| n.load(Ordering::Relaxed) == 0));
+                let scorer = PreparedF32Distance::new(&vectors[17], Metric::Cosine);
+                let actual = view.exact_distances8(&vids[..8], &scorer).unwrap();
+                assert_eq!(
+                    actual[0].to_bits(),
+                    ordering_distance(&vectors[17], &replacement, Metric::Cosine).to_bits()
+                );
+            })
+            .unwrap();
+    }
+
+    #[test]
     fn mapped_navigation_writer_drains_readers_and_reopen_needs_no_scan() {
         let dir = tempfile::Builder::new()
             .prefix("mapped-nav-")

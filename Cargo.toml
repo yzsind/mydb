@@ -27,6 +27,8 @@ fast-alloc = ["dep:mimalloc", "dep:libmimalloc-sys"]
 
 [build-dependencies]
 chrono = "0.4"
+# Keep openssl-sys on the vendored LTS release when resolving a fresh lockfile.
+openssl-src = "=300.5.6"
 
 [dependencies]
 rmcp = { version = "=3.9.0", default-features = false, features = ["server", "transport-streamable-http-server"] }
@@ -36,7 +38,6 @@ serde_json = { version = "1", features = ["unbounded_depth", "raw_value"] }
 jsonschema = { version = "0.49.2", default-features = false }
 base64 = "0.22"
 axum = { version = "0.8", default-features = false, features = ["http1", "http2", "json", "tokio"] }
-hyper = { version = "1", features = ["server", "http1", "http2"] }
 hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service"] }
 tokio-stream = "0.1"
 subtle = "2"
@@ -47,7 +48,6 @@ httpdate = "1"
 flate2 = "1"
 aes = "0.8"
 aes-gcm = "0.10"
-ecb = { version = "0.1", features = ["alloc"] }
 sqlparser = "0.61.0"
 # Bound recursive scalar evaluation before entering large debug stack frames.
 stacker = "0.1.24"
@@ -105,6 +105,9 @@ rustix = { version = "1", features = ["process"] }
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }
 tempfile = "3"
+
+[patch.crates-io]
+openssl-src = { path = "vendor/openssl-src" }
 
 [[bin]]
 name = "mydb"
