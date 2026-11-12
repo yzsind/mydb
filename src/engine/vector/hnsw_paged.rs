@@ -258,6 +258,7 @@ struct QueryCacheEntry {
 /// publishing a miss does not block hits in unrelated sets.
 #[derive(Debug)]
 pub(crate) struct QueryNavCache {
+    enabled: bool,
     max_k: usize,
     sets: Vec<parking_lot::RwLock<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]>>,
 }
@@ -294,7 +295,18 @@ impl QueryNavCache {
                 .take((entries / QUERY_CACHE_WAYS).max(1))
                 .collect();
         sets.shrink_to_fit();
-        Self { max_k, sets }
+        Self {
+            enabled: crate::startup_config::var("MYDB_HNSW_QUERY_MEMO")
+                .ok()
+                .and_then(|value| crate::util::env::parse_bool(&value))
+                .unwrap_or(true),
+            max_k,
+            sets,
+        }
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
     }
 
     #[inline]
@@ -315,6 +327,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn get(&self, query: &[f32], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
+        if !self.enabled {
+            return None;
+        }
         // SAFETY: every f32 bit pattern may be borrowed as initialized bytes.
         let bytes = unsafe {
             std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
@@ -323,6 +338,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn get_bytes(&self, query: &[u8], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
+        if !self.enabled {
+            return None;
+        }
         self.get_key(query, k, ef, Self::hash_bytes(query, k, ef))
     }
 
@@ -357,6 +375,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn insert(&self, query: &[f32], k: usize, ef: usize, result: &[(RowId, f64)]) {
+        if !self.enabled {
+            return;
+        }
         // SAFETY: the byte view is bounded by the initialized f32 slice.
         let bytes = unsafe {
             std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
@@ -365,6 +386,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn insert_bytes(&self, query: &[u8], k: usize, ef: usize, result: &[(RowId, f64)]) {
+        if !self.enabled {
+            return;
+        }
         self.insert_key(query, k, ef, result, Self::hash_bytes(query, k, ef));
     }
 
@@ -5607,6 +5631,29 @@ mod build_adj_tests {
 mod query_nav_allocation_tests {
     use super::{query_navigation_allocation, QueryNavCache, QueryNavStorage, QUERY_CACHE_MAX_K};
     use crate::storage::RowId;
+
+    #[test]
+    fn disabled_query_memo_neither_reuses_nor_publishes_candidates() {
+        let mut cache = QueryNavCache::new();
+        let values = [(
+            RowId {
+                page_id: 1,
+                slot_id: 2,
+            },
+            3.0,
+        )];
+        cache.insert(&[1.0, 2.0], 1, 64, &values);
+        cache.insert_bytes(&[1, 2], 1, 64, &values);
+        cache.enabled = false;
+        assert!(!cache.enabled());
+        assert!(cache.get(&[1.0, 2.0], 1, 64).is_none());
+        assert!(cache.get_bytes(&[1, 2], 1, 64).is_none());
+        cache.insert(&[3.0, 4.0], 1, 64, &values);
+        cache.insert_bytes(&[3, 4], 1, 64, &values);
+        cache.enabled = true;
+        assert!(cache.get(&[3.0, 4.0], 1, 64).is_none());
+        assert!(cache.get_bytes(&[3, 4], 1, 64).is_none());
+    }
 
     #[test]
     fn query_memo_capacity_accounts_wide_keys_results_and_replacement() {

@@ -443,6 +443,14 @@ construction graph is admitted; only compressed payloads survive publication. Th
   memo when it can be admitted.
   Memo hits reuse graph candidates; heap visibility and exact row scoring still
   run for every statement. Graph mutations revoke the mapping and its memo.
+  Eligible cosine mappings can also admit a lazy exact FLOAT32 norm cache,
+  bounded by 1/256 of the working-set target and 64 MiB. It uses four bytes per
+  addressable node slot and is revoked with the mapping; admission failure keeps
+  the original distance path. Cached norms preserve the existing SIMD reduction.
+- `MYDB_HNSW_QUERY_MEMO` / `hnsw_query_memo` defaults to `ON`. Set it to `OFF`
+  to measure graph searches without candidate-memo hits or publication. Index
+  mappings, navigation payloads, exact row norms, and heap caching remain enabled.
+  This diagnostic switch does not change search effort or the rerank pool.
 - INSERT, UPDATE and DELETE revoke the mapping before changing index pages and
   drain in-flight mapped readers. Subsequent queries use the live WAL/buffer-pool
   path and see incremental maintenance immediately; no navigation rebuild is

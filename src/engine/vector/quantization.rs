@@ -429,6 +429,58 @@ fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
     }
 }
 
+fn sq8_weighted_dot_batch4(code: [&[u8]; 4], weights: &[f64]) -> [f64; 4] {
+    #[cfg(target_arch = "x86_64")]
+    if weights.len() >= 8
+        && code.iter().all(|row| row.len() == weights.len())
+        && std::is_x86_feature_detected!("avx2")
+    {
+        // SAFETY: dispatch enables AVX2 and all rows have complete weights.
+        return unsafe { sq8_weighted_dot_batch4_avx2(code, weights) };
+    }
+    code.map(|row| sq8_weighted_dot(row, weights))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn sq8_weighted_dot_batch4_avx2(code: [&[u8]; 4], weights: &[f64]) -> [f64; 4] {
+    use std::arch::x86_64::*;
+    let mut sums = [[_mm256_setzero_pd(); 2]; 4];
+    let mut i = 0;
+    while i + 8 <= weights.len() {
+        let low_weights = _mm256_loadu_pd(weights.as_ptr().add(i));
+        let high_weights = _mm256_loadu_pd(weights.as_ptr().add(i + 4));
+        macro_rules! row {
+            ($j:literal) => {{
+                let packed =
+                    _mm_cvtsi64_si128(std::ptr::read_unaligned(code[$j].as_ptr().add(i).cast()));
+                let codes = _mm256_cvtepu8_epi32(packed);
+                let low = _mm256_cvtepi32_pd(_mm256_castsi256_si128(codes));
+                let high = _mm256_cvtepi32_pd(_mm256_extracti128_si256(codes, 1));
+                // Keep each row's eight accumulators and separate mul/add.
+                sums[$j][0] = _mm256_add_pd(sums[$j][0], _mm256_mul_pd(low, low_weights));
+                sums[$j][1] = _mm256_add_pd(sums[$j][1], _mm256_mul_pd(high, high_weights));
+            }};
+        }
+        row!(0);
+        row!(1);
+        row!(2);
+        row!(3);
+        i += 8;
+    }
+    std::array::from_fn(|j| {
+        let mut lanes = [0.0; 8];
+        _mm256_storeu_pd(lanes.as_mut_ptr(), sums[j][0]);
+        _mm256_storeu_pd(lanes.as_mut_ptr().add(4), sums[j][1]);
+        let tail = code[j][i..]
+            .iter()
+            .zip(&weights[i..])
+            .map(|(&c, &w)| c as f64 * w)
+            .sum::<f64>();
+        lanes.into_iter().sum::<f64>() + tail
+    })
+}
+
 #[cfg(target_arch = "x86_64")]
 #[target_feature(enable = "avx2")]
 unsafe fn sq8_weighted_dot_avx2(code: &[u8], weights: &[f64]) -> f64 {
@@ -1380,6 +1432,53 @@ impl Quantizer {
             Ok(score(&self.prepare(query)?))
         }
     }
+
+    /// Score independent SQ8 probes with shared query loads, preserving the
+    /// single-row reductions and its cancellation/legacy/exception fallbacks.
+    pub(crate) fn score_payloads4(
+        &self,
+        rows: [&[u8]; 4],
+        file: Option<&Arc<VectorIndexFile>>,
+        query: &VectorValue,
+        prepared: Option<&QuantQuery>,
+    ) -> Result<[f64; 4], QueryError> {
+        let scalar = || {
+            Ok([
+                self.score_payload(rows[0], file, query, prepared)?,
+                self.score_payload(rows[1], file, query, prepared)?,
+                self.score_payload(rows[2], file, query, prepared)?,
+                self.score_payload(rows[3], file, query, prepared)?,
+            ])
+        };
+        let Some(prepared) = prepared.filter(|q| !q.sq_weights.is_empty()) else {
+            return scalar();
+        };
+        if !matches!(self.model.config, QuantizationConfig::Sq8)
+            || rows
+                .iter()
+                .any(|row| row.len() != self.record_len() || row[0] != 0)
+        {
+            return scalar();
+        }
+        let norms = rows.map(|row| f64::from_le_bytes(row[1..9].try_into().unwrap()));
+        if self.metric() != Metric::Dot && norms.iter().any(|n| *n <= 0.0 || !n.is_finite()) {
+            return scalar();
+        }
+        let weighted = sq8_weighted_dot_batch4(rows.map(|row| &row[9..]), &prepared.sq_weights);
+        Ok(std::array::from_fn(|j| {
+            let dot = prepared.center_dot + weighted[j];
+            if dot.abs() <= (prepared.center_dot.abs() + weighted[j].abs()) * 1e-12 {
+                return self.score(&rows[j][9..], prepared);
+            }
+            match self.metric() {
+                Metric::Dot => -dot,
+                Metric::Cosine if prepared.norm2 > 0.0 => {
+                    1.0 - (dot / (prepared.norm2 * norms[j]).sqrt()).clamp(-1.0, 1.0)
+                }
+                _ => f64::INFINITY,
+            }
+        }))
+    }
     pub(crate) fn value_payload(
         &self,
         bytes: &[u8],
@@ -1552,6 +1651,115 @@ mod tests {
                     .sum::<f64>();
                 let actual = sq8_weighted_dot(&code, &weights);
                 assert!((actual - reference).abs() <= 1e-12 * magnitude * dimension as f64 * 255.0);
+            }
+        }
+    }
+
+    #[test]
+    fn sq8_batch4_preserves_single_row_bits_for_alignment_and_tails() {
+        for n in [0, 1, 7, 8, 9, 31, 32, 33, 127, 768, 769, 1536] {
+            for prefix in 0..8 {
+                let storage: [Vec<u8>; 4] = std::array::from_fn(|j| {
+                    let mut bytes = vec![0; prefix + j];
+                    bytes.extend((0..n).map(|i| (i * 71 + j * 13) as u8));
+                    bytes
+                });
+                let rows = std::array::from_fn(|j| &storage[j][prefix + j..]);
+                for magnitude in [0.0, -0.0, f64::MIN_POSITIVE, 1e-200, 1.0, 1e100] {
+                    let weights = (0..n)
+                        .map(|i| ((i * 7919 % 997) as f64 - 498.0) / 997.0 * magnitude)
+                        .collect::<Vec<_>>();
+                    let actual = sq8_weighted_dot_batch4(rows, &weights);
+                    for j in 0..4 {
+                        assert_eq!(
+                            actual[j].to_bits(),
+                            sq8_weighted_dot(rows[j], &weights).to_bits(),
+                            "n={n} prefix={prefix} row={j}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batched_payload_scores_preserve_types_models_and_legacy_records() {
+        for datatype in [
+            VectorDataType::Float32,
+            VectorDataType::Float16,
+            VectorDataType::BFloat16,
+            VectorDataType::Int8,
+        ] {
+            for metric in [Metric::L2, Metric::Cosine, Metric::Dot] {
+                for config in configs() {
+                    let mut trainer = Trainer::new(config, datatype, 33, metric).unwrap();
+                    let values: Vec<_> = (0..32)
+                        .map(|row| {
+                            codec::parse_typed_text(
+                                &format!(
+                                    "[{}]",
+                                    (0..33)
+                                        .map(|j| ((row * (j + 3) + j * j) % 39 - 19).to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(",")
+                                ),
+                                datatype,
+                            )
+                            .unwrap()
+                        })
+                        .collect();
+                    for value in &values {
+                        trainer.observe(value).unwrap();
+                    }
+                    let quant = trainer.finish().unwrap().unwrap();
+                    let mut stored: Vec<_> = values
+                        .iter()
+                        .take(4)
+                        .map(|v| quant.store(v, None).unwrap())
+                        .collect();
+                    for legacy in [false, true] {
+                        if legacy {
+                            for row in &mut stored {
+                                if row.payload[0] == 0 {
+                                    row.payload[1..9].fill(0);
+                                }
+                            }
+                        }
+                        for zero in [false, true] {
+                            let query = codec::from_f32(
+                                &(0..33)
+                                    .map(|j| if zero { 0.0 } else { j as f32 * 0.13 - 2.1 })
+                                    .collect::<Vec<_>>(),
+                            );
+                            let prepared = quant.prepare(&query).unwrap();
+                            let rows = std::array::from_fn(|j| stored[j].payload.as_slice());
+                            for probe in [None, Some(&prepared)] {
+                                let actual =
+                                    quant.score_payloads4(rows, None, &query, probe).unwrap();
+                                for j in 0..4 {
+                                    let reference =
+                                        quant.score_payload(rows[j], None, &query, probe).unwrap();
+                                    assert_eq!(
+                                        actual[j].to_bits(),
+                                        reference.to_bits(),
+                                        "{datatype:?} {metric:?} {} legacy={legacy} zero={zero}",
+                                        quant.name()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                    let bad = [2u8; 3];
+                    let query = codec::from_f32(&vec![1.0; 33]);
+                    let prepared = quant.prepare(&query).unwrap();
+                    let expected = quant
+                        .score_payload(&bad, None, &query, Some(&prepared))
+                        .unwrap_err();
+                    let actual = quant
+                        .score_payloads4([&bad, &bad, &bad, &bad], None, &query, Some(&prepared))
+                        .unwrap_err();
+                    assert_eq!(actual.code(), expected.code());
+                }
             }
         }
     }

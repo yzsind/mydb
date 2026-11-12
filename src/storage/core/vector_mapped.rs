@@ -12,6 +12,7 @@ pub(crate) struct MappedVectorNavigation {
     source_revision: u64,
     verified: Vec<AtomicU64>,
     records: Option<MappedRecordCache>,
+    norms: Option<MappedNormCache>,
     cache: crate::engine::vector::hnsw_paged::QueryNavCache,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
@@ -68,7 +69,7 @@ impl MappedRecordCache {
     }
 
     #[inline]
-    fn slot(&self, vid: VecId) -> Option<&std::sync::atomic::AtomicU16> {
+    fn position(&self, vid: VecId) -> Option<usize> {
         let slot = usize::from(vid_slot(vid));
         if slot >= self.slots_per_page {
             return None;
@@ -77,7 +78,12 @@ impl MappedRecordCache {
             .ok()?
             .checked_mul(self.slots_per_page)?
             .checked_add(slot)?;
-        self.offsets.get(index)
+        (index < self.offsets.len()).then_some(index)
+    }
+
+    #[inline]
+    fn slot(&self, vid: VecId) -> Option<&std::sync::atomic::AtomicU16> {
+        self.position(vid).map(|index| &self.offsets[index])
     }
 
     #[inline]
@@ -94,6 +100,48 @@ impl MappedRecordCache {
             // Racing readers publish the same immutable record location.
             slot.store(offset as u16, Ordering::Release);
         }
+    }
+}
+
+/// Optional row-derived scalars share the mapping generation, not a query
+/// key. Zero means unknown; exceptional norms retain the exact wide scorer.
+#[derive(Debug)]
+struct MappedNormCache {
+    values: Vec<AtomicU32>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl MappedNormCache {
+    fn try_new(count: usize, limit: usize) -> Option<Self> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let bytes = count
+            .checked_mul(std::mem::size_of::<AtomicU32>())?
+            .checked_add(std::mem::size_of::<Self>())?;
+        if bytes > limit {
+            return None;
+        }
+        // No reclamation while the mapping publication guard is held.
+        let mut charge = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::DerivedCache,
+            bytes,
+        )?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(count).ok()?;
+        let allocated = values
+            .capacity()
+            .checked_mul(std::mem::size_of::<AtomicU32>())?
+            .checked_add(std::mem::size_of::<Self>())?;
+        if allocated > bytes && (allocated > limit || !charge.try_grow_optional(allocated - bytes))
+        {
+            return None;
+        }
+        values.extend((0..count).map(|_| AtomicU32::new(0)));
+        Some(Self {
+            values,
+            _charge: charge,
+        })
     }
 }
 
@@ -260,6 +308,21 @@ impl VectorIndexFile {
             (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
                 .min(64 * 1024 * 1024),
         );
+        let norms = records
+            .as_ref()
+            .filter(|_| {
+                cfg!(target_endian = "little")
+                    && meta.metric == 1
+                    && native_geometry(meta.dim as usize).is_none()
+                    && meta.dim >= 64
+            })
+            .and_then(|records| {
+                MappedNormCache::try_new(
+                    records.offsets.len(),
+                    (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
+                        .min(64 * 1024 * 1024),
+                )
+            });
         let mapping = MappedVectorNavigation {
             address: image.as_ptr().cast(),
             _mapping: image,
@@ -268,6 +331,7 @@ impl VectorIndexFile {
             source_revision: revision,
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
             records,
+            norms,
             cache: QueryNavCache::with_capacity(QUERY_CACHE_MAX_K, cache_entries),
             _charge: charge,
         };
@@ -505,6 +569,44 @@ impl MappedVectorNavigation {
         Ok(query.score_batch4(rows))
     }
 
+    fn exact_distances8(
+        &self,
+        vids: &[VecId],
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+    ) -> Result<[f64; 8], QueryError> {
+        let rows = [
+            self.exact_payload(vids[0], query.dimension())?,
+            self.exact_payload(vids[1], query.dimension())?,
+            self.exact_payload(vids[2], query.dimension())?,
+            self.exact_payload(vids[3], query.dimension())?,
+            self.exact_payload(vids[4], query.dimension())?,
+            self.exact_payload(vids[5], query.dimension())?,
+            self.exact_payload(vids[6], query.dimension())?,
+            self.exact_payload(vids[7], query.dimension())?,
+        ];
+        let cells = std::array::from_fn::<_, 8, _>(|j| {
+            self.records
+                .as_ref()
+                .and_then(|records| records.position(vids[j]))
+                .and_then(|position| {
+                    self.norms
+                        .as_ref()
+                        .and_then(|norms| norms.values.get(position))
+                })
+        });
+        let before = cells.map(|cell| cell.map_or(0, |value| value.load(Ordering::Relaxed)));
+        let mut norms = before.map(f32::from_bits);
+        let scores = query.score_batch8(rows, &mut norms);
+        for j in 0..8 {
+            if before[j] == 0 && norms[j].is_normal() {
+                if let Some(cell) = cells[j] {
+                    cell.store(norms[j].to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(scores)
+    }
+
     fn exact_batch4(
         &self,
         vids: &[VecId],
@@ -568,15 +670,56 @@ impl MappedVectorNavigation {
     ) -> Result<(), QueryError> {
         use crate::engine::vector::distance::{dot_i8_batch4_ptrs, prefetch_read};
         out.clear();
-        // Bring record headers into cache before dereferencing their SQ8 rows.
+        // Exact probes need the vector prefix, not only the page header. A
+        // validated location can overlap those misses with neighboring rows.
         for &vid in vids {
             let page = vid_page(vid) as usize;
             if page < self.len / PAGE_SIZE {
                 // SAFETY: prefetch targets an address inside the live mapping.
                 unsafe {
-                    prefetch_read(self.address.cast::<i8>().add(page * PAGE_SIZE));
+                    let base = self.address.cast::<i8>().add(page * PAGE_SIZE);
+                    if let Some(offset) = self
+                        .records
+                        .as_ref()
+                        .and_then(|cache| cache.get(vid))
+                        .filter(|_| codes.is_empty())
+                    {
+                        let payload = base.add(offset + 10);
+                        for position in (0..(self.meta.dim as usize * 4).min(256)).step_by(64) {
+                            prefetch_read(payload.add(position));
+                        }
+                    } else {
+                        prefetch_read(base);
+                    }
+                }
+                if codes.is_empty() {
+                    if let Some(position) =
+                        self.records.as_ref().and_then(|cache| cache.position(vid))
+                    {
+                        if let Some(cell) = self
+                            .norms
+                            .as_ref()
+                            .and_then(|cache| cache.values.get(position))
+                        {
+                            prefetch_read((cell as *const AtomicU32).cast());
+                        }
+                    }
                 }
             }
+        }
+        if codes.is_empty() && self.norms.is_some() {
+            let mut chunks = vids.chunks_exact(8);
+            for chunk in &mut chunks {
+                out.extend(self.exact_distances8(chunk, query)?);
+            }
+            let mut tail = chunks.remainder().chunks_exact(4);
+            for chunk in &mut tail {
+                out.extend(self.exact_distances4(chunk, query)?);
+            }
+            for &vid in tail.remainder() {
+                out.push(self.distance(vid, query, codes, norm)?);
+            }
+            return Ok(());
         }
         let mut chunks = vids.chunks_exact(4);
         for chunk in &mut chunks {
@@ -639,7 +782,9 @@ impl MappedVectorNavigation {
         };
         let explore_ties = metric != Metric::Dot || query.iter().any(|value| *value != 0.0);
         let mut normalized = Vec::new();
-        let src = if metric == Metric::Cosine {
+        let quantized_navigation =
+            self.meta.nav_quant_valid && self.meta.nav_exact_nodes < self.meta.node_count;
+        let src = if quantized_navigation && metric == Metric::Cosine {
             normalized.extend_from_slice(query);
             crate::engine::vector::distance::normalize_in_place(&mut normalized);
             normalized.as_slice()
@@ -647,7 +792,7 @@ impl MappedVectorNavigation {
             query
         };
         let mut codes = Vec::new();
-        if self.meta.nav_quant_valid
+        if quantized_navigation
             && src.iter().all(|v| {
                 v.is_finite() && ((v - self.meta.nav_mid) * self.meta.nav_inv_scale).abs() <= 127.5
             })
