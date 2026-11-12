@@ -151,6 +151,7 @@ fn startup_error(err: mydb::error::QueryError) -> std::io::Error {
 
 async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     let config = Config::from_startup();
+    mydb::engine::validate_http_startup_config().map_err(startup_error)?;
     configure_open_files_limit();
     let addr = SocketAddr::new(config.host, config.port);
     // Reserve the socket before bootstrap or recovery can modify the directory.

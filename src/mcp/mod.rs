@@ -60,6 +60,7 @@ struct Lease<E: QueryEngine> {
     delivery: AtomicU8,
     delivery_frames: AtomicUsize,
     supervisor: Mutex<Option<oneshot::Sender<()>>>,
+    ready_at: Mutex<Option<Instant>>,
     persistent_created: AtomicBool,
     connection: Option<crate::rest::ConnectionAbort>,
 }
@@ -161,6 +162,7 @@ struct Delivery<E: QueryEngine> {
     lease: Arc<Lease<E>>,
     deadline: Pin<Box<tokio::time::Sleep>>,
     ended: bool,
+    timeout: Duration,
 }
 impl<E: QueryEngine> Delivery<E> {
     fn new(
@@ -174,9 +176,16 @@ impl<E: QueryEngine> Delivery<E> {
         // This supervisor must run independently of body polling: HTTP/2 flow
         // control can retain a complete frame without polling Delivery again.
         tokio::spawn(async move {
-            if tokio::time::timeout(timeout, stopped).await.is_err() {
-                if let Some(lease) = weak.upgrade() {
-                    lease.abort_delivery();
+            tokio::pin!(stopped);
+            let mut tick = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                tokio::select! {
+                    _ = &mut stopped => break,
+                    _ = tick.tick() => {
+                        let Some(lease) = weak.upgrade() else { break; };
+                        let expired = lease.ready_at.lock().is_some_and(|ready| ready.elapsed() >= timeout);
+                        if expired { lease.abort_delivery(); break; }
+                    }
                 }
             }
         });
@@ -185,6 +194,7 @@ impl<E: QueryEngine> Delivery<E> {
             lease,
             deadline: Box::pin(tokio::time::sleep(timeout)),
             ended: false,
+            timeout,
         }
     }
 }
@@ -203,8 +213,13 @@ impl<E: QueryEngine> Stream for Delivery<E> {
         if self.ended {
             return Poll::Ready(None);
         }
+        let ready = *self.lease.ready_at.lock();
+        if let Some(ready) = ready {
+            let deadline = tokio::time::Instant::from_std(ready + self.timeout);
+            self.deadline.as_mut().reset(deadline);
+        }
         if self.lease.delivery.load(Ordering::Acquire) == DELIVERY_ABORTED
-            || std::future::Future::poll(self.deadline.as_mut(), cx).is_ready()
+            || (ready.is_some() && std::future::Future::poll(self.deadline.as_mut(), cx).is_ready())
         {
             self.ended = true;
             self.lease.abort_delivery();
@@ -220,6 +235,9 @@ impl<E: QueryEngine> Stream for Delivery<E> {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Ok(bytes))) => {
+                if bytes.windows(9).any(|w| w == b"\"jsonrpc\"") {
+                    self.lease.ready_at.lock().get_or_insert_with(Instant::now);
+                }
                 self.lease.delivery_frames.fetch_add(1, Ordering::AcqRel);
                 Poll::Ready(Some(Ok(Bytes::from_owner(GovernedSdkBytes {
                     bytes,
@@ -305,7 +323,12 @@ async fn admit<E: QueryEngine>(
         .ok_or_else(|| Failure::internal("Missing HTTP peer identity"))?;
     let identity = sql::authenticate(&state.sql, request.headers(), peer)?;
     if request.method() != axum::http::Method::POST {
-        return Ok(StatusCode::METHOD_NOT_ALLOWED.into_response());
+        return Ok((
+            StatusCode::METHOD_NOT_ALLOWED,
+            [("allow", "POST")],
+            "MCP requires POST",
+        )
+            .into_response());
     }
     let (head, body) = request.into_parts();
     let mut body_request = Request::new(body);
@@ -316,6 +339,7 @@ async fn admit<E: QueryEngine>(
     struct Envelope {
         id: Option<Box<RawValue>>,
         params: Option<Box<RawValue>>,
+        method: Option<String>,
     }
     #[derive(Deserialize)]
     struct Params {
@@ -341,6 +365,7 @@ async fn admit<E: QueryEngine>(
         delivery: AtomicU8::new(DELIVERY_PENDING),
         delivery_frames: AtomicUsize::new(0),
         supervisor: Mutex::new(None),
+        ready_at: Mutex::new((envelope.method.as_deref() != Some("tools/call")).then(Instant::now)),
         persistent_created: AtomicBool::new(false),
         connection: head
             .extensions
@@ -490,6 +515,7 @@ impl<E: QueryEngine> ServerHandler for Handler<E> {
                 true,
             );
         }
+        *lease.ready_at.lock() = Some(Instant::now());
         Ok(tool.into())
     }
 }
@@ -619,11 +645,7 @@ impl<E: QueryEngine> Handler<E> {
         *lease.permit.lock() = Some(admission.clone());
         // Account for SDK serialization, result clones and outbound buffers in
         // addition to the shared executor's incrementally charged row storage.
-        lease.memory.lock().push(
-            self.state
-                .sql
-                .memory(self.state.config.max_result_bytes.saturating_mul(3))?,
-        );
+
         let input_memory = self.state.sql.memory(codec::input_memory_bytes(&items)?)?;
         let temporary = session_id.is_none();
         let session = if let Some(session_id) = session_id {
@@ -671,6 +693,11 @@ impl<E: QueryEngine> Handler<E> {
         let sql::Payload::Structured(value, memory) = chunk.payload else {
             unreachable!()
         };
+        lease.memory.lock().push(
+            self.state
+                .sql
+                .memory(codec::encoded_len(&value)?.saturating_mul(3))?,
+        );
         lease.memory.lock().push(memory);
         *lease.execution.lock() = Some(execution);
         Ok(value)

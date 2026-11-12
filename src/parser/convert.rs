@@ -2391,6 +2391,16 @@ fn convert_set_expr_checked(
                     select.projection.as_slice()
                 {
                     if let Some(extensions::Extension::Rrf(parsed)) = extensions::get(&name.value) {
+                        if select.selection.is_some()
+                            || select.having.is_some()
+                            || select.into.is_some()
+                            || !matches!(&select.group_by, sqlparser::ast::GroupByExpr::Expressions(items, modifiers) if items.is_empty() && modifiers.is_empty())
+                        {
+                            return Err(parse_error_full_span(
+                                sql,
+                                "RRF filtering and grouping require an outer SELECT",
+                            ));
+                        }
                         let fusion = super::rrf::convert(&parsed, sql)?;
                         return apply_tail_modifiers(
                             sql,
@@ -2678,6 +2688,12 @@ fn convert_select(
         value_table_mode: _,
         flavor: _,
     } = select;
+    if select.into.is_some() {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "SELECT INTO is not supported",
+        ));
+    }
     if !select.connect_by.is_empty()
         || select.exclude.is_some()
         || select.top.is_some()
@@ -7470,10 +7486,13 @@ fn show_database(options: &ShowStatementOptions) -> Option<String> {
     match show_in.parent_type {
         Some(ShowStatementInParentType::Database)
         | Some(ShowStatementInParentType::Schema)
-        | None => show_in
-            .parent_name
-            .clone()
-            .and_then(|name| object_name_to_string(name).ok()),
+        | None => show_in.parent_name.clone().and_then(|name| {
+            if let [sqlparser::ast::ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
+                Some(ident.value.clone())
+            } else {
+                object_name_to_string(name).ok()
+            }
+        }),
         _ => None,
     }
 }

@@ -2107,7 +2107,30 @@ fn reduce_distinct_integer_set_branch(db: &Database, plan: &mut PhysicalPlan) {
 /// existence on the other side. Preserve the projected relation as the SEMI
 /// probe, avoiding one joined output row for every matching duplicate.
 fn reduce_distinct_join_to_existence(plan: &mut PhysicalPlan, source: &(u64, String)) {
+    // Only admit constant arithmetic whose complete evaluation is known to
+    // stay in the signed integer domain. A general deterministic expression
+    // may still warn or fail, which an existence join could evaluate fewer
+    // times than the original join.
+    fn exact_integer_constant(expr: &Expr) -> Option<i64> {
+        match expr {
+            Expr::Literal(crate::parser::Literal::Int(value)) => Some(*value),
+            Expr::Binary { left, right, op } => {
+                let left = exact_integer_constant(left)?;
+                let right = exact_integer_constant(right)?;
+                match op {
+                    BinaryOp::Add => left.checked_add(right),
+                    BinaryOp::Sub => left.checked_sub(right),
+                    BinaryOp::Mul => left.checked_mul(right),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
     fn safe_predicate(expr: &Expr) -> bool {
+        if exact_integer_constant(expr).is_some() {
+            return true;
+        }
         match expr {
             Expr::Identifier(_)
             | Expr::CompoundIdentifier(_)
@@ -2147,7 +2170,10 @@ fn reduce_distinct_join_to_existence(plan: &mut PhysicalPlan, source: &(u64, Str
             | PhysicalPlan::ParallelZoneMapScan { filter, .. }
             | PhysicalPlan::IndexFastScan { filter, .. }
             | PhysicalPlan::IndexRangeScan { filter, .. }
-            | PhysicalPlan::IndexLookup { filter, .. } => {
+            | PhysicalPlan::IndexLookup { filter, .. }
+            | PhysicalPlan::IndexMultiLookup { filter, .. }
+            | PhysicalPlan::ParallelIndexFastScan { filter, .. }
+            | PhysicalPlan::ParallelIndexRangeScan { filter, .. } => {
                 filter.as_ref().is_none_or(safe_predicate)
             }
             PhysicalPlan::Exchange { .. } => true,
@@ -8226,25 +8252,82 @@ fn performance_core_count() -> Option<u32> {
     *CORES.get_or_init(detect_performance_core_count)
 }
 
+#[cfg(any(target_os = "macos", test))]
+fn performance_cores_from_levels(levels: &[(String, u32)]) -> Option<u32> {
+    // Newer heterogeneous CPUs can expose multiple performance tiers. Level
+    // zero alone is no longer the complete set of performance cores.
+    if levels
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("Efficiency"))
+    {
+        let cores = levels
+            .iter()
+            .filter(|(name, _)| !name.eq_ignore_ascii_case("Efficiency"))
+            .map(|(_, cores)| *cores)
+            .sum::<u32>();
+        (cores > 0).then_some(cores)
+    } else {
+        levels
+            .first()
+            .map(|(_, cores)| *cores)
+            .filter(|cores| *cores > 0)
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn detect_performance_core_count() -> Option<u32> {
-    let name = std::ffi::CString::new("hw.perflevel0.physicalcpu").ok()?;
-    let mut value: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>();
-    let rc = unsafe {
-        libc::sysctlbyname(
-            name.as_ptr(),
-            &mut value as *mut _ as *mut libc::c_void,
-            &mut len,
-            std::ptr::null_mut(),
-            0,
-        )
-    };
-    if rc == 0 && value > 0 {
-        Some(value as u32)
-    } else {
-        None
+    fn read_u32(name: &str) -> Option<u32> {
+        let name = std::ffi::CString::new(name).ok()?;
+        let mut value: u32 = 0;
+        let mut len = std::mem::size_of::<u32>();
+        // SAFETY: the output pointer covers `len` writable bytes.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                &mut value as *mut _ as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && len == std::mem::size_of::<u32>()).then_some(value)
     }
+    fn read_name(level: u32) -> Option<String> {
+        let name = std::ffi::CString::new(format!("hw.perflevel{level}.name")).ok()?;
+        let mut bytes = [0u8; 128];
+        let mut len = bytes.len();
+        // SAFETY: the output pointer covers `len` writable bytes.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                name.as_ptr(),
+                bytes.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        if rc != 0 || len > bytes.len() {
+            return None;
+        }
+        let end = bytes[..len].iter().position(|b| *b == 0).unwrap_or(len);
+        std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned)
+    }
+    let fallback = || read_u32("hw.perflevel0.physicalcpu").filter(|cores| *cores > 0);
+    let Some(count) = read_u32("hw.nperflevels").filter(|count| (1..=32).contains(count)) else {
+        return fallback();
+    };
+    let levels: Option<Vec<_>> = (0..count)
+        .map(|level| {
+            Some((
+                read_name(level)?,
+                read_u32(&format!("hw.perflevel{level}.physicalcpu"))?,
+            ))
+        })
+        .collect();
+    levels
+        .as_deref()
+        .and_then(performance_cores_from_levels)
+        .or_else(fallback)
 }
 
 #[cfg(not(target_os = "macos"))]
@@ -12663,9 +12746,8 @@ fn choose_scan(
             let effective_table_pages = if will_cover {
                 0.0
             } else {
-                table_pages_for_batched_in_lookup(
-                    &table.schema,
-                    &choice.index,
+                table_pages_for_index_nlj_lookup(
+                    choice.index.unique && exact,
                     table_pages,
                     keys.len() as f64,
                 )
@@ -16104,13 +16186,12 @@ fn effective_index_access_cost(
             cost.cpu_units += qual_cpu;
             cost
         }
-        IndexAccessKind::MultiLookup { keys, .. } => {
+        IndexAccessKind::MultiLookup { keys, exact } => {
             let effective_table_pages = if will_cover {
                 0.0
             } else {
-                table_pages_for_batched_in_lookup(
-                    table,
-                    &access.index,
+                table_pages_for_index_nlj_lookup(
+                    access.index.unique && *exact,
                     table_pages,
                     keys.len() as f64,
                 )
@@ -16382,7 +16463,7 @@ fn cost_in_subquery_index_access(
         effective_table_pages,
         row_width,
     );
-    let cost = crate::engine::cbo::Cost {
+    let mut cost = crate::engine::cbo::Cost {
         startup: per_lookup_cost.startup,
         total: per_lookup_cost.total * lookup_count,
         io_seq_pages: per_lookup_cost.io_seq_pages * lookup_count,
@@ -16391,6 +16472,53 @@ fn cost_in_subquery_index_access(
         mem_bytes: per_lookup_cost.mem_bytes,
         spill_bytes: per_lookup_cost.spill_bytes,
     };
+    // The native keyset source sorts candidate RIDs once and projects heap
+    // pages in order. Charging a random heap lookup for every key loses that
+    // sharing and can make a repeatedly chunked INLJ appear cheaper. Keep the
+    // conservative path for large keysets whose RID workspace exceeds the
+    // fixed planning budget; actual allocations remain query-governed.
+    let keyset_bytes = access_rows * 32.0 + lookup_count * 128.0;
+    if effective_table_pages > 0.0
+        && !table.schema.is_partitioned()
+        && table.system_time.is_none()
+        && keyset_bytes <= ctx.planning_mem_budget_bytes as f64
+    {
+        use crate::engine::cbo::operator_cost;
+        cost = operator_cost::estimate_index_keyset_lookup(
+            ctx,
+            operator_cost::BatchedIndexLookupInput {
+                index_height: height,
+                index_leaf_pages: index_cost_leaf_pages(
+                    &table.schema,
+                    &access.index,
+                    total_rows,
+                    total_rows,
+                ),
+                probe_key_locality: 0.0,
+                leaf_pages: index_cost_leaf_pages(
+                    &table.schema,
+                    &access.index,
+                    access_rows,
+                    total_rows,
+                ),
+                matched_rows: access_rows,
+                probe_keys: lookup_count,
+                table_pages,
+                output_width: operator_cost::estimated_row_width(&table.schema),
+                correlation: index_cost_correlation(&table.schema, &access.index),
+                competing_pages: 0.0,
+            },
+        )
+        .cost;
+        let routing =
+            extra_multi_lookup_cpu(height, lookup_count.ceil().min(usize::MAX as f64) as usize);
+        let sort_cpu = access_rows
+            * access_rows.max(2.0).log2()
+            * crate::engine::cbo::cbo_consts().cpu_operator_cost();
+        cost.total += routing + sort_cpu;
+        cost.cpu_units += routing + sort_cpu;
+        cost.mem_bytes = keyset_bytes;
+    }
     CostedInSubqueryIndexAccess {
         access: access.clone(),
         lookup_count,
@@ -16532,15 +16660,6 @@ fn subquery_plan_tables(db: &Database, subquery: &Select) -> Option<Vec<PlanTabl
 
 thread_local! {
     static SUBQUERY_ROW_ESTIMATE_DEPTH: std::cell::Cell<usize> = std::cell::Cell::new(0);
-}
-
-fn table_pages_for_batched_in_lookup(
-    schema: &TableSchema,
-    index: &IndexSchema,
-    table_pages: f64,
-    lookup_count: f64,
-) -> f64 {
-    table_pages_for_index_nlj_lookup(schema, index, table_pages, lookup_count)
 }
 
 fn subquery_tables_conflict_with_outer_table(
@@ -17381,20 +17500,19 @@ fn apply_large_secondary_index_nlj_penalty(
 }
 
 fn table_pages_for_index_nlj_lookup(
-    schema: &TableSchema,
-    index: &IndexSchema,
+    unique_exact: bool,
     table_pages: f64,
     lookup_count: f64,
 ) -> f64 {
     if table_pages <= 1.0 || lookup_count <= 1.0 {
         return table_pages;
     }
-    if acts_like_primary_for_cost(schema, index) || lookup_count <= 1_024.0 {
-        // Repeated probes revisit upper B-tree levels and small keysets tend
-        // to touch a bounded heap working set. Bound only the cache model's
-        // working set; do not amortize the lookup itself. Large non-primary
-        // NLJs still cost against the full table so fact-table fanout does
-        // not look artificially cheap.
+    if unique_exact {
+        // Only a complete unique key bounds heap matches by the number of
+        // probes. A nonunique key or a prefix of a composite primary key can
+        // fan out across the entire heap even with a one-digit outer row count.
+        // index_lookup uses this population for both residency and distinct
+        // page geometry, so shrinking it would erase real heap I/O.
         return lookup_count.min(table_pages).max(1.0);
     }
     table_pages
@@ -17670,6 +17788,8 @@ pub(crate) fn choose_join_with_hints(
                 &left,
                 &right,
                 rt,
+                ri,
+                *eql,
                 join_type,
                 left_rows,
             );
@@ -18877,8 +18997,8 @@ fn key_numeric_min_max_in_plan(plan: &PhysicalPlan, col: &str) -> Option<(f64, f
 
 /// Return the joint NDV (`prefix_distinct_counts[len-1]`) of any
 /// composite index on a base scan inside `plan` whose leading columns
-/// match `keys` in order. Falls back to `None` when no such index
-/// exists.
+/// match `keys` in order. A complete non-null unique key also determines
+/// additional attributes from that same relation, in any key order.
 fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
     if keys.iter().any(|key| expr_column_name(key).is_none()) {
         return None;
@@ -18888,6 +19008,33 @@ fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
         for index in table.schema.iter_queryable_indexes().filter(|i| {
             !i.is_fulltext() && !i.is_spatial() && !i.is_vector() && !i.has_multi_valued_parts()
         }) {
+            // Adding a dependent attribute cannot expand a unique tuple's
+            // domain. Independent column selectivities would multiply that
+            // attribute again and can collapse a large join to almost zero.
+            // Every key must resolve to this relation: a different relation
+            // may multiply its rows and introduce new attribute values.
+            if table.schema.stats.row_count > 0
+                && index.unique
+                && !index.columns.is_empty()
+                && !index.has_prefix_columns()
+                && index.columns.iter().all(|column| {
+                    table.schema.column_index(column).ok().is_some_and(|slot| {
+                        !table.schema.columns[slot].nullable
+                            && keys.iter().any(|key| {
+                                plan_key_equivalent_to_table_column(
+                                    plan, &tables, key, table, column,
+                                )
+                            })
+                    })
+                })
+                && keys.iter().all(|key| {
+                    table.schema.columns.iter().any(|column| {
+                        plan_key_equivalent_to_table_column(plan, &tables, key, table, &column.name)
+                    })
+                })
+            {
+                return Some(table.schema.stats.row_count);
+            }
             if index.columns.len() < keys.len()
                 || !keys.iter().zip(index.columns.iter()).all(|(key, column)| {
                     plan_key_equivalent_to_table_column(plan, &tables, key, table, column)
@@ -19325,6 +19472,8 @@ fn apply_inlj_right_only_residual_selectivity(
     left_plan: &PhysicalPlan,
     right_plan: &PhysicalPlan,
     right_table: &PlanTable,
+    right_index: &IndexSchema,
+    eq_prefix_len: usize,
     join_type: JoinType,
     left_rows: f64,
 ) -> f64 {
@@ -19343,6 +19492,69 @@ fn apply_inlj_right_only_residual_selectivity(
     {
         return base_est;
     }
+    // A constant equality consumed by the probe prefix has already reduced
+    // rows_per_lookup. It remains an execution-time correctness recheck, but
+    // applying its base-table selectivity again squares that restriction.
+    // Only discard this costing factor when every possible binding of that
+    // part is the same losslessly represented constant. An outer-dependent
+    // binding or a lossy cast still needs ordinary residual selectivity.
+    let scan_filter = extract_scan_filter(right_plan);
+    let mut probe_conjuncts = condition.map(expr_conjuncts).unwrap_or_default();
+    if let Some(filter) = &scan_filter {
+        probe_conjuncts.extend(expr_conjuncts(filter));
+    }
+    let lossless_constant = |expr: &Expr, pos: usize| -> Option<Value> {
+        let crate::storage::IndexKeyPart::Column(column) = right_index.key_part(pos)? else {
+            return None;
+        };
+        let slot = right_table.schema.column_index(column).ok()?;
+        let original = expr_literal_value(expr)?;
+        if matches!(original, Value::Null) {
+            return None;
+        }
+        let constraint = expr_to_plan_constraint(expr)?;
+        let target = index_bounds::target_for_index_column(&right_table.schema, right_index, pos);
+        let part = constraint_key_part_for_index(&constraint, target, right_index, pos)?;
+        let stored = concrete_key_part_value(&part, &right_table.schema.columns[slot].data_type)?;
+        (stored == original).then_some(stored)
+    };
+    let residuals = expr_conjuncts(&combined)
+        .into_iter()
+        .filter(|conjunct| {
+            !(0..eq_prefix_len).any(|pos| {
+                let Some(bound) = equality_between_index_part_and_left_plan(
+                    conjunct,
+                    right_table,
+                    right_index,
+                    pos,
+                    left_plan,
+                ) else {
+                    return false;
+                };
+                let Some(constant) = lossless_constant(&bound, pos) else {
+                    return false;
+                };
+                probe_conjuncts
+                    .iter()
+                    .filter_map(|candidate| {
+                        equality_between_index_part_and_left_plan(
+                            candidate,
+                            right_table,
+                            right_index,
+                            pos,
+                            left_plan,
+                        )
+                    })
+                    .all(|binding| {
+                        lossless_constant(&binding, pos).is_some_and(|value| value == constant)
+                    })
+            })
+        })
+        .cloned()
+        .collect();
+    let Some(combined) = combine_conjuncts(residuals) else {
+        return base_est;
+    };
     let total = (right_table.schema.stats.row_count.max(1) as f64).max(1.0);
     use crate::engine::cbo::selectivity::Selectivity;
     let kept = crate::engine::cbo::selectivity::default_selectivity().predicate_rows(
@@ -21662,6 +21874,12 @@ pub(crate) fn expr_is_deterministic(expr: &Expr) -> bool {
                 }
                 let upper = name.to_ascii_uppercase();
                 if crate::storage::schema::is_nondeterministic_function(name)
+                    || matches!(
+                        crate::engine::cbo::function_cost::function_class(
+                            &name.to_ascii_lowercase()
+                        ),
+                        crate::engine::builtin_catalog::CostClass::Volatile
+                    )
                     || name.contains('.')
                     || !(crate::engine::cbo::function_cost::is_known_builtin_function(name)
                         || crate::parser::is_aggregate_function(name)

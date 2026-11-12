@@ -565,7 +565,6 @@ impl BatchOperator for FilteredStorageBatchStream {
         ) else {
             return false;
         };
-        let single_column = (columns.len() == 1).then(|| columns[0]);
         // Preserve the existing predicate program's positional layout and
         // append only missing dynamic-key columns. The storage callback then
         // decodes SQL-predicate and runtime-filter keys in one predicate-first
@@ -585,85 +584,35 @@ impl BatchOperator for FilteredStorageBatchStream {
             return false;
         };
         self.runtime_probes.push(Some(compiled));
-        if let (
-            Some(column),
-            crate::planner::RuntimeFilter::ExactIntKey {
-                keys,
-                null_safe,
-                filter,
-                ..
-            },
-        ) = (single_column, &filter)
+        if let Some(ranges) =
+            super::super::plan::runtime_filter_zone_ranges(&self.db, self.txn, &self.table, &filter)
         {
-            // An exact integer domain also provides a conservative storage
-            // range. Keep the row membership probe and parent join unchanged;
-            // missing/stale/disabled zone metadata simply declines pruning.
-            if self.table.zone_map_hint != Some(false)
-                && (self.table.zone_map_hint == Some(true)
-                    || crate::storage::schema::zone_map_optimizer_enabled())
-                && !self.txn.dirty_read
-                && self.table.system_time.is_none()
-                && !self.table.schema.is_partitioned()
-                && null_safe.iter().all(|safe| !*safe)
-                && keys.len() == 1
-                && matches!(keys[0], Expr::Identifier(_) | Expr::CompoundIdentifier(_))
-                && !self.table.schema.columns[column].unsigned
-                && matches!(
-                    self.table.schema.columns[column].data_type,
-                    crate::storage::DataTypeKind::TinyInt
-                        | crate::storage::DataTypeKind::SmallInt
-                        | crate::storage::DataTypeKind::MediumInt
-                        | crate::storage::DataTypeKind::Int
-                        | crate::storage::DataTypeKind::BigInt
-                )
-            {
-                if let Some((low, high)) = filter
-                    .bounds()
-                    .and_then(|(lo, hi)| Some((i64::try_from(lo).ok()?, i64::try_from(hi).ok()?)))
-                {
-                    let predicate = Expr::Between {
-                        expr: Box::new(Expr::Identifier(
-                            self.table.schema.columns[column].name.clone(),
-                        )),
-                        low: Box::new(Expr::BoundValue(Value::Int(low))),
-                        high: Box::new(Expr::BoundValue(Value::Int(high))),
-                        negated: false,
-                    };
-                    if let Some(ranges) = self
-                        .db
-                        .zone_map_candidate_ranges_for_plan(&self.table.schema, &predicate)
-                    {
-                        #[cfg(test)]
-                        let before = self
-                            .tasks
-                            .iter()
-                            .map(|task| task.page_hi - task.page_lo)
-                            .sum::<u64>();
-                        self.tasks.retain_mut(|task| {
-                            let first = ranges.partition_point(|(_, hi)| *hi <= task.page_lo);
-                            let end = ranges.partition_point(|(lo, _)| *lo < task.page_hi);
-                            if first >= end {
-                                return false;
-                            }
-                            // Enclose surviving zones without splitting tasks,
-                            // so a sparse map cannot grow the task allocation.
-                            task.page_lo = task.page_lo.max(ranges[first].0);
-                            task.page_hi = task.page_hi.min(ranges[end - 1].1);
-                            task.page_lo < task.page_hi
-                        });
-                        #[cfg(test)]
-                        if self
-                            .tasks
-                            .iter()
-                            .map(|task| task.page_hi - task.page_lo)
-                            .sum::<u64>()
-                            < before
-                        {
-                            RUNTIME_RANGE_ZONE_PRUNE_HITS
-                                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        }
-                    }
+            #[cfg(test)]
+            let before = self
+                .tasks
+                .iter()
+                .map(|task| task.page_hi - task.page_lo)
+                .sum::<u64>();
+            self.tasks.retain_mut(|task| {
+                let first = ranges.partition_point(|(_, hi)| *hi <= task.page_lo);
+                let end = ranges.partition_point(|(lo, _)| *lo < task.page_hi);
+                if first >= end {
+                    return false;
                 }
+                // Enclose surviving zones without growing the bounded task list.
+                task.page_lo = task.page_lo.max(ranges[first].0);
+                task.page_hi = task.page_hi.min(ranges[end - 1].1);
+                task.page_lo < task.page_hi
+            });
+            #[cfg(test)]
+            if self
+                .tasks
+                .iter()
+                .map(|task| task.page_hi - task.page_lo)
+                .sum::<u64>()
+                < before
+            {
+                RUNTIME_RANGE_ZONE_PRUNE_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         }
         true

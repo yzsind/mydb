@@ -292,3 +292,19 @@ memory conditions retain their native codes.
 Error numbers are unsigned 16-bit values on the MySQL wire. A client that
 exposes extension codes as signed integers can normalize them with
 `code & 0xffff` before comparing the numbers above.
+
+### Response and memory boundaries
+
+Per-response size and per-statement call-count limits are independent ceilings,
+not a guarantee that their product fits in memory. Response leases remain charged
+until the executor releases the current output batch or statement. Buffered DML
+and streaming projections can therefore exhaust the shared node HTTP memory
+budget before reaching the call-count limit. Reduce the batch size or increase
+`http_memory_limit_mb` within the node's memory capacity; completed statements
+release their response leases.
+
+The decoder requires valid gzip members and zlib-wrapped `deflate`. It rejects
+trailing garbage, padding between gzip members, and raw RFC 1951 deflate streams.
+HTTP/1 responses also have a transport header-count bound in addition to the
+configured header-byte limit. Malformed or oversized transport headers are
+reported as invalid responses without echoing potentially sensitive header data.

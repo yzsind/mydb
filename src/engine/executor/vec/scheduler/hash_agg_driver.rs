@@ -1241,11 +1241,14 @@ fn parallel_finalize_stream(
                         }
                         partials.push(vec![sink.agg.take_partition_merged_snapshot(partition)?]);
                     }
-                    let compact = match (&shared_spill, count_topk, &final_filter) {
-                        (Some(shared), Some(hint), None) => {
-                            shared.try_partition_count_topk(partition, &mut partials, hint)?
-                        }
-                        _ => None,
+                    let compact = match &shared_spill {
+                        Some(shared) => shared.try_partition_count(
+                            partition,
+                            &mut partials,
+                            count_topk,
+                            final_filter.as_ref(),
+                        )?,
+                        None => None,
                     };
                     let rows = if let Some(rows) = compact {
                         rows
@@ -2260,7 +2263,7 @@ mod tests {
         aggs: Vec<AggregateSpec>,
         worker_count: usize,
     ) -> Result<Vec<Vec<Value>>, QueryError> {
-        let directory = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let directory = tempfile::tempdir().unwrap();
         collect_parallel_hash_agg_with_metrics(
             stream,
             group_columns,
@@ -2328,7 +2331,7 @@ mod tests {
             make_batch(&schema, &[(2, 40), (3, 50)]),
         ];
         for workers in [0, 1, 2] {
-            let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+            let root = tempfile::tempdir().unwrap();
             let mut stream = MaterializedBatchOperator::new(schema.clone(), batches.clone());
             let result = run_rollup_finest_parallel(
                 &mut stream,

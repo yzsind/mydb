@@ -3132,11 +3132,60 @@ impl Database {
         if self.has_pending_index_repairs_for(table.id, &index.name) {
             return Ok((0, page_lo.max(INDEX_EMPTY_ROOT)));
         }
+        let mut snapshot_prefix = None;
         self.with_index_read(table.id, &index.name, |index_file| {
             index_file.count_leaf_entries_page_range_while(page_lo, page_hi, |page_bound| {
-                self.index_page_all_visible(page_bound, txn)
+                if self.index_page_all_visible(page_bound, txn) {
+                    return true;
+                }
+                if txn.historical
+                    || txn.dirty_read
+                    || !index_page_max_trx_shortcut_enabled()
+                    || self.xa_prepared_active.load(Ordering::Acquire) != 0
+                {
+                    return false;
+                }
+                // A recent bulk commit may still have a retained slot. Prove
+                // the entire writer prefix once for this scan, including SCN
+                // order and allocation/registration holes, without forcing GC.
+                let prefix =
+                    *snapshot_prefix.get_or_insert_with(|| self.index_snapshot_writer_prefix(txn));
+                if page_bound <= prefix {
+                    self.record_index_page_max_trx_shortcut_hit();
+                    true
+                } else {
+                    false
+                }
             })
         })
+    }
+
+    fn index_snapshot_writer_prefix(&self, txn: TxnView) -> u64 {
+        const MAX_SLOTS: usize = 8192;
+        let txns = self.txns.read();
+        let mut prefix = self.min_retained_txn_id.load(Ordering::Acquire);
+        let frontier = txns.registered_txn_frontier;
+        if frontier <= prefix {
+            return prefix;
+        }
+        let mut slots = txns.slots.range((
+            std::ops::Bound::Excluded(prefix),
+            std::ops::Bound::Included(frontier),
+        ));
+        for _ in 0..MAX_SLOTS {
+            let Some((&id, slot)) = slots.next() else {
+                return frontier;
+            };
+            // Retained aborted and in-flight writers require the ordinary
+            // heap/repair path. A higher transaction id is not a commit proof.
+            if slot.status != TxnStatus::Committed
+                || !slot.commit_scn.is_some_and(|scn| scn <= txn.snapshot_scn)
+            {
+                return id.saturating_sub(1);
+            }
+            prefix = id;
+        }
+        prefix
     }
 
     pub(crate) fn visit_visible_index_numeric_prefix_page_range<F>(

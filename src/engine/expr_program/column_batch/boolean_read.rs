@@ -8,15 +8,24 @@ enum Kind {
     IsNotNull,
     Logical(BinaryOp),
     NullSafeEqual,
+    Between(bool),
 }
 pub(super) struct BooleanRead<'a> {
     left: &'a ExprNode,
     right: Option<&'a ExprNode>,
     kind: Kind,
+    high: Option<&'a ExprNode>,
 }
 impl<'a> BooleanRead<'a> {
     pub(super) fn bind(node: &'a ExprNode, schema: &BatchSchema) -> Option<Self> {
+        let high = match node {
+            ExprNode::Between { high, .. } => Some(high.as_ref()),
+            _ => None,
+        };
         let (left, right, kind) = match node {
+            ExprNode::Between {
+                expr, low, negated, ..
+            } => (expr.as_ref(), Some(low.as_ref()), Kind::Between(*negated)),
             ExprNode::Unary {
                 op: UnaryOp::Not,
                 expr,
@@ -81,7 +90,20 @@ impl<'a> BooleanRead<'a> {
                 }
             }
         }
-        Some(Self { left, right, kind })
+        if let Some(high) = high {
+            // Exact integer comparisons are safe even across signedness: both
+            // domains fit losslessly in i128, including the full u64 range.
+            let proof = super::contract(high, schema)?;
+            if !proof.parallel || !numeric(proof.domain) {
+                return None;
+            }
+        }
+        Some(Self {
+            left,
+            right,
+            kind,
+            high,
+        })
     }
     pub(super) fn contract(&self) -> Contract {
         Contract {
@@ -95,6 +117,9 @@ impl<'a> BooleanRead<'a> {
         if let Some(right) = self.right {
             child = child.checked_add(super::workspace(right, batch)?.1)?;
         }
+        if let Some(high) = self.high {
+            child = child.checked_add(super::workspace(high, batch)?.1)?;
+        }
         Some((
             bytes,
             child.checked_add(bytes.checked_mul(2)?)?.checked_add(512)?,
@@ -104,6 +129,10 @@ impl<'a> BooleanRead<'a> {
         let left = operand(self.left, batch)?;
         let right = match self.right {
             Some(right) => Some(operand(right, batch)?),
+            None => None,
+        };
+        let high = match self.high {
+            Some(high) => Some(operand(high, batch)?),
             None => None,
         };
         let numeric = |column: &ColumnVector, row| -> Option<i128> {
@@ -118,15 +147,18 @@ impl<'a> BooleanRead<'a> {
             }
         };
         if !matches!(self.kind, Kind::IsNull | Kind::IsNotNull)
-            && std::iter::once(&left).chain(right.iter()).any(|column| {
-                !matches!(
-                    column.as_ref(),
-                    ColumnVector::I64 { .. }
-                        | ColumnVector::U64 { .. }
-                        | ColumnVector::Bool { .. }
-                        | ColumnVector::Null { .. }
-                )
-            })
+            && std::iter::once(&left)
+                .chain(right.iter())
+                .chain(high.iter())
+                .any(|column| {
+                    !matches!(
+                        column.as_ref(),
+                        ColumnVector::I64 { .. }
+                            | ColumnVector::U64 { .. }
+                            | ColumnVector::Bool { .. }
+                            | ColumnVector::Null { .. }
+                    )
+                })
         {
             return None;
         }
@@ -145,6 +177,16 @@ impl<'a> BooleanRead<'a> {
                 Kind::IsFalse => Some(ta == Some(false)),
                 Kind::Not => ta.map(|v| !v),
                 Kind::NullSafeEqual => Some(a == numeric(right.as_deref()?, row)),
+                Kind::Between(negated) => {
+                    let lower = a.zip(numeric(right.as_deref()?, row)).map(|(a, b)| a >= b);
+                    let upper = a.zip(numeric(high.as_deref()?, row)).map(|(a, b)| a <= b);
+                    let inside = if lower == Some(false) || upper == Some(false) {
+                        Some(false)
+                    } else {
+                        lower.zip(upper).map(|(a, b)| a && b)
+                    };
+                    inside.map(|value| value ^ negated)
+                }
                 Kind::Logical(op) => {
                     let b = numeric(right.as_deref()?, row).map(|n| n != 0);
                     match op {

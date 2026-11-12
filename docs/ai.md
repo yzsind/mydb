@@ -461,3 +461,15 @@ rejected while outgoing MySQL binary logging is enabled. Native WAL replication
 replicates encrypted metadata and stored results, and never replays an external
 model call. Ordinary row replication of saved results follows existing MySQL
 type-compatibility boundaries.
+
+Pure expressions surrounding a single eagerly evaluated AI call retain the
+external stage's batching and concurrency. Conditional expressions retain SQL
+short-circuit behavior. When materialized inputs prove that the statement would
+exceed its AI item budget, execution fails before contacting the provider.
+`on_error='return'` must be selected on a DETAIL call, rather than in model
+defaults. Caller `response_format` replaces the model default as a whole.
+
+Provider timeouts count toward connection circuit health only after admission;
+a timeout before dispatch reports zero attempts and no ambiguous provider effect.
+HTTP 429 may be retried within the configured retry budget without enabling
+ambiguous retries. Server errors can still have ambiguous effects.

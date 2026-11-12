@@ -1314,7 +1314,14 @@ fn complete_fused_trace(
         });
         let children = super::plan::plan_stats_children(plan);
         for child in children.iter().copied() {
-            visit(child, stats, child_owner, None, false);
+            // Fusion may skip zero-weight branches completely. Each branch
+            // establishes its own measured owner before completing fused nodes.
+            let owner = if matches!(plan, planner::PhysicalPlan::RrfFusion { .. }) {
+                None
+            } else {
+                child_owner
+            };
+            visit(child, stats, owner, None, false);
         }
         if let Some(mut measured) = stats.get_for_plan(plan).copied() {
             if measured.loops > 0 && measured.self_time_ns == 0 {
@@ -3573,6 +3580,9 @@ fn explain_analyze_join_derived_formatted(
                 std::sync::Arc::new(crate::engine::executor::mem_budget::MemBudget::from_env());
             crate::engine::executor::mem_budget::with_query_budget(budget, exec_fn)?
         };
+    for plan in cte_plans.values() {
+        complete_fused_trace(plan, &mut stats, None);
+    }
     complete_fused_trace(&body_plan, &mut stats, None);
     if let Some(mut root) = stats.get_for_plan(&body_plan).copied() {
         root.first_row_ns = (body_ms * 1_000_000.0).round() as u128;

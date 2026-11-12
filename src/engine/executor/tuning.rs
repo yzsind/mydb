@@ -10,7 +10,7 @@ pub(crate) struct ExecutorTuningSnapshot {
     pub(crate) stream_batch_rows: usize,
     pub(crate) stream_channel_batches: usize,
     pub(crate) sort_run_bytes: Option<usize>,
-    pub(crate) sort_merge_fanin: usize,
+    pub(crate) sort_merge_fanin: Option<usize>,
     pub(crate) hash_join_bloom_adaptive: bool,
     pub(crate) scheduler_parallelism: usize,
 }
@@ -24,8 +24,7 @@ impl ExecutorTuningSnapshot {
                 sort_run_bytes: positive_usize("MYDB_SORT_RUN_BYTES")
                     .filter(|value| *value >= 1024 * 1024),
                 sort_merge_fanin: positive_usize("MYDB_SORT_MERGE_FANIN")
-                    .unwrap_or(32)
-                    .clamp(2, 128),
+                    .map(|value| value.clamp(2, 128)),
                 hash_join_bloom_adaptive: !boolean_is_disabled("MYDB_HASH_JOIN_BLOOM_ADAPTIVE"),
                 scheduler_parallelism: crate::planner::default_parallel_degree() as usize,
             }
@@ -100,14 +99,14 @@ mod tests {
             stream_batch_rows: 17,
             stream_channel_batches: 3,
             sort_run_bytes: Some(4096),
-            sort_merge_fanin: 7,
+            sort_merge_fanin: Some(7),
             hash_join_bloom_adaptive: false,
             scheduler_parallelism: 5,
         };
         let _scope = enter(first.clone());
         assert_eq!(current_or_capture().stream_batch_rows, 17);
         assert!(enter_if_absent().is_none());
-        assert_eq!(current_or_capture().sort_merge_fanin, 7);
+        assert_eq!(current_or_capture().sort_merge_fanin, Some(7));
         assert_eq!(current_or_capture().scheduler_parallelism, 5);
     }
 }

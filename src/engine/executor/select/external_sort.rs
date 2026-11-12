@@ -1093,7 +1093,9 @@ fn run_bytes_for_budget(budget: Option<&crate::engine::executor::mem_budget::Mem
 }
 
 fn sort_merge_fanin() -> usize {
-    crate::engine::executor::tuning::current_or_capture().sort_merge_fanin
+    crate::engine::executor::tuning::current_or_capture()
+        .sort_merge_fanin
+        .unwrap_or(32)
 }
 
 fn flush_sort_run(

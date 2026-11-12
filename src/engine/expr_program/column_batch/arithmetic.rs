@@ -133,6 +133,127 @@ impl<'a> Arithmetic<'a> {
     }
 }
 
+/// Constant exact divisors can share their scale expansion across a batch.
+/// The declared numerator domain proves that no row can overflow the decimal
+/// scratch representation; nullable operands are still evaluated per row.
+pub(super) struct ConstantExactDivision<'a> {
+    left: &'a ExprNode,
+    right: &'a ExprNode,
+    a: Exact,
+    b: Exact,
+    scale: u8,
+    factor: num_bigint::BigInt,
+    divisor: num_bigint::BigInt,
+    multiply_only: bool,
+}
+impl<'a> ConstantExactDivision<'a> {
+    pub(super) fn bind(node: &'a ExprNode, schema: &BatchSchema) -> Option<Self> {
+        use num_bigint::BigInt;
+        use num_traits::Signed;
+        let ExprNode::Binary {
+            left,
+            op: BinaryOp::Div,
+            right,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        let a = describe(left, schema)?;
+        let b = describe(right, schema)?;
+        if !a.parallel || !b.parallel {
+            return None;
+        }
+        let (Kind::Exact(a), Kind::Exact(b)) = (a.kind, b.kind) else {
+            return None;
+        };
+        if b.min != b.max || b.min == 0 {
+            return None;
+        }
+        let scale = crate::util::decimal::division_intermediate_scale(
+            a.scale,
+            b.scale,
+            crate::engine::expr::session_div_precision_increment(),
+        );
+        let exponent = i32::from(scale) + i32::from(b.scale) - i32::from(a.scale);
+        let mut factor = BigInt::from(10u8).pow(exponent.max(0) as u32);
+        let mut divisor = BigInt::from(b.min) * BigInt::from(10u8).pow((-exponent).max(0) as u32);
+        let largest = BigInt::from(a.min).abs().max(BigInt::from(a.max).abs());
+        let bound = largest * &factor / divisor.abs();
+        if bound
+            >= BigInt::from(10u8).pow(u32::from(
+                crate::util::decimal::MAX_DECIMAL_INTERMEDIATE_PRECISION,
+            ))
+        {
+            return None;
+        }
+        let multiply_only = &factor % &divisor == BigInt::from(0u8);
+        if multiply_only {
+            factor /= &divisor;
+            divisor = BigInt::from(1u8);
+        }
+        Some(Self {
+            left,
+            right,
+            a,
+            b,
+            scale,
+            factor,
+            divisor,
+            multiply_only,
+        })
+    }
+    pub(super) fn contract(&self) -> Contract {
+        Contract {
+            domain: Domain::Exact,
+            parallel: true,
+        }
+    }
+    pub(super) fn evaluate(&self, batch: &Batch) -> Option<ColumnVector> {
+        use num_bigint::BigInt;
+        use num_traits::ToPrimitive;
+        let left = operand(self.left, batch)?;
+        let right = operand(self.right, batch)?;
+        let mut values = crate::engine::executor::mem_budget::try_vec_with_capacity(
+            batch.num_rows(),
+            "constant exact division output",
+        )
+        .ok()?;
+        let small_factor = self.factor.to_i128();
+        let small_divisor = self.divisor.to_i128();
+        for row in 0..batch.num_rows() {
+            if row % 1024 == 0 {
+                crate::engine::cancel::check_cancelled().ok()?;
+            }
+            if left.is_null(row) || right.is_null(row) {
+                values.push(Value::Null);
+                continue;
+            }
+            let numerator = exact_at(&left, row, self.a)?;
+            if numerator < self.a.min || numerator > self.a.max {
+                return None;
+            }
+            if exact_at(&right, row, self.b)? != self.b.min {
+                return None;
+            }
+            let small = small_factor
+                .and_then(|f| numerator.checked_mul(f))
+                .and_then(|n| small_divisor.and_then(|d| n.checked_div(d)));
+            let exact = if let Some(magnitude) = small {
+                crate::util::decimal::ExactDecimal::from_i128(magnitude, self.scale)
+            } else {
+                let mut magnitude = BigInt::from(numerator) * &self.factor;
+                if !self.multiply_only {
+                    magnitude /= &self.divisor;
+                }
+                crate::util::decimal::ExactDecimal::from_big(magnitude, self.scale)
+            };
+            values.push(Value::from_exact_decimal(exact));
+        }
+        Some(ColumnVector::from_values(values))
+    }
+}
+
 fn integer(min: i128, max: i128, unsigned: bool) -> Exact {
     Exact {
         min,
@@ -529,6 +650,7 @@ fn approximate_bounds(kind: Kind) -> Option<(f64, f64, bool)> {
     }
 }
 
+#[inline]
 fn exact_at(column: &ColumnVector, row: usize, expected: Exact) -> Option<i128> {
     let (value, scale, decimal, unsigned) = match column {
         ColumnVector::I64 { data, .. } => (i128::from(data[row]), 0, false, false),
@@ -670,6 +792,31 @@ fn evaluate_binary(
                 }
             };
             if result.decimal {
+                // Keep the proven coefficient domain narrow across expression
+                // and aggregate queues. Runtime conversion remains checked for
+                // batches whose values violate their declared metadata.
+                if result.min >= i32::MIN as i128 && result.max <= i32::MAX as i128 {
+                    return numeric_loop!(
+                        i32,
+                        |row| i32::try_from(calculate(row)?).ok(),
+                        |data, nulls| ColumnVector::Decimal32 {
+                            data,
+                            scale: result.scale,
+                            nulls
+                        }
+                    );
+                }
+                if result.min >= i64::MIN as i128 && result.max <= i64::MAX as i128 {
+                    return numeric_loop!(
+                        i64,
+                        |row| i64::try_from(calculate(row)?).ok(),
+                        |data, nulls| ColumnVector::Decimal64 {
+                            data,
+                            scale: result.scale,
+                            nulls
+                        }
+                    );
+                }
                 numeric_loop!(i128, calculate, |data, nulls| ColumnVector::Decimal128 {
                     data,
                     scale: result.scale,

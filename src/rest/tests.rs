@@ -63,6 +63,7 @@ async fn query(
         format!("rq_{}", crate::engine::access_keys::random_id().unwrap()),
         stream,
         state.memory(1024).unwrap(),
+        None,
     )
     .await
     .unwrap();
@@ -170,6 +171,7 @@ async fn rest_protocol_busy_cancellation_and_revocation() {
             worker_id,
             false,
             worker_state.memory(1024).unwrap(),
+            None,
         )
         .await
     });
@@ -191,6 +193,7 @@ async fn rest_protocol_busy_cancellation_and_revocation() {
         "concurrent_request_001".into(),
         false,
         state.memory(1024).unwrap(),
+        None,
     )
     .await
     .unwrap_err();
@@ -364,6 +367,7 @@ async fn rest_protocol_transport_deadline_retains_worker_until_cleanup() {
             "transport_deadline_0001".into(),
             false,
             state.memory(1024).unwrap(),
+            None,
         ),
     )
     .await;
@@ -528,6 +532,7 @@ async fn rest_protocol_temporary_session_releases_admission_before_reply() {
             format!("rq_{}", crate::engine::access_keys::random_id().unwrap()),
             false,
             state.memory(1024).unwrap(),
+            None,
         )
         .await
         .unwrap();
@@ -547,7 +552,9 @@ async fn release_audit_rest_bound_dml_and_atomic_rollback() {
         engine.clone(),
         engine.registry().clone(),
     );
-    let s = create_session(state.clone(), identity, None).await.unwrap();
+    let s = create_session(state.clone(), identity, Some("test".into()))
+        .await
+        .unwrap();
     let requests = [
         json!({"sql":"CREATE TABLE audit_params(id INT PRIMARY KEY,v VARCHAR(80))"}),
         json!({"sql":"INSERT INTO audit_params VALUES (?,?)","params":[1,"first"]}),
@@ -608,7 +615,9 @@ async fn release_audit_rest_returning_overflow_confirms_commit_and_batch_rollbac
     let mut config = RestConfig::from_startup().unwrap();
     config.max_json_response_bytes = 4096;
     let state = runtime::State::new(config, engine.clone(), engine.registry().clone());
-    let s = create_session(state.clone(), identity, None).await.unwrap();
+    let s = create_session(state.clone(), identity, Some("test".into()))
+        .await
+        .unwrap();
     query(
         state.clone(),
         s.clone(),
@@ -701,4 +710,30 @@ async fn release_audit_rest_chunked_body_memory_and_transaction_expiry() {
         .store(false, std::sync::atomic::Ordering::Release);
     assert_eq!(session_info(&s, &state.config)["expires_at_ms"], 610000);
     s.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_audit_no_implicit_database_and_sequential_batch_sql_mode() {
+    let (_dir, engine) = engine();
+    let identity = identity(&engine);
+    let state = runtime::State::new(
+        RestConfig::from_startup().unwrap(),
+        engine.clone(),
+        engine.registry().clone(),
+    );
+    let session = create_session(state.clone(), identity, None).await.unwrap();
+    let (_, bytes) = query(
+        state.clone(),
+        session.clone(),
+        json!({"sql":"SELECT DATABASE()"}),
+        false,
+    )
+    .await;
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(result["results"][0]["rows"], json!([[null]]));
+    let (_, bytes) = query(state.clone(), session.clone(), json!({"statements":[{"sql":"SET sql_mode='ANSI_QUOTES'"},{"sql":"SELECT 7 AS \"n\" ORDER BY \"n\""}]}), false).await;
+    let result: Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(result["error"].is_null(), "{result}");
+    assert_eq!(result["results"][1]["rows"], json!([["7"]]));
+    session.close().await;
 }

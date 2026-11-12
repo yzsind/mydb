@@ -7572,6 +7572,40 @@ impl BufferPool {
         keys: &[PageKey],
         intent: AccessIntent,
     ) -> Result<(), QueryError> {
+        self.load_page_run_with_timeout(keys, intent, self.lock_wait)
+    }
+
+    /// Synchronous scan read-ahead uses the same Loading/Ready publication
+    /// protocol as demand reads. It must not wait for capacity: the caller
+    /// can still make progress by pinning one page at a time.
+    fn load_scan_page_range(
+        self: &Arc<Self>,
+        file: &Arc<BufferPageFileKey>,
+        start: u64,
+        count: usize,
+    ) -> Result<(), QueryError> {
+        let mut keys = Vec::with_capacity(count);
+        for page_id in start..start.saturating_add(count as u64) {
+            let key = PageKey {
+                file: Arc::clone(file),
+                page_id,
+            };
+            if self.lookup_frame(&key)?.is_none() {
+                keys.push(key);
+            }
+        }
+        if keys.len() > 1 {
+            self.load_page_run_with_timeout(&keys, AccessIntent::Scan, Duration::ZERO)?;
+        }
+        Ok(())
+    }
+
+    fn load_page_run_with_timeout(
+        self: &Arc<Self>,
+        keys: &[PageKey],
+        intent: AccessIntent,
+        capacity_wait: Duration,
+    ) -> Result<(), QueryError> {
         if keys.is_empty() {
             return Ok(());
         }
@@ -7580,7 +7614,7 @@ impl BufferPool {
         let initial_generation = generation_cell.load(Ordering::Acquire);
         let mut reserved = Vec::with_capacity(keys.len());
         for key in keys {
-            self.ensure_capacity_for_insert(self.lock_wait)?;
+            self.ensure_capacity_for_insert(capacity_wait)?;
             let shard_idx = self.shard_index(key);
             let raw_page = self.claim_raw_page_lease(shard_idx)?;
             let frame = Arc::new(Frame::new_loading(

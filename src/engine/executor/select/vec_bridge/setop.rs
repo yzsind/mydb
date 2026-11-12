@@ -299,7 +299,7 @@ impl SetOpBatchOperator<'_> {
             position: 0,
         });
         self.blocking_output = Some(
-            crate::engine::executor::dispatch::combine_set_sources_spillable(
+            crate::engine::executor::dispatch::combine_unordered_set_sources_spillable(
                 &self
                     .schema
                     .fields()
@@ -510,10 +510,17 @@ fn try_build_setop_batch_checked<'a>(
     else {
         return Ok(None);
     };
-    let Some(left_input) = try_build_query_output_batch(db, txn, left)? else {
+    let domain =
+        SET_DOMAINS.with(|domains| domains.borrow().get(&(plan as *const _ as usize)).cloned());
+    let distinct_domain = if *all { None } else { domain.as_deref() };
+    let Some(left_input) =
+        try_build_query_output_batch_in_set_domain(db, txn, left, distinct_domain)?
+    else {
         return Ok(None);
     };
-    let Some(right_input) = try_build_query_output_batch(db, txn, right)? else {
+    let Some(right_input) =
+        try_build_query_output_batch_in_set_domain(db, txn, right, distinct_domain)?
+    else {
         return Ok(None);
     };
     #[cfg(test)]
@@ -533,8 +540,6 @@ fn try_build_setop_batch_checked<'a>(
         );
     }
     let mut template = unify_setop_templates(left_input.template, right_input.template)?;
-    let domain =
-        SET_DOMAINS.with(|domains| domains.borrow().get(&(plan as *const _ as usize)).cloned());
     if let Some(domain) = domain {
         for (field, target) in template.iter_mut().zip(domain.fields()) {
             let mut meta = (*field.meta).clone();

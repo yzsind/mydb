@@ -407,8 +407,7 @@ mod tests {
                 input_column,
             })
             .collect::<Vec<_>>();
-        std::fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let shared = Arc::new(SharedHashAggSpill::new(
             root.path().to_path_buf(),
             schema.clone(),

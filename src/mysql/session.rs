@@ -6102,9 +6102,12 @@ where
         // `Arc`; `zerofill` is derived once. Both are `Arc`-shared so each
         // round captures a cheap clone. `encoding` is `Copy`.
         let columns = Arc::new(std::mem::take(&mut result.columns));
-        let zerofill = Arc::new(crate::mysql::protocol::zerofill_pad_spec(
-            columns.as_slice(),
-        ));
+        let zerofill = Arc::new(match encoding {
+            StreamRowEncoding::Text(_) | StreamRowEncoding::VectorText(_) => {
+                crate::mysql::protocol::zerofill_pad_spec(columns.as_slice())
+            }
+            StreamRowEncoding::Binary(_) => None,
+        });
         let found_rows = result.found_rows;
         let mut cursor = result.cursor;
         let mut pending = PendingStreamRows::default();
@@ -7267,7 +7270,12 @@ where
         // synchronous dispatch + scan setup; the rows themselves are
         // pulled lazily during socket writeback, so server memory stays
         // bounded even on a `SELECT * FROM huge_table`.
-        let ai = crate::engine::ai::sql::sql_may_have_ai(&sql);
+        let ai = crate::engine::ai::sql::sql_calls_ai(
+            &sql,
+            crate::sql_lex::SqlLexMode::from_parser_bits(
+                crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode),
+            ),
+        );
         let http = self.sql_may_call_http(&sql);
         let _http_session = if http {
             Some(crate::engine::http::admit_session(&self.context).await?)
@@ -7698,7 +7706,9 @@ where
         // demand. Materializing up front would defeat server-side cursor
         // fetching (`useCursorFetch=true`) by buffering the full result
         // set in memory before the FETCH loop even starts.
-        if !self.sql_may_call_http(&sql)
+        let http =
+            self.sql_may_call_http(&sql) || crate::engine::http::statement_has_http(&statement);
+        if !http
             && statement_is_lock_safe_read(&statement)
             && !statement_has_computed_ordering(&statement)
             && context_allows_inline_lock_safe_read(&self.context)
@@ -7729,13 +7739,15 @@ where
         // Transaction admission: a lock-taking statement is the point a
         // transaction starts holding hot-row locks, so gate concurrent open
         // transactions here. No-op when disabled or a permit is already held.
-        if !statement_is_lock_safe_read(&statement)
-            || !context_allows_inline_lock_safe_read(&self.context)
+        // HTTP admission and network waits must not consume the transaction
+        // gate. Match the text HTTP route; retain any already-owned permit.
+        if !http
+            && (!statement_is_lock_safe_read(&statement)
+                || !context_allows_inline_lock_safe_read(&self.context))
         {
             self.acquire_txn_admission().await;
         }
         let ai = crate::engine::ai::sql::statement_has_ai(&statement);
-        let http = self.sql_may_call_http(&sql);
         let _http_session = if http {
             match crate::engine::http::admit_session(&self.context).await {
                 Ok(p) => Some(p),
@@ -7886,7 +7898,10 @@ where
         // an ordinary read does not become a lock-holding transaction merely
         // because it missed an optimization. The general path still applies
         // its own locking/isolation admission checks (including SERIALIZABLE).
-        if !prepared_dml_statement_candidate(parsed.as_ref()) {
+        if !prepared_dml_statement_candidate(parsed.as_ref())
+            || self.sql_may_call_http(&sql)
+            || crate::engine::http::statement_has_http(&parsed)
+        {
             return (dml_state, None, params);
         }
         self.acquire_txn_admission().await;
@@ -7938,7 +7953,7 @@ where
         crate::engine::api::PreparedDmlState,
         Option<Result<QueryResponse, QueryError>>,
     ) {
-        if self.sql_may_call_http(sql) {
+        if self.sql_may_call_http(sql) || crate::engine::http::statement_has_http(parsed) {
             return (dml_state, None);
         }
         // The storage engine is synchronous: even an uncontended autocommit
@@ -9119,11 +9134,11 @@ fn encode_stream_row(
 ) {
     let padded;
     let row: &[crate::types::Value] = match zerofill {
-        Some(spec) => {
+        Some(spec) if !matches!(encoding, StreamRowEncoding::Binary(_)) => {
             padded = crate::mysql::protocol::zerofill_padded_row(row, spec);
             &padded
         }
-        None => row,
+        _ => row,
     };
     match encoding {
         StreamRowEncoding::Text(charset) => {
@@ -12842,6 +12857,37 @@ mod tests {
         }
     }
 
+    #[test]
+    fn binary_stream_zerofill_keeps_numeric_wire_shape() {
+        let columns = vec![Column {
+            name: "zf".into(),
+            column_type: crate::types::ColumnType::Long,
+            source: crate::types::ColumnSource {
+                flags: crate::mysql::protocol::ZEROFILL_FLAG,
+                length: Some(6),
+                ..Default::default()
+            },
+        }];
+        let row = vec![crate::types::Value::Int(42)];
+        let mut encoded = Vec::new();
+        encode_stream_row(
+            &row,
+            &columns,
+            Some(&[6]),
+            StreamRowEncoding::Binary(None),
+            &mut encoded,
+        );
+        assert_eq!(encoded, vec![0, 0, 42, 0, 0, 0]);
+        encode_stream_row(
+            &row,
+            &columns,
+            Some(&[6]),
+            StreamRowEncoding::Text(None),
+            &mut encoded,
+        );
+        assert_eq!(encoded, b"\x06000042");
+    }
+
     #[tokio::test]
     async fn declined_read_dml_probe_does_not_acquire_transaction_admission() {
         struct DecliningEngine;
@@ -12891,6 +12937,21 @@ mod tests {
                 "an ineligible DML probe must not admit a read-only statement: {sql}"
             );
         }
+        let sql = "UPDATE t SET v=HTTP_GET('https://example.invalid/') WHERE id=1";
+        let _ = session
+            .execute_prepared_statement_blocking(
+                Arc::from(sql),
+                parse_statement(sql).unwrap(),
+                Vec::new(),
+                None,
+                crate::engine::perf_events::prepared_statement_texts(sql),
+                false,
+            )
+            .await;
+        assert!(
+            session.txn_admission.is_none(),
+            "HTTP fallback must not acquire transaction admission"
+        );
         for sql in [
             "UPDATE t SET v = 1 WHERE id = 1",
             "SELECT id FROM t FOR SHARE",

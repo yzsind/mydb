@@ -54,6 +54,23 @@ struct Typed {
 fn invalid() -> QueryError {
     crate::error::catalog::ER_WRONG_ARGUMENTS.error("Invalid REST SQL parameter")
 }
+fn decimal(text: &str) -> std::result::Result<Value, QueryError> {
+    if text.len() > 256 {
+        return Err(invalid());
+    }
+    let (magnitude, scale) =
+        crate::util::decimal::parse_exact_decimal_big(text).ok_or_else(invalid)?;
+    let value = crate::util::decimal::format_big_decimal_parts(&magnitude, scale);
+    if value.bytes().filter(u8::is_ascii_digit).count() > 65 || scale > 30 {
+        return Err(invalid());
+    }
+    Ok(Value::Decimal(value))
+}
+fn binary_column(c: &Column) -> bool {
+    matches!(c.column_type, ColumnType::Geometry | ColumnType::Bit { .. })
+        || matches!(c.column_type, ColumnType::Blob | ColumnType::VarString)
+            && c.source.collation_id == Some(crate::charset::BINARY_COLLATION_ID)
+}
 pub fn param(raw: &RawValue, s: &SessionContext) -> std::result::Result<Value, QueryError> {
     let text = raw.get();
     let j: Json = serde_json::from_str(text).map_err(|_| invalid())?;
@@ -63,11 +80,7 @@ pub fn param(raw: &RawValue, s: &SessionContext) -> std::result::Result<Value, Q
         Json::String(v) => Ok(Value::String(v)),
         Json::Number(n) => {
             if text.contains(['.', 'e', 'E']) {
-                if text.len() > 256 {
-                    return Err(invalid());
-                }
-                crate::util::decimal::parse_exact_decimal_big(text).ok_or_else(invalid)?;
-                return Ok(Value::Decimal(text.into()));
+                return decimal(text);
             }
             let value = n.as_i64().ok_or_else(invalid)?;
             if value.unsigned_abs() > 9007199254740991 {
@@ -86,17 +99,7 @@ pub fn param(raw: &RawValue, s: &SessionContext) -> std::result::Result<Value, Q
             match t.kind.as_str() {
                 "int64" => Ok(Value::Int(string()?.parse().map_err(|_| invalid())?)),
                 "uint64" => Ok(Value::UInt(string()?.parse().map_err(|_| invalid())?)),
-                "decimal" => {
-                    let v = string()?;
-                    if v.len() > 256 {
-                        return Err(invalid());
-                    }
-                    crate::util::decimal::parse_exact_decimal_big(v).ok_or_else(invalid)?;
-                    if v.chars().filter(char::is_ascii_digit).count() > 65 {
-                        return Err(invalid());
-                    }
-                    Ok(Value::Decimal(v.into()))
-                }
+                "decimal" => decimal(string()?),
                 "float32" | "float64" => {
                     let n = t.value.as_f64().ok_or_else(invalid)?;
                     if !n.is_finite() {
@@ -201,7 +204,14 @@ pub fn column(c: &Column) -> Json {
         | ColumnType::Year => "integer_string",
         ColumnType::Decimal { .. } => "decimal_string",
         ColumnType::Float | ColumnType::Double => "float",
-        ColumnType::Blob | ColumnType::Geometry | ColumnType::Bit { .. } => "base64",
+        ColumnType::Blob
+        | ColumnType::VarString
+        | ColumnType::Geometry
+        | ColumnType::Bit { .. }
+            if binary_column(c) =>
+        {
+            "base64"
+        }
         ColumnType::Json => "json_text",
         ColumnType::Vector => "vector_text",
         _ => "text",
@@ -237,9 +247,30 @@ pub fn row(values: Vec<Value>, columns: &[Column]) -> Result<Json> {
     for (v, c) in values.into_iter().zip(columns) {
         let j = match v {
             Value::Null => Json::Null,
+            Value::String(value) if binary_column(c) => {
+                Json::String(STANDARD.encode(value.as_bytes()))
+            }
             Value::String(value) => Json::String(value),
-            Value::Float(v) => float(v as f64),
+            Value::SmallString(value) if binary_column(c) => {
+                Json::String(STANDARD.encode(value.as_slice()))
+            }
+            Value::Float(v) => {
+                if v.is_finite() {
+                    Json::Number(
+                        ryu::Buffer::new()
+                            .format_finite(v)
+                            .parse()
+                            .map_err(|_| Failure::bad("Invalid FLOAT result"))?,
+                    )
+                } else {
+                    Json::Null
+                }
+            }
             Value::Double(v) => float(v),
+            Value::Bytes(v) if !binary_column(c) => Json::String(
+                String::from_utf8(v)
+                    .map_err(|_| Failure::internal("Non-UTF8 bytes in a text result column"))?,
+            ),
             Value::Bytes(v) => Json::String(STANDARD.encode(v)),
             Value::Geometry(v) => Json::String(STANDARD.encode(v)),
             Value::UInt(v) if matches!(c.column_type, ColumnType::Bit { .. }) => {
@@ -344,4 +375,75 @@ pub fn encoded_len<T: serde::Serialize + ?Sized>(value: &T) -> Result<usize> {
     serde_json::to_writer(&mut counter, value)
         .map_err(|_| Failure::internal("Result encoding failed"))?;
     Ok(counter.0)
+}
+
+#[cfg(test)]
+mod audit_tests {
+    use super::*;
+    #[test]
+    fn rest_audit_decimal_binding_is_canonical_and_bounded() {
+        let session = SessionContext::default();
+        for (raw, expected) in [
+            ("1e5", "100000"),
+            (r#"{"type":"decimal","value":" +007.10 "}"#, "7.10"),
+            (r#"{"type":"decimal","value":".5"}"#, "0.5"),
+        ] {
+            let raw = RawValue::from_string(raw.into()).unwrap();
+            assert_eq!(param(&raw, &session).unwrap().to_display_string(), expected);
+        }
+        for raw in ["1e65", "1e-31"] {
+            assert!(param(&RawValue::from_string(raw.into()).unwrap(), &session).is_err());
+        }
+    }
+    #[test]
+    fn rest_audit_result_encoding_matches_column_collation() {
+        let mut column = Column {
+            name: "s".into(),
+            column_type: ColumnType::VarString,
+            source: Default::default(),
+        };
+        column.source.collation_id = Some(63);
+        assert_eq!(super::column(&column)["encoding"], "base64");
+        assert_eq!(
+            row(vec![Value::String("abc".into())], &[column.clone()]).unwrap(),
+            json!(["YWJj"])
+        );
+        column.column_type = ColumnType::Blob;
+        column.source.collation_id = Some(255);
+        assert_eq!(super::column(&column)["encoding"], "text");
+        assert_eq!(
+            row(vec![Value::Bytes(b"abc".to_vec())], &[column.clone()]).unwrap(),
+            json!(["abc"])
+        );
+        column.column_type = ColumnType::Float;
+        assert_eq!(
+            row(vec![Value::Float(0.1)], &[column]).unwrap().to_string(),
+            "[0.1]"
+        );
+    }
+}
+
+/// Conservative retained allocation estimate for buffered JSON. B-tree nodes
+/// can have spare capacity; include that in addition to strings and arrays.
+pub(super) fn retained_bytes(value: &Json) -> usize {
+    match value {
+        Json::String(text) => text.capacity(),
+        Json::Array(values) => values
+            .capacity()
+            .saturating_mul(std::mem::size_of::<Json>())
+            .saturating_add(values.iter().map(retained_bytes).sum::<usize>()),
+        Json::Object(values) => values
+            .len()
+            .saturating_mul(
+                2 * std::mem::size_of::<(String, Json)>() + 3 * std::mem::size_of::<usize>(),
+            )
+            .saturating_add(
+                values
+                    .iter()
+                    .map(|(key, value)| key.capacity().saturating_add(retained_bytes(value)))
+                    .sum::<usize>(),
+            ),
+        Json::Number(number) => number.to_string().len(),
+        _ => 0,
+    }
 }

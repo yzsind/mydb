@@ -102,7 +102,8 @@ counts, invalid types and unsupported protocol operations produce errors.
 Batches contain 1 through 1024 items and stop at the first failure.
 
 `timeout_ms` defaults to 30000 and cannot exceed `rest_max_timeout_ms`.
-`database` selects the default database for an independent request. Each
+`database` selects the default database for an independent request. Omitting it
+leaves no database selected, including when creating a persistent session. Each
 independent request owns a temporary SQL session which is closed afterward.
 Explicit transaction control and disabling autocommit require a persistent
 session; use `atomic=true` for a transaction confined to one request.
@@ -267,3 +268,11 @@ Completed request summaries are evicted before active work under protocol
 memory pressure. A transport deadline can close the affected session; SQL
 resources remain owned until the engine actually finishes cleanup. Allow
 a short network grace period for terminal timeout diagnostics.
+
+Silent connections must begin HTTP within five seconds; HTTP/2 peers must answer
+keepalive pings. Completed SQL responses have a 30-second delivery deadline,
+including when network backpressure stops body polling. Expiry closes the HTTP
+connection and its affected SQL session; other HTTP/2 streams on that connection
+may also be interrupted. Memory and execution slots remain charged until their
+actual owners release them. Buffered result metadata and OK packets count toward
+the protocol memory budget, even when there are no result rows.

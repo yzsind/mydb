@@ -757,6 +757,105 @@ fn multi_start_greedy(
             best = Some(complete);
         }
     }
+    best.map(|best| refine_complete_order(ctx, graph, query_hints, best))
+}
+
+/// Greedy cardinality ranking can attach a wide dimension early even when it
+/// removes no rows. Price bounded relocations as complete plans so downstream
+/// hash state and spill width participate before a short DP budget expires.
+fn refine_complete_order(
+    ctx: &CboContext,
+    graph: &JoinGraph,
+    query_hints: &[QueryHint],
+    mut best: CompletePlan,
+) -> CompletePlan {
+    let n = graph.n();
+    if n > MAX_DP_TABLES || best.signature.len() != n {
+        return best;
+    }
+    let names: Vec<_> = (0..n).map(|index| stable_scan_name(graph, index)).collect();
+    // Diagnostic signatures are not relation identities. If two derived
+    // sources expose the same signature, keep the original valid incumbent
+    // rather than resolving both occurrences to the first relation.
+    if names
+        .iter()
+        .enumerate()
+        .any(|(index, name)| names[..index].contains(name))
+    {
+        return best;
+    }
+    let mut remaining_work = configured_operation_budget(ctx).min(64);
+    for _ in 0..2 {
+        let signature = best.signature.clone();
+        let Some(order) = signature
+            .iter()
+            .map(|name| names.iter().position(|candidate| candidate == name))
+            .collect::<Option<Vec<_>>>()
+        else {
+            break;
+        };
+        let mut changed = false;
+        for from in 0..n {
+            for to in 0..n {
+                if from == to {
+                    continue;
+                }
+                if remaining_work == 0 {
+                    return best;
+                }
+                remaining_work -= 1;
+                let mut candidate_order = order.clone();
+                let relation = candidate_order.remove(from);
+                candidate_order.insert(to, relation);
+                let first = candidate_order[0];
+                let mut head = graph.scans[first].clone();
+                let mut placed = 1u32 << first;
+                let mut remaining: Vec<_> = (0..graph.cross_preds.len()).collect();
+                let mut max_rows = 0.0f64;
+                let mut connected = true;
+                for &next in &candidate_order[1..] {
+                    let (joinable, still) =
+                        graph.straddling_predicate_ids(placed, 1u32 << next, &remaining);
+                    if joinable.is_empty() {
+                        connected = false;
+                        break;
+                    }
+                    head = choose_join_with_hints(
+                        ctx,
+                        head,
+                        graph.scans[next].clone(),
+                        JoinType::Inner,
+                        graph.combine_predicate_ids(&joinable),
+                        query_hints,
+                    );
+                    max_rows = max_rows.max(estimated_rows(&head));
+                    placed |= 1u32 << next;
+                    remaining = still;
+                }
+                if !connected {
+                    continue;
+                }
+                let candidate = CompletePlan {
+                    cost: plan_cost(&head),
+                    plan: head,
+                    remaining,
+                    max_intermediate_rows: max_rows,
+                    signature: candidate_order
+                        .iter()
+                        .map(|&index| names[index].clone())
+                        .collect(),
+                    source: "complete_order_refinement",
+                };
+                if complete_plan_cmp(&candidate, &best).is_lt() {
+                    best = candidate;
+                    changed = true;
+                }
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
     best
 }
 

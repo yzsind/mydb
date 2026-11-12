@@ -2528,6 +2528,20 @@ fn parallel_rollup_window_rank_matches_serial_with_boundary_ties() {
     );
     let parallel = execute_rows_in_result_order(&engine, parallel_sql);
     assert_eq!(serial, parallel);
+
+    // A tight grant must preserve the columnar spill route for the parallel
+    // plan, including all peers at a rank boundary and every ROLLUP prefix.
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    use crate::engine::executor::select::vec_bridge::COLUMNAR_ROLLUP_SORT_HITS;
+    use std::sync::atomic::Ordering;
+    let hits = COLUMNAR_ROLLUP_SORT_HITS.load(Ordering::Relaxed);
+    let budget = Arc::new(MemBudget::new(128 * 1024));
+    let spilled = with_query_budget(budget.clone(), || {
+        execute_rows_in_result_order(&engine, parallel_sql)
+    });
+    assert!(COLUMNAR_ROLLUP_SORT_HITS.load(Ordering::Relaxed) > hits);
+    assert_eq!(serial, spilled);
+    assert_eq!(budget.used(), 0);
 }
 
 #[test]
@@ -4048,7 +4062,7 @@ fn parallel_grouped_in_subquery_preserves_having() {
 
 #[test]
 fn aggregate_preflight_rebinds_having_constants_between_executions() {
-    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE agg_input (k INT, v DECIMAL(12,2))")

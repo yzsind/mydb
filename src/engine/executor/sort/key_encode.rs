@@ -96,8 +96,7 @@ struct Encoder<'a> {
     arena: Vec<u8>,
     /// Row key i occupies `arena[offsets[i]..offsets[i+1]]`.
     offsets: Vec<usize>,
-    /// Scratch for collation weight bytes, reused across rows.
-    weight: Vec<u8>,
+    weights: Option<crate::engine::executor::collation_cache::CollationKeyCache>,
 }
 
 impl<'a> Encoder<'a> {
@@ -111,7 +110,7 @@ impl<'a> Encoder<'a> {
                 v.push(0);
                 v
             },
-            weight: Vec::new(),
+            weights: None,
         }
     }
 
@@ -192,20 +191,21 @@ impl<'a> Encoder<'a> {
     }
 
     fn push_str_payload(&mut self, s: &str, collation: Option<u16>) {
-        match collation {
-            Some(id) => crate::charset::collation_key_by_id_into(id, s, &mut self.weight),
-            None => crate::charset::default_string_key_into(s, &mut self.weight),
-        }
-        for &b in &self.weight {
-            if b == 0x00 {
+        let id = collation.unwrap_or_else(|| crate::charset::default_collation_info().id);
+        self.weights
+            .get_or_insert_with(crate::engine::executor::collation_cache::CollationKeyCache::new)
+            .with_key(id, s, |weight| {
+                for &b in weight {
+                    if b == 0x00 {
+                        self.arena.push(0x00);
+                        self.arena.push(0xFF);
+                    } else {
+                        self.arena.push(b);
+                    }
+                }
                 self.arena.push(0x00);
-                self.arena.push(0xFF);
-            } else {
-                self.arena.push(b);
-            }
-        }
-        self.arena.push(0x00);
-        self.arena.push(0x00);
+                self.arena.push(0x00);
+            });
     }
 
     #[inline]
@@ -303,7 +303,6 @@ pub(crate) fn try_sort_by_borrowed_encoded_keys<T>(
     }
     let mut lanes = vec![None; fields.len()];
     let mut arena_bytes = 0usize;
-    let mut weight_bytes = 0usize;
     for (row, item) in items.iter().enumerate() {
         if row % 4096 == 0 {
             crate::engine::cancel::check_cancelled()?;
@@ -338,9 +337,6 @@ pub(crate) fn try_sort_by_borrowed_encoded_keys<T>(
                             field.collation_id.unwrap(),
                             text,
                         );
-                        // ASCII writers may stage the source span before
-                        // removing primary-ignorable bytes.
-                        weight_bytes = weight_bytes.max(bytes.max(text.len()));
                         bytes.saturating_add(zeros).saturating_add(3)
                     }
                     Value::Float(value) if value.is_nan() => return Ok(false),
@@ -363,7 +359,6 @@ pub(crate) fn try_sort_by_borrowed_encoded_keys<T>(
             rows.checked_mul(std::mem::size_of::<usize>() + 2 * std::mem::size_of::<u32>())
         })
         .and_then(|bytes| bytes.checked_add(arena_bytes))
-        .and_then(|bytes| bytes.checked_add(weight_bytes))
     else {
         return Ok(false);
     };
@@ -381,10 +376,7 @@ pub(crate) fn try_sort_by_borrowed_encoded_keys<T>(
             count + 1,
             "encoded sort offsets",
         )?,
-        weight: crate::engine::executor::mem_budget::try_vec_with_capacity(
-            weight_bytes,
-            "encoded sort collation scratch",
-        )?,
+        weights: None,
     };
     encoder.offsets.push(0);
     for (row, item) in items.iter().enumerate() {

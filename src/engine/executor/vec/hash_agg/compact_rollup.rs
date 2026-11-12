@@ -634,8 +634,7 @@ mod tests {
         specs: &[AggregateSpec],
         budget: Arc<MemBudget>,
     ) -> (Vec<HashAggregateCore>, Vec<Vec<Option<PartitionPartial>>>) {
-        std::fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap().keep();
+        let root = tempfile::tempdir().unwrap().keep();
         let shared = Arc::new(SharedHashAggSpill::new(
             root.clone(),
             schema.clone(),

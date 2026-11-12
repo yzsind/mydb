@@ -560,6 +560,7 @@ pub async fn create_session<E: QueryEngine>(
         let limits = &identity.outcome.resource_limits;
         auth::charge_reauthenticated_connection(&account, None, limits.max_connections, limits.max_user_connections)?;
         let mut ctx = SessionContext::default();
+        ctx.current_database.clear();
         ctx.authenticated_as = account.clone();
         ctx.user = account.user.clone();
         ctx.login_user = account.user.clone();
@@ -815,6 +816,7 @@ pub struct Output<E: QueryEngine> {
     pub results: Vec<J>,
     pub bytes: usize,
     results_omitted: bool,
+    collection_error: Option<Failure>,
     _memory: Memory,
     deadline: Instant,
     cancel: crate::engine::cancel::QueryCancelToken,
@@ -933,12 +935,14 @@ impl<E: QueryEngine> Output<E> {
             Ok(())
         }
     }
+    fn omit_results(&mut self, error: Failure) {
+        self.results_omitted = true;
+        self.collection_error = Some(error);
+        self.results.clear();
+        self._memory = self.state.memory(0).expect("zero-byte protocol charge");
+    }
     fn push_result(&mut self, result: J, charged_row_bytes: usize) -> Result<()> {
         if self.stream || self.results_omitted {
-            return Ok(());
-        }
-        if matches!(self.format, OutputFormat::Json) {
-            self.results.push(result);
             return Ok(());
         }
         let overhead = codec::encoded_len(&result)?
@@ -955,10 +959,37 @@ impl<E: QueryEngine> Output<E> {
             return Ok(());
         }
         self.bytes += overhead;
-        self.state.grow_memory(
-            &mut self._memory,
-            overhead.saturating_mul(3).saturating_add(128),
-        )?;
+        // Rows have already been charged incrementally. The envelope includes
+        // metadata maps and diagnostic strings even when the result has no rows.
+        let retained = result.as_object().map_or_else(
+            || codec::retained_bytes(&result),
+            |object| {
+                object
+                    .len()
+                    .saturating_mul(
+                        2 * std::mem::size_of::<(String, J)>() + 3 * std::mem::size_of::<usize>(),
+                    )
+                    .saturating_add(
+                        object
+                            .iter()
+                            .map(|(key, value)| {
+                                key.capacity().saturating_add(if key == "rows" {
+                                    0
+                                } else {
+                                    codec::retained_bytes(value)
+                                })
+                            })
+                            .sum::<usize>(),
+                    )
+            },
+        );
+        if let Err(error) = self
+            .state
+            .grow_memory(&mut self._memory, retained.saturating_add(128))
+        {
+            self.omit_results(error);
+            return Ok(());
+        }
         self.results.push(result);
         Ok(())
     }
@@ -1007,10 +1038,14 @@ impl<E: QueryEngine> Output<E> {
                 ));
             }
             let cells = row.as_array().map_or(0, Vec::len);
-            self.state.grow_memory(
+            if let Err(error) = self.state.grow_memory(
                 &mut self._memory,
                 bytes * 2 + cells * std::mem::size_of::<J>() + 64,
-            )?;
+            ) {
+                self.omit_results(error);
+                rows.clear();
+                return Ok(());
+            }
         }
         rows.push(row);
         Ok(())
@@ -1112,6 +1147,11 @@ fn parse_item(
         &item.sql,
         api::parse_temporal_sql_mode_bits(&ctx.sql_mode),
     );
+    if ranges.is_empty() {
+        return Err(crate::error::catalog::ER_EMPTY_QUERY
+            .error("Query was empty")
+            .into());
+    }
     if ranges.len() != 1 {
         return Err(Failure::new(
             StatusCode::UNPROCESSABLE_ENTITY,
@@ -1207,6 +1247,12 @@ fn perform<E: QueryEngine>(
     let mut prepared = Vec::new();
     for (index, item) in items.iter().enumerate() {
         *failed_at = index;
+        if index > 0 && !atomic {
+            for param in &item.params {
+                codec::param(param, ctx)?;
+            }
+            continue;
+        }
         let parsed = parse_item(item, ctx)?;
         if matches!(
             output.format,
@@ -1470,6 +1516,7 @@ pub async fn start<E: QueryEngine>(
             results: Vec::new(),
             bytes: 0,
             results_omitted: false,
+            collection_error: None,
             _memory: worker_state.memory(0).expect("zero-byte protocol charge"),
             deadline,
             cancel: ctx.current_cancel_token().unwrap().clone(),
@@ -1579,11 +1626,13 @@ pub async fn start<E: QueryEngine>(
                 || codec::encoded_len(&terminal).unwrap_or(usize::MAX)
                     > format.max_bytes(worker_state.config.max_json_response_bytes))
         {
-            let failure = Failure::new(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "RESULT_TOO_LARGE",
-                "Complete result exceeds configured response limit",
-            );
+            let failure = output.collection_error.take().unwrap_or_else(|| {
+                Failure::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "RESULT_TOO_LARGE",
+                    "Complete result exceeds configured response limit",
+                )
+            });
             terminal["results"] = json!([]);
             terminal["results_omitted"] = json!(true);
             let mut detail = failure.value();

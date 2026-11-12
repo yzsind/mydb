@@ -3,6 +3,113 @@
 use super::fulltext_source::{collect_heap_documents, heap_document_id, FtSearchSource};
 use super::*;
 
+/// A runtime integer domain is a conservative page predicate. Keep membership
+/// and join checks in place: gaps within the domain are deliberately admitted.
+pub(crate) fn runtime_filter_zone_ranges(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    runtime_filter: &RuntimeFilter,
+) -> Option<crate::storage::ZoneMapRanges> {
+    if txn.dirty_read
+        || table.system_time.is_some()
+        || table.schema.is_partitioned()
+        || table.zone_map_hint == Some(false)
+        || (table.zone_map_hint != Some(true)
+            && !crate::storage::schema::zone_map_optimizer_enabled())
+    {
+        return None;
+    }
+    let (keys, null_safe, bounds) = match runtime_filter {
+        RuntimeFilter::ExactIntKey {
+            keys,
+            null_safe,
+            filter,
+            ..
+        } => (keys, null_safe, filter.bounds()),
+        RuntimeFilter::KeySet {
+            keys,
+            null_safe,
+            values,
+            ..
+        } => {
+            let mut bounds: Option<(i128, i128)> = None;
+            for row in values.iter() {
+                let [value] = row.as_slice() else {
+                    return None;
+                };
+                let value = match value {
+                    Value::Null => continue,
+                    Value::Int(value) => i128::from(*value),
+                    Value::UInt(value) => i128::from(*value),
+                    _ => return None,
+                };
+                bounds =
+                    Some(bounds.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
+            }
+            (keys, null_safe, bounds)
+        }
+        RuntimeFilter::BloomKey { .. } => return None,
+    };
+    if keys.len() != 1 || null_safe.iter().any(|safe| *safe) {
+        return None;
+    }
+    let columns = runtime_filter_schema_indices(runtime_filter, table)?;
+    let [column] = columns.as_slice() else {
+        return None;
+    };
+    let column = &table.schema.columns[*column];
+    if column.unsigned
+        || !matches!(
+            column.data_type,
+            crate::storage::DataTypeKind::TinyInt
+                | crate::storage::DataTypeKind::SmallInt
+                | crate::storage::DataTypeKind::MediumInt
+                | crate::storage::DataTypeKind::Int
+                | crate::storage::DataTypeKind::BigInt
+        )
+    {
+        return None;
+    }
+    let (lo, hi) = bounds?;
+    let predicate = Expr::Between {
+        expr: Box::new(Expr::Identifier(column.name.clone())),
+        low: Box::new(Expr::BoundValue(Value::Int(i64::try_from(lo).ok()?))),
+        high: Box::new(Expr::BoundValue(Value::Int(i64::try_from(hi).ok()?))),
+        negated: false,
+    };
+    let ranges = db.zone_map_candidate_ranges_for_plan(&table.schema, &predicate)?;
+    let pages = db.heap_page_count_for_storage(table.schema.id).ok()?;
+    ranges
+        .iter()
+        .all(|&(lo, hi)| lo <= hi && hi <= pages)
+        .then_some(ranges)
+}
+
+pub(crate) fn prune_runtime_filter_row_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filters: &[RuntimeFilter],
+    row_ids: &mut Vec<RowId>,
+) {
+    for filter in filters {
+        if row_ids.is_empty() {
+            break;
+        }
+        let Some(ranges) = runtime_filter_zone_ranges(db, txn, table, filter) else {
+            continue;
+        };
+        row_ids.retain(|id| {
+            let page = u64::from(id.page_id);
+            let range = ranges.partition_point(|(_, hi)| *hi <= page);
+            ranges
+                .get(range)
+                .is_some_and(|&(lo, hi)| lo <= page && page < hi)
+        });
+    }
+}
+
 /// Wrap a scan call in a partition-pruning context derived from the
 /// optional WHERE filter. When the table is partitioned and the
 /// filter exposes equality / range / IN on the partition column(s),

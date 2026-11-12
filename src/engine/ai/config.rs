@@ -598,6 +598,33 @@ pub(crate) fn validate_model(m: &Model, c: &Connection) -> Result<(), QueryError
             "model limit exceeds implementation ceiling",
         ));
     }
+    if m.defaults.get("on_error").is_some_and(|v| v == "return") {
+        return Err(error(
+            "ER_AI_INVALID_ARGUMENT",
+            "on_error=return must be selected by a DETAIL caller",
+        ));
+    }
+    for path in &m.provider_options_allowed {
+        if path.is_empty()
+            || path.split('.').any(str::is_empty)
+            || super::runtime::reserved_provider_path(path)
+        {
+            return Err(error(
+                "ER_AI_INVALID_ARGUMENT",
+                "invalid or reserved provider option path",
+            ));
+        }
+    }
+    for (path, schema) in &m.provider_options_schema {
+        if !m.provider_options_allowed.contains(path) || super::runtime::contains_ref(schema) {
+            return Err(error(
+                "ER_AI_INVALID_ARGUMENT",
+                "provider option schema must describe an allowed path without references",
+            ));
+        }
+        jsonschema::validator_for(schema)
+            .map_err(|_| error("ER_AI_INVALID_ARGUMENT", "invalid provider option schema"))?;
+    }
     validate_limits(&m.limits)?;
     super::runtime::validate_defaults(m)
 }

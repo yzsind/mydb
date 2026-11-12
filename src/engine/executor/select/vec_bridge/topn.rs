@@ -5954,9 +5954,10 @@ pub(super) fn run_vec_topn_expr_keys(
         .collect();
     let collations = sources
         .iter()
-        .map(|source| match source {
+        .zip(order_by)
+        .map(|(source, order)| match source {
             KeySource::Column(column) => schema.fields()[*column].source.collation_id,
-            KeySource::Program(_) => None,
+            KeySource::Program(_) => computed_sort_collation(&order.expr, &schema),
         })
         .collect();
     let mut acc = vec_topn::TopNAccumulator::new_with_width(specs, k, template.len())?

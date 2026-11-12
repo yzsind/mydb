@@ -4503,3 +4503,245 @@ fn audit1106_boolean_regex_fast_matches_and_fold_fallback_share_one_batch() {
         checked_legacy_column(sql, schema, vec![ColumnVector::from_values(values.clone())]);
     }
 }
+
+#[test]
+fn decimal_conditionals_remain_columnar_and_match_scalar_coercion() {
+    let schema = Arc::new(BatchSchema::new(vec![
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "flag".into(),
+            column_type: ColumnType::Long,
+            source: Default::default(),
+        },
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "x".into(),
+            column_type: ColumnType::Decimal {
+                precision: 12,
+                scale: 2,
+            },
+            source: Default::default(),
+        },
+        BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "y".into(),
+            column_type: ColumnType::Decimal {
+                precision: 15,
+                scale: 3,
+            },
+            source: Default::default(),
+        },
+    ]));
+    let batch = Batch::new(
+        schema.clone(),
+        vec![
+            ColumnVector::from_values(vec![
+                Value::Null,
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(2),
+            ]),
+            ColumnVector::from_values(vec![
+                Value::DecimalCompact(12, 2),
+                Value::Null,
+                Value::DecimalCompact(-999999999999, 2),
+                Value::DecimalCompact(999999999999, 2),
+                Value::DecimalCompact(155, 2),
+            ]),
+            ColumnVector::from_values(vec![
+                Value::DecimalCompact(777, 3),
+                Value::DecimalCompact(-1555, 3),
+                Value::Null,
+                Value::DecimalCompact(999999999999999, 3),
+                Value::DecimalCompact(0, 3),
+            ]),
+        ],
+    );
+    for sql in [
+        "IF(flag>0,x,NULL)",
+        "CASE WHEN flag BETWEEN 1 AND 2 THEN x END",
+        "CASE flag WHEN 0 THEN x WHEN 1 THEN y ELSE NULL END",
+        "IF(flag>0,x,y)",
+        "CASE WHEN flag<0 THEN x+y ELSE y END",
+    ] {
+        let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+        let program = ExprCompiler::compile(
+            &ast,
+            &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+        )
+        .unwrap();
+        assert!(
+            program.column_parallel_safe(&schema),
+            "{sql}: {:?}",
+            program.root
+        );
+        let expected = oracle(&program, &batch).unwrap();
+        let actual = program
+            .try_eval_column(&batch)
+            .unwrap_or_else(|| panic!("kernel declined {sql}"));
+        assert_eq!(
+            (0..batch.num_rows())
+                .map(|row| actual.value_at(row))
+                .collect::<Vec<_>>(),
+            expected,
+            "{sql}"
+        );
+    }
+    // A potentially warning-producing branch must retain scalar short circuit.
+    let ast = crate::parser::parse_expr_fragment("CASE WHEN flag>0 THEN x ELSE x/0 END").unwrap();
+    let program = ExprCompiler::compile(
+        &ast,
+        &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
+    )
+    .unwrap();
+    assert!(program.try_eval_column(&batch).is_none());
+}
+
+#[test]
+fn integer_between_columns_preserve_false_dominance_and_unsigned_bounds() {
+    for sql in [
+        "x BETWEEN NULL AND 0",
+        "x NOT BETWEEN NULL AND 0",
+        "x BETWEEN 0 AND NULL",
+        "x BETWEEN -1 AND 1",
+        "x BETWEEN 1 AND -1",
+    ] {
+        let (_, schema) = compile("x", ColumnType::LongLong);
+        checked_legacy_column(
+            sql,
+            schema,
+            vec![ColumnVector::from_values(vec![
+                Value::Null,
+                Value::Int(i64::MIN),
+                Value::Int(-1),
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(i64::MAX),
+            ])],
+        );
+    }
+    let (_, schema) = compile("x", ColumnType::LongLong);
+    let mut field = schema.fields()[0].clone();
+    field.source.flags |= crate::mysql::protocol::UNSIGNED_FLAG;
+    let schema = Arc::new(BatchSchema::new(vec![field]));
+    for sql in [
+        "x BETWEEN -1 AND 18446744073709551615",
+        "x NOT BETWEEN 0 AND 9223372036854775807",
+        "x BETWEEN NULL AND 0",
+    ] {
+        checked_legacy_column(
+            sql,
+            schema.clone(),
+            vec![ColumnVector::U64 {
+                data: vec![0, 1, i64::MAX as u64, u64::MAX],
+                nulls: None,
+            }],
+        );
+    }
+}
+
+#[test]
+fn constant_exact_division_keeps_scratch_precision_nulls_and_truncation() {
+    for increment in [0, 4, 20, 30] {
+        let mut session = SessionContext::default();
+        session.sysvars.div_precision_increment = increment;
+        session.sql_mode = "ERROR_FOR_DIVISION_BY_ZERO".into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            for sql in ["x/2", "x/-2", "x/3", "x/0.25", "(x-1.25+x)/2", "x/(x*0+2)"] {
+                let (program, schema) = compile(
+                    sql,
+                    ColumnType::Decimal {
+                        precision: 7,
+                        scale: 2,
+                    },
+                );
+                let batch = Batch::new(
+                    schema.clone(),
+                    vec![ColumnVector::from_values(vec![
+                        Value::Null,
+                        Value::DecimalCompact(0, 2),
+                        Value::DecimalCompact(123, 2),
+                        Value::DecimalCompact(-123, 2),
+                        Value::DecimalCompact(9_999_999, 2),
+                    ])],
+                );
+                assert!(
+                    program.column_parallel_safe(&schema),
+                    "{sql}, increment={increment}"
+                );
+                let expected = oracle(&program, &batch).unwrap();
+                let actual = program.try_eval_column(&batch).unwrap();
+                assert_eq!(
+                    (0..batch.num_rows())
+                        .map(|r| actual.value_at(r))
+                        .collect::<Vec<_>>(),
+                    expected,
+                    "{sql}, increment={increment}"
+                );
+            }
+            for sql in ["x/0", "1/x"] {
+                let (program, schema) = compile(
+                    sql,
+                    ColumnType::Decimal {
+                        precision: 7,
+                        scale: 2,
+                    },
+                );
+                assert!(!program.column_parallel_safe(&schema));
+                let batch = Batch::new(
+                    schema,
+                    vec![ColumnVector::from_values(vec![Value::DecimalCompact(0, 2)])],
+                );
+                crate::engine::api::clear_statement_warnings();
+                assert!(program.try_eval_column(&batch).is_none());
+                assert_eq!(crate::engine::api::statement_warning_count(), 0);
+            }
+            parity(
+                "x/3",
+                ColumnType::Decimal {
+                    precision: 38,
+                    scale: 6,
+                },
+                vec![
+                    Value::Decimal128(10i128.pow(38) - 1, 6),
+                    Value::Decimal128(-(10i128.pow(38) - 1), 6),
+                ],
+            );
+        });
+    }
+}
+
+#[test]
+fn arithmetic_narrow_decimal_lanes_match_scalar_at_domain_boundaries() {
+    for (precision, magnitude) in [
+        (4, 9999i128),
+        (12, 999999999999),
+        (25, 9999999999999999999999999),
+    ] {
+        let (program, schema) = compile(
+            "x * 2.0",
+            ColumnType::Decimal {
+                precision,
+                scale: 2,
+            },
+        );
+        let column = ColumnVector::from_values(vec![
+            Value::Null,
+            Value::Decimal128(-magnitude, 2),
+            Value::Decimal128(magnitude, 2),
+            Value::DecimalCompact(0, 2),
+        ]);
+        checked_legacy_column("x * 2.0", schema.clone(), vec![column.clone()]);
+        let batch = Batch::new(schema, vec![column]);
+        let output = program.try_eval_column(&batch).unwrap();
+        assert!(match precision {
+            4 => matches!(output, ColumnVector::Decimal32 { .. }),
+            12 => matches!(output, ColumnVector::Decimal64 { .. }),
+            _ => matches!(output, ColumnVector::Decimal128 { .. }),
+        });
+    }
+}

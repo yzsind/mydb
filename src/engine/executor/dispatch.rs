@@ -33,7 +33,8 @@ pub(in crate::engine::executor) use setop::{
 };
 pub(crate) use setop::{
     combine_set_rows_spillable_charged, combine_set_sources_spillable,
-    unify_setop_declared_column_metadata, IncrementalSetOutput,
+    combine_unordered_set_sources_spillable, unify_setop_declared_column_metadata,
+    IncrementalSetOutput,
 };
 pub(super) use setop::{
     execute_set_operation_branch_response, execute_set_operation_dispatch, execute_subquery,

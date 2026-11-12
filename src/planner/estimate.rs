@@ -611,7 +611,43 @@ pub(super) fn estimate_and_rows(
 
     // Independence-product baseline and fallback. Same-column ordered bounds
     // are coalesced before multiplying selectivities.
-    let independence = || estimate_independent_conjuncts(table, &conjuncts, total_rows, &[]);
+    let independence = || {
+        let independent = estimate_independent_conjuncts(table, &conjuncts, total_rows, &[]);
+        if total_rows <= 0.0 || independent <= 0.0 || table.stats.row_count == 0 {
+            return independent;
+        }
+        // Several non-singleton domains often describe the same underlying
+        // population (for example a product's category, class and brand).
+        // With no joint frequency evidence, multiplying every marginal at
+        // full strength can underprice a fanout lookup by orders of magnitude.
+        // Use exponential backoff for this uncertain case, retaining the
+        // strongest marginal as an upper bound. Single-column restrictions,
+        // exact equalities and proved empty intersections keep their estimates.
+        let mut columns = std::collections::HashSet::new();
+        let mut selectivities = Vec::with_capacity(conjuncts.len());
+        for conjunct in &conjuncts {
+            let Some((column, values)) = estimation_finite_domain(table, conjunct) else {
+                return independent;
+            };
+            if values.len() < 2 || !columns.insert(column) {
+                return independent;
+            }
+            selectivities.push(
+                (estimate_filter_rows(table, conjunct, total_rows) / total_rows).clamp(0.0, 1.0),
+            );
+        }
+        if selectivities.len() < 2 {
+            return independent;
+        }
+        selectivities.sort_by(f64::total_cmp);
+        let mut weight = 1.0;
+        let mut selectivity = 1.0;
+        for marginal in selectivities {
+            selectivity *= marginal.powf(weight);
+            weight *= 0.5;
+        }
+        (total_rows * selectivity).max(independent).min(total_rows)
+    };
 
     if total_rows <= 0.0 || table.stats.row_count == 0 {
         return independence();
@@ -2192,7 +2228,7 @@ pub(super) fn estimate_index_nlj_operator_cost(
         let revisit_coverage = if primary_like {
             distinct_coverage
         } else {
-            (distinct_coverage * batched_estimate.probe_batches).min(1.0)
+            batched_estimate.heap_sweep_coverage(table_pages)
         };
         // A handful of pages can have 100% percentage coverage without being
         // a broad probe in the operational sense. Keep sparse point/batch
@@ -2412,12 +2448,8 @@ pub(super) fn estimate_index_nlj_operator_cost(
         } else {
             0.5
         };
-        let lookup_table_pages = table_pages_for_index_nlj_lookup(
-            &right_table.schema,
-            right_index,
-            table_pages,
-            left_rows,
-        );
+        let lookup_table_pages =
+            table_pages_for_index_nlj_lookup(unique_exact, table_pages, left_rows);
         let mut batched = operator_cost::calibrated_inlj_range_probe(
             ctx,
             height,
@@ -2433,12 +2465,8 @@ pub(super) fn estimate_index_nlj_operator_cost(
         batched.cpu_units /= left_rows.max(1.0);
         batched
     } else {
-        let effective_table_pages = table_pages_for_index_nlj_lookup(
-            &right_table.schema,
-            right_index,
-            table_pages,
-            left_rows,
-        );
+        let effective_table_pages =
+            table_pages_for_index_nlj_lookup(unique_exact, table_pages, left_rows);
         operator_cost::index_lookup(ctx, height, per_match, effective_table_pages, right_width)
     };
     apply_large_secondary_index_nlj_penalty(
@@ -2617,14 +2645,13 @@ pub(super) fn estimate_hash_join_operator_cost(
     // joins use the adaptive in-memory filter, while the vector Grace path
     // builds one before spilling the probe partitions. The adaptive sampler
     // enables at a >=50% miss rate, hence the stable selectivity gate here.
-    // The Grace bitmap caps its sizing input at 8M rows and rounds to a
-    // 134M-bit allocation; beyond roughly 32M inserted keys its false-positive
-    // rate no longer supports the conservative 12.5% costing assumption.
+    // Keep the cost credit conservative at larger cardinalities: bounded
+    // Grace filters can saturate, so a 12.5% false-positive rate is not
+    // justified for arbitrarily large builds.
     const BLOOM_COST_MAX_BUILD_ROWS: f64 = 32_000_000.0;
-    let bloom_applicable = build_rows <= 1_000_000.0
-        || (matches!(join_type, JoinType::Inner | JoinType::Semi)
-            && build_rows <= BLOOM_COST_MAX_BUILD_ROWS
-            && match_rate <= 0.5);
+    let bloom_applicable = matches!(join_type, JoinType::Inner | JoinType::Semi)
+        && (build_rows <= 1_000_000.0
+            || (build_rows <= BLOOM_COST_MAX_BUILD_ROWS && match_rate <= 0.5));
     let runtime_probe = if join_type == JoinType::Inner
         && residual.is_none()
         && left_keys.len() == 1
@@ -2664,8 +2691,16 @@ pub(super) fn estimate_hash_join_operator_cost(
     );
     if runtime_probe.is_none() {
         apply_hash_join_parallel_probe_cost_adjustment(
-            &mut cost, probe_plan, probe_cost, build_rows, probe_rows, join_type, build_side,
-            residual, match_rate,
+            &mut cost,
+            probe_plan,
+            probe_cost,
+            build_rows,
+            probe_rows,
+            join_type,
+            build_side,
+            residual,
+            match_rate,
+            bloom_applicable,
         );
     }
     (cost, build_side, output_est)

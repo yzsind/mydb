@@ -2,15 +2,47 @@
 
 use super::*;
 
-/// Incremental reader for a grace-join value partition. Values are decoded
-/// directly into the original typed lanes; at most one Batch is resident.
+/// Incremental replay of value rows or columnar partition blocks. Small blocks
+/// are coalesced into bounded, capacity-tight typed morsels.
 pub(super) struct VecJoinSpillBatchStream {
     pub(super) schema: Arc<BatchSchema>,
     pub(super) batch_rows: usize,
     pub(super) reader: Option<crate::engine::executor::select::grace::ValueRowReader>,
+    columnar_reader: Option<crate::engine::executor::spill_quota::TrackedSpillReader>,
 }
 
 impl VecJoinSpillBatchStream {
+    fn open_columnar(
+        path: &std::path::Path,
+        schema: Arc<BatchSchema>,
+        charger: crate::engine::executor::spill_quota::SpillCharger,
+    ) -> Result<Self, QueryError> {
+        let reader = if charger.absent_partition(path)? {
+            None
+        } else {
+            Some(
+                crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                    path,
+                    charger,
+                    crate::engine::executor::spill_quota::writer_buffer_capacity(
+                        scheduler_hash_join_workers().max(1) * 2,
+                    ),
+                )?,
+            )
+        };
+        let batch_bytes = mem_budget::current_budget()
+            .map(|budget| budget.limit() / scheduler_hash_join_workers().max(1) / 8)
+            .unwrap_or(1024 * 1024);
+        let batch_rows = (batch_bytes / schema.len().max(1) / std::mem::size_of::<Value>())
+            .clamp(1, DEFAULT_BATCH_ROWS);
+        Ok(Self {
+            schema,
+            batch_rows,
+            reader: None,
+            columnar_reader: reader,
+        })
+    }
+
     pub(super) fn open(
         path: &std::path::Path,
         schema: Arc<BatchSchema>,
@@ -35,6 +67,7 @@ impl VecJoinSpillBatchStream {
         Ok(Self {
             schema,
             batch_rows,
+            columnar_reader: None,
             reader: crate::engine::executor::select::grace::ValueRowReader::open_with_capacity(
                 path, charger, capacity,
             )?,
@@ -48,6 +81,92 @@ impl BatchOperator for VecJoinSpillBatchStream {
     }
 
     fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        if let Some(reader) = self.columnar_reader.as_mut() {
+            crate::engine::cancel::check_cancelled()?;
+            let Some(first) =
+                crate::engine::executor::vec::spill::read_owned_batch(reader, self.schema.clone())?
+            else {
+                self.columnar_reader = None;
+                return Ok(None);
+            };
+            let target_bytes = reader.decode_limit();
+            if first.num_rows() >= self.batch_rows || first.memory_bytes() >= target_bytes {
+                return Ok(Some(first));
+            }
+            // Radix routing can make each persisted block much smaller than a
+            // useful probe morsel. Coalesce bounded blocks before the join so
+            // codec compression does not multiply hash-kernel/batch overhead.
+            let mut rows = first.num_rows();
+            let mut charge = reader.memory_charge();
+            charge.add_force(first.resident_bytes())?;
+            let (mut columns, owner) = first.into_columns()?.into_parts();
+            drop(owner);
+            let mut bytes = columns
+                .iter()
+                .map(ColumnVector::memory_bytes)
+                .sum::<usize>();
+            let mut exhausted = false;
+            while rows < self.batch_rows && bytes < target_bytes {
+                let Some(next) = crate::engine::executor::vec::spill::read_owned_batch(
+                    reader,
+                    self.schema.clone(),
+                )?
+                else {
+                    exhausted = true;
+                    break;
+                };
+                let next_rows = next.num_rows();
+                // Reserve for vector growth, old/new buffer overlap and a
+                // possible lossless promotion from typed lanes to Generic.
+                let scratch = bytes
+                    .saturating_add(next.memory_bytes())
+                    .saturating_add(
+                        rows.saturating_add(next_rows)
+                            .saturating_mul(columns.len())
+                            .saturating_mul(std::mem::size_of::<Value>()),
+                    )
+                    .saturating_add(next_rows.saturating_mul(std::mem::size_of::<usize>()));
+                charge.add_force(scratch)?;
+                let indices = (0..next_rows).collect::<Vec<_>>();
+                for (column, incoming) in columns.iter_mut().zip(next.columns()) {
+                    column.append_rows_from(incoming, &indices);
+                }
+                rows = rows.saturating_add(next_rows);
+                bytes = columns
+                    .iter()
+                    .map(ColumnVector::memory_bytes)
+                    .sum::<usize>();
+                drop(indices);
+                let resident = bytes
+                    .saturating_add(
+                        columns
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<ColumnVector>()),
+                    )
+                    .saturating_add(128);
+                if resident > charge.charged() {
+                    charge.add_force(resident - charge.charged())?;
+                }
+                charge.release_bytes(charge.charged().saturating_sub(resident));
+            }
+            if exhausted {
+                self.columnar_reader = None;
+            }
+            // Vec growth can leave nearly twice the visible payload live.
+            // A replay build is admitted by capacity, so retaining that slack
+            // can repartition an otherwise fitting file. Compact once at the
+            // morsel boundary, with both buffers reserved during the copy.
+            charge.add_force(bytes.saturating_add(rows.saturating_mul(4)))?;
+            let indices = (0..rows).map(|row| row as u32).collect::<Vec<_>>();
+            columns = columns
+                .iter()
+                .map(|column| column.take_indices(&indices))
+                .collect();
+            drop(indices);
+            return Batch::with_row_count(self.schema.clone(), columns, rows)
+                .with_memory_charge(charge)
+                .map(Some);
+        }
         let Some(reader) = self.reader.as_mut() else {
             return Ok(None);
         };
@@ -116,6 +235,16 @@ pub(super) fn drain_vec_join_build_to_cap_impl(
     ),
     QueryError,
 > {
+    drain_vec_join_build_with_index_bytes(build, cap, work_area, replay_progress_bytes, None)
+}
+
+pub(super) fn drain_vec_join_build_with_index_bytes(
+    build: &mut dyn BatchOperator,
+    cap: vec_hash_join::BuildCap,
+    work_area: Option<&crate::engine::executor::work_area::WorkAreaHandle>,
+    replay_progress_bytes: usize,
+    index_bytes_per_row: Option<u64>,
+) -> Result<(Vec<Batch>, bool, mem_budget::ScopedCharge), QueryError> {
     let mut batches = Vec::new();
     let mut memory_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     // Pipeline borrowing can cover overlapping producers, but it must not
@@ -130,8 +259,11 @@ pub(super) fn drain_vec_join_build_to_cap_impl(
         crate::engine::cancel::check_cancelled()?;
         let batch_rows = batch.visible_rows() as u64;
         rows = rows.saturating_add(batch_rows);
-        let batch_bytes = (batch.memory_bytes() as u64)
-            .saturating_add(vec_hash_join::estimate_build_index_bytes(batch_rows));
+        let batch_bytes =
+            (batch.memory_bytes() as u64).saturating_add(index_bytes_per_row.map_or_else(
+                || vec_hash_join::estimate_build_index_bytes(batch_rows),
+                |bytes| bytes.saturating_mul(batch_rows),
+            ));
         bytes = bytes.saturating_add(batch_bytes);
         let resident_bytes = batch_bytes.min(usize::MAX as u64) as usize;
         let memory_wants_spill = match memory_charge.add(resident_bytes) {
@@ -391,12 +523,253 @@ impl GraceRangePartitioning {
     }
 }
 
+/// Partition files contain bounded columnar blocks. Small fixed-width inputs
+/// share a governed coalescing budget; LRU reopening bounds active writers
+/// while preserving the file quota and checksums.
+pub(super) struct VecJoinSpillWriterPool {
+    paths: Vec<std::path::PathBuf>,
+    charger: crate::engine::executor::spill_quota::SpillCharger,
+    slots: Vec<
+        Option<(
+            crate::engine::executor::spill_quota::TrackedSpillWriter,
+            u64,
+        )>,
+    >,
+    max_open: usize,
+    epoch: u64,
+    bytes: u64,
+    pending: Vec<Option<PendingSpillBatch>>,
+    buffer_charge: mem_budget::ScopedCharge,
+    buffer_cap: usize,
+}
+
+struct PendingSpillBatch {
+    batch: Batch,
+    bytes: usize,
+}
+
+impl VecJoinSpillWriterPool {
+    fn new(
+        dir: &std::path::Path,
+        prefix: &str,
+        partitions: usize,
+        charger: crate::engine::executor::spill_quota::SpillCharger,
+        max_open: usize,
+    ) -> Self {
+        let buffer_cap = mem_budget::current_budget()
+            .map_or(8 * 1024 * 1024, |budget| budget.limit() / 64)
+            .min(8 * 1024 * 1024);
+        let mut buffer_charge = mem_budget::ScopedCharge::new(0);
+        let metadata = partitions.saturating_mul(std::mem::size_of::<Option<PendingSpillBatch>>());
+        let pending = if buffer_charge.add_within(metadata, buffer_cap) {
+            (0..partitions).map(|_| None).collect()
+        } else {
+            Vec::new()
+        };
+        Self {
+            paths: (0..partitions)
+                .map(|index| dir.join(format!("{prefix}-{index}")))
+                .collect(),
+            charger,
+            slots: (0..partitions).map(|_| None).collect(),
+            max_open: max_open.max(1).min(partitions.max(1)),
+            epoch: 0,
+            bytes: 0,
+            pending,
+            buffer_charge,
+            buffer_cap,
+        }
+    }
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+    fn write(&mut self, partition: usize, batch: &Batch) -> Result<(), QueryError> {
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.slots[partition].is_none() {
+            if self.slots.iter().filter(|slot| slot.is_some()).count() >= self.max_open {
+                let evict = self
+                    .slots
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(index, slot)| slot.as_ref().map(|(_, epoch)| (index, *epoch)))
+                    .min_by_key(|(_, epoch)| *epoch)
+                    .unwrap()
+                    .0;
+                if let Some((writer, _)) = self.slots[evict].take() {
+                    self.bytes = self.bytes.saturating_add(writer.finish()?);
+                }
+            }
+            let writer = crate::engine::executor::spill_quota::TrackedSpillWriter::open_append(
+                &self.paths[partition],
+                self.charger.clone(),
+                crate::engine::executor::spill_quota::writer_buffer_capacity(self.max_open),
+            )?;
+            self.slots[partition] = Some((writer, self.epoch));
+        }
+        let (writer, epoch) = self.slots[partition].as_mut().unwrap();
+        *epoch = self.epoch;
+        crate::engine::executor::vec::spill::write_batch(writer, batch)
+    }
+
+    fn flush_pending(&mut self, partition: usize) -> Result<(), QueryError> {
+        if let Some(pending) = self.pending[partition].take() {
+            self.write(partition, &pending.batch)?;
+            let bytes = pending.bytes;
+            drop(pending);
+            self.buffer_charge.release_bytes(bytes);
+        }
+        Ok(())
+    }
+
+    fn reserve_buffer(&mut self, bytes: usize) -> Result<bool, QueryError> {
+        if bytes > self.buffer_cap {
+            return Ok(false);
+        }
+        loop {
+            if self.buffer_charge.add_within(bytes, self.buffer_cap) {
+                return Ok(true);
+            }
+            let Some((largest, _)) = self
+                .pending
+                .iter()
+                .enumerate()
+                .filter_map(|(index, pending)| {
+                    pending.as_ref().map(|pending| (index, pending.bytes))
+                })
+                .max_by_key(|(_, bytes)| *bytes)
+            else {
+                return Ok(false);
+            };
+            self.flush_pending(largest)?;
+        }
+    }
+
+    /// Radix routing commonly emits only a handful of rows per block.
+    /// Coalesce predictable typed lanes before encoding, so replay does not
+    /// allocate and charge every column once per tiny input fragment.
+    fn append(&mut self, partition: usize, batch: Batch) -> Result<(), QueryError> {
+        if self.pending.is_empty() {
+            return self.write(partition, &batch);
+        }
+        let fixed = batch.selection().is_none()
+            && batch.columns().iter().all(|column| {
+                matches!(
+                    column,
+                    ColumnVector::Null { .. }
+                        | ColumnVector::Bool { .. }
+                        | ColumnVector::I64 { .. }
+                        | ColumnVector::U64 { .. }
+                        | ColumnVector::F64 { .. }
+                        | ColumnVector::Date32 { .. }
+                        | ColumnVector::Time64 { .. }
+                        | ColumnVector::DateTime64 { .. }
+                        | ColumnVector::Timestamp64 { .. }
+                        | ColumnVector::Decimal32 { .. }
+                        | ColumnVector::Decimal64 { .. }
+                        | ColumnVector::Decimal128 { .. }
+                )
+            });
+        let target_rows = DEFAULT_BATCH_ROWS.min(1024);
+        if !fixed || batch.num_rows() >= target_rows {
+            self.flush_pending(partition)?;
+            return self.write(partition, &batch);
+        }
+        let compatible = self.pending[partition].as_ref().is_none_or(|pending| {
+            Arc::ptr_eq(pending.batch.schema(), batch.schema())
+                && pending.batch.columns().len() == batch.columns().len()
+                && pending
+                    .batch
+                    .columns()
+                    .iter()
+                    .zip(batch.columns())
+                    .all(|(left, right)| {
+                        std::mem::discriminant(left) == std::mem::discriminant(right)
+                            && left.decimal_scale() == right.decimal_scale()
+                    })
+        });
+        if !compatible {
+            self.flush_pending(partition)?;
+        }
+        let metadata = batch
+            .columns()
+            .len()
+            .saturating_mul(std::mem::size_of::<ColumnVector>())
+            .saturating_add(128);
+        let bytes = batch.memory_bytes().saturating_add(metadata);
+        if let Some(pending) = self.pending[partition].take() {
+            // The old arrays and their replacements may coexist during Vec
+            // growth. The incoming block is still covered by the caller's
+            // gather reservation; reserve the old/new overlap before copying.
+            let rows = pending.batch.num_rows().saturating_add(batch.num_rows());
+            let extra = rows
+                .saturating_mul(batch.columns().len())
+                // Reserve geometric growth at the widest admitted lane,
+                // including new validity masks and column metadata.
+                .saturating_mul(2 * std::mem::size_of::<i128>() + 2)
+                .saturating_add(metadata.saturating_mul(2))
+                .saturating_add(
+                    batch
+                        .num_rows()
+                        .saturating_mul(std::mem::size_of::<usize>()),
+                );
+            if self.reserve_buffer(extra)? {
+                let schema = pending.batch.schema().clone();
+                let old = pending.bytes;
+                let (mut columns, owner) = pending.batch.into_columns()?.into_parts();
+                let indices = (0..batch.num_rows()).collect::<Vec<_>>();
+                for (target, input) in columns.iter_mut().zip(batch.columns()) {
+                    target.append_rows_from(input, &indices);
+                }
+                drop(owner);
+                let merged = Batch::with_row_count(schema, columns, rows);
+                let retained = merged.memory_bytes().saturating_add(metadata);
+                debug_assert!(retained <= old.saturating_add(extra));
+                self.buffer_charge
+                    .release_bytes(old.saturating_add(extra).saturating_sub(retained));
+                self.pending[partition] = Some(PendingSpillBatch {
+                    batch: merged,
+                    bytes: retained,
+                });
+                if rows >= target_rows {
+                    self.flush_pending(partition)?;
+                }
+                return Ok(());
+            }
+            // No optional workspace remains. Persist the retained prefix and
+            // the new block directly without retrying or dropping either.
+            self.write(partition, &pending.batch)?;
+            let bytes = pending.bytes;
+            drop(pending);
+            self.buffer_charge.release_bytes(bytes);
+            return self.write(partition, &batch);
+        }
+        if self.reserve_buffer(bytes)? {
+            self.pending[partition] = Some(PendingSpillBatch { batch, bytes });
+            Ok(())
+        } else {
+            self.write(partition, &batch)
+        }
+    }
+
+    fn finish(mut self) -> Result<u64, QueryError> {
+        for partition in 0..self.pending.len() {
+            self.flush_pending(partition)?;
+        }
+        for slot in &mut self.slots {
+            if let Some((writer, _)) = slot.take() {
+                self.bytes = self.bytes.saturating_add(writer.finish()?);
+            }
+        }
+        Ok(self.bytes)
+    }
+}
+
 pub(super) fn spill_vec_join_batch(
     batch: &Batch,
     keys: &[usize],
     null_safe: &[bool],
     key_collations: &[Option<u16>],
-    writers: &mut crate::engine::executor::select::grace::LazyValueRowWriterPool,
+    writers: &mut VecJoinSpillWriterPool,
     null_sequence: &mut u64,
     depth: u32,
     range: Option<&GraceRangePartitioning>,
@@ -404,6 +777,13 @@ pub(super) fn spill_vec_join_batch(
     filter_probe: bool,
 ) -> Result<u64, QueryError> {
     let partitions = writers.len();
+    let _routing_charge = mem_budget::force_charge_scoped(
+        batch
+            .visible_rows()
+            .saturating_mul(8)
+            .saturating_add(partitions.saturating_mul(std::mem::size_of::<Vec<u32>>())),
+    )?;
+    let mut routed: Vec<Vec<u32>> = (0..partitions).map(|_| Vec::new()).collect();
     let mut key = Vec::with_capacity(64);
     let mut filtered = 0u64;
     let component_prefilter_available =
@@ -473,7 +853,26 @@ pub(super) fn spill_vec_join_batch(
             *null_sequence = null_sequence.saturating_add(1);
             partition
         };
-        writers.append_batch_row(partition, batch, row_idx)?;
+        routed[partition].push(row_idx as u32);
+    }
+    for (partition, indices) in routed.iter().enumerate() {
+        if indices.is_empty() {
+            continue;
+        }
+        crate::engine::cancel::check_cancelled()?;
+        // At most one gathered partition batch is live. The ordinary spill
+        // codec preserves every lane type, null bitmap and decimal scale.
+        let _gather_charge = mem_budget::force_charge_scoped(batch.memory_bytes())?;
+        let compact = Batch::with_row_count(
+            batch.schema().clone(),
+            batch
+                .columns()
+                .iter()
+                .map(|column| column.take_indices(indices))
+                .collect(),
+            indices.len(),
+        );
+        writers.append(partition, compact)?;
     }
     Ok(filtered)
 }
@@ -580,7 +979,7 @@ pub(super) fn run_vec_hot_build_chunk(
 ) -> Result<(), QueryError> {
     let build_batches = value_row_slice_to_batches(build_schema.clone(), rows);
     let mut build = MaterializedBatchOperator::new(build_schema, build_batches);
-    let mut probe = VecJoinSpillBatchStream::open(probe_path, probe_schema, charger)?;
+    let mut probe = VecJoinSpillBatchStream::open_columnar(probe_path, probe_schema, charger)?;
     if matches!(
         join_type,
         crate::parser::JoinType::Semi | crate::parser::JoinType::Anti
@@ -664,7 +1063,7 @@ pub(super) fn run_vec_hot_partition_chunked(
         || (join_type == crate::parser::JoinType::Right && build_cols_first);
 
     let mut build =
-        VecJoinSpillBatchStream::open(build_path, build_schema.clone(), charger.clone())?;
+        VecJoinSpillBatchStream::open_columnar(build_path, build_schema.clone(), charger.clone())?;
     let max_rows = if build_cap.max_rows == 0 {
         u64::MAX
     } else {
@@ -810,7 +1209,7 @@ pub(super) fn run_vec_hot_partition_chunked(
     };
     let mut final_rows = Vec::new();
     let mut probe =
-        VecJoinSpillBatchStream::open(probe_path, probe_schema.clone(), charger.clone())?;
+        VecJoinSpillBatchStream::open_columnar(probe_path, probe_schema.clone(), charger.clone())?;
     while let Some(batch) = probe.next_batch()? {
         for row_idx in batch.visible_indices() {
             crate::engine::cancel::check_cancelled()?;
@@ -852,7 +1251,8 @@ pub(super) fn run_vec_hot_partition_chunked(
     if preserve_build {
         let join_spec = spec.expect("build-preserved hot partition spec");
         let null_probe = vec![Value::Null; probe_schema.fields().len()];
-        let mut build = VecJoinSpillBatchStream::open(build_path, build_schema.clone(), charger)?;
+        let mut build =
+            VecJoinSpillBatchStream::open_columnar(build_path, build_schema.clone(), charger)?;
         while let Some(batch) = build.next_batch()? {
             for row_idx in batch.visible_indices() {
                 let build_row = batch.row(row_idx);
@@ -983,6 +1383,7 @@ impl GraceJoinOutput {
         db: &Arc<Database>,
         schema: Arc<BatchSchema>,
         produce: impl FnOnce(&mut dyn FnMut(Batch) -> Result<(), QueryError>) -> Result<(), QueryError>,
+        output_columns: Option<&[bool]>,
     ) -> Result<Self, QueryError> {
         let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
             db.data_dir(),
@@ -993,7 +1394,29 @@ impl GraceJoinOutput {
             dir.charger(),
             32 * 1024,
         )?;
-        produce(&mut |batch| {
+        produce(&mut |mut batch| {
+            if let Some(retained) = output_columns {
+                if retained.len() != batch.columns().len() {
+                    return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                        .error("Grace output projection width mismatch"));
+                }
+                // Dead columns are never observed above the planned projection.
+                // Null lanes preserve its indices with constant-size encoding,
+                // without copying retained buffers or encoding unused values.
+                let selection = batch.selection().cloned();
+                let schema = batch.schema().clone();
+                let rows = batch.num_rows();
+                let mut columns = batch.take_columns()?;
+                for (column, &keep) in columns.iter_mut().zip(retained) {
+                    if !keep {
+                        *column = ColumnVector::Null { len: rows };
+                    }
+                }
+                batch = Batch::from_owned_columns(schema, columns);
+                if let Some(selection) = selection {
+                    batch = batch.with_selection(selection);
+                }
+            }
             let _charge = mem_budget::force_charge_scoped(batch.memory_bytes())?;
             if batch.selection().is_some() {
                 let indices = batch
@@ -1098,6 +1521,7 @@ pub(super) fn run_vec_grace_partition(
     build_cap: vec_hash_join::BuildCap,
     max_depth: u32,
     depth: u32,
+    output_columns: Option<&[bool]>,
 ) -> Result<GraceJoinOutput, QueryError> {
     let output_schema = match join_type {
         crate::parser::JoinType::Semi | crate::parser::JoinType::Anti => semi_out_schema.clone(),
@@ -1108,9 +1532,9 @@ pub(super) fn run_vec_grace_partition(
     let build_path = tmp_path.join(format!("build-{partition}"));
     let probe_path = tmp_path.join(format!("probe-{partition}"));
     let mut build =
-        VecJoinSpillBatchStream::open(&build_path, build_schema.clone(), charger.clone())?;
+        VecJoinSpillBatchStream::open_columnar(&build_path, build_schema.clone(), charger.clone())?;
     let mut probe =
-        VecJoinSpillBatchStream::open(&probe_path, probe_schema.clone(), charger.clone())?;
+        VecJoinSpillBatchStream::open_columnar(&probe_path, probe_schema.clone(), charger.clone())?;
     let (build_prefix, overflow, build_memory_charge) = drain_vec_join_build_to_cap_impl(
         &mut build,
         build_cap,
@@ -1131,25 +1555,30 @@ pub(super) fn run_vec_grace_partition(
             drop(build_memory_charge);
             drop(build);
             drop(probe);
-            return GraceJoinOutput::write_from(db, output_schema, |emit| {
-                run_vec_hot_partition_chunked(
-                    &build_path,
-                    &probe_path,
-                    build_schema,
-                    probe_schema,
-                    charger,
-                    build_keys,
-                    probe_keys,
-                    null_safe,
-                    key_collations,
-                    join_type,
-                    spec,
-                    semi_out_schema,
-                    semi_residual,
-                    build_cap,
-                    emit,
-                )
-            });
+            return GraceJoinOutput::write_from(
+                db,
+                output_schema,
+                |emit| {
+                    run_vec_hot_partition_chunked(
+                        &build_path,
+                        &probe_path,
+                        build_schema,
+                        probe_schema,
+                        charger,
+                        build_keys,
+                        probe_keys,
+                        null_safe,
+                        key_collations,
+                        join_type,
+                        spec,
+                        semi_out_schema,
+                        semi_residual,
+                        build_cap,
+                        emit,
+                    )
+                },
+                output_columns,
+            );
         }
         return run_vec_grace_hash_join_stream(
             db,
@@ -1171,54 +1600,61 @@ pub(super) fn run_vec_grace_partition(
             max_depth,
             depth + 1,
             false,
+            output_columns,
         );
     }
 
     let mut build = MaterializedBatchOperator::new(build_schema.clone(), build_prefix);
     let batch_rows = probe.batch_rows;
     let result = vec_hash_join::with_vec_build_cap(build_cap, || {
-        GraceJoinOutput::write_from(db, output_schema.clone(), |emit| match join_type {
-            crate::parser::JoinType::Inner => vec_hash_join::run_inner_hash_join_into(
-                &mut build,
-                &mut probe,
-                spec.expect("inner grace spec"),
-                batch_rows,
-                emit,
-            ),
-            crate::parser::JoinType::Left
-            | crate::parser::JoinType::Right
-            | crate::parser::JoinType::Full => {
-                let spec = spec.expect("outer grace spec");
-                let preserve_build = join_type == crate::parser::JoinType::Full
-                    || (join_type == crate::parser::JoinType::Left && spec.build_cols_first)
-                    || (join_type == crate::parser::JoinType::Right && !spec.build_cols_first);
-                let preserve_probe = join_type == crate::parser::JoinType::Full || !preserve_build;
-                vec_hash_join::run_outer_hash_join_into(
+        GraceJoinOutput::write_from(
+            db,
+            output_schema.clone(),
+            |emit| match join_type {
+                crate::parser::JoinType::Inner => vec_hash_join::run_inner_hash_join_into(
                     &mut build,
                     &mut probe,
-                    spec,
-                    preserve_probe,
-                    preserve_build,
+                    spec.expect("inner grace spec"),
                     batch_rows,
                     emit,
-                )
-            }
-            crate::parser::JoinType::Semi | crate::parser::JoinType::Anti => {
-                vec_hash_join::run_semi_anti_hash_join_into(
-                    &mut build,
-                    &mut probe,
-                    build_keys,
-                    probe_keys,
-                    key_collations,
-                    null_safe,
-                    join_type == crate::parser::JoinType::Anti,
-                    semi_out_schema.clone(),
-                    semi_residual.clone(),
-                    emit,
-                )
-            }
-            _ => unreachable!("preflighted vec grace join type"),
-        })
+                ),
+                crate::parser::JoinType::Left
+                | crate::parser::JoinType::Right
+                | crate::parser::JoinType::Full => {
+                    let spec = spec.expect("outer grace spec");
+                    let preserve_build = join_type == crate::parser::JoinType::Full
+                        || (join_type == crate::parser::JoinType::Left && spec.build_cols_first)
+                        || (join_type == crate::parser::JoinType::Right && !spec.build_cols_first);
+                    let preserve_probe =
+                        join_type == crate::parser::JoinType::Full || !preserve_build;
+                    vec_hash_join::run_outer_hash_join_into(
+                        &mut build,
+                        &mut probe,
+                        spec,
+                        preserve_probe,
+                        preserve_build,
+                        batch_rows,
+                        emit,
+                    )
+                }
+                crate::parser::JoinType::Semi | crate::parser::JoinType::Anti => {
+                    vec_hash_join::run_semi_anti_hash_join_into(
+                        &mut build,
+                        &mut probe,
+                        build_keys,
+                        probe_keys,
+                        key_collations,
+                        null_safe,
+                        join_type == crate::parser::JoinType::Anti,
+                        semi_out_schema.clone(),
+                        semi_residual.clone(),
+                        emit,
+                    )
+                }
+                _ => unreachable!("preflighted vec grace join type"),
+            },
+            output_columns,
+        )
     });
     match result {
         Ok(output) => Ok(output),
@@ -1238,29 +1674,35 @@ pub(super) fn run_vec_grace_partition(
             drop(build_memory_charge);
             drop(probe);
             if depth >= max_depth {
-                return GraceJoinOutput::write_from(db, output_schema, |emit| {
-                    run_vec_hot_partition_chunked(
-                        &build_path,
-                        &probe_path,
-                        build_schema,
-                        probe_schema,
-                        charger,
-                        build_keys,
-                        probe_keys,
-                        null_safe,
-                        key_collations,
-                        join_type,
-                        spec,
-                        semi_out_schema,
-                        semi_residual,
-                        build_cap,
-                        emit,
-                    )
-                });
+                return GraceJoinOutput::write_from(
+                    db,
+                    output_schema,
+                    |emit| {
+                        run_vec_hot_partition_chunked(
+                            &build_path,
+                            &probe_path,
+                            build_schema,
+                            probe_schema,
+                            charger,
+                            build_keys,
+                            probe_keys,
+                            null_safe,
+                            key_collations,
+                            join_type,
+                            spec,
+                            semi_out_schema,
+                            semi_residual,
+                            build_cap,
+                            emit,
+                        )
+                    },
+                    output_columns,
+                );
             }
             let mut build =
-                VecJoinSpillBatchStream::open(&build_path, build_schema, charger.clone())?;
-            let mut probe = VecJoinSpillBatchStream::open(&probe_path, probe_schema, charger)?;
+                VecJoinSpillBatchStream::open_columnar(&build_path, build_schema, charger.clone())?;
+            let mut probe =
+                VecJoinSpillBatchStream::open_columnar(&probe_path, probe_schema, charger)?;
             run_vec_grace_hash_join_stream(
                 db,
                 txn,
@@ -1281,6 +1723,7 @@ pub(super) fn run_vec_grace_partition(
                 max_depth,
                 depth + 1,
                 false,
+                output_columns,
             )
         }
         Err(error) => Err(error),
@@ -1428,6 +1871,7 @@ pub(super) fn run_vec_grace_hash_join(
         max_depth,
         depth,
         false,
+        None,
     )?
     .collect()
 }
@@ -1453,6 +1897,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
     max_depth: u32,
     depth: u32,
     prefer_key_locality: bool,
+    output_columns: Option<&[bool]>,
 ) -> Result<GraceJoinOutput, QueryError> {
     crate::engine::executor::select::plan::HASH_JOIN_GRACE_MAX_DEPTH
         .fetch_max(depth as u64, std::sync::atomic::Ordering::Relaxed);
@@ -1477,24 +1922,18 @@ pub(super) fn run_vec_grace_hash_join_stream(
         db.data_dir(),
         "vec-hashjoin",
     )?;
-    let mut build_writers =
-        crate::engine::executor::select::grace::LazyValueRowWriterPool::new_with_concurrent_pools(
-            tmp.path(),
-            "build",
-            partitions,
-            build_schema.fields().len(),
-            tmp.charger(),
-            partitions.min(256),
-            1,
-        );
+    let mut build_writers = VecJoinSpillWriterPool::new(
+        tmp.path(),
+        "build",
+        partitions,
+        tmp.charger(),
+        partitions.min(256),
+    );
 
-    // Size from the already materialised crossing prefix.  It is a stable
+    // Size from the already materialised crossing prefix. It is a stable
     // lower bound available without rescanning or consulting live memory.
-    // Capping the estimate bounds this optional filter at 16 MiB (the Bloom
-    // layout is a power of two); a larger actual build only raises the false
-    // positive rate and can never change results. The reservation is attached
-    // to the bitmap and follows every pushed runtime-filter Arc until its last
-    // owner releases it.
+    // A bounded filter may admit false positives on larger builds, but it
+    // never discards a matching row. Its charge follows pushed filter Arcs.
     let prefix_rows = build_prefix
         .iter()
         .map(|batch| batch.visible_rows())
@@ -1536,6 +1975,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                     crate::engine::executor::select::bloom::BloomFilter::new(bloom_entries)
                 };
                 filter.attach_charge(charge.clone());
+                filter.enable_dense_int(budget.clone());
                 if use_components {
                     let mut filters = Vec::with_capacity(component_count);
                     filters.push((0, filter));
@@ -1548,6 +1988,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                             crate::engine::executor::select::bloom::BloomFilter::new(bloom_entries)
                         };
                         filter.attach_charge(charge.clone());
+                        filter.enable_dense_int(budget.clone());
                         (component, filter)
                     }));
                     GraceProbeBloom::Components(filters)
@@ -1635,16 +2076,13 @@ pub(super) fn run_vec_grace_hash_join_stream(
     // writers; keeping both pools alive halved every writer buffer and doubled
     // the live descriptor set without enabling any overlap.
     let build_spill_bytes = build_writers.finish()?;
-    let mut probe_writers =
-        crate::engine::executor::select::grace::LazyValueRowWriterPool::new_with_concurrent_pools(
-            tmp.path(),
-            "probe",
-            partitions,
-            probe_schema.fields().len(),
-            tmp.charger(),
-            partitions.min(256),
-            1,
-        );
+    let mut probe_writers = VecJoinSpillWriterPool::new(
+        tmp.path(),
+        "probe",
+        partitions,
+        tmp.charger(),
+        partitions.min(256),
+    );
     let pushed_bloom_rejected = push_vec_grace_probe_bloom(
         &mut grace_bloom,
         probe,
@@ -1752,6 +2190,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                 replay_cap,
                 max_depth,
                 depth,
+                output_columns,
             )?;
             output.append(batches);
         }
@@ -1805,6 +2244,7 @@ pub(super) fn run_vec_grace_hash_join_stream(
                                     replay_cap,
                                     max_depth,
                                     depth,
+                                    output_columns,
                                 )?;
                                 local.push((partition, batches));
                             }
@@ -1857,3 +2297,309 @@ pub(crate) static VEC_HASH_JOIN_RANGE_PARTITION_COUNT: std::sync::atomic::Atomic
     std::sync::atomic::AtomicU64::new(0);
 pub(crate) static VEC_HASH_JOIN_GRACE_PARALLEL_WORKERS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+mod columnar_partition_tests {
+    use super::*;
+
+    #[test]
+    fn tiny_fixed_partition_blocks_coalesce_before_encoding_and_release_memory() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let budget = Arc::new(mem_budget::MemBudget::new(8 * 1024 * 1024));
+        mem_budget::with_query_budget(budget.clone(), || {
+            let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                root.path(),
+                "coalesced-partitions",
+            )
+            .unwrap();
+            let schema = Arc::new(BatchSchema::new(
+                [
+                    ColumnType::LongLong,
+                    ColumnType::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                    ColumnType::Date,
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, column_type)| BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: format!("c{index}"),
+                    column_type,
+                    source: Default::default(),
+                })
+                .collect(),
+            ));
+            let batch = Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(
+                        (0..16)
+                            .map(|i| {
+                                if i == 3 {
+                                    Value::Null
+                                } else {
+                                    Value::Int(i - 8)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values(
+                        (0..16)
+                            .map(|i| {
+                                if i == 7 {
+                                    Value::Null
+                                } else {
+                                    Value::DecimalCompact(i * 19, 2)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values((0..16).map(|i| Value::Date(19000 + i)).collect()),
+                ],
+            )
+            .with_selection(Selection::Indices(vec![
+                15, 0, 3, 1, 7, 1, 2, 4, 5, 6, 8, 9, 10, 11, 12, 13,
+            ]));
+            let mut expected = Vec::new();
+            let mut writers = VecJoinSpillWriterPool::new(dir.path(), "build", 1, dir.charger(), 1);
+            for _ in 0..65 {
+                spill_vec_join_batch(
+                    &batch,
+                    &[0],
+                    &[false],
+                    &[None],
+                    &mut writers,
+                    &mut 0,
+                    0,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                assert!(writers.buffer_charge.charged() <= writers.buffer_cap);
+                expected.extend(
+                    batch
+                        .visible_indices()
+                        .map(|row| format!("{:?}", batch.row(row))),
+                );
+            }
+            writers.finish().unwrap();
+            let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                &dir.path().join("build-0"),
+                dir.charger(),
+                4096,
+            )
+            .unwrap();
+            let mut actual = Vec::new();
+            let mut blocks = 0;
+            while let Some(batch) =
+                crate::engine::executor::vec::spill::read_owned_batch(&mut reader, schema.clone())
+                    .unwrap()
+            {
+                blocks += 1;
+                actual.extend(
+                    batch
+                        .visible_indices()
+                        .map(|row| format!("{:?}", batch.row(row))),
+                );
+            }
+            assert_eq!(
+                blocks, 2,
+                "65 tiny blocks must be encoded as two bounded blocks"
+            );
+            assert_eq!(actual, expected);
+        });
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.spill_bytes(), 0);
+    }
+
+    #[test]
+    fn partition_coalescing_flushes_type_and_scale_changes_with_small_budgets() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        for memory in [32 * 1024, 8 * 1024 * 1024] {
+            let budget = Arc::new(mem_budget::MemBudget::new(memory));
+            mem_budget::with_query_budget(budget.clone(), || {
+                let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                    root.path(),
+                    "coalesced-drift",
+                )
+                .unwrap();
+                let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "v".into(),
+                    column_type: ColumnType::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                    source: Default::default(),
+                }]));
+                let columns = [
+                    ColumnVector::Decimal64 {
+                        data: vec![1, -7],
+                        scale: 1,
+                        nulls: None,
+                    },
+                    ColumnVector::Decimal64 {
+                        data: vec![20, -9],
+                        scale: 2,
+                        nulls: None,
+                    },
+                    ColumnVector::Generic {
+                        values: vec![Value::Null, Value::Int(7)],
+                    },
+                    ColumnVector::Decimal64 {
+                        data: vec![30, 99],
+                        scale: 2,
+                        nulls: None,
+                    },
+                ];
+                let mut expected = Vec::new();
+                let mut writers =
+                    VecJoinSpillWriterPool::new(dir.path(), "build", 1, dir.charger(), 1);
+                for column in columns {
+                    let batch = Batch::new(schema.clone(), vec![column]);
+                    expected.extend(
+                        batch
+                            .visible_indices()
+                            .map(|row| format!("{:?}", batch.row(row))),
+                    );
+                    writers.append(0, batch).unwrap();
+                }
+                writers.finish().unwrap();
+                let mut reader = crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                    &dir.path().join("build-0"),
+                    dir.charger(),
+                    256,
+                )
+                .unwrap();
+                let mut actual = Vec::new();
+                while let Some(batch) = crate::engine::executor::vec::spill::read_owned_batch(
+                    &mut reader,
+                    schema.clone(),
+                )
+                .unwrap()
+                {
+                    actual.extend(
+                        batch
+                            .visible_indices()
+                            .map(|row| format!("{:?}", batch.row(row))),
+                    );
+                }
+                assert_eq!(actual, expected);
+            });
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        }
+    }
+
+    #[test]
+    fn partition_blocks_preserve_selected_values_reopen_and_release_budget() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let budget = Arc::new(mem_budget::MemBudget::new(8 * 1024 * 1024));
+        mem_budget::with_query_budget(budget.clone(), || {
+            let dir = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                root.path(),
+                "columnar-partitions",
+            )
+            .unwrap();
+            let schema = Arc::new(BatchSchema::new(
+                [
+                    ColumnType::LongLong,
+                    ColumnType::VarString,
+                    ColumnType::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, column_type)| BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: format!("c{index}"),
+                    column_type,
+                    source: Default::default(),
+                })
+                .collect(),
+            ));
+            let batch = Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(vec![
+                        Value::Int(i64::MIN),
+                        Value::Int(1),
+                        Value::Int(i64::MAX),
+                        Value::Null,
+                    ]),
+                    ColumnVector::from_values(vec![
+                        Value::String("é\0中".into()),
+                        Value::Null,
+                        Value::String("x".repeat(4096)),
+                        Value::String("".into()),
+                    ]),
+                    ColumnVector::from_values(vec![
+                        Value::DecimalCompact(-123, 2),
+                        Value::Null,
+                        Value::DecimalCompact(321, 2),
+                        Value::DecimalCompact(0, 2),
+                    ]),
+                ],
+            )
+            .with_selection(Selection::Indices(vec![0, 2, 3]));
+            let mut expected = Vec::new();
+            let mut writers = VecJoinSpillWriterPool::new(dir.path(), "build", 3, dir.charger(), 1);
+            for _ in 0..3 {
+                spill_vec_join_batch(
+                    &batch,
+                    &[0],
+                    &[false],
+                    &[None],
+                    &mut writers,
+                    &mut 0,
+                    0,
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap();
+                expected.extend(
+                    batch
+                        .visible_indices()
+                        .map(|row| format!("{:?}", batch.row(row))),
+                );
+            }
+            assert!(writers.finish().unwrap() > 0);
+            let mut actual = Vec::new();
+            for partition in 0..3 {
+                let mut stream = VecJoinSpillBatchStream::open_columnar(
+                    &dir.path().join(format!("build-{partition}")),
+                    schema.clone(),
+                    dir.charger(),
+                )
+                .unwrap();
+                while let Some(batch) = stream.next_batch().unwrap() {
+                    if let ColumnVector::I64 { data, .. } = &batch.columns()[0] {
+                        assert_eq!(
+                            data.capacity(),
+                            data.len(),
+                            "replay must not retain growth slack"
+                        );
+                    }
+                    actual.extend(
+                        batch
+                            .visible_indices()
+                            .map(|row| format!("{:?}", batch.row(row))),
+                    );
+                }
+            }
+            expected.sort();
+            actual.sort();
+            assert_eq!(actual, expected);
+        });
+        assert_eq!(budget.used(), 0);
+    }
+}

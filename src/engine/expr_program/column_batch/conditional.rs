@@ -7,6 +7,7 @@ enum Family {
     Null,
     Signed,
     Unsigned,
+    Decimal,
     Text,
     Date,
 }
@@ -22,6 +23,7 @@ enum Choice<'a> {
 pub(super) struct Conditional<'a> {
     choice: Choice<'a>,
     family: Family,
+    decimal_scale: Option<u8>,
 }
 impl<'a> Conditional<'a> {
     pub(super) fn bind(node: &'a ExprNode, schema: &BatchSchema) -> Option<Self> {
@@ -76,6 +78,7 @@ impl<'a> Conditional<'a> {
                 Domain::Null => return Some(()),
                 Domain::Integer(..) => Family::Signed,
                 Domain::Unsigned => Family::Unsigned,
+                Domain::Exact => Family::Decimal,
                 Domain::Text => Family::Text,
                 Domain::Temporal if matches!(node, ExprNode::Column(index) if schema.fields().get(*index)?.column_type == ColumnType::Date) => {
                     Family::Date
@@ -117,6 +120,7 @@ impl<'a> Conditional<'a> {
                 }
             }
         }
+        let mut decimal_scale = None;
         if let Some(coercion) = coercion {
             use crate::engine::expr_type::{ExprTypeKind, StringKind, TemporalKind};
             let compatible = match family {
@@ -130,6 +134,17 @@ impl<'a> Conditional<'a> {
                 ),
                 Family::Unsigned => {
                     matches!(coercion.kind, ExprTypeKind::Integer { unsigned: true, .. })
+                }
+                Family::Decimal => {
+                    if let ExprTypeKind::Decimal {
+                        precision, scale, ..
+                    } = coercion.kind
+                    {
+                        if precision <= 38 {
+                            decimal_scale = Some(scale);
+                        }
+                    }
+                    decimal_scale.is_some()
                 }
                 Family::Text => matches!(
                     coercion.kind,
@@ -149,7 +164,14 @@ impl<'a> Conditional<'a> {
                 return None;
             }
         }
-        Some(Self { choice, family })
+        if family == Family::Decimal && decimal_scale.is_none() {
+            return None;
+        }
+        Some(Self {
+            choice,
+            family,
+            decimal_scale,
+        })
     }
     pub(super) fn contract(&self) -> Contract {
         Contract {
@@ -157,6 +179,7 @@ impl<'a> Conditional<'a> {
                 Family::Null => Domain::Null,
                 Family::Signed => Domain::Integer(i64::MIN, i64::MAX),
                 Family::Unsigned => Domain::Unsigned,
+                Family::Decimal => Domain::Exact,
                 Family::Text => Domain::Text,
                 Family::Date => Domain::Temporal,
             },
@@ -256,6 +279,7 @@ impl<'a> Conditional<'a> {
         let mut signed = Vec::new();
         let mut unsigned = Vec::new();
         let mut dates = Vec::new();
+        let mut decimals = Vec::new();
         let mut data = Vec::new();
         let mut offsets = Vec::new();
         if self.family == Family::Text {
@@ -300,6 +324,24 @@ impl<'a> Conditional<'a> {
                 } else {
                     0
                 }),
+                Family::Decimal => decimals.push(if valid {
+                    let (value, scale) = match result? {
+                        ColumnVector::Decimal32 { data, scale, .. } => {
+                            (i128::from(data[row]), *scale)
+                        }
+                        ColumnVector::Decimal64 { data, scale, .. } => {
+                            (i128::from(data[row]), *scale)
+                        }
+                        ColumnVector::Decimal128 { data, scale, .. } => (data[row], *scale),
+                        _ => return None,
+                    };
+                    // Conditional coercion preserves extra intermediate scale.
+                    // Decline rather than round a high-scale arithmetic result.
+                    let delta = self.decimal_scale?.checked_sub(scale)?;
+                    value.checked_mul(10i128.checked_pow(u32::from(delta))?)?
+                } else {
+                    0
+                }),
                 Family::Text => {
                     if valid {
                         data.extend_from_slice(bytes_at(result?, row)?);
@@ -324,6 +366,11 @@ impl<'a> Conditional<'a> {
             },
             Family::Unsigned => ColumnVector::U64 {
                 data: unsigned,
+                nulls: Some(nulls),
+            },
+            Family::Decimal => ColumnVector::Decimal128 {
+                data: decimals,
+                scale: self.decimal_scale?,
                 nulls: Some(nulls),
             },
             Family::Text => ColumnVector::Utf8 {

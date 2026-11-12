@@ -535,6 +535,7 @@ fn grace_locality_sampling_covers_late_rows_between_prefix_bands() {
                     1,
                     0,
                     true,
+                    None,
                 )
                 .unwrap();
                 let rows = vec_hash_join::flatten_batches_to_rows(output.collect().unwrap());
@@ -912,6 +913,7 @@ fn grace_range_partitions_match_hash_oracle_for_all_join_preservation_modes() {
                                         1,
                                         0,
                                         true,
+                                        None,
                                     )
                                     .unwrap()
                                     .collect()
@@ -1195,7 +1197,7 @@ fn assert_wide_topn_is_bounded(parallel_workers: usize, budget_bytes: usize) {
     let mut expected = (0..3000usize).collect::<Vec<_>>();
     expected.sort_by_key(|n| n % 29);
     mem_budget::with_query_budget(budget.clone(), || {
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let mut topn = TopNBatchOperator {
             data_dir: root.path().to_path_buf(),
             external_output: None,
@@ -1258,7 +1260,7 @@ fn assert_wide_topn_is_bounded(parallel_workers: usize, budget_bytes: usize) {
 
 #[test]
 fn rand_top_one_wide_output_retains_its_owner_after_the_operator_closes() {
-    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let root = tempfile::tempdir().unwrap();
     let schema = Arc::new(BatchSchema::new(vec![test_batch_field(
         ColumnType::VarString,
     )]));
@@ -1743,6 +1745,80 @@ fn grace_materialization_boundary_stops_reading_at_budget() {
         );
     });
     assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn grace_output_prunes_dead_payload_before_spilling_selected_rows() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(Database::open(root.path()).unwrap());
+    let schema = Arc::new(BatchSchema::new(vec![
+        test_batch_field(ColumnType::LongLong),
+        test_batch_field(ColumnType::VarString),
+        test_batch_field(ColumnType::Decimal {
+            precision: 12,
+            scale: 2,
+        }),
+    ]));
+    for retained in [[true, false, true], [false, false, false]] {
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::I64 {
+                    data: (0..32).collect(),
+                    nulls: None,
+                },
+                ColumnVector::from_values(
+                    (0..32).map(|_| Value::String("x".repeat(4096))).collect(),
+                ),
+                ColumnVector::from_values(
+                    (0..32)
+                        .map(|row| {
+                            if row == 3 {
+                                Value::Null
+                            } else {
+                                Value::DecimalCompact(row * 125, 2)
+                            }
+                        })
+                        .collect(),
+                ),
+            ],
+        )
+        .with_selection(Selection::Indices(vec![1, 3, 17]));
+        let expected = [1, 3, 17].map(|row| {
+            batch
+                .columns()
+                .iter()
+                .zip(retained)
+                .map(|(column, keep)| {
+                    if keep {
+                        column.value_at(row)
+                    } else {
+                        Value::Null
+                    }
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut output =
+            GraceJoinOutput::write_from(&db, schema.clone(), |emit| emit(batch), Some(&retained))
+                .unwrap();
+        let Some(GraceJoinPart::Disk { dir, .. }) = output.parts.front() else {
+            panic!("output must exercise the spill codec");
+        };
+        assert!(std::fs::metadata(dir.path().join("output")).unwrap().len() < 512);
+        let batch = output.next_batch().unwrap().unwrap();
+        assert_eq!(batch.num_rows(), 3);
+        for (row, expected) in expected.into_iter().enumerate() {
+            assert_eq!(
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| column.value_at(row))
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        assert!(output.next_batch().unwrap().is_none());
+    }
 }
 
 #[test]
@@ -3187,7 +3263,7 @@ fn native_cursor_finish_rechecks_worker_cancellation_and_deadline() {
 
 #[test]
 fn count_distinct_computed_numeric_input_stays_native_and_exact() {
-    let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let root = tempfile::tempdir().unwrap();
     let db = Arc::new(Database::open(root.path()).unwrap());
     let input = PhysicalPlan::ValuesScan {
         rows: [9007199254740992_i64, 9007199254740993, 9007199254740992]
@@ -3247,4 +3323,226 @@ fn count_distinct_computed_numeric_input_stays_native_and_exact() {
             );
         },
     );
+}
+
+#[test]
+fn native_index_keyset_accepts_only_matching_relation_runtime_filters() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = crate::engine::executor::StorageQueryEngine::open_with_storage_config_without_background_workers(
+        dir.path(), crate::engine::executor::tests::memory_test_storage_config(),
+    ).unwrap();
+    engine.execute("CREATE TABLE ik_dim(k INT)").unwrap();
+    engine
+        .execute("INSERT INTO ik_dim VALUES (0),(2),(4),(NULL),(2)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE ik_fact(k INT,v INT,KEY by_k(k))")
+        .unwrap();
+    let values = (0..1000)
+        .map(|i| {
+            format!(
+                "({},{})",
+                i % 10,
+                if i % 13 == 0 {
+                    "NULL".into()
+                } else {
+                    (i / 10 % 10).to_string()
+                }
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO ik_fact VALUES {values}"))
+        .unwrap();
+    let db = engine.db_for_tests();
+    let schema = db.table("ik_fact").unwrap();
+    let table = crate::planner::PlanTable::new(schema.id, schema.clone(), Some("f".into()));
+    let crate::parser::Statement::Select(subquery) =
+        crate::parser::parse_statement("SELECT k FROM ik_dim").unwrap()
+    else {
+        panic!("select");
+    };
+    let subplan = crate::planner::plan_select(db, &subquery).unwrap();
+    let plan = PhysicalPlan::IndexInLookup {
+        table,
+        index: schema
+            .indexes
+            .iter()
+            .find(|index| index.name == "by_k")
+            .unwrap()
+            .clone(),
+        key_prefix: crate::storage::IndexKey::from(vec![]),
+        in_column: "k".into(),
+        subquery: Box::new(subquery),
+        subquery_plan: Box::new(subplan.physical),
+        filter: None,
+        estimated_rows: 300.0,
+        access_rows: 300.0,
+        cost: Default::default(),
+        possible_keys: vec![],
+        covering: false,
+        hint_note: None,
+        projected_columns: Some(Arc::new(vec![0, 1])),
+    };
+    let mut bloom = super::super::bloom::BloomFilter::new(1);
+    bloom.insert(&[crate::engine::expr::ValueKey::Int(7)][..]);
+    let mut filter = crate::planner::RuntimeFilter::KeySet {
+        keys: vec![Expr::CompoundIdentifier(vec!["other".into(), "v".into()])],
+        null_safe: vec![false],
+        values: Arc::new(vec![vec![Value::Int(7)]]),
+        filter: Arc::new(bloom),
+    };
+    let budget = Arc::new(mem_budget::MemBudget::new(1024 * 1024));
+    crate::util::env::with_vars(&[("MYDB_PARALLEL_DEGREE", Some("4"))], || {
+        mem_budget::with_query_budget(budget.clone(), || {
+            let txn = TxnView::read_only(
+                db.visible_scn(),
+                crate::storage::IsolationLevel::ReadCommitted,
+            );
+            let mut input = try_build_parallel_index_in_batch(db, txn, &plan)
+                .unwrap()
+                .unwrap();
+            assert!(!input.stream.install_runtime_filter(filter.clone()));
+            if let crate::planner::RuntimeFilter::KeySet { keys, .. } = &mut filter {
+                keys[0] = Expr::CompoundIdentifier(vec!["f".into(), "v".into()]);
+            }
+            assert!(input.stream.install_runtime_filter(filter.clone()));
+            let mut actual = Vec::new();
+            while let Some(batch) = input.stream.next_batch().unwrap() {
+                for row in 0..batch.num_rows() {
+                    actual.push((
+                        batch.columns()[0].value_at(row),
+                        batch.columns()[1].value_at(row),
+                    ));
+                }
+            }
+            assert!(
+                !input.stream.install_runtime_filter(filter.clone()),
+                "started source cannot accept late filters"
+            );
+            let expected = (0..1000)
+                .filter(|i| [0, 2, 4].contains(&(i % 10)) && i / 10 % 10 == 7 && i % 13 != 0)
+                .count();
+            assert_eq!(actual.len(), expected);
+            assert!(actual
+                .iter()
+                .all(
+                    |(k, v)| [Value::Int(0), Value::Int(2), Value::Int(4)].contains(k)
+                        && *v == Value::Int(7)
+                ));
+        });
+    });
+    assert_eq!(budget.used(), 0);
+}
+
+#[test]
+fn large_outer_join_stays_unopened_for_ancestor_runtime_filter() {
+    use crate::parser::JoinType;
+    use crate::planner::BuildSide;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = crate::engine::executor::StorageQueryEngine::open_with_storage_config_without_background_workers(
+        dir.path(), crate::engine::executor::tests::memory_test_storage_config(),
+    ).unwrap();
+    engine.execute("CREATE TABLE lazy_probe(k INT)").unwrap();
+    engine
+        .execute("INSERT INTO lazy_probe VALUES (1),(2),(3),(NULL)")
+        .unwrap();
+    engine.execute("CREATE TABLE lazy_build(k INT)").unwrap();
+    engine
+        .execute("INSERT INTO lazy_build VALUES (1),(1),(2),(NULL)")
+        .unwrap();
+    let db = engine.db_for_tests();
+    let scan = |name: &str| {
+        let crate::parser::Statement::Select(select) =
+            crate::parser::parse_statement(&format!("SELECT * FROM {name}")).unwrap()
+        else {
+            panic!("select")
+        };
+        let mut plan = crate::planner::plan_select(db, &select).unwrap().physical;
+        // Keep a tiny fixture while exercising the large-build admission path.
+        plan.walk_mut(|node| {
+            if let PhysicalPlan::SeqScan { estimated_rows, .. }
+            | PhysicalPlan::Projection { estimated_rows, .. } = node
+            {
+                *estimated_rows = 10_000_000.0;
+            }
+        });
+        plan
+    };
+    for join_type in [JoinType::Left, JoinType::Right] {
+        let probe = scan("lazy_probe");
+        let build = scan("lazy_build");
+        let key = |table: &str| Expr::CompoundIdentifier(vec![table.into(), "k".into()]);
+        let right = join_type == JoinType::Right;
+        let plan = PhysicalPlan::HashJoin {
+            left: Box::new(if right { build.clone() } else { probe.clone() }),
+            right: Box::new(if right { probe } else { build }),
+            join_type,
+            left_keys: vec![key(if right { "lazy_build" } else { "lazy_probe" })],
+            right_keys: vec![key(if right { "lazy_probe" } else { "lazy_build" })],
+            null_safe: vec![false],
+            build_side: if right {
+                BuildSide::Left
+            } else {
+                BuildSide::Right
+            },
+            residual: None,
+            output_projection: None,
+            estimated_rows: 10_000_000.0,
+            cost: Default::default(),
+        };
+        crate::engine::executor::vec::config::with_vec_mode(
+            crate::engine::executor::vec::config::VecMode::On,
+            || {
+                let txn = TxnView::read_only(
+                    db.visible_scn(),
+                    crate::storage::IsolationLevel::ReadCommitted,
+                );
+                let mut input = try_build_vec_hash_join_input(db, txn, &plan)
+                    .unwrap()
+                    .unwrap();
+                let mut bloom = super::super::bloom::BloomFilter::new(2);
+                for value in [1, 3] {
+                    bloom.insert(&[crate::engine::expr::ValueKey::Int(value)][..]);
+                }
+                assert!(
+                    input
+                        .stream
+                        .install_runtime_filter(crate::planner::RuntimeFilter::KeySet {
+                            keys: vec![key("lazy_probe")],
+                            null_safe: vec![false],
+                            values: Arc::new(vec![vec![Value::Int(1)], vec![Value::Int(3)]]),
+                            filter: Arc::new(bloom),
+                        }),
+                    "ancestor filter must reach the unopened preserved source"
+                );
+                let mut rows = Vec::new();
+                while let Some(batch) = input.stream.next_batch().unwrap() {
+                    for row in 0..batch.num_rows() {
+                        rows.push(
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| column.value_at(row))
+                                .collect::<Vec<_>>(),
+                        );
+                    }
+                }
+                let unmatched = if right {
+                    vec![Value::Null, Value::Int(3)]
+                } else {
+                    vec![Value::Int(3), Value::Null]
+                };
+                assert_eq!(
+                    rows.iter()
+                        .filter(|row| **row == vec![Value::Int(1), Value::Int(1)])
+                        .count(),
+                    2
+                );
+                assert_eq!(rows.iter().filter(|row| **row == unmatched).count(), 1);
+                assert_eq!(rows.len(), 3);
+            },
+        );
+    }
 }

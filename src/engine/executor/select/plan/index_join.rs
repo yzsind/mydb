@@ -35,6 +35,81 @@ pub(in crate::engine::executor::select) struct IndexLookupPlan {
     /// We surface this as an empty-result shortcut because B-tree
     /// keys never compare equal to SQL `NULL`.
     pub(super) forced_empty: bool,
+    prepared_residual: Option<PreparedIndexResidual>,
+}
+
+/// Statement-local constants and residual partitioning live for the whole
+/// stream, rather than being cloned and materialized for every probe chunk.
+struct PreparedIndexResidual {
+    right_only: Option<Expr>,
+    joined: Option<Expr>,
+    _charge: Option<crate::engine::executor::mem_budget::OwnedMemCharge>,
+}
+
+fn projected_inlj_schema(table: &PlanTable, columns: &[usize]) -> TableSchema {
+    let mut schema = projected_schema_view(&table.schema, columns);
+    if let Some(alias) = &table.alias {
+        schema.name = alias.clone();
+    }
+    schema
+}
+
+pub(in crate::engine::executor::select) fn prepare_index_lookup_residual(
+    db: &Arc<Database>,
+    txn: TxnView,
+    left: &PhysicalPlan,
+    right: &PlanTable,
+    lookup: &mut IndexLookupPlan,
+) -> Result<(), QueryError> {
+    let Some(residual) = lookup.residual.as_ref() else {
+        return Ok(());
+    };
+    if !crate::parser::visit::value_expr_contains_subquery(residual) {
+        return Ok(());
+    }
+    let mut metas = Vec::new();
+    collect_plan_fields(left, &mut metas);
+    let left_refs = field_ref_set(&metas);
+    metas.extend(build_alias_right_metas(
+        right,
+        &(0..right.schema.columns.len()).collect::<Vec<_>>(),
+        right.alias.clone(),
+    ));
+    let template = PlanRow::from_fields(
+        metas
+            .into_iter()
+            .map(|meta| PlanField {
+                meta: intern_col_meta(meta),
+                value: Value::Null,
+            })
+            .collect(),
+    );
+    if let Some(resolved) =
+        super::super::eval::resolve_batch_constant_scalar_subqueries(db, txn, residual, &template)?
+    {
+        let (right_only, joined) =
+            split_right_only_residual(Some(&resolved.expr), right, &left_refs);
+        if let Some(predicate) = right_only.as_ref() {
+            let mut columns = HashSet::new();
+            if collect_right_filter_column_indices(predicate, right, &mut columns).is_none() {
+                return Ok(());
+            }
+            let mut columns: Vec<_> = columns.into_iter().collect();
+            columns.sort_unstable();
+            let schema = projected_inlj_schema(right, &columns);
+            // Never replace a memoized scalar subquery by a large list that
+            // the narrow storage reader would interpret for every candidate.
+            if compile_projected_row_predicate(predicate, &schema).is_none() {
+                return Ok(());
+            }
+        }
+        lookup.prepared_residual = Some(PreparedIndexResidual {
+            right_only,
+            joined,
+            _charge: resolved.charge,
+        });
+    }
+    Ok(())
 }
 
 impl IndexLookupPlan {
@@ -400,6 +475,7 @@ pub(in crate::engine::executor::select) fn compile_index_lookup_plan(
         range,
         residual,
         forced_empty,
+        prepared_residual: None,
     })
 }
 
@@ -1026,7 +1102,8 @@ pub(super) fn open_inlj_chunk_stream_inner(
             "INLJ chunk stream requires a join condition",
         )
     })?;
-    let lookup_plan = compile_index_lookup_plan(&condition, &right_table, &right_index)?;
+    let mut lookup_plan = compile_index_lookup_plan(&condition, &right_table, &right_index)?;
+    prepare_index_lookup_residual(db, txn, &left, &right_table, &mut lookup_plan)?;
     if let Some(left_keys) = display_keys.as_ref().and_then(|keys| keys.child(0)) {
         bind_plan_stats_key_tree(&left, left_keys);
     }
@@ -1115,6 +1192,17 @@ pub(in crate::engine::executor::select) fn inlj_fanout_chunk_rows(
     if index.unique && lookup.is_full_equality_for(index) {
         return inlj_runtime_chunk_rows(max_rows);
     }
+    inlj_chunk_rows_for_fanout(max_rows, inlj_estimated_fanout(table, index, lookup))
+}
+
+fn inlj_estimated_fanout(
+    table: &PlanTable,
+    index: &IndexSchema,
+    lookup: &IndexLookupPlan,
+) -> usize {
+    if index.unique && lookup.is_full_equality_for(index) {
+        return 1;
+    }
     let prefix = lookup.eq_exprs.len();
     let distinct = table
         .schema
@@ -1139,11 +1227,10 @@ pub(in crate::engine::executor::select) fn inlj_fanout_chunk_rows(
                     .filter(|n| *n > 0)
             })
         });
-    let fanout = distinct
+    distinct
         .map(|ndv| table.schema.stats.row_count.div_ceil(ndv).max(1))
         .unwrap_or(1)
-        .min(usize::MAX as u64) as usize;
-    inlj_chunk_rows_for_fanout(max_rows, fanout)
+        .min(usize::MAX as u64) as usize
 }
 
 pub(in crate::engine::executor::select) fn inlj_chunk_rows_for_fanout(
@@ -1410,8 +1497,13 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
     let mut left_fields = Vec::new();
     collect_plan_fields(left, &mut left_fields);
     let left_refs = field_ref_set(&left_fields);
-    let (right_only_residual, joined_residual) =
-        split_right_only_residual(plan.residual.as_ref(), right_table, &left_refs);
+    let split_residual;
+    let (right_only_residual, joined_residual) = if let Some(prepared) = &plan.prepared_residual {
+        (prepared.right_only.as_ref(), prepared.joined.as_ref())
+    } else {
+        split_residual = split_right_only_residual(plan.residual.as_ref(), right_table, &left_refs);
+        (split_residual.0.as_ref(), split_residual.1.as_ref())
+    };
     let mut out = Vec::new();
     let join_lk = new_join_lookup();
     let semi_or_anti = matches!(
@@ -1428,8 +1520,8 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
         join_type,
         &plan,
         right_covering,
-        right_only_residual.as_ref(),
-        joined_residual.as_ref(),
+        right_only_residual,
+        joined_residual,
         right_projected_columns,
         right_runtime_filters,
     )? {
@@ -1565,7 +1657,7 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
                     txn,
                     join_type,
                     semi_or_anti,
-                    joined_residual.as_ref(),
+                    joined_residual,
                     residual_pre,
                     join_lk,
                     left_row,
@@ -1661,7 +1753,7 @@ pub(super) fn execute_index_nested_loop_join_from_left_rows_inner(
                     txn,
                     join_type,
                     semi_or_anti,
-                    joined_residual.as_ref(),
+                    joined_residual,
                     residual_pre,
                     join_lk,
                     left_row,
@@ -2481,6 +2573,17 @@ pub(super) fn try_execute_batched_index_nested_loop_join(
     if right_rows >= min_right_rows_for_small_batch && left_rows.len() >= 8 {
         min_left_rows = min_left_rows.min(8);
     }
+    // A bounded fan-out morsel can contain fewer than eight outer keys
+    // while fetching thousands of heap rows. Keep those rows on sorted,
+    // parallel MRR instead of falling back to one random heap read per RID.
+    // Honor the existing diagnostic admission override and retain point
+    // lookup behavior for unique/low-fan-out keys.
+    if !right_covering
+        && right_rows >= min_right_rows_for_small_batch
+        && inlj_estimated_fanout(right_table, right_index, plan) >= 128
+    {
+        min_left_rows = 1;
+    }
     if left_rows.len() < min_left_rows {
         return Ok(None);
     }
@@ -2963,7 +3066,7 @@ pub(super) fn compile_fused_semi_anti_neq_spec(
         }
     }
     let (left_idx, right_idx) = neq?;
-    let mut projected_schema = projected_schema_view(&right_table.schema, projection);
+    let mut projected_schema = projected_inlj_schema(right_table, projection);
     if let Some(alias) = aliased_right.alias.as_ref() {
         projected_schema.name = alias.clone();
     }
@@ -4068,6 +4171,13 @@ pub(super) fn execute_batched_inlj_noncovering(
     let mut sorted_row_ids = candidate_row_ids;
     sorted_row_ids.sort_unstable();
     sorted_row_ids.dedup();
+    prune_runtime_filter_row_ids(
+        db,
+        txn,
+        right_table,
+        right_runtime_filters,
+        &mut sorted_row_ids,
+    );
     record_inlj_probe_batch(
         lookup_keys.len() as u64,
         entries.len() as u64,
@@ -4266,7 +4376,7 @@ pub(super) fn execute_batched_inlj_noncovering(
             filter_set.extend(cols.iter().copied());
         }
         let filter_columns: Vec<usize> = filter_set.into_iter().collect();
-        let filter_schema = projected_schema_view(&right_table.schema, &filter_columns);
+        let filter_schema = projected_inlj_schema(right_table, &filter_columns);
         let compiled_filter = right_only_residual
             .and_then(|residual| compile_projected_row_predicate(residual, &filter_schema));
         let compiled_runtime_filters: Vec<Option<CompiledRuntimeFilterProbe>> =
@@ -4310,7 +4420,7 @@ pub(super) fn execute_batched_inlj_noncovering(
             filter_set.extend(cols.iter().copied());
         }
         let filter_columns: Vec<usize> = filter_set.into_iter().collect();
-        let filter_schema = projected_schema_view(&right_table.schema, &filter_columns);
+        let filter_schema = projected_inlj_schema(right_table, &filter_columns);
         let compiled_filter = right_only_residual
             .and_then(|residual| compile_projected_row_predicate(residual, &filter_schema));
         let mut passing = if force_serial_filter {
@@ -4400,7 +4510,7 @@ pub(super) fn execute_batched_inlj_noncovering(
     //    that `compile_projected_row_predicate` can't recognise.
     if let Some(residual) = right_only_residual {
         if !residual_already_satisfied {
-            let proj_schema = projected_schema_view(&right_table.schema, projection);
+            let proj_schema = projected_inlj_schema(right_table, projection);
             if let Some(compiled) = compile_projected_row_predicate(residual, &proj_schema) {
                 let mut keep: Vec<bool> = Vec::with_capacity(right_pairs.len());
                 for (_, values) in right_pairs.iter() {
@@ -5572,6 +5682,8 @@ pub(in crate::engine::executor::select) enum CompiledRowPredicate {
     },
     And(Box<CompiledRowPredicate>, Box<CompiledRowPredicate>),
     Or(Box<CompiledRowPredicate>, Box<CompiledRowPredicate>),
+    /// Reuse the governed constant-set kernels for large fixed-width lists.
+    ConstantSet(CompiledPredicate),
     IsNull(usize),
     IsNotNull(usize),
 }
@@ -5621,6 +5733,7 @@ impl CompiledRowPredicate {
         values: &[Value],
     ) -> Result<bool, QueryError> {
         match self {
+            CompiledRowPredicate::ConstantSet(predicate) => predicate.eval(values),
             CompiledRowPredicate::Cmp {
                 column_pos,
                 op,
@@ -6026,6 +6139,16 @@ pub(super) fn compile_projected_in_list(
             continue;
         }
         items.push(coerced);
+    }
+    if list.len() > 16 {
+        let predicate = Expr::InList {
+            expr: Box::new(expr.clone()),
+            list: list.to_vec(),
+            negated,
+        };
+        if let Some(compiled) = CompiledPredicate::compile_for_storage(&predicate, schema) {
+            return Some(CompiledRowPredicate::ConstantSet(compiled));
+        }
     }
     Some(CompiledRowPredicate::InListConst {
         column_pos,
@@ -6676,5 +6799,95 @@ pub(in crate::engine::executor::select) fn expr_matches_plan_table_column(
             })
         }
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod constant_residual_tests {
+    use super::*;
+
+    #[test]
+    fn inlj_constant_subquery_residual_is_prepared_once_and_charged() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY, v BIGINT)")
+            .unwrap();
+        let db = engine.db_for_tests();
+        let table = PlanTable::new(1, db.table("t").unwrap(), Some("probe".into()));
+        let index = table.schema.indexes[0].clone();
+        let left = PhysicalPlan::ValuesScan {
+            rows: vec![],
+            columns: vec![Column {
+                name: "k".into(),
+                column_type: ColumnType::LongLong,
+                source: crate::types::ColumnSource {
+                    table: "l".into(),
+                    ..Default::default()
+                },
+            }],
+            filter: None,
+            estimated_rows: 2.0,
+            cost: crate::engine::cbo::Cost::scalar(1.0),
+        };
+        let predicate = |sql: &str| {
+            let crate::parser::Statement::Select(select) =
+                crate::parser::parse_statement(sql).unwrap()
+            else {
+                panic!()
+            };
+            select.selection.unwrap()
+        };
+        let budget = Arc::new(MemBudget::new(64 * 1024 * 1024));
+        let txn = TxnView::read_only(0, crate::storage::IsolationLevel::RepeatableRead);
+        with_query_budget(budget.clone(), || {
+            let condition = predicate("SELECT 1 FROM t WHERE probe.id=k AND probe.v IN (SELECT n FROM generate_series(1,6000) AS g(n) UNION ALL SELECT NULL)");
+            let mut lookup = compile_index_lookup_plan(&condition, &table, &index).unwrap();
+            let mut fields = Vec::new();
+            collect_plan_fields(&left, &mut fields);
+            let (right_only, _) = split_right_only_residual(
+                lookup.residual.as_ref(),
+                &table,
+                &field_ref_set(&fields),
+            );
+            assert!(
+                right_only.is_none(),
+                "subquery originally prevents narrow filtering"
+            );
+            prepare_index_lookup_residual(db, txn, &left, &table, &mut lookup).unwrap();
+            let prepared = lookup.prepared_residual.as_ref().unwrap();
+            assert!(prepared.joined.is_none());
+            let residual = prepared.right_only.as_ref().unwrap();
+            assert_eq!(
+                right_only_filter_columns(Some(residual), &table, &[0, 1]),
+                Some(vec![1])
+            );
+            let schema = projected_inlj_schema(&table, &[1]);
+            let compiled = compile_projected_row_predicate(residual, &schema).unwrap();
+            assert!(matches!(&compiled, CompiledRowPredicate::ConstantSet(_)));
+            for value in [
+                Value::Null,
+                Value::Int(0),
+                Value::Int(1),
+                Value::Int(6000),
+                Value::Int(6001),
+            ] {
+                assert_eq!(
+                    compiled.eval(&[value.clone()]).unwrap(),
+                    crate::engine::expr::eval_bool(residual, &schema, &[value]).unwrap()
+                );
+            }
+            drop(compiled);
+            assert!(budget.used() > 0);
+            drop(lookup);
+            assert_eq!(budget.used(), 0);
+
+            let correlated = predicate("SELECT 1 FROM t WHERE probe.id=k AND probe.v IN (SELECT n FROM generate_series(1,10) AS g(n) WHERE n=k)");
+            let mut lookup = compile_index_lookup_plan(&correlated, &table, &index).unwrap();
+            prepare_index_lookup_residual(db, txn, &left, &table, &mut lookup).unwrap();
+            assert!(lookup.prepared_residual.is_none());
+        });
+        assert_eq!(budget.used(), 0);
     }
 }

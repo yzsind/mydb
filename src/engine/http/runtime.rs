@@ -382,6 +382,21 @@ pub(super) fn tls_source(error: &(dyn std::error::Error + 'static), depth: usize
         .source()
         .is_some_and(|inner| tls_source(inner, depth + 1))
 }
+fn malformed_response(mut source: &(dyn std::error::Error + 'static)) -> bool {
+    for _ in 0..16 {
+        if source
+            .downcast_ref::<hyper::Error>()
+            .is_some_and(|e| e.is_parse())
+        {
+            return true;
+        }
+        let Some(inner) = source.source() else {
+            break;
+        };
+        source = inner;
+    }
+    false
+}
 fn transport(e: reqwest::Error, stage: &'static str) -> Failure {
     let tls = tls_source(&e, 0);
     let code = if e.is_timeout() {
@@ -390,7 +405,7 @@ fn transport(e: reqwest::Error, stage: &'static str) -> Failure {
         "ER_HTTP_TLS"
     } else if e.is_connect() {
         "ER_HTTP_CONNECT"
-    } else if e.is_decode() {
+    } else if e.is_decode() || malformed_response(&e) {
         "ER_HTTP_INVALID_RESPONSE"
     } else {
         "ER_HTTP_TRANSPORT"

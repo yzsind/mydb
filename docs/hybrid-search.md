@@ -103,7 +103,9 @@ outer SQL offsets are supported. HNSW/IVF hints belong to their own branch.
 
 Branch projections must be explicit, with matching column counts and logical
 types at each position. There is no implicit cross-branch type promotion: use
-`CAST` for different signedness, precision, temporal precision, or collation.
+`CAST` for different integer widths, string lengths, signedness, precision,
+temporal precision, or collation. Equal-length CHAR and VARCHAR share the same
+character identity domain; declared length still participates in type matching.
 Nullable declarations are allowed, but an actual NULL identity component fails
 the statement. Supported keys are integers, finite floating point, DECIMAL,
 text, binary, and date/time scalars. JSON, VECTOR, geometry, untyped parameters,
@@ -270,3 +272,10 @@ demonstrates standard MySQL binary prepared metadata and rebinding.
 Default full-text token length is 3. Short identifiers, punctuation, CJK, model
 versions, and language-specific tokenization need workload evaluation; RRF does
 not replace tokenizer configuration. See [full-text functions](function/README.md).
+
+Branch-local window functions, LATERAL inputs, and unaliased parenthesized joins
+must be evaluated in a derived SELECT before the ordered RRF branch. Unsupported
+forms fail during validation. `SQL_CALC_FOUND_ROWS` is not supported inside a
+branch. Clauses that filter or group the fusion result belong in an outer SELECT.
+ANALYZE reports fused child work as included in its measured operator; skipped
+zero-weight branches remain unexecuted.

@@ -4922,12 +4922,9 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                     fully_resolved,
                     retained_bytes,
                 )?;
-                // Keep the rewrite bounded: the compiled InConstSet owns the
-                // constants for the lifetime of this operator. Star-schema
-                // dimension domains are normally well below this cap; a large
-                // or allocation-heavy result keeps the existing memoized
-                // scalar Apply path instead of creating unbudgeted query state.
-                const MAX_BATCH_IN_VALUES: usize = 4096;
+                // The compiled set is retained for this operator's lifetime.
+                // Admit it by accounted bytes, rather than a fixed row count
+                // that forces otherwise small sets onto the per-row lane.
                 if super::explain::select_is_uncacheable(subquery) {
                     *fully_resolved = false;
                     return Ok(());
@@ -4946,7 +4943,17 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                 if result.columns.len() != 1 {
                     return Err(crate::engine::expr::operand_columns_error(1));
                 }
-                if result.rows.len() > MAX_BATCH_IN_VALUES {
+                let bytes_per_value = std::mem::size_of::<Expr>()
+                    + 2 * std::mem::size_of::<crate::engine::expr::ValueKey>()
+                    + 2 * std::mem::size_of::<usize>();
+                let limit = crate::engine::executor::mem_budget::current_budget()
+                    .map_or(0, |budget| budget.limit() / 4);
+                let admission_bytes = result
+                    .rows
+                    .len()
+                    .checked_mul(bytes_per_value)
+                    .and_then(|bytes| retained_bytes.checked_add(bytes));
+                if admission_bytes.is_none_or(|bytes| bytes > limit) {
                     *fully_resolved = false;
                     return Ok(());
                 }
@@ -4985,11 +4992,8 @@ pub(super) fn resolve_batch_constant_scalar_subqueries(
                 // The charge is transferred to BatchExprProgram and follows
                 // the last operator owner; the uncached compile prevents the
                 // statement-specific set from leaking into the global cache.
-                *retained_bytes = retained_bytes.saturating_add(list.capacity().saturating_mul(
-                    std::mem::size_of::<Expr>()
-                        + 2 * std::mem::size_of::<crate::engine::expr::ValueKey>()
-                        + 2 * std::mem::size_of::<usize>(),
-                ));
+                *retained_bytes =
+                    retained_bytes.saturating_add(list.capacity().saturating_mul(bytes_per_value));
                 let tested =
                     std::mem::replace(tested_expr, Box::new(Expr::BoundValue(Value::Null)));
                 *expr = Expr::InList {
@@ -6842,6 +6846,102 @@ mod compiled_plan_expr_tests {
             };
             assert_eq!(next_placeholder_index_in_select(&select), expected, "{sql}");
         }
+    }
+
+    #[test]
+    fn batch_in_constant_rewrite_admits_large_sets_within_byte_budget() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        use crate::engine::executor::vec::{Batch, BatchField, BatchSchema, ColumnVector};
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(root.path()).unwrap());
+        let txn = TxnView::read_only(0, crate::storage::IsolationLevel::RepeatableRead);
+        let template = PlanRow::from_fields(vec![PlanField::new(
+            "t",
+            None,
+            "p",
+            ColumnType::LongLong,
+            Value::Null,
+        )]);
+        let schema = Arc::new(BatchSchema::new(vec![BatchField {
+            table: "t".into(),
+            alias: None,
+            name: "p".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }]));
+        let values = vec![
+            Value::Null,
+            Value::Int(0),
+            Value::Int(1),
+            Value::Int(6000),
+            Value::Int(6001),
+        ];
+        let batch = Batch::new(
+            schema.clone(),
+            vec![ColumnVector::from_values(values.clone())],
+        );
+        let budget = Arc::new(MemBudget::new(64 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            for sql in [
+                "SELECT p IN (SELECT n FROM generate_series(1,6000) AS g(n))",
+                "SELECT p NOT IN (SELECT n FROM generate_series(1,6000) AS g(n) UNION ALL SELECT NULL)",
+            ] {
+                let original = first_projection_expr(sql);
+                let resolved = resolve_batch_constant_scalar_subqueries(&db,txn,&original,&template).unwrap().expect("large fixed-width set fits the byte grant");
+                let program = crate::engine::executor::vec::expr_batch::BatchExprProgram::compile_runtime_constants(&resolved.expr,&schema,resolved.charge).unwrap().unwrap();
+                let mask = program.eval_predicate_bitmap(&batch).unwrap();
+                let mut oracle = EvalQueryContext::default();
+                for (index,value) in values.iter().enumerate() {
+                    let row = PlanRow::from_fields(vec![PlanField::new("t",None,"p",ColumnType::LongLong,value.clone())]);
+                    let expected = eval_plan_expr_with_db(&db,txn,&original,&row,&mut oracle).unwrap();
+                    assert_eq!(eval_plan_expr_legacy(&resolved.expr,&row).unwrap(),expected);
+                    assert_eq!(mask.get(index),expected==Value::Int(1));
+                }
+                drop(oracle);
+                drop(resolved.expr);
+                let shared = program.clone();
+                drop(program);
+                assert!(budget.used() > 0);
+                drop(shared);
+                assert_eq!(budget.used(),0);
+            }
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn batch_in_constant_rewrite_limits_total_retained_bytes() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        let root = tempfile::tempdir().unwrap();
+        let db = Arc::new(Database::open(root.path()).unwrap());
+        let txn = TxnView::read_only(0, crate::storage::IsolationLevel::RepeatableRead);
+        let entry_bytes = std::mem::size_of::<Expr>()
+            + 2 * std::mem::size_of::<crate::engine::expr::ValueKey>()
+            + 2 * std::mem::size_of::<usize>();
+        let expr =
+            first_projection_expr("SELECT 1 IN (SELECT n FROM generate_series(1,6000) AS g(n))");
+        let budget = Arc::new(MemBudget::new(entry_bytes * 6000 * 2));
+        with_query_budget(budget.clone(), || {
+            assert!(
+                resolve_batch_constant_scalar_subqueries(&db, txn, &expr, &PlanRow::default())
+                    .unwrap()
+                    .is_none()
+            );
+            assert!(budget.terminal_oom().is_none());
+        });
+        assert_eq!(budget.used(), 0);
+        let budget = Arc::new(MemBudget::new(entry_bytes * 4000 * 4));
+        let expr = first_projection_expr("SELECT 1 IN (SELECT n FROM generate_series(1,3000) AS g(n)) AND 2 IN (SELECT n FROM generate_series(1,3000) AS g(n))");
+        with_query_budget(budget.clone(), || {
+            assert!(
+                resolve_batch_constant_scalar_subqueries(&db, txn, &expr, &PlanRow::default())
+                    .unwrap()
+                    .is_none(),
+                "several sets share one retained-state byte grant"
+            );
+            assert!(budget.terminal_oom().is_none());
+        });
+        assert_eq!(budget.used(), 0);
     }
 
     #[test]

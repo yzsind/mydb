@@ -21,6 +21,7 @@ use crate::types::Value;
 
 use super::batch::ColumnVector;
 
+#[inline]
 pub fn encode(v: &Value, buf: &mut Vec<u8>) {
     encode_with_collation(v, None, buf)
 }
@@ -28,8 +29,26 @@ pub fn encode(v: &Value, buf: &mut Vec<u8>) {
 /// Canonical SQL hash key codec shared by every vector state operator.
 /// Its tags/payloads mirror legacy `ValueKey`, including numeric
 /// cross-type equality, DECIMAL normalization, canonical NaN and ±0.
+#[inline]
 pub fn encode_with_collation(v: &Value, collation_id: Option<u16>, buf: &mut Vec<u8>) {
+    // Fixed-width snapshots already carry the canonical integer domain.
+    // Avoid constructing the general ValueKey envelope for every group.
     match (v, collation_id) {
+        (Value::Null, _) => buf.push(0),
+        (Value::Int(value), _) => push_integer(i128::from(*value), buf),
+        (Value::UInt(value), _) => push_integer(i128::from(*value), buf),
+        (Value::Date(value), _) => push_integer(i128::from(*value), buf),
+        (Value::Time(value) | Value::DateTime(value) | Value::Timestamp(value), _) => {
+            push_integer(i128::from(*value), buf)
+        }
+        (Value::Year(value), _) => push_integer(
+            if *value == 0 {
+                0
+            } else {
+                1900 + i128::from(*value)
+            },
+            buf,
+        ),
         (Value::String(s), Some(id)) => push_string_key(s, Some(id), buf),
         (Value::SmallString(bytes), Some(id)) => {
             // SAFETY: SmallString always contains valid UTF-8.
@@ -43,13 +62,16 @@ pub fn encode_with_collation(v: &Value, collation_id: Option<u16>, buf: &mut Vec
     }
 }
 
+#[inline]
+fn push_integer(value: i128, buf: &mut Vec<u8>) {
+    buf.push(1);
+    buf.extend_from_slice(&value.to_le_bytes());
+}
+
 fn encode_value_key(key: ValueKey, buf: &mut Vec<u8>) {
     match key {
         ValueKey::Null => buf.push(0),
-        ValueKey::Int(value) => {
-            buf.push(1);
-            buf.extend_from_slice(&value.to_le_bytes());
-        }
+        ValueKey::Int(value) => push_integer(value, buf),
         ValueKey::Float(bits) => {
             buf.push(2);
             buf.extend_from_slice(&bits.to_le_bytes());
@@ -232,6 +254,32 @@ pub fn fxhash(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_fixed_width_keys_match_legacy_domains() {
+        let values = [
+            Value::Null,
+            Value::Int(i64::MIN),
+            Value::Int(i64::MAX),
+            Value::UInt(u64::MAX),
+            Value::Date(i32::MIN),
+            Value::Date(i32::MAX),
+            Value::Time(i64::MIN),
+            Value::DateTime(i64::MAX),
+            Value::Timestamp(-1),
+            Value::Year(0),
+            Value::Year(255),
+        ];
+        for value in values {
+            let mut expected = vec![7];
+            encode_value_key(ValueKey::from(&value), &mut expected);
+            for collation in [None, Some(45), Some(255)] {
+                let mut actual = vec![7];
+                encode_with_collation(&value, collation, &mut actual);
+                assert_eq!(actual, expected, "{value:?}");
+            }
+        }
+    }
 
     #[test]
     fn single_integer_partition_key_preserves_canonical_equality() {

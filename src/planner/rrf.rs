@@ -29,12 +29,13 @@ fn normalize(query: &mut QueryExpr) -> Result<(), QueryError> {
                 } else {
                     resolve_order_alias(&order.expr, &select.projection).clone()
                 };
+                order.names_bound = true;
             }
             for item in &select.projection {
                 if let SelectItem::Expr { expr, .. } = item {
                     if !select.order_by.iter().any(|order| order.expr == *expr) {
                         select.order_by.push(OrderBy {
-                            names_bound: false,
+                            names_bound: true,
                             expr: expr.clone(),
                             asc: true,
                             nulls_first: None,
@@ -51,7 +52,12 @@ fn normalize(query: &mut QueryExpr) -> Result<(), QueryError> {
 
 fn input(db: &Database, query: &QueryExpr) -> Result<PhysicalPlan, QueryError> {
     match query {
-        QueryExpr::Select(select) => Ok(plan_select(db, select)?.physical),
+        QueryExpr::Select(select) => {
+            if crate::engine::expr::session_only_full_group_by() {
+                check_only_full_group_by(db, select)?;
+            }
+            Ok(plan_select(db, select)?.physical)
+        }
         QueryExpr::WithCte(with) => {
             let stubs = crate::engine::executor::cte::describe_definitions(&with.ctes, |query| {
                 crate::engine::executor::select::describe_subquery_columns(db, query)

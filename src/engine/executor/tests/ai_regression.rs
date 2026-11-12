@@ -1206,8 +1206,8 @@ fn ai_audit_large_embedding_batch() {
                     assert_eq!(item["index"], index);
                     assert_eq!(item["embedding"].as_array().unwrap().len(), dimensions);
                     assert_eq!(
-                        item["embedding"][dimensions - 1].as_f64().unwrap(),
-                        0.123456_f32 as f64
+                        item["embedding"][dimensions - 1].as_f64().unwrap() as f32,
+                        0.123456_f32
                     );
                 }
                 assert_idle();

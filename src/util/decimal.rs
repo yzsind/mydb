@@ -396,8 +396,26 @@ fn decimal_ref_is_zero(value: ExactDecimalRef<'_>) -> bool {
 }
 
 #[inline]
+fn cached_pow10_big(exp: u8) -> &'static BigInt {
+    static POWERS: std::sync::OnceLock<Vec<BigInt>> = std::sync::OnceLock::new();
+    &POWERS.get_or_init(|| {
+        let mut powers = Vec::with_capacity(256);
+        let mut power = BigInt::from(1u8);
+        for _ in 0..=u8::MAX {
+            powers.push(power.clone());
+            power *= 10u8;
+        }
+        powers
+    })[exp as usize]
+}
+
+#[inline]
 fn pow10_big(exp: u32) -> BigInt {
-    BigInt::from(10u8).pow(exp)
+    if let Ok(exp) = u8::try_from(exp) {
+        cached_pow10_big(exp).clone()
+    } else {
+        BigInt::from(10u8).pow(exp)
+    }
 }
 
 fn div_round_big(numer: BigInt, denom: BigInt) -> BigInt {
@@ -434,6 +452,21 @@ pub fn rescale_exact(value: ExactDecimal, to_scale: u8, round: bool) -> ExactDec
     let from_scale = value.scale();
     if from_scale == to_scale {
         return value;
+    }
+    let fixed = match &value {
+        ExactDecimal::I64(magnitude, _) => Some(i128::from(*magnitude)),
+        ExactDecimal::I128(magnitude, _) => Some(*magnitude),
+        ExactDecimal::Big(..) => None,
+    };
+    if let Some(magnitude) = fixed {
+        let rescaled = if round {
+            rescale_round_i128(magnitude, from_scale, to_scale)
+        } else {
+            rescale_trunc_i128(magnitude, from_scale, to_scale)
+        };
+        if let Some(magnitude) = rescaled {
+            return ExactDecimal::from_i128(magnitude, to_scale);
+        }
     }
     let (mut magnitude, _) = value.into_big_parts();
     if from_scale < to_scale {
@@ -476,7 +509,10 @@ fn shape_exact(
         };
     }
     let (magnitude, scale) = value.into_big_parts();
-    if magnitude.abs().to_str_radix(10).len() > spec.precision as usize {
+    // Comparing binary magnitudes avoids formatting every wide arithmetic
+    // intermediate just to count its decimal digits.
+    if spec.precision == 0 || magnitude.magnitude() >= cached_pow10_big(spec.precision).magnitude()
+    {
         return Err("DECIMAL value is out of range");
     }
     Ok(ExactDecimal::from_big(magnitude, scale))
@@ -1329,6 +1365,49 @@ mod tests {
             DecimalResultSpec::modulo(left, right),
             DecimalResultSpec::new(12, 4)
         );
+    }
+
+    #[test]
+    fn rescale_native_matches_arbitrary_precision_at_boundaries() {
+        for magnitude in [i128::MIN, i128::MIN + 1, -155, -1, 0, 1, 155, i128::MAX] {
+            for from in [0, 2, 18, 30, 38, 72] {
+                for to in [0, 1, 2, 18, 30, 38, 72] {
+                    for round in [false, true] {
+                        let native = rescale_exact(ExactDecimal::I128(magnitude, from), to, round);
+                        let wide = rescale_exact(
+                            ExactDecimal::Big(BigInt::from(magnitude), from),
+                            to,
+                            round,
+                        );
+                        assert_eq!(native.into_big_parts(), wide.into_big_parts());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn wide_precision_check_matches_decimal_digit_boundary() {
+        for precision in 1..=81 {
+            let power = cached_pow10_big(precision);
+            for magnitude in [power - 1u8, power.clone(), power + 1u8] {
+                for sign in [-1, 1] {
+                    let magnitude: BigInt = &magnitude * sign;
+                    let expected = magnitude.abs().to_str_radix(10).len() <= precision as usize;
+                    let actual = shape_exact(
+                        ExactDecimal::Big(magnitude, 0),
+                        DecimalContext {
+                            result: Some(DecimalResultSpec {
+                                precision,
+                                scale: 0,
+                            }),
+                            ..Default::default()
+                        },
+                    );
+                    assert_eq!(actual.is_ok(), expected);
+                }
+            }
+        }
     }
 
     #[test]

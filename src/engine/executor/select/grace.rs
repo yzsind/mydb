@@ -955,10 +955,6 @@ impl LazyValueRowWriterPool {
         }
     }
 
-    pub(crate) fn len(&self) -> usize {
-        self.slots.len()
-    }
-
     pub(crate) fn opens(&self) -> u64 {
         self.opens
     }

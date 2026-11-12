@@ -463,9 +463,36 @@ pub struct BatchedIndexLookupEstimate {
     pub probe_batches: f64,
 }
 
+impl BatchedIndexLookupEstimate {
+    /// Actual chunk-local page work, capped at one complete heap sweep for
+    /// the planner's broad-access penalty. Global distinct coverage already
+    /// includes every key: multiplying it by the chunk count would charge a
+    /// partial tail batch as if it repeated the complete key set.
+    pub fn heap_sweep_coverage(&self, table_pages: f64) -> f64 {
+        (self.logical_heap_page_visits / table_pages.max(1.0)).clamp(0.0, 1.0)
+    }
+}
+
 pub fn estimate_batched_index_lookup(
     ctx: &CboContext,
     input: BatchedIndexLookupInput,
+) -> BatchedIndexLookupEstimate {
+    estimate_index_lookup_batches(ctx, input, true)
+}
+
+/// IN-keyset access collects and sorts RIDs before heap projection. Unlike
+/// streamed INLJ, its heap pass is not restarted for every outer-key morsel.
+pub(crate) fn estimate_index_keyset_lookup(
+    ctx: &CboContext,
+    input: BatchedIndexLookupInput,
+) -> BatchedIndexLookupEstimate {
+    estimate_index_lookup_batches(ctx, input, false)
+}
+
+fn estimate_index_lookup_batches(
+    ctx: &CboContext,
+    input: BatchedIndexLookupInput,
+    fanout_bounded: bool,
 ) -> BatchedIndexLookupEstimate {
     let BatchedIndexLookupInput {
         index_height,
@@ -512,9 +539,19 @@ pub fn estimate_batched_index_lookup(
     // a page evicted (or merely revisited) between chunks pays the lookup
     // and buffer work again. The global page population below remains useful
     // for diagnostics, but cannot cap repeated chunk-local sweeps.
-    let chunk_keys = crate::engine::cbo::PLANNING_INLJ_CHUNK_ROWS as f64;
-    let probe_batches = (keys / chunk_keys).ceil().max(1.0);
     let matches_per_key = if keys > 0.0 { m / keys } else { 0.0 };
+    // The streamed executor bounds fanout by matching rows as well as
+    // outer keys (inlj_chunk_rows_for_fanout). A few hundred nonunique
+    // keys can therefore cause many independent MRR heap sweeps. Use the
+    // stable planning memory baseline, never the live query grant.
+    let match_capacity = (ctx.planning_mem_budget_bytes as f64 / 4096.0).max(1.0);
+    let chunk_keys = if fanout_bounded {
+        (crate::engine::cbo::PLANNING_INLJ_CHUNK_ROWS as f64)
+            .min((match_capacity / matches_per_key.max(1.0)).floor().max(1.0))
+    } else {
+        keys.max(1.0)
+    };
+    let probe_batches = (keys / chunk_keys).ceil().max(1.0);
     let full_batches = (keys / chunk_keys).floor();
     let tail_keys = keys - full_batches * chunk_keys;
     let locality = probe_key_locality.clamp(0.0, 1.0);
@@ -736,6 +773,25 @@ pub fn estimated_btree_height(entries: f64) -> f64 {
     (entries.log(fanout)).ceil().max(1.0)
 }
 
+/// Probe CPU after the optional runtime filter, shared with parallel costing.
+pub(crate) fn hash_join_probe_cpu(probe_rows: f64, match_rate: f64, filtered: bool) -> f64 {
+    let consts = cbo_consts();
+    let matches = match_rate.clamp(0.0, 1.0);
+    let ordinary = consts.hash_probe_cost() + matches * consts.cpu_operator_cost();
+    let per_row = if filtered {
+        // A runtime filter tests every key, but only survivors hash/probe the
+        // payload. Charge the same conservative false positives as Grace I/O.
+        let pass = matches + (1.0 - matches) * 0.125;
+        (consts.cpu_operator_cost()
+            + pass * consts.hash_probe_cost()
+            + matches * consts.cpu_operator_cost())
+        .min(ordinary)
+    } else {
+        ordinary
+    };
+    probe_rows * per_row
+}
+
 /// Cost of a hash join. The build side feeds a hash table, the probe
 /// side streams through it. Returns a [`Cost`] whose `startup` reflects
 /// the build phase (must complete before probing emits any rows).
@@ -788,27 +844,27 @@ pub fn hash_join(
         probe_rows * probe_width * probe_spill_pass_rate,
         ctx.planning_mem_budget_bytes as f64,
     );
-    let cpu_build = build_rows * (consts.hash_build_cost() + consts.cpu_tuple_cost());
-    let cpu_probe = probe_rows
-        * (consts.hash_probe_cost() + match_rate.clamp(0.0, 1.0) * consts.cpu_operator_cost());
-    let cpu_output = output_rows.max(0.0) * per_row_decode_cost(output_width);
-    let bloom_savings = if bloom_filter_applicable {
-        // Bloom prefilter discards (1 - match_rate) of probe rows
-        // before they hit the hash table. Phase 6 calibration may
-        // refine this 0.7 efficiency factor.
-        probe_rows * (1.0 - match_rate.clamp(0.0, 1.0)) * consts.cpu_operator_cost() * 0.7
+    // Grace currently materializes joined batches before its parent can pull
+    // them. Charge that write/read as well as partitioning the two inputs;
+    // otherwise a wide intermediate looks as cheap as a narrow one.
+    let spill_output = if spill > 0.0 {
+        output_rows.max(0.0) * output_width.max(0.0) / PAGE_SIZE_BYTES as f64
+            * 2.0
+            * consts.spill_page_cost()
     } else {
         0.0
     };
-    let startup = build_cost.total + cpu_build + spill;
-    let total = startup + probe_cost.total + cpu_probe + cpu_output - bloom_savings;
+    let cpu_build = build_rows * (consts.hash_build_cost() + consts.cpu_tuple_cost());
+    let cpu_probe = hash_join_probe_cpu(probe_rows, match_rate, bloom_filter_applicable);
+    let cpu_output = output_rows.max(0.0) * per_row_decode_cost(output_width);
+    let startup = build_cost.total + cpu_build + spill + spill_output;
+    let total = startup + probe_cost.total + cpu_probe + cpu_output;
     Cost {
         startup,
         total: total.max(startup),
         io_seq_pages: build_cost.io_seq_pages + probe_cost.io_seq_pages,
         io_rnd_pages: build_cost.io_rnd_pages + probe_cost.io_rnd_pages,
-        cpu_units: build_cost.cpu_units + probe_cost.cpu_units + cpu_build + cpu_probe + cpu_output
-            - bloom_savings,
+        cpu_units: build_cost.cpu_units + probe_cost.cpu_units + cpu_build + cpu_probe + cpu_output,
         mem_bytes: build_cost
             .mem_bytes
             .max(probe_cost.mem_bytes)
@@ -1813,6 +1869,23 @@ mod tests {
     }
 
     #[test]
+    fn hash_join_runtime_filter_prices_surviving_hash_probes() {
+        let all = hash_join_probe_cpu(1_000_000.0, 1.0, false);
+        assert_eq!(all, hash_join_probe_cpu(1_000_000.0, 1.0, true));
+        let selective = hash_join_probe_cpu(1_000_000.0, 0.01, true);
+        assert!(selective > 0.0 && selective < all * 0.5);
+        for filtered in [false, true] {
+            let mut previous = 0.0;
+            for rate in [0.0, 0.01, 0.1, 0.5, 1.0] {
+                let cost = hash_join_probe_cpu(1_000_000.0, rate, filtered);
+                assert!(cost >= previous);
+                assert_eq!(hash_join_probe_cpu(2_000_000.0, rate, filtered), cost * 2.0);
+                previous = cost;
+            }
+        }
+    }
+
+    #[test]
     fn hash_join_bloom_reduces_grace_probe_spill() {
         let mut tight = ctx();
         tight.planning_mem_budget_bytes = 1024 * 1024;
@@ -2164,6 +2237,90 @@ mod tests {
         );
         assert!((prefix.logical_index_leaf_visits - input.leaf_pages).abs() < 1.0);
         assert!(prefix.cost.total < sparse.cost.total);
+    }
+
+    #[test]
+    fn batched_fanout_costs_repeated_memory_bounded_heap_sweeps() {
+        let input = BatchedIndexLookupInput {
+            index_height: 3.0,
+            index_leaf_pages: 50_000.0,
+            probe_key_locality: 0.0,
+            leaf_pages: 5_000.0,
+            matched_rows: 1_000_000.0,
+            probe_keys: 500.0,
+            table_pages: 400_000.0,
+            output_width: 200.0,
+            correlation: 0.0,
+            competing_pages: 0.0,
+        };
+        let bounded = estimate_batched_index_lookup(&ctx(), input);
+        let mut generous = ctx();
+        generous.planning_mem_budget_bytes = 8 * 1024 * 1024 * 1024;
+        let one_batch = estimate_batched_index_lookup(&generous, input);
+        let keyset = estimate_index_keyset_lookup(&ctx(), input);
+        assert_eq!(keyset.probe_batches, 1.0);
+        assert_eq!(
+            keyset.logical_heap_page_visits,
+            one_batch.logical_heap_page_visits
+        );
+        assert_eq!(keyset.cost.total, one_batch.cost.total);
+        assert!(bounded.probe_batches > 1.0);
+        assert_eq!(one_batch.probe_batches, 1.0);
+        assert_eq!(bounded.distinct_heap_pages, one_batch.distinct_heap_pages);
+        assert!(bounded.logical_heap_page_visits > one_batch.logical_heap_page_visits * 2.0);
+        assert!(bounded.cost.total > one_batch.cost.total);
+        let point = BatchedIndexLookupInput {
+            matched_rows: 500.0,
+            ..input
+        };
+        assert_eq!(
+            estimate_batched_index_lookup(&ctx(), point).probe_batches,
+            1.0
+        );
+    }
+
+    #[test]
+    fn sparse_fanout_tail_does_not_repeat_the_global_heap_domain() {
+        let mut context = ctx();
+        context.planning_mem_budget_bytes = 256 * 1024 * 1024;
+        let per_key = 200.0;
+        let chunk = (context.planning_mem_budget_bytes as f64 / 4096.0 / per_key).floor();
+        let input = BatchedIndexLookupInput {
+            index_height: 3.0,
+            index_leaf_pages: 50_000.0,
+            probe_key_locality: 0.0,
+            leaf_pages: 400.0,
+            matched_rows: chunk * per_key,
+            probe_keys: chunk,
+            table_pages: 500_000.0,
+            output_width: 240.0,
+            correlation: 0.0,
+            competing_pages: 0.0,
+        };
+        let full = estimate_batched_index_lookup(&context, input);
+        let tail = estimate_batched_index_lookup(
+            &context,
+            BatchedIndexLookupInput {
+                matched_rows: (chunk + 1.0) * per_key,
+                probe_keys: chunk + 1.0,
+                ..input
+            },
+        );
+        assert_eq!(full.probe_batches, 1.0);
+        assert_eq!(tail.probe_batches, 2.0);
+        let coverage = tail.heap_sweep_coverage(input.table_pages);
+        assert!(coverage < 0.2);
+        assert!(coverage >= full.heap_sweep_coverage(input.table_pages));
+        assert!(coverage < full.heap_sweep_coverage(input.table_pages) * 1.01);
+        let repeated = estimate_batched_index_lookup(
+            &context,
+            BatchedIndexLookupInput {
+                matched_rows: chunk * per_key * 20.0,
+                probe_keys: chunk * 20.0,
+                ..input
+            },
+        );
+        assert_eq!(repeated.heap_sweep_coverage(input.table_pages), 1.0);
     }
 
     #[test]

@@ -270,6 +270,11 @@ impl SpillSlot {
         slot: usize,
     ) {
         let columns = &mut columns[self.offset..self.offset + self.codec.width()];
+        if let Some(counts) = &arena.count_states {
+            debug_assert!(matches!(self.codec, PartialCodec::Count));
+            columns[0].push(Value::Int(counts[group * arena.n_aggs + slot]));
+            return;
+        }
         if let Some(decimal) = &arena.decimal_state_columns[slot] {
             debug_assert!(matches!(self.codec, PartialCodec::Numeric));
             let sum = decimal.state(group);

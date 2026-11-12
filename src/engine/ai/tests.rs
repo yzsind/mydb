@@ -544,3 +544,66 @@ fn strict_json_domains_preserve_values_errors_and_budget_order() {
     assert!(error.is(crate::error::catalog::ER_AI_BUDGET_EXCEEDED));
     assert_eq!(error.message(), "reservation rejected");
 }
+
+#[test]
+fn ai_audit_routing_ignores_data_and_preserves_executable_comments() {
+    for sql in [
+        "DO SLEEP(1) /* AI model */",
+        "INSERT INTO t VALUES ('AI model')",
+        "SET @x = 'create AI'",
+    ] {
+        assert!(!sql::sql_calls_ai(sql, Default::default()), "{sql}");
+        assert!(!sql::sql_may_have_ai(sql), "{sql}");
+    }
+    for sql in [
+        "SELECT AI_GENERATE('m','x')",
+        "SELECT /*!50000AI_GENERATE*/('m','x')",
+        "CREATE AI MODEL m USING c WITH CONFIG '{}'",
+        "CREATE AI_SECRET k VALUE 'sensitive'",
+    ] {
+        assert!(sql::sql_may_have_ai(sql), "{sql}");
+    }
+}
+
+#[test]
+fn ai_audit_provider_schema_is_validated_before_catalog_mutation() {
+    let connection: Connection = serde_json::from_value(serde_json::json!({"protocol":"ollama","base_url":"http://127.0.0.1:1","auth":{"type":"none"}})).unwrap();
+    for extra in [
+        serde_json::json!({"provider_options_allowed":["x"],"provider_options_schema":{"x":{"type":"nonsense"}}}),
+        serde_json::json!({"provider_options_schema":{"x":{"type":"integer"}}}),
+        serde_json::json!({"provider_options_allowed":["model"]}),
+        serde_json::json!({"defaults":{"on_error":"return"}}),
+    ] {
+        let mut value =
+            serde_json::json!({"kind":"text_generation","remote_model":"m","model_revision":"v1"});
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let model: Model = serde_json::from_value(value).unwrap();
+        assert!(config::validate_model(&model, &connection).is_err());
+    }
+    let error = parse_statement("CREATE AI MODEL m\n USING c WITH CONFIG 123").unwrap_err();
+    assert_eq!(error.line, 2);
+    assert!(error.column > 1);
+}
+
+#[test]
+fn ai_model_grant_preserves_escaped_account_literals_and_identifiers() {
+    for tail in [
+        r#"TO 'app\'@\'%\', \'victim'@'%'"#,
+        r#"TO "app\"@\"%\", \"victim"@"%""#,
+        "TO `o``brien`@`%` WITH GRANT OPTION",
+        "TO 'o''brien'@'%'",
+    ] {
+        let Statement::Ai(ai) =
+            parse_statement(&format!("GRANT AI_USE ON AI MODEL test.m {tail}")).unwrap()
+        else {
+            panic!()
+        };
+        let expected = parse_statement(&format!("GRANT SELECT ON *.* {tail}")).unwrap();
+        let translated =
+            parse_statement(&format!("GRANT SELECT ON *.* {}", ai.tail.unwrap())).unwrap();
+        assert_eq!(format!("{translated:?}"), format!("{expected:?}"));
+    }
+}

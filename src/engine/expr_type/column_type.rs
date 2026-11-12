@@ -279,7 +279,12 @@ fn infer_column_type_checked<const SCHEMA: bool>(
             ColumnType::Date | ColumnType::Time | ColumnType::DateTime | ColumnType::Timestamp => {
                 ColumnType::Double
             }
-            ColumnType::Year => ColumnType::LongLong,
+            ColumnType::Tiny
+            | ColumnType::Short
+            | ColumnType::MediumInt
+            | ColumnType::Long
+            | ColumnType::LongLong
+            | ColumnType::Year => ColumnType::LongLong,
             other => other,
         },
         Expr::Unary { expr, .. } => recurse(expr),
@@ -385,7 +390,12 @@ where
                 | ColumnType::Time
                 | ColumnType::DateTime
                 | ColumnType::Timestamp => ColumnType::Double,
-                ColumnType::Year => ColumnType::LongLong,
+                ColumnType::Tiny
+                | ColumnType::Short
+                | ColumnType::MediumInt
+                | ColumnType::Long
+                | ColumnType::LongLong
+                | ColumnType::Year => ColumnType::LongLong,
                 other => other,
             },
         ),

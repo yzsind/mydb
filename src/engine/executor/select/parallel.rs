@@ -2288,6 +2288,19 @@ pub(super) fn execute_parallel_rollup_aggregate(
     )? {
         return super::plan::rollup_emit_from_vec_finest(finest, group_by, &slots, having);
     }
+    // Keep the same bounded columnar fallback as serial ROLLUP. Expanding
+    // every input row before external sorting multiplies string/key payloads
+    // and spill traffic precisely when finest groups exceed the query grant.
+    if let Some((stream, merge_slots)) =
+        super::vec_bridge::try_native_rollup_sorted_stream(db, txn, input, group_by, &slots)?
+    {
+        return super::plan::aggregate_rollup_plan_stream_sorted(
+            stream,
+            group_by,
+            having,
+            &merge_slots,
+        );
+    }
     // See `aggregate_rollup_plan_rows`: the per-group representative row is only
     // needed for the MySQL hidden-column extension, detectable from the slots.
     let needs_sample_fields = slots.iter().any(|slot| {

@@ -67,7 +67,7 @@ fn zero_column_sort_preserves_cardinality_in_memory_and_spill() {
         .unwrap();
         let mut tuning = crate::engine::executor::tuning::current_or_capture();
         tuning.sort_run_bytes = Some(limit);
-        tuning.sort_merge_fanin = 2;
+        tuning.sort_merge_fanin = Some(2);
         let _tuning = crate::engine::executor::tuning::enter(tuning);
         let mut sort = ExternalSortBatchOperator::new(
             None,
@@ -276,7 +276,7 @@ fn wide_computed_sort_keys_use_chunks_without_leaking_hidden_columns() {
             .unwrap();
         let mut tuning = crate::engine::executor::tuning::current_or_capture();
         tuning.sort_run_bytes = Some(256 * 1024);
-        tuning.sort_merge_fanin = 2;
+        tuning.sort_merge_fanin = Some(2);
         let _tuning = crate::engine::executor::tuning::enter(tuning);
         let mut sort = ExternalSortBatchOperator::new(
             None,
@@ -308,4 +308,111 @@ fn wide_computed_sort_keys_use_chunks_without_leaking_hidden_columns() {
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.spill_bytes(), 0);
     });
+}
+
+#[test]
+fn repeated_string_sort_keys_restore_payload_after_multi_pass_spill() {
+    for run_bytes in [1024, 1024 * 1024] {
+        let dir = tempfile::tempdir().unwrap();
+        let schema = Arc::new(BatchSchema::new(vec![
+            BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "k".into(),
+                column_type: ColumnType::VarString,
+                source: Default::default(),
+            },
+            BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "v".into(),
+                column_type: ColumnType::LongLong,
+                source: Default::default(),
+            },
+        ]));
+        let rows = (0..300)
+            .map(|i| {
+                vec![
+                    if i % 11 == 0 {
+                        Value::Null
+                    } else {
+                        Value::String(["é", "E", "中", "a ", "A"][i % 5].repeat(24))
+                    },
+                    Value::Int(i as i64),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let field = crate::engine::executor::sort::SortField {
+            ascending: true,
+            nulls_first: false,
+            collation_id: Some(crate::charset::collation_id("utf8mb4_0900_ai_ci")),
+        };
+        let fields = vec![field.clone(), field];
+        let mut expected = rows.clone();
+        expected.sort_by(|a, b| {
+            crate::engine::executor::sort::compare_sort_keys(
+                &fields,
+                &[a[0].clone(), a[0].clone()],
+                &[b[0].clone(), b[0].clone()],
+            )
+        });
+        let input = MaterializedBatchOperator::new(
+            schema.clone(),
+            vec![Batch::new(
+                schema.clone(),
+                (0..2)
+                    .map(|column| {
+                        ColumnVector::from_values(
+                            rows.iter().map(|row| row[column].clone()).collect(),
+                        )
+                    })
+                    .collect(),
+            )],
+        );
+        let mut tuning = crate::engine::executor::tuning::current_or_capture();
+        tuning.sort_run_bytes = Some(run_bytes);
+        tuning.sort_merge_fanin = Some(2);
+        let _tuning = crate::engine::executor::tuning::enter(tuning);
+        let mut sort = ExternalSortBatchOperator::new(
+            None,
+            Box::new(input),
+            schema,
+            BatchProperties {
+                ordering: BatchOrdering::Ordered(vec![]),
+                partitioning: BatchPartitioning::Single,
+            },
+            vec![SortKeySource::Column(0), SortKeySource::Column(0)],
+            fields,
+            dir.path(),
+        );
+        let mut actual = Vec::new();
+        while let Some(batch) = sort.next_batch().unwrap() {
+            for row in batch.visible_indices() {
+                actual.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| column.value_at(row))
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        assert_eq!(actual, expected);
+    }
+}
+
+#[test]
+fn merge_fanin_is_bounded_by_live_headroom_and_explicit_tuning() {
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget, ScopedCharge};
+    let budget = Arc::new(MemBudget::new(64 * 1024 * 1024));
+    with_query_budget(budget.clone(), || {
+        let available = merge_fanin(None);
+        assert!((2..=128).contains(&available));
+        assert_eq!(merge_fanin(Some(2)), 2);
+        let mut retained = ScopedCharge::new(0);
+        retained.add(63 * 1024 * 1024).unwrap();
+        assert_eq!(merge_fanin(None), 2);
+        assert!(merge_fanin(Some(128)) <= available);
+    });
+    assert_eq!(budget.used(), 0);
 }

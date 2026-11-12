@@ -1919,7 +1919,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 UnaryOp::Neg => {
                     let mut result = input;
                     match &mut result.kind {
-                        Integer { unsigned, .. } | Decimal { unsigned, .. } => *unsigned = false,
+                        Integer { width, unsigned } => {
+                            *width = IntegerWidth::Big;
+                            *unsigned = false;
+                            result.max_octets = None;
+                        }
+                        Decimal { unsigned, .. } => *unsigned = false,
                         Year => {
                             result.kind = Integer {
                                 width: IntegerWidth::Big,

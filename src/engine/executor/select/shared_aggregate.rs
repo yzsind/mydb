@@ -9,6 +9,8 @@ use std::collections::HashSet;
 pub(super) struct SharedAggregates {
     pub(super) definitions: Vec<(CteDef, usize)>,
     pub(super) body: Select,
+    pub(super) outer_probe: Option<Select>,
+    pub(super) column_overrides: Vec<Vec<Column>>,
 }
 
 fn safe_expr(expr: &Expr) -> bool {
@@ -302,7 +304,327 @@ fn identity(db: &Database, select: &Select) -> Option<Select> {
     Some(normalized)
 }
 
+// Fuse warning-free scalar aggregates over the same unindexed source. Each
+// conditional aggregate retains its own filter and NULL semantics; consumers
+// still see scalar subqueries with the original result column descriptors.
+fn factor_scalar(db: &Database, select: &Select) -> Option<SharedAggregates> {
+    if select.from.len() > 1
+        || select.distinct
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || !select.order_by.is_empty()
+        || planner::select_has_aggregate(db, select)
+        || select.for_update
+        || select.lock_clause.is_some()
+        || select.sql_calc_found_rows
+        || select.derived.is_some()
+        || !select.joins.is_empty()
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || select.values.is_some()
+        || select.json_table.is_some()
+        || !select.named_windows.is_empty()
+        || !select.query_hints.is_empty()
+        || select.projection.iter().all(|item| {
+            !matches!(item, SelectItem::Expr { expr, .. }
+            if crate::parser::visit::value_expr_contains_subquery(expr))
+        })
+        || crate::engine::params::streaming_param_source_active()
+        || !super::super::cte::current_cte_registry().is_empty()
+        || !crate::util::env::flag("MYDB_SHARED_SCALAR_AGGREGATE", true)
+    {
+        return None;
+    }
+
+    // Probe at most one outer row before eagerly sharing independent
+    // aggregates. Empty outer inputs must never trigger a large fact scan.
+    let outer_probe = if let Some(table) = select.from.first() {
+        let schema = db.table(&table.name).ok()?;
+        if schema.system
+            || schema.row_security.enabled
+            || !schema.table_type.eq_ignore_ascii_case("BASE TABLE")
+            || schema
+                .columns
+                .iter()
+                .any(|column| column.generated_expr.is_some())
+            || table.system_time.is_some()
+            || table.sample.is_some()
+            || table.generate_series.is_some()
+            || !table.column_aliases.is_empty()
+        {
+            return None;
+        }
+        let tables = vec![(table, schema)];
+        if select
+            .selection
+            .as_ref()
+            .is_some_and(|filter| !predicate(filter, &tables))
+        {
+            return None;
+        }
+        let mut probe = select.clone();
+        probe.projection = vec![SelectItem::Expr {
+            expr: Expr::Literal(Literal::Int(1)),
+            alias: None,
+        }];
+        probe.limit = Some(crate::parser::LimitValue::Rows(1));
+        Some(probe)
+    } else {
+        if select.selection.is_some() {
+            return None;
+        }
+        None
+    };
+
+    fn candidate(db: &Database, query: &Select) -> Option<(Select, Expr)> {
+        if !safe_tree(query)
+            || query.from.len() != 1
+            || !query.joins.is_empty()
+            || query.derived.is_some()
+            || !query.group_by.is_empty()
+            || !query.grouping_sets.is_empty()
+            || query.group_by_modifier != GroupByModifier::None
+            || query.having.is_some()
+            || query.limit.is_some()
+            || query.offset.is_some()
+            || !query.order_by.is_empty()
+            || query.distinct
+        {
+            return None;
+        }
+        let table = &query.from[0];
+        let schema = db.table(&table.name).ok()?;
+        if schema.system
+            || schema.row_security.enabled
+            || !schema.table_type.eq_ignore_ascii_case("BASE TABLE")
+            || schema
+                .columns
+                .iter()
+                .any(|column| column.generated_expr.is_some())
+            || table.system_time.is_some()
+            || table.sample.is_some()
+            || !table.column_aliases.is_empty()
+        {
+            return None;
+        }
+        let tables = vec![(table, schema.clone())];
+        let [SelectItem::Expr {
+            expr:
+                Expr::Function {
+                    name,
+                    args,
+                    distinct: false,
+                },
+            ..
+        }] = query.projection.as_slice()
+        else {
+            return None;
+        };
+        if args.len() != 1
+            || !matches!(
+                name.to_ascii_uppercase().as_str(),
+                "COUNT" | "SUM" | "AVG" | "MIN" | "MAX"
+            )
+        {
+            return None;
+        }
+        let argument = if name.eq_ignore_ascii_case("COUNT") && matches!(args[0], Expr::Wildcard) {
+            Expr::Literal(Literal::Int(1))
+        } else {
+            let (_, col) = column(&args[0], &tables)?;
+            if !exact(col) {
+                return None;
+            }
+            args[0].clone()
+        };
+        if let Some(filter) = &query.selection {
+            if !predicate(filter, &tables) {
+                return None;
+            }
+            let mut indexed = false;
+            crate::parser::visit::inspect_value_expr(
+                filter,
+                |expr| {
+                    if let Some(((_, index), _)) = column(expr, &tables) {
+                        indexed |= schema.indexes.iter().any(|key| {
+                            key.columns.first().is_some_and(|col| {
+                                col.eq_ignore_ascii_case(&schema.columns[index].name)
+                            })
+                        });
+                    }
+                    true
+                },
+                |_| {},
+            );
+            if indexed {
+                return None;
+            }
+        }
+        let argument = match &query.selection {
+            Some(filter) => Expr::Case {
+                operand: None,
+                conditions: vec![filter.clone()].into(),
+                results: vec![argument],
+                else_result: Some(Box::new(Expr::Literal(Literal::Null))),
+            },
+            None => argument,
+        };
+        let aggregate = Expr::Function {
+            name: name.clone(),
+            args: vec![argument],
+            distinct: false,
+        };
+        let mut source = query.clone();
+        source.projection.clear();
+        source.selection = None;
+        Some((source, aggregate))
+    }
+    struct Group {
+        source: Select,
+        queries: Vec<Select>,
+        aggregates: Vec<Expr>,
+        consumers: usize,
+        name: String,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+    for item in &select.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            crate::parser::visit::inspect_value_expr(
+                expr,
+                |expr| {
+                    if let Expr::Subquery(query) = expr {
+                        if let Some((source, aggregate)) = candidate(db, query) {
+                            if let Some(group) =
+                                groups.iter_mut().find(|group| group.source == source)
+                            {
+                                group.consumers += 1;
+                                if !group.queries.contains(query) {
+                                    group.queries.push((**query).clone());
+                                    group.aggregates.push(aggregate);
+                                }
+                            } else if groups.len() < 16 {
+                                groups.push(Group {
+                                    source,
+                                    queries: vec![(**query).clone()],
+                                    aggregates: vec![aggregate],
+                                    consumers: 1,
+                                    name: String::new(),
+                                });
+                            }
+                        }
+                        return false;
+                    }
+                    true
+                },
+                |_| {},
+            );
+        }
+    }
+    groups.retain(|group| group.queries.len() > 1 && group.queries.len() <= 64);
+    if groups.is_empty() {
+        return None;
+    }
+    let mut serial = 0;
+    for group in &mut groups {
+        loop {
+            let name = format!("__mydb_scalar_agg_{serial}");
+            serial += 1;
+            if db.table(&name).is_err()
+                && !select.from.iter().any(|table| {
+                    table.name.eq_ignore_ascii_case(&name)
+                        || table
+                            .alias
+                            .as_ref()
+                            .is_some_and(|alias| alias.eq_ignore_ascii_case(&name))
+                })
+            {
+                group.name = name;
+                break;
+            }
+        }
+    }
+    let mut body = select.clone();
+    for item in &mut body.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            crate::parser::visit::rewrite_value_expr(expr, |expr| {
+                if let Expr::Subquery(query) = expr {
+                    for group in &groups {
+                        if let Some(index) = group
+                            .queries
+                            .iter()
+                            .position(|original| original == query.as_ref())
+                        {
+                            query.table = Some(group.name.clone());
+                            query.from[0].name = group.name.clone();
+                            query.from[0].alias = None;
+                            query.from[0].partitions.clear();
+                            query.selection = None;
+                            query.projection = vec![SelectItem::Expr {
+                                expr: Expr::Identifier(format!("v{index}")),
+                                alias: None,
+                            }];
+                            break;
+                        }
+                    }
+                    return false;
+                }
+                true
+            });
+        }
+    }
+    let column_overrides = groups
+        .iter()
+        .map(|group| {
+            group
+                .queries
+                .iter()
+                .enumerate()
+                .map(|(index, query)| {
+                    let mut columns = describe_select_columns(db, query).ok()?;
+                    if columns.len() != 1 {
+                        return None;
+                    }
+                    columns[0].name = format!("v{index}");
+                    columns.pop()
+                })
+                .collect::<Option<Vec<_>>>()
+        })
+        .collect::<Option<Vec<_>>>()?;
+    Some(SharedAggregates {
+        outer_probe,
+        column_overrides,
+        body,
+        definitions: groups
+            .into_iter()
+            .map(|mut group| {
+                group.source.projection = group
+                    .aggregates
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, expr)| SelectItem::Expr {
+                        expr,
+                        alias: Some(format!("v{index}")),
+                    })
+                    .collect();
+                (
+                    CteDef {
+                        name: group.name,
+                        columns: Vec::new(),
+                        is_recursive: false,
+                        query: QueryExpr::from(group.source),
+                    },
+                    group.consumers,
+                )
+            })
+            .collect(),
+    })
+}
+
 pub(super) fn factor(db: &Database, select: &Select) -> Option<SharedAggregates> {
+    if let Some(shared) = factor_scalar(db, select) {
+        return Some(shared);
+    }
     // Ordinary point/range queries must not pay AST cloning or catalog lookups.
     if select.derived.is_none() && select.joins.iter().all(|join| join.derived.is_none()) {
         return None;
@@ -423,6 +745,8 @@ pub(super) fn factor(db: &Database, select: &Select) -> Option<SharedAggregates>
     }
     replace(db, &mut body, &candidates);
     Some(SharedAggregates {
+        outer_probe: None,
+        column_overrides: Vec::new(),
         body,
         definitions: candidates
             .into_iter()

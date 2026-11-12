@@ -65,6 +65,13 @@ impl SortKeyValues {
         }
     }
 
+    fn as_mut_slice(&mut self) -> &mut [Value] {
+        match self {
+            Self::One(value) => std::slice::from_mut(value),
+            Self::Many(values) => values,
+        }
+    }
+
     fn take_values(&mut self) -> impl Iterator<Item = Value> + '_ {
         let values = match self {
             Self::One(value) => std::slice::from_mut(value),
@@ -305,7 +312,7 @@ fn run_bytes() -> usize {
         return bytes;
     }
     crate::engine::executor::mem_budget::current_budget()
-        .map(|budget| (budget.limit() / 4).clamp(1024 * 1024, 64 * 1024 * 1024))
+        .map(|budget| (budget.limit() / 4).clamp(1024 * 1024, 256 * 1024 * 1024))
         .unwrap_or(8 * 1024 * 1024)
 }
 
@@ -315,12 +322,20 @@ fn spill_block_bytes() -> usize {
     })
 }
 
-fn merge_fanin(configured: usize) -> usize {
+fn merge_fanin(configured: Option<usize>) -> usize {
+    // A fixed small fan-in adds entire read/write passes even when memory
+    // and file descriptors can hold all remaining runs. Explicit tuning is
+    // still an upper bound; reserve half the live headroom for output and
+    // downstream state, rather than using the query's original limit.
+    let without_budget = configured.unwrap_or(32);
+    let configured = configured.unwrap_or(128);
     let per_reader = spill_block_bytes()
         .saturating_mul(4)
         .saturating_add(32 * 1024);
     let memory = crate::engine::executor::mem_budget::current_budget()
-        .map_or(configured, |budget| budget.limit() / per_reader.max(1));
+        .map_or(without_budget, |budget| {
+            budget.remaining() / 2 / per_reader.max(1)
+        });
     let descriptors = {
         #[cfg(unix)]
         {
@@ -590,8 +605,74 @@ impl RunReader {
     }
 }
 
+/// Merge comparisons revisit each head O(log fan-in) times. Cache string
+/// weights once per head instead of repeating Unicode collation on every
+/// comparison; numeric and mixed-domain keys retain the shared comparator.
+struct MergeStringKeys {
+    keys: Vec<Option<Vec<u8>>>,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
+impl MergeStringKeys {
+    fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        }
+    }
+
+    fn update(
+        &mut self,
+        row: &SortRow,
+        fields: &[crate::engine::executor::sort::SortField],
+        previous: Option<&SortRow>,
+    ) -> Result<(), QueryError> {
+        self.keys.resize_with(fields.len(), || None);
+        for (index, ((slot, value), field)) in self
+            .keys
+            .iter_mut()
+            .zip(row.keys.iter())
+            .zip(fields)
+            .enumerate()
+        {
+            // Consecutive heads of one sorted run usually share a long raw
+            // prefix. Its collation weights are unchanged; borrow the outgoing
+            // head rather than retaining a second copy of each string.
+            if slot.is_some()
+                && previous
+                    .and_then(|row| row.keys.get(index))
+                    .is_some_and(|old| old.storage_eq(value))
+            {
+                continue;
+            }
+            let text = match value {
+                Value::String(text) => Some(text.as_str()),
+                Value::SmallString(text) => std::str::from_utf8(text.as_ref()).ok(),
+                _ => None,
+            };
+            // Without an explicit collation retain the context-aware comparator.
+            if let (Some(text), Some(id)) = (text, field.collation_id) {
+                crate::charset::collation_key_by_id_into(
+                    id,
+                    text,
+                    slot.get_or_insert_with(Vec::new),
+                );
+            } else {
+                *slot = None;
+            }
+        }
+        let bytes = self.keys.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+            + self.keys.iter().flatten().map(Vec::capacity).sum::<usize>();
+        if bytes > self.charge.charged() {
+            self.charge.add_force(bytes - self.charge.charged())?;
+        }
+        Ok(())
+    }
+}
+
 struct HeapRow {
     row: SortRow,
+    string_keys: MergeStringKeys,
     charge: crate::engine::executor::mem_budget::ScopedCharge,
     fields: Arc<[crate::engine::executor::sort::SortField]>,
     payload_ties: bool,
@@ -610,7 +691,38 @@ impl PartialOrd for HeapRow {
 }
 impl Ord for HeapRow {
     fn cmp(&self, other: &Self) -> Ordering {
-        compare_rows(&self.row, &other.row, &self.fields, self.payload_ties)
+        for (index, field) in self.fields.iter().enumerate() {
+            let order = match (
+                &self.string_keys.keys[index],
+                &other.string_keys.keys[index],
+            ) {
+                (Some(left), Some(right)) => {
+                    let order = left.cmp(right);
+                    if field.ascending {
+                        order
+                    } else {
+                        order.reverse()
+                    }
+                }
+                _ => crate::engine::executor::sort::compare_value_for_sort(
+                    &self.row.keys.as_slice()[index],
+                    &other.row.keys.as_slice()[index],
+                    *field,
+                ),
+            };
+            if order != Ordering::Equal {
+                return order;
+            }
+        }
+        (if self.payload_ties {
+            crate::engine::executor::sort::compare_payload_rows(
+                &self.row.payload,
+                &other.row.payload,
+            )
+        } else {
+            Ordering::Equal
+        })
+        .then_with(|| self.row.ordinal.cmp(&other.row.ordinal))
     }
 }
 
@@ -632,17 +744,23 @@ impl RunMerger {
         let mut heads = Vec::with_capacity(runs.len());
         for run in runs {
             let mut reader = RunReader::open(run, &tmp, schema.clone(), key_count, runs.len())?;
-            heads.push(reader.next_row()?.map(|row| {
-                (
+            let head = if let Some(row) = reader.next_row()? {
+                let mut string_keys = MergeStringKeys::new();
+                string_keys.update(&row.row, &fields, None)?;
+                Some((
                     HeapRow {
                         row: row.row,
+                        string_keys,
                         charge: row.charge,
                         fields: fields.clone(),
                         payload_ties,
                     },
                     (),
-                )
-            }));
+                ))
+            } else {
+                None
+            };
+            heads.push(head);
             readers.push(reader);
         }
         Ok(Self {
@@ -659,20 +777,23 @@ impl RunMerger {
             row: item.row,
             charge: item.charge,
         };
-        self.tree.refill(
-            run,
-            self.readers[run].next_row()?.map(|row| {
-                (
-                    HeapRow {
-                        row: row.row,
-                        charge: row.charge,
-                        fields: item.fields,
-                        payload_ties: item.payload_ties,
-                    },
-                    (),
-                )
-            }),
-        );
+        let next = if let Some(row) = self.readers[run].next_row()? {
+            let mut string_keys = item.string_keys;
+            string_keys.update(&row.row, &item.fields, Some(&output.row))?;
+            Some((
+                HeapRow {
+                    row: row.row,
+                    string_keys,
+                    charge: row.charge,
+                    fields: item.fields,
+                    payload_ties: item.payload_ties,
+                },
+                (),
+            ))
+        } else {
+            None
+        };
+        self.tree.refill(run, next);
         Ok(Some(output))
     }
 }
@@ -791,6 +912,9 @@ pub(crate) struct ExternalSortBatchOperator<'a> {
     output_remaining: Option<usize>,
     record_topn_keys: bool,
     payload_ties: bool,
+    // Direct sort columns already own their values in the key. Their payload
+    // lanes remain NULL until output, avoiding duplicate strings in every run.
+    payload_key_sources: Vec<Option<usize>>,
     input_ordinal_column: Option<usize>,
 }
 
@@ -861,6 +985,7 @@ impl<'a> ExternalSortBatchOperator<'a> {
             output_remaining: None,
             record_topn_keys: false,
             payload_ties: false,
+            payload_key_sources: Vec::new(),
             input_ordinal_column: None,
         }
     }
@@ -902,6 +1027,16 @@ impl<'a> ExternalSortBatchOperator<'a> {
             self.upstream = None;
             self.output = Some(OutputState::Empty);
             return Ok(());
+        }
+        if self.topn.is_none() && !self.payload_ties && !self.row_major_keys {
+            self.payload_key_sources = vec![None; self.output_schema.len()];
+            for (key, source) in self.sources.iter().enumerate() {
+                if let SortKeySource::Column(column) = source {
+                    if let Some(slot) = self.payload_key_sources.get_mut(*column) {
+                        slot.get_or_insert(key);
+                    }
+                }
+            }
         }
         let input = self.upstream.take().expect("batch sort initialized once");
         let mut programs = Vec::new();
@@ -1079,8 +1214,19 @@ impl<'a> ExternalSortBatchOperator<'a> {
                 let value_slot = std::mem::size_of::<Value>();
                 let mut predicted = batch.columns()[..self.output_schema.len()]
                     .iter()
-                    .fold(0usize, |bytes, column| {
-                        bytes.saturating_add(column.owned_value_bytes(row_index))
+                    .enumerate()
+                    .fold(0usize, |bytes, (index, column)| {
+                        bytes.saturating_add(
+                            if self
+                                .payload_key_sources
+                                .get(index)
+                                .is_some_and(Option::is_some)
+                            {
+                                value_slot
+                            } else {
+                                column.owned_value_bytes(row_index)
+                            },
+                        )
                     });
                 if self.sources.len() != 1 {
                     predicted =
@@ -1214,7 +1360,28 @@ impl<'a> ExternalSortBatchOperator<'a> {
                     let payload = match prepared_payload {
                         Some(payload) => payload,
                         None => {
-                            copy_payload(&batch.columns()[..self.output_schema.len()], row_index)?
+                            let mut payload =
+                                crate::engine::executor::mem_budget::try_vec_with_capacity(
+                                    self.output_schema.len(),
+                                    "sort non-key payload",
+                                )?;
+                            for (column, vector) in batch.columns()[..self.output_schema.len()]
+                                .iter()
+                                .enumerate()
+                            {
+                                payload.push(
+                                    if self
+                                        .payload_key_sources
+                                        .get(column)
+                                        .is_some_and(Option::is_some)
+                                    {
+                                        Value::Null
+                                    } else {
+                                        vector.try_value_at(row_index)?
+                                    },
+                                );
+                            }
+                            payload
                         }
                     };
                     generation.push(
@@ -1329,7 +1496,15 @@ impl<'a> ExternalSortBatchOperator<'a> {
             }
             self.output_offset -= 1;
         }
-        let row = self.next_owned_row_unlimited()?;
+        let mut row = self.next_owned_row_unlimited()?;
+        if let Some(owned) = row.as_mut() {
+            for (column, key) in self.payload_key_sources.iter().enumerate() {
+                if let Some(key) = key {
+                    owned.row.payload[column] =
+                        std::mem::replace(&mut owned.row.keys.as_mut_slice()[*key], Value::Null);
+                }
+            }
+        }
         if row.is_some() {
             if let Some(remaining) = &mut self.output_remaining {
                 *remaining -= 1;
@@ -1389,8 +1564,10 @@ impl<'a> ExternalSortBatchOperator<'a> {
         Ok(output)
     }
 
-    #[cfg(test)]
-    fn next_values(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+    /// Move the final payload directly into a row consumer. Rebuilding a
+    /// columnar batch here would immediately copy every value back out again.
+    pub(crate) fn next_values(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+        self.initialize()?;
         Ok(self.next_owned_row()?.map(|owned| owned.row.payload))
     }
 }
@@ -1464,6 +1641,79 @@ mod tests {
     }
 
     #[test]
+    fn merge_string_cache_matches_total_order_and_releases_memory() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget, ScopedCharge};
+        let budget = Arc::new(MemBudget::new(1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            let mut values = vec![
+                Value::Null,
+                Value::Int(-2),
+                Value::UInt(3),
+                Value::DecimalCompact(125, 2),
+                Value::Bytes(vec![0, 65]),
+            ];
+            for text in ["", "A", "a", "a ", "é", "e", "ß", "ss", "中", "a\0b"] {
+                values.push(Value::String(text.into()));
+            }
+            for collation_id in [None, Some(63), Some(45), Some(46), Some(255), Some(309)] {
+                for ascending in [false, true] {
+                    for nulls_first in [false, true] {
+                        let fields: Arc<[_]> = vec![crate::engine::executor::sort::SortField {
+                            ascending,
+                            nulls_first,
+                            collation_id,
+                        }]
+                        .into();
+                        let make = |value: &Value| {
+                            let row = SortRow {
+                                keys: SortKeyValues::One(value.clone()),
+                                payload: vec![],
+                                ordinal: 0,
+                            };
+                            let mut string_keys = MergeStringKeys::new();
+                            string_keys.update(&row, &fields, None).unwrap();
+                            HeapRow {
+                                row,
+                                string_keys,
+                                charge: ScopedCharge::new(0),
+                                fields: fields.clone(),
+                                payload_ties: false,
+                            }
+                        };
+                        let mut reused = MergeStringKeys::new();
+                        let mut previous: Option<HeapRow> = None;
+                        for value in values.iter().chain(values.iter().rev()) {
+                            let fresh = make(value);
+                            reused
+                                .update(&fresh.row, &fields, previous.as_ref().map(|v| &v.row))
+                                .unwrap();
+                            assert_eq!(reused.keys, fresh.string_keys.keys);
+                            // Revisit the identical raw head, then transition to
+                            // another value, including NULL and non-string lanes.
+                            reused
+                                .update(&fresh.row, &fields, Some(&fresh.row))
+                                .unwrap();
+                            assert_eq!(reused.keys, fresh.string_keys.keys);
+                            previous = Some(fresh);
+                        }
+                        for left in &values {
+                            let left = make(left);
+                            for right in &values {
+                                let right = make(right);
+                                assert_eq!(
+                                    left.cmp(&right),
+                                    compare_rows(&left.row, &right.row, &fields, false)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
     fn selected_sort_releases_reservations_in_memory_and_after_spill() {
         use super::super::batch::Selection;
         use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
@@ -1492,7 +1742,7 @@ mod tests {
                     stream_batch_rows: 64,
                     stream_channel_batches: 2,
                     sort_run_bytes: Some(run_limit),
-                    sort_merge_fanin: 2,
+                    sort_merge_fanin: Some(2),
                     hash_join_bloom_adaptive: true,
                     scheduler_parallelism: 1,
                 };
@@ -1570,7 +1820,7 @@ mod tests {
             stream_batch_rows: 64,
             stream_channel_batches: 2,
             sort_run_bytes: Some(1024),
-            sort_merge_fanin: 2,
+            sort_merge_fanin: Some(2),
             hash_join_bloom_adaptive: true,
             scheduler_parallelism: 1,
         };
@@ -1645,8 +1895,7 @@ mod spill_contract_regressions {
     fn scalar_key_topk_matches_full_sort_for_domains_nulls_ties_and_selection() {
         use super::super::batch::Selection;
         use crate::engine::expr_program::{ExprCompiler, InputColumn, InputSchema};
-        std::fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
         with_query_budget(budget.clone(), || {
             for family in 0..10 {
@@ -1800,8 +2049,7 @@ mod spill_contract_regressions {
 
     #[test]
     fn topk_rejected_wide_payload_does_not_force_a_spill() {
-        std::fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
         with_query_budget(budget.clone(), || {
             let schema = Arc::new(BatchSchema::new(vec![
@@ -1837,7 +2085,7 @@ mod spill_contract_regressions {
                     stream_batch_rows: 64,
                     stream_channel_batches: 2,
                     sort_run_bytes: Some(8192),
-                    sort_merge_fanin: 2,
+                    sort_merge_fanin: Some(2),
                     hash_join_bloom_adaptive: true,
                     scheduler_parallelism: 1,
                 },
@@ -1876,8 +2124,7 @@ mod spill_contract_regressions {
 
     #[test]
     fn multi_pass_sort_live_quota_matches_remaining_files() {
-        std::fs::create_dir_all("/tmp/mydb").unwrap();
-        let root = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let root = tempfile::tempdir().unwrap();
         let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
         with_query_budget(budget.clone(), || {
             let schema = Arc::new(BatchSchema::new(vec![BatchField {
@@ -1903,7 +2150,7 @@ mod spill_contract_regressions {
                     stream_batch_rows: 64,
                     stream_channel_batches: 2,
                     sort_run_bytes: Some(1024),
-                    sort_merge_fanin: 2,
+                    sort_merge_fanin: Some(2),
                     hash_join_bloom_adaptive: true,
                     scheduler_parallelism: 1,
                 },

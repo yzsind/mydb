@@ -5477,6 +5477,9 @@ fn group_expr_fd_determined_by_retained_keys(
     select: &Select,
     group_expr: &Expr,
 ) -> bool {
+    if !crate::planner::expr_is_deterministic(group_expr) {
+        return false;
+    }
     let Some((alias, columns, table)) =
         expr_columns_single_base_table(db, current_db, select, group_expr)
     else {
@@ -5551,11 +5554,13 @@ fn resolve_column_ref_table(
             .filter(|j| j.derived.is_none())
             .map(|j| &j.table),
     ) {
-        let alias = table_alias_name(table_ref);
+        let (database_name, table_name) =
+            crate::storage::split_table_name(current_db, &table_ref.name);
+        let alias = table_ref.alias.as_deref().unwrap_or(&table_name);
         if qualifier.is_some_and(|q| !alias.eq_ignore_ascii_case(q)) {
             continue;
         }
-        let Ok(table) = db.table_in_database(current_db, &table_ref.name) else {
+        let Ok(table) = db.table_in_database(&database_name, &table_name) else {
             continue;
         };
         if table.column_index(column).is_ok() {
@@ -5588,8 +5593,9 @@ fn table_alias_name(table: &TableRef) -> &str {
 fn expr_is_column_for_alias(expr: &Expr, alias: &str, column: &str) -> bool {
     match expr {
         Expr::Identifier(name) => name.eq_ignore_ascii_case(column),
-        Expr::CompoundIdentifier(parts) if parts.len() == 2 => {
-            parts[0].eq_ignore_ascii_case(alias) && parts[1].eq_ignore_ascii_case(column)
+        Expr::CompoundIdentifier(parts) if parts.len() >= 2 => {
+            parts[parts.len() - 2].eq_ignore_ascii_case(alias)
+                && parts[parts.len() - 1].eq_ignore_ascii_case(column)
         }
         Expr::GroupKeyRef { expr, .. } => expr_is_column_for_alias(expr, alias, column),
         _ => false,

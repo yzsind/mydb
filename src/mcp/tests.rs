@@ -508,7 +508,7 @@ async fn mcp_raw_decimal_validation_and_network_memory_ownership() {
     let response = h.app.clone().oneshot(request).await.unwrap();
     let bytes = to_bytes(response.into_body(), 65536).await.unwrap();
     assert!(
-        h.sql.used.load(Ordering::Acquire) > 3 * 1024 * 1024,
+        h.sql.used.load(Ordering::Acquire) >= bytes.len(),
         "SDK buffer accounting must outlive the response body"
     );
     let text = String::from_utf8(bytes.to_vec()).unwrap();

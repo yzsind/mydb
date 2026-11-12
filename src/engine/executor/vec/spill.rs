@@ -118,12 +118,10 @@ pub fn write_batch<W: Write>(w: &mut W, batch: &Batch) -> Result<(), QueryError>
             w.write_all(&base.to_le_bytes()).map_err(io_err)?;
             // Spill runs at the memory frontier. Never allocate another
             // column-sized encoding buffer while its resident input is live.
-            let mut bytes = [0u8; 8192];
-            for chunk in data.chunks(bytes.len() / width) {
-                for (slot, &value) in bytes.chunks_exact_mut(width).zip(chunk) {
-                    slot.copy_from_slice(&(value.wrapping_sub(base) as u64).to_le_bytes()[..width]);
-                }
-                w.write_all(&bytes[..chunk.len() * width]).map_err(io_err)?;
+            match data.len().saturating_mul(width) {
+                0..=256 => write_packed_buffer::<W, 256>(w, data, base, width)?,
+                257..=1024 => write_packed_buffer::<W, 1024>(w, data, base, width)?,
+                _ => write_packed_buffer::<W, 8192>(w, data, base, width)?,
             }
             continue;
         }
@@ -184,6 +182,25 @@ pub fn write_batch<W: Write>(w: &mut W, batch: &Batch) -> Result<(), QueryError>
                 write_value(w, &c.value_at(row))?;
             }
         }
+    }
+    Ok(())
+}
+
+/// Bound stack initialization by the useful payload for short partition blocks.
+fn write_packed_buffer<W: Write, const N: usize>(
+    writer: &mut W,
+    data: &[i64],
+    base: i64,
+    width: usize,
+) -> Result<(), QueryError> {
+    let mut bytes = [0u8; N];
+    for chunk in data.chunks(bytes.len() / width) {
+        for (slot, &value) in bytes.chunks_exact_mut(width).zip(chunk) {
+            slot.copy_from_slice(&(value.wrapping_sub(base) as u64).to_le_bytes()[..width]);
+        }
+        writer
+            .write_all(&bytes[..chunk.len() * width])
+            .map_err(io_err)?;
     }
     Ok(())
 }

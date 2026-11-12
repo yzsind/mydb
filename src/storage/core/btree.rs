@@ -5917,6 +5917,7 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<IndexEntry, QueryError>>,
     {
+        let leaf_started = Instant::now();
         let mut writer =
             BulkIndexPageWriter::new(self, "index file should be open for streamed bulk load")?;
 
@@ -5975,6 +5976,7 @@ impl IndexFile {
             level.push((page_id, first));
         }
         writer.flush()?;
+        INDEX_BUILD_LEAF_US.fetch_add(leaf_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(level)
     }
 
@@ -5987,6 +5989,7 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<(i32, RowId), QueryError>>,
     {
+        let leaf_started = Instant::now();
         let mut writer =
             BulkIndexPageWriter::new(self, "index file should be open for DATE stream build")?;
 
@@ -6040,6 +6043,7 @@ impl IndexFile {
             level.push((page_id, date_index_entry(first_days, first_row_id)));
         }
         writer.flush()?;
+        INDEX_BUILD_LEAF_US.fetch_add(leaf_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(level)
     }
 
@@ -6052,6 +6056,7 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<(i64, RowId), QueryError>>,
     {
+        let leaf_started = Instant::now();
         let mut writer =
             BulkIndexPageWriter::new(self, "index file should be open for INT stream build")?;
 
@@ -6115,6 +6120,7 @@ impl IndexFile {
             level.push((page_id, single_int_index_entry(first_value, first_row_id)));
         }
         writer.flush()?;
+        INDEX_BUILD_LEAF_US.fetch_add(leaf_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(level)
     }
 
@@ -6127,6 +6133,7 @@ impl IndexFile {
     where
         I: Iterator<Item = Result<((i64, i64), RowId), QueryError>>,
     {
+        let leaf_started = Instant::now();
         let mut writer =
             BulkIndexPageWriter::new(self, "index file should be open for streamed bulk load")?;
         let mut level = Vec::new();
@@ -6197,6 +6204,7 @@ impl IndexFile {
             ));
         }
         writer.flush()?;
+        INDEX_BUILD_LEAF_US.fetch_add(leaf_started.elapsed().as_micros() as u64, Ordering::Relaxed);
         Ok(level)
     }
 

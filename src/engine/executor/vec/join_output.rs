@@ -17,6 +17,7 @@ pub(crate) struct JoinOutputQueue {
     memory: VecDeque<Batch>,
     charge: mem_budget::ScopedCharge,
     cap: usize,
+    allow_soft_handoff: bool,
     data_dir: Option<PathBuf>,
     schema: Option<Arc<BatchSchema>>,
     writer: Option<TrackedSpillWriter>,
@@ -27,14 +28,17 @@ pub(crate) struct JoinOutputQueue {
 
 impl JoinOutputQueue {
     pub(crate) fn new() -> Self {
+        let budget = mem_budget::current_budget();
         Self {
             memory: VecDeque::new(),
             charge: mem_budget::ScopedCharge::new(0),
             // Normal probe morsels can emit several batches. Let them share
             // a bounded fraction of the query grant; every resident byte is
             // still charged, and large fanout or quota pressure still spills.
-            cap: mem_budget::current_budget()
+            cap: budget
+                .as_ref()
                 .map_or(1024 * 1024, |b| (b.limit() / 16).clamp(1, 16 * 1024 * 1024)),
+            allow_soft_handoff: budget.as_ref().is_some_and(|b| b.tracks_process()),
             data_dir: None,
             schema: None,
             writer: None,
@@ -58,7 +62,15 @@ impl JoinOutputQueue {
         if self.dir.is_none()
             && (self.memory.is_empty() || self.charge.charged().saturating_add(bytes) <= self.cap)
         {
-            if self.charge.add(bytes).is_ok() {
+            // A producer and its consumer can overlap at the query's soft
+            // watermark. Admit one bounded handoff against the hard process
+            // governor instead of creating a temp directory for every morsel.
+            // Additional fanout still obeys ordinary query admission.
+            if self.charge.add(bytes).is_ok()
+                || (self.allow_soft_handoff
+                    && self.memory.is_empty()
+                    && self.charge.add_within(bytes, self.cap))
+            {
                 self.memory.push_back(batch);
                 return Ok(());
             }
@@ -166,6 +178,94 @@ mod tests {
         std::fs::create_dir_all("/tmp/mydb/join-fix").unwrap();
         tempfile::tempdir_in("/tmp/mydb/join-fix").unwrap()
     }
+    #[test]
+    fn single_pipeline_handoff_does_not_spill_at_query_soft_watermark() {
+        let root = root();
+        let budget = Arc::new(mem_budget::MemBudget::process_tracked_for_test(1024 * 1024));
+        mem_budget::with_query_budget(budget.clone(), || {
+            let mut upstream = mem_budget::ScopedCharge::new(0);
+            upstream.add(1024 * 1024 - 4096).unwrap();
+            let mut queue = JoinOutputQueue::new();
+            queue.set_data_dir(root.path());
+            let batch = Batch::new(
+                schema(),
+                vec![ColumnVector::from_values(vec![Value::Int(7); 1024])],
+            );
+            let bytes = batch.memory_bytes();
+            assert!(bytes <= queue.cap);
+            assert!(bytes > budget.remaining());
+            let mut old_queue = JoinOutputQueue::new();
+            old_queue.set_data_dir(root.path());
+            old_queue.allow_soft_handoff = false;
+            old_queue.push_back(batch.clone()).unwrap();
+            assert!(
+                old_queue.dir.is_some(),
+                "the old admission rule spills this same handoff"
+            );
+            assert_eq!(
+                old_queue.pop_front().unwrap().unwrap().row(0),
+                vec![Value::Int(7)]
+            );
+            drop(old_queue);
+            queue.push_back(batch).unwrap();
+            assert!(
+                queue.dir.is_none(),
+                "one bounded producer/consumer handoff must not create a spill file"
+            );
+            assert_eq!(queue.charge.charged(), bytes);
+            let batch = queue.pop_front().unwrap().unwrap();
+            assert_eq!(batch.row(1023), vec![Value::Int(7)]);
+            assert_eq!(queue.charge.charged(), 0);
+            assert_eq!(budget.used(), upstream.charged());
+            for value in [8, 9] {
+                queue
+                    .push_back(Batch::new(
+                        schema(),
+                        vec![ColumnVector::from_values(vec![Value::Int(value); 1024])],
+                    ))
+                    .unwrap();
+            }
+            assert!(queue.dir.is_some(), "extra fanout must still spill");
+            for value in [8, 9] {
+                assert_eq!(
+                    queue.pop_front().unwrap().unwrap().row(0),
+                    vec![Value::Int(value)]
+                );
+            }
+            assert!(queue.pop_front().unwrap().is_none());
+            assert_eq!(budget.used(), upstream.charged());
+        });
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.spill_bytes(), 0);
+    }
+
+    #[test]
+    fn explicit_output_budget_remains_a_spill_boundary_for_one_batch() {
+        let root = root();
+        let budget = Arc::new(mem_budget::MemBudget::new(1024 * 1024));
+        mem_budget::with_query_budget(budget.clone(), || {
+            let mut upstream = mem_budget::ScopedCharge::new(0);
+            upstream.add(1024 * 1024 - 4096).unwrap();
+            let mut queue = JoinOutputQueue::new();
+            queue.set_data_dir(root.path());
+            queue
+                .push_back(Batch::new(
+                    schema(),
+                    vec![ColumnVector::from_values(vec![Value::Int(7); 1024])],
+                ))
+                .unwrap();
+            assert!(queue.dir.is_some());
+            assert_eq!(queue.charge.charged(), 0);
+            assert_eq!(
+                queue.pop_front().unwrap().unwrap().row(0),
+                vec![Value::Int(7)]
+            );
+            assert!(queue.pop_front().unwrap().is_none());
+        });
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.spill_bytes(), 0);
+    }
+
     #[test]
     fn join_output_uses_query_grant_for_normal_multi_batch_output() {
         let root = root();

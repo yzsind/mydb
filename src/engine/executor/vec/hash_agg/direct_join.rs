@@ -7,6 +7,53 @@ pub(super) struct DirectJoinState {
     groups: DirectGroups,
     charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
     key_values: Vec<Value>,
+    dense_count: Option<DenseCountOutput>,
+}
+
+/// Domain-addressed counts retain holes without materializing one key per row.
+struct DenseCountOutput {
+    min: i64,
+    present: Vec<u64>,
+    counts: Vec<Vec<u64>>,
+    cursor: usize,
+    schema: Arc<BatchSchema>,
+    _charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
+impl BatchOperator for DenseCountOutput {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        &self.schema
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        crate::engine::cancel::check_cancelled()?;
+        let mut keys = Vec::with_capacity(DEFAULT_BATCH_ROWS);
+        let mut values = self
+            .counts
+            .iter()
+            .map(|_| Vec::with_capacity(DEFAULT_BATCH_ROWS))
+            .collect::<Vec<_>>();
+        let len = self.counts.first().map_or(0, Vec::len);
+        while self.cursor < len && keys.len() < DEFAULT_BATCH_ROWS {
+            let slot = self.cursor;
+            self.cursor += 1;
+            if self.present[slot / 64] & (1 << (slot % 64)) == 0 {
+                continue;
+            }
+            keys.push((i128::from(self.min) + slot as i128) as i64);
+            for (output, counts) in values.iter_mut().zip(&self.counts) {
+                output.push(counts[slot] as i64);
+            }
+        }
+        if keys.is_empty() {
+            return Ok(None);
+        }
+        let columns = std::iter::once(keys)
+            .chain(values)
+            .map(|data| ColumnVector::I64 { data, nulls: None })
+            .collect();
+        Ok(Some(Batch::new(self.schema.clone(), columns)))
+    }
 }
 
 #[derive(Default)]
@@ -184,6 +231,23 @@ fn update_direct_state_from_column(
 }
 
 impl HashAggregateCore {
+    pub(crate) fn install_dense_count_output(
+        &mut self,
+        min: i64,
+        present: Vec<u64>,
+        counts: Vec<Vec<u64>>,
+        charge: crate::engine::executor::mem_budget::ScopedCharge,
+    ) {
+        self.peak_mem_bytes = self.peak_mem_bytes.max(charge.charged());
+        self.direct_join.dense_count = Some(DenseCountOutput {
+            min,
+            present,
+            counts,
+            cursor: 0,
+            schema: self.output_schema(),
+            _charge: charge,
+        });
+    }
     pub(crate) fn direct_join_columns(&self) -> (&[usize], &[AggregateSpec]) {
         (
             self.aggregate_plan.group_columns(),
@@ -1133,6 +1197,12 @@ impl HashAggregateCore {
     pub(super) fn take_direct_join_output(
         &mut self,
     ) -> Result<Option<Box<dyn BatchOperator>>, QueryError> {
+        if let Some(mut output) = self.direct_join.dense_count.take() {
+            // A delegated projection may have temporarily remapped the input
+            // columns. Resolve metadata only after that mapping is restored.
+            output.schema = self.output_schema();
+            return Ok(Some(Box::new(output)));
+        }
         if self.group_columns.is_empty()
             && self
                 .direct_join

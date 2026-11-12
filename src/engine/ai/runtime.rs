@@ -12,7 +12,7 @@ use std::{
     cell::RefCell,
     collections::HashMap,
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicU64, AtomicUsize, Ordering},
         Arc, OnceLock,
     },
     time::{Duration, Instant},
@@ -69,6 +69,26 @@ pub(crate) fn prepare_calls(
     })
 }
 impl CallScope {
+    pub(crate) fn validate_item_count(&self, count: usize) -> Result<(), QueryError> {
+        let local = LocalConfig::load()?;
+        let limit = local
+            .user_limits
+            .iter()
+            .find(|u| {
+                u.user == self.auth.authenticated_as.user
+                    && u.host == self.auth.authenticated_as.host
+            })
+            .and_then(|u| u.max_call_items_per_statement)
+            .unwrap_or(100)
+            .min(100);
+        if count > limit {
+            return Err(error(
+                "ER_AI_BUDGET_EXCEEDED",
+                "statement AI item budget exceeded before dispatch",
+            ));
+        }
+        Ok(())
+    }
     pub(crate) fn database(&self) -> &str {
         &self.database
     }
@@ -194,8 +214,12 @@ fn merge_options(base: &mut Json, patch: Json) {
         for (key, value) in b {
             if value.is_null() {
                 a.remove(&key);
-            } else if let Some(old) = a.get_mut(&key) {
-                merge(old, value);
+            } else if key == "provider_options" {
+                if let Some(old) = a.get_mut(&key) {
+                    merge(old, value);
+                } else {
+                    a.insert(key, value);
+                }
             } else {
                 a.insert(key, value);
             }
@@ -386,7 +410,16 @@ fn validate_options(model: &Model, options: &Json) -> Result<(), QueryError> {
                         _ => false,
                     };
                     if let Some(schema) = model.provider_options_schema.get(&path) {
-                        if contains_ref(schema) || !jsonschema::is_valid(schema, value) {
+                        if contains_ref(schema)
+                            || !jsonschema::validator_for(schema)
+                                .map_err(|_| {
+                                    error(
+                                        "ER_AI_INVALID_ARGUMENT",
+                                        "invalid provider option schema",
+                                    )
+                                })?
+                                .is_valid(value)
+                        {
                             return Err(error(
                                 "ER_AI_INVALID_ARGUMENT",
                                 "provider option schema mismatch",
@@ -398,50 +431,7 @@ fn validate_options(model: &Model, options: &Json) -> Result<(), QueryError> {
                             "provider option requires an explicit schema",
                         ));
                     }
-                    if path.split('.').any(|p| {
-                        matches!(
-                            p,
-                            "model"
-                                | "input"
-                                | "messages"
-                                | "stream"
-                                | "tools"
-                                | "tool_choice"
-                                | "endpoint"
-                                | "auth"
-                                | "headers"
-                                | "conversation"
-                                | "previous_response_id"
-                                | "background"
-                                | "store"
-                                | "max_tokens"
-                                | "max_completion_tokens"
-                                | "max_output_tokens"
-                                | "num_predict"
-                                | "temperature"
-                                | "top_p"
-                                | "stop"
-                                | "seed"
-                                | "response_format"
-                                | "format"
-                                | "text"
-                                | "url"
-                                | "image_url"
-                                | "file_id"
-                                | "modalities"
-                                | "encoding_format"
-                                | "truncate"
-                                | "n"
-                                | "timeout_ms"
-                                | "max_retries"
-                                | "retry_ambiguous"
-                                | "on_error"
-                                | "dimensions"
-                                | "normalize"
-                                | "datatype"
-                                | "task_type"
-                        )
-                    }) {
+                    if reserved_provider_path(&path) {
                         return Err(error("ER_AI_INVALID_ARGUMENT", "reserved provider option"));
                     }
                 }
@@ -456,7 +446,7 @@ fn validate_options(model: &Model, options: &Json) -> Result<(), QueryError> {
     }
     Ok(())
 }
-fn contains_ref(v: &Json) -> bool {
+pub(super) fn contains_ref(v: &Json) -> bool {
     match v {
         Json::Object(m) => m.iter().any(|(k, v)| k == "$ref" || contains_ref(v)),
         Json::Array(a) => a.iter().any(contains_ref),
@@ -480,7 +470,7 @@ fn flatten<'a>(
         } else {
             format!("{prefix}.{k}")
         };
-        if v.is_object() {
+        if v.as_object().is_some_and(|object| !object.is_empty()) {
             flatten(v, &path, out)?;
         } else {
             out.push((path, v));
@@ -679,6 +669,7 @@ fn request_body(
 }
 #[derive(Clone)]
 struct Dispatch {
+    sent: Arc<AtomicU64>,
     db: Arc<Database>,
     auth: crate::engine::auth::AuthorizationContext,
     model_name: String,
@@ -834,26 +825,50 @@ async fn http(
     dispatch: Dispatch,
     response_limit: usize,
     memory: Arc<super::admission::Memory>,
+    deadline: Instant,
 ) -> Result<ProviderReply, ProviderFailure> {
     let queued = Instant::now();
     let breaker =
         super::admission::breaker(dispatch.breaker_key.clone(), dispatch.breaker_revision)?;
-    let mut quotas = super::admission::acquire(|| dispatch.quotas(runtime.max_inflight)).await?;
-    let outcome = http_inner(
-        runtime,
-        local,
-        connection,
-        url,
-        body,
-        credential,
-        dispatch,
-        response_limit,
-        &memory,
-        queued,
-        &breaker,
-        &mut quotas,
+    let timeout_error = || ProviderFailure {
+        error: error(
+            "ER_AI_TIMEOUT",
+            if dispatch.sent.load(Ordering::Acquire) > 0 {
+                "AI deadline exceeded; provider may still execute"
+            } else {
+                "AI deadline expired before dispatch"
+            },
+        ),
+        retryable: true,
+        ambiguous: dispatch.sent.load(Ordering::Acquire) > 0,
+        status: None,
+        retry_after: None,
+    };
+    let mut quotas = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        super::admission::acquire(|| dispatch.quotas(runtime.max_inflight)),
     )
-    .await;
+    .await
+    .map_err(|_| timeout_error())??;
+    let outcome = tokio::time::timeout_at(
+        tokio::time::Instant::from_std(deadline),
+        http_inner(
+            runtime,
+            local,
+            connection,
+            url,
+            body,
+            credential,
+            dispatch.clone(),
+            response_limit,
+            &memory,
+            queued,
+            &breaker,
+            &mut quotas,
+        ),
+    )
+    .await
+    .unwrap_or_else(|_| Err(timeout_error()));
     match &outcome {
         Ok(_) => breaker.record(true, false, false),
         Err(e) => breaker.record(
@@ -987,6 +1002,7 @@ async fn http_inner(
     dispatch.check()?;
     breaker.check()?;
     quotas.mark_dispatched();
+    dispatch.sent.fetch_add(1, Ordering::AcqRel);
     HTTP_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     let upstream_start = Instant::now();
     let mut response = request.send().await.map_err(|e| ProviderFailure {
@@ -1027,7 +1043,7 @@ async fn http_inner(
                 format!("provider HTTP status {}", status.as_u16()),
             ),
             retryable: status.is_server_error() || status == 429 || status == 408,
-            ambiguous: status.is_server_error() || status == 429 || status == 408,
+            ambiguous: status.is_server_error() || status == 408,
             status: Some(status.as_u16()),
             retry_after,
         });
@@ -1074,7 +1090,6 @@ struct PendingProvider {
     receiver: std::sync::mpsc::Receiver<Result<ProviderReply, ProviderFailure>>,
     task: tokio::task::JoinHandle<()>,
     dispatch: Dispatch,
-    deadline: Instant,
 }
 impl Drop for PendingProvider {
     fn drop(&mut self) {
@@ -1088,13 +1103,6 @@ impl PendingProvider {
         }
         if let Err(e) = self.dispatch.check() {
             return Some(Err(e.into()));
-        }
-        if Instant::now() >= self.deadline {
-            return Some(Err(error(
-                "ER_AI_TIMEOUT",
-                "AI deadline exceeded; provider may still execute",
-            )
-            .into()));
         }
         match self.receiver.try_recv() {
             Ok(result) => Some(result),
@@ -1136,28 +1144,19 @@ fn start_pending(
     let memory = call.memory.clone();
     let task = runtime.rt.spawn(async move {
         let _pending = pending;
-        let result = tokio::time::timeout_at(
-            tokio::time::Instant::from_std(deadline),
-            http(
-                runtime,
-                local,
-                connection,
-                url,
-                body,
-                credential,
-                dispatch,
-                response_limit,
-                memory,
-            ),
+        let result = http(
+            runtime,
+            local,
+            connection,
+            url,
+            body,
+            credential,
+            dispatch,
+            response_limit,
+            memory,
+            deadline,
         )
-        .await
-        .unwrap_or_else(|_| {
-            Err(error(
-                "ER_AI_TIMEOUT",
-                "AI deadline exceeded; provider may still execute",
-            )
-            .into())
-        });
+        .await;
         let _ = tx.send(result);
         if let Some(wake) = wake {
             let _ = wake.send(());
@@ -1167,7 +1166,6 @@ fn start_pending(
         receiver,
         task,
         dispatch: call.dispatch.clone(),
-        deadline,
     })
 }
 fn send(call: &PreparedCall) -> Result<ProviderReply, ProviderFailure> {
@@ -1307,7 +1305,7 @@ fn decode_output(
         let embedding = model.embedding.as_ref().unwrap();
         return Ok((
             None,
-            json!({"dimensions":embedding.dimensions,"datatype":"FLOAT32","normalization":embedding.normalize,"data":vectors.into_iter().enumerate().map(|(index,embedding)|json!({"index":index,"embedding":embedding})).collect::<Vec<_>>() }),
+            json!({"dimensions":embedding.dimensions,"datatype":"FLOAT32","normalization":embedding.normalize,"data":vectors.into_iter().enumerate().map(|(index,embedding)|json!({"index":index,"embedding":embedding.into_iter().map(|v| ryu::Buffer::new().format_finite(v).parse::<serde_json::Number>().expect("finite embedding coordinate")).collect::<Vec<_>>()})).collect::<Vec<_>>() }),
         ));
     }
     let (text, finish) = match connection.protocol.as_str() {
@@ -1441,6 +1439,14 @@ fn usage(response: &Json, connection: &Connection, embedding: bool) -> Result<Js
             None | Some(Json::Null) => Ok(None),
             Some(value) => value
                 .as_u64()
+                .or_else(|| {
+                    value
+                        .as_f64()
+                        .filter(|n| {
+                            n.is_finite() && *n >= 0.0 && *n < u64::MAX as f64 && n.fract() == 0.0
+                        })
+                        .map(|n| n as u64)
+                })
                 .map(Some)
                 .ok_or_else(|| error("ER_AI_INVALID_RESPONSE", "invalid token usage")),
         }
@@ -1560,6 +1566,15 @@ fn finish_reply(
     attempts: u64,
 ) -> Result<Value, QueryError> {
     let response = &reply.body;
+    call.envelope["provider_model"] = response
+        .get("model")
+        .filter(|v| v.as_str().is_some_and(|s| s.len() <= 1024))
+        .cloned()
+        .unwrap_or(Json::Null);
+    call.envelope["provider_request_id"] = json!(reply.request_id);
+    call.envelope["timing_ms"]["queue"] = json!(reply.queue.as_millis());
+    call.envelope["timing_ms"]["upstream"] = json!(reply.upstream.as_millis());
+    call.envelope["usage"] = usage(response, &call.connection, call.embed)?;
     let (simple, fields) = decode_output(
         response,
         &call.connection,
@@ -1601,6 +1616,7 @@ fn finish_call(
     attempts: u64,
     failure: Option<&ProviderFailure>,
 ) -> Result<Value, QueryError> {
+    let attempts = call.dispatch.sent.load(Ordering::Acquire).min(attempts);
     TOTAL_CALLS.fetch_add(1, Ordering::Relaxed);
     if result.is_err() {
         FAILED_CALLS.fetch_add(1, Ordering::Relaxed);
@@ -1715,6 +1731,9 @@ fn prepare_call(
         name.eq_ignore_ascii_case("AI_EMBED") || name.eq_ignore_ascii_case("AI_EMBED_DETAIL");
     let detail = name.to_ascii_uppercase().ends_with("_DETAIL");
     let raw = text(&args[0])?;
+    if !raw.contains('.') && scope.database.is_empty() {
+        return Err(crate::error::catalog::ER_NO_DB_ERROR.error("No database selected"));
+    }
     let model_name = if raw.contains('.') {
         raw.to_ascii_lowercase()
     } else {
@@ -1724,7 +1743,7 @@ fn prepare_call(
     let model = state
         .models
         .get(&model_name)
-        .ok_or_else(|| error("ER_AI_MODEL_NOT_FOUND", "model does not exist"))?
+        .ok_or_else(|| missing_model(&scope.db, &scope.auth))?
         .clone();
     if authorize(&scope.db, &scope.auth, "AI_USE").is_err() {
         authorize(
@@ -1837,6 +1856,7 @@ fn prepare_call(
         None
     };
     let dispatch = Dispatch {
+        sent: Arc::new(AtomicU64::new(0)),
         db: scope.db.clone(),
         auth: scope.auth.clone(),
         model_name: model_name.clone(),
@@ -1979,8 +1999,20 @@ pub(crate) fn embed_batch(
             "AI_EMBED does not support on_error=return",
         ));
     }
+    let mut options_json = options_json;
+    options_json
+        .as_object_mut()
+        .ok_or_else(|| error("ER_AI_INVALID_ARGUMENT", "options must be an object"))?
+        .insert("on_error".into(), json!("error"));
     let input = Value::Json(crate::engine::json::from_serde(&json!(texts)));
-    let detail = call("AI_EMBED_DETAIL", &[model, input, options])?;
+    let detail = call(
+        "AI_EMBED_DETAIL",
+        &[
+            model,
+            input,
+            Value::Json(crate::engine::json::from_serde(&options_json)),
+        ],
+    )?;
     let Value::Json(bytes) = detail else {
         return Err(error(
             "ER_AI_INVALID_RESPONSE",
@@ -2674,4 +2706,62 @@ fn call_many_in_scope(
         }
     }
     Ok(values.into_iter().map(Option::unwrap).collect())
+}
+
+pub(super) fn reserved_provider_path(path: &str) -> bool {
+    path.split('.').any(|p| {
+        matches!(
+            p,
+            "model"
+                | "input"
+                | "messages"
+                | "stream"
+                | "tools"
+                | "tool_choice"
+                | "endpoint"
+                | "auth"
+                | "headers"
+                | "conversation"
+                | "previous_response_id"
+                | "background"
+                | "store"
+                | "max_tokens"
+                | "max_completion_tokens"
+                | "max_output_tokens"
+                | "num_predict"
+                | "temperature"
+                | "top_p"
+                | "stop"
+                | "seed"
+                | "response_format"
+                | "format"
+                | "text"
+                | "url"
+                | "image_url"
+                | "file_id"
+                | "modalities"
+                | "encoding_format"
+                | "truncate"
+                | "n"
+                | "timeout_ms"
+                | "max_retries"
+                | "retry_ambiguous"
+                | "on_error"
+                | "dimensions"
+                | "normalize"
+                | "datatype"
+                | "task_type"
+        )
+    })
+}
+
+pub(crate) fn missing_model(
+    db: &Database,
+    auth: &crate::engine::auth::AuthorizationContext,
+) -> QueryError {
+    if authorize(db, auth, "AI_USE").is_ok() || authorize(db, auth, "AI_ADMIN").is_ok() {
+        error("ER_AI_MODEL_NOT_FOUND", "model does not exist")
+    } else {
+        error("ER_AI_ACCESS_DENIED", "AI privilege required")
+    }
 }

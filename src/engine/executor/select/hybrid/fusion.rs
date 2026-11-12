@@ -64,6 +64,7 @@ pub(in crate::engine::executor::select) fn open_plan(
         .map(|column| column.source.collation_id)
         .collect::<Vec<_>>();
     let has_collations = collations.iter().any(Option::is_some);
+    let binary_collations = vec![Some(crate::charset::BINARY_COLLATION_ID); width];
     let mut state: crate::util::fast_hash::AhHashMap<crate::engine::expr::InlineKeyBuf, Entry> =
         ah_hash_map();
     let recording = super::super::analyze_stats::is_recording();
@@ -77,6 +78,13 @@ pub(in crate::engine::executor::select) fn open_plan(
             continue;
         }
         with_branch_scope(db, txn, &spec.branches[branch_index].query, |select| {
+            // Scalar branch streams need their own ANALYZE metrics even when
+            // the surrounding query uses the batch execution mode.
+            let _metrics_mode = recording.then(|| {
+                crate::engine::executor::vec::config::enter_mode(
+                    crate::engine::executor::vec::config::VecMode::Off,
+                )
+            });
             let mut stream = super::super::plan::execute_plan_stream(db, txn, input)?;
             let mut rank = 0u64;
             let projection =
@@ -136,7 +144,7 @@ pub(in crate::engine::executor::select) fn open_plan(
                 }
                 let key = crate::engine::executor::dispatch::set_row_key(&collations, &identity);
                 let representation = if has_collations {
-                    crate::engine::executor::dispatch::set_row_key(&[], &identity)
+                    crate::engine::executor::dispatch::set_row_key(&binary_collations, &identity)
                 } else {
                     key.clone()
                 };
@@ -253,9 +261,7 @@ pub(in crate::engine::executor::select) fn open_plan(
             if limit == 0 {
                 Ok(0)
             } else {
-                offset
-                    .checked_add(limit)
-                    .ok_or_else(|| invalid("output OFFSET plus LIMIT overflow"))
+                Ok::<usize, QueryError>(offset.saturating_add(limit))
             }
         })
         .transpose()?;

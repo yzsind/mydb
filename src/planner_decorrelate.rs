@@ -26,7 +26,19 @@ pub mod derived;
 pub mod scalar;
 pub mod sublink;
 
-/// Catalog-backed name scope shared by scalar and semi/anti rewrites.
+fn source_schema(
+    db: &crate::storage::Database,
+    name: &str,
+) -> Option<std::sync::Arc<crate::storage::TableSchema>> {
+    if let Some(cte) = crate::engine::executor::cte::lookup_cte(name) {
+        return Some(std::sync::Arc::new(
+            crate::storage::TableSchema::synthetic_for_planning(name, &cte.columns),
+        ));
+    }
+    db.table(name).ok()
+}
+
+/// Catalog and CTE name scope shared by scalar and semi/anti rewrites.
 /// Include derived outputs so bare outer references cannot be mistaken for
 /// inner-only predicates during decorrelation.
 pub(crate) fn select_scope(
@@ -45,7 +57,7 @@ pub(crate) fn select_scope(
                 .map(|join| (&join.table, join.derived.as_ref())),
         )
     {
-        let schema = db.table(&table.name);
+        let schema = source_schema(db, &table.name);
         scope.add_table(&table.name);
         if let Some(alias) = &table.alias {
             scope.add_table(alias);
@@ -62,7 +74,7 @@ pub(crate) fn select_scope(
                     }
                 }
             }
-        } else if let Ok(schema) = schema {
+        } else if let Some(schema) = schema {
             if let Some(bare) = table.name.rsplit('.').next() {
                 if bare != table.name {
                     scope.add_table(bare);
@@ -108,7 +120,7 @@ pub(crate) fn column_comparison_domain(
         }) {
             return None;
         }
-        let schema = db.table(&source.name).ok()?;
+        let schema = source_schema(db, &source.name)?;
         let column = &schema.columns[schema.column_index(name).ok()?];
         Some(crate::storage::ParamTarget::for_column_with_collation(
             &column.data_type,

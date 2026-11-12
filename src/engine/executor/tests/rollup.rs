@@ -1180,3 +1180,65 @@ fn rollup_approximate_prefixes_preserve_finest_addition_order() {
         assert_eq!(total[3], Value::Double(1.0));
     });
 }
+
+#[test]
+fn ordered_rollup_exact_cascade_matches_independent_prefixes() {
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE cascade_rows (a VARCHAR(180), b INT, x DECIMAL(30,6), n INT, f DOUBLE)",
+        )
+        .unwrap();
+    let pad = "z".repeat(120);
+    for chunk in 0..4 {
+        let values = (0..100)
+            .map(|i| {
+                let k = chunk * 100 + i;
+                format!(
+                    "('{}',{}, {}, {}, {})",
+                    format!("{}{pad}", k / 40),
+                    k % 5,
+                    if k % 7 == 0 {
+                        "NULL".to_owned()
+                    } else {
+                        format!("{}.123456", k - 200)
+                    },
+                    k % 11,
+                    ["0.5", "1", "-0.5", "NULL"][k as usize % 4]
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO cascade_rows VALUES {values}"))
+            .unwrap();
+    }
+    for aggs in [
+        "COUNT(*), COUNT(x), SUM(COALESCE(x*n,0)), AVG(x)",
+        "SUM(f), AVG(f), COUNT(*)",
+        "SUM(DISTINCT x), COUNT(DISTINCT n)",
+    ] {
+        let mut expected = Vec::new();
+        for (projection, grouping) in [
+            ("a,b", " GROUP BY a,b"),
+            ("a,NULL", " GROUP BY a"),
+            ("NULL,NULL", ""),
+        ] {
+            expected.extend(query_rows(
+                &engine,
+                &format!("SELECT {projection},{aggs} FROM cascade_rows{grouping}"),
+            ));
+        }
+        let mut got = with_query_budget(std::sync::Arc::new(MemBudget::new(32 * 1024)), || {
+            query_rows(
+                &engine,
+                &format!("SELECT a,b,{aggs} FROM cascade_rows GROUP BY a,b WITH ROLLUP"),
+            )
+        });
+        got.sort_by_key(|r| rollup_multiset_key(r));
+        expected.sort_by_key(|r| rollup_multiset_key(r));
+        assert_eq!(got, expected, "{aggs}");
+    }
+}

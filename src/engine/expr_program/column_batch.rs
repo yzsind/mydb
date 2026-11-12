@@ -30,7 +30,7 @@ use crate::engine::executor::vec::{
 };
 use crate::engine::expr::date_format::DateFormatPlan;
 use crate::engine::expr::network::{self, NetworkFunction};
-use arithmetic::Arithmetic;
+use arithmetic::{Arithmetic, ConstantExactDivision};
 use boolean_read::BooleanRead;
 use chrono::{Datelike, NaiveDate};
 use conditional::Conditional;
@@ -400,6 +400,9 @@ fn string_bound(node: &ExprNode, schema: &BatchSchema) -> Option<u64> {
 }
 
 fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
+    if let Some(division) = ConstantExactDivision::bind(node, schema) {
+        return Some(division.contract());
+    }
     if let Some(arithmetic) = Arithmetic::bind(node, schema) {
         return Some(arithmetic.contract());
     }
@@ -470,6 +473,9 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
                 | ColumnType::MediumInt
                 | ColumnType::Long
                 | ColumnType::LongLong => Domain::Unsigned,
+                ColumnType::Decimal {
+                    precision: 1..=38, ..
+                } => Domain::Exact,
                 ColumnType::Date | ColumnType::DateTime | ColumnType::Timestamp => Domain::Temporal,
                 ColumnType::Json => Domain::Json,
                 ColumnType::VarString | ColumnType::Blob => {
@@ -489,6 +495,7 @@ fn contract(node: &ExprNode, schema: &BatchSchema) -> Option<Contract> {
             match constant(node)?.as_ref() {
                 Value::Int(n) => Domain::Integer(*n, *n),
                 Value::UInt(_) => Domain::Unsigned,
+                Value::DecimalCompact(..) | Value::Decimal128(..) => Domain::Exact,
                 Value::Null => Domain::Null,
                 Value::String(_) | Value::SmallString(_) => Domain::Text,
                 Value::Bytes(_) => Domain::Binary,
@@ -992,7 +999,14 @@ fn workspace(node: &ExprNode, batch: &Batch) -> Option<(usize, usize)> {
         ExprNode::Binary { left, right, .. } => {
             let (_, left) = workspace(left, batch)?;
             let (_, right) = workspace(right, batch)?;
-            Some((numeric, left.checked_add(right)?.checked_add(numeric)?))
+            // Up to 81 decimal digits, including simultaneous Value and
+            // column ownership while the result is repacked into native lanes.
+            let output = if ConstantExactDivision::bind(node, batch.schema()).is_some() {
+                batch.num_rows().checked_mul(128)?.checked_add(512)?
+            } else {
+                numeric
+            };
+            Some((output, left.checked_add(right)?.checked_add(output)?))
         }
         ExprNode::Unary { expr, .. } if Arithmetic::bind(node, batch.schema()).is_some() => {
             let (_, work) = workspace(expr, batch)?;
@@ -1371,6 +1385,9 @@ fn operand<'a>(node: &ExprNode, batch: &'a Batch) -> Option<std::borrow::Cow<'a,
 }
 
 fn evaluate(node: &ExprNode, batch: &Batch) -> Option<ColumnVector> {
+    if let Some(division) = ConstantExactDivision::bind(node, batch.schema()) {
+        return division.evaluate(batch);
+    }
     if let Some(arithmetic) = Arithmetic::bind(node, batch.schema()) {
         return arithmetic.evaluate(batch);
     }
