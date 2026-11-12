@@ -1640,7 +1640,6 @@ where
         push(row, 0, 1, left_rows.saturating_add(right_rows))?;
         right_rows = right_rows.saturating_add(1);
     }
-    drop(push);
     drop(key_cache);
     let Some(spill) = spill else {
         return Ok(IncrementalSetOutput::in_memory(
