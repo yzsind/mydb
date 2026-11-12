@@ -1589,6 +1589,10 @@ pub struct PreparedSelectMemo {
     /// parameter tiers. Parameter values that alternate between tiers then
     /// switch memos instead of recompiling on every EXECUTE.
     pub(crate) alternates: parking_lot::Mutex<Vec<Arc<PreparedSelectMemo>>>,
+    /// Cached [`crate::planner::parameter_selectivity_is_static`] for
+    /// `presentation_select`; valid for as long as the memo's catalog
+    /// dependencies, which are revalidated first on every EXECUTE.
+    pub(crate) selectivity_static: std::sync::OnceLock<bool>,
 }
 
 /// Plan-cache-off prepared SELECT template.  This deliberately contains no

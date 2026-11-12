@@ -90,6 +90,57 @@ fn audit1109_rolled_back_insert_slots_wait_for_readers_then_reuse() {
     assert_eq!(db.heap_page_count(table.id), before);
 }
 
+/// Rolled-back undo is pinned only by readers that may predate the end of
+/// the rollback. A reader registered afterwards must not keep it (and, through
+/// the retained slot, every later transaction's undo) from being purged.
+#[test]
+fn rolled_back_undo_is_purged_under_readers_registered_after_the_rollback() {
+    let (_dir, e) = fixture();
+    e.execute("CREATE TABLE t(id INT PRIMARY KEY,v VARCHAR(200))")
+        .unwrap();
+    let db = e.database();
+    let table = db.table("test.t").unwrap();
+    let txn = db.begin_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            txn,
+            "test.t",
+            (0..100)
+                .map(|i| vec![Value::Int(i), Value::String("x".repeat(200))])
+                .collect(),
+        )
+        .unwrap();
+    db.rollback_txn(txn.txn_id).unwrap();
+    let rolled_back = txn.txn_id;
+    let purge = || {
+        std::thread::sleep(Duration::from_millis(5));
+        db.purge_obsolete_undo();
+        db.slot_flags_for_test(table.id, ids[0]).unwrap()
+    };
+
+    // Same frontier as the rollback: indistinguishable from a reader that
+    // registered just before it finished, so the undo stays.
+    let same = db.read_only_statement_view(IsolationLevel::RepeatableRead, None);
+    let same_guard = db.register_statement_snapshot(same.snapshot_scn);
+    assert_ne!(purge(), Some(ROW_FLAG_FREE));
+
+    // A later commit moves the frontier; a reader registered now is newer
+    // than the rollback, but the older reader still pins the undo.
+    e.execute("INSERT INTO t VALUES(1000,'y')").unwrap();
+    let newer = db.read_only_statement_view(IsolationLevel::RepeatableRead, None);
+    assert!(newer.snapshot_scn > same.snapshot_scn);
+    let newer_guard = db.register_statement_snapshot(newer.snapshot_scn);
+    assert_ne!(purge(), Some(ROW_FLAG_FREE));
+
+    // Only the newer reader remains: the rolled-back undo drains, its slots
+    // become reusable and the transaction-slot watermark moves past it.
+    drop(same_guard);
+    assert_eq!(purge(), Some(ROW_FLAG_FREE));
+    db.gc_committed_txn_slots();
+    assert!(db.min_retained_txn_id.load(Ordering::Acquire) >= rolled_back);
+    drop(newer_guard);
+}
+
 #[test]
 fn audit1109_fast_parent_insert_retains_fk_wait_lock() {
     let (_dir, e) = fixture();

@@ -1118,6 +1118,7 @@ impl Database {
                 wal_logged: true,
                 xa_xid: None,
                 begin_lsn: lsn,
+                rollback_fence_scn: None,
             });
             // A base backup already contains all effects visible at the
             // source transaction's start snapshot. Fresh replicas therefore
@@ -1231,6 +1232,7 @@ impl Database {
                             wal_logged: true,
                             xa_xid: None,
                             begin_lsn: 0,
+                            rollback_fence_scn: None,
                         },
                     );
                     false
@@ -1522,6 +1524,7 @@ impl Database {
                         wal_logged: true,
                         xa_xid: None,
                         begin_lsn: 0,
+                        rollback_fence_scn: None,
                     },
                 );
                 false
@@ -1597,6 +1600,7 @@ impl Database {
                 wal_logged: true,
                 xa_xid: None,
                 begin_lsn: lsn,
+                rollback_fence_scn: None,
             });
             if slot.status == TxnStatus::Active {
                 slot.status = TxnStatus::Prepared;

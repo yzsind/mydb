@@ -2,6 +2,11 @@ impl Database {
     pub(crate) fn row_security_catalog_snapshot(&self) -> Arc<crate::engine::rls::CatalogSnapshot> {
         self.catalog.row_security.snapshot()
     }
+    /// Identity of the published row-security catalog; see
+    /// [`Database::auth_catalog_ptr`].
+    pub(crate) fn row_security_catalog_ptr(&self) -> *const crate::engine::rls::CatalogSnapshot {
+        self.catalog.row_security.snapshot_ptr()
+    }
     pub(crate) fn row_security_may_be_configured(&self, object_id: u64) -> bool {
         self.catalog.row_security.may_have_security(object_id)
     }

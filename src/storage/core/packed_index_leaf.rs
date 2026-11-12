@@ -1267,13 +1267,11 @@ impl BufferPool {
         self.write_requests.fetch_add(1, Ordering::Relaxed);
         pinned.frame.checksum_dirty.store(true, Ordering::Release);
         if btree_logical_wal::is_deferred() {
-            pinned.frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+            BufferPool::take_txn_deferred_pin(&pinned.frame);
             btree_logical_wal::push_deferred_key(pinned.frame.key.clone());
         }
-        if pinned.frame.mark_dirty(dirty_lsn) {
-            self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-            self.note_dirty(&pinned.frame.key, dirty_lsn);
-        }
+        let mark = pinned.frame.mark_dirty(dirty_lsn);
+        self.publish_dirty_mark(&pinned.frame, mark, dirty_lsn);
         self.mark_raw_structure_validated(&pinned.frame);
         pinned.frame.prefetch.store(false, Ordering::Release);
         pinned.frame.packed_leaf_state.store(2, Ordering::Release);

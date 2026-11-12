@@ -14204,9 +14204,38 @@ pub(crate) fn parameter_selectivity_signature(
     select: &Select,
     params: &[Value],
 ) -> String {
+    let mut dynamic = false;
+    selectivity_signature_impl(db, select, Some(params), &mut dynamic)
+}
+
+/// True when [`parameter_selectivity_signature`] is the empty string for
+/// every parameter vector: no predicate compares a statistics-bearing column
+/// with a placeholder outside a unique single-column equality, and no vector
+/// cost setting participates. The answer depends only on the statement and
+/// the table descriptors (including their statistics), so a prepared memo
+/// that revalidates those descriptors may cache it and skip recomputing the
+/// signature on every EXECUTE.
+pub(crate) fn parameter_selectivity_is_static(db: &Database, select: &Select) -> bool {
+    let mut dynamic = false;
+    selectivity_signature_impl(db, select, None, &mut dynamic);
+    !dynamic
+}
+
+/// Shared walk. With `params == None` it only decides, conservatively,
+/// whether any term could contribute to the signature (`dynamic`).
+fn selectivity_signature_impl(
+    db: &Database,
+    select: &Select,
+    params: Option<&[Value]>,
+    dynamic: &mut bool,
+) -> String {
     use std::fmt::Write as _;
     let mut signature = String::new();
     if has_vector_cost_dependency(select) {
+        let Some(_) = params else {
+            *dynamic = true;
+            return signature;
+        };
         // Search settings alter the ANN/exact cost crossover even when the
         // predicate and parameter types stay unchanged. Include nested KNNs.
         let mut hasher = std::hash::DefaultHasher::new();
@@ -14216,7 +14245,7 @@ pub(crate) fn parameter_selectivity_signature(
         );
         let _ = write!(signature, ":v{:016x}", std::hash::Hasher::finish(&hasher));
     }
-    if params.is_empty() {
+    if params.is_some_and(|params| params.is_empty()) {
         return signature;
     }
     let mut tables = smallvec::SmallVec::<[(&str, Option<&str>, Arc<TableSchema>); 4]>::new();
@@ -14243,8 +14272,12 @@ pub(crate) fn parameter_selectivity_signature(
         let Expr::Placeholder(index) = parameter else {
             return;
         };
-        let Some(value) = params.get(*index) else {
-            return;
+        let value = match params {
+            Some(params) => match params.get(*index) {
+                Some(value) => Some(value),
+                None => return,
+            },
+            None => None,
         };
         let Some(column) = expr_column_name(column_expr) else {
             return;
@@ -14287,6 +14320,12 @@ pub(crate) fn parameter_selectivity_signature(
         {
             return;
         }
+        // Every static gate passed: this term can contribute.
+        let Some(value) = value else {
+            *dynamic = true;
+            return;
+        };
+        let params = params.unwrap_or_default();
         // A conjunctive interval has one cardinality. Bucketing its two
         // half-lines independently needlessly invalidates a prepared memo as
         // a narrow window moves through the domain, even when its cost stays

@@ -369,6 +369,7 @@ pub(super) fn compile_prepared_select_from_memo(
         authorization_account: session.authenticated_as.clone(),
         authorized_auth_epoch: std::sync::atomic::AtomicU64::new(0),
         alternates: parking_lot::Mutex::new(Vec::new()),
+        selectivity_static: std::sync::OnceLock::new(),
     })
 }
 
@@ -428,7 +429,10 @@ fn current_parameter_signature_matches(
     params: &[crate::types::Value],
     selectivity: &mut Option<String>,
 ) -> bool {
-    let suffix = if has_parameter_independent_cardinality(&memo.compiled) {
+    let suffix = if has_parameter_independent_cardinality(&memo.compiled)
+        || *memo.selectivity_static.get_or_init(|| {
+            crate::planner::parameter_selectivity_is_static(db, &memo.presentation_select)
+        }) {
         ""
     } else {
         selectivity
