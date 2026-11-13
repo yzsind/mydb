@@ -358,7 +358,12 @@ impl CompactHnswStats {
             1.0
         };
         let inv_norm = if norm > 0.0 { norm.recip() } else { 1.0 };
-        for (i, &x) in vector.iter().enumerate() {
+        let inv_rows = ((self.rows + 1) as f64).recip();
+        for ((&x, mean), deviation) in vector
+            .iter()
+            .zip(self.means.iter_mut())
+            .zip(self.deviations.iter_mut())
+        {
             let x = (x as f64 * inv_norm) as f32;
             if !x.is_finite() {
                 self.valid = false;
@@ -366,11 +371,41 @@ impl CompactHnswStats {
             }
             self.vmin = self.vmin.min(x);
             self.vmax = self.vmax.max(x);
-            let delta = x as f64 - self.means[i];
-            self.means[i] += delta / (self.rows + 1) as f64;
-            self.deviations[i] += delta * (x as f64 - self.means[i]);
+            let delta = x as f64 - *mean;
+            *mean += delta * inv_rows;
+            *deviation += delta * (x as f64 - *mean);
         }
         self.rows += 1;
+    }
+
+    /// Combine statistics of a disjoint row set (Chan et al. parallel
+    /// variance), so a partitioned heap scan yields one global summary.
+    pub(crate) fn merge(&mut self, other: CompactHnswStats) {
+        if other.rows == 0 {
+            self.valid &= other.valid;
+            return;
+        }
+        if self.rows == 0 {
+            let valid = self.valid && other.valid;
+            *self = other;
+            self.valid = valid;
+            return;
+        }
+        if self.dim != other.dim {
+            self.valid = false;
+            return;
+        }
+        self.valid &= other.valid;
+        self.vmin = self.vmin.min(other.vmin);
+        self.vmax = self.vmax.max(other.vmax);
+        let (a, b) = (self.rows as f64, other.rows as f64);
+        let total = a + b;
+        for i in 0..self.dim {
+            let delta = other.means[i] - self.means[i];
+            self.means[i] += delta * (b / total);
+            self.deviations[i] += other.deviations[i] + delta * delta * (a * b / total);
+        }
+        self.rows += other.rows;
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -540,6 +575,10 @@ struct Probe<'a> {
     /// When SQ8 navigation is active: the arena, the quantized query codes, and
     /// the query's precomputed `‖q‖²` (so each probe is one `sdot` + two adds).
     quant: Option<(&'a QuantArena, &'a [i8], i32)>,
+    /// Cached cosine `‖query‖²` for graph construction, where both endpoints
+    /// carry cached norms and edge geometry uses [`cosine_with_norms`] just
+    /// like neighbour selection. Query-time probes leave it `None`.
+    cosine_norm: Option<f32>,
 }
 
 impl Probe<'_> {
@@ -628,13 +667,15 @@ const HNSW_BUILD_SOFT_CAP_MULT: usize = 2;
 
 /// Cold-build deferred-diversity link default. When on, [`HnswIndex::link_all`]
 /// keeps every navigable list at ≤ m during the link fan-out via a cheap
-/// drop-farthest (parking the evicted reverse edges), so navigation traverses
-/// ≤ m-degree lists — about half the per-neighbour random arena fetches that
-/// dominate the build — and the parked edges are merged back and diversity-pruned
-/// once in Phase D. The shipped graph is the same degree-bounded structure (the
-/// Phase-D candidate set is a superset of the soft-cap path's), so recall is
-/// unchanged. `MYDB_HNSW_BUILD_DEFERRED=0` restores the soft-cap path.
-const HNSW_BUILD_DEFERRED: bool = true;
+/// drop-farthest (parking the evicted reverse edges) and merges the parked
+/// edges back in Phase D. That halves construction-time navigation work, but
+/// the graph navigated *during* the build is then a nearest-only kNN graph
+/// without the diversity heuristic's long links, so every later insertion
+/// finds poorer candidates: on 1M × 768-d cosine data it cost ~3 recall
+/// points at equal search effort. The default therefore keeps diversity-pruned
+/// lists throughout (the soft-cap path); `MYDB_HNSW_BUILD_DEFERRED=1` restores
+/// the faster, lower-quality variant.
+const HNSW_BUILD_DEFERRED: bool = false;
 
 /// Default navigable headroom above `m` for the deferred build (see
 /// [`BuildAux::nav_slack`]). A small value keeps the during-build scaffolding
@@ -2068,6 +2109,23 @@ impl HnswIndex {
         }
     }
 
+    /// Timing hint for exact-f32 construction: start fetching the head of a
+    /// neighbour's vector before it is scored. Only frozen build vectors can
+    /// be borrowed without their lock; other states are left to demand loads.
+    #[inline]
+    fn prefetch_frozen_vector(&self, id: u32) {
+        if !self.frozen_build_vectors.load(Ordering::Relaxed) {
+            return;
+        }
+        // SAFETY: see `with_node_vector`; frozen vectors have no writer.
+        let vector = unsafe { &*self.nodes.get(id).vector.data_ptr() };
+        let bytes = std::mem::size_of_val(vector.as_slice()).min(512);
+        let base = vector.as_ptr().cast::<i8>();
+        for offset in (0..bytes).step_by(64) {
+            prefetch_read(base.wrapping_add(offset));
+        }
+    }
+
     #[inline]
     fn quant_covers(&self, arena: &QuantArena, id: u32) -> bool {
         (id as usize) < arena.n
@@ -2086,6 +2144,12 @@ impl HnswIndex {
                 // exact f32 fallback. Bit-identical to the widen-subtract SSD.
                 return arena.ssd_from_query(qcodes, qnorm, id) as f64 * (arena.dist_mul as f64);
             }
+        }
+        if let Some(query_norm) = probe.cosine_norm {
+            let node_norm = self.nodes.get(id).cosine_norm;
+            return self.with_node_vector(id, |v| {
+                super::distance::cosine_with_norms(probe.query, v, query_norm, node_norm)
+            });
         }
         self.with_node_vector(id, |v| ordering_distance(probe.query, v, self.metric))
     }
@@ -2437,6 +2501,11 @@ impl HnswIndex {
             for &nb in &nbr_buf {
                 probe.prefetch(nb);
             }
+            if probe.quant.is_none() {
+                for &nb in &nbr_buf {
+                    self.prefetch_frozen_vector(nb);
+                }
+            }
             for group in nbr_buf.chunks(4) {
                 let distances: [f64; 4] = if BATCH && group.len() == 4 {
                     if let Some((arena, qcodes, qnorm)) = probe.quant {
@@ -2515,8 +2584,10 @@ impl HnswIndex {
 
     /// Neighbour-selection heuristic (Algorithm 4): keep a candidate only if it
     /// is closer to the query than to any already-selected neighbour, which
-    /// spreads connections out and improves graph navigability. Rejected
-    /// redundant edges are not refilled merely to reach the degree bound.
+    /// spreads connections out and improves graph navigability. Remaining
+    /// slots are then refilled with the nearest rejected candidates ("keep
+    /// pruned connections"): in high dimensions the heuristic alone leaves
+    /// most of the degree bound unused, which costs recall at equal effort.
     /// Node-to-node distance for the build heuristic. Uses the SQ8 arena when it
     /// covers both nodes (contiguous int8 codes, 4× less traffic) and falls back
     /// to exact f32 otherwise. The arena scales its integer SSD back to ~real
@@ -2546,6 +2617,17 @@ impl HnswIndex {
     /// need the edge distance — the deferred build's drop-farthest, which stores
     /// it to avoid recomputation — get it without a second pass.
     fn select_neighbors(
+        &self,
+        candidates: &[Scored],
+        m: usize,
+        arena: Option<&QuantArena>,
+    ) -> Vec<Scored> {
+        let mut selected = self.select_neighbors_diverse(candidates, m, arena);
+        super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        selected
+    }
+
+    fn select_neighbors_diverse(
         &self,
         candidates: &[Scored],
         m: usize,
@@ -3033,6 +3115,7 @@ impl HnswIndex {
                         .map(|(q, n)| (a.as_ref(), q.as_slice(), *n))
                 }
             }),
+            cosine_norm: (self.metric == Metric::Cosine).then_some(node.cosine_norm),
         };
 
         SCRATCH.with(|cell| {
@@ -3096,9 +3179,15 @@ impl HnswIndex {
                 // several reverse edges. `max` leaves the cold-build value
                 // unchanged (`2·m ≥ m + slack`).
                 let soft_cap = (m_layer * cap_mult).max(m_layer + incremental_soft_cap_slack());
-                // Insert M links; layer 0 reserves 2*M for later reverse links.
                 let select_arena = self.selection_arena(arena.as_deref());
-                let selected = self.select_neighbors(&ranked, self.m, select_arena);
+                // A cold build links up to m0 forward edges on layer 0, as its
+                // degree bound allows; selecting only m left the base layer at
+                // ~⅓ of that bound in high dimensions once diversity pruning
+                // ran. Incremental inserts (`cap_mult == 1`, no build aux) keep
+                // the m fanout: filling m0 on birth doubles DML maintenance.
+                let cold_build = cap_mult > 1 || aux.is_some();
+                let forward_m = if lc == 0 && cold_build { m_layer } else { self.m };
+                let selected = self.select_neighbors(&ranked, forward_m, select_arena);
                 for s in &selected {
                     let nb = s.id;
                     if nb == id {
@@ -3276,7 +3365,38 @@ impl HnswIndex {
                 "[hnsw] connectivity repair: {:?} (n={len})",
                 repair_started.elapsed()
             );
+            self.log_degree_histogram();
         }
+    }
+
+    /// Diagnostic: layer-0 / upper-layer degree statistics of the built graph.
+    fn log_degree_histogram(&self) {
+        let len = self.nodes.len();
+        let mut hist = vec![0usize; self.m0 + 2];
+        let (mut sum0, mut upper_nodes, mut upper_sum) = (0usize, 0usize, 0usize);
+        for id in 0..len as u32 {
+            let nbrs = self.nodes.get(id).neighbors.lock();
+            let d = nbrs.first().map_or(0, Vec::len);
+            sum0 += d;
+            hist[d.min(self.m0 + 1)] += 1;
+            for layer in nbrs.iter().skip(1) {
+                upper_nodes += 1;
+                upper_sum += layer.len();
+            }
+        }
+        let buckets: Vec<String> = hist
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(d, c)| format!("{d}:{c}"))
+            .collect();
+        eprintln!(
+            "[hnsw] degree: layer0_avg={:.2} upper_avg={:.2} upper_lists={} hist0=[{}]",
+            sum0 as f64 / len.max(1) as f64,
+            upper_sum as f64 / upper_nodes.max(1) as f64,
+            upper_nodes,
+            buckets.join(" ")
+        );
     }
 
     /// Repair only disconnected cold graphs. Ordinary connected graphs keep
@@ -3620,6 +3740,7 @@ impl HnswIndex {
                 (Some(a), Some((qc, qn))) => Some((a.as_ref(), qc.as_slice(), *qn)),
                 _ => None,
             },
+            cosine_norm: None,
         };
         let score_epoch = self.update_epoch.load(Ordering::Acquire);
         let used_quant = probe.quant.is_some();
@@ -4014,6 +4135,32 @@ use crc32fast::hash as crc32;
 #[allow(unused_must_use)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_stats_merge_matches_serial_observation() {
+        let rows: Vec<Vec<f32>> = (0..997)
+            .map(|r| (0..24).map(|i| ((r * 37 + i * 11) % 101) as f32 / 9.0 - 5.0).collect())
+            .collect();
+        for metric in [Metric::Cosine, Metric::L2] {
+            let mut serial = CompactHnswStats::new(metric);
+            rows.iter().for_each(|row| serial.observe(row));
+            let mut merged = CompactHnswStats::new(metric);
+            for part in rows.chunks(130) {
+                let mut stats = CompactHnswStats::new(metric);
+                part.iter().for_each(|row| stats.observe(row));
+                merged.merge(stats);
+            }
+            merged.merge(CompactHnswStats::new(metric));
+            assert_eq!(merged.rows(), serial.rows());
+            assert_eq!((merged.vmin, merged.vmax), (serial.vmin, serial.vmax));
+            assert_eq!(merged.quantizable(), serial.quantizable());
+            for i in 0..24 {
+                assert!((merged.means[i] - serial.means[i]).abs() < 1e-9);
+                let scale = serial.deviations[i].abs().max(1.0);
+                assert!((merged.deviations[i] - serial.deviations[i]).abs() / scale < 1e-9);
+            }
+        }
+    }
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -4231,6 +4378,7 @@ mod tests {
         let probe = Probe {
             query: &query,
             quant: Some((&old, &codes, super::super::distance::ssq_i8(&codes))),
+            cosine_norm: None,
         };
         assert_eq!(index.probe_dist(&probe, 32), 0.0);
         for i in 0..8u32 {
@@ -4606,6 +4754,7 @@ mod tests {
                             } else {
                                 None
                             },
+                            cosine_norm: None,
                         };
                         for ef in [1, 17, 64, 100] {
                             let scalar = index.search_layer_impl::<false>(

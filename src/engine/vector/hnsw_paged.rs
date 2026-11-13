@@ -2056,6 +2056,10 @@ pub(crate) struct PagedHnsw {
     mutation_gate: Arc<parking_lot::RwLock<()>>,
     reverse_latches: [parking_lot::Mutex<()>; 256],
     next_calibration: AtomicU64,
+    /// Node count at which a complete pass proved SQ8 navigation calibration
+    /// infeasible (`u64::MAX` = unknown). Refresh skips repeating that full
+    /// index pass until the node set changes.
+    calibration_infeasible_at: AtomicU64,
     metric: Metric,
     m: usize,
     m0: usize,
@@ -2144,6 +2148,7 @@ impl PagedHnsw {
             mutation_gate: Arc::new(parking_lot::RwLock::new(())),
             reverse_latches: std::array::from_fn(|_| parking_lot::Mutex::new(())),
             next_calibration: AtomicU64::new(64),
+            calibration_infeasible_at: AtomicU64::new(u64::MAX),
             row_index: parking_lot::RwLock::new(None),
             restored_retirements: parking_lot::RwLock::new((
                 std::collections::HashSet::new(),
@@ -2562,6 +2567,13 @@ impl PagedHnsw {
     /// Synchronously refresh after CREATE/OPTIMIZE so the first user query
     /// starts on the compact path. Admission failure is expected for an
     /// optional cache and leaves the paged implementation as the oracle.
+    /// A cold build that observed every indexed row already established that
+    /// no SQ8 calibration exists for the current node set.
+    pub(crate) fn note_navigation_calibration_infeasible(&self) {
+        self.calibration_infeasible_at
+            .store(self.file.node_count(), Ordering::Release);
+    }
+
     pub(crate) fn refresh_query_navigation(&self) -> Result<(), QueryError> {
         let _gate = self.navigation_gate.write();
         if self.query_nav.read().as_ref().is_some_and(|arena| {
@@ -2575,9 +2587,14 @@ impl PagedHnsw {
             && (self.navigation_quant_enabled && paged_quant_enabled())
             && (self.file.navigation_quantization().is_none()
                 || self.file.meta().nav_exact_nodes != 0)
+            && self.calibration_infeasible_at.load(Ordering::Acquire) != self.file.node_count()
         {
             self.invalidate_query_navigation();
             self.file.recalibrate_navigation(&[])?;
+            if self.file.navigation_quantization().is_none() {
+                self.calibration_infeasible_at
+                    .store(self.file.node_count(), Ordering::Release);
+            }
         }
         if self.file.prepare_navigation_mapping()? {
             self.query_nav.write().take();
@@ -2696,14 +2713,19 @@ impl PagedHnsw {
     /// Transcribe a fully linked dense in-memory graph through the storage
     /// layer's sequential direct writer. Only one vector/node is copied at a
     /// time; there is no second table-sized `rows` or exported-links batch.
-    pub(crate) fn materialize_memory_graph(&self, graph: &HnswIndex) -> Result<(), QueryError> {
+    pub(crate) fn materialize_memory_graph(
+        &self,
+        graph: &HnswIndex,
+        threads: usize,
+    ) -> Result<(), QueryError> {
         let timing = std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok();
         let started = std::time::Instant::now();
-        self.file.bulk_build_direct(
+        self.file.bulk_build_direct_parallel(
             graph.build_node_count(),
             graph.build_entry(),
             |id| graph.build_node_top_layer(id),
             |id, vector, neighbors| Ok(graph.copy_build_node_into(id, vector, neighbors)),
+            threads,
         )?;
         if timing {
             eprintln!(
@@ -3807,6 +3829,18 @@ impl PagedHnsw {
     /// neighbour. Rejected redundant edges are not added back merely to
     /// fill capacity: M is an upper bound, not a required degree.
     fn select_neighbors(
+        &self,
+        candidates: &[Scored],
+        m: usize,
+        scratch: &mut Scratch,
+    ) -> Result<Vec<Scored>, QueryError> {
+        // Keep pruned connections, as the in-memory builder does.
+        let mut selected = self.select_neighbors_diverse(candidates, m, scratch)?;
+        super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        Ok(selected)
+    }
+
+    fn select_neighbors_diverse(
         &self,
         candidates: &[Scored],
         m: usize,

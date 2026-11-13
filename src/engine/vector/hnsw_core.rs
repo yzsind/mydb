@@ -187,6 +187,26 @@ pub(super) fn select_diverse_by<C: Copy, E>(
     Ok(selected)
 }
 
+/// HNSW "keep pruned connections": after the diversity heuristic, refill the
+/// remaining slots with the nearest rejected candidates (in candidate order) so
+/// a node's degree is not left far below its bound in high dimensions.
+pub(super) fn fill_pruned<C: Copy, K: PartialEq>(
+    selected: &mut Vec<C>,
+    candidates: &[C],
+    maximum: usize,
+    key: impl Fn(&C) -> K,
+) {
+    for candidate in candidates {
+        if selected.len() >= maximum {
+            break;
+        }
+        let k = key(candidate);
+        if !selected.iter().any(|s| key(s) == k) {
+            selected.push(*candidate);
+        }
+    }
+}
+
 #[inline]
 pub(super) fn permits_in_place_update(drift_sq: f64, nearest_sq: f64, ratio_sq: f64) -> bool {
     !(!nearest_sq.is_finite() || drift_sq > ratio_sq * nearest_sq)
@@ -195,6 +215,21 @@ pub(super) fn permits_in_place_update(drift_sq: f64, nearest_sq: f64, ratio_sq: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fill_pruned_appends_nearest_rejected_without_duplicates() {
+        let candidates = [
+            Scored { dist: 1.0, id: 10u32 },
+            Scored { dist: 2.0, id: 11 },
+            Scored { dist: 3.0, id: 12 },
+            Scored { dist: 4.0, id: 13 },
+        ];
+        let mut selected = vec![candidates[0], candidates[2]];
+        fill_pruned(&mut selected, &candidates, 3, |s| s.id);
+        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [10, 12, 11]);
+        fill_pruned(&mut selected, &candidates, 8, |s| s.id);
+        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [10, 12, 11, 13]);
+    }
 
     #[test]
     fn vector_release_nonzero_coincident_candidates_preserve_bridge() {

@@ -569,11 +569,17 @@ impl MappedVectorNavigation {
         Ok(query.score_batch4(rows))
     }
 
+    /// Score one to eight rows with the cached-norm cosine kernel. A short
+    /// tail is padded by repeating its first row; batch lanes are reduced
+    /// independently, so padding never changes a real row's score, and the
+    /// tail now reuses cached norms too (padded rows are already L1-resident).
     fn exact_distances8(
         &self,
         vids: &[VecId],
         query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
     ) -> Result<[f64; 8], QueryError> {
+        debug_assert!((1..=8).contains(&vids.len()));
+        let vids: [VecId; 8] = std::array::from_fn(|j| vids[if j < vids.len() { j } else { 0 }]);
         let rows = [
             self.exact_payload(vids[0], query.dimension())?,
             self.exact_payload(vids[1], query.dimension())?,
@@ -708,16 +714,9 @@ impl MappedVectorNavigation {
             }
         }
         if codes.is_empty() && self.norms.is_some() {
-            let mut chunks = vids.chunks_exact(8);
-            for chunk in &mut chunks {
-                out.extend(self.exact_distances8(chunk, query)?);
-            }
-            let mut tail = chunks.remainder().chunks_exact(4);
-            for chunk in &mut tail {
-                out.extend(self.exact_distances4(chunk, query)?);
-            }
-            for &vid in tail.remainder() {
-                out.push(self.distance(vid, query, codes, norm)?);
+            for chunk in vids.chunks(8) {
+                let scores = self.exact_distances8(chunk, query)?;
+                out.extend_from_slice(&scores[..chunk.len()]);
             }
             return Ok(());
         }
@@ -824,13 +823,14 @@ impl MappedVectorNavigation {
             return Ok(Vec::new());
         }
         let mut neighbors = Vec::with_capacity(self.meta.m0 as usize);
+        let mut distances = Vec::with_capacity(self.meta.m0 as usize);
         for level in (1..=self.meta.max_layer as usize).rev() {
             let mut best = distance(current)?;
             loop {
                 let previous = current;
                 self.neighbors(current, level, &mut neighbors)?;
-                for &vid in &neighbors {
-                    let score = distance(vid)?;
+                self.distances(&neighbors, &prepared, &codes, norm, &mut distances)?;
+                for (&vid, &score) in neighbors.iter().zip(&distances) {
                     if score < best {
                         best = score;
                         current = vid;
@@ -883,7 +883,6 @@ impl MappedVectorNavigation {
             Ok(fresh)
         };
         let mut fresh = Vec::with_capacity(self.meta.m0 as usize);
-        let mut distances = Vec::with_capacity(self.meta.m0 as usize);
         let mut frontier = BinaryHeap::new();
         let mut results = BinaryHeap::new();
         let first = Scored {
