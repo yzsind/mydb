@@ -570,8 +570,8 @@ fn for_system_time_selective_old_key_uses_history_index_oracle() {
     let diagnostics = rows(
         engine
             .execute(
-                "SELECT INDEX_NAME, HISTORY_ENTRIES, DEGRADED \
-                 FROM information_schema.mydb_temporal_history \
+                "SELECT INDEX_NAME, HISTORY_ENTRIES, IS_DEGRADED \
+                 FROM information_schema.MYDB_TEMPORAL_HISTORY \
                  WHERE TABLE_SCHEMA='test' AND TABLE_NAME='temporal_idx_t' AND INDEX_NAME='idx_k'",
             )
             .unwrap(),

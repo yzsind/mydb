@@ -198,9 +198,9 @@ When a DDL waits for a long time, check transaction-duration MDL, explicit `LOCK
 ### Inspecting Undo and Overall State
 
 ```sql
-SELECT txn_id, table_id, record_count, bytes,
+SELECT txn_id, table_id, record_count, UNDO_BYTES,
        chain_depth, oldest_created_unix_ms
-FROM information_schema.mydb_undo_history
+FROM information_schema.MYDB_UNDO_HISTORY
 ORDER BY record_count DESC;
 
 SHOW ENGINE MYDB STATUS;

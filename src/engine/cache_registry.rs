@@ -3,7 +3,7 @@
 //! Every cache keeps its own native counters (lock-free atomics or its
 //! own guard); this module is a read-side aggregator — one row per
 //! cache, one shape for all of them — feeding
-//! `information_schema.mydb_caches` and the cache section of
+//! `information_schema.MYDB_CACHES` and the cache section of
 //! `SHOW ENGINE MYDB STATUS`. It deliberately does NOT own any cache
 //! lifecycle: registration happens through each cache's existing global
 //! accessor, so there is no new lock on any hot path.
@@ -80,7 +80,7 @@ impl CacheStatsRow {
 }
 
 /// Snapshot every registered cache. Order is stable (grouped by layer)
-/// so `information_schema.mydb_caches` reads consistently.
+/// so `information_schema.MYDB_CACHES` reads consistently.
 pub fn collect() -> Vec<CacheStatsRow> {
     let mut rows = Vec::with_capacity(8);
 

@@ -1553,6 +1553,7 @@ fn varchar_col(name: &'static str, len: i64, nullable: bool) -> SystemColumn {
         numeric_precision: None,
         numeric_scale: None,
         datetime_precision: None,
+        comment: "",
     }
 }
 
@@ -1612,6 +1613,7 @@ fn mysql80_sys_view_columns() -> &'static HashMap<(&'static str, &'static str), 
                         numeric_precision,
                         numeric_scale,
                         datetime_precision,
+                        comment: "",
                     },
                 );
             }
@@ -1632,6 +1634,7 @@ fn timestamp_col(name: &'static str) -> SystemColumn {
         numeric_precision: None,
         numeric_scale: None,
         datetime_precision: Some(0),
+        comment: "",
     }
 }
 

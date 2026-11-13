@@ -699,7 +699,7 @@ engineering records (partition-ddl-completion-2026-09-18).
 production builds always use shadow COPY. Offline COPY also covers LOBs, vectors,
 and partitions; the Memory backend publishes private memory handles to avoid
 reopening empty indexes. Progress is visible in
-`information_schema.mydb_ddl_jobs`; cumulative scan/convert/index/replay/swap
+`information_schema.MYDB_DDL_JOBS`; cumulative scan/convert/index/replay/swap
 durations, source/shadow/spill bytes, direct heap build counts, and peak batch
 bytes are provided by the `ddl_copy_*` lines of `SHOW ENGINE MYDB STATUS`.
 
@@ -735,7 +735,7 @@ incremental log reuses the online DDL spill capability. The final tail uses the
 dirty rows, 4 MiB of row data, and 4096 entries / 1 MiB of index changes; it
 fails explicitly when it cannot converge. The `online_constraint_*` lines of
 `SHOW ENGINE MYDB STATUS` report scan, recomputation, and barrier durations;
-progress and cancellation use `information_schema.mydb_ddl_jobs` /
+progress and cancellation use `information_schema.MYDB_DDL_JOBS` /
 `CANCEL DDL JOB`. Design and verification background is archived in the
 project's internal engineering records (online-constraints-20260914).
 
@@ -839,7 +839,7 @@ is invalidated. Explicit ANALYZE still performs a full rebuild in bounded batche
 Progress updates by covered zone; queries read summary pages on demand and never
 rescan the whole table because of a cache miss. When cache admission fails or page
 contents cannot be verified, queries fall back conservatively. A per-table
-maintenance failure is recorded in `information_schema.mydb_zone_map_storage.last_error`,
+maintenance failure is recorded in `information_schema.MYDB_ZONE_MAP_STORAGE.LAST_ERROR`,
 retried after a default 30 seconds from the end of the failure, while other tables
 keep being maintained. A rebuild error is not cleared by later successful sidecar
 writes.
@@ -918,12 +918,12 @@ when off, the Zone Map diagnostics table is empty.
   round it waits 10 seconds. The batch sizes and scheduling interval are currently
   source constants and are not controlled by the quiet-window or failure-retry
   variables above.
-- `information_schema.mydb_zone_map_storage.MEMORY_FALLBACKS_GLOBAL` is a
+- `information_schema.MYDB_ZONE_MAP_STORAGE.MEMORY_FALLBACKS_GLOBAL` is a
   process-cumulative counter; the diagnostics row of every table shows the same
   global value and must not be summed per table. The remaining storage usage
   columns are still accounted per storage object.
-- `information_schema.mydb_zone_map_storage.state=PENDING` means the trusted sidecar
-  has Unknown zones awaiting maintenance. `mydb_zone_maps` outputs `Unknown` and NULL
+- `information_schema.MYDB_ZONE_MAP_STORAGE.STATE=PENDING` means the trusted sidecar
+  has Unknown zones awaiting maintenance. `MYDB_ZONE_MAPS` outputs `Unknown` and NULL
   bounds for columns not yet built and no longer misreports imported data as zero
   summaries; `READY` means the base is trusted but does not guarantee a prunable
   summary for every column.
@@ -1308,7 +1308,7 @@ metadata commits are also subject to disk latency. `MYDB_LOB_SHRINK_DISABLE` /
 `MYDB_LOB_SHRINK_MIN_FREE_PAGES` only control the extra shrink of free LOB tail
 pages after replay and do not disable OPTIMIZE's full physical rebuild.
 
-Progress/cancellation: `information_schema.mydb_ddl_jobs`,
+Progress/cancellation: `information_schema.MYDB_DDL_JOBS`,
 `CANCEL DDL JOB <job_id>`. In `SHOW ENGINE MYDB STATUS`,
 `ddl_copy_barrier_wait_us`, `ddl_copy_lock_hold_us`, `ddl_copy_lock_hold_max_us`,
 and `ddl_copy_final_tail_rows` are the shared online COPY cumulative metrics; the

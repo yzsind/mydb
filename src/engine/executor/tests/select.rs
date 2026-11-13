@@ -4147,8 +4147,8 @@ fn information_schema_mydb_caches_lists_engine_caches() {
     }
     let response = engine
         .execute(
-            "SELECT cache_name, scope, hits, misses, capacity \
-             FROM information_schema.mydb_caches ORDER BY cache_name",
+            "SELECT cache_name, scope, hits, misses, CAPACITY_ENTRIES \
+             FROM information_schema.MYDB_CACHES ORDER BY cache_name",
         )
         .unwrap()
         .materialize()

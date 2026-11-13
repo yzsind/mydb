@@ -179,7 +179,7 @@ pub(crate) fn show_columns(
                     row.push(Value::String(
                         mysql80
                             .map(|metadata| metadata.comment)
-                            .unwrap_or("")
+                            .unwrap_or(column.comment)
                             .to_string(),
                     ));
                 }
@@ -327,7 +327,7 @@ pub(crate) fn show_columns_columns(full: bool) -> Vec<Column> {
     columns
 }
 
-fn column_privileges_for_show(
+pub(crate) fn column_privileges_for_show(
     db: &Database,
     session: &SessionContext,
     database: &str,
@@ -3662,7 +3662,7 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
             format!( "{:.2}", crate::engine::expr_program::expr_program_stats().legacy_fallback_pct() ),
         // Function-input compile caches (regex patterns / JSON paths) and
         // the column-metadata intern pool gauge — see
-        // information_schema.mydb_caches for the unified view.
+        // information_schema.MYDB_CACHES for the unified view.
         "func_cache_regex_hits" => crate::engine::func_cache::stats().regex_hits.to_string(),
         "func_cache_regex_misses" => crate::engine::func_cache::stats().regex_misses.to_string(),
         "func_cache_json_path_hits" => crate::engine::func_cache::stats() .json_path_hits .to_string(),
@@ -3999,7 +3999,7 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         "memory_reclaim_allocator_bytes" => admission_reclaim.allocator_bytes.to_string(),
         "memory_oom_after_reclaim" => admission_reclaim.oom_after_retry.to_string(),
         // PGA-style work-area arbiter summary. The advisor view
-        // `information_schema.mydb_memory_advisor` breaks each of
+        // `information_schema.MYDB_MEMORY_ADVISOR` breaks each of
         // these out one-per-row with explanatory text.
         "memory_target_bytes" => crate::engine::executor::mem_budget::memory_target_bytes().to_string(),
         "memory_soft_target_configured_bytes" =>
@@ -4185,7 +4185,7 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
 /// runtime stats (node counts, stale ratio, backend, persisted LSN); cold
 /// (never-queried) indexes report their catalog build parameters with a
 /// `(cold — not yet built)` marker. Shares its data source with
-/// `information_schema.mydb_vector_indexes`.
+/// `information_schema.MYDB_VECTOR_INDEXES`.
 fn hnsw_status_rows(db: &Database) -> Vec<(String, String)> {
     use crate::storage::naming::normalize_name;
     let runtime = db.vector_index_runtime_stats();

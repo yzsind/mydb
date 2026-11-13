@@ -350,6 +350,10 @@ pub(super) fn projection_result_columns(
 ) -> Result<Vec<Column>, QueryError> {
     let mut columns = Vec::new();
     let source_order = wildcard_source_order(stmt);
+    let metadata_result = sample
+        .fields
+        .iter()
+        .any(|field| field.source.canonical_metadata_name);
     for item in &stmt.projection {
         match item {
             SelectItem::Wildcard => {
@@ -386,6 +390,9 @@ pub(super) fn projection_result_columns(
             }
             SelectItem::Expr { expr, alias } => {
                 let mut column = project_expr(expr, alias.as_deref())?;
+                if metadata_result && !crate::engine::expr::is_direct_column_reference(expr) {
+                    column.source.canonical_metadata_name |= metadata_result;
+                }
                 column.source.round_decimal_result |=
                     crate::parser::visit::any_expr(expr, |node| {
                         matches!(
@@ -483,7 +490,11 @@ pub(super) fn projected_expr_column(
     if let Some(field) = source_field_for_projection_expr(expr, sample) {
         return Ok(Column {
             source: field.source.clone(),
-            name: alias.map(str::to_string).unwrap_or_else(|| expr_name(expr)),
+            name: crate::engine::expr::result_column_name(
+                expr,
+                alias,
+                crate::engine::expr::metadata_column_name(&field.column, &field.source),
+            ),
             column_type: field.column_type,
         });
     }

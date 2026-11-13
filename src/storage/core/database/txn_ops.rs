@@ -2499,7 +2499,7 @@ impl Database {
     }
 
     /// P2/13 — surface the live undo mirror as a flat record list for
-    /// `information_schema.mydb_undo_history`. Each entry exposes the
+    /// `information_schema.MYDB_UNDO_HISTORY`. Each entry exposes the
     /// fields the view aggregates by `(txn_id, table_id)`. Returns
     /// `None` if the undo lock is unavailable (avoid blocking the
     /// catalog query when a writer is mid-append).

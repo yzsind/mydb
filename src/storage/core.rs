@@ -1409,7 +1409,7 @@ pub struct Database {
     async_ddl: AtomicBool,
     /// Active ALTER TABLE COPY rewrites. Synchronous COPY registers
     /// here while it scans/converts/rebuilds the table; future async
-    /// COPY uses the same tracker so `information_schema.mydb_ddl_jobs`
+    /// COPY uses the same tracker so `information_schema.MYDB_DDL_JOBS`
     /// has one table-copy progress surface.
     alter_copy_jobs: Mutex<HashMap<u64, Arc<AlterCopyJob>>>,
     /// Bounded terminal history so a fast failure/cancellation remains

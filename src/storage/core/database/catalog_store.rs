@@ -955,10 +955,10 @@ impl Database {
     }
 
     fn delete_auto_increment_metadata(&self, table_id: u64) -> Result<(), QueryError> {
-        use crate::storage::data_dictionary::DD_INNODB_DYNAMIC_METADATA;
+        use crate::storage::data_dictionary::DD_TABLE_DYNAMIC_METADATA;
         let mut txn = CatalogTxn::new(self);
         txn.replace(
-            DD_INNODB_DYNAMIC_METADATA,
+            DD_TABLE_DYNAMIC_METADATA,
             CatalogRowSelector::PrimaryValues(vec![Value::UInt(table_id)]),
             Vec::new(),
         );
@@ -973,7 +973,7 @@ impl Database {
         if states.is_empty() || self.config.durability == DurabilityMode::Memory {
             return Ok(());
         }
-        use crate::storage::data_dictionary::DD_INNODB_DYNAMIC_METADATA;
+        use crate::storage::data_dictionary::DD_TABLE_DYNAMIC_METADATA;
         let mut by_table = BTreeMap::<u64, (u64, u64, u64)>::new();
         for state in states {
             if state.retired.load(Ordering::Acquire) || is_temp_table_id(state.table_id) {
@@ -1007,7 +1007,7 @@ impl Database {
                 _ => (version, max_value, covered_lsn),
             };
             txn.replace(
-                DD_INNODB_DYNAMIC_METADATA,
+                DD_TABLE_DYNAMIC_METADATA,
                 CatalogRowSelector::PrimaryValues(vec![Value::UInt(table_id)]),
                 vec![vec![
                     Value::UInt(table_id),
@@ -1029,7 +1029,7 @@ impl Database {
         crate::binlog::prepare_auth_ddl_transaction(after)?;
         use crate::storage::data_dictionary::{
             auth_grant_key, auth_restriction_key, auth_role_edge_key, DD_DD_PROPERTIES,
-            DD_GLOBAL_PRIVILEGES, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_USERS,
+            DD_GRANTS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_USERS,
         };
 
         let mut txn = CatalogTxn::new(self);
@@ -1136,7 +1136,7 @@ impl Database {
                 .transpose()?
                 .unwrap_or_default();
             txn.replace(
-                DD_GLOBAL_PRIVILEGES,
+                DD_GRANTS,
                 CatalogRowSelector::PrimaryValues(vec![Value::String(key)]),
                 rows,
             );
@@ -1451,7 +1451,7 @@ impl Database {
             dd_row_for_trigger, dd_row_for_view, dd_rows_for_auth, dd_rows_for_table,
             DD_CHECK_CONSTRAINTS, DD_ROW_SECURITY_POLICIES, DD_ROW_SECURITY_DEPENDENCIES, DD_COLUMNS, DD_COLUMN_HISTOGRAMS, DD_COLUMN_STATS,
             DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
-            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
+            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GRANTS, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
             DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES,
             DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
         };
@@ -1683,7 +1683,7 @@ impl Database {
                     for (dd_table_id, family) in [
                         (DD_USERS, rows.users),
                         (crate::storage::data_dictionary::DD_API_KEYS, rows.api_keys),
-                        (DD_GLOBAL_PRIVILEGES, rows.grants),
+                        (DD_GRANTS, rows.grants),
                         (DD_ROLE_EDGES, rows.role_edges),
                         (DD_RESTRICTIONS, rows.restrictions),
                     ] {

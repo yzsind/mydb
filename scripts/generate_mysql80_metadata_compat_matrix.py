@@ -29,8 +29,8 @@ NODE_LOCAL_OBJECTS = {
     "PROCESSLIST", "OPTIMIZER_TRACE", "INNODB_TRX",
     "INNODB_LOCK_WAITS", "INNODB_BUFFER_PAGE", "INNODB_BUFFER_PAGE_LRU",
     "INNODB_BUFFER_POOL_STATS", "INNODB_CACHED_INDEXES", "INNODB_METRICS",
-    "MYDB_CURSORS", "MYDB_CACHES", "MYDB_PLAN_CACHE",
-    "MYDB_MEMORY_ADVISOR", "MYDB_UNDO_HISTORY", "MYDB_XA_RECOVER",
+    "MYDB_CURSORS", "MYDB_CACHES", "MYDB_PLAN_CACHE_ENTRIES",
+    "MYDB_MEMORY_ADVISOR", "MYDB_UNDO_HISTORY",
     "GLOBAL_VARIABLES", "SESSION_VARIABLES",
 }
 PROCESS_OBJECTS = {
@@ -102,6 +102,10 @@ def main() -> int:
         }.get(function)
         if compatibility_class is None:
             raise SystemExit(f"unknown registry constructor {function}")
+        if compatibility_class == "mydb_native" and not re.fullmatch(
+            r"MYDB_[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*", name
+        ):
+            raise SystemExit(f"invalid native metadata name: {name}")
         producer = "honest_empty" if "empty_def" in function else "real_producer"
         surface = {
             "schema": "information_schema",
@@ -131,6 +135,26 @@ def main() -> int:
                 surface["data_source"] = "auth_catalog"
                 surface["replication_semantics"] = "replicated_catalog"
                 surface["visibility"] = "current_account_and_roles"
+            elif upper.startswith("MYDB_AI_"):
+                surface["data_source"] = (
+                    "ai_runtime" if upper == "MYDB_AI_RUNTIME_STATUS" else "ai_catalog"
+                )
+                surface["replication_semantics"] = (
+                    "node_local" if upper == "MYDB_AI_RUNTIME_STATUS"
+                    else "replicated_catalog_with_node_local_key_availability"
+                )
+                surface["visibility"] = (
+                    "ai_use_or_model_use_or_ai_admin" if upper == "MYDB_AI_MODELS"
+                    else "ai_admin"
+                )
+            elif upper == "MYDB_ROW_SECURITY_POLICIES":
+                surface["data_source"] = "row_security_catalog"
+                surface["replication_semantics"] = "replicated_catalog"
+                surface["visibility"] = "object_policy"
+            elif upper == "MYDB_PREPARED_XA_TRANSACTIONS":
+                surface["data_source"] = "prepared_xa_transactions"
+                surface["replication_semantics"] = "node_local_recoverable_state"
+                surface["visibility"] = "xa_recover_admin"
             elif upper in NODE_LOCAL_OBJECTS:
                 surface["data_source"] = "node_runtime"
                 surface["replication_semantics"] = "node_local"
@@ -145,8 +169,6 @@ def main() -> int:
             elif upper.startswith("MYDB_"):
                 surface["data_source"] = "mydb_catalog_or_runtime"
                 surface["replication_semantics"] = "classified_by_row"
-                if upper == "MYDB_XA_RECOVER":
-                    surface["visibility"] = "xa_recover_admin"
             else:
                 surface["data_source"] = "data_dictionary_catalog"
                 surface["replication_semantics"] = "replicated_catalog"
@@ -159,15 +181,17 @@ def main() -> int:
         surfaces.append(surface)
         class_counts[compatibility_class] = class_counts.get(compatibility_class, 0) + 1
 
-    if len(surfaces) != 99 or class_counts != {
-        "mysql80_community": 76,
-        "mysql_legacy_compat": 3,
-        "mydb_native": 13,
-        "mysql_optional_plugin_compat": 7,
-    }:
-        raise SystemExit(
-            f"unexpected registry inventory: {len(surfaces)} entries, {class_counts}"
-        )
+    # Pin the external contract exactly; native extensions are validated and
+    # generated from registrations without a second hard-coded inventory.
+    fixture = json.loads((ROOT / "tests/fixtures/mysql80/mysql80-information-schema-8.0.46.json").read_text())
+    excluded = {"RESOURCE_GROUPS", "TABLESPACES", "TABLESPACES_EXTENSIONS"}
+    expected_core = {table["name"] for table in fixture["tables"]} - excluded
+    actual_core = {s["object"] for s in surfaces if s["compatibility_class"] == "mysql80_community"}
+    if actual_core != expected_core:
+        raise SystemExit(f"MySQL contract mismatch: missing={expected_core - actual_core}, extra={actual_core - expected_core}")
+    names = [s["object"].lower() for s in surfaces]
+    if len(names) != len(set(names)):
+        raise SystemExit("duplicate normalized information_schema name")
     payload = {
         "version": 2,
         "oracle_mysql_baseline": "8.0.46 Community",

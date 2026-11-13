@@ -96,8 +96,8 @@ fn sequence_diagnostics_show_recovery_reservation_and_hide_raw_catalog() {
     )
     .unwrap();
     assert_eq!(nextval(&engine, &mut session, "diagnostic_sequence"), 1);
-    assert_eq!(scalar(&engine, &mut session, "SELECT ALLOCATED_VALUE FROM information_schema.mydb_sequences WHERE SEQUENCE_NAME='diagnostic_sequence'"), Value::Int(10));
-    assert_eq!(scalar(&engine, &mut session, "SELECT RESUME_VALUE FROM information_schema.mydb_sequences WHERE SEQUENCE_NAME='diagnostic_sequence'"), Value::Int(42));
+    assert_eq!(scalar(&engine, &mut session, "SELECT ALLOCATED_VALUE FROM information_schema.MYDB_SEQUENCES WHERE SEQUENCE_NAME='diagnostic_sequence'"), Value::Int(10));
+    assert_eq!(scalar(&engine, &mut session, "SELECT RESUME_VALUE FROM information_schema.MYDB_SEQUENCES WHERE SEQUENCE_NAME='diagnostic_sequence'"), Value::Int(42));
     assert_eq!(nextval(&engine, &mut session, "diagnostic_sequence"), 2);
     for (name, expected) in [
         ("Mydb_sequence_values", "2"),

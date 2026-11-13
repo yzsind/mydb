@@ -85,9 +85,9 @@ fn matrix(backend: &str) {
                             .any(|v| v.to_display_string().contains("Using vector index")),
                         "{explain:?}"
                     );
-                    assert_eq!(text(&engine,"SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),quant);
+                    assert_eq!(text(&engine,"SELECT QUANTIZATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"),quant);
                     if quant != "none" {
-                        let work=query_rows(&engine,"SELECT QUANTIZATION_STATE,QUANTIZER_BYTES,COMPRESSED_BYTES,HEAP_RERANKS,EXACT_FALLBACKS FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'");
+                        let work=query_rows(&engine,"SELECT QUANTIZATION_STATE,QUANTIZER_BYTES,COMPRESSED_BYTES,HEAP_RERANKS,EXACT_FALLBACKS FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'");
                         assert_eq!(work[0][0].to_display_string(), "READY");
                         assert!(work[0][1].to_display_string().parse::<u64>().unwrap() > 0);
                         assert!(work[0][2].to_display_string().parse::<u64>().unwrap() > 0);
@@ -178,16 +178,16 @@ fn vector_quantization_pending_pq_trains_after_growth() {
                     options(algo, "pq")
                 ))
                 .unwrap();
-            assert_eq!(text(&engine,"SELECT QUANTIZATION_STATE FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"PENDING_TRAINING");
+            assert_eq!(text(&engine,"SELECT QUANTIZATION_STATE FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"),"PENDING_TRAINING");
             engine
                 .execute("INSERT INTO items VALUES(90,'[1,2,3,4,5,6,7]')")
                 .unwrap();
             let sql = "SELECT id FROM items ORDER BY L2_DISTANCE(v,'[1,2,3,4,5,6,7]') LIMIT 1";
             assert_eq!(text(&engine, sql), "90");
-            assert_eq!(text(&engine,"SELECT QUANTIZATION_STATE FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"PENDING_TRAINING");
+            assert_eq!(text(&engine,"SELECT QUANTIZATION_STATE FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"),"PENDING_TRAINING");
             populate(&engine);
             assert_eq!(text(&engine, sql), "90");
-            assert_eq!(text(&engine,"SELECT QUANTIZATION_STATE FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"READY");
+            assert_eq!(text(&engine,"SELECT QUANTIZATION_STATE FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"),"READY");
         }
     }
 }
@@ -288,10 +288,10 @@ fn vector_quantization_dml_mvcc_and_restart() {
                 "TABLE_SCHEMA='test' AND TABLE_NAME='{}' AND INDEX_NAME='vx'",
                 table.to_ascii_lowercase()
             );
-            assert_eq!(text(&engine, &format!("SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE {predicate}")), q);
-            assert_eq!(text(&engine, &format!("SELECT LOADED FROM information_schema.mydb_vector_indexes WHERE {predicate}")), "0");
+            assert_eq!(text(&engine, &format!("SELECT QUANTIZATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE {predicate}")), q);
+            assert_eq!(text(&engine, &format!("SELECT IS_LOADED FROM information_schema.MYDB_VECTOR_INDEXES WHERE {predicate}")), "0");
             assert_eq!(text(&engine, &sql), "0");
-            assert_eq!(text(&engine, &format!("SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE {predicate}")), q);
+            assert_eq!(text(&engine, &format!("SELECT QUANTIZATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE {predicate}")), q);
         }
     }
 }
@@ -446,7 +446,7 @@ fn vector_quantization_retraining_and_parallel_build() {
     );
     let before = text(
         &engine,
-        "SELECT GENERATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'",
+        "SELECT GENERATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'",
     );
     engine
         .execute("UPDATE items SET v='[10000,1,2,3,4,5,6]' WHERE id<103")
@@ -456,7 +456,7 @@ fn vector_quantization_retraining_and_parallel_build() {
         before,
         text(
             &engine,
-            "SELECT GENERATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"
+            "SELECT GENERATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"
         )
     );
     let rows = query_rows(
@@ -469,7 +469,7 @@ fn vector_quantization_retraining_and_parallel_build() {
         .all(|r| r[0].to_display_string().parse::<u32>().unwrap() < 103));
     let after = text(
         &engine,
-        "SELECT GENERATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'",
+        "SELECT GENERATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'",
     );
     assert_ne!(before, after);
     engine
@@ -478,7 +478,7 @@ fn vector_quantization_retraining_and_parallel_build() {
     assert_eq!(
         text(
             &engine,
-            "SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vy'"
+            "SELECT QUANTIZATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vy'"
         ),
         "sq4"
     );
@@ -486,7 +486,7 @@ fn vector_quantization_retraining_and_parallel_build() {
     assert_eq!(
         text(
             &engine,
-            "SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vy'"
+            "SELECT QUANTIZATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vy'"
         ),
         "sq4"
     );
@@ -585,7 +585,7 @@ fn vector_quantization_copy_validates_type_and_dimension_before_publication() {
                 if q == "pq" {
                     let error=engine.execute(&format!("ALTER TABLE {table} MODIFY COLUMN v VECTOR(2,FLOAT16) NOT NULL, ALGORITHM=COPY")).unwrap_err();
                     assert!(error.message().contains("pq_m"), "{error}");
-                    assert_eq!(text(&engine,&format!("SELECT DECLARED_DIM FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='{index}'")),"7");
+                    assert_eq!(text(&engine,&format!("SELECT DECLARED_DIMENSIONS FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='{index}'")),"7");
                 }
                 assert!(engine.execute(&format!("ALTER TABLE {table} MODIFY COLUMN v VECTOR(7,BINARY) NOT NULL, ALGORITHM=COPY")).is_err());
                 assert!(engine
@@ -608,7 +608,7 @@ fn vector_quantization_copy_validates_type_and_dimension_before_publication() {
                     ),
                     "0"
                 );
-                assert_eq!(text(&engine,&format!("SELECT QUANTIZATION FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='{index}'")),q);
+                assert_eq!(text(&engine,&format!("SELECT QUANTIZATION FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='{index}'")),q);
                 let create = query_rows(&engine, &format!("SHOW CREATE TABLE {table}"))[0][1]
                     .to_display_string();
                 assert!(create.contains("vector(7,bfloat16)"), "{create}");

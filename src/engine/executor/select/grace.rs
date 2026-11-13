@@ -360,7 +360,8 @@ impl PartitionWriter {
                 }
                 self.writer
                     .write_all(&[u8::from(f.source.dynamic_parameter)
-                        | (u8::from(f.source.round_decimal_result) << 1)])
+                        | (u8::from(f.source.round_decimal_result) << 1)
+                        | (u8::from(f.source.canonical_metadata_name) << 2)])
                     .map_err(io_err)?;
             }
             self.schema_written = true;
@@ -595,6 +596,7 @@ impl PartitionReader {
                         vector_type,
                         dynamic_parameter: dynamic_parameter[0] & 1 != 0,
                         round_decimal_result: dynamic_parameter[0] & 2 != 0,
+                        canonical_metadata_name: dynamic_parameter[0] & 4 != 0,
                         schema: source_schema,
                         table: source_table,
                         org_table: source_org_table,
@@ -1669,6 +1671,7 @@ mod tests {
             collation_coercibility: Some(0),
             dynamic_parameter: true,
             round_decimal_result: true,
+            canonical_metadata_name: true,
             wire_type: Some(crate::mysql::protocol::MYSQL_TYPE_STRING),
             schema: "db".into(),
             table: "alias_t".into(),

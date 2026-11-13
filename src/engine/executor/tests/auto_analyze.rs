@@ -198,8 +198,8 @@ fn stats_health_view_reflects_analyze_and_staleness() {
     // columns and a populated TABLE_ROWS.
     let QueryResponse::ResultSet(rs) = engine
         .execute(
-            "SELECT TABLE_ROWS, MODIFIED_ROWS, IS_STALE, HAS_HISTOGRAM, ANALYZED_COLUMNS \
-             FROM information_schema.mydb_stats_health \
+            "SELECT TABLE_ROWS, MODIFIED_ROWS, IS_STALE, HAS_HISTOGRAM, ANALYZED_COLUMN_COUNT \
+             FROM information_schema.MYDB_STATS_HEALTH \
              WHERE TABLE_SCHEMA='test' AND TABLE_NAME='sh'",
         )
         .unwrap()
@@ -230,7 +230,7 @@ fn stats_health_view_reflects_analyze_and_staleness() {
     let QueryResponse::ResultSet(rs) = engine
         .execute(
             "SELECT MODIFIED_ROWS, IS_STALE \
-             FROM information_schema.mydb_stats_health \
+             FROM information_schema.MYDB_STATS_HEALTH \
              WHERE TABLE_SCHEMA='test' AND TABLE_NAME='sh'",
         )
         .unwrap()
@@ -255,7 +255,7 @@ fn stats_health_view_excludes_system_schemas() {
     let QueryResponse::ResultSet(rs) = engine
         .execute(
             "SELECT TABLE_SCHEMA, TABLE_NAME \
-             FROM information_schema.mydb_stats_health",
+             FROM information_schema.MYDB_STATS_HEALTH",
         )
         .unwrap()
     else {

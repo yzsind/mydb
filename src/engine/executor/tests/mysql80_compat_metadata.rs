@@ -740,8 +740,8 @@ fn temporal_history_no_index_row_keeps_columns_aligned() {
         .unwrap();
     let result = rows(
         &engine,
-        "SELECT INDEX_NAME, SYSTEM_TIME_EPOCH_US, LAST_COMPACTION_UNIX_US \
-         FROM information_schema.mydb_temporal_history \
+        "SELECT INDEX_NAME, SYSTEM_TIME_EPOCH_UNIX_US, LAST_COMPACTION_UNIX_US \
+         FROM information_schema.MYDB_TEMPORAL_HISTORY \
          WHERE TABLE_SCHEMA='test' AND TABLE_NAME='temporal_plain'",
     );
     assert_eq!(result.len(), 1);

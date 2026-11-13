@@ -41,7 +41,7 @@ CREATE POLICY tenant_access ON accounts
 ALTER POLICY tenant_access ON accounts
     USING (tenant_id = 42) WITH CHECK (tenant_id = 42);
 SHOW CREATE POLICY tenant_access ON accounts;
-SELECT * FROM information_schema.mydb_row_security_policies;
+SELECT * FROM information_schema.MYDB_ROW_SECURITY_POLICIES;
 ALTER POLICY tenant_access ON accounts RENAME TO account_access;
 DROP POLICY account_access ON accounts;
 ALTER TABLE accounts DISABLE ROW LEVEL SECURITY;

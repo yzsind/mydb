@@ -65,6 +65,9 @@ pub struct ColumnSource {
     pub dynamic_parameter: bool,
     /// Exact division keeps scratch digits until the outer result boundary.
     pub round_decimal_result: bool,
+    /// Published spelling belongs to a system-metadata result. This provenance
+    /// survives computed projections without claiming a physical catalog origin.
+    pub canonical_metadata_name: bool,
     /// Catalog wire representation when the execution type intentionally
     /// groups several SQL domains (e.g. BINARY/VARBINARY as byte vectors).
     pub wire_type: Option<u8>,

@@ -3409,6 +3409,9 @@ fn query_projection_template(
 ) -> Option<Vec<PlanField>> {
     let mut output = Vec::with_capacity(lowered.len());
     let mut lowered_index = 0usize;
+    let metadata_result = input
+        .iter()
+        .any(|field| field.source.canonical_metadata_name);
     for item in projection {
         match item {
             SelectItem::Wildcard => {
@@ -3432,10 +3435,16 @@ fn query_projection_template(
             }
             SelectItem::Expr { expr, alias } => {
                 let lowered = lowered.get(lowered_index)?;
-                let name = alias
-                    .clone()
-                    .unwrap_or_else(|| crate::engine::expr::expr_name(expr));
-                let (table, table_alias, column_type, source) = match lowered {
+                let source_name = match lowered {
+                    VecResultProjection::Column(index) => {
+                        let field = input.get(*index)?;
+                        crate::engine::expr::metadata_column_name(&field.column, &field.source)
+                    }
+                    _ => None,
+                };
+                let name =
+                    crate::engine::expr::result_column_name(expr, alias.as_deref(), source_name);
+                let (table, table_alias, column_type, mut source) = match lowered {
                     VecResultProjection::Column(index) => {
                         let field = input.get(*index)?;
                         (
@@ -3470,6 +3479,9 @@ fn query_projection_template(
                         (String::new(), None, descriptor.column_type(), source)
                     }
                 };
+                if !matches!(lowered, VecResultProjection::Column(_)) {
+                    source.canonical_metadata_name |= metadata_result;
+                }
                 output.push(PlanField {
                     meta: super::plan::intern_col_meta(ColMeta {
                         invisible: false,

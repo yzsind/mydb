@@ -37,7 +37,7 @@ The quoted JSON object has these fields:
 
 ## Privileges, Results, and Operational Details
 
-Requires SYSTEM_VARIABLES_ADMIN. Role Epoch and sequence SYNC_CONFIG_EPOCH are different values. Read SYNC_POLICY/PENDING/SYNC_CONFIG_EPOCH from information_schema.mydb_sequences when inspecting the current reservation state, and retain the configured epoch operationally even before sequences exist. On an acknowledgment failure, publication can have succeeded; do not blindly retry the same previous+1 epoch or resume old master writes.
+Requires SYSTEM_VARIABLES_ADMIN. Role Epoch and sequence SYNC_CONFIG_EPOCH are different values. Read SYNC_POLICY/PENDING/SYNC_CONFIG_EPOCH from information_schema.MYDB_SEQUENCES when inspecting the current reservation state, and retain the configured epoch operationally even before sequences exist. On an acknowledgment failure, publication can have succeeded; do not blindly retry the same previous+1 epoch or resume old master writes.
 
 After replacing candidates, verify their durable applied boundary and external promotion fencing before RESUME MASTER WRITES. The policy changes reservation-window confirmation, not every NEXTVAL into a per-value network transaction.
 

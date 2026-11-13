@@ -1186,7 +1186,7 @@ pub struct CompiledSelectPlan {
     required_privileges: OnceLock<Arc<[RequiredPrivilege]>>,
     mdl_requests: OnceLock<Arc<[MdlRequest]>>,
     /// Per-entry hit counter, bumped on each cache hit. Powers the
-    /// per-plan `HITS` column of `information_schema.mydb_plan_cache`.
+    /// per-plan `HITS` column of `information_schema.MYDB_PLAN_CACHE_ENTRIES`.
     pub hits: AtomicU64,
     _cache_bytes: Option<CacheByteLease>,
 }
@@ -1299,7 +1299,7 @@ impl CompiledSelectPlan {
     }
 }
 
-/// One snapshot row for `information_schema.mydb_plan_cache`.
+/// One snapshot row for `information_schema.MYDB_PLAN_CACHE_ENTRIES`.
 #[derive(Debug, Clone)]
 pub struct PlanCacheEntryInfo {
     /// Normalized SQL text, or the `ap:<hex>` auto-parameterization
@@ -1556,7 +1556,7 @@ impl PlanCache {
     }
 
     /// One [`PlanCacheEntryInfo`] per resident entry, for
-    /// `information_schema.mydb_plan_cache`. Snapshots under each shard lock;
+    /// `information_schema.MYDB_PLAN_CACHE_ENTRIES`. Snapshots under each shard lock;
     /// not a hot path (driven by an explicit introspection query).
     pub fn snapshot(&self) -> Vec<PlanCacheEntryInfo> {
         let mut out = Vec::new();

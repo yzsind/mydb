@@ -748,6 +748,33 @@ fn prepare_window_execution(
             final_options.hidden += 1;
         }
     }
+    // Preserve the source relation's published spelling before the window
+    // rewrite replaces direct columns with hidden input aliases.
+    if stmt.projection.iter().any(|item| {
+        matches!(
+            item,
+            SelectItem::Expr {
+                expr: Expr::Identifier(_) | Expr::CompoundIdentifier(_) | Expr::GroupKeyRef { .. },
+                alias: None
+            }
+        )
+    }) {
+        let published_names = crate::planner::query_output_column_names(db, &stmt)?;
+        for (item, name) in stmt.projection.iter_mut().zip(published_names) {
+            if let SelectItem::Expr { expr, alias } = item {
+                if alias.is_none()
+                    && matches!(
+                        expr,
+                        Expr::Identifier(_)
+                            | Expr::CompoundIdentifier(_)
+                            | Expr::GroupKeyRef { .. }
+                    )
+                {
+                    *alias = Some(name);
+                }
+            }
+        }
+    }
     let original_projection = stmt.projection.clone();
     let original_order_by = stmt.order_by.clone();
     let original_limit = stmt.limit.clone();
@@ -1195,11 +1222,13 @@ pub(in crate::engine::executor) fn execute_windowed_select(
             final_options,
         )
     };
-    if ctes.is_empty() {
-        run()
-    } else {
-        crate::engine::executor::cte::with_cte_registry_extended(ctes, run)
-    }
+    crate::engine::executor::select::with_session_registry(registry.clone(), || {
+        if ctes.is_empty() {
+            run()
+        } else {
+            crate::engine::executor::cte::with_cte_registry_extended(ctes, run)
+        }
+    })
 }
 
 pub(in crate::engine::executor) fn execute_windowed_select_for_analyze(
@@ -1235,11 +1264,13 @@ pub(in crate::engine::executor) fn execute_windowed_select_for_analyze(
             final_options,
         )
     };
-    if ctes.is_empty() {
-        run()
-    } else {
-        crate::engine::executor::cte::with_cte_registry_extended(ctes, run)
-    }
+    crate::engine::executor::select::with_session_registry(registry.clone(), || {
+        if ctes.is_empty() {
+            run()
+        } else {
+            crate::engine::executor::cte::with_cte_registry_extended(ctes, run)
+        }
+    })
 }
 
 fn plan_is_rollup_aggregate(plan: &PhysicalPlan) -> bool {
@@ -1794,6 +1825,9 @@ fn prepare_window_final_projection(
     // end, so the post-projection logic below works against `inner` directly.
     // Build final result by mapping output_template
     let mut final_columns: Vec<Column> = Vec::new();
+    let metadata_result = all_columns
+        .iter()
+        .any(|column| column.source.canonical_metadata_name);
     let mut col_index_map: std::collections::HashMap<String, usize> =
         std::collections::HashMap::new();
     for (idx, col) in all_columns.iter().enumerate() {
@@ -1831,6 +1865,7 @@ fn prepare_window_final_projection(
                 let idx = win_start + spec_index;
                 final_cols.push(WindowFinalCol::Index(idx));
                 let mut source = crate::types::ColumnSource::default();
+                source.canonical_metadata_name = metadata_result;
                 if window_specs.get(*spec_index).is_some_and(|s| {
                     matches!(
                         s.name.to_ascii_uppercase().as_str(),
@@ -1861,6 +1896,7 @@ fn prepare_window_final_projection(
                 let descriptor =
                     crate::engine::expr_type::infer_expr_type_in_table(expr, &post_schema);
                 let mut source = crate::types::ColumnSource::default();
+                source.canonical_metadata_name = metadata_result;
                 descriptor.apply_to_source(&mut source);
                 source.round_decimal_result = crate::parser::visit::any_expr(expr, |node| {
                     matches!(

@@ -4,7 +4,7 @@
 //! The registry is the source of truth for cursor-related admin views and
 //! protections:
 //!
-//!   * `information_schema.mydb_cursors` reads `snapshot()` to list every
+//!   * `information_schema.MYDB_CURSORS` reads `snapshot()` to list every
 //!     live cursor with its statement id, owning connection, rows
 //!     fetched, and idle time.
 //!   * `SHOW ENGINE MYDB STATUS` reads the lifetime counters in
@@ -678,7 +678,7 @@ mod tests {
 // Both registries share the same `mydb_cursor_*` GUCs (per-session cap,
 // global cap, idle timeout) so a misbehaving client cannot leak named
 // cursors any more than it can leak prepared cursors. The
-// `information_schema.mydb_cursors` view unions the two sources so
+// `information_schema.MYDB_CURSORS` view unions the two sources so
 // admins see every server-side cursor in one place.
 // ----------------------------------------------------------------------
 

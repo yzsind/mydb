@@ -263,7 +263,7 @@ preview; retrieval quality depends on the data, models, and candidate windows.
 - **Model privileges**: `AI_ADMIN` manages AI objects; `AI_USE` can be granted per model independently of table read privileges.
 - **Encrypted credentials**: API keys are stored as encrypted Secrets. SQL metadata views do not expose decrypted keys; Secret DDL requires TLS.
 - **Bounded execution**: concurrency, queue, memory, request-rate, and output budgets govern model calls. Deadlines and `KILL` cancel local waits, and optional node policies restrict outbound destinations.
-- **Visibility**: `SHOW AI MODELS`, `information_schema.AI_RUNTIME_STATUS`, and `_DETAIL` results expose configuration and execution information. `EXPLAIN` shows the external stage without calling a provider; `EXPLAIN ANALYZE` executes it.
+- **Visibility**: `SHOW AI MODELS`, `information_schema.MYDB_AI_RUNTIME_STATUS`, and `_DETAIL` results expose configuration and execution information. `EXPLAIN` shows the external stage without calling a provider; `EXPLAIN ANALYZE` executes it.
 
 Model calls require autocommit outside explicit transactions and are rejected
 in DML, predicates, and persistent schema expressions. Save generated values

@@ -67,6 +67,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | [Optimizer and Query Execution](optimizer-and-operators.md) | Access paths, join algorithms, execution modes, EXPLAIN, and tuning |
 | [ANALYZE TABLE](statements/admin/analyze-table.md) | Statistics collection and concurrency boundaries |
 | [Performance Schema](performance-schema.md) | Runtime tables, collection, memory, and diagnostics |
+| [Metadata Naming](metadata-naming.md) | Canonical result names, native metadata views, and column units |
 | [SHOW STATUS](show-status.md) | Counters, scope, reset behavior, and compatibility |
 | [Error Codes](error-codes.md) | Error catalog and diagnostic details |
 | [Performance Comparison](performance-comparison.md) | Published measurements, test conditions, and interpretation |

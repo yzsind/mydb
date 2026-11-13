@@ -351,7 +351,7 @@ pub(crate) enum UndoCreatorState {
 }
 
 /// P2/13 — one row's worth of in-memory undo history for the
-/// `information_schema.mydb_undo_history` view. Flat shape so the
+/// `information_schema.MYDB_UNDO_HISTORY` view. Flat shape so the
 /// view aggregator can group by `(txn_id, table_id)` without holding
 /// the undo lock across the catalog query.
 #[derive(Debug, Clone, Copy)]

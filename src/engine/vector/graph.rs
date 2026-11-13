@@ -70,9 +70,9 @@ pub(crate) struct VectorSearchResult {
 
 /// Runtime stats for a single vector index, aggregated across whichever
 /// per-partition graphs are currently warm in `Database::vector_indexes`.
-/// Powers `information_schema.mydb_vector_indexes` and the `SHOW ENGINE MYDB
+/// Powers `information_schema.MYDB_VECTOR_INDEXES` and the `SHOW ENGINE MYDB
 /// STATUS` HNSW section. A cold (never-queried) index has no row here — the
-/// view falls back to catalog-only metadata with `LOADED = 0`.
+/// view falls back to catalog-only metadata with `IS_LOADED = 0`.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct VectorIndexRuntimeStats {
     /// How many per-partition graphs are warm (1 for an unpartitioned table).
@@ -328,7 +328,7 @@ impl VectorGraph {
         }
     }
 
-    /// Backend tag for `information_schema.mydb_vector_indexes` / SHOW ENGINE.
+    /// Backend tag for `information_schema.MYDB_VECTOR_INDEXES` / SHOW ENGINE.
     pub(crate) fn backend_name(&self) -> &'static str {
         match self {
             VectorGraph::NativeHnsw(g) => g.backend_name(),

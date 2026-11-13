@@ -449,8 +449,8 @@ from sending superseded credentials or routing settings. Requests already
 received upstream may still execute and incur charges. Referenced Secrets and
 connections cannot be dropped.
 
-Read-only metadata is available in `information_schema.AI_MODELS`,
-`AI_CONNECTIONS`, `AI_SECRETS`, and `AI_RUNTIME_STATUS`. Models are filtered by
+Read-only metadata is available in `information_schema.MYDB_AI_MODELS`,
+`MYDB_AI_CONNECTIONS`, `MYDB_AI_SECRETS`, and `MYDB_AI_RUNTIME_STATUS`. Models are filtered by
 model privileges; sensitive management metadata requires AI_ADMIN. AI SQL is
 redacted in server SQL logs, process metadata, prepared-statement snapshots,
 and optimizer trace. The server never automatically executes generated SQL,

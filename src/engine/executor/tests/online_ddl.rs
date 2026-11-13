@@ -2600,7 +2600,7 @@ fn unique_index_rejects_pre_existing_duplicate() {
 
     // The failed DDL must not leave a half-built index visible.
     let QueryResponse::ResultSet(jobs) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2654,7 +2654,7 @@ fn batched_add_unique_index_rejects_pre_existing_duplicate() {
         !matches!(&row[2], Value::String(name) if name == "payload_idx" || name == "v_uniq")
     }));
     let QueryResponse::ResultSet(jobs) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2715,7 +2715,7 @@ fn online_add_index_waits_for_backfill_completion() {
     );
 
     let QueryResponse::ResultSet(jobs) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2755,7 +2755,7 @@ fn online_add_index_waits_for_backfill_completion() {
     );
 
     let QueryResponse::ResultSet(jobs_after) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2772,7 +2772,7 @@ fn online_add_index_waits_for_backfill_completion() {
     assert_eq!(rs.rows, vec![vec![Value::Int(50)]]);
 }
 
-/// `information_schema.mydb_ddl_jobs` is empty when no online DDL is
+/// `information_schema.MYDB_DDL_JOBS` is empty when no online DDL is
 /// in flight. Smoke-test the view shape.
 // P2/13 — the new mydb_undo_history view groups by (txn_id, table_id)
 // and surfaces the in-memory undo mirror to operators. Each DML
@@ -2796,7 +2796,7 @@ fn mydb_undo_history_view_groups_by_txn_and_table() {
     let QueryResponse::ResultSet(rs) = engine
         .execute(
             "SELECT TXN_ID, TABLE_ID, RECORD_COUNT, CHAIN_DEPTH, OLDEST_CREATED_UNIX_MS \
-             FROM information_schema.mydb_undo_history",
+             FROM information_schema.MYDB_UNDO_HISTORY",
         )
         .unwrap()
     else {
@@ -2837,7 +2837,7 @@ fn mydb_ddl_jobs_view_retains_terminal_index_history_when_idle() {
     engine.execute("CREATE INDEX v_idx ON t (v)").unwrap();
 
     let QueryResponse::ResultSet(rs) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2855,7 +2855,7 @@ fn mydb_ddl_jobs_view_retains_terminal_index_history_when_idle() {
     assert_eq!(rs.rows[0][10], Value::Int(0));
 }
 
-/// `information_schema.mydb_ddl_jobs` may surface a `Building` index
+/// `information_schema.MYDB_DDL_JOBS` may surface a `Building` index
 /// while ADD INDEX is in flight on a parallel connection. The
 /// observation is inherently racy because mydb's ADD INDEX is
 /// synchronous from the issuing connection's perspective, but a
@@ -2883,7 +2883,7 @@ fn mydb_ddl_jobs_view_surfaces_building_index_during_add() {
     );
 
     let QueryResponse::ResultSet(during) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2901,7 +2901,7 @@ fn mydb_ddl_jobs_view_surfaces_building_index_during_add() {
 
     // Completion leaves a bounded terminal record rather than an active job.
     let QueryResponse::ResultSet(after) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2932,7 +2932,7 @@ fn mydb_ddl_jobs_view_surfaces_table_copy_progress() {
     );
 
     let QueryResponse::ResultSet(during) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -2952,7 +2952,7 @@ fn mydb_ddl_jobs_view_surfaces_table_copy_progress() {
     ddl.join().unwrap().unwrap();
 
     let QueryResponse::ResultSet(after) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS")
         .unwrap()
     else {
         panic!("expected result set");
@@ -3001,7 +3001,7 @@ fn cancel_ddl_job_aborts_before_final_swap_and_keeps_original_table() {
     assert!(hook.wait_until_reached(std::time::Duration::from_secs(2)));
 
     let QueryResponse::ResultSet(jobs) = engine
-        .execute("SELECT JOB_ID FROM information_schema.mydb_ddl_jobs WHERE TABLE_NAME='cancel_t'")
+        .execute("SELECT JOB_ID FROM information_schema.MYDB_DDL_JOBS WHERE TABLE_NAME='cancel_t'")
         .unwrap()
     else {
         panic!("expected result set");
@@ -3031,7 +3031,7 @@ fn cancel_ddl_job_aborts_before_final_swap_and_keeps_original_table() {
     );
     let QueryResponse::ResultSet(history) = engine
         .execute(
-            "SELECT STATE, ERROR_MESSAGE FROM information_schema.mydb_ddl_jobs \
+            "SELECT STATE, ERROR_MESSAGE FROM information_schema.MYDB_DDL_JOBS \
              WHERE TABLE_NAME='cancel_t'",
         )
         .unwrap()

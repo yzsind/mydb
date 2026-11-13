@@ -10,6 +10,7 @@ mod fresh_release_audit;
 mod function_runtime_fixes;
 mod github_release_audit;
 mod http;
+mod metadata_naming;
 mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;

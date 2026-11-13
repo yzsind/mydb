@@ -32,7 +32,7 @@ pub enum Statement {
     ReleaseSavepoint(String),
     /// mydb extension: request cancellation of an online DDL before its
     /// final catalog swap. The numeric id is exposed by
-    /// `information_schema.mydb_ddl_jobs`.
+    /// `information_schema.MYDB_DDL_JOBS`.
     CancelDdlJob(u64),
     /// Engine-native online backup administration. The backup subsystem owns
     /// strict parsing of BACKUP/SHOW/CANCEL clauses and repository URIs.
@@ -636,7 +636,7 @@ pub enum Statement {
     /// cursor stays open until `CLOSE` or session disconnect.
     ///
     /// `sql` is the original DECLARE statement, kept so
-    /// `information_schema.mydb_cursors.SQL` shows the user's input
+    /// `information_schema.MYDB_CURSORS.SQL_TEXT` shows the user's input
     /// (we can't round-trip the parsed AST back to SQL without losing
     /// fidelity).
     DeclareSqlCursor {

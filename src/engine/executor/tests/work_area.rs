@@ -144,9 +144,9 @@ fn memory_advisor_view_is_populated() {
     let engine = open_test_engine(dir.path());
     let rows = rows_of(
         &engine,
-        "SELECT METRIC, VALUE, UNIT \
-         FROM information_schema.mydb_memory_advisor \
-         WHERE METRIC IN ('memory_target_bytes', 'executor_memory_target_bytes', \
+        "SELECT METRIC_NAME, METRIC_VALUE, UNIT \
+         FROM information_schema.MYDB_MEMORY_ADVISOR \
+         WHERE METRIC_NAME IN ('memory_target_bytes', 'executor_memory_target_bytes', \
                           'work_area_utilization_pct', 'optimal_grants', \
                           'query_memory_reservation_rejections', \
                           'process_memory_reservation_rejections', \
@@ -157,7 +157,7 @@ fn memory_advisor_view_is_populated() {
                           'process_memory_hard_limit_bytes', \
                           'memory_reclaim_attempts', \
                           'active_spill_files', 'orphan_spill_bytes') \
-         ORDER BY METRIC",
+         ORDER BY METRIC_NAME",
     );
     assert_eq!(rows.len(), 14, "expected all selected advisor metrics");
     // memory_target_bytes must be positive (default 1 GiB or env override).

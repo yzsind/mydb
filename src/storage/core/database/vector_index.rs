@@ -4291,9 +4291,9 @@ impl Database {
 
     /// Snapshot runtime stats for every *warm* vector index, aggregated across
     /// per-partition graphs and keyed by `(table_id, normalized_index_name)`.
-    /// Drives `information_schema.mydb_vector_indexes` and the SHOW ENGINE HNSW
+    /// Drives `information_schema.MYDB_VECTOR_INDEXES` and the SHOW ENGINE HNSW
     /// section. Cold (never-queried) indexes don't appear — the view joins this
-    /// against the catalog and reports them as `LOADED = 0`. Takes only the
+    /// against the catalog and reports them as `IS_LOADED = 0`. Takes only the
     /// `vector_indexes` read lock; never builds a graph.
     pub(crate) fn record_vector_query_work(
         &self,

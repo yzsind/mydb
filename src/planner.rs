@@ -4181,8 +4181,57 @@ fn plan_has_parallel_node(plan: &PhysicalPlan) -> bool {
     }
 }
 
+/// Name provenance is tracked per column so a metadata/user join cannot
+/// change the presentation of unrelated user columns.
+#[derive(Debug, Clone)]
+enum MetadataNamePolicy {
+    QuerySpelling,
+    PublishedSpelling,
+    Mixed(Vec<bool>),
+}
+
+impl MetadataNamePolicy {
+    fn from_flags(flags: Vec<bool>) -> Self {
+        if !flags.iter().any(|flag| *flag) {
+            Self::QuerySpelling
+        } else if flags.iter().all(|flag| *flag) {
+            Self::PublishedSpelling
+        } else {
+            Self::Mixed(flags)
+        }
+    }
+
+    fn from_columns(columns: &[crate::types::Column]) -> Self {
+        if !columns
+            .iter()
+            .any(|column| column.source.canonical_metadata_name)
+        {
+            return Self::QuerySpelling;
+        }
+        Self::from_flags(
+            columns
+                .iter()
+                .map(|column| column.source.canonical_metadata_name)
+                .collect(),
+        )
+    }
+
+    fn any(&self) -> bool {
+        !matches!(self, Self::QuerySpelling)
+    }
+
+    fn at(&self, index: usize) -> bool {
+        match self {
+            Self::QuerySpelling => false,
+            Self::PublishedSpelling => true,
+            Self::Mixed(flags) => flags.get(index).copied().unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScopeTable {
+    canonical_metadata_names: MetadataNamePolicy,
     name: String,
     alias: Option<String>,
     /// All addressable column names (name resolution / ambiguity checks).
@@ -4334,7 +4383,15 @@ pub fn resolve_join_using_natural(db: &Database, select: &mut Select) -> Result<
     }
 
     let rewrite = coalesced_rewrite_map(&output);
-    rewrite_select_level_coalesced_identifiers(select, &rewrite);
+    rewrite_select_level_coalesced_identifiers(
+        select,
+        &rewrite,
+        preceding_scope
+            .tables
+            .iter()
+            .any(|table| table.canonical_metadata_names.any())
+            .then_some(output.as_slice()),
+    );
     if has_coalescing_join {
         expand_bare_wildcards(select, &output);
     }
@@ -4557,7 +4614,11 @@ fn coalesced_rewrite_map(columns: &[JoinOutputColumn]) -> CoalescedRewrite {
     rewrite
 }
 
-fn rewrite_select_level_coalesced_identifiers(select: &mut Select, rewrite: &CoalescedRewrite) {
+fn rewrite_select_level_coalesced_identifiers(
+    select: &mut Select,
+    rewrite: &CoalescedRewrite,
+    output: Option<&[JoinOutputColumn]>,
+) {
     for item in &mut select.projection {
         if let SelectItem::Expr { expr, alias } = item {
             let implicit_name = if alias.is_none() {
@@ -4565,7 +4626,16 @@ fn rewrite_select_level_coalesced_identifiers(select: &mut Select, rewrite: &Coa
                     rewrite
                         .unqualified
                         .contains_key(&name.to_ascii_lowercase())
-                        .then(|| name.clone())
+                        .then(|| {
+                            output
+                                .and_then(|output| {
+                                    output
+                                        .iter()
+                                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                                })
+                                .map(|column| column.name.clone())
+                                .unwrap_or_else(|| name.clone())
+                        })
                 } else if let Expr::CompoundIdentifier(parts) = expr {
                     let column = parts.last().cloned();
                     let qualifier = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
@@ -5000,18 +5070,30 @@ fn scope_table_for_ref(
         let stubs = crate::engine::executor::cte::describe_definitions(&with.ctes, |query| {
             crate::engine::executor::select::describe_subquery_columns(db, query)
         })?;
-        let mut columns = crate::engine::executor::cte::with_cte_registry_extended(stubs, || {
-            if let crate::parser::QueryExpr::Select(body) = &with.body {
-                let scope = build_column_scope(db, body, outer)?;
-                validate_select_in_column_scope(db, body, &scope)?;
-                select_output_column_names(body, &scope)
-            } else {
-                crate::engine::executor::select::describe_subquery_columns(db, derived)
-                    .map(|columns| columns.into_iter().map(|column| column.name).collect())
-            }
-        })?;
+        let (mut columns, canonical_metadata_names) =
+            crate::engine::executor::cte::with_cte_registry_extended(stubs, || {
+                if let crate::parser::QueryExpr::Select(body) = &with.body {
+                    let scope = build_column_scope(db, body, outer)?;
+                    validate_select_in_column_scope(db, body, &scope)?;
+                    Ok((
+                        select_output_column_names(body, &scope)?,
+                        scope.projected_metadata_names(body),
+                    ))
+                } else {
+                    crate::engine::executor::select::describe_subquery_columns(db, derived).map(
+                        |columns| {
+                            let canonical = MetadataNamePolicy::from_columns(&columns);
+                            (
+                                columns.into_iter().map(|column| column.name).collect(),
+                                canonical,
+                            )
+                        },
+                    )
+                }
+            })?;
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5020,12 +5102,15 @@ fn scope_table_for_ref(
         });
     }
     if let Some(derived @ SubQuery::Rrf(_)) = derived {
-        let mut columns = crate::engine::executor::select::describe_subquery_columns(db, derived)?
+        let described = crate::engine::executor::select::describe_subquery_columns(db, derived)?;
+        let canonical_metadata_names = MetadataNamePolicy::from_columns(&described);
+        let mut columns = described
             .into_iter()
             .map(|column| column.name)
             .collect::<Vec<_>>();
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5050,6 +5135,7 @@ fn scope_table_for_ref(
         let mut columns = select_output_column_names(inner, &inner_scope)?;
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            canonical_metadata_names: inner_scope.projected_metadata_names(inner),
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5060,6 +5146,7 @@ fn scope_table_for_ref(
     if let Some(spec) = table.generate_series.as_deref() {
         let columns = generate_series_column_names(spec);
         return Ok(ScopeTable {
+            canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5068,8 +5155,10 @@ fn scope_table_for_ref(
         });
     }
     if let Some(PhysicalPlan::CteScan { columns, .. }) = try_plan_cte_scan(table) {
+        let canonical_metadata_names = MetadataNamePolicy::from_columns(&columns);
         let columns: Vec<String> = columns.into_iter().map(|column| column.name).collect();
         return Ok(ScopeTable {
+            canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5080,6 +5169,7 @@ fn scope_table_for_ref(
     if let Ok(columns) = crate::engine::information_schema::columns_for_table_name(&table.name) {
         let columns: Vec<String> = columns.into_iter().map(|column| column.name).collect();
         return Ok(ScopeTable {
+            canonical_metadata_names: MetadataNamePolicy::PublishedSpelling,
             name: crate::storage::split_table_name(crate::storage::DEFAULT_DATABASE, &table.name).1,
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5103,6 +5193,7 @@ fn scope_table_for_ref(
         addressable.push("ROWID".into());
     }
     Ok(ScopeTable {
+        canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
         name: schema.name.clone(),
         alias: table.alias.clone(),
         columns: addressable,
@@ -5202,11 +5293,11 @@ fn select_output_column_names(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                columns.push(
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| crate::engine::expr::expr_name(expr)),
-                );
+                columns.push(crate::engine::expr::result_column_name(
+                    expr,
+                    alias.as_deref(),
+                    scope.published_column_name(expr),
+                ));
             }
         }
     }
@@ -5239,6 +5330,87 @@ fn projection_aliases(select: &Select) -> HashSet<String> {
 }
 
 impl ColumnScope<'_> {
+    fn projected_metadata_names(&self, select: &Select) -> MetadataNamePolicy {
+        if !self
+            .tables
+            .iter()
+            .any(|table| table.canonical_metadata_names.any())
+        {
+            return MetadataNamePolicy::QuerySpelling;
+        }
+        let mut flags = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    for table in self.tables.iter().filter(|table| match item {
+                        SelectItem::QualifiedWildcard(qualifier) => table.matches_name(qualifier),
+                        _ => true,
+                    }) {
+                        for name in &table.wildcard_columns {
+                            flags.push(
+                                table
+                                    .columns
+                                    .iter()
+                                    .position(|column| column.eq_ignore_ascii_case(name))
+                                    .is_some_and(|index| table.canonical_metadata_names.at(index)),
+                            );
+                        }
+                    }
+                }
+                SelectItem::Expr { expr, .. } => {
+                    let mut reference = expr;
+                    while let Expr::GroupKeyRef { expr, .. } = reference {
+                        reference = expr;
+                    }
+                    flags.push(
+                        if matches!(reference, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                            self.published_column_name(expr).is_some()
+                        } else {
+                            true
+                        },
+                    );
+                }
+            }
+        }
+        MetadataNamePolicy::from_flags(flags)
+    }
+
+    fn published_column_name(&self, expr: &Expr) -> Option<&str> {
+        let (qualifier, name) = match expr {
+            Expr::Identifier(name) => (None, name.as_str()),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                Some(parts[parts.len() - 2].as_str()),
+                parts.last()?.as_str(),
+            ),
+            Expr::GroupKeyRef { expr, .. } => return self.published_column_name(expr),
+            _ => return None,
+        };
+        let mut columns = self
+            .tables
+            .iter()
+            .filter(|table| table.visible)
+            .filter(|table| qualifier.is_none_or(|q| table.matches_name(q)))
+            .flat_map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, column)| (column, table.canonical_metadata_names.at(index)))
+            })
+            .filter(|(column, _)| column.eq_ignore_ascii_case(name));
+        let first = columns.next();
+        if columns.next().is_some() {
+            return None;
+        }
+        match first {
+            Some((column, true)) => Some(column.as_str()),
+            Some((_, false)) => None,
+            None => self
+                .outer
+                .and_then(|outer| outer.published_column_name(expr)),
+        }
+    }
+
     fn resolve_qualifier(&self, qualifier: &str) -> Result<(), QueryError> {
         if self.matching_tables(qualifier).next().is_some() {
             return Ok(());
@@ -9551,7 +9723,13 @@ pub(crate) fn try_plan_cte_scan(table: &TableRef) -> Option<PhysicalPlan> {
 }
 
 fn try_plan_system_scan(table: &TableRef, filter: Option<Expr>) -> Option<PhysicalPlan> {
-    let columns = crate::engine::information_schema::columns_for_table_name(&table.name).ok()?;
+    let mut columns =
+        crate::engine::information_schema::columns_for_table_name(&table.name).ok()?;
+    if let Some(alias) = &table.alias {
+        for column in &mut columns {
+            column.source.table.clone_from(alias);
+        }
+    }
     let estimated_rows = 1_000.0;
     Some(PhysicalPlan::SystemScan {
         name: table.name.clone(),

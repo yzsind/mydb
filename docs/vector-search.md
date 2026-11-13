@@ -458,15 +458,15 @@ Inspect the persisted configuration and current runtime state:
 ```sql
 SHOW CREATE TABLE vector_documents;
 
-SELECT INDEX_NAME, ALGO, METRIC, QUANTIZATION, QUANTIZATION_STATE,
-       LOADED, RERANK_MULT, CANDIDATES_RETURNED, HEAP_RERANKS, EXACT_FALLBACKS
-FROM information_schema.mydb_vector_indexes
+SELECT INDEX_NAME, ALGORITHM, DISTANCE_METRIC, QUANTIZATION, QUANTIZATION_STATE,
+       IS_LOADED, RERANK_MULTIPLIER, CANDIDATES_RETURNED, HEAP_RERANKS, EXACT_FALLBACKS
+FROM information_schema.MYDB_VECTOR_INDEXES
 WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 'vector_documents';
 ```
 
 `SHOW CREATE TABLE` emits persisted `WITH` options. `QUANTIZATION_STATE` shows
 `READY` or `PENDING_TRAINING` for loaded quantized indexes; a cold index has
-`LOADED=0` and no runtime training state. Runtime counters describe loaded
+`IS_LOADED=0` and no runtime training state. Runtime counters describe loaded
 accelerators rather than durable lifetime totals. Candidate, heap re-ranking,
 and fallback counters are collected by quantized accelerators; zero values on
 an unquantized index do not imply that it has served no queries.
