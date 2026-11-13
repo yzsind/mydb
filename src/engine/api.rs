@@ -2791,7 +2791,7 @@ pub struct SessionSysVarState {
     /// `/*+ HNSW_EF(n) */` overrides this. Default 64.
     pub mydb_hnsw_ef_search: u64,
     /// `mydb_hnsw_ef_dynamic_factor` — multiplier that scales `ef_search`
-    /// with the user's `LIMIT k`. Set to 0 to disable scaling. Default 4.
+    /// with the user's `LIMIT k`. Set to 0 to disable scaling. Default 2.
     pub mydb_hnsw_ef_dynamic_factor: u64,
     /// `mydb_hnsw_iterative_scan` — filter-aware widening policy when a
     /// residual WHERE drops candidates below k:
@@ -2923,7 +2923,7 @@ impl Default for SessionSysVarState {
             // can scope an override with `crate::util::env::with_vars`.
             // The env names match the GUC table in CLAUDE.md.
             mydb_hnsw_ef_search: hnsw_env_u64("MYDB_HNSW_EF_SEARCH", 64),
-            mydb_hnsw_ef_dynamic_factor: hnsw_env_u64("MYDB_HNSW_EF_DYNAMIC_FACTOR", 4),
+            mydb_hnsw_ef_dynamic_factor: hnsw_env_u64("MYDB_HNSW_EF_DYNAMIC_FACTOR", 2),
             mydb_hnsw_iterative_scan: hnsw_env_iterative(),
             mydb_hnsw_ef_search_explicit: false,
             mydb_hnsw_max_scan_tuples: hnsw_env_u64("MYDB_HNSW_MAX_SCAN_TUPLES", 20_000),

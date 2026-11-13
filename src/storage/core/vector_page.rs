@@ -1083,6 +1083,86 @@ impl VectorIndexFile {
         .map(|_| ())
     }
 
+    /// [`Self::bulk_build_direct`] with page encoding fanned out over
+    /// `threads` workers. Node placement is computed first, so every worker
+    /// packs a disjoint run of whole pages exactly as the serial writer would
+    /// and the resulting file image is byte-identical.
+    pub(crate) fn bulk_build_direct_parallel<FT, FF>(
+        &self,
+        node_count: usize,
+        entry: Option<(u32, usize)>,
+        top_layer: FT,
+        fetch: FF,
+        threads: usize,
+    ) -> Result<(), QueryError>
+    where
+        FT: FnMut(usize) -> usize,
+        FF: Fn(usize, &mut Vec<f32>, &mut Vec<Vec<u32>>) -> Result<RowId, QueryError> + Sync,
+    {
+        let _mapping_write = self.navigation_write();
+        let layout = self.bulk_layout(node_count, top_layer, false)?;
+        self.bulk_reset_frames(false)?;
+        if node_count == 0 {
+            self.bulk_sync_empty(layout.last_page)?;
+            return self.bulk_publish(entry, &layout, node_count);
+        }
+        let nav_quant = self.persisted_nav_quant();
+        let pages = (layout.last_page + 1 - layout.first_page) as usize;
+        let chunks = pages.div_ceil(BULK_WRITE_BATCH_PAGES);
+        let threads = threads.clamp(1, chunks);
+        let file_guard = self.file.lock();
+        let file = file_guard.as_ref().ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector index file is closed during bulk build",
+            )
+        })?;
+        let cursor = std::sync::atomic::AtomicUsize::new(0);
+        let nav_exact_nodes = AtomicU64::new(0);
+        let (layout_ref, fetch_ref) = (&layout, &fetch);
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
+            let workers: Vec<_> = (0..threads)
+                .map(|_| {
+                    let (cursor, nav_exact_nodes) = (&cursor, &nav_exact_nodes);
+                    scope.spawn(move || -> Result<(), QueryError> {
+                        let mut packer = BulkPagePacker::new(self, file, nav_quant);
+                        loop {
+                            let chunk = cursor.fetch_add(1, Ordering::Relaxed);
+                            if chunk >= chunks {
+                                break;
+                            }
+                            let lo =
+                                layout_ref.first_page + (chunk * BULK_WRITE_BATCH_PAGES) as u64;
+                            let hi =
+                                (lo + BULK_WRITE_BATCH_PAGES as u64).min(layout_ref.last_page + 1);
+                            let first = layout_ref.vids.partition_point(|vid| vid_page(*vid) < lo);
+                            let last = layout_ref.vids.partition_point(|vid| vid_page(*vid) < hi);
+                            packer.pack_range(layout_ref, first..last, false, |id, v, _, l| {
+                                fetch_ref(id, v, l)
+                            })?;
+                            packer.flush()?;
+                        }
+                        nav_exact_nodes.fetch_add(packer.nav_exact_nodes, Ordering::Relaxed);
+                        Ok(())
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().map_err(|_| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "vector materialize worker panicked",
+                    )
+                })??;
+            }
+            Ok(())
+        })?;
+        self.bulk_sync_file(file, layout.last_page)?;
+        drop(file_guard);
+        self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes.into_inner();
+        self.bulk_publish(entry, &layout, node_count)
+    }
+
     /// Pack compressed native nodes and links once, preserving preceding model
     /// blobs and the same data-before-finalized-meta durability contract.
     pub(crate) fn bulk_build_native_direct<FT, FF>(
@@ -1105,33 +1185,20 @@ impl VectorIndexFile {
         )
     }
 
-    fn bulk_build_image<FT, FF>(
+    /// Assign every node its page/slot before any page is written.
+    fn bulk_layout<FT: FnMut(usize) -> usize>(
         &self,
         node_count: usize,
-        entry: Option<(u32, usize)>,
         mut top_layer: FT,
-        mut fetch: FF,
         native: bool,
-    ) -> Result<Vec<VecId>, QueryError>
-    where
-        FT: FnMut(usize) -> usize,
-        FF: FnMut(
-            usize,
-            &mut Vec<f32>,
-            &mut Vec<u8>,
-            &mut Vec<Vec<u32>>,
-        ) -> Result<RowId, QueryError>,
-    {
-        let _mapping_write = self.navigation_write();
+    ) -> Result<BulkLayout, QueryError> {
         if !self.supports_direct_bulk_build() {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "direct vector bulk build requires file-backed durability",
             ));
         }
-
         let (dim, m, m0) = (self.dim_fixed, self.m_fixed, self.m0_fixed);
-        let nav_quant = self.persisted_nav_quant();
         let usable = PAGE_SIZE - NODE_OFF_DIRECTORY;
         let mut vids = Vec::with_capacity(node_count);
         let mut levels = Vec::with_capacity(node_count);
@@ -1174,157 +1241,107 @@ impl VectorIndexFile {
         } else {
             page_id
         };
+        Ok(BulkLayout {
+            vids,
+            levels,
+            first_page,
+            last_page,
+        })
+    }
 
-        // No stale buffer frame may race a later cleaner flush over the direct
-        // image. The freshly opened meta page is reconstructed below.
+    /// No stale buffer frame may race a later cleaner flush over the direct
+    /// image. The freshly opened meta page is reconstructed by publication.
+    fn bulk_reset_frames(&self, native: bool) -> Result<(), QueryError> {
         self.build_mode.store(false, Ordering::Release);
         self.touched_pages.lock().clear();
         if native {
             self.buffer_pool.flush_file(&self.file_key)?;
         }
-        self.buffer_pool.discard_file(&self.file_key)?;
+        self.buffer_pool.discard_file(&self.file_key)
+    }
 
-        if node_count > 0 {
-            const WRITE_BATCH_PAGES: usize = 256; // 4 MiB sequential writes
-            let mut file_guard = self.file.lock();
-            let file = file_guard.as_mut().ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "vector index file is closed during bulk build",
-                )
-            })?;
-            let mut image = vec![0u8; PAGE_SIZE];
-            format_empty_node_page(&mut image);
-            let mut image_page = first_page;
-            let mut vector = Vec::new();
-            let mut payload = Vec::new();
-            let mut dense_neighbors: Vec<Vec<u32>> = Vec::new();
-            let mut mapped = Vec::<VecId>::with_capacity(m0.max(m));
-            let mut write_batch = Vec::with_capacity(WRITE_BATCH_PAGES * PAGE_SIZE);
-            let mut batch_first_page = first_page;
-            let mut nav_exact_nodes = 0u64;
-
-            let flush_page = |page: &mut Vec<u8>,
-                              page_no: u64,
-                              batch: &mut Vec<u8>,
-                              batch_first: &mut u64,
-                              file: &File|
-             -> Result<(), QueryError> {
-                refresh_page_checksum(page);
-                if batch.is_empty() {
-                    *batch_first = page_no;
-                }
-                batch.extend_from_slice(page);
-                if batch.len() >= WRITE_BATCH_PAGES * PAGE_SIZE {
-                    file.write_all_at(batch, *batch_first * PAGE_SIZE as u64)
-                        .map_err(io_err)?;
-                    batch.clear();
-                }
-                Ok(())
-            };
-
-            for id in 0..node_count {
-                let expected = vids[id];
-                let expected_page = vid_page(expected);
-                if expected_page != image_page {
-                    flush_page(
-                        &mut image,
-                        image_page,
-                        &mut write_batch,
-                        &mut batch_first_page,
-                        file,
-                    )?;
-                    image_page = expected_page;
-                    format_empty_node_page(&mut image);
-                }
-                let row_id = fetch(id, &mut vector, &mut payload, &mut dense_neighbors)?;
-                let actual_slot = if native {
-                    if payload.len() + 8 != vector_record_lanes(dim) {
-                        return Err(crate::engine::vector::persistence::corrupt());
-                    }
-                    node_page_append_native(
-                        &mut image, row_id, levels[id], &payload, id as u64, dim, m, m0,
-                    )
-                } else {
-                    nav_exact_nodes += u64::from(persisted_nav_is_exact(&vector, nav_quant));
-                    node_page_append(
-                        &mut image, row_id, levels[id], &vector, dim, m, m0, nav_quant,
-                    )
-                }
-                .ok_or_else(|| {
-                    error(
-                        crate::error::catalog::ER_GET_ERRNO,
-                        "vector bulk page packing mismatch",
-                    )
-                })?;
-                if actual_slot != vid_slot(expected) {
-                    return Err(error(
-                        crate::error::catalog::ER_GET_ERRNO,
-                        "vector bulk vid packing mismatch",
-                    ));
-                }
-                if native {
-                    let offset = node_record_offset(&image, actual_slot)?;
-                    image[offset] |= REC_FLAG_LINKED;
-                }
-                for (level, dense) in dense_neighbors.iter().enumerate() {
-                    mapped.clear();
-                    mapped.reserve(dense.len());
-                    for &neighbor in dense {
-                        let mapped_vid = vids.get(neighbor as usize).copied().ok_or_else(|| {
-                            error(
-                                crate::error::catalog::ER_GET_ERRNO,
-                                "vector bulk neighbour id out of range",
-                            )
-                        })?;
-                        mapped.push(mapped_vid);
-                    }
-                    node_page_set_neighbors(&mut image, actual_slot, level, &mapped, dim, m, m0)?;
-                }
-            }
-            flush_page(
-                &mut image,
-                image_page,
-                &mut write_batch,
-                &mut batch_first_page,
-                file,
-            )?;
-            if !write_batch.is_empty() {
-                file.write_all_at(&write_batch, batch_first_page * PAGE_SIZE as u64)
-                    .map_err(io_err)?;
-            }
-            file.set_len((last_page + 1) * PAGE_SIZE as u64)
-                .map_err(io_err)?;
-            file.flush().map_err(io_err)?;
-            if self.durability != DurabilityMode::Memory {
-                crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
-            }
-            self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes;
-        } else if let Some(file) = self.file.lock().as_mut() {
-            file.set_len((last_page + 1) * PAGE_SIZE as u64)
-                .map_err(io_err)?;
-            file.flush().map_err(io_err)?;
-            if self.durability != DurabilityMode::Memory {
-                crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
-            }
+    fn bulk_sync_file(&self, file: &File, last_page: u64) -> Result<(), QueryError> {
+        file.set_len((last_page + 1) * PAGE_SIZE as u64)
+            .map_err(io_err)?;
+        let mut writer = file;
+        writer.flush().map_err(io_err)?;
+        if self.durability != DurabilityMode::Memory {
+            crate::platform::fs::sync_file_data_at(file, &self.path).map_err(io_err)?;
         }
+        Ok(())
+    }
 
+    fn bulk_sync_empty(&self, last_page: u64) -> Result<(), QueryError> {
+        if let Some(file) = self.file.lock().as_ref() {
+            self.bulk_sync_file(file, last_page)?;
+        }
+        Ok(())
+    }
+
+    fn bulk_publish(
+        &self,
+        entry: Option<(u32, usize)>,
+        layout: &BulkLayout,
+        node_count: usize,
+    ) -> Result<(), QueryError> {
         {
             let mut state = self.meta_state.lock();
             state.meta.entry_vid = entry
-                .and_then(|(id, _)| vids.get(id as usize).copied())
+                .and_then(|(id, _)| layout.vids.get(id as usize).copied())
                 .unwrap_or(VEC_NO_VID);
             state.meta.max_layer = entry.map_or(0, |(_, level)| level as u32);
-            state.meta.node_next_page_id = last_page + 1;
+            state.meta.node_next_page_id = layout.last_page + 1;
             state.meta.node_count = node_count as u64;
             state.meta.tombstone_count = 0;
             state.meta.finalized = true;
             state.meta.built_lsn = self.log_atomics.next_lsn();
             state.pristine_pages.clear();
         }
-        self.append_hint.store(last_page, Ordering::Release);
-        self.write_meta_page(txn_id_for_ddl())?;
-        Ok(vids)
+        self.append_hint.store(layout.last_page, Ordering::Release);
+        self.write_meta_page(txn_id_for_ddl())
+    }
+
+    fn bulk_build_image<FT, FF>(
+        &self,
+        node_count: usize,
+        entry: Option<(u32, usize)>,
+        top_layer: FT,
+        mut fetch: FF,
+        native: bool,
+    ) -> Result<Vec<VecId>, QueryError>
+    where
+        FT: FnMut(usize) -> usize,
+        FF: FnMut(
+            usize,
+            &mut Vec<f32>,
+            &mut Vec<u8>,
+            &mut Vec<Vec<u32>>,
+        ) -> Result<RowId, QueryError>,
+    {
+        let _mapping_write = self.navigation_write();
+        let layout = self.bulk_layout(node_count, top_layer, native)?;
+        self.bulk_reset_frames(native)?;
+        if node_count > 0 {
+            let file_guard = self.file.lock();
+            let file = file_guard.as_ref().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "vector index file is closed during bulk build",
+                )
+            })?;
+            let mut packer = BulkPagePacker::new(self, file, self.persisted_nav_quant());
+            packer.pack_range(&layout, 0..node_count, native, &mut fetch)?;
+            packer.flush()?;
+            self.bulk_sync_file(file, layout.last_page)?;
+            let nav_exact_nodes = packer.nav_exact_nodes;
+            drop(packer);
+            drop(file_guard);
+            self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes;
+        } else {
+            self.bulk_sync_empty(layout.last_page)?;
+        }
+        self.bulk_publish(entry, &layout, node_count)?;
+        Ok(layout.vids)
     }
 
     #[allow(private_interfaces)]
@@ -2896,6 +2913,11 @@ impl VectorIndexFile {
         self.build_mode.store(true, Ordering::Release);
     }
 
+    /// Whether a cold bulk build currently owns this file.
+    pub(crate) fn in_bulk_build(&self) -> bool {
+        self.build_mode.load(Ordering::Acquire)
+    }
+
     /// Leave bulk-build mode and publish the graph. Node pages are build-local
     /// derived data until the meta page says `finalized = true`, so the fast
     /// path writes them directly to the `.hvec` file (and fsyncs in strict
@@ -3139,9 +3161,272 @@ impl VectorIndexFile {
     }
 }
 
+/// Pages per sequential bulk write (4 MiB).
+const BULK_WRITE_BATCH_PAGES: usize = 256;
+
+/// Precomputed placement of a bulk-built node image.
+struct BulkLayout {
+    vids: Vec<VecId>,
+    levels: Vec<usize>,
+    first_page: u64,
+    last_page: u64,
+}
+
+/// Packs contiguous node ranges into checksummed pages and batches them into
+/// sequential positional writes. One packer per writer thread.
+struct BulkPagePacker<'a> {
+    file: &'a VectorIndexFile,
+    out: &'a File,
+    nav_quant: PersistedNavQuant,
+    image: Vec<u8>,
+    /// Page currently being filled in `image` (0 = none).
+    image_page: u64,
+    batch: Vec<u8>,
+    batch_first_page: u64,
+    vector: Vec<f32>,
+    payload: Vec<u8>,
+    dense_neighbors: Vec<Vec<u32>>,
+    mapped: Vec<VecId>,
+    nav_exact_nodes: u64,
+}
+
+impl<'a> BulkPagePacker<'a> {
+    fn new(file: &'a VectorIndexFile, out: &'a File, nav_quant: PersistedNavQuant) -> Self {
+        Self {
+            file,
+            out,
+            nav_quant,
+            image: vec![0u8; PAGE_SIZE],
+            image_page: 0,
+            batch: Vec::with_capacity(BULK_WRITE_BATCH_PAGES * PAGE_SIZE),
+            batch_first_page: 0,
+            vector: Vec::new(),
+            payload: Vec::new(),
+            dense_neighbors: Vec::new(),
+            mapped: Vec::with_capacity(file.m0_fixed.max(file.m_fixed)),
+            nav_exact_nodes: 0,
+        }
+    }
+
+    /// Append node ids `range` (covering whole pages) to the pending batch.
+    fn pack_range<FF>(
+        &mut self,
+        layout: &BulkLayout,
+        range: std::ops::Range<usize>,
+        native: bool,
+        mut fetch: FF,
+    ) -> Result<(), QueryError>
+    where
+        FF: FnMut(
+            usize,
+            &mut Vec<f32>,
+            &mut Vec<u8>,
+            &mut Vec<Vec<u32>>,
+        ) -> Result<RowId, QueryError>,
+    {
+        let (dim, m, m0) = (self.file.dim_fixed, self.file.m_fixed, self.file.m0_fixed);
+        for id in range {
+            let expected = layout.vids[id];
+            let expected_page = vid_page(expected);
+            if expected_page != self.image_page {
+                self.finish_page()?;
+                self.image_page = expected_page;
+                format_empty_node_page(&mut self.image);
+            }
+            let row_id = fetch(
+                id,
+                &mut self.vector,
+                &mut self.payload,
+                &mut self.dense_neighbors,
+            )?;
+            let actual_slot = if native {
+                if self.payload.len() + 8 != vector_record_lanes(dim) {
+                    return Err(crate::engine::vector::persistence::corrupt());
+                }
+                node_page_append_native(
+                    &mut self.image,
+                    row_id,
+                    layout.levels[id],
+                    &self.payload,
+                    id as u64,
+                    dim,
+                    m,
+                    m0,
+                )
+            } else {
+                self.nav_exact_nodes +=
+                    u64::from(persisted_nav_is_exact(&self.vector, self.nav_quant));
+                node_page_append(
+                    &mut self.image,
+                    row_id,
+                    layout.levels[id],
+                    &self.vector,
+                    dim,
+                    m,
+                    m0,
+                    self.nav_quant,
+                )
+            }
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "vector bulk page packing mismatch",
+                )
+            })?;
+            if actual_slot != vid_slot(expected) {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "vector bulk vid packing mismatch",
+                ));
+            }
+            if native {
+                let offset = node_record_offset(&self.image, actual_slot)?;
+                self.image[offset] |= REC_FLAG_LINKED;
+            }
+            for (level, dense) in self.dense_neighbors.iter().enumerate() {
+                self.mapped.clear();
+                self.mapped.reserve(dense.len());
+                for &neighbor in dense {
+                    let mapped_vid = layout.vids.get(neighbor as usize).copied().ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "vector bulk neighbour id out of range",
+                        )
+                    })?;
+                    self.mapped.push(mapped_vid);
+                }
+                node_page_set_neighbors(
+                    &mut self.image,
+                    actual_slot,
+                    level,
+                    &self.mapped,
+                    dim,
+                    m,
+                    m0,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Checksum the open page into the pending batch; batches of
+    /// [`BULK_WRITE_BATCH_PAGES`] are written as soon as they fill.
+    fn finish_page(&mut self) -> Result<(), QueryError> {
+        if self.image_page == 0 {
+            return Ok(());
+        }
+        refresh_page_checksum(&mut self.image);
+        if self.batch.is_empty() {
+            self.batch_first_page = self.image_page;
+        }
+        debug_assert_eq!(
+            self.batch_first_page + (self.batch.len() / PAGE_SIZE) as u64,
+            self.image_page
+        );
+        self.batch.extend_from_slice(&self.image);
+        self.image_page = 0;
+        if self.batch.len() >= BULK_WRITE_BATCH_PAGES * PAGE_SIZE {
+            self.write_batch()?;
+        }
+        Ok(())
+    }
+
+    fn write_batch(&mut self) -> Result<(), QueryError> {
+        if !self.batch.is_empty() {
+            let offset = self.batch_first_page * PAGE_SIZE as u64;
+            self.out
+                .write_all_at(&self.batch, offset)
+                .map_err(io_err)?;
+            // Overlap device writeback with packing the next batch; the
+            // final data sync remains the durability barrier.
+            if self.file.durability != DurabilityMode::Memory {
+                crate::util::file::start_file_writeback(self.out, offset, self.batch.len())
+                    .map_err(io_err)?;
+            }
+            self.batch.clear();
+        }
+        Ok(())
+    }
+
+    /// Write every finished page, including the open one, at its offset.
+    fn flush(&mut self) -> Result<(), QueryError> {
+        self.finish_page()?;
+        self.write_batch()
+    }
+}
+
 #[cfg(test)]
 mod vector_page_tests {
     use super::*;
+
+    fn bulk_test_file(dir: &std::path::Path, dim: u32) -> VectorIndexFile {
+        let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir).unwrap()));
+        let pool = BufferPool::new_with_options(
+            128,
+            log.clone(),
+            DurabilityMode::Strict,
+            std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+            1,
+            0,
+        );
+        VectorIndexFile::open_with_durability(
+            dir.join("bulk.hvec"),
+            log,
+            DurabilityMode::Strict,
+            pool,
+            dim,
+            1,
+            4,
+            8,
+            32,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn parallel_bulk_image_is_byte_identical_to_serial() {
+        // 256-d records pack ~12 per page, so 7,000 nodes span several
+        // 256-page write chunks and exercise chunk boundaries.
+        const DIM: usize = 256;
+        const NODES: usize = 7_000;
+        let level = |id: usize| [0usize, 0, 0, 1, 0, 2, 0, 0][id % 8];
+        let fetch = |id: usize, vector: &mut Vec<f32>, links: &mut Vec<Vec<u32>>| {
+            vector.clear();
+            vector.extend((0..DIM).map(|i| ((id * 31 + i * 7) % 113) as f32 / 7.0 - 8.0));
+            links.clear();
+            for layer in 0..=level(id) {
+                let cap = if layer == 0 { 8 } else { 4 };
+                links.push(
+                    (1..=cap)
+                        .map(|k| ((id + k * 97 + layer) % NODES) as u32)
+                        .collect(),
+                );
+            }
+            Ok(RowId::new(id as u32 + 1, (id % 7) as u16))
+        };
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let (a, b) = (
+            tempfile::tempdir_in("/tmp/mydb").unwrap(),
+            tempfile::tempdir_in("/tmp/mydb").unwrap(),
+        );
+        let serial = bulk_test_file(a.path(), DIM as u32);
+        let parallel = bulk_test_file(b.path(), DIM as u32);
+        serial
+            .bulk_build_direct(NODES, Some((5, 2)), level, fetch)
+            .unwrap();
+        parallel
+            .bulk_build_direct_parallel(NODES, Some((5, 2)), level, fetch, 7)
+            .unwrap();
+        assert_eq!(serial.meta().node_next_page_id, parallel.meta().node_next_page_id);
+        assert!(serial.meta().node_next_page_id > 2 * BULK_WRITE_BATCH_PAGES as u64);
+        assert_eq!(serial.meta().entry_vid, parallel.meta().entry_vid);
+        assert_eq!(serial.meta().nav_exact_nodes, parallel.meta().nav_exact_nodes);
+        let left = std::fs::read(a.path().join("bulk.hvec")).unwrap();
+        let right = std::fs::read(b.path().join("bulk.hvec")).unwrap();
+        assert_eq!(left.len(), right.len());
+        // The meta page carries per-file identity; node pages must match.
+        assert!(left[PAGE_SIZE..] == right[PAGE_SIZE..]);
+    }
 
     fn no_nav_quant() -> PersistedNavQuant {
         PersistedNavQuant {

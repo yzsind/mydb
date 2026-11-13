@@ -1850,21 +1850,22 @@ impl Database {
         // allocation and governor reservation capacity-based.
         let stats_started = Instant::now();
         let mut stats = CompactHnswStats::new(metric);
-        self.scan_hnsw_build_rows(
+        for part in self.scan_hnsw_build_rows_parallel(
             table,
-            storage_id,
             txn,
+            storage_id,
             cols,
-            0,
-            u64::MAX,
-            |_row_id, values| {
+            threads,
+            || CompactHnswStats::new(metric),
+            |part, _row_id, values| {
                 if let Some(Value::Vector(bytes)) = values.first() {
-                    stats.observe(&vector::to_f32(bytes));
+                    part.observe(&vector::to_f32(bytes));
                 }
-
-                Ok(false)
+                Ok(())
             },
-        )?;
+        )? {
+            stats.merge(part);
+        }
         if stats.rows() == 0 {
             paged.finalize_bulk_build()?;
             paged.record_build_stats(HnswBuildStats {
@@ -2050,7 +2051,7 @@ impl Database {
                 crate::engine::cancel::check_cancelled()?;
                 build_stats.link_ms = link_started.elapsed().as_millis() as u64;
                 let materialize_started = Instant::now();
-                paged.materialize_memory_graph(&graph)?;
+                paged.materialize_memory_graph(&graph, threads)?;
                 build_stats.materialize_ms = materialize_started.elapsed().as_millis() as u64;
                 drop(graph);
             }
@@ -2119,6 +2120,9 @@ impl Database {
         // it only after releasing the larger construction reservation so
         // CREATE INDEX does not transiently double-charge both workspaces.
         drop(lease.take());
+        if stats.quantization_params().is_none() {
+            paged.note_navigation_calibration_infeasible();
+        }
         paged.refresh_query_navigation()?;
         build_stats.total_ms = total_started.elapsed().as_millis() as u64;
         if timing {
@@ -2476,6 +2480,84 @@ impl Database {
     /// heap into disjoint `[page_lo, page_hi)` ranges across `threads` workers —
     /// disjoint ranges mean no row is decoded twice, and `with_heap_read` is a
     /// shared `RwLock` so workers don't serialise on the heap.
+    /// Partition the heap into contiguous page ranges and visit each range on
+    /// its own worker with a private state. States return in page order, so a
+    /// caller's merge is deterministic for a given worker count.
+    fn scan_hnsw_build_rows_parallel<S: Send>(
+        &self,
+        table: &TableSchema,
+        txn: TxnView,
+        storage_id: u64,
+        cols: &[usize],
+        threads: usize,
+        init: impl Fn() -> S + Sync,
+        visit: impl Fn(&mut S, RowId, &[Value]) -> Result<(), QueryError> + Sync,
+    ) -> Result<Vec<S>, QueryError> {
+        let page_count = self.with_heap_read(storage_id, |heap| heap.page_count())?;
+        let min_pages = hnsw_build_min_pages_per_worker();
+        let max_by_pages = (page_count / min_pages).max(1) as usize;
+        let effective = threads.min(max_by_pages).max(1);
+        if effective <= 1 || page_count == 0 {
+            let mut state = init();
+            self.scan_hnsw_build_rows(
+                table,
+                storage_id,
+                txn,
+                cols,
+                0,
+                u64::MAX,
+                |row_id, values| {
+                    visit(&mut state, row_id, values)?;
+                    Ok(false)
+                },
+            )?;
+            return Ok(vec![state]);
+        }
+        let chunk = page_count.div_ceil(effective as u64);
+        crate::util::thread_spawn::scope(|scope| -> Result<Vec<S>, QueryError> {
+            let mut handles = Vec::with_capacity(effective);
+            let mut lo = 0u64;
+            while lo < page_count {
+                // The final range is open-ended so rows appended to the last
+                // page range are still visited exactly as the serial scan does.
+                let hi = if lo + chunk >= page_count {
+                    u64::MAX
+                } else {
+                    lo + chunk
+                };
+                let (init, visit) = (&init, &visit);
+                handles.push(scope.spawn(move || -> Result<S, QueryError> {
+                    let mut state = init();
+                    self.scan_hnsw_build_rows(
+                        table,
+                        storage_id,
+                        txn,
+                        cols,
+                        lo,
+                        hi,
+                        |row_id, values| {
+                            visit(&mut state, row_id, values)?;
+                            Ok(false)
+                        },
+                    )?;
+                    Ok(state)
+                }));
+                lo = hi.min(page_count);
+            }
+            handles
+                .into_iter()
+                .map(|h| {
+                    h.join().map_err(|_| {
+                        error(
+                            crate::error::catalog::ER_GET_ERRNO,
+                            "hnsw build worker panicked",
+                        )
+                    })?
+                })
+                .collect()
+        })
+    }
+
     fn vector_graph_append_from_heap(
         &self,
         table: &TableSchema,
@@ -2485,69 +2567,21 @@ impl Database {
         graph: &HnswIndex,
         threads: usize,
     ) -> Result<(), QueryError> {
-        let page_count = self.with_heap_read(storage_id, |heap| heap.page_count())?;
-        if page_count == 0 {
-            return Ok(());
-        }
-        let min_pages = hnsw_build_min_pages_per_worker();
-        let max_by_pages = (page_count / min_pages).max(1) as usize;
-        let effective = threads.min(max_by_pages).max(1);
-        if effective <= 1 {
-            return self.scan_hnsw_build_rows(
-                table,
-                storage_id,
-                txn,
-                cols,
-                0,
-                u64::MAX,
-                |row_id, values| {
-                    if let Some(Value::Vector(bytes)) = values.first() {
-                        graph.append_node(row_id, vector::to_f32(bytes))?;
-                    }
-
-                    Ok(false)
-                },
-            );
-        }
-
-        let chunk = page_count.div_ceil(effective as u64);
-        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
-            let mut handles = Vec::with_capacity(effective);
-            let mut lo = 0u64;
-            while lo < page_count {
-                let hi = (lo + chunk).min(page_count);
-                let cols_ref = cols;
-                let graph_ref = graph;
-                let h = scope.spawn(move || -> Result<(), QueryError> {
-                    self.scan_hnsw_build_rows(
-                        table,
-                        storage_id,
-                        txn,
-                        cols_ref,
-                        lo,
-                        hi,
-                        |row_id, values| {
-                            if let Some(Value::Vector(bytes)) = values.first() {
-                                graph_ref.append_node(row_id, vector::to_f32(bytes))?;
-                            }
-
-                            Ok(false)
-                        },
-                    )
-                });
-                handles.push(h);
-                lo = hi;
-            }
-            for h in handles {
-                h.join().map_err(|_| {
-                    error(
-                        crate::error::catalog::ER_GET_ERRNO,
-                        "hnsw build worker panicked",
-                    )
-                })??;
-            }
-            Ok(())
-        })
+        self.scan_hnsw_build_rows_parallel(
+            table,
+            txn,
+            storage_id,
+            cols,
+            threads,
+            || (),
+            |_, row_id, values| {
+                if let Some(Value::Vector(bytes)) = values.first() {
+                    graph.append_node(row_id, vector::to_f32(bytes))?;
+                }
+                Ok(())
+            },
+        )?;
+        Ok(())
     }
 
     /// Compare heap vectors with snapshot nodes and re-link only changes;

@@ -457,7 +457,7 @@ pub(crate) fn cosine_norm_squared(vector: &[f32]) -> f32 {
 #[inline]
 pub(crate) fn cosine_with_norms(a: &[f32], b: &[f32], na: f32, nb: f32) -> f64 {
     if na.is_normal() && nb.is_normal() {
-        let dot = unsafe { dot_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len())) };
+        let dot = unsafe { edge_dot_ptr(a.as_ptr(), b.as_ptr(), a.len().min(b.len())) };
         if dot.is_finite() {
             return (1.0 - finish_cosine(dot, na, nb)) as f64;
         }
@@ -1490,6 +1490,181 @@ unsafe fn cosine_dot_norm_batch4_ptr(
     std::array::from_fn(|j| cosine_dot_norm_ptr(query, rows[j], n))
 }
 
+/// Throughput-oriented dot product for ANN edge geometry (graph
+/// construction only). Independent accumulators hide FMA latency; the result
+/// may differ from [`dot_ptr`] in reduction order, never in exceptional-value
+/// handling, which callers check on the returned sum.
+///
+/// # Safety
+/// See [`l2_sq_ptr`].
+#[inline]
+unsafe fn edge_dot_ptr(pa: *const f32, pb: *const f32, n: usize) -> f32 {
+    #[cfg(target_arch = "x86_64")]
+    {
+        if std::is_x86_feature_detected!("avx512f") {
+            return edge_dot_avx512(pa, pb, n);
+        }
+        if std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("fma") {
+            return edge_dot_avx2(pa, pb, n);
+        }
+    }
+    dot_ptr(pa, pb, n)
+}
+
+/// Cosine edge geometry for four rows against one query. Each row uses the
+/// same reduction as [`cosine_with_norms`], so results are bit-identical to
+/// four single calls; AVX-512 interleaves the rows to overlap their misses.
+pub(crate) fn cosine_with_norms_batch4(
+    query: &[f32],
+    rows: [&[f32]; 4],
+    query_norm: f32,
+    row_norms: [f32; 4],
+) -> [f64; 4] {
+    let n = query.len();
+    if query_norm.is_normal()
+        && rows.iter().all(|row| row.len() == n)
+        && row_norms.iter().all(|norm| norm.is_normal())
+    {
+        let dots = unsafe { edge_dot_batch4_ptr(query.as_ptr(), rows.map(<[f32]>::as_ptr), n) };
+        if dots.iter().all(|dot| dot.is_finite()) {
+            return std::array::from_fn(|j| {
+                (1.0 - finish_cosine(dots[j], query_norm, row_norms[j])) as f64
+            });
+        }
+    }
+    std::array::from_fn(|j| cosine_with_norms(query, rows[j], query_norm, row_norms[j]))
+}
+
+/// # Safety
+/// The query and every row must be valid for `n` consecutive `f32` reads.
+#[inline]
+unsafe fn edge_dot_batch4_ptr(query: *const f32, rows: [*const f32; 4], n: usize) -> [f32; 4] {
+    #[cfg(target_arch = "x86_64")]
+    if std::is_x86_feature_detected!("avx512f") {
+        return edge_dot_batch4_avx512(query, rows, n);
+    }
+    rows.map(|row| edge_dot_ptr(query, row, n))
+}
+
+/// Four rows of [`edge_dot_avx512`], each with its own unchanged accumulator
+/// set and reduction order.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn edge_dot_batch4_avx512(query: *const f32, rows: [*const f32; 4], n: usize) -> [f32; 4] {
+    use std::arch::x86_64::*;
+    let mut acc = [[_mm512_setzero_ps(); 4]; 4];
+    let mut i = 0usize;
+    while i + 64 <= n {
+        let q = [
+            _mm512_loadu_ps(query.add(i)),
+            _mm512_loadu_ps(query.add(i + 16)),
+            _mm512_loadu_ps(query.add(i + 32)),
+            _mm512_loadu_ps(query.add(i + 48)),
+        ];
+        for (row, sums) in rows.iter().zip(acc.iter_mut()) {
+            for (lane, sum) in sums.iter_mut().enumerate() {
+                *sum = _mm512_fmadd_ps(q[lane], _mm512_loadu_ps(row.add(i + lane * 16)), *sum);
+            }
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        let q = _mm512_loadu_ps(query.add(i));
+        for (row, sums) in rows.iter().zip(acc.iter_mut()) {
+            sums[0] = _mm512_fmadd_ps(q, _mm512_loadu_ps(row.add(i)), sums[0]);
+        }
+        i += 16;
+    }
+    if i < n {
+        let mask: __mmask16 = (1u32 << (n - i)) as u16 - 1;
+        let q = _mm512_maskz_loadu_ps(mask, query.add(i));
+        for (row, sums) in rows.iter().zip(acc.iter_mut()) {
+            sums[1] = _mm512_fmadd_ps(q, _mm512_maskz_loadu_ps(mask, row.add(i)), sums[1]);
+        }
+    }
+    acc.map(|sums| {
+        _mm512_reduce_add_ps(_mm512_add_ps(
+            _mm512_add_ps(sums[0], sums[1]),
+            _mm512_add_ps(sums[2], sums[3]),
+        ))
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn edge_dot_avx512(pa: *const f32, pb: *const f32, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = [_mm512_setzero_ps(); 4];
+    let mut i = 0usize;
+    while i + 64 <= n {
+        for (lane, sum) in acc.iter_mut().enumerate() {
+            let offset = i + lane * 16;
+            *sum = _mm512_fmadd_ps(
+                _mm512_loadu_ps(pa.add(offset)),
+                _mm512_loadu_ps(pb.add(offset)),
+                *sum,
+            );
+        }
+        i += 64;
+    }
+    while i + 16 <= n {
+        acc[0] = _mm512_fmadd_ps(
+            _mm512_loadu_ps(pa.add(i)),
+            _mm512_loadu_ps(pb.add(i)),
+            acc[0],
+        );
+        i += 16;
+    }
+    if i < n {
+        let mask: __mmask16 = (1u32 << (n - i)) as u16 - 1;
+        acc[1] = _mm512_fmadd_ps(
+            _mm512_maskz_loadu_ps(mask, pa.add(i)),
+            _mm512_maskz_loadu_ps(mask, pb.add(i)),
+            acc[1],
+        );
+    }
+    _mm512_reduce_add_ps(_mm512_add_ps(
+        _mm512_add_ps(acc[0], acc[1]),
+        _mm512_add_ps(acc[2], acc[3]),
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2,fma")]
+unsafe fn edge_dot_avx2(pa: *const f32, pb: *const f32, n: usize) -> f32 {
+    use std::arch::x86_64::*;
+    let mut acc = [_mm256_setzero_ps(); 4];
+    let mut i = 0usize;
+    while i + 32 <= n {
+        for (lane, sum) in acc.iter_mut().enumerate() {
+            let offset = i + lane * 8;
+            *sum = _mm256_fmadd_ps(
+                _mm256_loadu_ps(pa.add(offset)),
+                _mm256_loadu_ps(pb.add(offset)),
+                *sum,
+            );
+        }
+        i += 32;
+    }
+    while i + 8 <= n {
+        acc[0] = _mm256_fmadd_ps(
+            _mm256_loadu_ps(pa.add(i)),
+            _mm256_loadu_ps(pb.add(i)),
+            acc[0],
+        );
+        i += 8;
+    }
+    let mut sum = hsum256(_mm256_add_ps(
+        _mm256_add_ps(acc[0], acc[1]),
+        _mm256_add_ps(acc[2], acc[3]),
+    ));
+    while i < n {
+        sum += read_unaligned(pa.add(i)) * read_unaligned(pb.add(i));
+        i += 1;
+    }
+    sum
+}
+
 // ── Scalar reference kernels (correctness oracle + portable fallback) ───────
 
 #[allow(dead_code)]
@@ -2001,6 +2176,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn edge_dot_matches_wide_reference_for_every_tail_length() {
+        for n in [0, 1, 7, 15, 16, 17, 31, 63, 64, 65, 127, 768, 769, 1536] {
+            let a: Vec<f32> = (0..n)
+                .map(|i| ((i * 37 % 101) as f32 - 50.0) / 13.0)
+                .collect();
+            let b: Vec<f32> = (0..n)
+                .map(|i| ((i * 53 % 97) as f32 - 48.0) / 11.0)
+                .collect();
+            let wide: f64 = a.iter().zip(&b).map(|(x, y)| *x as f64 * *y as f64).sum();
+            let scale: f64 = a
+                .iter()
+                .zip(&b)
+                .map(|(x, y)| (*x as f64 * *y as f64).abs())
+                .sum();
+            let actual = unsafe { edge_dot_ptr(a.as_ptr(), b.as_ptr(), n) } as f64;
+            assert!(
+                (actual - wide).abs() <= scale * 4.0 * f32::EPSILON as f64 + f64::MIN_POSITIVE,
+                "n={n}: {actual} vs {wide}"
+            );
+        }
+    }
+
+    #[test]
+    fn cosine_batch4_matches_single_edge_geometry_bitwise() {
+        for n in [1, 15, 16, 17, 63, 64, 65, 768, 1536] {
+            let row = |seed: usize| -> Vec<f32> {
+                (0..n)
+                    .map(|i| ((i * seed + 7) % 89) as f32 / 9.0 - 4.5)
+                    .collect()
+            };
+            let query = row(31);
+            let rows = [row(13), row(17), row(19), row(23)];
+            let norms = rows.clone().map(|r| cosine_norm_squared(&r));
+            let qn = cosine_norm_squared(&query);
+            let batch = cosine_with_norms_batch4(
+                &query,
+                [&rows[0], &rows[1], &rows[2], &rows[3]],
+                qn,
+                norms,
+            );
+            for j in 0..4 {
+                let single = cosine_with_norms(&query, &rows[j], qn, norms[j]);
+                assert_eq!(batch[j].to_bits(), single.to_bits(), "n={n} row={j}");
+            }
+        }
+        // Exceptional norms keep the per-row fallback.
+        let zero = vec![0.0f32; 8];
+        let one = vec![1.0f32; 8];
+        let batch =
+            cosine_with_norms_batch4(&one, [&zero, &one, &one, &one], 8.0, [0.0, 8.0, 8.0, 8.0]);
+        assert_eq!(
+            batch[1].to_bits(),
+            cosine_with_norms(&one, &one, 8.0, 8.0).to_bits()
+        );
+        assert_eq!(
+            batch[0].to_bits(),
+            cosine_with_norms(&one, &zero, 8.0, 0.0).to_bits()
+        );
     }
 
     #[test]

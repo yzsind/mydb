@@ -63,7 +63,7 @@ impl Default for HnswSessionConfig {
         Self {
             ef_search: super::DEFAULT_EF_SEARCH as u64,
             ef_search_explicit: false,
-            ef_dynamic_factor: 4,
+            ef_dynamic_factor: 2,
             iterative_scan: IterativeScan::StrictOrder,
             max_scan_tuples: 20_000,
             brute_threshold: 10_000,

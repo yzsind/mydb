@@ -301,33 +301,86 @@ impl Database {
     }
 
     fn log_vector_initial_image(&self, path: &Path) -> Result<u64, QueryError> {
-        let mut file = fs::File::open(path).map_err(io_err)?;
+        // Chunks are read and pre-encoded (copy + checksum) by one producer
+        // while this thread appends the previous chunk, so only the ordered
+        // WAL write stays serial. A bounded queue caps resident chunks.
+        const CHUNK: usize = 1024 * 1024;
+        const QUEUED: usize = 2;
+        let file = crate::platform::file::OpenOptions::new()
+            .read(true)
+            .open(path)
+            .map_err(io_err)?;
         let total = file.metadata().map_err(io_err)?.len();
         if total == 0 {
             return Err(vector::persistence::corrupt());
         }
+        // Producer, queue and appender each hold at most one raw chunk and
+        // its encoded frame.
         let _charge =
             crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
                 crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
-                2 * 1024 * 1024 + 1024,
+                (QUEUED + 2) * 2 * (CHUNK + 1024),
             )?;
-        let mut bytes = vec![0; 1024 * 1024];
-        let mut offset = 0;
+        self.ensure_writable()?;
+        let relative = self.relative_path(path);
         let mut last = 0;
-        while offset < total {
-            let count = (total - offset).min(bytes.len() as u64) as usize;
-            file.read_exact(&mut bytes[..count]).map_err(io_err)?;
-            last = self.append_wal(
-                0,
-                WalPayload::VectorIndexImage {
-                    path: self.relative_path(path),
-                    offset,
-                    total,
-                    bytes: bytes[..count].to_vec(),
-                },
-            )?;
-            offset += count as u64;
-        }
+        crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
+            let (sender, receiver) =
+                std::sync::mpsc::sync_channel::<Result<crate::wal::PreEncodedRecord, QueryError>>(
+                    QUEUED,
+                );
+            let (file, relative) = (&file, &relative);
+            let producer = scope.spawn(move || {
+                let mut offset = 0u64;
+                while offset < total {
+                    let count = (total - offset).min(CHUNK as u64) as usize;
+                    let mut bytes = vec![0; count];
+                    let record = crate::util::file::read_exact_at_counted(
+                        file,
+                        &mut bytes,
+                        offset,
+                        true,
+                        Some("vector index image shrank while logging"),
+                    )
+                    .map_err(io_err)
+                    .and_then(|_| {
+                        crate::wal::LogManager::pre_encode_record(
+                            0,
+                            WalPayload::VectorIndexImage {
+                                path: relative.clone(),
+                                offset,
+                                total,
+                                bytes,
+                            },
+                        )
+                    });
+                    let failed = record.is_err();
+                    if sender.send(record).is_err() || failed {
+                        return;
+                    }
+                    offset += count as u64;
+                }
+            });
+            let mut appended = Ok(());
+            for record in receiver {
+                match record.and_then(|pre| {
+                    crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
+                }) {
+                    Ok(lsn) => last = lsn,
+                    Err(err) => {
+                        appended = Err(err);
+                        break;
+                    }
+                }
+            }
+            producer.join().map_err(|_| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "vector image logging worker panicked",
+                )
+            })?;
+            appended
+        })?;
         crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         persist_vector_image_receipt(path, last)?;
         Ok(last)

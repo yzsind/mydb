@@ -301,13 +301,13 @@ impl BulkHnsw {
             .store(neighbors.len() as u16, Ordering::Relaxed);
     }
     fn select(&self, ranked: &[Scored<u32>], maximum: usize) -> Vec<u32> {
-        select_diverse_ties(ranked, maximum, true, |a, b| {
+        let mut selected = select_diverse_ties(ranked, maximum, true, |a, b| {
             Ok::<_, std::convert::Infallible>(self.distance(a, b))
         })
-        .unwrap()
-        .into_iter()
-        .map(|candidate| candidate.id)
-        .collect()
+        .unwrap();
+        // Keep pruned connections, as the in-memory builder does.
+        super::hnsw_core::fill_pruned(&mut selected, ranked, maximum, |s| s.id);
+        selected.into_iter().map(|candidate| candidate.id).collect()
     }
     fn prune(&self, id: u32, neighbors: &[u32], maximum: usize) -> Vec<u32> {
         let mut ranked: Vec<_> = neighbors
