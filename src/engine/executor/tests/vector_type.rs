@@ -1821,7 +1821,8 @@ fn cosine_hnsw_parallel_registry_scan_covers_rows_and_rejects_zero_vectors() {
     engine
         .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap();
-    let probe = format!(
+    let probe =
+        format!(
         "SELECT id FROM items ORDER BY DISTANCE(emb, STRING_TO_VECTOR('[{}]'), 'COSINE') LIMIT 1",
         vectors[123].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
     );
@@ -1836,7 +1837,8 @@ fn cosine_hnsw_parallel_registry_scan_covers_rows_and_rejects_zero_vectors() {
         .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
         .unwrap_err();
     assert!(
-        err.message().contains("COSINE indexes reject existing zero vectors"),
+        err.message()
+            .contains("COSINE indexes reject existing zero vectors"),
         "{err:?}"
     );
 }

@@ -2186,7 +2186,8 @@ impl HnswIndex {
             self.frozen_row(id(3))?,
         ];
         // SAFETY: see `FrozenRows`.
-        let slices = rows.map(|row| unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) });
+        let slices =
+            rows.map(|row| unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) });
         Some(super::distance::cosine_with_norms_batch4(
             probe.query,
             slices,
@@ -3280,7 +3281,11 @@ impl HnswIndex {
                 // ran. Incremental inserts (`cap_mult == 1`, no build aux) keep
                 // the m fanout: filling m0 on birth doubles DML maintenance.
                 let cold_build = cap_mult > 1 || aux.is_some();
-                let forward_m = if lc == 0 && cold_build { m_layer } else { self.m };
+                let forward_m = if lc == 0 && cold_build {
+                    m_layer
+                } else {
+                    self.m
+                };
                 let selected = self.select_neighbors(&ranked, forward_m, select_arena, cold_build);
                 for s in &selected {
                     let nb = s.id;
@@ -4278,7 +4283,11 @@ mod tests {
     #[test]
     fn compact_stats_merge_matches_serial_observation() {
         let rows: Vec<Vec<f32>> = (0..997)
-            .map(|r| (0..24).map(|i| ((r * 37 + i * 11) % 101) as f32 / 9.0 - 5.0).collect())
+            .map(|r| {
+                (0..24)
+                    .map(|i| ((r * 37 + i * 11) % 101) as f32 / 9.0 - 5.0)
+                    .collect()
+            })
             .collect();
         for metric in [Metric::Cosine, Metric::L2] {
             let mut serial = CompactHnswStats::new(metric);

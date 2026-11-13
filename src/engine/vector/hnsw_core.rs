@@ -219,16 +219,25 @@ mod tests {
     #[test]
     fn fill_pruned_appends_nearest_rejected_without_duplicates() {
         let candidates = [
-            Scored { dist: 1.0, id: 10u32 },
+            Scored {
+                dist: 1.0,
+                id: 10u32,
+            },
             Scored { dist: 2.0, id: 11 },
             Scored { dist: 3.0, id: 12 },
             Scored { dist: 4.0, id: 13 },
         ];
         let mut selected = vec![candidates[0], candidates[2]];
         fill_pruned(&mut selected, &candidates, 3, |s| s.id);
-        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [10, 12, 11]);
+        assert_eq!(
+            selected.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [10, 12, 11]
+        );
         fill_pruned(&mut selected, &candidates, 8, |s| s.id);
-        assert_eq!(selected.iter().map(|s| s.id).collect::<Vec<_>>(), [10, 12, 11, 13]);
+        assert_eq!(
+            selected.iter().map(|s| s.id).collect::<Vec<_>>(),
+            [10, 12, 11, 13]
+        );
     }
 
     #[test]
