@@ -2616,14 +2616,20 @@ impl HnswIndex {
     /// Returns the selected candidates (id + distance-to-query), so callers that
     /// need the edge distance — the deferred build's drop-farthest, which stores
     /// it to avoid recomputation — get it without a second pass.
+    /// `keep_pruned` refills the degree bound; cold builds pass `true`.
+    /// Incremental DML passes `false`: full lists would make every later
+    /// reverse edge re-run the O(m²) heuristic instead of using slack.
     fn select_neighbors(
         &self,
         candidates: &[Scored],
         m: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
     ) -> Vec<Scored> {
         let mut selected = self.select_neighbors_diverse(candidates, m, arena);
-        super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        if keep_pruned {
+            super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        }
         selected
     }
 
@@ -2672,6 +2678,7 @@ impl HnswIndex {
         existing: &[u32],
         m: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
     ) -> Vec<u32> {
         if existing.len() <= m {
             return existing.to_vec();
@@ -2684,7 +2691,7 @@ impl HnswIndex {
             })
             .collect();
         scored.sort_unstable();
-        self.select_neighbors(&scored, m, arena)
+        self.select_neighbors(&scored, m, arena, keep_pruned)
             .into_iter()
             .map(|s| s.id)
             .collect()
@@ -2707,8 +2714,9 @@ impl HnswIndex {
         m: usize,
         soft_cap: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
     ) {
-        self.wire_edge_with_snapshot_hook(id, nb, level, m, soft_cap, arena, || {});
+        self.wire_edge_with_snapshot_hook(id, nb, level, m, soft_cap, arena, keep_pruned, || {});
     }
 
     fn wire_edge_with_snapshot_hook(
@@ -2719,6 +2727,7 @@ impl HnswIndex {
         m: usize,
         soft_cap: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
         after_snapshot: impl FnOnce(),
     ) {
         // id == nb would self-lock the same mutex twice. Defensive guard;
@@ -2778,7 +2787,7 @@ impl HnswIndex {
 
         let mut candidate_list = candidate_list;
         loop {
-            let pruned = self.prune_select(nb, &candidate_list, m, arena);
+            let pruned = self.prune_select(nb, &candidate_list, m, arena, keep_pruned);
             let mut nbrs = self.node_at(nb).neighbors.lock();
             let Some(layer) = nbrs.get_mut(level) else {
                 return;
@@ -3187,7 +3196,7 @@ impl HnswIndex {
                 // the m fanout: filling m0 on birth doubles DML maintenance.
                 let cold_build = cap_mult > 1 || aux.is_some();
                 let forward_m = if lc == 0 && cold_build { m_layer } else { self.m };
-                let selected = self.select_neighbors(&ranked, forward_m, select_arena);
+                let selected = self.select_neighbors(&ranked, forward_m, select_arena, cold_build);
                 for s in &selected {
                     let nb = s.id;
                     if nb == id {
@@ -3205,7 +3214,7 @@ impl HnswIndex {
                         // Eager / soft-cap mode: reverse edge prunes by the
                         // diversity heuristic once the list exceeds `soft_cap`.
                         None => {
-                            self.wire_edge(id, nb, lc, m_layer, soft_cap, select_arena);
+                            self.wire_edge(id, nb, lc, m_layer, soft_cap, select_arena, cold_build);
                         }
                     }
                 }
@@ -3443,6 +3452,7 @@ impl HnswIndex {
                 &neighbors[0],
                 self.m0 - 1,
                 self.selection_arena(arena.as_deref()),
+                true,
             );
         });
         seen.fill(false);
@@ -3492,7 +3502,7 @@ impl HnswIndex {
                         }
                     }
                     if cand.len() > m_layer {
-                        nbrs[lc] = self.prune_select(id, &cand, m_layer, ar);
+                        nbrs[lc] = self.prune_select(id, &cand, m_layer, ar, true);
                     } else {
                         nbrs[lc] = cand;
                     }
@@ -3529,7 +3539,7 @@ impl HnswIndex {
                 for lc in 0..nbrs.len() {
                     let m_layer = if lc == 0 { self.m0 } else { self.m };
                     if nbrs[lc].len() > m_layer {
-                        let pruned = self.prune_select(id, &nbrs[lc], m_layer, ar);
+                        let pruned = self.prune_select(id, &nbrs[lc], m_layer, ar, true);
                         nbrs[lc] = pruned;
                     }
                 }
@@ -4354,10 +4364,10 @@ mod tests {
         for (i, x) in [0.0, 10.0, 20.0, 1.0].into_iter().enumerate() {
             index.append_node(rid(i as u32), vec![x]).unwrap();
         }
-        index.wire_edge(1, 0, 0, 1, 2, None);
-        index.wire_edge_with_snapshot_hook(2, 0, 0, 1, 1, None, || {
+        index.wire_edge(1, 0, 0, 1, 2, None, false);
+        index.wire_edge_with_snapshot_hook(2, 0, 0, 1, 1, None, false, || {
             // T2 lands after T1 snapshots [1, 2], and keeps the nearer id=3.
-            index.wire_edge(3, 0, 0, 1, 1, None);
+            index.wire_edge(3, 0, 0, 1, 1, None, false);
             assert_eq!(index.nodes.get(0).neighbors.lock()[0], vec![3]);
         });
         assert_eq!(index.nodes.get(0).neighbors.lock()[0], vec![3]);

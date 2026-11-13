@@ -2913,6 +2913,11 @@ impl VectorIndexFile {
         self.build_mode.store(true, Ordering::Release);
     }
 
+    /// Whether a cold bulk build currently owns this file.
+    pub(crate) fn in_bulk_build(&self) -> bool {
+        self.build_mode.load(Ordering::Acquire)
+    }
+
     /// Leave bulk-build mode and publish the graph. Node pages are build-local
     /// derived data until the meta page says `finalized = true`, so the fast
     /// path writes them directly to the `.hvec` file (and fsyncs in strict

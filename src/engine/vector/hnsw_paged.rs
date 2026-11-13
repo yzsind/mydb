@@ -3834,9 +3834,13 @@ impl PagedHnsw {
         m: usize,
         scratch: &mut Scratch,
     ) -> Result<Vec<Scored>, QueryError> {
-        // Keep pruned connections, as the in-memory builder does.
+        // Cold builds keep pruned connections, as the in-memory builder does.
+        // Incremental DML does not: full lists would make every later reverse
+        // edge re-run the O(m0²) heuristic instead of appending into slack.
         let mut selected = self.select_neighbors_diverse(candidates, m, scratch)?;
-        super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        if self.file.in_bulk_build() {
+            super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        }
         Ok(selected)
     }
 
