@@ -2023,7 +2023,7 @@ fn m5_ef_search_sysvar_registered_with_defaults() {
     assert_eq!(cell(&engine, "SELECT @@SESSION.mydb_hnsw_ef_search"), "64");
     assert_eq!(
         cell(&engine, "SELECT @@SESSION.mydb_hnsw_ef_dynamic_factor"),
-        "4"
+        "2"
     );
     assert_eq!(
         cell(&engine, "SELECT @@SESSION.mydb_hnsw_iterative_scan"),

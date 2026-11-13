@@ -1037,7 +1037,7 @@ pub(crate) fn register(reg: &mut Registry) {
         |s| s.sysvars.mydb_hnsw_ef_dynamic_factor,
         |s, n| s.sysvars.mydb_hnsw_ef_dynamic_factor = n,
         "HNSW dynamic ef multiplier vs LIMIT k (0 disables scaling).",
-        4,
+        2,
     );
     register_session_uint64_aliased(
         reg,

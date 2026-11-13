@@ -144,8 +144,8 @@ session multiplier, otherwise the index `rerank_mult` captured at creation.
 
 This priority resolves the **base** HNSW ef. Dynamic scaling still applies
 after a hint, explicit SET, or index default has selected that base. With
-base ef=128, LIMIT 100 and the default dynamic factor of 4, the initial
-effective ef is 400. To keep the initial breadth at 128, set
+base ef=128, LIMIT 100 and the default dynamic factor of 2, the initial
+effective ef is 200. To keep the initial breadth at 128, set
 `mydb_hnsw_ef_dynamic_factor=0` as well as `mydb_hnsw_ef_search=128`.
 Filter/visibility-driven iterative scans can subsequently widen the search.
 Ef controls the retained search frontier; it is not a count or hard limit
@@ -154,7 +154,7 @@ on all distance evaluations or physical page reads.
 | Session variable | Default | Effect |
 | --- | --- | --- |
 | `mydb_hnsw_ef_search` | 64 | Base HNSW search breadth |
-| `mydb_hnsw_ef_dynamic_factor` | 4 | Initial effective ef is `max(base ef, factor*k, k)`; 0 disables scaling |
+| `mydb_hnsw_ef_dynamic_factor` | 2 | Initial effective ef is `max(base ef, factor*k, k)`; 0 disables scaling |
 | `mydb_ivf_nprobe` | 8 | IVF lists to probe, clamped to `1..nlist` at execution |
 | `mydb_hnsw_rerank_mult`, `mydb_ivf_rerank_mult` | 4 | Candidate multiplier; explicit SET overrides index `rerank_mult`, range 1..1024 |
 | `mydb_hnsw_iterative_scan`, `mydb_ivf_iterative_scan` | strict_order | `off`, `relaxed_order`, or `strict_order`; controls candidate widening after filters or visibility checks remove rows |
@@ -341,12 +341,12 @@ these configurations is guaranteed; PQ codebook size/training, scalar ranges,
 data distribution and graph coverage all affect the result.
 
 By default, LIMIT 100 with a configured HNSW ef of 128 can explore with
-effective ef=400 and retain a rerank pool of 400. A high final recall then
+effective ef=200 and retain a rerank pool of 200. A high final recall then
 describes that complete retrieval pipeline, including exact scoring of the
-400 candidates. It does not describe the compressed top-100 ranking alone.
+200 candidates. It does not describe the compressed top-100 ranking alone.
 Original vector reads can dominate latency when they miss the buffer cache.
-For 768-dimensional FLOAT32 vectors, scoring 400 candidates consumes about
-1.17 MiB of original vector values, before page and row overhead; this is
+For 768-dimensional FLOAT32 vectors, scoring 200 candidates consumes about
+0.59 MiB of original vector values, before page and row overhead; this is
 logical data volume, not a measurement of physical I/O.
 
 Measure compressed-ranking recall, graph candidate coverage and final SQL

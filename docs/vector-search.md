@@ -348,8 +348,8 @@ LIMIT 2;
 
 HNSW's initial effective breadth is
 `max(base_ef, mydb_hnsw_ef_dynamic_factor * k, k)`, where `k` includes OFFSET
-and the dynamic factor defaults to 4. Thus base ef 128 with LIMIT 100 normally
-starts at ef 400. Set the factor to 0 to disable dynamic scaling; iterative
+and the dynamic factor defaults to 2. Thus base ef 128 with LIMIT 100 normally
+starts at ef 200. Set the factor to 0 to disable dynamic scaling; iterative
 scanning can still widen the search. Ef is a frontier size, not a hard limit
 on distance evaluations or physical page reads.
 
