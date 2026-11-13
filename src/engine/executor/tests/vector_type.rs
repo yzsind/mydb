@@ -1806,6 +1806,42 @@ fn knn_recall_vs_bruteforce(
 }
 
 #[test]
+fn cosine_hnsw_parallel_registry_scan_covers_rows_and_rejects_zero_vectors() {
+    // 960-d rows stay inline at ~3 per page, so 400 rows span well over the
+    // 64-page threshold of the parallel registry scan.
+    let _env = HnswEnv::set(&[("MYDB_HNSW_BUILD_THREADS", "4")]);
+    let dir = tempfile::tempdir().unwrap();
+    // Strict durability takes the direct offline scan used in production.
+    let engine = open_strict_hnsw_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(960) NOT NULL)")
+        .unwrap();
+    let vectors = gen_vectors(400, 960, 0x5eed_1234_abcd_0001);
+    bulk_insert_vectors(&engine, &vectors);
+    engine
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
+        .unwrap();
+    let probe = format!(
+        "SELECT id FROM items ORDER BY DISTANCE(emb, STRING_TO_VECTOR('[{}]'), 'COSINE') LIMIT 1",
+        vectors[123].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+    );
+    assert_eq!(cell(&engine, &probe), "124");
+    engine.execute("DROP INDEX idx_emb ON items").unwrap();
+    let zero = format!(
+        "INSERT INTO items VALUES (1000, STRING_TO_VECTOR('[{}]'))",
+        vec!["0"; 960].join(",")
+    );
+    engine.execute(&zero).unwrap();
+    let err = engine
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
+        .unwrap_err();
+    assert!(
+        err.message().contains("COSINE indexes reject existing zero vectors"),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn hnsw_parallel_build_matches_brute_force_recall() {
     // M4: with MYDB_HNSW_BUILD_THREADS>1 the cold-build path splits the
     // heap into disjoint page ranges and concurrent workers each call

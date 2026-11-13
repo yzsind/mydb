@@ -1197,9 +1197,37 @@ pub(crate) struct HnswIndex {
     codes_only: bool,
     // Set only by the exclusive cold builder, until all scoped readers join.
     frozen_build_vectors: AtomicBool,
+    /// Dense (vector, norm) view of every node, valid only while
+    /// `frozen_build_vectors` is set; it removes the node-slab load from each
+    /// construction distance.
+    frozen_rows: FrozenRows,
     // Temporary cold-build graphs own the caller's admitted workspace. Keep
     // this last so all graph allocations are freed before releasing admission.
     build_reservation: Option<BuildReservation>,
+}
+
+/// One node's immutable cold-build payload: vector address, length and
+/// cached cosine norm.
+#[derive(Clone, Copy)]
+struct FrozenRow {
+    ptr: *const f32,
+    len: u32,
+    norm: f32,
+}
+
+#[derive(Default)]
+struct FrozenRows(Vec<FrozenRow>);
+
+// SAFETY: rows point into node vectors that `link_all_frozen` keeps alive and
+// unmodified (exclusive `&mut self`) for as long as readers may use them; the
+// view is consulted only while `frozen_build_vectors` is set.
+unsafe impl Send for FrozenRows {}
+unsafe impl Sync for FrozenRows {}
+
+impl std::fmt::Debug for FrozenRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FrozenRows({})", self.0.len())
+    }
 }
 
 struct BuildReservation {
@@ -1269,6 +1297,7 @@ impl HnswIndex {
             identity_lineage: AtomicU64::new(0),
             codes_only: false,
             frozen_build_vectors: AtomicBool::new(false),
+            frozen_rows: FrozenRows::default(),
             build_reservation: None,
         }
     }
@@ -2095,8 +2124,27 @@ impl HnswIndex {
         self.nodes.get(id)
     }
 
+    /// The dense cold-build row for `id`, while the build owns the vectors.
+    #[inline]
+    fn frozen_row(&self, id: u32) -> Option<FrozenRow> {
+        if !self.frozen_build_vectors.load(Ordering::Acquire) {
+            return None;
+        }
+        self.frozen_rows.0.get(id as usize).copied()
+    }
+
+    #[inline]
+    fn node_cosine_norm(&self, id: u32) -> f32 {
+        self.frozen_row(id)
+            .map_or_else(|| self.nodes.get(id).cosine_norm, |row| row.norm)
+    }
+
     #[inline]
     fn with_node_vector<T>(&self, id: u32, f: impl FnOnce(&[f32]) -> T) -> T {
+        if let Some(row) = self.frozen_row(id) {
+            // SAFETY: see `FrozenRows`; the row is immutable while frozen.
+            return f(unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) });
+        }
         let node = self.nodes.get(id);
         if self.frozen_build_vectors.load(Ordering::Acquire) {
             // SAFETY: only link_all_frozen can set this flag. Its exclusive
@@ -2114,16 +2162,37 @@ impl HnswIndex {
     /// be borrowed without their lock; other states are left to demand loads.
     #[inline]
     fn prefetch_frozen_vector(&self, id: u32) {
-        if !self.frozen_build_vectors.load(Ordering::Relaxed) {
+        let Some(row) = self.frozen_row(id) else {
             return;
-        }
-        // SAFETY: see `with_node_vector`; frozen vectors have no writer.
-        let vector = unsafe { &*self.nodes.get(id).vector.data_ptr() };
-        let bytes = std::mem::size_of_val(vector.as_slice()).min(512);
-        let base = vector.as_ptr().cast::<i8>();
+        };
+        let bytes = (row.len as usize * std::mem::size_of::<f32>()).min(512);
+        let base = row.ptr.cast::<i8>();
         for offset in (0..bytes).step_by(64) {
             prefetch_read(base.wrapping_add(offset));
         }
+    }
+
+    /// Exact cosine construction distances for one to four frozen rows at
+    /// once. A short group repeats its first row; each lane is reduced
+    /// independently, so padding never changes a real row's distance.
+    #[inline]
+    fn frozen_cosine_batch4(&self, probe: &Probe, group: &[u32]) -> Option<[f64; 4]> {
+        let query_norm = probe.cosine_norm?;
+        let id = |j: usize| group[if j < group.len() { j } else { 0 }];
+        let rows = [
+            self.frozen_row(id(0))?,
+            self.frozen_row(id(1))?,
+            self.frozen_row(id(2))?,
+            self.frozen_row(id(3))?,
+        ];
+        // SAFETY: see `FrozenRows`.
+        let slices = rows.map(|row| unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) });
+        Some(super::distance::cosine_with_norms_batch4(
+            probe.query,
+            slices,
+            query_norm,
+            rows.map(|row| row.norm),
+        ))
     }
 
     #[inline]
@@ -2146,7 +2215,7 @@ impl HnswIndex {
             }
         }
         if let Some(query_norm) = probe.cosine_norm {
-            let node_norm = self.nodes.get(id).cosine_norm;
+            let node_norm = self.node_cosine_norm(id);
             return self.with_node_vector(id, |v| {
                 super::distance::cosine_with_norms(probe.query, v, query_norm, node_norm)
             });
@@ -2402,13 +2471,19 @@ impl HnswIndex {
             for &nb in nbr_buf.iter() {
                 probe.prefetch(nb);
             }
-            for k in 0..nbr_buf.len() {
-                let nb = nbr_buf[k];
-                let d = self.probe_dist(probe, nb);
-                if d < cur_d {
-                    cur_d = d;
-                    cur = nb;
-                    changed = true;
+            for group in nbr_buf.chunks(4) {
+                let batch = if probe.quant.is_none() {
+                    self.frozen_cosine_batch4(probe, group)
+                } else {
+                    None
+                };
+                for (k, &nb) in group.iter().enumerate() {
+                    let d = batch.map_or_else(|| self.probe_dist(probe, nb), |b| b[k]);
+                    if d < cur_d {
+                        cur_d = d;
+                        cur = nb;
+                        changed = true;
+                    }
                 }
             }
             scratch.nbr_buf = nbr_buf;
@@ -2507,7 +2582,14 @@ impl HnswIndex {
                 }
             }
             for group in nbr_buf.chunks(4) {
-                let distances: [f64; 4] = if BATCH && group.len() == 4 {
+                let frozen = if BATCH && probe.quant.is_none() {
+                    self.frozen_cosine_batch4(probe, group)
+                } else {
+                    None
+                };
+                let distances: [f64; 4] = if let Some(batch) = frozen {
+                    batch
+                } else if BATCH && group.len() == 4 {
                     if let Some((arena, qcodes, qnorm)) = probe.quant {
                         if group.iter().all(|&id| self.quant_covers(arena, id)) {
                             let dots = dot_i8_batch4_ptrs(
@@ -2600,12 +2682,15 @@ impl HnswIndex {
                 return l2_ssd_i8(ar.codes_for(a), ar.codes_for(b)) as f64 * (ar.scale_sq as f64);
             }
         }
-        let left = self.nodes.get(a);
-        let right = self.nodes.get(b);
         self.with_node_vector(a, |va| {
             self.with_node_vector(b, |vb| {
                 if self.metric == Metric::Cosine {
-                    super::distance::cosine_with_norms(va, vb, left.cosine_norm, right.cosine_norm)
+                    super::distance::cosine_with_norms(
+                        va,
+                        vb,
+                        self.node_cosine_norm(a),
+                        self.node_cosine_norm(b),
+                    )
                 } else {
                     ordering_distance(va, vb, self.metric)
                 }
@@ -3266,9 +3351,25 @@ impl HnswIndex {
                 self.0.store(false, Ordering::Release);
             }
         }
+        let rows = (0..self.nodes.len() as u32)
+            .map(|id| {
+                let node = self.nodes.get(id);
+                // SAFETY: `&mut self` excludes every vector writer.
+                let vector = unsafe { &*node.vector.data_ptr() };
+                FrozenRow {
+                    ptr: vector.as_ptr(),
+                    len: vector.len() as u32,
+                    norm: node.cosine_norm,
+                }
+            })
+            .collect();
+        self.frozen_rows = FrozenRows(rows);
         self.frozen_build_vectors.store(true, Ordering::Release);
-        let _reset = Reset(&self.frozen_build_vectors);
-        self.link_all(threads);
+        {
+            let _reset = Reset(&self.frozen_build_vectors);
+            self.link_all(threads);
+        }
+        self.frozen_rows = FrozenRows::default();
     }
 
     pub(crate) fn link_all(&self, threads: usize) {
@@ -3443,6 +3544,34 @@ impl HnswIndex {
             return;
         }
         let arena = self.quant.read().clone();
+        // Usually few components are detached: make room only on the anchors
+        // that receive a bridge edge, then verify reachability once more.
+        let mut anchor = entry;
+        for id in 0..count as u32 {
+            if !seen[id as usize] {
+                let mut neighbors = self.nodes.get(anchor).neighbors.lock();
+                if neighbors[0].len() >= self.m0 {
+                    neighbors[0] = self.prune_select(
+                        anchor,
+                        &neighbors[0],
+                        self.m0 - 1,
+                        self.selection_arena(arena.as_deref()),
+                        true,
+                    );
+                }
+                neighbors[0].push(id);
+                drop(neighbors);
+                visit(id, &mut seen, &mut stack);
+                anchor = id;
+            }
+        }
+        seen.fill(false);
+        visit(entry, &mut seen, &mut stack);
+        if seen.iter().all(|&v| v) {
+            return;
+        }
+        // A pruned anchor edge was some node's only path: fall back to
+        // reserving a spare slot everywhere before bridging again.
         // Each prune changes only its own adjacency and reads immutable
         // payloads. No cross-node adjacency latch is acquired here.
         parallel_claim_ids(0, count as u32, threads.max(1), |id| {
