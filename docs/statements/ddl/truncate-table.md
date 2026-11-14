@@ -33,3 +33,5 @@ TRUNCATE TABLE staging_event;
 - [DDL category index](README.md)
 - [Syntax notation](../syntax-conventions.md)
 - [SHOW CREATE TABLE](../metadata/show-create-table.md)
+
+Persistent tables enter the [recycle bin](../../recycle-bin.md) before their new empty physical identity is published when recycling is enabled. Restore the retained version to an unused table name; it does not overwrite the current table.

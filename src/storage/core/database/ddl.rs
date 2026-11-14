@@ -3359,6 +3359,7 @@ impl Database {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
+        if self.recyclebin_enabled() { return self.recycle_drop_tables(&[name.to_string()], false); }
         let (database, table_name) = split_table_name(DEFAULT_DATABASE, name);
         check_table_ddl_writable(&database)?;
         let key = table_key(&database, &table_name);
@@ -3387,7 +3388,8 @@ impl Database {
         // leaves table + files + intent intact (recovery drops the stale
         // intent); a crash after it is finished by `recover_drop_tables`.
         let intent = self.build_drop_table_intent(&table)?;
-        let intent_path = self.write_drop_table_intent(&intent)?;
+        self.stage_table_retirement(&intent)?;
+        let intent_path = None;
         // Catalog commit point.
         {
             let mut catalog = self.catalog_write()?;
@@ -3427,6 +3429,7 @@ impl Database {
     }
 
     pub fn drop_tables(&self, names: &[String], if_exists: bool) -> Result<(), QueryError> {
+        if self.recyclebin_enabled() { return self.recycle_drop_tables(names, if_exists); }
         let mut resolved = Vec::with_capacity(names.len());
         let mut drop_set = BTreeSet::new();
         for name in names {
@@ -3489,7 +3492,7 @@ impl Database {
             return Ok(());
         }
         for entry in &mut dropped {
-            entry.2 = self.write_drop_table_intent(&entry.1)?;
+            self.stage_table_retirement(&entry.1)?;
         }
         // Catalog commit point — all tables removed atomically in one flush.
         // Rebuild reverse FK caches only if at least one dropped table had an
@@ -3604,7 +3607,11 @@ impl Database {
         candidate.bump_schema_version();
         candidate.build_column_index();
         let retired = self.build_drop_table_intent(&table)?;
-        let retired_path = self.write_drop_table_intent(&retired)?;
+        let recycle_txn = if self.recyclebin_enabled() { Some(self.begin_txn()?) } else { None };
+        let _recycle_guard = recycle_txn.map(|txn| RollbackTxnGuard::<true> { db: self, txn_id: txn.txn_id });
+        let recycled = recycle_txn.map(|txn| self.prepare_recycle(&table, "TRUNCATE TABLE", txn.txn_id)).transpose()?;
+        let retired_path: Option<PathBuf> = None;
+        if recycled.is_none() { self.stage_table_retirement(&retired)?; }
         let mut private = DropTableIntent {
             retired_index: None,
             table_id: candidate.id,
@@ -3624,6 +3631,7 @@ impl Database {
                 })
                 .collect(),
             vector_files: Vec::new(),
+            vector_directories: Vec::new(),
         };
         let private_path = self.write_drop_table_intent(&private)?;
         for path in &private.files {
@@ -3678,9 +3686,12 @@ impl Database {
             table: candidate.clone(),
             _charge: charge,
         };
+        if let Some(recycled) = &recycled { self.install_recycle(recycled)?; }
         self.note_catalog_table(table.id);
         self.note_catalog_table(candidate.id);
-        if let Err(err) = self.commit_ddl_catalog_txn_recoverable() {
+        let publication = match recycle_txn { Some(txn) => self.commit_recycle_catalog(txn), None => self.commit_ddl_catalog_txn_recoverable() };
+        if let Err(err) = publication {
+            if let Some(recycled) = &recycled { self.rollback_recycle_binding(&table, &recycled.table.qualified_name())?; }
             self.catalog_write()?
                 .tables
                 .insert(key.clone(), table.clone());
@@ -3694,14 +3705,16 @@ impl Database {
             return Err(err);
         }
         self.remove_drop_table_intent(private_path.as_ref());
-        if self.evict_dropped_table_caches(&table).is_ok()
+        if recycled.is_none() && self.evict_dropped_table_caches(&table).is_ok()
             && self.purge_dropped_table_files(&retired)
         {
             self.remove_drop_table_intent(retired_path.as_ref());
         }
         self.catalog.forget_dropped_table(&key, &table);
-        self.table_write_epochs.write().remove(&table.id);
-        self.drop_table_modification_delta_without_epoch(table.id);
+        if recycled.is_none() {
+            self.table_write_epochs.write().remove(&table.id);
+            self.drop_table_modification_delta_without_epoch(table.id);
+        }
         Ok(())
     }
 
@@ -5525,6 +5538,7 @@ impl Database {
             table_name: table_only,
             files: Vec::new(),
             vector_files: Vec::new(),
+            vector_directories: Vec::new(),
         };
         for storage_id in table_snapshot.storage_ids() {
             retired.files.push(self.relative_path(
@@ -5547,6 +5561,7 @@ impl Database {
                 }
             }
             if dropped_index.is_vector() {
+                retired.vector_directories.push(self.relative_path(&self.vector_index_path_for_parts(storage_id, table_snapshot.active_generation.max(1), dropped_index.index_id, "vmanifest").with_extension("vector")));
                 retired.vector_files.extend(
                     self.owned_vector_files(&table_snapshot, &dropped_index, storage_id)?
                         .iter()
@@ -15364,7 +15379,7 @@ fn move_column_in_candidate(
 
 #[inline]
 fn check_table_ddl_writable(database: &str) -> Result<(), QueryError> {
-    if table_ddl_schema_is_read_only(database) {
+    if database.eq_ignore_ascii_case(crate::recyclebin::DATABASE) || table_ddl_schema_is_read_only(database) {
         return Err(error(
             crate::error::catalog::ER_DBACCESS_DENIED_ERROR,
             format!("access denied for database '{database}'"),

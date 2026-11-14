@@ -127,6 +127,12 @@ pub trait BatchOperator {
     fn sample_scan_pages(&mut self, _max_pages: usize) -> bool {
         false
     }
+    /// An unopened source can use component domains as optional physical
+    /// candidates while the complete tuple filter remains authoritative.
+    fn benefits_from_runtime_key_components(&self, _keys: &[crate::parser::Expr]) -> bool {
+        false
+    }
+
     /// Install a build-derived runtime filter into a still-unopened child.
     /// Operators that cannot push the filter to a matching source return
     /// false. This changes only candidate batching inside the fixed physical

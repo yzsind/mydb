@@ -240,6 +240,9 @@ pub const ER_AI_KEY_ROTATION_INCOMPLETE: ErrorSpec = ErrorSpec::new(
     "ER_AI_KEY_ROTATION_INCOMPLETE",
 );
 
+pub const MYDB_ER_RECYCLEBIN: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50140, *b"HY000", "MYDB_ER_RECYCLEBIN");
+
 pub const MYDB_ERROR_SPECS: &[ErrorSpec] = &[
     MYDB_ER_INVALID_VECTOR_VALUE,
     MYDB_ER_VECTOR_DIMENSION_MISMATCH,
@@ -287,6 +290,7 @@ pub const MYDB_ERROR_SPECS: &[ErrorSpec] = &[
     ER_AI_WRONG_MODEL_KIND,
     ER_AI_CIRCUIT_OPEN,
     ER_AI_KEY_ROTATION_INCOMPLETE,
+    MYDB_ER_RECYCLEBIN,
 ];
 
 pub fn lookup_by_code(code: u16) -> Option<&'static ErrorSpec> {

@@ -3507,7 +3507,7 @@ fn information_schema_registry_and_real_producers_are_queryable() {
     else {
         panic!("expected SHOW FULL TABLES result");
     };
-    assert_eq!(tables.rows.len(), 104);
+    assert_eq!(tables.rows.len(), 105);
     let names = tables
         .rows
         .iter()

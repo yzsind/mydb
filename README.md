@@ -68,7 +68,7 @@ toolchain or config file is needed. With a MySQL 8.0 client installed, connect
 from another terminal:
 
 ```bash
-mysql -h127.0.0.1 -P8738 -uroot -proot  test
+mysql -h127.0.0.1 -P8738 -uroot -proot test
 ```
 
 A fresh data directory includes the `test` database and the local `root` account
@@ -105,13 +105,25 @@ MYDB_DATA_DIR=/tmp/mydb/data \
 When the server is ready, connect from another terminal:
 
 ```bash
-mysql -h127.0.0.1 -P8738 -uroot -proot --ssl-mode=REQUIRED test
+mysql -h127.0.0.1 -P8738 -uroot -proot test
 ```
 
 A fresh data directory creates `root@localhost` with password `root` and a `test`
 database. This account accepts only loopback connections. `MYDB_ROOT_PASSWORD`
 sets the initial password on first start; it does not change existing accounts.
 The default protocol port is `8738`; override it with `--port`.
+
+The default authentication plugin is `caching_sha2_password`. TLS is available
+without certificate configuration: the server generates a temporary self-signed
+certificate. The MySQL 8.0 client negotiates TLS by default when the server offers
+it, so the commands above need no explicit TLS option. For a local JDBC
+connection, use `jdbc:mysql://127.0.0.1:8738/test`; no TLS or
+`allowPublicKeyRetrieval` setting is needed with the server's default TLS
+configuration. Connector/J defaults to
+`sslMode=PREFERRED`, which negotiates TLS when available without verifying server
+identity. For remote connections, configure a trusted certificate and use
+`sslMode=VERIFY_IDENTITY`; see [TLS configuration](docs/configuration.md#tls)
+and the [runnable client examples](examples/README.md).
 
 Try a write, an aggregate, and a window function:
 
@@ -358,6 +370,8 @@ The full coverage map, transactional differences, and unsupported features are l
 | **`EXPLAIN ANALYZE`** | Inspect actual per-step performance of an execution plan. |
 | **`SHOW MYDB MEMORY`** | Inspect global memory usage for capacity planning and diagnostics. |
 | **Native backup and replication** | Online physical backup, WAL archiving, PITR, and an independent primary/replica physical replication protocol. |
+
+Persistent DROP/TRUNCATE tables are protected by the default-on [recycle bin](docs/recycle-bin.md), including read-only inspection, restore and asynchronous reclamation.
 
 See [sequences](docs/statements/ddl/create-sequence.md), [series generation](docs/generate-series.md), [backup and recovery](docs/backup-and-recovery.md), and [native replication](docs/native-replication.md).
 

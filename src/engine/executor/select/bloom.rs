@@ -141,7 +141,16 @@ impl ExactIntKeySetBuilder {
         self.keys.push(key);
     }
 
-    pub(crate) fn finish(mut self) -> Result<ExactIntKeySet, crate::types::QueryError> {
+    pub(crate) fn finish(self) -> Result<ExactIntKeySet, crate::types::QueryError> {
+        self.finish_for_probe_rows(0)
+    }
+
+    /// Repeated probes can amortize a small, bounded bitmap over a sparse
+    /// sorted set. Ordinary consumers retain the memory-minimal policy.
+    pub(crate) fn finish_for_probe_rows(
+        mut self,
+        probe_rows: u64,
+    ) -> Result<ExactIntKeySet, crate::types::QueryError> {
         self.keys.sort_unstable();
         self.keys.dedup();
         let Some((&min, &max)) = self.keys.first().zip(self.keys.last()) else {
@@ -166,7 +175,14 @@ impl ExactIntKeySetBuilder {
         let sorted_bytes =
             (self.keys.capacity() as u128).saturating_mul(std::mem::size_of::<i128>() as u128);
         if let (Some(span), Some(dense_bytes)) = (span, dense_bytes) {
-            if dense_bytes <= sorted_bytes && dense_bytes <= 64 * 1024 * 1024 {
+            let bitmap_cap = crate::engine::executor::mem_budget::current_budget()
+                .map_or(1 << 20, |b| (b.limit() / 64).min(8 << 20));
+            let probe_amortized = probe_rows >= (self.keys.len() as u64).saturating_mul(32)
+                && dense_bytes <= sorted_bytes.saturating_mul(8)
+                && dense_bytes <= bitmap_cap as u128
+                && crate::engine::executor::mem_budget::current_budget()
+                    .is_none_or(|b| dense_bytes <= b.limit().saturating_sub(b.used()) as u128);
+            if (dense_bytes <= sorted_bytes || probe_amortized) && dense_bytes <= 64 * 1024 * 1024 {
                 let words_len = usize::try_from(span.div_ceil(64)).map_err(|_| {
                     crate::engine::executor::mem_budget::allocation_error(
                         "exact integer runtime filter domain is too large",
@@ -951,5 +967,37 @@ mod tests {
             .filter(|i| !bf.contains(&IndexKey::from(vec![KeyPart::Int(*i as i64)])))
             .count();
         assert!(misses >= 900, "rejected {} of 1000 IndexKey misses", misses);
+    }
+}
+
+#[cfg(test)]
+mod probe_bitmap_tests {
+    use super::*;
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+    use std::sync::Arc;
+    #[test]
+    fn repeated_probe_bitmap_is_exact_and_respects_optional_memory_bound() {
+        for bytes in [1 << 20, 64 << 20] {
+            let budget = Arc::new(MemBudget::new(bytes));
+            with_query_budget(budget.clone(), || {
+                for probes in [0, 1_000_000] {
+                    let mut builder = ExactIntKeySetBuilder::with_capacity(4096).unwrap();
+                    for n in 0..4096 {
+                        builder.insert(i128::MIN + i128::from(n) * 512);
+                    }
+                    let keys = builder.finish_for_probe_rows(probes).unwrap();
+                    assert_eq!(
+                        matches!(keys.storage, ExactIntKeyStorage::Dense { .. }),
+                        bytes == 64 << 20 && probes > 0
+                    );
+                    for n in 0..4096 {
+                        let k = i128::MIN + i128::from(n) * 512;
+                        assert!(keys.contains(k));
+                        assert!(!keys.contains(k + 1));
+                    }
+                }
+            });
+            assert_eq!(budget.used(), 0);
+        }
     }
 }

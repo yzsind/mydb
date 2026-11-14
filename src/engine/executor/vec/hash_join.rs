@@ -515,6 +515,15 @@ pub(crate) fn build_exact_int_runtime_filter(
     build_keys: &[usize],
     key_collations: &[Option<u16>],
 ) -> Option<Arc<crate::engine::executor::select::bloom::ExactIntKeySet>> {
+    build_exact_int_runtime_filter_for_probes(payload, build_keys, key_collations, 0)
+}
+
+pub(crate) fn build_exact_int_runtime_filter_for_probes(
+    payload: &BuildPayload,
+    build_keys: &[usize],
+    key_collations: &[Option<u16>],
+    probe_rows: u64,
+) -> Option<Arc<crate::engine::executor::select::bloom::ExactIntKeySet>> {
     if build_keys.len() != 1 || key_collations.iter().any(Option::is_some) {
         return None;
     }
@@ -538,7 +547,7 @@ pub(crate) fn build_exact_int_runtime_filter(
     if inserted == 0 {
         return None;
     }
-    builder.finish().ok().map(Arc::new)
+    builder.finish_for_probe_rows(probe_rows).ok().map(Arc::new)
 }
 
 fn build_i64_index(

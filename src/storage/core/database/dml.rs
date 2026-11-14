@@ -758,6 +758,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
 
         let has_generated_columns = table
@@ -840,6 +841,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         if table.is_partitioned() {
             return self.insert_rows_partitioned_detailed(txn, &table, rows);
@@ -1467,6 +1469,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.insert_rows_bulk_detailed_for(txn, table, rows, skip_unique_check)
     }
@@ -1708,6 +1711,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         // Pre-encoded row payloads can't be partition-routed without
         // decoding them first — the row bytes hide the column values
@@ -1798,6 +1802,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         // Partitioned tables go through the partition-aware insert
         // path, which routes each row to the matching partition.
@@ -1954,6 +1959,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         if table.is_partitioned() {
             return self.update_rows_partitioned(
@@ -2538,6 +2544,7 @@ impl Database {
                 format!("Table '{table_name}' doesn't exist"),
             )
         })?;
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         if table.is_partitioned() {
             return self.delete_rows_partitioned(
@@ -2709,6 +2716,7 @@ impl Database {
         table: &TableSchema,
         row_id: RowId,
     ) -> Result<bool, QueryError> {
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         let storage_id = self.locate_row_storage_id(table, row_id)?;
@@ -2746,6 +2754,7 @@ impl Database {
     where
         F: FnMut(&[Value]) -> Result<bool, QueryError>,
     {
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         // Lock the known row id before decoding its payload. Besides removing
@@ -3361,6 +3370,7 @@ impl Database {
             return Ok(None);
         }
 
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         let storage_id = self.locate_row_storage_id(table, row_id)?;
@@ -3580,6 +3590,7 @@ impl Database {
     where
         F: FnMut(&[Value]) -> Result<Vec<Value>, QueryError>,
     {
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         let generated_changed_columns =

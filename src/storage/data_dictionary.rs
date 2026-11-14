@@ -130,6 +130,7 @@ pub(crate) const DD_COLUMN_STATS: u64 = DD_TABLE_ID_BASE + 28;
 pub(crate) const DD_INDEX_STATS: u64 = DD_TABLE_ID_BASE + 29;
 pub(crate) const DD_EXTENDED_STATS: u64 = DD_TABLE_ID_BASE + 30;
 pub(crate) const DD_COLUMN_HISTOGRAMS: u64 = DD_TABLE_ID_BASE + 31;
+pub(crate) const DD_RECYCLEBIN: u64 = DD_TABLE_ID_BASE + 35;
 pub(crate) const DD_API_KEYS: u64 = DD_TABLE_ID_BASE + 34;
 pub(crate) const DD_ROW_SECURITY_POLICIES: u64 = DD_TABLE_ID_BASE + 32;
 pub(crate) const DD_ROW_SECURITY_DEPENDENCIES: u64 = DD_TABLE_ID_BASE + 33;
@@ -919,6 +920,21 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
                 ucol("index_id", DataTypeKind::BigInt, false),
                 col(
                     "manifest",
+                    DataTypeKind::Text {
+                        max_len: 16 * 1024 * 1024,
+                    },
+                    false,
+                ),
+            ],
+        )),
+        Arc::new(TableSchema::system_table(
+            DD_RECYCLEBIN,
+            "recyclebin",
+            vec![
+                ucol("recycle_id", DataTypeKind::BigInt, false),
+                ucol("expires_ms", DataTypeKind::BigInt, false),
+                col(
+                    "entry_json",
                     DataTypeKind::Text {
                         max_len: 16 * 1024 * 1024,
                     },

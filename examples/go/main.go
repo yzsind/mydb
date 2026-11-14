@@ -328,6 +328,8 @@ func run() (err error) {
 	config.Net = "tcp"
 	config.Addr = net.JoinHostPort(env("MYDB_HOST", "127.0.0.1"), env("MYDB_PORT", "8738"))
 	config.DBName = env("MYDB_DB", "test")
+	// Local examples accept mydb's temporary self-signed certificate and require TLS.
+	config.TLSConfig = "skip-verify"
 	config.ParseTime = true
 	config.Timeout, config.ReadTimeout, config.WriteTimeout = 5*time.Second, 15*time.Second, 15*time.Second
 	config.Params = map[string]string{"charset": "utf8mb4"}

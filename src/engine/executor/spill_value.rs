@@ -26,6 +26,47 @@ pub(crate) const VALUE_VECTOR: u8 = 15;
 pub(crate) const VALUE_TIMESTAMP: u8 = 16;
 pub(crate) const VALUE_DECIMAL128: u8 = 17;
 pub(crate) const VALUE_DECIMAL_WIDE: u8 = 18;
+// Temporary records preserve signedness while narrowing only the payload.
+const VALUE_INT8: u8 = 19;
+const VALUE_INT16: u8 = 20;
+const VALUE_INT32: u8 = 21;
+const VALUE_UINT8: u8 = 22;
+const VALUE_UINT16: u8 = 23;
+const VALUE_UINT32: u8 = 24;
+
+#[inline]
+pub(crate) fn write_int<W: Write>(writer: &mut W, value: i64) -> std::io::Result<()> {
+    let (tag, width) = if i8::try_from(value).is_ok() {
+        (VALUE_INT8, 1)
+    } else if i16::try_from(value).is_ok() {
+        (VALUE_INT16, 2)
+    } else if i32::try_from(value).is_ok() {
+        (VALUE_INT32, 4)
+    } else {
+        (VALUE_INT, 8)
+    };
+    let mut encoded = [0; 9];
+    encoded[0] = tag;
+    encoded[1..width + 1].copy_from_slice(&value.to_le_bytes()[..width]);
+    writer.write_all(&encoded[..width + 1])
+}
+
+#[inline]
+pub(crate) fn write_uint<W: Write>(writer: &mut W, value: u64) -> std::io::Result<()> {
+    let (tag, width) = if u8::try_from(value).is_ok() {
+        (VALUE_UINT8, 1)
+    } else if u16::try_from(value).is_ok() {
+        (VALUE_UINT16, 2)
+    } else if u32::try_from(value).is_ok() {
+        (VALUE_UINT32, 4)
+    } else {
+        (VALUE_UINT, 8)
+    };
+    let mut encoded = [0; 9];
+    encoded[0] = tag;
+    encoded[1..width + 1].copy_from_slice(&value.to_le_bytes()[..width]);
+    writer.write_all(&encoded[..width + 1])
+}
 
 pub(crate) fn write_u32<W: Write>(w: &mut W, v: u32) -> std::io::Result<()> {
     w.write_all(&v.to_le_bytes())
@@ -100,10 +141,26 @@ pub(crate) fn read_exact_bytes_accounted<R: Read>(
             .add_force(len)
             .map_err(super::spill_quota::quota_as_io)?;
     }
+    // Most temporary strings/keys are short. Do not clear an 8 KiB scratch
+    // array for each of them. Keep the large decoder outlined so its stack
+    // initialization cannot be hoisted into the common short-payload path.
+    if len <= 256 {
+        read_exact_bytes_chunked::<R, 256>(r, len, budget)
+    } else {
+        read_exact_bytes_chunked::<R, 8192>(r, len, budget)
+    }
+}
+
+#[inline(never)]
+fn read_exact_bytes_chunked<R: Read, const CHUNK: usize>(
+    r: &mut R,
+    len: usize,
+    budget: Option<&mut super::mem_budget::ScopedCharge>,
+) -> std::io::Result<Vec<u8>> {
     // A corrupt length must not allocate/touch the entire declared payload
     // before discovering EOF. Grow only after each bounded read succeeds.
     let mut buf = Vec::new();
-    let mut chunk = [0; 8192];
+    let mut chunk = [0; CHUNK];
     while buf.len() < len {
         if len > chunk.len() {
             crate::engine::cancel::check_cancelled().map_err(super::spill_quota::quota_as_io)?;
@@ -199,8 +256,14 @@ pub(crate) fn write_value_payload<W: Write>(w: &mut W, v: &Value) -> std::io::Re
 
 #[inline]
 pub(crate) fn write_value<W: Write>(w: &mut W, value: &Value) -> std::io::Result<()> {
-    w.write_all(&[value_tag(value)])?;
-    write_value_payload(w, value)
+    match value {
+        Value::Int(value) => write_int(w, *value),
+        Value::UInt(value) => write_uint(w, *value),
+        _ => {
+            w.write_all(&[value_tag(value)])?;
+            write_value_payload(w, value)
+        }
+    }
 }
 
 pub(crate) fn read_payload<R: Read>(
@@ -234,6 +297,22 @@ pub(crate) fn read_payload_limited<R: Read>(
 ) -> Result<Value, QueryError> {
     Ok(match tag {
         VALUE_NULL => Value::Null,
+        VALUE_INT8 | VALUE_INT16 | VALUE_INT32 => {
+            let width = 1usize << (tag - VALUE_INT8);
+            let mut bytes = [0; 4];
+            r.read_exact(&mut bytes[..width]).map_err(io_err)?;
+            Value::Int(match width {
+                1 => i64::from(bytes[0] as i8),
+                2 => i64::from(i16::from_le_bytes(bytes[..2].try_into().unwrap())),
+                _ => i64::from(i32::from_le_bytes(bytes)),
+            })
+        }
+        VALUE_UINT8 | VALUE_UINT16 | VALUE_UINT32 => {
+            let width = 1usize << (tag - VALUE_UINT8);
+            let mut bytes = [0; 4];
+            r.read_exact(&mut bytes[..width]).map_err(io_err)?;
+            Value::UInt(u64::from(u32::from_le_bytes(bytes)))
+        }
         VALUE_INT => {
             let mut buf = [0u8; 8];
             r.read_exact(&mut buf).map_err(io_err)?;
@@ -460,5 +539,87 @@ mod tests {
             }
         }
         assert!(read_payload(&mut &[][..], 254, false, error).is_err());
+    }
+}
+
+#[cfg(test)]
+mod compact_integer_tests {
+    use super::*;
+    fn error(error: std::io::Error) -> QueryError {
+        crate::error::catalog::ER_UNKNOWN_ERROR.error(error.to_string())
+    }
+    #[test]
+    fn compact_integer_spills_preserve_domain_boundaries_and_reject_truncation() {
+        for value in [
+            i64::MIN,
+            i32::MIN as i64 - 1,
+            i32::MIN as i64,
+            -32769,
+            -32768,
+            -129,
+            -128,
+            -1,
+            0,
+            1,
+            127,
+            128,
+            32767,
+            32768,
+            i32::MAX as i64,
+            i32::MAX as i64 + 1,
+            i64::MAX,
+        ]
+        .into_iter()
+        .map(Value::Int)
+        .chain(
+            [
+                0,
+                1,
+                255,
+                256,
+                65535,
+                65536,
+                u32::MAX as u64,
+                u32::MAX as u64 + 1,
+                u64::MAX,
+            ]
+            .into_iter()
+            .map(Value::UInt),
+        ) {
+            let mut bytes = Vec::new();
+            write_value(&mut bytes, &value).unwrap();
+            assert!(bytes.len() <= 9);
+            let decoded = read_payload(&mut &bytes[1..], bytes[0], false, error).unwrap();
+            assert_eq!(decoded, value);
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&value)
+            );
+            for end in 1..bytes.len() {
+                assert!(read_payload(&mut &bytes[1..end], bytes[0], false, error).is_err());
+            }
+            // Semantic tags remain stable for callers with an explicit schema.
+            let mut legacy = Vec::new();
+            write_value_payload(&mut legacy, &value).unwrap();
+            assert_eq!(
+                read_payload(&mut legacy.as_slice(), value_tag(&value), false, error).unwrap(),
+                value
+            );
+        }
+        let mut bytes = Vec::new();
+        for value in [
+            Value::UInt(0),
+            Value::UInt(1),
+            Value::UInt(1_000_000),
+            Value::Int(2001),
+            Value::Int(48_000),
+        ] {
+            write_value(&mut bytes, &value).unwrap();
+        }
+        assert_eq!(
+            bytes.len(),
+            17,
+            "common counters/keys use 17 bytes instead of 45"
+        );
     }
 }

@@ -1,6 +1,184 @@
 use super::*;
 
 #[test]
+fn dense_noncovering_point_domains_compete_with_sequential_access() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE point_domains(id BIGINT PRIMARY KEY,k INT,v VARCHAR(100),INDEX by_k(k))",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO point_domains VALUES(1,NULL,'one'),(2,1,'two'),(3,2,'three')")
+        .unwrap();
+    engine.execute("ANALYZE TABLE point_domains").unwrap();
+    let db = engine.db_for_tests();
+    let mut schema = db.table("point_domains").unwrap();
+    let stats = &mut Arc::make_mut(&mut schema).stats;
+    stats.row_count = 100_000_000;
+    stats.heap_page_count = 2_000_000;
+    let column = stats.columns.get_mut("k").unwrap();
+    column.distinct_count = 4;
+    column.null_count = 20_000_000;
+    column.top_values.clear();
+    column.histogram.clear();
+    column.frequency = Default::default();
+    stats
+        .indexes
+        .get_mut("by_k")
+        .unwrap()
+        .prefix_distinct_counts = vec![4];
+    let table = PlanTable::new(schema.id, schema.clone(), None);
+    for predicate in ["k IS NULL", "k=1", "k IN (1,2)"] {
+        let filter = parsed_filter(&format!("SELECT * FROM point_domains WHERE {predicate}"));
+        let plan = choose_scan(db, &table, Some(filter.clone()), &ScanHints::none()).unwrap();
+        assert!(
+            matches!(
+                plan,
+                PhysicalPlan::SeqScan { .. } | PhysicalPlan::ZoneMapScan { .. }
+            ),
+            "a dense noncovering domain must price the heap scan: {predicate}: {plan:?}"
+        );
+        let Statement::Select(forced) =
+            crate::parser::parse_statement("SELECT * FROM point_domains FORCE INDEX(by_k)")
+                .unwrap()
+        else {
+            panic!()
+        };
+        let mut hints = ScanHints::none();
+        hints.index_hints = &forced.from[0].index_hints;
+        let plan = choose_scan(db, &table, Some(filter), &hints).unwrap();
+        assert!(matches!(
+            plan,
+            PhysicalPlan::IndexLookup { .. } | PhysicalPlan::IndexMultiLookup { .. }
+        ));
+    }
+    let stats = &mut Arc::make_mut(&mut schema).stats;
+    stats.columns.get_mut("k").unwrap().distinct_count = 1_000_000;
+    stats
+        .indexes
+        .get_mut("by_k")
+        .unwrap()
+        .prefix_distinct_counts = vec![1_000_000];
+    let table = PlanTable::new(schema.id, schema, None);
+    let plan = choose_scan(
+        db,
+        &table,
+        Some(parsed_filter("SELECT * FROM point_domains WHERE k=1")),
+        &ScanHints::none(),
+    )
+    .unwrap();
+    assert!(
+        matches!(plan, PhysicalPlan::IndexLookup { .. }),
+        "sparse point access remains indexed: {plan:?}"
+    );
+}
+
+#[test]
+fn independent_inner_join_can_precede_a_preserved_join() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE island_fact (id INT, d INT, INDEX by_d(d))",
+        "CREATE TABLE island_optional (id INT, v INT, INDEX by_id(id))",
+        "CREATE TABLE island_dim (d INT PRIMARY KEY, flag INT)",
+        "INSERT INTO island_fact SELECT n,MOD(n,100) FROM generate_series(1,10000) g(n)",
+        "INSERT INTO island_optional SELECT n,n FROM generate_series(1,1000) g(n)",
+        "INSERT INTO island_dim SELECT n,IF(n=1,1,0) FROM generate_series(0,99) g(n)",
+        "ANALYZE TABLE island_fact,island_optional,island_dim",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let Statement::Select(select) = crate::parser::parse_statement(
+        "SELECT f.id,o.v FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1"
+    ).unwrap() else { panic!("SELECT") };
+    let plan = plan_select(engine.db_for_tests(), &select)
+        .unwrap()
+        .physical;
+    let mut below_preserved = false;
+    plan.any(|node| {
+        if let PhysicalPlan::HashJoin {
+            left,
+            join_type: JoinType::Left,
+            ..
+        }
+        | PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            join_type: JoinType::Left,
+            ..
+        } = node
+        {
+            below_preserved |= left.any(|node| {
+                collect_physical_plan_tables(node)
+                    .iter()
+                    .any(|table| table.schema.name.ends_with("island_dim"))
+            });
+        }
+        false
+    });
+    assert!(
+        below_preserved,
+        "the selective independent dimension must be available below the preserved join: {plan:?}"
+    );
+    engine
+        .execute("INSERT INTO island_optional VALUES(1,-1),(NULL,22),(101,NULL)")
+        .unwrap();
+    for sql in [
+        "SELECT f.id,o.v,d.flag FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1 ORDER BY f.id,o.v",
+        "SELECT f.id,o.v,d.flag FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1 AND o.v IS NULL ORDER BY f.id,o.v",
+        "SELECT f.*,o.*,d.* FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON f.d=d.d WHERE d.flag=1 ORDER BY f.id,o.v",
+        "SELECT f.id,o.v,d.flag FROM island_fact f LEFT JOIN island_optional o ON f.id=o.id JOIN island_dim d ON o.id=d.d WHERE d.flag=1 ORDER BY f.id,o.v",
+    ] {
+        let QueryResponse::ResultSet(actual) = engine.execute(sql).unwrap().materialize().unwrap() else { panic!("rows") };
+        let QueryResponse::ResultSet(expected) = engine.execute(&sql.replacen("SELECT", "SELECT STRAIGHT_JOIN", 1)).unwrap().materialize().unwrap() else { panic!("rows") };
+        assert_eq!(actual.rows, expected.rows, "{sql}");
+        assert_eq!(actual.columns.iter().map(|column| (&column.name, column.column_type)).collect::<Vec<_>>(),
+            expected.columns.iter().map(|column| (&column.name, column.column_type)).collect::<Vec<_>>(), "{sql}");
+    }
+}
+
+#[test]
+fn sideways_dimension_filter_survives_an_unrelated_materialized_source() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE sip_dim (k INT PRIMARY KEY, flag INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO sip_dim SELECT n, MOD(n,10) FROM generate_series(1,100) g(n)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE sip_fact (k INT, v INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO sip_fact SELECT MOD(n,100)+1,n FROM generate_series(1,1000) g(n)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE sip_dim,sip_fact").unwrap();
+    let spool = crate::engine::api::CteResult::materialized(
+        vec![Column {
+            name: "v".into(),
+            column_type: ColumnType::LongLong,
+            source: Default::default(),
+        }],
+        vec![vec![Value::Int(1)]],
+    );
+    crate::engine::executor::cte::with_cte_registry_extended(
+        HashMap::from([("side".into(), Arc::new(spool))]),
+        || {
+            let Statement::Select(mut select) = crate::parser::parse_statement(
+                "SELECT f.v FROM sip_fact f JOIN sip_dim d ON f.k=d.k CROSS JOIN side s WHERE d.flag=1 AND f.v=s.v"
+            ).unwrap() else { panic!("SELECT") };
+            propagate_sideways_dimension_filters(engine.db_for_tests(), &mut select);
+            assert!(
+                select.selection.as_ref().is_some_and(sip_expr_has_subquery),
+                "a materialized sibling must not hide the base dimension filter"
+            );
+        },
+    );
+}
+
+#[test]
 fn inlj_constant_probe_prefix_does_not_reapply_its_equality_selectivity() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -5677,4 +5855,226 @@ fn uncertain_multicolumn_domains_keep_marginal_bounds_and_contradictions() {
     assert_eq!(estimate("a IN (1,2) AND a IN (3,4)"), 0.0);
     assert_eq!(estimate("a IN (1,2,3,4,5) AND a IN (1,2,3,4,5)"), single);
     assert!((estimate("a=1 AND b=1") - 0.1).abs() < 0.001);
+}
+
+#[test]
+fn runtime_hash_filter_cost_credits_only_deferred_apply_cpu() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE qual_probe(k BIGINT,v INT,s VARCHAR(10))")
+        .unwrap();
+    let schema = engine.db_for_tests().table("qual_probe").unwrap();
+    let key = Expr::CompoundIdentifier(vec!["qual_probe".into(), "k".into()]);
+    let predicate = parsed_filter("SELECT 1 WHERE k IN (SELECT k FROM qual_probe)");
+    let work = 100_000.0 * crate::engine::cbo::cbo_consts().cpu_operator_cost();
+    let mut plan = PhysicalPlan::SeqScan {
+        table: PlanTable::new(schema.id, schema, None),
+        filter: Some(predicate),
+        estimated_rows: 100.0,
+        access_rows: 100_000.0,
+        cost: crate::engine::cbo::Cost::scalar(100_000.0),
+        possible_keys: vec![],
+        runtime_filters: vec![],
+        hint_note: None,
+        projected_columns: None,
+    };
+    let (actual, latency) = runtime_filter_apply_qualification_cpu(&plan, &key).unwrap();
+    assert_eq!(actual, work);
+    assert!(latency > 0.0 && latency <= work);
+    assert!(runtime_filter_apply_qualification_cpu(&plan, &Expr::Identifier("s".into())).is_none());
+    assert!(runtime_filter_apply_qualification_cpu(
+        &plan,
+        &Expr::CompoundIdentifier(vec!["other".into(), "k".into()])
+    )
+    .is_none());
+    let parallel = PhysicalPlan::Exchange {
+        input: Box::new(plan.clone()),
+        degree: 4,
+        output_order: ExchangeOrder::Unordered,
+        merge_keys: vec![],
+        estimated_rows: 100.0,
+        cost: plan_cost(&plan),
+    };
+    assert_eq!(
+        runtime_filter_apply_qualification_cpu(&parallel, &key),
+        Some((work, work / 4.0))
+    );
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE k IN (SELECT k FROM qual_probe) AND k IN (SELECT v FROM qual_probe)",
+    ));
+    assert_eq!(
+        runtime_filter_apply_qualification_cpu(&plan, &key)
+            .unwrap()
+            .0,
+        work,
+        "later Apply conjuncts may short-circuit; only the first test is guaranteed"
+    );
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE v>0 AND k IN (SELECT k FROM qual_probe)",
+    ));
+    let qualified = runtime_filter_apply_qualification_cpu(&plan, &key)
+        .unwrap()
+        .0;
+    assert!(
+        qualified > 0.0 && qualified < work,
+        "scan-local predicates reduce Apply's input population"
+    );
+    for predicate in [
+        "k IN (SELECT a.k FROM qual_probe a JOIN qual_probe b ON a.k=b.k)",
+        "k IN (SELECT MAX(k) FROM qual_probe GROUP BY v)",
+        "k IN (SELECT k+v FROM qual_probe)",
+        "k IN (SELECT k FROM (SELECT k FROM qual_probe) a)",
+        "k IN (SELECT k FROM qual_probe WHERE v IN (SELECT v FROM qual_probe))",
+        "s IN (SELECT s FROM qual_probe)",
+    ] {
+        let predicate = parsed_filter(&format!("SELECT 1 WHERE {predicate}"));
+        let expected = 100_000.0 * qual_cost_per_row(&predicate);
+        let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+            unreachable!()
+        };
+        *filter = Some(predicate);
+        assert_eq!(
+            runtime_filter_apply_qualification_cpu(&plan, &key)
+                .unwrap()
+                .0,
+            expected,
+            "computed or compound domains retain the generic estimate"
+        );
+    }
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE FALSE AND k IN (SELECT k FROM qual_probe)",
+    ));
+    assert!(runtime_filter_apply_qualification_cpu(&plan, &key).is_none());
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE v>0 OR k IN (SELECT k FROM qual_probe)",
+    ));
+    assert!(
+        runtime_filter_apply_qualification_cpu(&plan, &key).is_none(),
+        "an earlier OR arm can skip the subquery altogether"
+    );
+    let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter("SELECT 1 WHERE v>0 AND SHA2(s,512)<>''"));
+    assert!(runtime_filter_apply_qualification_cpu(&plan, &key).is_none());
+}
+
+#[test]
+fn like_selectivity_uses_complete_frequencies_with_sql_collation() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE pattern_frequencies(v VARCHAR(32) COLLATE utf8mb4_0900_ai_ci)")
+        .unwrap();
+    engine.execute("INSERT INTO pattern_frequencies VALUES('>10000'),('>10000'),('<1000'),('Unknown'),('UNKNOWN'),('éclair'),('eclair'),('a_b'),('axb'),(NULL)").unwrap();
+    engine.execute("ANALYZE TABLE pattern_frequencies").unwrap();
+    let table = engine.db_for_tests().table("pattern_frequencies").unwrap();
+    let stats = table.stats.columns.get("v").unwrap();
+    assert!(stats.frequency.complete);
+    assert_eq!(
+        stats.frequency.source,
+        crate::storage::FrequencySource::Exact
+    );
+    for (pattern, escape, expected) in [
+        (">10000%", None, 2.0),
+        ("%known", None, 2.0),
+        ("É%", None, 2.0),
+        ("a!_b", Some('!'), 1.0),
+        ("a_b", None, 2.0),
+        ("%", None, 9.0),
+        ("missing%", None, 0.0),
+    ] {
+        let actual = estimate::estimate_like_rows(&table, "v", pattern, escape, 10.0);
+        assert_eq!(actual, expected, "pattern {pattern}");
+        assert_eq!(
+            estimate::estimate_like_rows(&table, "v", pattern, escape, 100.0),
+            expected * 10.0,
+            "scaled pattern {pattern}"
+        );
+    }
+    let mut binary = (*table).clone();
+    binary.columns[0].collation = Some("utf8mb4_bin".into());
+    assert_eq!(
+        estimate::estimate_like_rows(&binary, "v", "%known", None, 10.0),
+        1.0
+    );
+    assert_eq!(
+        estimate::estimate_like_rows(&binary, "v", "É%", None, 10.0),
+        0.0
+    );
+}
+
+#[test]
+fn exact_integer_arithmetic_bounds_reuse_literal_statistics_and_access() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE arithmetic_bounds(k INT,v VARCHAR(12),INDEX by_k(k),INDEX by_v(v))",
+        "INSERT INTO arithmetic_bounds VALUES(1,'01'),(2,'2'),(2,'02'),(3,' 2'),(4,'2.0'),(5,NULL),(NULL,'five')",
+        "ANALYZE TABLE arithmetic_bounds",
+    ] {engine.execute(sql).unwrap();}
+    let table = engine.db_for_tests().table("arithmetic_bounds").unwrap();
+    for (expression, literal) in [
+        ("k=1+1", "k=2"),
+        ("k BETWEEN 1+0 AND 1+2", "k BETWEEN 1 AND 3"),
+        ("k IN (1,1+1,2*2)", "k IN (1,2,4)"),
+        ("k>=8-6", "k>=2"),
+        ("v=1+1", "v=2"),
+    ] {
+        let estimate = |predicate: &str| {
+            estimate_filter_rows(
+                &table,
+                &parsed_filter(&format!(
+                    "SELECT * FROM arithmetic_bounds WHERE {predicate}"
+                )),
+                7.0,
+            )
+        };
+        assert_eq!(estimate(expression), estimate(literal), "{expression}");
+        let run = |predicate: &str| {
+            let response = engine
+                .execute(&format!(
+                    "SELECT k,v FROM arithmetic_bounds WHERE {predicate} ORDER BY k,v"
+                ))
+                .unwrap()
+                .materialize()
+                .unwrap();
+            let crate::engine::api::QueryResponse::ResultSet(result) = response else {
+                panic!()
+            };
+            result.rows
+        };
+        assert_eq!(run(expression), run(literal), "{expression}");
+    }
+    let expression = |text: &str| {
+        let Statement::Select(select) =
+            crate::parser::parse_statement(&format!("SELECT {text}")).unwrap()
+        else {
+            panic!()
+        };
+        let SelectItem::Expr { expr, .. } = select.projection.into_iter().next().unwrap() else {
+            panic!()
+        };
+        expr
+    };
+    assert_eq!(
+        expr_literal_value(&expression("(1999+2)*2-1")),
+        Some(Value::Int(4001))
+    );
+    for text in ["9223372036854775807+1", "1/0", "1.25+2.5", "RAND()+1"] {
+        assert!(expr_literal_value(&expression(text)).is_none(), "{text}");
+    }
 }

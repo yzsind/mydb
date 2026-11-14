@@ -562,7 +562,10 @@ fn mdl_requests_for_statement(
     if changes_sequence_ownership && !statement_writes_only_temp_tables(session, statement) {
         let table_ids = requests
             .iter()
-            .filter(|request| request.key.object_type == MdlObjectType::Table)
+            .filter(|request| {
+                request.key.object_type == MdlObjectType::Table
+                    && request.lock_type != MdlLockType::SharedRead
+            })
             .filter_map(|request| {
                 let schema = request.key.schema.as_deref()?;
                 let name = request.key.name.as_deref()?;
@@ -773,6 +776,22 @@ pub(super) fn drop_database_mdl_requests(db: &Database, database: &str) -> Vec<M
     }
     for event in catalog.events.values() {
         add(MdlObjectType::Event, &event.database, &event.name);
+    }
+    for header in catalog
+        .tables
+        .values()
+        .filter(|table| table.database.eq_ignore_ascii_case(database))
+    {
+        if let Ok(table) = db.table(&header.qualified_name()) {
+            for fk in &table.foreign_keys {
+                if !fk.referenced_database.eq_ignore_ascii_case(database) {
+                    requests.push(MdlRequest {
+                        key: MdlObjectKey::table(&fk.referenced_database, &fk.referenced_table),
+                        lock_type: MdlLockType::SharedRead,
+                    });
+                }
+            }
+        }
     }
     requests
 }
@@ -1001,6 +1020,30 @@ fn add_fk_mdl_dependencies(
         statement,
         Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
     ) {
+        // Existing FK edges must remain stable while their parent definition
+        // is replaced. This includes FK removal and child identity changes.
+        let mut targets = uses
+            .iter()
+            .filter(|table_use| table_use.write)
+            .map(|table_use| table_use.table.as_str())
+            .collect::<Vec<_>>();
+        if let Statement::RenameTables { pairs } = statement {
+            targets.extend(pairs.iter().map(|(from, _)| from.as_str()));
+        }
+        for target in targets {
+            if is_session_temp_table_ref(session, target) {
+                continue;
+            }
+            if let Ok(table) = db.table(&qualify_persistent_table_name(session, target)) {
+                for fk in &table.foreign_keys {
+                    insert_mdl_mode(
+                        out,
+                        crate::storage::table_key(&fk.referenced_database, &fk.referenced_table),
+                        MdlLockType::SharedRead,
+                    );
+                }
+            }
+        }
         return;
     }
     for table_use in uses.iter().filter(|table_use| table_use.write) {

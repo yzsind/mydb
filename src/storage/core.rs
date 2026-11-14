@@ -1423,6 +1423,14 @@ pub struct Database {
     /// once the catalog swap has published the ids (or on rollback).
     reorg_storage_locs: Mutex<HashMap<u64, ReorgStorageLocation>>,
     partition_ddl_journal_lock: Mutex<()>,
+    recyclebin_ddl: parking_lot::Mutex<()>,
+    recyclebin_scan: parking_lot::Mutex<Option<(IndexKey, RowId)>>,
+    recyclebin_oldest_scan: parking_lot::Mutex<Option<(IndexKey, RowId)>>,
+    recyclebin_pressure: AtomicBool,
+    recyclebin_pressure_purges: AtomicU64,
+    recyclebin_cleanup_failures: AtomicU64,
+    #[cfg(test)]
+    recyclebin_test_free_pct: AtomicU64,
     ddl_retirement_cleanup: parking_lot::Mutex<Option<(IndexKey, RowId)>>,
     partition_cleanup_background: AtomicBool,
     /// XID ownership spans ACTIVE, IDLE, PREPARED and completion I/O.
@@ -3018,6 +3026,7 @@ fn record_query_buffer_miss() {
 
 #[derive(Debug, Clone, Copy)]
 struct RuntimeStorageConfig {
+    recyclebin: crate::recyclebin::Config,
     checkpoint_wal_bytes: u64,
     buffer_pool_pages: u64,
     undo_retention: Duration,
@@ -4591,6 +4600,7 @@ include!("core/database/online_copy.rs");
 include!("core/database/partition_reorg.rs");
 include!("core/database/ctas_recovery.rs");
 include!("core/database/drop_table_recovery.rs");
+include!("core/database/recyclebin.rs");
 include!("core/database/truncate_recovery.rs");
 include!("core/database/rename_table_recovery.rs");
 include!("core/database/dml.rs");

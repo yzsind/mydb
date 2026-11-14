@@ -835,7 +835,9 @@ mod tests {
             .iter()
             .map(batch_field_template)
             .collect::<Vec<_>>();
-        let rows = (0..40_000)
+        // Stay above the parallel admission threshold with compact integer
+        // spill encoding as well as the legacy fixed-width encoding.
+        let rows = (0..80_000)
             .rev()
             .map(|id| {
                 vec![

@@ -35,6 +35,7 @@ pub mod parser_partition;
 pub mod planner;
 pub mod planner_decorrelate;
 pub(crate) mod platform;
+pub mod recyclebin;
 pub mod repl;
 pub mod replication;
 pub mod replication_columns;

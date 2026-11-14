@@ -2211,7 +2211,7 @@ pub(crate) fn create_table_sql(table: &TableSchema) -> Result<String, QueryError
     create_table_sql_with_auto_increment(table, None)
 }
 
-fn create_table_sql_with_auto_increment(
+pub(crate) fn create_table_sql_with_auto_increment(
     table: &TableSchema,
     next_value: Option<u64>,
 ) -> Result<String, QueryError> {
@@ -3132,6 +3132,9 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         crate::engine::executor::mem_budget::controlled_memory_rejections_by_category();
     let work_area = crate::engine::executor::work_area::snapshot();
     let rows = status_rows! {
+        "recyclebin_pressure" => db.recyclebin_status()[0].to_string(),
+        "recyclebin_pressure_purges" => db.recyclebin_status()[1].to_string(),
+        "recyclebin_cleanup_failures" => db.recyclebin_status()[2].to_string(),
         "durability" => status.durability.to_string(),
         "ddl_copy_total" => ddl_copy[0].to_string(),
         "ddl_copy_scan_us" => ddl_copy[1].to_string(),
@@ -3773,6 +3776,12 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
             crate::engine::executor::select::plan::MRR_RIDS .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
         "mrr_unique_pages" =>
             crate::engine::executor::select::plan::MRR_UNIQUE_PAGES .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
+        "hash_agg_dense_integer_activations" => crate::engine::executor::vec::hash_agg::DENSE_INTEGER_ACTIVATIONS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "hash_agg_dense_integer_fallbacks" => crate::engine::executor::vec::hash_agg::DENSE_INTEGER_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "group_count_witness_candidates" => crate::engine::executor::select::vec_bridge::count_witness::CANDIDATES.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "group_count_witness_activations" => crate::engine::executor::select::vec_bridge::count_witness::ACTIVATIONS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "group_count_witness_rows_skipped" =>
+            crate::engine::executor::select::vec_bridge::count_witness::ROWS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed).to_string(),
         "mrr_page_reuses" =>
             crate::engine::executor::select::plan::MRR_PAGE_REUSES .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
         "mrr_workarea_flushes" =>

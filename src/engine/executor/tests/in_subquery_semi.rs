@@ -886,3 +886,131 @@ fn unique_in_subquery_batch_handles_multiple_probe_windows() {
     let QueryResponse::ResultSet(result)=engine.execute("SELECT COUNT(*) FROM batch_numbers WHERE tenant=1 AND id IN (SELECT id FROM batch_keys)").unwrap() else {panic!("rows")};
     assert_eq!(result.rows, vec![vec![Value::Int(2100)]]);
 }
+
+#[test]
+fn grouped_existence_keyset_keeps_nulls_collations_and_count_thresholds() {
+    let setup=[
+        "CREATE TABLE fine_events(k VARCHAR(12) COLLATE utf8mb4_0900_ai_ci,day INT,v DECIMAL(20,4))",
+        "INSERT INTO fine_events VALUES('a',1,1.2500),('A',1,NULL),('a',2,2.5000),('a',2,1.2500),('b',1,9.0000),('b',2,8.0000),(NULL,1,1.0000),(NULL,1,2.0000),('É',1,3.0000),('e',1,4.0000)",
+        "CREATE TABLE key_probes(k VARCHAR(12) COLLATE utf8mb4_0900_ai_ci)",
+        "INSERT INTO key_probes VALUES('a'),('A'),('b'),('é'),('missing'),(NULL)",
+    ];
+    for predicate in ["COUNT(*)>1", "COUNT(v)>1 AND SUM(v)>2.0000"] {
+        for selection in [
+            "k IN (SELECT k FROM selected_groups)",
+            "k NOT IN (SELECT k FROM selected_groups)",
+            "(k IN (SELECT k FROM selected_groups)) IS NULL",
+            "k IN (SELECT k FROM selected_groups WHERE k IS NOT NULL)",
+        ] {
+            let sql=format!("WITH selected_groups AS (SELECT k FROM fine_events GROUP BY k,day HAVING {predicate}) SELECT k FROM key_probes WHERE {selection} ORDER BY k");
+            assert_eq!(
+                run_with_existence_keyset(&setup, &sql, true),
+                run_with_existence_keyset(&setup, &sql, false),
+                "{sql}"
+            );
+        }
+    }
+}
+
+#[test]
+fn grouped_count_witness_matches_full_aggregation_and_observable_counts() {
+    use crate::engine::executor::select::vec_bridge::count_witness::{HITS, ROWS_SKIPPED};
+    use std::sync::atomic::Ordering::Relaxed;
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE witnesses(k BIGINT UNSIGNED,d INT,v DECIMAL(20,4))")
+        .unwrap();
+    let values = (0..180)
+        .map(|i| {
+            format!(
+                "({},{},1.2500)",
+                if i % 3 == 0 {
+                    "NULL"
+                } else if i % 3 == 1 {
+                    "18446744073709551615"
+                } else {
+                    "7"
+                },
+                i % 5
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO witnesses VALUES{values}"))
+        .unwrap();
+    for suffix in ["", " ORDER BY k", " LIMIT 1"] {
+        let sql=format!("WITH g AS (SELECT DISTINCT k FROM witnesses GROUP BY k,d HAVING COUNT(*)>4{suffix}) SELECT a.k FROM g a JOIN g b ON a.k<=>b.k ORDER BY a.k");
+        let rows = |mode| {
+            with_test_env(
+                &[
+                    ("MYDB_GROUP_COUNT_WITNESS", Some(mode)),
+                    ("MYDB_VECTORIZED", Some("on")),
+                    ("MYDB_CTE_PARALLEL_MATERIALIZE", Some("off")),
+                ],
+                || {
+                    let QueryResponse::ResultSet(rs) = engine.execute(&sql).unwrap() else {
+                        panic!("rows")
+                    };
+                    rs.rows
+                },
+            )
+        };
+        let expected = rows("off");
+        let before = HITS.load(Relaxed);
+        let skipped = ROWS_SKIPPED.load(Relaxed);
+        assert_eq!(rows("on"), expected, "{sql}");
+        if suffix.is_empty() {
+            assert!(HITS.load(Relaxed) > before, "witness rule missed");
+            assert!(ROWS_SKIPPED.load(Relaxed) > skipped, "no rows suppressed");
+        } else {
+            assert_eq!(
+                HITS.load(Relaxed),
+                before,
+                "observable ordering/limit must retain all groups"
+            );
+        }
+    }
+    let sql="WITH g AS (SELECT DISTINCT k FROM witnesses GROUP BY k,d HAVING COUNT(*)>4 ORDER BY COUNT(*)) SELECT a.k FROM g a JOIN g b ON a.k<=>b.k";
+    let before = HITS.load(Relaxed);
+    for mode in ["off", "on"] {
+        let error = with_test_env(&[("MYDB_GROUP_COUNT_WITNESS", Some(mode))], || {
+            engine.execute(sql)
+        })
+        .unwrap_err();
+        assert_eq!(error.code(), 3065);
+    }
+    assert_eq!(HITS.load(Relaxed), before);
+    for (predicate, eligible) in [
+        ("COUNT(*)>=5", true),
+        ("4<COUNT(*)", true),
+        ("5<=COUNT(*)", true),
+        ("COUNT(*)=5", false),
+        ("COUNT(*)<5", false),
+        ("COUNT(v)>4", false),
+        ("COUNT(DISTINCT d)>1", false),
+        ("SUM(v)>4", false),
+    ] {
+        let sql=format!("WITH g AS (SELECT DISTINCT k FROM witnesses GROUP BY k,d HAVING {predicate}) SELECT a.k FROM g a JOIN g b ON a.k<=>b.k ORDER BY a.k");
+        let run = |mode| {
+            with_test_env(
+                &[
+                    ("MYDB_GROUP_COUNT_WITNESS", Some(mode)),
+                    ("MYDB_VECTORIZED", Some("on")),
+                    ("MYDB_CTE_PARALLEL_MATERIALIZE", Some("off")),
+                ],
+                || {
+                    let QueryResponse::ResultSet(rs) = engine.execute(&sql).unwrap() else {
+                        panic!("rows")
+                    };
+                    rs.rows
+                },
+            )
+        };
+        let expected = run("off");
+        let before = HITS.load(Relaxed);
+        assert_eq!(run("on"), expected, "{sql}");
+        assert_eq!(HITS.load(Relaxed) > before, eligible, "{sql}");
+    }
+}

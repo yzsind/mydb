@@ -239,7 +239,7 @@ impl Database {
 
     pub fn drop_database(&self, name: &str, if_exists: bool) -> Result<(), QueryError> {
         let key = normalize_name(name);
-        if is_system_database(&key) {
+        if is_system_database(&key) || key == crate::recyclebin::DATABASE {
             return Err(error(
                 crate::error::catalog::ER_DBACCESS_DENIED_ERROR,
                 format!("access denied for database '{name}'"),
@@ -269,6 +269,10 @@ impl Database {
             .map(|name| self.table(name))
             .collect::<Result<Vec<_>, _>>()?;
         let drop_set = table_names.iter().cloned().collect::<HashSet<_>>();
+        let recycle_txn = if self.recyclebin_enabled() { Some(self.begin_txn()?) } else { None };
+        let _recycle_guard = recycle_txn.map(|txn| RollbackTxnGuard::<true> { db: self, txn_id: txn.txn_id });
+        let mut undo = if recycle_txn.is_some() { Some(self.snapshot_recycle_database(&key)?) } else { None };
+        let mut recycled = Vec::new();
         let mut dropped = Vec::new();
         for table in &tables {
             self.check_ddl_table_lock(table.id)?;
@@ -286,7 +290,11 @@ impl Database {
                 ));
             }
             let intent = self.build_drop_table_intent(table)?;
-            let path = self.write_drop_table_intent(&intent)?;
+            let path = if let Some(txn) = recycle_txn {
+                for id in table.storage_ids().into_iter().chain([table.id]) { self.acquire_table_exclusive(txn.txn_id, id)?; }
+                recycled.push(self.prepare_recycle(table, "DROP DATABASE", txn.txn_id)?);
+                None
+            } else { self.stage_table_retirement(&intent)?; None };
             dropped.push((table.clone(), intent, path));
         }
         let sequences = self
@@ -349,6 +357,7 @@ impl Database {
                                 normalize_name(&dep.name),
                             ))
                     }) {
+                        if let Some(undo) = &mut undo { undo.views.insert(table_key(&view.database, &view.name), view.clone()); }
                         view.invalid = true;
                         invalidated.insert(view_key);
                         invalidated_views.push((view.database.clone(), view.name.clone()));
@@ -393,6 +402,7 @@ impl Database {
             }
             catalog.databases.remove(&key);
         }
+        for prepared in &recycled { self.install_recycle(prepared)?; }
         self.note_catalog_schema(&key);
         for (schema, name) in events {
             self.note_catalog_event(&schema, &name);
@@ -418,17 +428,36 @@ impl Database {
             ));
         }
         // One dictionary transaction is the commit point for the entire set.
-        self.commit_ddl_catalog_txn()?;
+        if let Some(txn) = recycle_txn {
+            if let Err(err) = self.commit_recycle_catalog(txn) {
+                for (table, prepared) in tables.iter().zip(&recycled) {
+                    self.rollback_recycle_binding(table, &prepared.table.qualified_name())?;
+                }
+                if let Some(undo) = undo {
+                    let mut catalog = self.catalog_write()?;
+                    catalog.databases.insert(key.clone(), undo.schema);
+                    catalog.views.extend(undo.views);
+                    catalog.routines.extend(undo.routines);
+                    catalog.triggers.extend(undo.triggers);
+                    catalog.events.extend(undo.events);
+                    catalog.sequences.extend(undo.sequences);
+                    build_fk_runtime(&mut catalog);
+                }
+                return Err(err);
+            }
+        } else { self.commit_ddl_catalog_txn()?; }
         for (table, intent, path) in dropped {
-            if self.evict_dropped_table_caches(&table).is_ok()
+            if recycle_txn.is_none() && self.evict_dropped_table_caches(&table).is_ok()
                 && self.purge_dropped_table_files(&intent)
             {
                 self.remove_drop_table_intent(path.as_ref());
             }
             self.catalog
                 .forget_dropped_table(&table.qualified_name(), &table);
-            self.table_write_epochs.write().remove(&table.id);
-            self.drop_table_modification_delta_without_epoch(table.id);
+            if recycle_txn.is_none() {
+                self.table_write_epochs.write().remove(&table.id);
+                self.drop_table_modification_delta_without_epoch(table.id);
+            }
         }
         for sequence in sequences {
             self.sequences.remove(sequence.id);
@@ -725,11 +754,19 @@ impl Database {
     }
 
     pub fn user_table_snapshots(&self) -> Result<Vec<TableSchema>, QueryError> {
+        self.user_table_snapshots_filtered(true)
+    }
+
+    fn active_user_table_snapshots(&self) -> Result<Vec<TableSchema>, QueryError> {
+        self.user_table_snapshots_filtered(false)
+    }
+
+    fn user_table_snapshots_filtered(&self, include_recycled: bool) -> Result<Vec<TableSchema>, QueryError> {
         let headers = self
             .catalog_read()?
             .tables
             .values()
-            .filter(|table| !table.system)
+            .filter(|table| !table.system && (include_recycled || table.database != crate::recyclebin::DATABASE))
             .cloned()
             .collect::<Vec<_>>();
         let mut tables = Vec::with_capacity(headers.len());

@@ -22,7 +22,7 @@ const GEOMETRY: u8 = 15;
 const DECIMAL32_PACKED: u8 = 16;
 const DECIMAL64_PACKED: u8 = 17;
 
-trait Fixed: Copy {
+pub(super) trait Fixed: Copy {
     const WIDTH: usize;
     fn encode(self, bytes: &mut [u8]);
     fn decode(bytes: &[u8]) -> Self;
@@ -44,7 +44,10 @@ fn invalid(message: &str) -> QueryError {
     ))
 }
 
-fn write_fixed<W: Write, T: Fixed>(writer: &mut W, values: &[T]) -> Result<(), QueryError> {
+pub(super) fn write_fixed<W: Write, T: Fixed>(
+    writer: &mut W,
+    values: &[T],
+) -> Result<(), QueryError> {
     // Radix partitions often emit short columns. Clearing an 8 KiB scratch
     // for a few values can cost more than the entire encoded payload.
     match values.len().saturating_mul(T::WIDTH) {
@@ -71,7 +74,7 @@ fn write_fixed_buffer<W: Write, T: Fixed, const N: usize>(
     Ok(())
 }
 
-fn read_fixed<R: Read, T: Fixed>(
+pub(super) fn read_fixed<R: Read, T: Fixed>(
     reader: &mut R,
     count: usize,
     charge: &mut crate::engine::executor::mem_budget::ScopedCharge,

@@ -1,4 +1,4 @@
-//! Lossless build-key reduction from a complete preserved SEMI/ANTI input.
+//! Lossless build-key reduction from a complete preserved probe domain.
 
 use super::*;
 use crate::engine::executor::mem_budget::{self, ScopedCharge};

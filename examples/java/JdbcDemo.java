@@ -51,6 +51,10 @@ public class JdbcDemo {
         require(connection.getAutoCommit(), "New connections should use autocommit");
         require(connection.isValid(5), "Connection validation failed");
         try (Statement statement = connection.createStatement();
+             ResultSet rows = statement.executeQuery("SHOW SESSION STATUS LIKE 'Ssl_cipher'")) {
+            require(rows.next() && !rows.getString(2).isEmpty(), "TLS is required");
+        }
+        try (Statement statement = connection.createStatement();
              ResultSet rows = statement.executeQuery("SELECT 1 AS value")) {
             require(rows.next() && rows.getInt("value") == 1 && !rows.next(), "SELECT 1 failed");
         }
@@ -275,8 +279,6 @@ public class JdbcDemo {
         Properties properties = new Properties();
         properties.setProperty("user", env("MYDB_USER", "root"));
         properties.setProperty("password", env("MYDB_PASSWORD", "root"));
-        properties.setProperty("sslMode", "DISABLED");
-        properties.setProperty("allowPublicKeyRetrieval", "true");
         properties.setProperty("connectTimeout", "5000");
         properties.setProperty("socketTimeout", "15000");
         properties.setProperty("characterEncoding", "UTF-8");

@@ -119,7 +119,7 @@ impl CatalogTxn<'_> {
                 .catalog_read()?
                 .tables
                 .values()
-                .find(|table| table.id == id)
+                .find(|table| table.id == id && table.database != crate::recyclebin::DATABASE)
                 .map(|table| table.object_id);
             let object = match live {
                 Some(id) => Some(id),
@@ -162,7 +162,7 @@ impl CatalogTxn<'_> {
                 .catalog_read()?
                 .tables
                 .values()
-                .find(|table| Some(table.object_id) == current.owned_table_id)
+                .find(|table| Some(table.object_id) == current.owned_table_id && table.database != crate::recyclebin::DATABASE)
                 .cloned();
             // Compact catalog headers deliberately omit columns. They do
             // not prove that an owned column was dropped.

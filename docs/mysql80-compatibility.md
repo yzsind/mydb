@@ -1212,7 +1212,12 @@ MYDB_DATA_DIR=/tmp/mydb/compat-data cargo run -- --host 127.0.0.1 --port 3307
 mysql -h127.0.0.1 -P3307 -uroot -proot test -e "SELECT 1"
 ```
 
-JDBC: `jdbc:mysql://127.0.0.1:3307/test?useSSL=false&allowPublicKeyRetrieval=true`.
+JDBC: `jdbc:mysql://127.0.0.1:3307/test`.
+The default `caching_sha2_password` plugin authenticates over TLS without an
+`allowPublicKeyRetrieval` setting, including on the first connection after a
+restart. Connector/J defaults to `sslMode=PREFERRED`, which negotiates TLS when
+available without verifying server identity and permits plaintext fallback.
+Use a trusted certificate and `sslMode=VERIFY_IDENTITY` for remote connections.
 Startup configuration and TLS options are in [`configuration.md`](configuration.md).
 
 ---
@@ -1286,3 +1291,7 @@ B-tree DESC declarations currently retain metadata and emit a warning. Physical
 keys use ascending encoding; reverse scans or an explicit sort preserve query
 ordering. Mixed ASC/DESC declarations do not provide mixed-direction physical
 ordering.
+
+### Recycle Bin
+
+➕ Persistent DROP TABLE, TRUNCATE TABLE and tables removed by DROP DATABASE enter the default-on [recycle bin](recycle-bin.md). Administrators can inspect retained data, restore it under an unused name, and purge it. Retention is best effort under disk pressure.

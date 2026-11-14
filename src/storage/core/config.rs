@@ -239,6 +239,13 @@ impl StorageConfig {
 impl RuntimeStorageConfig {
     fn from_storage_config(config: &StorageConfig) -> Self {
         Self {
+            recyclebin: crate::recyclebin::Config {
+                enabled: env_bool("MYDB_RECYCLEBIN", true),
+                retention_seconds: env_u64("MYDB_RECYCLEBIN_RETENTION_SECONDS", 604800),
+                min_free_pct: env_u64("MYDB_RECYCLEBIN_MIN_FREE_PCT", 10),
+                target_free_pct: env_u64("MYDB_RECYCLEBIN_TARGET_FREE_PCT", 15),
+                gc_interval_ms: env_u64("MYDB_RECYCLEBIN_GC_INTERVAL_MS", 10000),
+            },
             checkpoint_wal_bytes: config.checkpoint_wal_bytes,
             buffer_pool_pages: config.buffer_pool_pages,
             undo_retention: config.undo_retention,

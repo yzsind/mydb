@@ -1,6 +1,7 @@
 """Self-checking PyMySQL examples against an isolated disposable schema."""
 
 import os
+import ssl
 import uuid
 from datetime import datetime
 from decimal import Decimal
@@ -14,7 +15,7 @@ def require(condition, message):
 
 
 def connect():
-    return pymysql.connect(
+    connection = pymysql.connect(
         host=os.getenv("MYDB_HOST", "127.0.0.1"),
         port=int(os.getenv("MYDB_PORT", "8738")),
         user=os.getenv("MYDB_USER", "root"),
@@ -25,8 +26,16 @@ def connect():
         connect_timeout=5,
         read_timeout=15,
         write_timeout=15,
-        ssl_disabled=True,
+        ssl={"check_hostname": False, "verify_mode": ssl.CERT_NONE},
     )
+    try:
+        with connection.cursor() as cursor:
+            cursor.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+            require(bool(cursor.fetchone()[1]), "TLS is required")
+        return connection
+    except BaseException:
+        connection.close()
+        raise
 
 
 def balance(connection, name, expected):

@@ -3433,6 +3433,8 @@ mod zone_map_worker_budget_tests {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let mut config = StorageConfig::from_env();
         config.buffer_pool_pages = 64;
+        // Keep unrelated asynchronous prefetch scratch out of exact lease deltas.
+        config.buffer_pool_prefetch_pages = 0;
         let engine =
             crate::engine::StorageQueryEngine::open_with_storage_config_without_background_workers(
                 dir.path(),
@@ -10547,7 +10549,7 @@ impl Database {
             .catalog_read()?
             .tables
             .values()
-            .filter(|table| table.zone_map_enabled())
+            .filter(|table| table.database != crate::recyclebin::DATABASE && table.zone_map_enabled())
             .cloned()
             .collect::<Vec<_>>();
         let mut rebuilt = 0u64;
@@ -12337,6 +12339,7 @@ mod zone_map_tests {
         db.rebuild_zone_map_for_table(&table).unwrap();
         db.checkpoint().unwrap();
         let path = db.zone_map_file_path(table.id);
+        db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
         db.drop_table("test.t").unwrap();
         db.checkpoint().unwrap();
         assert!(!path.exists(), "DROP must retire paged sidecar");

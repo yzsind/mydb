@@ -15,8 +15,8 @@ public class JdbcReleaseGate {
         if (!condition) throw new AssertionError(detail);
     }
     private static String url(String port) {
-        return "jdbc:mysql://127.0.0.1:" + port + "/test?useSSL=false&allowPublicKeyRetrieval=true"
-            + "&useServerPrepStmts=true&cachePrepStmts=true&characterEncoding=UTF-8&connectionTimeZone=UTC";
+        return "jdbc:mysql://127.0.0.1:" + port + "/test?useServerPrepStmts=true"
+            + "&cachePrepStmts=true&characterEncoding=UTF-8&connectionTimeZone=UTC";
     }
     private static void verify(Connection connection) throws Exception {
         String sql = "SELECT id,v,u,b,p,ts,s FROM jdbc_release ORDER BY id";

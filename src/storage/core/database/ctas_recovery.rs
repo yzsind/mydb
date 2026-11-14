@@ -167,6 +167,7 @@ impl Database {
                     table_name: intent.table.name.clone(),
                     files: intent.files,
                     vector_files: intent.vector_files,
+                    vector_directories: Vec::new(),
                 });
                 if !cleaned {
                     continue;

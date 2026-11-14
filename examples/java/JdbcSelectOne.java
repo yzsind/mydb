@@ -6,13 +6,19 @@ public class JdbcSelectOne {
             System.exit(2);
         }
         String url = "jdbc:mysql://" + args[0] + ":" + args[1] + "/" + args[4]
-                + "?useSSL=false&allowPublicKeyRetrieval=true&connectTimeout=5000";
+                + "?connectTimeout=5000";
         Class.forName("com.mysql.cj.jdbc.Driver");
         try (java.sql.Connection connection = java.sql.DriverManager.getConnection(url, args[2], args[3]);
-             java.sql.Statement statement = connection.createStatement();
-             java.sql.ResultSet resultSet = statement.executeQuery("SELECT 1 AS v")) {
-            if (!resultSet.next() || resultSet.getInt("v") != 1) {
-                System.exit(1);
+             java.sql.Statement statement = connection.createStatement()) {
+            try (java.sql.ResultSet resultSet = statement.executeQuery("SELECT 1 AS v")) {
+                if (!resultSet.next() || resultSet.getInt("v") != 1) {
+                    throw new IllegalStateException("SELECT 1 failed");
+                }
+            }
+            try (java.sql.ResultSet tls = statement.executeQuery("SHOW SESSION STATUS LIKE 'Ssl_cipher'")) {
+                if (!tls.next() || tls.getString(2).isEmpty()) {
+                    throw new IllegalStateException("TLS is required");
+                }
             }
         }
     }

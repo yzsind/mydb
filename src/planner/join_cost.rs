@@ -495,6 +495,145 @@ pub(super) fn apply_hash_join_parallel_probe_cost_adjustment(
     cost.cpu_units = (cost.cpu_units - cpu_saved).max(0.0);
 }
 
+/// A subquery conjunct is lowered from a scan into Apply before execution.
+/// Runtime filters run in the scan before Apply, so rejected rows avoid that
+/// qualification CPU. Ordinary scan predicates run before runtime filters:
+/// their CPU and all heap I/O must remain in the cost.
+pub(super) fn runtime_filter_apply_qualification_cpu(
+    plan: &PhysicalPlan,
+    key: &Expr,
+) -> Option<(f64, f64)> {
+    use crate::engine::cbo::selectivity::Selectivity;
+    match plan {
+        PhysicalPlan::Exchange { input, degree, .. } => {
+            let (work, _) = runtime_filter_apply_qualification_cpu(input, key)?;
+            Some((work, work / f64::from((*degree).max(1))))
+        }
+        PhysicalPlan::SeqScan {
+            table,
+            filter: Some(predicate),
+            access_rows,
+            ..
+        }
+        | PhysicalPlan::ParallelSeqScan {
+            table,
+            filter: Some(predicate),
+            access_rows,
+            ..
+        } => {
+            let integer_column = |expr: &Expr| {
+                expr_column_name(expr).is_some_and(|column| {
+                    expr_matches_table_column(expr, table, column)
+                        && table.schema.column_index(column).ok().is_some_and(|index| {
+                            matches!(
+                                table.schema.columns[index].data_type,
+                                crate::storage::DataTypeKind::TinyInt
+                                    | crate::storage::DataTypeKind::SmallInt
+                                    | crate::storage::DataTypeKind::MediumInt
+                                    | crate::storage::DataTypeKind::Int
+                                    | crate::storage::DataTypeKind::BigInt
+                            )
+                        })
+                })
+            };
+            if !integer_column(key) {
+                return None;
+            }
+            fn conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+                match expr {
+                    Expr::Binary {
+                        left,
+                        op: BinaryOp::And,
+                        right,
+                    } => {
+                        conjuncts(left, out);
+                        conjuncts(right, out);
+                    }
+                    _ => out.push(expr),
+                }
+            }
+            let mut terms = Vec::new();
+            conjuncts(predicate, &mut terms);
+            let first = terms
+                .iter()
+                .copied()
+                .find(|expr| sip_expr_has_subquery(expr))?;
+            // Later AND terms may short-circuit, and an OR arm can skip its
+            // subquery entirely. Credit only a guaranteed first Apply test.
+            if !matches!(
+                first,
+                Expr::InSubquery { .. } | Expr::Exists { .. } | Expr::QuantifiedComparison { .. }
+            ) {
+                return None;
+            }
+            let local = combine_conjuncts(
+                terms
+                    .into_iter()
+                    .filter(|expr| !sip_expr_has_subquery(expr))
+                    .cloned()
+                    .collect(),
+            );
+            let rows = access_rows.max(0.0);
+            let qualified = local.as_ref().map_or(rows, |predicate| {
+                crate::engine::cbo::selectivity::default_selectivity()
+                    .predicate_rows(&table.schema, predicate, rows)
+                    .clamp(0.0, rows)
+            });
+            // A plain column-domain IN is materialized once and probed with
+            // native integer membership. The generic subquery multiplier
+            // includes work that this kernel does not repeat per input row.
+            // Crediting it in full can incorrectly replace a selective index
+            // range with an entire heap scan. Keep the conservative generic
+            // estimate for joins, derived inputs and computed domains.
+            let per_row = match first {
+                Expr::InSubquery { expr, subquery, .. }
+                    if integer_column(expr)
+                        && subquery.from.len() == 1
+                        && subquery.derived.is_none()
+                        && subquery.joins.is_empty()
+                        && subquery.group_by.is_empty()
+                        && subquery.having.is_none()
+                        && subquery.projection.len() == 1
+                        && matches!(
+                            &subquery.projection[0],
+                            crate::parser::SelectItem::Expr { expr, .. }
+                                if expr_column_name(expr).is_some()
+                        )
+                        && subquery
+                            .selection
+                            .as_ref()
+                            .is_none_or(|predicate| !sip_expr_has_subquery(predicate)) =>
+                {
+                    crate::engine::cbo::cbo_consts().cpu_operator_cost()
+                }
+                _ => qual_cost_per_row(first),
+            };
+            let work = qualified * per_row;
+            if work <= 0.0 {
+                return None;
+            }
+            let degree = match plan {
+                PhysicalPlan::ParallelSeqScan { degree, .. } => (*degree).max(1),
+                _ => {
+                    let degree = if parallel_planner_config().disabled {
+                        1
+                    } else {
+                        cpu_bound_parallel_degree(default_parallel_degree())
+                    };
+                    if degree > 1
+                        && parallelized_probe_scan_cost_for_hash_join(plan, degree).is_some()
+                    {
+                        degree
+                    } else {
+                        1
+                    }
+                }
+            };
+            Some((work, work / f64::from(degree)))
+        }
+        _ => None,
+    }
+}
 pub(super) fn hash_join_parallel_probe_degree_for_cost(build_rows: f64, probe_rows: f64) -> u32 {
     if crate::util::env::var("MYDB_HASH_JOIN_PARALLEL_PROBE_DISABLE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))

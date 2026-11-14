@@ -17,7 +17,7 @@ Drops one or more persistent or temporary tables.
 - Requires the DROP privilege and acquires exclusive metadata locks; missing objects produce an error or a Note depending on IF EXISTS.
 - TEMPORARY resolves only session temporary tables and never accidentally drops a persistent table of the same name.
 - Foreign-key dependencies are checked by the storage drop path. RESTRICT/CASCADE are accepted spellings but do not select a separate cascading-drop algorithm; CASCADE does not authorize deleting dependent foreign-key tables.
-- The drop is DDL; once committed, recovery relies on backups/PITR.
+- The drop is DDL and cannot be rolled back. By default, persistent tables enter the [recycle bin](../../recycle-bin.md); after permanent purge, recovery relies on backups/PITR.
 
 ## Privileges, Transactions, and Dependencies
 

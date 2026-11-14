@@ -21,6 +21,10 @@ use crate::parser::{
 use crate::storage::{error, Database, IsolationLevel, TxnView};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
+mod aggregate_existence;
+mod consumer_domain;
+pub(super) mod grouped_domain;
+mod grouped_share;
 pub(crate) mod spool;
 
 thread_local! {
@@ -871,8 +875,43 @@ pub(super) fn materialize_ctes(
     body: &Statement,
     registry: &SessionRegistry,
 ) -> Result<HashMap<String, Arc<CteResult>>, QueryError> {
+    materialize_ctes_with(
+        db,
+        session,
+        ctes,
+        body,
+        registry,
+        &materialize_single_cte_filtered,
+    )
+}
+
+/// Share dependency ordering, parallel admission, domains, caching and consumer
+/// counts between execution and ANALYZE. The callback changes observation only.
+pub(super) fn materialize_ctes_with<F>(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    ctes: &[CteDef],
+    body: &Statement,
+    registry: &SessionRegistry,
+    materialize: &F,
+) -> Result<HashMap<String, Arc<CteResult>>, QueryError>
+where
+    F: Fn(
+            &Arc<Database>,
+            &mut SessionContext,
+            &CteDef,
+            HashMap<String, Arc<CteResult>>,
+            &SessionRegistry,
+            Option<crate::planner::RuntimeFilter>,
+        ) -> Result<CteResult, QueryError>
+        + Sync,
+{
     let cte_keys = validate_cte_names(ctes)?;
-    let dependencies = collect_cte_dependencies(ctes, &cte_keys);
+    let mut dependencies = collect_cte_dependencies(ctes, &cte_keys);
+    let grouped_domain = grouped_domain::prove(ctes, body, &cte_keys, &dependencies);
+    if let Some(domain) = &grouped_domain {
+        dependencies[domain.producer].extend(domain.builds.iter().map(|&i| cte_keys[i].clone()));
+    }
     let lazy_union_plans = lazy_union_aggregate_plans(ctes, body, &cte_keys);
     let mut lazy_ready: HashMap<String, LazyUnionCte> = HashMap::new();
     let mut accum: HashMap<String, Arc<CteResult>> = HashMap::new();
@@ -929,7 +968,11 @@ pub(super) fn materialize_ctes(
             }
             let mut snapshot = outer.clone();
             snapshot.extend(accum.clone());
+            // A consumer-specific key domain must never populate or reuse a
+            // cache keyed by the unrestricted producer's SQL alone.
+            let domain_producer = grouped_domain.as_ref().is_some_and(|d| d.producer == idx);
             let cache_key = (cte_cache_allowed
+                && !domain_producer
                 && cte_result_cache_cte_eligible(&ctes[idx])
                 && deps
                     .iter()
@@ -964,8 +1007,16 @@ pub(super) fn materialize_ctes(
                     registry,
                 )? {
                     Some(result) => result,
-                    None => materialize_single_cte(db, session, &ctes[idx], snapshot, registry)?,
+                    None => materialize(db, session, &ctes[idx], snapshot, registry, None)?,
                 }
+            } else if domain_producer {
+                let filter = with_cte_registry_extended(snapshot.clone(), || {
+                    grouped_domain
+                        .as_ref()
+                        .expect("domain producer")
+                        .filter(db, session, ctes)
+                })?;
+                materialize(db, session, &ctes[idx], snapshot, registry, filter)?
             } else if parallel_allowed && cte_parallel_materialize_cte_eligible(&ctes[idx]) {
                 parallel_jobs.push(ParallelCteJob {
                     idx,
@@ -976,7 +1027,7 @@ pub(super) fn materialize_ctes(
                 });
                 continue;
             } else {
-                materialize_single_cte(db, session, &ctes[idx], snapshot, registry)?
+                materialize(db, session, &ctes[idx], snapshot, registry, None)?
             };
             let body_result = Arc::new(body_result);
             if let Some(cache_key) = cache_key {
@@ -997,7 +1048,7 @@ pub(super) fn materialize_ctes(
 
         if parallel_jobs.len() == 1 {
             let job = parallel_jobs.pop().expect("one job");
-            let result = materialize_single_cte(db, session, &job.cte, job.visible, registry)?;
+            let result = materialize(db, session, &job.cte, job.visible, registry, None)?;
             let body_result = Arc::new(result);
             if let Some(cache_key) = job.cache_key {
                 let table_versions = collect_cte_dep_versions(db, session, &job.cte);
@@ -1014,7 +1065,8 @@ pub(super) fn materialize_ctes(
             accum.insert(job.key, body_result);
             processed.insert(job.idx);
         } else if parallel_jobs.len() > 1 {
-            let results = materialize_cte_jobs_parallel(db, session, parallel_jobs, registry)?;
+            let results =
+                materialize_cte_jobs_parallel(db, session, parallel_jobs, registry, materialize)?;
             for job_result in results {
                 let body_result = Arc::new(job_result.result);
                 if let Some(cache_key) = job_result.cache_key {
@@ -1130,12 +1182,24 @@ fn cte_parallel_materialize_cte_eligible(cte: &CteDef) -> bool {
         && cte_result_cache_cte_eligible(cte)
 }
 
-fn materialize_cte_jobs_parallel(
+fn materialize_cte_jobs_parallel<F>(
     db: &Arc<Database>,
     session: &SessionContext,
     jobs: Vec<ParallelCteJob>,
     registry: &SessionRegistry,
-) -> Result<Vec<ParallelCteResult>, QueryError> {
+    materialize: &F,
+) -> Result<Vec<ParallelCteResult>, QueryError>
+where
+    F: Fn(
+            &Arc<Database>,
+            &mut SessionContext,
+            &CteDef,
+            HashMap<String, Arc<CteResult>>,
+            &SessionRegistry,
+            Option<crate::planner::RuntimeFilter>,
+        ) -> Result<CteResult, QueryError>
+        + Sync,
+{
     let budget = crate::engine::executor::mem_budget::current_budget();
     let collector = super::select::analyze_stats::current_collector_handle();
     let cancellation = crate::engine::cancel::CancellationSnapshot::capture();
@@ -1163,12 +1227,13 @@ fn materialize_cte_jobs_parallel(
                     )
                 });
                 let run = || {
-                    let result = materialize_single_cte(
+                    let result = materialize(
                         &db,
                         &mut worker_session,
                         &job.cte,
                         job.visible,
                         registry,
+                        None,
                     )?;
                     Ok::<_, QueryError>(ParallelCteResult {
                         idx: job.idx,
@@ -2036,7 +2101,10 @@ pub(super) fn validate_cte_names(ctes: &[CteDef]) -> Result<Vec<String>, QueryEr
     Ok(keys)
 }
 
-fn collect_cte_dependencies(ctes: &[CteDef], cte_keys: &[String]) -> Vec<HashSet<String>> {
+pub(super) fn collect_cte_dependencies(
+    ctes: &[CteDef],
+    cte_keys: &[String],
+) -> Vec<HashSet<String>> {
     ctes.iter()
         .map(|cte| {
             cte_keys
@@ -2065,6 +2133,17 @@ pub(super) fn materialize_single_cte(
     visible: HashMap<String, Arc<CteResult>>,
     registry: &SessionRegistry,
 ) -> Result<CteResult, QueryError> {
+    materialize_single_cte_filtered(db, session, cte, visible, registry, None)
+}
+
+fn materialize_single_cte_filtered(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    cte: &CteDef,
+    visible: HashMap<String, Arc<CteResult>>,
+    registry: &SessionRegistry,
+    filter: Option<crate::planner::RuntimeFilter>,
+) -> Result<CteResult, QueryError> {
     let depth_limit = session.cte_max_recursion_depth;
     with_cte_registry_extended(visible, || {
         let self_ref = statement_references_cte(&cte.query, &cte.name)
@@ -2078,7 +2157,7 @@ pub(super) fn materialize_single_cte(
         if self_ref {
             materialize_recursive(db, session, cte, registry, depth_limit, None, None)
         } else {
-            materialize_non_recursive(db, session, cte, registry)
+            materialize_non_recursive(db, session, cte, registry, filter)
         }
     })
 }
@@ -2090,6 +2169,7 @@ fn materialize_non_recursive(
     session: &mut SessionContext,
     cte: &CteDef,
     registry: &SessionRegistry,
+    filter: Option<crate::planner::RuntimeFilter>,
 ) -> Result<CteResult, QueryError> {
     fn batch_graph_is_planner_visible<'q>(
         statement: impl Into<crate::parser::QueryRef<'q>>,
@@ -2200,14 +2280,25 @@ fn materialize_non_recursive(
                     super::select::execution_context::ExecutionContext::capture_with_budget(
                         txn, budget,
                     );
-                super::select::vec_bridge::try_stream_native_plan(
+                super::select::vec_bridge::try_stream_native_plan_with_group_filter(
                     Arc::clone(db),
                     txn,
                     Arc::new(plan),
                     context,
+                    filter,
                 )
             })?;
-            if let Some(stream) = stream {
+            if let Some(mut stream) = stream {
+                if let Some(select) = physical_statement.as_select() {
+                    let mut described = super::select::describe_select_columns(db, select)?;
+                    for (column, native) in described.iter_mut().zip(&stream.columns) {
+                        if native.source.collation_coercibility.is_some() {
+                            column.source.collation_coercibility =
+                                native.source.collation_coercibility;
+                        }
+                    }
+                    stream.columns = described;
+                }
                 return route_response_to_cte_result(
                     db,
                     QueryResponse::StreamingResultSet(stream),
@@ -2297,7 +2388,7 @@ fn materialize_inline_derived_sources<'q>(
             is_recursive: false,
             query: subquery,
         };
-        let result = materialize_non_recursive(db, session, &synthetic, registry)?;
+        let result = materialize_non_recursive(db, session, &synthetic, registry, None)?;
         set_cte_result(&name, Arc::new(result));
         Ok(())
     }
@@ -2625,6 +2716,17 @@ pub(super) fn materialize_cte_from_physical(
     // in `prepare_select_for_planning` before reaching the executor.
     let mut execution_select = select.clone();
     crate::planner::bind_rollup_select_for_execution(db, &mut execution_select)?;
+    if let Some(stream) = with_cte_materialization(|| {
+        super::select::vec_bridge::try_stream_analyzed_select(
+            db,
+            txn,
+            &execution_select,
+            plan,
+            None,
+        )
+    })? {
+        return route_response_to_cte_result(db, QueryResponse::StreamingResultSet(stream), cte);
+    }
     // A large estimate selects bounded consumption, not a different join
     // executor. Keep native batches for supported projections, including FULL
     // joins whose CTE-key cardinality estimate can greatly exceed real rows.
@@ -2797,6 +2899,7 @@ pub(super) fn analyze_materialize_cte(
     txn: crate::storage::TxnView,
     visible: HashMap<String, Arc<CteResult>>,
     registry: &SessionRegistry,
+    filter: Option<crate::planner::RuntimeFilter>,
 ) -> Result<CteResult, QueryError> {
     // UNION ALL branch path: every branch's display plan was pre-planned
     // (LEFT in `cte_plans`, branches 1.. in `cte_extras`). Drive each
@@ -2863,6 +2966,26 @@ pub(super) fn analyze_materialize_cte(
             let started = std::time::Instant::now();
             let io_start = db.buffer_stats_counts();
             let result = with_cte_registry_extended(visible, || {
+                if let Some(filter) = filter {
+                    let mut execution_select = select.clone();
+                    crate::planner::bind_rollup_select_for_execution(db, &mut execution_select)?;
+                    let stream = with_cte_materialization(|| {
+                        super::select::vec_bridge::try_stream_analyzed_select(
+                            db,
+                            txn,
+                            &execution_select,
+                            plan,
+                            Some(filter),
+                        )
+                    })?;
+                    if let Some(stream) = stream {
+                        return route_response_to_cte_result(
+                            db,
+                            QueryResponse::StreamingResultSet(stream),
+                            cte,
+                        );
+                    }
+                }
                 materialize_cte_from_physical(db, txn, cte, select, plan)
             })?;
             super::select::analyze_stats::record_if_absent_with_io_snapshot(
@@ -3542,7 +3665,7 @@ fn materialize_recursive(
             materialize_cte_from_physical(db, txn, &anchor_def, anchor_select, anchor_plan)?
         }
         _ if read_view.is_some() => materialize_cte_in_view(db, txn, &anchor_def, registry)?,
-        _ => materialize_non_recursive(db, session, &anchor_def, registry)?,
+        _ => materialize_non_recursive(db, session, &anchor_def, registry, None)?,
     };
     for column in &mut anchor.columns {
         column.source.flags &= !crate::mysql::protocol::NOT_NULL_FLAG;
@@ -3735,7 +3858,7 @@ fn materialize_recursive(
                 None if read_view.is_some() => {
                     materialize_cte_in_view(db, txn, &recursive_def, registry)?
                 }
-                None => materialize_non_recursive(db, session, &recursive_def, registry)?,
+                None => materialize_non_recursive(db, session, &recursive_def, registry, None)?,
             };
             if produced.columns.len() != total_columns.len() {
                 return Err(error(
@@ -4143,6 +4266,14 @@ pub(super) fn inline_single_use_ctes<'q>(
     ctes: &mut Vec<CteDef>,
     body: impl Into<crate::parser::QueryMut<'q>>,
 ) {
+    inline_single_use_ctes_retaining(ctes, body, &HashSet::new());
+}
+
+fn inline_single_use_ctes_retaining<'q>(
+    ctes: &mut Vec<CteDef>,
+    body: impl Into<crate::parser::QueryMut<'q>>,
+    retained: &HashSet<String>,
+) {
     let body = body.into();
     if !cte_inline_enabled() || ctes.is_empty() {
         return;
@@ -4152,7 +4283,7 @@ pub(super) fn inline_single_use_ctes<'q>(
     };
     let mut i = 0;
     while i < ctes.len() {
-        if !cte_inline_eligible(&ctes[i]) {
+        if retained.contains(&ctes[i].name.to_ascii_lowercase()) || !cte_inline_eligible(&ctes[i]) {
             i += 1;
             continue;
         }
@@ -4633,9 +4764,20 @@ fn collect_existence_uses_stmt<'q>(
             collect_existence_uses_stmt(&set.left, cte_name, positive_in, state);
             collect_existence_uses_stmt(&set.right, cte_name, positive_in, state);
         }
-        // A nested WITH can shadow the name. Over-counting here only disables
-        // the rewrite, so treating its body conservatively is safe.
+        // Nested definitions can observe multiplicity or shadow the producer.
+        // Inspect both their definitions and their body before proving IN-only use.
         crate::parser::QueryRef::WithCte(with) => {
+            if with
+                .ctes
+                .iter()
+                .any(|cte| cte.name.eq_ignore_ascii_case(cte_name))
+            {
+                state.invalid = true;
+                return;
+            }
+            for cte in with.ctes {
+                collect_existence_uses_stmt(&cte.query, cte_name, false, state);
+            }
             collect_existence_uses_stmt(&with.body, cte_name, positive_in, state)
         }
         _ => {}
@@ -5788,10 +5930,37 @@ pub(super) fn apply_pre_materialization_rewrites(
         fold_query_block_constants(&mut cte.query);
     }
     fold_query_block_constants(&mut *body);
+    aggregate_existence::share(db, current_db, ctes);
+    grouped_share::share(db, current_db, ctes);
     push_reference_domain_predicates_into_ctes(ctes, &mut *body);
     push_groupkey_predicates_into_ctes(ctes, &mut *body);
     if inline {
-        inline_single_use_ctes(ctes, &mut *body);
+        // Keep optional groups available before opening a large grouped
+        // producer. Small relations retain the ordinary inlining route.
+        let keys = ctes
+            .iter()
+            .map(|c| c.name.to_ascii_lowercase())
+            .collect::<Vec<_>>();
+        let dependencies = collect_cte_dependencies(ctes, &keys);
+        let grouped = grouped_domain::prove(ctes, body, &keys, &dependencies);
+        let retained = grouped
+            .filter(|d| {
+                let forced = cfg!(test)
+                    && crate::util::env::var("MYDB_GROUPED_CTE_DOMAIN").is_ok_and(|v| v == "force");
+                forced
+                    || cte_body_scan_volume(db, current_db, &ctes[d.producer].query)
+                        .saturating_mul(128)
+                        > crate::engine::executor::mem_budget::query_mem_limit_bytes()
+                            .saturating_mul(2) as u64
+            })
+            .map(|d| {
+                std::iter::once(d.producer)
+                    .chain(d.builds)
+                    .map(|i| keys[i].clone())
+                    .collect::<HashSet<_>>()
+            })
+            .unwrap_or_default();
+        inline_single_use_ctes_retaining(ctes, &mut *body, &retained);
     }
     prune_unused_cte_columns(ctes, &mut *body);
     shrink_existence_key_ctes(ctes, &mut *body);
@@ -5800,7 +5969,62 @@ pub(super) fn apply_pre_materialization_rewrites(
         inline_in_subquery_only_ctes(db, current_db, ctes, &mut *body);
     }
     push_in_subquery_consumer_domains_into_ctes(ctes, &mut *body);
+    consumer_domain::share(db, current_db, ctes, body);
     push_common_predicates_into_ctes(ctes, &mut *body);
+    // Narrowing the output must not hide group-key lineage from the earlier
+    // consumer-domain proofs. Deduplicate only their already-filtered result.
+    deduplicate_grouped_existence_ctes(ctes, body);
+}
+
+/// IN-only consumers cannot observe duplicate producer keys. Keep the full
+/// grouping and HAVING calculation, then remove duplicates before the CTE
+/// spool, rather than materializing one key per qualifying fine-grained group.
+fn deduplicate_grouped_existence_ctes(ctes: &mut [CteDef], body: &Statement) {
+    if !cte_pushdown_enabled() || !cte_existence_keyset_enabled() {
+        return;
+    }
+    for index in 0..ctes.len() {
+        let Some(key) = existence_only_cte_key(&ctes[index], body, ctes, index) else {
+            continue;
+        };
+        let crate::parser::QueryExpr::Select(select) = &mut ctes[index].query else {
+            continue;
+        };
+        if select.projection.len() != 1
+            || select.group_by.is_empty()
+            || select.distinct
+            || !select.grouping_sets.is_empty()
+            || select.group_by_modifier != crate::parser::GroupByModifier::None
+            || !select.order_by.is_empty()
+            || select.limit.is_some()
+            || select.offset.is_some()
+            || select.for_update
+            || select.lock_clause.is_some()
+            || select.sql_calc_found_rows
+            || select_has_nondeterministic(select)
+        {
+            continue;
+        }
+        let SelectItem::Expr { expr, alias } = &select.projection[0] else {
+            continue;
+        };
+        if alias
+            .as_ref()
+            .or_else(|| match expr {
+                Expr::Identifier(name) => Some(name),
+                Expr::CompoundIdentifier(parts) => parts.last(),
+                _ => None,
+            })
+            .is_none_or(|name| !name.eq_ignore_ascii_case(&key))
+            || !matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+        {
+            continue;
+        }
+        if select.group_by.as_slice() == std::slice::from_ref(expr) {
+            continue;
+        }
+        select.distinct = true;
+    }
 }
 
 // ===========================================================================
@@ -8838,5 +9062,32 @@ mod spill_contract_regressions {
             assert_eq!(budget.used(), 0);
             assert_eq!(budget.spill_bytes(), 0);
         });
+    }
+}
+
+#[cfg(test)]
+mod grouped_existence_tests {
+    use super::*;
+
+    #[test]
+    fn grouped_existence_dedup_keeps_having_and_rejects_visible_multiplicity() {
+        for (suffix, consumer, expected) in [
+            ("", "SELECT k FROM probe WHERE k IN (SELECT k FROM groups_cte)", true),
+            ("", "SELECT k IN (SELECT k FROM groups_cte) FROM probe", true),
+            ("", "SELECT k FROM probe WHERE k NOT IN (SELECT k FROM groups_cte)", false),
+            ("", "SELECT k FROM groups_cte", false),
+            (" LIMIT 2", "SELECT k FROM probe WHERE k IN (SELECT k FROM groups_cte)", false),
+            ("", "SELECT k FROM probe WHERE k IN (SELECT k FROM groups_cte) AND k IN (SELECT k FROM groups_cte)", true),
+            ("", "SELECT k FROM probe WHERE k IN (SELECT k FROM groups_cte) AND 1=(SELECT COUNT(*) FROM groups_cte)", false),
+        ] {
+            let sql=format!("WITH groups_cte AS (SELECT k FROM events GROUP BY k,day HAVING COUNT(*)>2{suffix}) {consumer}");
+            let Statement::WithCte(mut with)=crate::parser::parse_statement(&sql).unwrap() else {panic!()};
+            let original=with.ctes[0].query.as_select().unwrap().clone();
+            deduplicate_grouped_existence_ctes(&mut with.ctes,&with.body);
+            let actual=with.ctes[0].query.as_select().unwrap();
+            assert_eq!(actual.distinct,expected,"{sql}");
+            assert_eq!(actual.group_by,original.group_by);
+            assert_eq!(actual.having,original.having);
+        }
     }
 }
