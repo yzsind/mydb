@@ -4651,10 +4651,98 @@ impl Database {
         } else {
             Vec::new()
         };
+        let reject_zero = |row: &ProjectedMvccStoredRow<'_>| -> Result<(), QueryError> {
+            if cosine
+                && matches!(row.values.first(), Some(Value::Vector(value)) if vector::distance::typed_is_zero(value))
+            {
+                return Err(vector::vector_err("COSINE indexes reject existing zero vectors"));
+            }
+            Ok(())
+        };
+        let page_count = self.with_heap_read(table.id, |heap| Ok(heap.page_count_relaxed()))?;
+        // The registry is part of the vector build, which fans out over the
+        // HNSW build threads regardless of the B-tree build degree.
+        let workers = degree.max(hnsw_build_threads());
+        if direct && workers > 1 && page_count > 64 {
+            // Decoding the cosine column dominates this scan. Workers scan
+            // disjoint page ranges and hand row ids to the shared external
+            // sorter in batches; its run order does not matter.
+            const BATCH: usize = 4096;
+            let task_pages = encoded_scan_task_pages(page_count, workers);
+            let workers = workers.min(page_count.div_ceil(task_pages) as usize).max(1);
+            let next_page = AtomicU64::new(0);
+            let shared = parking_lot::Mutex::new(sorter);
+            let cancel = crate::engine::cancel::CancellationSnapshot::capture();
+            self.with_heap_read(table.id, |heap| {
+                crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
+                    let handles: Vec<_> = (0..workers)
+                        .map(|_| {
+                            let (next_page, shared, columns, key) =
+                                (&next_page, &shared, &columns, &key);
+                            let (cancel, reject_zero) = (cancel.clone(), &reject_zero);
+                            scope.spawn(move || -> Result<(), QueryError> {
+                                let _worker = enter_index_build_worker();
+                                let _cancel = cancel.enter();
+                                heap.with_lob(|| {
+                                    let mut rows = Vec::with_capacity(BATCH);
+                                    let flush = |rows: &mut Vec<RowId>| -> Result<(), QueryError> {
+                                        let mut sorter = shared.lock();
+                                        for row_id in rows.drain(..) {
+                                            sorter.push(
+                                                self.data_dir(),
+                                                IndexEntry {
+                                                    key: key.clone(),
+                                                    row_id,
+                                                },
+                                            )?;
+                                        }
+                                        Ok(())
+                                    };
+                                    loop {
+                                        crate::engine::cancel::check_cancelled()?;
+                                        let start =
+                                            next_page.fetch_add(task_pages, Ordering::Relaxed);
+                                        if start >= page_count {
+                                            break;
+                                        }
+                                        heap.scan_mvcc_columns_direct_range_impl(
+                                            columns,
+                                            start,
+                                            start.saturating_add(task_pages).min(page_count),
+                                            |row| {
+                                                if !row.header.is_deleted() {
+                                                    reject_zero(&row)?;
+                                                    rows.push(row.row_id);
+                                                    if rows.len() == BATCH {
+                                                        flush(&mut rows)?;
+                                                    }
+                                                }
+                                                Ok(false)
+                                            },
+                                        )?;
+                                    }
+                                    flush(&mut rows)
+                                })
+                            })
+                        })
+                        .collect();
+                    for handle in handles {
+                        handle.join().map_err(|_| {
+                            error(
+                                crate::error::catalog::ER_GET_ERRNO,
+                                "vector registry scan worker panicked",
+                            )
+                        })??;
+                    }
+                    Ok(())
+                })
+            })?;
+            return shared.into_inner().finish_with_degree(self.data_dir(), degree);
+        }
         self.with_heap_read(table.id, |heap| {
             let mut append = |row: ProjectedMvccStoredRow<'_>| {
                 if !row.header.is_deleted() {
-                    if cosine&&matches!(row.values.first(),Some(Value::Vector(value)) if vector::distance::typed_is_zero(value)){return Err(vector::vector_err("COSINE indexes reject existing zero vectors"));}
+                    reject_zero(&row)?;
                     sorter.push(
                         self.data_dir(),
                         IndexEntry {

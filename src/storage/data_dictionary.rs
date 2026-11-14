@@ -113,15 +113,15 @@ pub(crate) const DD_DD_PROPERTIES: u64 = DD_TABLE_ID_BASE + 17;
 /// Auth catalog tables.
 pub(crate) const DD_USERS: u64 = DD_TABLE_ID_BASE + 18;
 pub(crate) const DD_ROLE_EDGES: u64 = DD_TABLE_ID_BASE + 19;
-pub(crate) const DD_GLOBAL_PRIVILEGES: u64 = DD_TABLE_ID_BASE + 20;
+pub(crate) const DD_GRANTS: u64 = DD_TABLE_ID_BASE + 20;
 /// `mysql.sequences` — sequence definitions; values live in `sequence_values`.
 pub(crate) const DD_SEQUENCES: u64 = DD_TABLE_ID_BASE + 21;
 /// `mysql.restrictions` — partial-revoke denylist entries.
 pub(crate) const DD_RESTRICTIONS: u64 = DD_TABLE_ID_BASE + 22;
 /// `mysql.table_stats` — independently versioned optimizer statistics.
 pub(crate) const DD_TABLE_STATS: u64 = DD_TABLE_ID_BASE + 23;
-/// `mysql.innodb_dynamic_metadata` — checkpointed engine-owned table state.
-pub(crate) const DD_INNODB_DYNAMIC_METADATA: u64 = DD_TABLE_ID_BASE + 24;
+/// `mysql.table_dynamic_metadata` — checkpointed engine-owned table state.
+pub(crate) const DD_TABLE_DYNAMIC_METADATA: u64 = DD_TABLE_ID_BASE + 24;
 /// Engine-owned retirement manifests, committed with the defining DDL.
 pub(crate) const DD_DDL_RETIREMENTS: u64 = DD_TABLE_ID_BASE + 25;
 pub(crate) const DD_SEQUENCE_VALUES: u64 = DD_TABLE_ID_BASE + 26;
@@ -213,8 +213,8 @@ fn schemata_table() -> TableSchema {
             col("default_charset", varchar(64), false),
             col("default_collation", varchar(64), false),
             col("is_system", DataTypeKind::Bool, false),
-            ucol("created_ms", DataTypeKind::BigInt, false),
-            ucol("updated_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
+            ucol("updated_unix_ms", DataTypeKind::BigInt, false),
         ],
     )
 }
@@ -255,8 +255,8 @@ fn tables_table() -> TableSchema {
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
-            ucol("created_ms", DataTypeKind::BigInt, false),
-            ucol("updated_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
+            ucol("updated_unix_ms", DataTypeKind::BigInt, false),
             // v34: per-table physical-storage knobs (PCTFREE / PCTUSED).
             // Nullable: NULL = follow global. Format: `TableOptions` JSON.
             col(
@@ -288,7 +288,7 @@ fn table_stats_table() -> TableSchema {
             ucol("row_count", DataTypeKind::BigInt, false),
             ucol("heap_page_count", DataTypeKind::BigInt, false),
             ucol("modified_rows", DataTypeKind::BigInt, false),
-            ucol("analyzed_ms", DataTypeKind::BigInt, true),
+            ucol("analyzed_unix_ms", DataTypeKind::BigInt, true),
             col(
                 "sample_fraction",
                 DataTypeKind::Double {
@@ -341,10 +341,10 @@ fn stats_object_table(id: u64, name: &str, keys: &[&str]) -> TableSchema {
     TableSchema::system_table(id, name, columns)
 }
 
-fn innodb_dynamic_metadata_table() -> TableSchema {
+fn table_dynamic_metadata_table() -> TableSchema {
     TableSchema::system_table(
-        DD_INNODB_DYNAMIC_METADATA,
-        "innodb_dynamic_metadata",
+        DD_TABLE_DYNAMIC_METADATA,
+        "table_dynamic_metadata",
         vec![
             ucol("table_id", DataTypeKind::BigInt, false),
             ucol("version", DataTypeKind::BigInt, false),
@@ -366,8 +366,8 @@ fn columns_table() -> TableSchema {
             ucol("column_id", DataTypeKind::Int, false),
             col("name", varchar(64), false),
             ucol("ordinal_position", DataTypeKind::Int, false),
-            ucol("physical_pos", DataTypeKind::Int, false),
-            ucol("logical_pos", DataTypeKind::Int, false),
+            ucol("physical_position", DataTypeKind::Int, false),
+            ucol("logical_position", DataTypeKind::Int, false),
             col(
                 "column_type_json",
                 DataTypeKind::Text { max_len: 65_535 },
@@ -396,7 +396,7 @@ fn columns_table() -> TableSchema {
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
-            col("generated_stored", DataTypeKind::Bool, false),
+            col("is_generated_stored", DataTypeKind::Bool, false),
             col(
                 "generated_column_names_json",
                 DataTypeKind::Text { max_len: 65_535 },
@@ -441,13 +441,13 @@ fn indexes_table() -> TableSchema {
             col("fulltext_parser", varchar(32), true),
             ucol("index_id", DataTypeKind::BigInt, false),
             col(
-                "fulltext_config",
+                "fulltext_config_json",
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
             ucol("readable_from_scn", DataTypeKind::BigInt, false),
             col(
-                "vector_config",
+                "vector_config_json",
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
@@ -472,18 +472,18 @@ fn index_column_usage_table() -> TableSchema {
             col("is_included", DataTypeKind::Bool, false),
             col("expression", DataTypeKind::Text { max_len: 65_535 }, true),
             col(
-                "expr_column_type_json",
+                "expression_column_type_json",
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
-            col("expr_nullable", DataTypeKind::Bool, false),
+            col("is_expression_nullable", DataTypeKind::Bool, false),
             col(
-                "expr_referenced_columns_json",
+                "expression_referenced_columns_json",
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
-            col("expr_multi_valued", DataTypeKind::Bool, false),
-            ucol("expr_collation_id", DataTypeKind::Int, true),
+            col("is_expression_multi_valued", DataTypeKind::Bool, false),
+            ucol("expression_collation_id", DataTypeKind::Int, true),
         ],
     )
 }
@@ -501,7 +501,7 @@ fn check_constraints_table() -> TableSchema {
                 DataTypeKind::Text { max_len: 65_535 },
                 false,
             ),
-            col("enforced", DataTypeKind::Bool, false),
+            col("is_enforced", DataTypeKind::Bool, false),
             col(
                 "column_names_json",
                 DataTypeKind::Text { max_len: 65_535 },
@@ -540,7 +540,7 @@ fn foreign_key_column_usage_table() -> TableSchema {
         "foreign_key_column_usage",
         vec![
             ucol("table_id", DataTypeKind::BigInt, false),
-            col("fk_name", varchar(64), false),
+            col("foreign_key_name", varchar(64), false),
             ucol("ordinal_position", DataTypeKind::Int, false),
             col("column_name", varchar(64), false),
             col("referenced_column_name", varchar(64), false),
@@ -597,7 +597,7 @@ fn views_table() -> TableSchema {
                 true,
             ),
             col("query_json", DataTypeKind::Text { max_len: u32::MAX }, true),
-            ucol("created_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
         ],
     )
 }
@@ -625,15 +625,19 @@ fn routines_table() -> TableSchema {
                 DataTypeKind::Text { max_len: 65_535 },
                 true,
             ),
-            col("return_unsigned", DataTypeKind::Bool, false),
+            col("is_return_unsigned", DataTypeKind::Bool, false),
             col("is_deterministic", DataTypeKind::Bool, false),
             col("sql_data_access", varchar(32), false),
             col("comment", DataTypeKind::Text { max_len: 65_535 }, false),
             col("body", DataTypeKind::Text { max_len: 65_535 }, false),
-            col("params_json", DataTypeKind::Text { max_len: 65_535 }, false),
+            col(
+                "parameters_json",
+                DataTypeKind::Text { max_len: 65_535 },
+                false,
+            ),
             ucol("schema_version", DataTypeKind::BigInt, false),
-            ucol("created_ms", DataTypeKind::BigInt, false),
-            ucol("updated_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
+            ucol("updated_unix_ms", DataTypeKind::BigInt, false),
             col("character_set_client", varchar(64), false),
             col("collation_connection", varchar(64), false),
             col("database_collation", varchar(64), false),
@@ -667,7 +671,7 @@ fn triggers_table() -> TableSchema {
             col("create_sql", DataTypeKind::Text { max_len: 65_535 }, false),
             ucol("action_order", DataTypeKind::Int, false),
             ucol("schema_version", DataTypeKind::BigInt, false),
-            ucol("created_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
             col("sql_mode", DataTypeKind::Text { max_len: 65_535 }, false),
             col("character_set_client", varchar(64), false),
             col("collation_connection", varchar(64), false),
@@ -697,9 +701,9 @@ fn events_table() -> TableSchema {
             col("comment", DataTypeKind::Text { max_len: 65_535 }, false),
             col("body", DataTypeKind::Text { max_len: 65_535 }, false),
             col("create_sql", DataTypeKind::Text { max_len: 65_535 }, false),
-            ucol("created_ms", DataTypeKind::BigInt, false),
-            ucol("last_altered_ms", DataTypeKind::BigInt, false),
-            ucol("last_executed_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
+            ucol("last_altered_unix_ms", DataTypeKind::BigInt, false),
+            ucol("last_executed_unix_ms", DataTypeKind::BigInt, false),
             ucol("schema_version", DataTypeKind::BigInt, false),
             col("sql_mode", DataTypeKind::Text { max_len: 65_535 }, false),
             col("time_zone", varchar(64), false),
@@ -743,7 +747,7 @@ fn users_table() -> TableSchema {
 /// `ordinal`.
 fn grants_table() -> TableSchema {
     TableSchema::system_table(
-        DD_GLOBAL_PRIVILEGES,
+        DD_GRANTS,
         "grants",
         vec![
             col("grant_key", varchar(1024), false),
@@ -788,17 +792,17 @@ fn sequences_table() -> TableSchema {
             ucol("id", DataTypeKind::BigInt, false),
             col("schema_name", varchar(64), false),
             col("name", varchar(64), false),
-            col("as_type", varchar(16), false),
+            col("data_type", varchar(16), false),
             col("increment", DataTypeKind::BigInt, false),
             col("min_value", DataTypeKind::BigInt, false),
             col("max_value", DataTypeKind::BigInt, false),
             col("start_value", DataTypeKind::BigInt, false),
-            col("cache", DataTypeKind::BigInt, false),
-            col("cycle", DataTypeKind::Bool, false),
+            col("cache_size", DataTypeKind::BigInt, false),
+            col("is_cyclic", DataTypeKind::Bool, false),
             col("owned_table", varchar(64), true),
             col("owned_column", varchar(64), true),
-            ucol("created_ms", DataTypeKind::BigInt, false),
-            ucol("updated_ms", DataTypeKind::BigInt, false),
+            ucol("created_unix_ms", DataTypeKind::BigInt, false),
+            ucol("updated_unix_ms", DataTypeKind::BigInt, false),
             ucol("counter_id", DataTypeKind::BigInt, false),
             ucol("owned_table_id", DataTypeKind::BigInt, true),
             ucol("owned_column_id", DataTypeKind::Int, true),
@@ -905,10 +909,10 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
             "column_histograms",
             &["table_id", "column_id"],
         )),
-        Arc::new(innodb_dynamic_metadata_table()),
+        Arc::new(table_dynamic_metadata_table()),
         Arc::new(TableSchema::system_table(
             DD_DDL_RETIREMENTS,
-            "mydb_ddl_retirements",
+            "ddl_retirements",
             vec![
                 ucol("table_id", DataTypeKind::BigInt, false),
                 ucol("generation", DataTypeKind::BigInt, false),
@@ -993,7 +997,7 @@ pub(crate) struct DdRowSet {
     pub index_stats: Vec<Vec<Value>>,
     pub extended_stats: Vec<Vec<Value>>,
     pub column_histograms: Vec<Vec<Value>>,
-    pub innodb_dynamic_metadata: Vec<Vec<Value>>,
+    pub table_dynamic_metadata: Vec<Vec<Value>>,
 }
 
 impl DdRowSet {
@@ -1019,7 +1023,7 @@ impl DdRowSet {
             (DD_EVENTS, &self.events),
             (DD_USERS, &self.users),
             (DD_API_KEYS, &self.api_keys),
-            (DD_GLOBAL_PRIVILEGES, &self.grants),
+            (DD_GRANTS, &self.grants),
             (DD_ROLE_EDGES, &self.role_edges),
             (DD_DD_PROPERTIES, &self.dd_properties),
             (DD_SEQUENCES, &self.sequences),
@@ -1029,7 +1033,7 @@ impl DdRowSet {
             (DD_INDEX_STATS, &self.index_stats),
             (DD_EXTENDED_STATS, &self.extended_stats),
             (DD_COLUMN_HISTOGRAMS, &self.column_histograms),
-            (DD_INNODB_DYNAMIC_METADATA, &self.innodb_dynamic_metadata),
+            (DD_TABLE_DYNAMIC_METADATA, &self.table_dynamic_metadata),
         ]
     }
 }

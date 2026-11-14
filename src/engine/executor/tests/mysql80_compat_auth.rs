@@ -902,10 +902,10 @@ fn information_schema_diagnostics_and_role_grants_follow_mysql_visibility() {
         "INNODB_BUFFER_PAGE",
         "INNODB_TABLES",
         "MYDB_CACHES",
-        "MYDB_PLAN_CACHE",
+        "MYDB_PLAN_CACHE_ENTRIES",
         "MYDB_MEMORY_ADVISOR",
         "MYDB_UNDO_HISTORY",
-        "MYDB_XA_RECOVER",
+        "MYDB_PREPARED_XA_TRANSACTIONS",
     ] {
         if table.starts_with("INNODB_") {
             assert_eq!(

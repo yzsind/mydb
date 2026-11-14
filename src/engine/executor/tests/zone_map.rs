@@ -452,7 +452,7 @@ fn zone_map_sql_differential_and_diagnostics() {
 
     let QueryResponse::ResultSet(rows) = engine
         .execute(
-            "SELECT COUNT(*) FROM information_schema.mydb_zone_maps \
+            "SELECT COUNT(*) FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_schema='test' AND table_name='zm_t' AND column_name='id'",
         )
         .unwrap()
@@ -465,7 +465,7 @@ fn zone_map_sql_differential_and_diagnostics() {
     let QueryResponse::ResultSet(storage_rows) = engine
         .execute(
             "SELECT format_version,file_bytes,live_bytes,state \
-             FROM information_schema.mydb_zone_map_storage \
+             FROM information_schema.MYDB_ZONE_MAP_STORAGE \
              WHERE table_schema='test' AND table_name='zm_t'",
         )
         .unwrap()
@@ -516,7 +516,7 @@ fn zone_map_membership_prunes_randomly_scattered_column_with_real_rows() {
     let analyze_us = analyze_started.elapsed().as_micros();
     let membership_rows = engine
         .execute(
-            "SELECT membership_kind,membership_bytes FROM information_schema.mydb_zone_maps \
+            "SELECT membership_kind,membership_bytes FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_schema='test' AND table_name='zm_scatter' AND column_name='scatter'",
         )
         .unwrap();
@@ -1101,7 +1101,7 @@ fn maintenance_rebuilds_only_stale_zones_and_reports_progress() {
 
     let QueryResponse::ResultSet(before) = engine
         .execute(
-            "SELECT COUNT(DISTINCT zone_id) FROM information_schema.mydb_zone_maps \
+            "SELECT COUNT(DISTINCT zone_id) FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_name='zm_targeted'",
         )
         .unwrap()
@@ -1123,7 +1123,7 @@ fn maintenance_rebuilds_only_stale_zones_and_reports_progress() {
     let QueryResponse::ResultSet(progress) = engine
         .execute(
             "SELECT rebuild_state,rebuild_zones_total,rebuild_zones_done \
-             FROM information_schema.mydb_zone_map_storage \
+             FROM information_schema.MYDB_ZONE_MAP_STORAGE \
              WHERE table_name='zm_targeted'",
         )
         .unwrap()
@@ -1198,7 +1198,7 @@ fn maintenance_cancellation_keeps_conservative_unknown_zones_and_resumes() {
     let QueryResponse::ResultSet(cancelled) = engine
         .execute(
             "SELECT state,rebuild_state,rebuild_zones_total,rebuild_zones_done \
-             FROM information_schema.mydb_zone_map_storage \
+             FROM information_schema.MYDB_ZONE_MAP_STORAGE \
              WHERE table_name='zm_cancel'",
         )
         .unwrap()
@@ -1229,7 +1229,7 @@ fn maintenance_cancellation_keeps_conservative_unknown_zones_and_resumes() {
     let QueryResponse::ResultSet(completed) = engine
         .execute(
             "SELECT state,rebuild_state,rebuild_zones_total,rebuild_zones_done \
-             FROM information_schema.mydb_zone_map_storage \
+             FROM information_schema.MYDB_ZONE_MAP_STORAGE \
              WHERE table_name='zm_cancel'",
         )
         .unwrap()
@@ -1261,7 +1261,7 @@ fn optimize_table_synchronously_rebuilds_zone_map_and_reports_completion() {
     let QueryResponse::ResultSet(progress) = engine
         .execute(
             "SELECT rebuild_state,rebuild_zones_total,rebuild_zones_done \
-             FROM information_schema.mydb_zone_map_storage \
+             FROM information_schema.MYDB_ZONE_MAP_STORAGE \
              WHERE table_name='zm_optimize'",
         )
         .unwrap()
@@ -1490,7 +1490,7 @@ fn zone_maps_diagnostics_pushes_filters_into_lazy_column_loading() {
     let frames_before = resident_pages();
     let QueryResponse::ResultSet(filtered) = engine
         .execute(
-            "SELECT column_name FROM information_schema.mydb_zone_maps \
+            "SELECT column_name FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_schema='test' AND table_name='zm_diag' AND column_name='id'",
         )
         .unwrap()
@@ -1509,7 +1509,7 @@ fn zone_maps_diagnostics_pushes_filters_into_lazy_column_loading() {
 
     let QueryResponse::ResultSet(all_columns) = engine
         .execute(
-            "SELECT column_name FROM information_schema.mydb_zone_maps \
+            "SELECT column_name FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_schema='test' AND table_name='zm_diag'",
         )
         .unwrap()
@@ -1520,7 +1520,7 @@ fn zone_maps_diagnostics_pushes_filters_into_lazy_column_loading() {
     let frames_all_columns = resident_pages();
     let plan = match engine
         .execute(
-            "EXPLAIN FORMAT=TREE SELECT column_name FROM information_schema.mydb_zone_maps \
+            "EXPLAIN FORMAT=TREE SELECT column_name FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_schema='test' AND table_name='zm_diag' AND column_name='id'",
         )
         .unwrap()
@@ -1850,7 +1850,7 @@ fn partitioned_zone_map_prunes_each_storage_for_serial_projected_and_parallel_sc
 
     let QueryResponse::ResultSet(diagnostics) = engine
         .execute(
-            "SELECT storage_id FROM information_schema.mydb_zone_maps \
+            "SELECT storage_id FROM information_schema.MYDB_ZONE_MAPS \
              WHERE table_schema='test' AND table_name='zm_part' AND column_name='id'",
         )
         .unwrap()
@@ -2250,10 +2250,10 @@ fn zone_map_audit_diagnostics_and_settings() {
         .unwrap();
     let dump = |sql: &str| format!("{:?}", engine.execute(sql).unwrap());
     let storage = dump(
-        "SELECT state FROM information_schema.mydb_zone_map_storage WHERE table_name='zm_observe'",
+        "SELECT state FROM information_schema.MYDB_ZONE_MAP_STORAGE WHERE table_name='zm_observe'",
     );
     assert!(storage.contains("PENDING"), "{storage}");
-    assert!(dump("SELECT state FROM information_schema.mydb_zone_maps WHERE table_name='zm_observe' AND column_name='dt'").contains("Unknown"));
+    assert!(dump("SELECT state FROM information_schema.MYDB_ZONE_MAPS WHERE table_name='zm_observe' AND column_name='dt'").contains("Unknown"));
     engine.execute("ANALYZE TABLE zm_observe").unwrap();
     for (column, expected) in [
         ("d", "2024-01-01"),
@@ -2261,7 +2261,7 @@ fn zone_map_audit_diagnostics_and_settings() {
         ("t", "12:34:56"),
         ("y", "2024"),
     ] {
-        assert!(dump(&format!("SELECT min_value FROM information_schema.mydb_zone_maps WHERE table_name='zm_observe' AND column_name='{column}'")).contains(expected));
+        assert!(dump(&format!("SELECT min_value FROM information_schema.MYDB_ZONE_MAPS WHERE table_name='zm_observe' AND column_name='{column}'")).contains(expected));
     }
     for name in ["quiet", "retry"] {
         let key = format!("mydb_zone_map_maintenance_{name}_ms");

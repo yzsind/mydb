@@ -1820,12 +1820,12 @@ fn rls_metadata_and_context_collation() {
             "CREATE POLICY tenant ON secured USING(tenant_id=1)",
         )
         .unwrap();
-    assert_eq!(rows(&engine, &mut root, "SELECT POLICY_NAME,COMMAND,KIND FROM information_schema.mydb_row_security_policies WHERE TABLE_NAME='secured'"), vec![vec![Value::String("tenant".into()),Value::String("ALL".into()),Value::String("PERMISSIVE".into())]]);
+    assert_eq!(rows(&engine, &mut root, "SELECT POLICY_NAME,COMMAND,POLICY_KIND FROM information_schema.MYDB_ROW_SECURITY_POLICIES WHERE TABLE_NAME='secured'"), vec![vec![Value::String("tenant".into()),Value::String("ALL".into()),Value::String("PERMISSIVE".into())]]);
     let mut alice = user("alice", 2);
     assert!(rows(
         &engine,
         &mut alice,
-        "SELECT POLICY_NAME FROM information_schema.mydb_row_security_policies"
+        "SELECT POLICY_NAME FROM information_schema.MYDB_ROW_SECURITY_POLICIES"
     )
     .is_empty());
     assert_eq!(

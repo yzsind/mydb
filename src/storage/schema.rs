@@ -1152,8 +1152,8 @@ impl TableSchema {
             "index_stats" => vec!["table_id", "scope_id", "index_id"],
             "extended_stats" => vec!["table_id", "scope_id", "kind", "ordinal"],
             "column_histograms" => vec!["table_id", "column_id"],
-            "innodb_dynamic_metadata" => vec!["table_id"],
-            "mydb_ddl_retirements" => vec!["table_id", "generation", "index_id"],
+            "table_dynamic_metadata" => vec!["table_id"],
+            "ddl_retirements" => vec!["table_id", "generation", "index_id"],
             "columns" => vec!["table_id", "column_id"],
             "indexes" => vec!["table_id", "name"],
             "index_column_usage" => vec!["table_id", "index_name", "ordinal_position"],
@@ -1161,7 +1161,7 @@ impl TableSchema {
             "row_security_dependencies" => vec!["table_id", "name", "ordinal"],
             "foreign_keys" => vec!["table_id", "name"],
             "foreign_key_column_usage" => {
-                vec!["table_id", "fk_name", "ordinal_position"]
+                vec!["table_id", "foreign_key_name", "ordinal_position"]
             }
             "views" | "triggers" | "events" => vec!["schema_name", "name"],
             "routines" => vec!["schema_name", "routine_type", "name"],
@@ -4905,6 +4905,7 @@ impl TableSchema {
             collation_coercibility: Some(2),
             dynamic_parameter: false,
             round_decimal_result: false,
+            canonical_metadata_name: false,
             wire_type,
             schema: self.database.clone(),
             table: self.name.clone(),

@@ -11,34 +11,35 @@ pub(crate) fn read_word<const N: usize>(buf: &[u8], pos: &mut usize) -> Option<[
 
 #[inline]
 pub(crate) fn read_u16(buf: &[u8], offset: usize) -> u16 {
-    u16::from_le_bytes([buf[offset], buf[offset + 1]])
+    u16::from_le_bytes(buf[offset..][..2].try_into().unwrap())
 }
 #[inline]
 pub(crate) fn read_u32(buf: &[u8], offset: usize) -> u32 {
-    u32::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-    ])
+    u32::from_le_bytes(buf[offset..][..4].try_into().unwrap())
 }
 #[inline]
 pub(crate) fn read_u64(buf: &[u8], offset: usize) -> u64 {
-    u64::from_le_bytes([
-        buf[offset],
-        buf[offset + 1],
-        buf[offset + 2],
-        buf[offset + 3],
-        buf[offset + 4],
-        buf[offset + 5],
-        buf[offset + 6],
-        buf[offset + 7],
-    ])
+    u64::from_le_bytes(buf[offset..][..8].try_into().unwrap())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trusted_words_preserve_unaligned_little_endian_values() {
+        let bytes: Vec<u8> = (0..64).map(|i| (i * 137 + 19) as u8).collect();
+        for offset in 0..=bytes.len() - 8 {
+            let expected = (0..8).fold(0u64, |word, i| {
+                word | (u64::from(bytes[offset + i]) << (i * 8))
+            });
+            assert_eq!(read_u16(&bytes, offset), expected as u16);
+            assert_eq!(read_u32(&bytes, offset), expected as u32);
+            assert_eq!(read_u64(&bytes, offset), expected);
+        }
+        assert_eq!(read_u16(&bytes, bytes.len() - 2), 0xca41);
+        assert_eq!(read_u32(&bytes, bytes.len() - 4), 0xca41b82f);
+    }
 
     #[test]
     fn checked_words_preserve_cursor_on_truncation_and_overflow() {

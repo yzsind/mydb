@@ -8254,7 +8254,8 @@ impl Database {
             let index_builders = index_builders.into_inner();
             Self::set_alter_copy_job_total(&job, copied_rows);
             DDL_COPY_DIRECT_HEAP_BUILDS.fetch_add(1, Ordering::Relaxed);
-            Self::set_alter_copy_job_replay_watermark(&job, copied_rows);
+            // Copy progress is a row count, not a replay SCN. Keep the
+            // watermark absent until an incremental replay publishes one.
 
             Self::set_alter_copy_job_state(&job, "INDEX_BUILD");
             DDL_COPY_INDEX_FEED_US.fetch_add(index_elapsed_us, Ordering::Relaxed);

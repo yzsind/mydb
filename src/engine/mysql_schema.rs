@@ -1139,7 +1139,8 @@ pub(crate) const HIDDEN_DD_TABLES: &[&str] = &[
     "sequence_values",
     "sequence_retirements",
     "innodb_dynamic_metadata",
-    "mydb_ddl_retirements",
+    "table_dynamic_metadata",
+    "ddl_retirements",
 ];
 
 pub(crate) fn is_hidden_dd_table(schema: &str, table: &str) -> bool {

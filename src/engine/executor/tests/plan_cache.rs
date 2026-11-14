@@ -421,7 +421,7 @@ fn a3_caches_report_approx_bytes() {
     // The uniform mydb_caches view surfaces the same figure.
     let caches = rows(
         &engine,
-        "SELECT approx_bytes FROM information_schema.mydb_caches \
+        "SELECT approx_bytes FROM information_schema.MYDB_CACHES \
          WHERE cache_name = 'physical_plan'",
     );
     assert_eq!(caches.len(), 1);
@@ -549,7 +549,7 @@ fn d3_mydb_plan_cache_view_lists_entries() {
     // Empty cache → empty view.
     assert!(rows(
         &engine,
-        "SELECT cached_sql FROM information_schema.mydb_plan_cache"
+        "SELECT SQL_TEXT FROM information_schema.MYDB_PLAN_CACHE_ENTRIES"
     )
     .is_empty());
 
@@ -560,8 +560,8 @@ fn d3_mydb_plan_cache_view_lists_entries() {
 
     let view = rows(
         &engine,
-        "SELECT cached_sql, hits, table_deps, approx_bytes \
-         FROM information_schema.mydb_plan_cache",
+        "SELECT SQL_TEXT, hits, TABLE_DEPENDENCY_COUNT, approx_bytes \
+         FROM information_schema.MYDB_PLAN_CACHE_ENTRIES",
     );
     assert_eq!(view.len(), 1, "one cached join plan expected: {view:?}");
     let row = &view[0];
@@ -783,7 +783,7 @@ fn cache_audit_routine_statements_do_not_leak_plan_hint() {
     }
     let entries = rows(
         &engine,
-        "SELECT CACHED_SQL FROM information_schema.mydb_plan_cache",
+        "SELECT SQL_TEXT FROM information_schema.MYDB_PLAN_CACHE_ENTRIES",
     );
     assert!(
         !entries.iter().any(|row| match &row[0] {

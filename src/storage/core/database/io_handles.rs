@@ -634,7 +634,7 @@ impl Database {
     /// first relation access.
     pub(crate) fn open_catalog_headers_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_DD_PROPERTIES, DD_EVENTS, DD_GLOBAL_PRIVILEGES,
+            catalog_from_dd_rows, DdRowSet, DD_DD_PROPERTIES, DD_EVENTS, DD_GRANTS,
             DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES, DD_TABLES,
             DD_TRIGGERS, DD_USERS, DD_VIEWS,
         };
@@ -647,7 +647,7 @@ impl Database {
             events: load(DD_EVENTS)?,
             users: load(DD_USERS)?,
             api_keys: load(crate::storage::data_dictionary::DD_API_KEYS)?,
-            grants: load(DD_GLOBAL_PRIVILEGES)?,
+            grants: load(DD_GRANTS)?,
             role_edges: load(DD_ROLE_EDGES)?,
             dd_properties: load(DD_DD_PROPERTIES)?,
             sequences: load(DD_SEQUENCES)?,
@@ -752,7 +752,7 @@ impl Database {
         use crate::storage::data_dictionary::{
             catalog_from_dd_rows, DdRowSet, DD_CHECK_CONSTRAINTS, DD_COLUMNS, DD_COLUMN_HISTOGRAMS,
             DD_COLUMN_STATS, DD_DD_PROPERTIES, DD_EVENTS, DD_EXTENDED_STATS, DD_FOREIGN_KEYS,
-            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GLOBAL_PRIVILEGES, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
+            DD_FOREIGN_KEY_COLUMN_USAGE, DD_GRANTS, DD_INDEXES, DD_INDEX_COLUMN_USAGE,
             DD_INDEX_STATS, DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES,
             DD_ROW_SECURITY_DEPENDENCIES, DD_ROW_SECURITY_POLICIES, DD_SCHEMATA, DD_SEQUENCES,
             DD_TABLES, DD_TABLE_STATS, DD_TRIGGERS, DD_USERS, DD_VIEWS,
@@ -775,7 +775,7 @@ impl Database {
             events: load(DD_EVENTS)?,
             users: load(DD_USERS)?,
             api_keys: load(crate::storage::data_dictionary::DD_API_KEYS)?,
-            grants: load(DD_GLOBAL_PRIVILEGES)?,
+            grants: load(DD_GRANTS)?,
             role_edges: load(DD_ROLE_EDGES)?,
             dd_properties: load(DD_DD_PROPERTIES)?,
             sequences: load(DD_SEQUENCES)?,
@@ -785,7 +785,7 @@ impl Database {
             index_stats: load(DD_INDEX_STATS)?,
             extended_stats: load(DD_EXTENDED_STATS)?,
             column_histograms: load(DD_COLUMN_HISTOGRAMS)?,
-            innodb_dynamic_metadata: Vec::new(),
+            table_dynamic_metadata: Vec::new(),
         })
     }
 
@@ -794,7 +794,7 @@ impl Database {
     /// scanned here.
     fn load_non_table_families_from_store(&self) -> Result<Catalog, QueryError> {
         use crate::storage::data_dictionary::{
-            catalog_from_dd_rows, DdRowSet, DD_DD_PROPERTIES, DD_EVENTS, DD_GLOBAL_PRIVILEGES,
+            catalog_from_dd_rows, DdRowSet, DD_DD_PROPERTIES, DD_EVENTS, DD_GRANTS,
             DD_RESTRICTIONS, DD_ROLE_EDGES, DD_ROUTINES, DD_SCHEMATA, DD_SEQUENCES, DD_TRIGGERS,
             DD_USERS, DD_VIEWS,
         };
@@ -806,7 +806,7 @@ impl Database {
             events: self.scan_dd_table(DD_EVENTS)?,
             users: self.scan_dd_table(DD_USERS)?,
             api_keys: self.scan_dd_table(crate::storage::data_dictionary::DD_API_KEYS)?,
-            grants: self.scan_dd_table(DD_GLOBAL_PRIVILEGES)?,
+            grants: self.scan_dd_table(DD_GRANTS)?,
             role_edges: self.scan_dd_table(DD_ROLE_EDGES)?,
             restrictions: self.scan_dd_table(DD_RESTRICTIONS)?,
             dd_properties: self.scan_dd_table(DD_DD_PROPERTIES)?,
@@ -1794,9 +1794,9 @@ impl Database {
         if self.config.durability == DurabilityMode::Memory || is_temp_table_id(table_id) {
             return Ok(None);
         }
-        use crate::storage::data_dictionary::DD_INNODB_DYNAMIC_METADATA;
+        use crate::storage::data_dictionary::DD_TABLE_DYNAMIC_METADATA;
         let rows = self.catalog_rows_for_selector(
-            DD_INNODB_DYNAMIC_METADATA,
+            DD_TABLE_DYNAMIC_METADATA,
             CatalogRowSelector::PrimaryValues(vec![Value::UInt(table_id)]),
         )?;
         let Some(row) = rows.into_iter().next() else {

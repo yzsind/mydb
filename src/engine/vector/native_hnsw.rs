@@ -49,6 +49,7 @@ struct NativeSearchScratch {
     visited: Vec<u64>,
     todo: BinaryHeap<Reverse<Scored<usize>>>,
     best: BinaryHeap<Scored<usize>>,
+    unseen: Vec<usize>,
     charge: ControlledMemoryCharge,
 }
 
@@ -79,7 +80,8 @@ impl NativeSearchScratch {
         let words = nodes.div_ceil(64);
         let bytes = words
             .saturating_mul(8)
-            .saturating_add(ef.saturating_mul(3 * std::mem::size_of::<Scored<usize>>()));
+            .saturating_add(ef.saturating_mul(3 * std::mem::size_of::<Scored<usize>>()))
+            .saturating_add(64 * std::mem::size_of::<usize>());
         let charge = ControlledMemoryCharge::try_new_recoverable(
             ControlledMemoryCategory::StorageScratch,
             bytes,
@@ -88,6 +90,7 @@ impl NativeSearchScratch {
             visited: vec![0; words],
             todo: BinaryHeap::with_capacity(ef.saturating_mul(2)),
             best: BinaryHeap::with_capacity(ef),
+            unseen: Vec::with_capacity(64),
             charge,
         })
     }
@@ -101,6 +104,46 @@ impl NativeSearchScratch {
         let fresh = *word & mask == 0;
         *word |= mask;
         Ok(fresh)
+    }
+
+    fn prepare_neighbors(&mut self, count: usize) -> Result<(), QueryError> {
+        self.unseen.clear();
+        let old = self.unseen.capacity();
+        if count > old {
+            self.charge
+                .try_grow_recoverable((count - old).saturating_mul(std::mem::size_of::<usize>()))?;
+            self.unseen
+                .try_reserve_exact(count)
+                .map_err(|_| codec::vector_err("native HNSW neighbor scratch allocation failed"))?;
+            self.charge.try_grow_recoverable(
+                self.unseen
+                    .capacity()
+                    .saturating_sub(count)
+                    .saturating_mul(std::mem::size_of::<usize>()),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn consider(
+        &mut self,
+        score: Scored<usize>,
+        ef: usize,
+        ties: bool,
+        dot: bool,
+    ) -> Result<(), QueryError> {
+        if self.best.len() < ef || self.best.peek().is_some_and(|worst| score < *worst) {
+            self.push(score, ef, true)?;
+        } else if ties
+            && (score.dist != 0.0 || dot)
+            && self
+                .best
+                .peek()
+                .is_some_and(|worst| score.dist == worst.dist)
+        {
+            self.push(score, ef, false)?;
+        }
+        Ok(())
     }
 
     fn push(&mut self, score: Scored<usize>, ef: usize, admit: bool) -> Result<(), QueryError> {
@@ -135,12 +178,7 @@ impl NativeSearchScratch {
 /// Reserve both full entries and one replacement. Capacity follows memory
 /// headroom and vector width, independently of any query corpus or dataset.
 fn native_query_memo_allocation(dimension: usize, limit: usize) -> Option<(usize, usize)> {
-    let budget = (limit / 16).min(64 * 1024 * 1024);
-    let entry = dimension
-        .checked_mul(4)?
-        .checked_add(12 + NATIVE_MEMO_MAX_CANDIDATES * 16 + 128)?;
-    let entries = (budget / entry).saturating_sub(1).min(4096) / 8 * 8;
-    (entries >= 8).then(|| (entries, (entries + 1) * entry))
+    super::hnsw_paged::QueryNavCache::allocation(dimension, NATIVE_MEMO_MAX_CANDIDATES, limit)
 }
 
 #[derive(Debug)]
@@ -1261,6 +1299,47 @@ impl NativeHnsw {
         }
         self.score(state, id, query, exact)
     }
+    fn navigation_scores4(
+        &self,
+        state: &State,
+        ids: [usize; 4],
+        query: &VectorValue,
+        query_code: Option<&super::quantization::QuantQuery>,
+        exact: Option<&PreparedNativeDistance>,
+    ) -> Result<[f64; 4], QueryError> {
+        if let (Some(quant), Some(csr)) = (self.quantizer(), &state.csr) {
+            if let Some(payloads) = &csr.payloads {
+                let rows = ids.map(|id| {
+                    let begin = id * csr.payload_stride;
+                    &payloads[begin..begin + csr.payload_stride]
+                });
+                return quant.score_payloads4(rows, self.file.as_ref(), query, query_code);
+            }
+        }
+        Ok([
+            self.navigation_score(state, ids[0], query, query_code, exact)?,
+            self.navigation_score(state, ids[1], query, query_code, exact)?,
+            self.navigation_score(state, ids[2], query, query_code, exact)?,
+            self.navigation_score(state, ids[3], query, query_code, exact)?,
+        ])
+    }
+
+    fn prefetch_candidate(state: &State, id: usize) {
+        if let Some(csr) = &state.csr {
+            if let Some(payloads) = &csr.payloads {
+                if let Some(begin) = id.checked_mul(csr.payload_stride) {
+                    if let Some(row) = payloads.get(begin..begin.saturating_add(csr.payload_stride))
+                    {
+                        super::distance::prefetch_read(row.as_ptr().cast());
+                        if let Some(second) = row.get(64..) {
+                            super::distance::prefetch_read(second.as_ptr().cast());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     fn score(
         &self,
         state: &State,
@@ -1483,6 +1562,7 @@ impl NativeHnsw {
             level,
             self.explore_query_ties(query),
             |id| self.navigation_score(state, id, query, query_code, exact),
+            |ids| self.navigation_scores4(state, ids, query, query_code, exact),
         )
     }
 
@@ -1501,11 +1581,13 @@ impl NativeHnsw {
         level: usize,
         explore_ties: bool,
         mut score_node: impl FnMut(usize) -> Result<f64, QueryError>,
+        mut score_nodes4: impl FnMut([usize; 4]) -> Result<[f64; 4], QueryError>,
     ) -> Result<Vec<Scored<usize>>, QueryError> {
         let ef = ef.max(1).min(state.nodes.len());
         if ef == 0 {
             return Ok(Vec::new());
         }
+        let batch_navigation = self.quantizer().is_some();
         NATIVE_SEARCH_SCRATCH.with(|pool| {
             let mut cached = pool.borrow_mut();
             let mut scratch = match cached
@@ -1516,6 +1598,7 @@ impl NativeHnsw {
                     scratch.visited.fill(0);
                     scratch.todo.clear();
                     scratch.best.clear();
+                    scratch.unseen.clear();
                     scratch
                 }
                 None => NativeSearchScratch::new(state.nodes.len(), ef)?,
@@ -1526,20 +1609,12 @@ impl NativeHnsw {
                         dist: score_node(id)?,
                         id,
                     };
-                    if scratch.best.len() < ef
-                        || scratch.best.peek().is_some_and(|worst| score < *worst)
-                    {
-                        scratch.push(score, ef, true)?;
-                    } else if explore_ties
-                        && level == 0
-                        && (score.dist != 0.0 || self.metric == Metric::Dot)
-                        && scratch
-                            .best
-                            .peek()
-                            .is_some_and(|worst| score.dist == worst.dist)
-                    {
-                        scratch.push(score, ef, false)?;
-                    }
+                    scratch.consider(
+                        score,
+                        ef,
+                        explore_ties && level == 0,
+                        self.metric == Metric::Dot,
+                    )?;
                 }
             }
             let mut steps = 0usize;
@@ -1561,31 +1636,73 @@ impl NativeHnsw {
                 } else {
                     Vec::new()
                 };
-                for id in compact
-                    .into_iter()
-                    .flat_map(|edges| edges.iter().map(|&id| id as usize))
-                    .chain(owned)
-                {
-                    if !scratch.visit(id)? {
-                        continue;
+                if let Some(edges) = compact.filter(|_| batch_navigation) {
+                    // Preserve edge and heap-admission order while exposing
+                    // independent neighbor probes to prefetch and SIMD.
+                    scratch.prepare_neighbors(edges.len())?;
+                    for &id in edges {
+                        if scratch.visit(id as usize)? {
+                            scratch.unseen.push(id as usize);
+                        }
                     }
-                    let score = Scored {
-                        dist: score_node(id)?,
-                        id,
-                    };
-                    if scratch.best.len() < ef
-                        || scratch.best.peek().is_some_and(|worst| score < *worst)
+                    for &id in scratch.unseen.iter().take(8) {
+                        Self::prefetch_candidate(state, id);
+                    }
+                    let mut position = 0;
+                    while position + 4 <= scratch.unseen.len() {
+                        for &id in scratch.unseen.iter().skip(position + 8).take(4) {
+                            Self::prefetch_candidate(state, id);
+                        }
+                        let ids = [
+                            scratch.unseen[position],
+                            scratch.unseen[position + 1],
+                            scratch.unseen[position + 2],
+                            scratch.unseen[position + 3],
+                        ];
+                        let distances = score_nodes4(ids)?;
+                        for j in 0..4 {
+                            scratch.consider(
+                                Scored {
+                                    dist: distances[j],
+                                    id: ids[j],
+                                },
+                                ef,
+                                explore_ties,
+                                self.metric == Metric::Dot,
+                            )?;
+                        }
+                        position += 4;
+                    }
+                    while position < scratch.unseen.len() {
+                        let id = scratch.unseen[position];
+                        scratch.consider(
+                            Scored {
+                                dist: score_node(id)?,
+                                id,
+                            },
+                            ef,
+                            explore_ties,
+                            self.metric == Metric::Dot,
+                        )?;
+                        position += 1;
+                    }
+                } else {
+                    for id in compact
+                        .into_iter()
+                        .flat_map(|edges| edges.iter().map(|&id| id as usize))
+                        .chain(owned)
                     {
-                        scratch.push(score, ef, true)?;
-                    } else if explore_ties
-                        && level == 0
-                        && (score.dist != 0.0 || self.metric == Metric::Dot)
-                        && scratch
-                            .best
-                            .peek()
-                            .is_some_and(|worst| score.dist == worst.dist)
-                    {
-                        scratch.push(score, ef, false)?;
+                        if scratch.visit(id)? {
+                            scratch.consider(
+                                Scored {
+                                    dist: score_node(id)?,
+                                    id,
+                                },
+                                ef,
+                                explore_ties && level == 0,
+                                self.metric == Metric::Dot,
+                            )?;
+                        }
                     }
                 }
                 steps += 1;
@@ -2196,7 +2313,11 @@ impl NativeHnsw {
         // visibility and exact native distances on every statement. Holding
         // the state read lock pairs cache lifetime with DML invalidation.
         let limit = request.candidate_limit.min(state.rows.len());
-        let cache_key = state.query_cache.as_ref().map(|_| query.encode());
+        let cache_key = state
+            .query_cache
+            .as_ref()
+            .filter(|cache| cache.cache.enabled())
+            .map(|_| query.encode());
         if let (Some(cache), Some(key)) = (&state.query_cache, &cache_key) {
             if let Some(candidates) = cache.cache.get_bytes(key, limit, ef) {
                 return Ok(VectorSearchResult {
@@ -2266,6 +2387,20 @@ impl NativeHnsw {
                         0,
                         self.explore_query_ties(query),
                         score_node,
+                        |ids| {
+                            let rows = [
+                                view.native_payload(state.nodes[ids[0]].vid)?,
+                                view.native_payload(state.nodes[ids[1]].vid)?,
+                                view.native_payload(state.nodes[ids[2]].vid)?,
+                                view.native_payload(state.nodes[ids[3]].vid)?,
+                            ];
+                            quant.score_payloads4(
+                                rows,
+                                self.file.as_ref(),
+                                query,
+                                query_code.as_ref(),
+                            )
+                        },
                     )
                 })
             } else {

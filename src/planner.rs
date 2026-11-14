@@ -4181,8 +4181,57 @@ fn plan_has_parallel_node(plan: &PhysicalPlan) -> bool {
     }
 }
 
+/// Name provenance is tracked per column so a metadata/user join cannot
+/// change the presentation of unrelated user columns.
+#[derive(Debug, Clone)]
+enum MetadataNamePolicy {
+    QuerySpelling,
+    PublishedSpelling,
+    Mixed(Vec<bool>),
+}
+
+impl MetadataNamePolicy {
+    fn from_flags(flags: Vec<bool>) -> Self {
+        if !flags.iter().any(|flag| *flag) {
+            Self::QuerySpelling
+        } else if flags.iter().all(|flag| *flag) {
+            Self::PublishedSpelling
+        } else {
+            Self::Mixed(flags)
+        }
+    }
+
+    fn from_columns(columns: &[crate::types::Column]) -> Self {
+        if !columns
+            .iter()
+            .any(|column| column.source.canonical_metadata_name)
+        {
+            return Self::QuerySpelling;
+        }
+        Self::from_flags(
+            columns
+                .iter()
+                .map(|column| column.source.canonical_metadata_name)
+                .collect(),
+        )
+    }
+
+    fn any(&self) -> bool {
+        !matches!(self, Self::QuerySpelling)
+    }
+
+    fn at(&self, index: usize) -> bool {
+        match self {
+            Self::QuerySpelling => false,
+            Self::PublishedSpelling => true,
+            Self::Mixed(flags) => flags.get(index).copied().unwrap_or(false),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ScopeTable {
+    canonical_metadata_names: MetadataNamePolicy,
     name: String,
     alias: Option<String>,
     /// All addressable column names (name resolution / ambiguity checks).
@@ -4334,7 +4383,15 @@ pub fn resolve_join_using_natural(db: &Database, select: &mut Select) -> Result<
     }
 
     let rewrite = coalesced_rewrite_map(&output);
-    rewrite_select_level_coalesced_identifiers(select, &rewrite);
+    rewrite_select_level_coalesced_identifiers(
+        select,
+        &rewrite,
+        preceding_scope
+            .tables
+            .iter()
+            .any(|table| table.canonical_metadata_names.any())
+            .then_some(output.as_slice()),
+    );
     if has_coalescing_join {
         expand_bare_wildcards(select, &output);
     }
@@ -4557,7 +4614,11 @@ fn coalesced_rewrite_map(columns: &[JoinOutputColumn]) -> CoalescedRewrite {
     rewrite
 }
 
-fn rewrite_select_level_coalesced_identifiers(select: &mut Select, rewrite: &CoalescedRewrite) {
+fn rewrite_select_level_coalesced_identifiers(
+    select: &mut Select,
+    rewrite: &CoalescedRewrite,
+    output: Option<&[JoinOutputColumn]>,
+) {
     for item in &mut select.projection {
         if let SelectItem::Expr { expr, alias } = item {
             let implicit_name = if alias.is_none() {
@@ -4565,7 +4626,16 @@ fn rewrite_select_level_coalesced_identifiers(select: &mut Select, rewrite: &Coa
                     rewrite
                         .unqualified
                         .contains_key(&name.to_ascii_lowercase())
-                        .then(|| name.clone())
+                        .then(|| {
+                            output
+                                .and_then(|output| {
+                                    output
+                                        .iter()
+                                        .find(|column| column.name.eq_ignore_ascii_case(name))
+                                })
+                                .map(|column| column.name.clone())
+                                .unwrap_or_else(|| name.clone())
+                        })
                 } else if let Expr::CompoundIdentifier(parts) = expr {
                     let column = parts.last().cloned();
                     let qualifier = (parts.len() >= 2).then(|| parts[parts.len() - 2].clone());
@@ -4701,7 +4771,7 @@ fn validate_select_column_references_inner(
     validate_select_in_column_scope(db, select, &scope)
 }
 
-/// DISTINCT removes the source row identity. An ORDER BY expression must be
+/// Under ONLY_FULL_GROUP_BY, DISTINCT requires an ORDER BY expression to be
 /// evaluable entirely from selected expressions (or constants).
 fn distinct_order_is_selected(
     db: &Database,
@@ -4859,9 +4929,12 @@ fn validate_select_in_column_scope(
     if let Some(having) = &select.having {
         validate_expr_columns(db, having, &scope, Some(&aliases), true)?;
     }
+    // MySQL permits hidden sort keys when ONLY_FULL_GROUP_BY is disabled.
+    // Name resolution remains mandatory in either mode, including nested scopes.
+    let check_distinct_order = select.distinct && crate::engine::expr::session_only_full_group_by();
     for (index, order_by) in select.order_by.iter().enumerate() {
         validate_expr_columns(db, &order_by.expr, &scope, Some(&aliases), true)?;
-        if select.distinct && !distinct_order_is_selected(db, &order_by.expr, select, scope) {
+        if check_distinct_order && !distinct_order_is_selected(db, &order_by.expr, select, scope) {
             return Err(error(crate::error::catalog::ER_FIELD_IN_ORDER_NOT_SELECT,
                 format!("Expression #{} of ORDER BY clause is not in SELECT list; this is incompatible with DISTINCT", index + 1)));
         }
@@ -4997,18 +5070,30 @@ fn scope_table_for_ref(
         let stubs = crate::engine::executor::cte::describe_definitions(&with.ctes, |query| {
             crate::engine::executor::select::describe_subquery_columns(db, query)
         })?;
-        let mut columns = crate::engine::executor::cte::with_cte_registry_extended(stubs, || {
-            if let crate::parser::QueryExpr::Select(body) = &with.body {
-                let scope = build_column_scope(db, body, outer)?;
-                validate_select_in_column_scope(db, body, &scope)?;
-                select_output_column_names(body, &scope)
-            } else {
-                crate::engine::executor::select::describe_subquery_columns(db, derived)
-                    .map(|columns| columns.into_iter().map(|column| column.name).collect())
-            }
-        })?;
+        let (mut columns, canonical_metadata_names) =
+            crate::engine::executor::cte::with_cte_registry_extended(stubs, || {
+                if let crate::parser::QueryExpr::Select(body) = &with.body {
+                    let scope = build_column_scope(db, body, outer)?;
+                    validate_select_in_column_scope(db, body, &scope)?;
+                    Ok((
+                        select_output_column_names(body, &scope)?,
+                        scope.projected_metadata_names(body),
+                    ))
+                } else {
+                    crate::engine::executor::select::describe_subquery_columns(db, derived).map(
+                        |columns| {
+                            let canonical = MetadataNamePolicy::from_columns(&columns);
+                            (
+                                columns.into_iter().map(|column| column.name).collect(),
+                                canonical,
+                            )
+                        },
+                    )
+                }
+            })?;
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5017,12 +5102,15 @@ fn scope_table_for_ref(
         });
     }
     if let Some(derived @ SubQuery::Rrf(_)) = derived {
-        let mut columns = crate::engine::executor::select::describe_subquery_columns(db, derived)?
+        let described = crate::engine::executor::select::describe_subquery_columns(db, derived)?;
+        let canonical_metadata_names = MetadataNamePolicy::from_columns(&described);
+        let mut columns = described
             .into_iter()
             .map(|column| column.name)
             .collect::<Vec<_>>();
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5047,6 +5135,7 @@ fn scope_table_for_ref(
         let mut columns = select_output_column_names(inner, &inner_scope)?;
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            canonical_metadata_names: inner_scope.projected_metadata_names(inner),
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5057,6 +5146,7 @@ fn scope_table_for_ref(
     if let Some(spec) = table.generate_series.as_deref() {
         let columns = generate_series_column_names(spec);
         return Ok(ScopeTable {
+            canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5065,8 +5155,10 @@ fn scope_table_for_ref(
         });
     }
     if let Some(PhysicalPlan::CteScan { columns, .. }) = try_plan_cte_scan(table) {
+        let canonical_metadata_names = MetadataNamePolicy::from_columns(&columns);
         let columns: Vec<String> = columns.into_iter().map(|column| column.name).collect();
         return Ok(ScopeTable {
+            canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5077,6 +5169,7 @@ fn scope_table_for_ref(
     if let Ok(columns) = crate::engine::information_schema::columns_for_table_name(&table.name) {
         let columns: Vec<String> = columns.into_iter().map(|column| column.name).collect();
         return Ok(ScopeTable {
+            canonical_metadata_names: MetadataNamePolicy::PublishedSpelling,
             name: crate::storage::split_table_name(crate::storage::DEFAULT_DATABASE, &table.name).1,
             alias: table.alias.clone(),
             wildcard_columns: columns.clone(),
@@ -5100,6 +5193,7 @@ fn scope_table_for_ref(
         addressable.push("ROWID".into());
     }
     Ok(ScopeTable {
+        canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
         name: schema.name.clone(),
         alias: table.alias.clone(),
         columns: addressable,
@@ -5199,11 +5293,11 @@ fn select_output_column_names(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                columns.push(
-                    alias
-                        .clone()
-                        .unwrap_or_else(|| crate::engine::expr::expr_name(expr)),
-                );
+                columns.push(crate::engine::expr::result_column_name(
+                    expr,
+                    alias.as_deref(),
+                    scope.published_column_name(expr),
+                ));
             }
         }
     }
@@ -5236,6 +5330,87 @@ fn projection_aliases(select: &Select) -> HashSet<String> {
 }
 
 impl ColumnScope<'_> {
+    fn projected_metadata_names(&self, select: &Select) -> MetadataNamePolicy {
+        if !self
+            .tables
+            .iter()
+            .any(|table| table.canonical_metadata_names.any())
+        {
+            return MetadataNamePolicy::QuerySpelling;
+        }
+        let mut flags = Vec::new();
+        for item in &select.projection {
+            match item {
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                    for table in self.tables.iter().filter(|table| match item {
+                        SelectItem::QualifiedWildcard(qualifier) => table.matches_name(qualifier),
+                        _ => true,
+                    }) {
+                        for name in &table.wildcard_columns {
+                            flags.push(
+                                table
+                                    .columns
+                                    .iter()
+                                    .position(|column| column.eq_ignore_ascii_case(name))
+                                    .is_some_and(|index| table.canonical_metadata_names.at(index)),
+                            );
+                        }
+                    }
+                }
+                SelectItem::Expr { expr, .. } => {
+                    let mut reference = expr;
+                    while let Expr::GroupKeyRef { expr, .. } = reference {
+                        reference = expr;
+                    }
+                    flags.push(
+                        if matches!(reference, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                            self.published_column_name(expr).is_some()
+                        } else {
+                            true
+                        },
+                    );
+                }
+            }
+        }
+        MetadataNamePolicy::from_flags(flags)
+    }
+
+    fn published_column_name(&self, expr: &Expr) -> Option<&str> {
+        let (qualifier, name) = match expr {
+            Expr::Identifier(name) => (None, name.as_str()),
+            Expr::CompoundIdentifier(parts) if parts.len() >= 2 => (
+                Some(parts[parts.len() - 2].as_str()),
+                parts.last()?.as_str(),
+            ),
+            Expr::GroupKeyRef { expr, .. } => return self.published_column_name(expr),
+            _ => return None,
+        };
+        let mut columns = self
+            .tables
+            .iter()
+            .filter(|table| table.visible)
+            .filter(|table| qualifier.is_none_or(|q| table.matches_name(q)))
+            .flat_map(|table| {
+                table
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .map(move |(index, column)| (column, table.canonical_metadata_names.at(index)))
+            })
+            .filter(|(column, _)| column.eq_ignore_ascii_case(name));
+        let first = columns.next();
+        if columns.next().is_some() {
+            return None;
+        }
+        match first {
+            Some((column, true)) => Some(column.as_str()),
+            Some((_, false)) => None,
+            None => self
+                .outer
+                .and_then(|outer| outer.published_column_name(expr)),
+        }
+    }
+
     fn resolve_qualifier(&self, qualifier: &str) -> Result<(), QueryError> {
         if self.matching_tables(qualifier).next().is_some() {
             return Ok(());
@@ -9669,7 +9844,13 @@ pub(crate) fn try_plan_cte_scan(table: &TableRef) -> Option<PhysicalPlan> {
 }
 
 fn try_plan_system_scan(table: &TableRef, filter: Option<Expr>) -> Option<PhysicalPlan> {
-    let columns = crate::engine::information_schema::columns_for_table_name(&table.name).ok()?;
+    let mut columns =
+        crate::engine::information_schema::columns_for_table_name(&table.name).ok()?;
+    if let Some(alias) = &table.alias {
+        for column in &mut columns {
+            column.source.table.clone_from(alias);
+        }
+    }
     let estimated_rows = 1_000.0;
     Some(PhysicalPlan::SystemScan {
         name: table.name.clone(),
@@ -14412,9 +14593,38 @@ pub(crate) fn parameter_selectivity_signature(
     select: &Select,
     params: &[Value],
 ) -> String {
+    let mut dynamic = false;
+    selectivity_signature_impl(db, select, Some(params), &mut dynamic)
+}
+
+/// True when [`parameter_selectivity_signature`] is the empty string for
+/// every parameter vector: no predicate compares a statistics-bearing column
+/// with a placeholder outside a unique single-column equality, and no vector
+/// cost setting participates. The answer depends only on the statement and
+/// the table descriptors (including their statistics), so a prepared memo
+/// that revalidates those descriptors may cache it and skip recomputing the
+/// signature on every EXECUTE.
+pub(crate) fn parameter_selectivity_is_static(db: &Database, select: &Select) -> bool {
+    let mut dynamic = false;
+    selectivity_signature_impl(db, select, None, &mut dynamic);
+    !dynamic
+}
+
+/// Shared walk. With `params == None` it only decides, conservatively,
+/// whether any term could contribute to the signature (`dynamic`).
+fn selectivity_signature_impl(
+    db: &Database,
+    select: &Select,
+    params: Option<&[Value]>,
+    dynamic: &mut bool,
+) -> String {
     use std::fmt::Write as _;
     let mut signature = String::new();
     if has_vector_cost_dependency(select) {
+        let Some(_) = params else {
+            *dynamic = true;
+            return signature;
+        };
         // Search settings alter the ANN/exact cost crossover even when the
         // predicate and parameter types stay unchanged. Include nested KNNs.
         let mut hasher = std::hash::DefaultHasher::new();
@@ -14424,7 +14634,7 @@ pub(crate) fn parameter_selectivity_signature(
         );
         let _ = write!(signature, ":v{:016x}", std::hash::Hasher::finish(&hasher));
     }
-    if params.is_empty() {
+    if params.is_some_and(|params| params.is_empty()) {
         return signature;
     }
     let mut tables = smallvec::SmallVec::<[(&str, Option<&str>, Arc<TableSchema>); 4]>::new();
@@ -14451,8 +14661,12 @@ pub(crate) fn parameter_selectivity_signature(
         let Expr::Placeholder(index) = parameter else {
             return;
         };
-        let Some(value) = params.get(*index) else {
-            return;
+        let value = match params {
+            Some(params) => match params.get(*index) {
+                Some(value) => Some(value),
+                None => return,
+            },
+            None => None,
         };
         let Some(column) = expr_column_name(column_expr) else {
             return;
@@ -14495,6 +14709,12 @@ pub(crate) fn parameter_selectivity_signature(
         {
             return;
         }
+        // Every static gate passed: this term can contribute.
+        let Some(value) = value else {
+            *dynamic = true;
+            return;
+        };
+        let params = params.unwrap_or_default();
         // A conjunctive interval has one cardinality. Bucketing its two
         // half-lines independently needlessly invalidates a prepared memo as
         // a narrow window moves through the domain, even when its cost stays

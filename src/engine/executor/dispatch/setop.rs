@@ -1905,7 +1905,6 @@ where
     }
     drop(buffer);
     drop(buffer_charge);
-    drop(push);
     drop(key_cache);
     let Some(spill) = spill else {
         return Ok(IncrementalSetOutput::in_memory(

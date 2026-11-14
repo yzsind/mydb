@@ -12,6 +12,7 @@ pub(crate) struct MappedVectorNavigation {
     source_revision: u64,
     verified: Vec<AtomicU64>,
     records: Option<MappedRecordCache>,
+    norms: Option<MappedNormCache>,
     cache: crate::engine::vector::hnsw_paged::QueryNavCache,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
@@ -68,7 +69,7 @@ impl MappedRecordCache {
     }
 
     #[inline]
-    fn slot(&self, vid: VecId) -> Option<&std::sync::atomic::AtomicU16> {
+    fn position(&self, vid: VecId) -> Option<usize> {
         let slot = usize::from(vid_slot(vid));
         if slot >= self.slots_per_page {
             return None;
@@ -77,7 +78,12 @@ impl MappedRecordCache {
             .ok()?
             .checked_mul(self.slots_per_page)?
             .checked_add(slot)?;
-        self.offsets.get(index)
+        (index < self.offsets.len()).then_some(index)
+    }
+
+    #[inline]
+    fn slot(&self, vid: VecId) -> Option<&std::sync::atomic::AtomicU16> {
+        self.position(vid).map(|index| &self.offsets[index])
     }
 
     #[inline]
@@ -94,6 +100,48 @@ impl MappedRecordCache {
             // Racing readers publish the same immutable record location.
             slot.store(offset as u16, Ordering::Release);
         }
+    }
+}
+
+/// Optional row-derived scalars share the mapping generation, not a query
+/// key. Zero means unknown; exceptional norms retain the exact wide scorer.
+#[derive(Debug)]
+struct MappedNormCache {
+    values: Vec<AtomicU32>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl MappedNormCache {
+    fn try_new(count: usize, limit: usize) -> Option<Self> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let bytes = count
+            .checked_mul(std::mem::size_of::<AtomicU32>())?
+            .checked_add(std::mem::size_of::<Self>())?;
+        if bytes > limit {
+            return None;
+        }
+        // No reclamation while the mapping publication guard is held.
+        let mut charge = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::DerivedCache,
+            bytes,
+        )?;
+        let mut values = Vec::new();
+        values.try_reserve_exact(count).ok()?;
+        let allocated = values
+            .capacity()
+            .checked_mul(std::mem::size_of::<AtomicU32>())?
+            .checked_add(std::mem::size_of::<Self>())?;
+        if allocated > bytes && (allocated > limit || !charge.try_grow_optional(allocated - bytes))
+        {
+            return None;
+        }
+        values.extend((0..count).map(|_| AtomicU32::new(0)));
+        Some(Self {
+            values,
+            _charge: charge,
+        })
     }
 }
 
@@ -207,22 +255,44 @@ impl VectorIndexFile {
             return Ok(false);
         }
         let words = (len / PAGE_SIZE).div_ceil(64);
-        // A lazy checksum bitmap plus the same bounded exact-query memo used
-        // by the compact path. File-backed clean pages remain OS-reclaimable.
-        let bytes =
-            words.saturating_mul(8).saturating_add(
-                512usize.saturating_mul(
-                    native_geometry(meta.dim as usize)
-                        .map_or(meta.dim as usize * 4, |(datatype, dim)| {
-                            datatype.payload_len(dim)
-                        })
-                        + 128 * 16
-                        + 128,
-                ),
-            );
-        let Some(charge) =
-            ControlledMemoryCharge::try_new_optional(ControlledMemoryCategory::DerivedCache, bytes)
-        else {
+        // Grow the FLOAT32 query memo under the native path's bounded budget.
+        // A larger optional memo must never prevent the mapping's admission:
+        // retain the compact path's small cache when its reservation is denied.
+        use crate::engine::vector::hnsw_paged::{
+            QueryNavCache, QUERY_CACHE_ENTRIES, QUERY_CACHE_MAX_K,
+        };
+        let geometry = native_geometry(meta.dim as usize);
+        let entry_bytes = geometry.map_or(meta.dim as usize * 4, |(datatype, dim)| {
+            datatype.payload_len(dim)
+        }) + QUERY_CACHE_MAX_K * std::mem::size_of::<(RowId, f64)>()
+            + 128;
+        let (entries, cache_bytes) = geometry
+            .is_none()
+            .then(|| {
+                QueryNavCache::allocation(
+                    meta.dim as usize,
+                    QUERY_CACHE_MAX_K,
+                    crate::engine::executor::mem_budget::memory_target_bytes() / 4,
+                )
+            })
+            .flatten()
+            .filter(|(entries, _)| *entries > QUERY_CACHE_ENTRIES)
+            .unwrap_or((QUERY_CACHE_ENTRIES, (QUERY_CACHE_ENTRIES + 1) * entry_bytes));
+        let reserve = |bytes| {
+            ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::DerivedCache,
+                words.saturating_mul(8).saturating_add(bytes),
+            )
+        };
+        let reservation = reserve(cache_bytes)
+            .map(|charge| (entries, charge))
+            .or_else(|| {
+                (entries > QUERY_CACHE_ENTRIES)
+                    .then(|| reserve((QUERY_CACHE_ENTRIES + 1) * entry_bytes))
+                    .flatten()
+                    .map(|charge| (QUERY_CACHE_ENTRIES, charge))
+            });
+        let Some((cache_entries, charge)) = reservation else {
             return Ok(false);
         };
         // SAFETY: all local writers revoke this view before modifying the
@@ -238,6 +308,21 @@ impl VectorIndexFile {
             (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
                 .min(64 * 1024 * 1024),
         );
+        let norms = records
+            .as_ref()
+            .filter(|_| {
+                cfg!(target_endian = "little")
+                    && meta.metric == 1
+                    && native_geometry(meta.dim as usize).is_none()
+                    && meta.dim >= 64
+            })
+            .and_then(|records| {
+                MappedNormCache::try_new(
+                    records.offsets.len(),
+                    (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
+                        .min(64 * 1024 * 1024),
+                )
+            });
         let mapping = MappedVectorNavigation {
             address: image.as_ptr().cast(),
             _mapping: image,
@@ -246,7 +331,8 @@ impl VectorIndexFile {
             source_revision: revision,
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
             records,
-            cache: crate::engine::vector::hnsw_paged::QueryNavCache::new(),
+            norms,
+            cache: QueryNavCache::with_capacity(QUERY_CACHE_MAX_K, cache_entries),
             _charge: charge,
         };
         if self.navigation_writers.load(Ordering::Acquire) != 0
@@ -460,6 +546,73 @@ impl MappedVectorNavigation {
         Ok((row, deleted, query.score_bytes(bytes)))
     }
 
+    #[inline]
+    fn exact_payload(&self, vid: VecId, dimension: usize) -> Result<&[u8], QueryError> {
+        let (page, offset) = self.record(vid)?;
+        let start = offset + 10;
+        Ok(&page[start..start + dimension * 4])
+    }
+
+    fn exact_distances4(
+        &self,
+        vids: &[VecId],
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+    ) -> Result<[f64; 4], QueryError> {
+        // Navigation needs only distances. Row identity and tombstones are
+        // still read when publishing the final exact candidate pool.
+        let rows = [
+            self.exact_payload(vids[0], query.dimension())?,
+            self.exact_payload(vids[1], query.dimension())?,
+            self.exact_payload(vids[2], query.dimension())?,
+            self.exact_payload(vids[3], query.dimension())?,
+        ];
+        Ok(query.score_batch4(rows))
+    }
+
+    /// Score one to eight rows with the cached-norm cosine kernel. A short
+    /// tail is padded by repeating its first row; batch lanes are reduced
+    /// independently, so padding never changes a real row's score, and the
+    /// tail now reuses cached norms too (padded rows are already L1-resident).
+    fn exact_distances8(
+        &self,
+        vids: &[VecId],
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+    ) -> Result<[f64; 8], QueryError> {
+        debug_assert!((1..=8).contains(&vids.len()));
+        let vids: [VecId; 8] = std::array::from_fn(|j| vids[if j < vids.len() { j } else { 0 }]);
+        let rows = [
+            self.exact_payload(vids[0], query.dimension())?,
+            self.exact_payload(vids[1], query.dimension())?,
+            self.exact_payload(vids[2], query.dimension())?,
+            self.exact_payload(vids[3], query.dimension())?,
+            self.exact_payload(vids[4], query.dimension())?,
+            self.exact_payload(vids[5], query.dimension())?,
+            self.exact_payload(vids[6], query.dimension())?,
+            self.exact_payload(vids[7], query.dimension())?,
+        ];
+        let cells = std::array::from_fn::<_, 8, _>(|j| {
+            self.records
+                .as_ref()
+                .and_then(|records| records.position(vids[j]))
+                .and_then(|position| {
+                    self.norms
+                        .as_ref()
+                        .and_then(|norms| norms.values.get(position))
+                })
+        });
+        let before = cells.map(|cell| cell.map_or(0, |value| value.load(Ordering::Relaxed)));
+        let mut norms = before.map(f32::from_bits);
+        let scores = query.score_batch8(rows, &mut norms);
+        for j in 0..8 {
+            if before[j] == 0 && norms[j].is_normal() {
+                if let Some(cell) = cells[j] {
+                    cell.store(norms[j].to_bits(), Ordering::Relaxed);
+                }
+            }
+        }
+        Ok(scores)
+    }
+
     fn exact_batch4(
         &self,
         vids: &[VecId],
@@ -510,7 +663,7 @@ impl MappedVectorNavigation {
                     * (self.meta.nav_dist_mul as f64));
             }
         }
-        Ok(self.exact(vid, query)?.2)
+        Ok(query.score_bytes(self.exact_payload(vid, query.dimension())?))
     }
 
     fn distances(
@@ -523,22 +676,54 @@ impl MappedVectorNavigation {
     ) -> Result<(), QueryError> {
         use crate::engine::vector::distance::{dot_i8_batch4_ptrs, prefetch_read};
         out.clear();
-        // Bring record headers into cache before dereferencing their SQ8 rows.
+        // Exact probes need the vector prefix, not only the page header. A
+        // validated location can overlap those misses with neighboring rows.
         for &vid in vids {
             let page = vid_page(vid) as usize;
             if page < self.len / PAGE_SIZE {
                 // SAFETY: prefetch targets an address inside the live mapping.
                 unsafe {
-                    prefetch_read(self.address.cast::<i8>().add(page * PAGE_SIZE));
+                    let base = self.address.cast::<i8>().add(page * PAGE_SIZE);
+                    if let Some(offset) = self
+                        .records
+                        .as_ref()
+                        .and_then(|cache| cache.get(vid))
+                        .filter(|_| codes.is_empty())
+                    {
+                        let payload = base.add(offset + 10);
+                        for position in (0..(self.meta.dim as usize * 4).min(256)).step_by(64) {
+                            prefetch_read(payload.add(position));
+                        }
+                    } else {
+                        prefetch_read(base);
+                    }
+                }
+                if codes.is_empty() {
+                    if let Some(position) =
+                        self.records.as_ref().and_then(|cache| cache.position(vid))
+                    {
+                        if let Some(cell) = self
+                            .norms
+                            .as_ref()
+                            .and_then(|cache| cache.values.get(position))
+                        {
+                            prefetch_read((cell as *const AtomicU32).cast());
+                        }
+                    }
                 }
             }
+        }
+        if codes.is_empty() && self.norms.is_some() {
+            for chunk in vids.chunks(8) {
+                let scores = self.exact_distances8(chunk, query)?;
+                out.extend_from_slice(&scores[..chunk.len()]);
+            }
+            return Ok(());
         }
         let mut chunks = vids.chunks_exact(4);
         for chunk in &mut chunks {
             if codes.is_empty() {
-                for (_, _, score) in self.exact_batch4(chunk, query)? {
-                    out.push(score);
-                }
+                out.extend(self.exact_distances4(chunk, query)?);
                 continue;
             }
             if !codes.is_empty() {
@@ -556,9 +741,7 @@ impl MappedVectorNavigation {
                     continue;
                 }
                 if rows.iter().all(Option::is_none) {
-                    for (_, _, score) in self.exact_batch4(chunk, query)? {
-                        out.push(score);
-                    }
+                    out.extend(self.exact_distances4(chunk, query)?);
                     continue;
                 }
             }
@@ -573,6 +756,22 @@ impl MappedVectorNavigation {
     }
 
     pub(crate) fn search(
+        &self,
+        query: &[f32],
+        k: usize,
+        ef: usize,
+    ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        if !self.meta.nav_quant_valid || self.meta.nav_exact_nodes >= self.meta.node_count {
+            self.search_impl::<true>(query, k, ef)
+        } else {
+            self.search_impl::<false>(query, k, ef)
+        }
+    }
+
+    // Keep exact-only finalization out of the approximate navigator's hot
+    // loop, including its register lifetimes and existing scoring pipeline.
+    #[inline(never)]
+    fn search_impl<const EXACT: bool>(
         &self,
         query: &[f32],
         k: usize,
@@ -598,7 +797,9 @@ impl MappedVectorNavigation {
         };
         let explore_ties = metric != Metric::Dot || query.iter().any(|value| *value != 0.0);
         let mut normalized = Vec::new();
-        let src = if metric == Metric::Cosine {
+        let quantized_navigation =
+            !EXACT && self.meta.nav_quant_valid && self.meta.nav_exact_nodes < self.meta.node_count;
+        let src = if quantized_navigation && metric == Metric::Cosine {
             normalized.extend_from_slice(query);
             crate::engine::vector::distance::normalize_in_place(&mut normalized);
             normalized.as_slice()
@@ -606,7 +807,7 @@ impl MappedVectorNavigation {
             query
         };
         let mut codes = Vec::new();
-        if self.meta.nav_quant_valid
+        if quantized_navigation
             && src.iter().all(|v| {
                 v.is_finite() && ((v - self.meta.nav_mid) * self.meta.nav_inv_scale).abs() <= 127.5
             })
@@ -622,13 +823,14 @@ impl MappedVectorNavigation {
             return Ok(Vec::new());
         }
         let mut neighbors = Vec::with_capacity(self.meta.m0 as usize);
+        let mut distances = Vec::with_capacity(self.meta.m0 as usize);
         for level in (1..=self.meta.max_layer as usize).rev() {
             let mut best = distance(current)?;
             loop {
                 let previous = current;
                 self.neighbors(current, level, &mut neighbors)?;
-                for &vid in &neighbors {
-                    let score = distance(vid)?;
+                self.distances(&neighbors, &prepared, &codes, norm, &mut distances)?;
+                for (&vid, &score) in neighbors.iter().zip(&distances) {
                     if score < best {
                         best = score;
                         current = vid;
@@ -681,7 +883,6 @@ impl MappedVectorNavigation {
             Ok(fresh)
         };
         let mut fresh = Vec::with_capacity(self.meta.m0 as usize);
-        let mut distances = Vec::with_capacity(self.meta.m0 as usize);
         let mut frontier = BinaryHeap::new();
         let mut results = BinaryHeap::new();
         let first = Scored {
@@ -749,22 +950,40 @@ impl MappedVectorNavigation {
         }
         let candidates = results.into_vec();
         let mut out = Vec::with_capacity(candidates.len());
-        let mut chunks = candidates.chunks_exact(4);
-        for chunk in &mut chunks {
-            let ids = [chunk[0].id, chunk[1].id, chunk[2].id, chunk[3].id];
-            for (row, deleted, distance) in self.exact_batch4(&ids, &prepared)? {
+        if EXACT {
+            // These scores already use the same immutable FLOAT32 payloads
+            // and prepared scorer. Only row identity and deletion state need
+            // to be read again; quantized navigation still needs exact scoring.
+            for candidate in candidates {
+                let (page, offset) = self.record(candidate.id)?;
+                if page[offset] & REC_FLAG_TOMBSTONE == 0 {
+                    out.push((vec_unpack_row(read_u64(page, offset + 2)), candidate.dist));
+                }
+            }
+        } else {
+            let mut chunks = candidates.chunks_exact(4);
+            for chunk in &mut chunks {
+                let ids = [chunk[0].id, chunk[1].id, chunk[2].id, chunk[3].id];
+                for (row, deleted, distance) in self.exact_batch4(&ids, &prepared)? {
+                    if !deleted {
+                        out.push((row, distance));
+                    }
+                }
+            }
+            for candidate in chunks.remainder() {
+                let (row, deleted, distance) = self.exact(candidate.id, &prepared)?;
                 if !deleted {
                     out.push((row, distance));
                 }
             }
         }
-        for candidate in chunks.remainder() {
-            let (row, deleted, distance) = self.exact(candidate.id, &prepared)?;
-            if !deleted {
-                out.push((row, distance));
-            }
+        let compare =
+            |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
+        if EXACT && out.len() > k {
+            out.select_nth_unstable_by(k, compare);
+            out.truncate(k);
         }
-        out.sort_unstable_by(|a, b| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0)));
+        out.sort_unstable_by(compare);
         out.truncate(k);
         self.cache.insert(query, k, ef, &out);
         Ok(out)

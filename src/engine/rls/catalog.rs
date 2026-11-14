@@ -217,6 +217,9 @@ impl CatalogStore {
     pub(crate) fn snapshot(&self) -> Arc<CatalogSnapshot> {
         self.current.load_full()
     }
+    pub(crate) fn snapshot_ptr(&self) -> *const CatalogSnapshot {
+        Arc::as_ptr(&*self.current.load())
+    }
     fn bits(id: u64) -> [usize; 2] {
         let mut value = id.wrapping_add(0x9e3779b97f4a7c15);
         value = (value ^ (value >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);

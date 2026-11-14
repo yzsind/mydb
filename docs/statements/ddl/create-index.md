@@ -32,7 +32,7 @@ Creates the supported forms of regular, unique, full-text, spatial, functional, 
 - `ALTER TABLE ... ADD INDEX` (including adding multiple BTREE indexes and the primary key at once) uses the same path; `LOCK=NONE` allows DML during the build, and `LOCK=SHARED/EXCLUSIVE` preserves the explicit blocking behavior. Mixed ALTERs that include column changes, and special indexes, are not part of this online path.
 - The statement returns success only after waiting for the full index publication. A unique index does not prematurely enforce the new constraint on concurrent DML before publication; if duplicate values are found during validation, the creation fails while already committed business writes are preserved. Nullable unique keys allow multiple `NULL`s.
 - Incremental logs count toward the memory budget, with at most 64 MiB per physical index; exceeding the limit aborts the candidate index build. Long transactions may delay the prepare, publish, or failure cleanup phases.
-- BTREE builds expose cancellable job IDs in `information_schema.mydb_ddl_jobs`; terminal results remain in bounded in-memory history. Catch-up fails explicitly if its bounded publication attempts cannot converge.
+- BTREE builds expose cancellable job IDs in `information_schema.MYDB_DDL_JOBS`; terminal results remain in bounded in-memory history. Catch-up fails explicitly if its bounded publication attempts cannot converge.
 - Index definitions, statistics, and visibility enter the catalog; optimizer hints can explicitly select or exclude indexes.
 
 ## Index Keys and Options

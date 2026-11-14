@@ -420,6 +420,7 @@ fn shared_prepared_point_metadata_keeps_current_alias_and_identifier_presentatio
         );
         assert_eq!(result.columns[0].name, name);
         assert_eq!(result.columns[0].source.table, alias);
+        assert_eq!(result.columns[0].source.org_name, "c");
         assert_eq!(result.rows, vec![vec![Value::String("visible".into())]]);
     }
 }

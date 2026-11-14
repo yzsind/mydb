@@ -18,7 +18,7 @@ Declares a mydb SQL cursor at session top level and associates it with a read-on
 
 ## Context, Errors, and Lifecycle
 
-DECLARE executes the query and opens the session cursor immediately; do not issue OPEN for this extension. Source SELECT permissions apply and the query must produce a result set. Names belong to one connection. The cursor retains its execution state and can pin read history; use CLOSE promptly. COMMIT alone does not invalidate it. Inspect information_schema.mydb_cursors and the configured MYDB_CURSOR_* memory/idle limits; memory admission still applies.
+DECLARE executes the query and opens the session cursor immediately; do not issue OPEN for this extension. Source SELECT permissions apply and the query must produce a result set. Names belong to one connection. The cursor retains its execution state and can pin read history; use CLOSE promptly. COMMIT alone does not invalidate it. Inspect information_schema.MYDB_CURSORS and the configured MYDB_CURSOR_* memory/idle limits; memory admission still applies.
 
 ## Examples
 

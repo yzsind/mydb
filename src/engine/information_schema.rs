@@ -22,6 +22,7 @@ pub(crate) struct SystemColumn {
     pub numeric_precision: Option<i64>,
     pub numeric_scale: Option<i64>,
     pub datetime_precision: Option<i64>,
+    pub comment: &'static str,
 }
 
 impl SystemColumn {
@@ -43,6 +44,7 @@ impl SystemColumn {
             numeric_precision: None,
             numeric_scale: None,
             datetime_precision: None,
+            comment: "",
         }
     }
     pub(crate) const fn unsigned_bigint(name: &'static str, nullable: bool) -> Self {
@@ -53,6 +55,10 @@ impl SystemColumn {
             "bigint unsigned",
             nullable,
         )
+    }
+    pub(crate) const fn comment(mut self, comment: &'static str) -> Self {
+        self.comment = comment;
+        self
     }
     pub(crate) const fn bigint(name: &'static str, nullable: bool) -> Self {
         Self::new(name, ColumnType::LongLong, "bigint", "bigint", nullable)
@@ -1533,48 +1539,58 @@ const MYSQL_FIREWALL_WHITELIST_COLUMNS: &[SystemColumn] = &[v!("USERHOST"), text
 const VARIABLES_COLUMNS: &[SystemColumn] = &[v!("VARIABLE_NAME"), v!("VARIABLE_VALUE")];
 
 const SEQUENCES_COLUMNS: &[SystemColumn] = &[
-    SystemColumn::text("SEQUENCE_SCHEMA", false),
-    SystemColumn::text("SEQUENCE_NAME", false),
-    SystemColumn::text("DATA_TYPE", false),
-    SystemColumn::bigint("INCREMENT", false),
-    SystemColumn::bigint("MIN_VALUE", false),
-    SystemColumn::bigint("MAX_VALUE", false),
-    SystemColumn::bigint("CACHE_SIZE", false),
-    SystemColumn::bigint("CYCLE", false),
-    SystemColumn::unsigned_bigint("COUNTER_ID", false),
-    SystemColumn::bigint("ALLOCATED_VALUE", true),
-    SystemColumn::bigint("RESUME_VALUE", false),
-    SystemColumn::bigint("IS_CALLED", false),
-    SystemColumn::unsigned_bigint("STATE_LSN", false),
-    SystemColumn::unsigned_bigint("CHECKPOINTED_STATE_LSN", false),
-    SystemColumn::unsigned_bigint("LOCAL_DURABLE_STATE_LSN", false),
-    SystemColumn::text("SYNC_POLICY", false),
-    SystemColumn::bigint("PENDING", false),
-    SystemColumn::unsigned_bigint("SYNC_CONFIG_EPOCH", false),
+    SystemColumn::text("SEQUENCE_SCHEMA", false).comment("Schema containing the sequence."),
+    SystemColumn::text("SEQUENCE_NAME", false).comment("Sequence name."),
+    SystemColumn::text("DATA_TYPE", false).comment("Declared sequence integer type."),
+    SystemColumn::bigint("INCREMENT", false).comment("Increment."),
+    SystemColumn::bigint("MIN_VALUE", false).comment("Min value."),
+    SystemColumn::bigint("MAX_VALUE", false).comment("Max value."),
+    SystemColumn::bigint("CACHE_SIZE", false)
+        .comment("Number of sequence values reserved per allocation."),
+    SystemColumn::bigint("IS_CYCLIC", false).comment("Whether the sequence cycles at its bound."),
+    SystemColumn::unsigned_bigint("COUNTER_ID", false)
+        .comment("Identity of the sequence counter, independent of its logical name."),
+    SystemColumn::bigint("ALLOCATED_VALUE", true).comment("Allocated value."),
+    SystemColumn::bigint("RESUME_VALUE", false).comment("Resume value."),
+    SystemColumn::bigint("IS_CALLED", false).comment("Whether a sequence value has been returned."),
+    SystemColumn::unsigned_bigint("STATE_LSN", false)
+        .comment("WAL LSN of the logged sequence state."),
+    SystemColumn::unsigned_bigint("CHECKPOINTED_STATE_LSN", false)
+        .comment("Sequence state LSN included in a checkpoint."),
+    SystemColumn::unsigned_bigint("LOCAL_DURABLE_STATE_LSN", false)
+        .comment("Sequence state LSN durable in the local WAL."),
+    SystemColumn::text("SYNC_POLICY", false)
+        .comment("Sequence synchronization policy: local or remote_apply."),
+    SystemColumn::bigint("IS_PENDING", false)
+        .comment("Whether allocated sequence state still awaits logging."),
+    SystemColumn::unsigned_bigint("SYNC_CONFIG_EPOCH", false)
+        .comment("Generation of the sequence synchronization configuration."),
 ];
 
 const MYDB_DDL_JOBS_COLUMNS: &[SystemColumn] = &[
-    i64c!("JOB_ID"),
-    v!("TABLE_SCHEMA"),
-    v!("TABLE_NAME"),
-    v!("OBJECT_KIND"),
-    v!("OBJECT_NAME"),
-    v!("STATE"),
-    i64c!("PROGRESS_ROWS"),
-    i64c!("TOTAL_ROWS"),
-    i64c!("REPLAY_WATERMARK"),
-    text!("ERROR_MESSAGE"),
-    i64c!("CANCEL_ALLOWED"),
+    i64c!("JOB_ID").comment("DDL job identity."),
+    v!("TABLE_SCHEMA").comment("Schema containing the table."),
+    v!("TABLE_NAME").comment("Table name."),
+    v!("OBJECT_KIND").comment("Object kind."),
+    v!("OBJECT_NAME").comment("Object name."),
+    v!("STATE").comment("State."),
+    i64c!("PROGRESS_ROWS").comment("Number of rows processed by the DDL job."),
+    i64c!("TOTAL_ROWS").comment("Total source rows when known."),
+    i64c!("REPLAY_WATERMARK_SCN").comment(
+        "Snapshot SCN reached by incremental replay; NULL when no replay watermark exists.",
+    ),
+    text!("ERROR_MESSAGE").comment("Last failure description, if any."),
+    i64c!("CAN_CANCEL").comment("Whether the DDL job can currently be cancelled."),
 ];
 
-const MYDB_XA_RECOVER_COLUMNS: &[SystemColumn] = &[
-    i64c!("FORMAT_ID"),
-    i64c!("GTRID_LENGTH"),
-    i64c!("BQUAL_LENGTH"),
-    v!("DATA"),
-    i64c!("TXN_ID"),
-    i64c!("PREPARE_SCN"),
-    i64c!("STARTED_UNIX_MS"),
+const MYDB_PREPARED_XA_TRANSACTIONS_COLUMNS: &[SystemColumn] = &[
+    i64c!("FORMAT_ID").comment("XA transaction format identifier."),
+    i64c!("GTRID_LENGTH").comment("Length in bytes of the global XA transaction identifier."),
+    i64c!("BQUAL_LENGTH").comment("Length in bytes of the XA branch qualifier."),
+    v!("DATA").comment("Rendered XA global transaction identifier and branch qualifier."),
+    i64c!("TXN_ID").comment("Transaction identity."),
+    i64c!("PREPARE_SCN").comment("SCN at which the XA transaction was prepared."),
+    i64c!("STARTED_UNIX_MS").comment("Started time in milliseconds since the Unix epoch."),
 ];
 
 /// Snapshot of every live server-side cursor — the ones held open by
@@ -1584,14 +1600,14 @@ const MYDB_XA_RECOVER_COLUMNS: &[SystemColumn] = &[
 /// confirming a JDBC client really is consuming rows incrementally
 /// instead of pre-buffering the result set on the server.
 const MYDB_CURSORS_COLUMNS: &[SystemColumn] = &[
-    i64c!("CONNECTION_ID"),
-    i64c!("STATEMENT_ID"),
-    v!("SQL"),
-    i64c!("COLUMNS"),
-    i64c!("ROWS_FETCHED"),
-    i64c!("CREATED_UNIX_MS"),
-    i64c!("LAST_ACTIVE_UNIX_MS"),
-    i64c!("IDLE_MS"),
+    i64c!("CONNECTION_ID").comment("Owning SQL connection identity."),
+    i64c!("STATEMENT_ID").comment("Prepared statement identity; zero for a named SQL cursor."),
+    v!("SQL_TEXT").comment("SQL statement text."),
+    i64c!("COLUMN_COUNT").comment("Number of result columns."),
+    i64c!("ROWS_FETCHED").comment("Number of rows fetched from the cursor."),
+    i64c!("CREATED_UNIX_MS").comment("Created time in milliseconds since the Unix epoch."),
+    i64c!("LAST_ACTIVE_UNIX_MS").comment("Last active time in milliseconds since the Unix epoch."),
+    i64c!("IDLE_DURATION_MS").comment("Elapsed idle duration in milliseconds."),
 ];
 
 /// P2/13 — per-(txn_id, table_id) summary of the in-memory undo
@@ -1599,38 +1615,44 @@ const MYDB_CURSORS_COLUMNS: &[SystemColumn] = &[
 /// my undo" without dumping the whole BTreeMap. Sorted by RECORD_COUNT
 /// descending so heavy holders surface at the top.
 const MYDB_UNDO_HISTORY_COLUMNS: &[SystemColumn] = &[
-    i64c!("TXN_ID"),
-    i64c!("TABLE_ID"),
-    i64c!("RECORD_COUNT"),
-    i64c!("BYTES"),
-    i64c!("CHAIN_DEPTH"),
-    i64c!("OLDEST_CREATED_UNIX_MS"),
+    i64c!("TXN_ID").comment("Transaction identity."),
+    i64c!("TABLE_ID").comment("Physical storage table identity for this undo chain."),
+    i64c!("RECORD_COUNT").comment("Number of retained undo records."),
+    i64c!("UNDO_BYTES").comment("Bytes retained by the in-memory undo chain."),
+    i64c!("CHAIN_DEPTH").comment("Depth of the undo chain."),
+    i64c!("OLDEST_CREATED_UNIX_MS")
+        .comment("Oldest created time in milliseconds since the Unix epoch."),
 ];
 
 const MYDB_TEMPORAL_HISTORY_COLUMNS: &[SystemColumn] = &[
-    v!("TABLE_SCHEMA"),
-    v!("TABLE_NAME"),
-    vn!("INDEX_NAME"),
-    i64c!("SYSTEM_TIME_EPOCH_US"),
-    i64c!("EARLIEST_AVAILABLE_UNIX_US"),
-    i64c!("HISTORY_ENTRIES"),
-    i64c!("HISTORY_BYTES"),
-    i64c!("LAST_COMPACTION_UNIX_US"),
-    i64c!("DEGRADED"),
+    v!("TABLE_SCHEMA").comment("Schema containing the table."),
+    v!("TABLE_NAME").comment("Table name."),
+    vn!("INDEX_NAME").comment("Index name."),
+    i64c!("SYSTEM_TIME_EPOCH_UNIX_US")
+        .comment("Beginning of this table generation in microseconds since the Unix epoch."),
+    i64c!("EARLIEST_AVAILABLE_UNIX_US")
+        .comment("Earliest available time in microseconds since the Unix epoch."),
+    i64c!("HISTORY_ENTRIES").comment("History entries."),
+    i64c!("HISTORY_BYTES").comment("History size in bytes."),
+    i64c!("LAST_COMPACTION_UNIX_US")
+        .comment("Last compaction time in microseconds since the Unix epoch."),
+    i64c!("IS_DEGRADED").comment("Whether temporal history indexes are degraded."),
 ];
 
 const MYDB_CACHES_COLUMNS: &[SystemColumn] = &[
-    v!("CACHE_NAME"),
-    v!("CACHE_KIND"),
-    v!("SCOPE"),
-    i64c!("HITS"),
-    i64c!("MISSES"),
-    i64c!("HIT_PCT"),
-    i64c!("ENTRIES"),
-    i64c!("CAPACITY"),
-    i64c!("EVICTIONS"),
-    i64c!("INVALIDATIONS"),
-    i64c!("APPROX_BYTES"),
+    v!("CACHE_NAME").comment("Cache name."),
+    v!("CACHE_KIND").comment("Cache kind."),
+    v!("SCOPE").comment("Scope."),
+    i64c!("HITS").comment("Hits."),
+    i64c!("MISSES").comment("Misses."),
+    i64c!("HIT_PCT")
+        .comment("Rounded cache hit percentage, from 0 to 100; zero if no lookups occurred."),
+    i64c!("ENTRIES").comment("Entries."),
+    i64c!("CAPACITY_ENTRIES")
+        .comment("Configured capacity in entries; zero means unbounded or not applicable."),
+    i64c!("EVICTIONS").comment("Evictions."),
+    i64c!("INVALIDATIONS").comment("Invalidations."),
+    i64c!("APPROX_BYTES").comment("Estimated bytes retained by the cache or entry."),
 ];
 
 /// One row per resident entry of the cross-session physical-plan cache.
@@ -1638,75 +1660,82 @@ const MYDB_CACHES_COLUMNS: &[SystemColumn] = &[
 /// `physical_plan`: it breaks that single line down into the individual
 /// cached statements so an operator can see what is hot, what is bloating
 /// the cache, and which entries carry the most table dependencies.
-const MYDB_PLAN_CACHE_COLUMNS: &[SystemColumn] = &[
-    v!("CACHED_SQL"),
-    v!("SCHEMA_NAME"),
-    i64c!("SQL_MODE_FINGERPRINT"),
-    i64c!("HITS"),
-    i64c!("TABLE_DEPS"),
-    i64c!("APPROX_BYTES"),
-    i64c!("CACHE_EPOCH"),
+const MYDB_PLAN_CACHE_ENTRIES_COLUMNS: &[SystemColumn] = &[
+    v!("SQL_TEXT").comment("SQL statement text."),
+    v!("DEFAULT_SCHEMA_NAME").comment("Default schema used to bind the cached statement."),
+    i64c!("SQL_MODE_FINGERPRINT").comment("Sql mode fingerprint."),
+    i64c!("HITS").comment("Hits."),
+    i64c!("TABLE_DEPENDENCY_COUNT").comment("Number of table dependencies of the cached plan."),
+    i64c!("APPROX_BYTES").comment("Estimated bytes retained by the cache or entry."),
+    i64c!("CACHE_EPOCH").comment("Cache epoch."),
 ];
 
-const MYDB_MEMORY_ADVISOR_COLUMNS: &[SystemColumn] =
-    &[v!("METRIC"), i64c!("VALUE"), v!("UNIT"), v!("DESCRIPTION")];
+const MYDB_MEMORY_ADVISOR_COLUMNS: &[SystemColumn] = &[
+    v!("METRIC_NAME").comment("Name of the reported metric."),
+    i64c!("METRIC_VALUE")
+        .comment("Metric value; interpret together with its documented unit and scope."),
+    v!("UNIT").comment("Unit of the reported metric."),
+    v!("DESCRIPTION").comment("Description of the metric and its accounting semantics."),
+];
 
 /// One row per HNSW vector index in the catalog. Static columns (metric, M,
 /// ef_construction, declared dim) come from the catalog and are always present;
 /// runtime columns (node counts, stale ratio, generation, persisted LSN) are
 /// populated only when the index is *warm* (a graph has been built/loaded in
-/// `Database::vector_indexes`) — `LOADED = 0` rows report the catalog metadata
+/// `Database::vector_indexes`) — `IS_LOADED = 0` rows report the catalog metadata
 /// with `NULL` runtime stats. Powers `SELECT * FROM
-/// information_schema.mydb_vector_indexes` and the SHOW ENGINE HNSW section.
+/// information_schema.MYDB_VECTOR_INDEXES` and the SHOW ENGINE HNSW section.
 const MYDB_VECTOR_INDEXES_COLUMNS: &[SystemColumn] = &[
-    v!("TABLE_SCHEMA"),
-    v!("TABLE_NAME"),
-    v!("INDEX_NAME"),
-    v!("COLUMN_NAME"),
-    vn!("BACKEND"),
-    v!("METRIC"),
-    i64c!("DECLARED_DIM"),
-    i64c!("RUNTIME_DIM"),
-    i64c!("M"),
-    i64c!("EF_CONSTRUCTION"),
-    i64c!("DEFAULT_EF_SEARCH"),
-    i32c!("LOADED"),
-    i64c!("PARTITIONS_LOADED"),
-    i64c!("TOTAL_NODES"),
-    i64c!("LIVE_NODES"),
-    i64c!("STALE_NODES"),
-    i64c!("STALE_RATIO_PCT"),
-    i64c!("DIRTY_NODES"),
-    i64c!("GENERATION"),
-    i64c!("LAST_PERSISTED_LSN"),
-    // Algorithm discriminator + IVF-specific runtime stats. `ALGO` is
-    // always present; `NLIST` / `INSERTS_SINCE_TRAIN` are NULL for HNSW and for
+    v!("TABLE_SCHEMA").comment("Schema containing the table."),
+    v!("TABLE_NAME").comment("Table name."),
+    v!("INDEX_NAME").comment("Index name."),
+    v!("COLUMN_NAME").comment("Indexed or summarized column name."),
+    vn!("BACKEND").comment("Backend."),
+    v!("DISTANCE_METRIC").comment("Vector distance function."),
+    i64c!("DECLARED_DIMENSIONS").comment("Vector dimensions declared in the catalog."),
+    i64c!("RUNTIME_DIMENSIONS").comment("Dimensions of the loaded vector index."),
+    i64c!("M").comment("HNSW graph connectivity parameter."),
+    i64c!("EF_CONSTRUCTION").comment("HNSW construction search width."),
+    i64c!("DEFAULT_EF_SEARCH").comment("Default HNSW query search width."),
+    i32c!("IS_LOADED")
+        .comment("Whether the vector index is loaded; unavailable runtime statistics are NULL."),
+    i64c!("PARTITIONS_LOADED").comment("Partitions loaded."),
+    i64c!("TOTAL_NODES").comment("Total nodes."),
+    i64c!("LIVE_NODES").comment("Live nodes."),
+    i64c!("STALE_NODES").comment("Stale nodes."),
+    i64c!("STALE_RATIO_PCT")
+        .comment("Stale vector nodes as a percentage of total nodes, from 0 to 100."),
+    i64c!("DIRTY_NODES").comment("Dirty nodes."),
+    i64c!("GENERATION").comment("Generation."),
+    i64c!("LAST_PERSISTED_LSN").comment("Last persisted WAL log sequence number."),
+    // Algorithm discriminator + IVF-specific runtime stats. `ALGORITHM` is
+    // always present; `NLIST` / `INSERTS_SINCE_TRAINING` are NULL for HNSW and for
     // cold (never-queried) IVF indexes.
-    v!("ALGO"),
-    i64c!("REQUESTED_NLIST"),
-    i64c!("NLIST"),
-    i64c!("LIST_AVG_ENTRIES"),
-    i64c!("LIST_MAX_ENTRIES"),
-    i64c!("LIST_P95_ENTRIES"),
-    vn!("BUILD_STATE"),
-    i64c!("INSERTS_SINCE_TRAIN"),
-    i64c!("PAGED_FILE_SIZE_BYTES"),
-    i64c!("NAV_PAGES"),
-    i64c!("SQ8_EXACT_FALLBACK_NODES"),
-    i64c!("TOMBSTONES_ON_DISK"),
-    i64c!("SQ8_COVERED_NODES"),
-    i64c!("DEFAULT_NPROBE"),
-    i64c!("KMEANS_ITERS"),
-    i64c!("TRAIN_SAMPLE_MULT"),
-    v!("QUANTIZATION"),
-    vn!("QUANTIZATION_STATE"),
-    i64c!("QUANTIZER_BYTES"),
-    i64c!("COMPRESSED_BYTES"),
-    i64c!("QUANTIZATION_EXCEPTIONS"),
-    i64c!("RERANK_MULT"),
-    i64c!("CANDIDATES_RETURNED"),
-    i64c!("HEAP_RERANKS"),
-    i64c!("EXACT_FALLBACKS"),
+    v!("ALGORITHM").comment("Vector index algorithm, HNSW or IVF."),
+    i64c!("REQUESTED_NLIST").comment("Requested number of IVF lists."),
+    i64c!("NLIST").comment("Number of trained IVF lists."),
+    i64c!("LIST_AVG_ENTRIES").comment("List avg entries."),
+    i64c!("LIST_MAX_ENTRIES").comment("List max entries."),
+    i64c!("LIST_P95_ENTRIES").comment("List p95 entries."),
+    vn!("BUILD_STATE").comment("Build state."),
+    i64c!("INSERTS_SINCE_TRAINING").comment("Number of inserts since the latest IVF training."),
+    i64c!("PAGED_FILE_SIZE_BYTES").comment("Paged file size size in bytes."),
+    i64c!("NAVIGATION_PAGES").comment("Number of vector navigation pages."),
+    i64c!("SQ8_EXACT_FALLBACK_NODES").comment("Sq8 exact fallback nodes."),
+    i64c!("TOMBSTONES_ON_DISK").comment("Tombstones on disk."),
+    i64c!("SQ8_COVERED_NODES").comment("Sq8 covered nodes."),
+    i64c!("DEFAULT_NPROBE").comment("Default number of IVF lists searched."),
+    i64c!("KMEANS_ITERATIONS").comment("Number of k-means training iterations."),
+    i64c!("TRAIN_SAMPLE_MULTIPLIER").comment("Training sample size multiplier."),
+    v!("QUANTIZATION").comment("Quantization."),
+    vn!("QUANTIZATION_STATE").comment("Quantization state."),
+    i64c!("QUANTIZER_BYTES").comment("Quantizer size in bytes."),
+    i64c!("COMPRESSED_BYTES").comment("Compressed size in bytes."),
+    i64c!("QUANTIZATION_EXCEPTIONS").comment("Quantization exceptions."),
+    i64c!("RERANK_MULTIPLIER").comment("Exact reranking candidate multiplier."),
+    i64c!("CANDIDATES_RETURNED").comment("Candidates returned."),
+    i64c!("HEAP_RERANKS").comment("Heap reranks."),
+    i64c!("EXACT_FALLBACKS").comment("Exact fallbacks."),
 ];
 
 /// Per-table statistics freshness. Lets a DBA see, at a glance, which
@@ -1716,166 +1745,191 @@ const MYDB_VECTOR_INDEXES_COLUMNS: &[SystemColumn] = &[
 /// persisted `modified_rows_since_analyze`, so the figure tracks
 /// in-flight DML the way the planner's staleness check does.
 const MYDB_STATS_HEALTH_COLUMNS: &[SystemColumn] = &[
-    v!("TABLE_SCHEMA"),
-    v!("TABLE_NAME"),
-    i64c!("TABLE_ROWS"),
-    i64c!("MODIFIED_ROWS"),
-    f64c!("STALE_RATIO"),
-    i32c!("IS_STALE"),
-    dt!("LAST_ANALYZED"),
-    i32c!("HAS_HISTOGRAM"),
-    i32c!("ANALYZED_COLUMNS"),
+    v!("TABLE_SCHEMA").comment("Schema containing the table."),
+    v!("TABLE_NAME").comment("Table name."),
+    i64c!("TABLE_ROWS").comment("Table rows."),
+    i64c!("MODIFIED_ROWS").comment("Modified rows."),
+    f64c!("STALE_RATIO").comment(
+        "Modified rows divided by analyzed table rows; may exceed 1. Zero rows yield 0 or 1.",
+    ),
+    i32c!("IS_STALE").comment("Whether statistics meet the automatic analyze staleness threshold."),
+    dt!("LAST_ANALYZED_AT").comment("Last statistics analysis time as a MySQL DATETIME."),
+    i32c!("HAS_HISTOGRAM").comment("Whether any analyzed column has a histogram."),
+    i32c!("ANALYZED_COLUMN_COUNT").comment("Number of columns with analyzed statistics."),
 ];
 
 const ZONE_MAPS_COLUMNS: &[SystemColumn] = &[
-    v!("TABLE_SCHEMA"),
-    v!("TABLE_NAME"),
-    vn!("PARTITION_NAME"),
-    i64c!("STORAGE_ID"),
-    i64c!("ZONE_ID"),
-    i64c!("PAGE_START"),
-    i64c!("PAGE_END"),
-    v!("COLUMN_NAME"),
-    vn!("MIN_VALUE"),
-    vn!("MAX_VALUE"),
-    i32c!("HAS_NULL"),
-    i32c!("HAS_NON_NULL"),
-    i32c!("TRUNCATED"),
-    v!("STATE"),
-    i64c!("GENERATION"),
-    i64c!("REBUILD_SCN"),
-    i64c!("STALE_MUTATIONS"),
-    v!("MEMBERSHIP_KIND"),
-    i64c!("MEMBERSHIP_BYTES"),
-    i32c!("MEMBERSHIP_HASHES"),
-    i32c!("MEMBERSHIP_HASH_VERSION"),
-    i32c!("MEMBERSHIP_LAYOUT_VERSION"),
-    i32c!("MEMBERSHIP_SATURATED"),
+    v!("TABLE_SCHEMA").comment("Schema containing the table."),
+    v!("TABLE_NAME").comment("Table name."),
+    vn!("PARTITION_NAME").comment("Partition name."),
+    i64c!("STORAGE_ID").comment("Physical storage identity, including partition leaf storage."),
+    i64c!("ZONE_ID").comment("Zone identity within the storage object."),
+    i64c!("PAGE_START").comment("Page start."),
+    i64c!("PAGE_END").comment("Page end."),
+    v!("COLUMN_NAME").comment("Indexed or summarized column name."),
+    vn!("MIN_VALUE").comment("Min value."),
+    vn!("MAX_VALUE").comment("Max value."),
+    i32c!("HAS_NULL").comment("Whether the zone contains NULL values."),
+    i32c!("HAS_NON_NULL").comment("Whether the zone contains non-NULL values."),
+    i32c!("IS_TRUNCATED").comment("Whether summarized bounds were truncated."),
+    v!("STATE").comment("State."),
+    i64c!("GENERATION").comment("Generation."),
+    i64c!("REBUILD_SCN").comment("Rebuild system commit sequence number."),
+    i64c!("STALE_MUTATIONS").comment("Stale mutations."),
+    v!("MEMBERSHIP_KIND").comment("Membership kind."),
+    i64c!("MEMBERSHIP_BYTES").comment("Membership size in bytes."),
+    i32c!("MEMBERSHIP_HASHES").comment("Membership hashes."),
+    i32c!("MEMBERSHIP_HASH_VERSION").comment("Membership hash version."),
+    i32c!("MEMBERSHIP_LAYOUT_VERSION").comment("Membership layout version."),
+    i32c!("IS_MEMBERSHIP_SATURATED").comment("Whether the zone membership filter is saturated."),
 ];
 
 const ZONE_MAP_STORAGE_COLUMNS: &[SystemColumn] = &[
-    v!("TABLE_SCHEMA"),
-    v!("TABLE_NAME"),
-    vn!("PARTITION_NAME"),
-    i64c!("STORAGE_ID"),
-    i32c!("FORMAT_VERSION"),
-    i64c!("GENERATION"),
-    i64c!("TRUSTED_LSN"),
-    i64c!("FILE_BYTES"),
-    i64c!("LIVE_BYTES"),
-    i64c!("OBSOLETE_BYTES"),
-    i64c!("FRAME_COUNT"),
-    i64c!("CACHED_BYTES"),
-    i64c!("DIRTY_OVERLAY_BYTES"),
-    f64c!("COMPRESSION_RATIO"),
-    v!("STATE"),
-    vn!("LAST_ERROR"),
-    v!("REBUILD_STATE"),
-    i64c!("REBUILD_ZONES_TOTAL"),
-    i64c!("REBUILD_ZONES_DONE"),
-    i64c!("REBUILD_STARTED_MS"),
-    i64c!("REBUILD_FINISHED_MS"),
-    i64c!("GOVERNOR_CHARGED_BYTES"),
-    i64c!("MEMORY_FALLBACKS_GLOBAL"),
+    v!("TABLE_SCHEMA").comment("Schema containing the table."),
+    v!("TABLE_NAME").comment("Table name."),
+    vn!("PARTITION_NAME").comment("Partition name."),
+    i64c!("STORAGE_ID").comment("Physical storage identity, including partition leaf storage."),
+    i32c!("FORMAT_VERSION").comment("Format version."),
+    i64c!("GENERATION").comment("Generation."),
+    i64c!("TRUSTED_LSN").comment("Trusted WAL log sequence number."),
+    i64c!("FILE_BYTES").comment("File size in bytes."),
+    i64c!("LIVE_BYTES").comment("Live size in bytes."),
+    i64c!("OBSOLETE_BYTES").comment("Obsolete size in bytes."),
+    i64c!("FRAME_COUNT").comment("Frame count."),
+    i64c!("CACHED_BYTES").comment("Cached size in bytes."),
+    i64c!("DIRTY_OVERLAY_BYTES").comment("Dirty overlay size in bytes."),
+    f64c!("COMPRESSION_RATIO").comment("Sidecar compression ratio; currently 1 for nonempty files and NULL for empty files."),
+    v!("STATE").comment("State."),
+    vn!("LAST_ERROR").comment("Last error."),
+    v!("REBUILD_STATE").comment("Rebuild state."),
+    i64c!("REBUILD_ZONES_TOTAL").comment("Rebuild zones total."),
+    i64c!("REBUILD_ZONES_DONE").comment("Rebuild zones done."),
+    i64c!("REBUILD_STARTED_UNIX_MS").comment("Rebuild started time in milliseconds since the Unix epoch."),
+    i64c!("REBUILD_FINISHED_UNIX_MS").comment("Rebuild finished time in milliseconds since the Unix epoch."),
+    i64c!("GOVERNOR_CHARGED_BYTES").comment("Governor charged size in bytes."),
+    i64c!("MEMORY_FALLBACKS_GLOBAL").comment("Process-wide cumulative memory fallbacks, repeated per storage row; do not sum across rows."),
 ];
 
 const AI_MODELS_COLUMNS: &[SystemColumn] = &[
-    varchar_column!("MODEL_SCHEMA", 64, 256, false),
-    varchar_column!("MODEL_NAME", 64, 256, false),
+    varchar_column!("MODEL_SCHEMA", 64, 256, false).comment("Model schema."),
+    varchar_column!("MODEL_NAME", 64, 256, false).comment("Model name."),
     SystemColumn::new(
         "MODEL_ID",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
-    varchar_column!("KIND", 32, 128, false),
-    varchar_column!("REMOTE_MODEL", 256, 1024, false),
-    varchar_column!("MODEL_REVISION", 128, 512, false),
+    )
+    .comment("Stable AI model identity."),
+    varchar_column!("MODEL_KIND", 32, 128, false).comment("AI model kind."),
+    varchar_column!("REMOTE_MODEL", 256, 1024, false).comment("Remote model."),
+    varchar_column!("MODEL_REVISION", 128, 512, false).comment("Model revision."),
     SystemColumn::new(
         "GENERATION",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
-    SystemColumn::new("ENABLED", ColumnType::LongLong, "bigint", "bigint", false),
+    )
+    .comment("Generation."),
+    SystemColumn::new(
+        "IS_ENABLED",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint",
+        false,
+    )
+    .comment("Whether this object is enabled."),
     SystemColumn::new(
         "DIMENSIONS",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         true,
-    ),
+    )
+    .comment("Dimensions."),
 ];
 const AI_CONNECTIONS_COLUMNS: &[SystemColumn] = &[
-    varchar_column!("CONNECTION_NAME", 64, 256, false),
-    varchar_column!("PROTOCOL", 32, 128, false),
-    varchar_column!("BASE_URL", 2048, 8192, false),
+    varchar_column!("CONNECTION_NAME", 64, 256, false).comment("Connection name."),
+    varchar_column!("PROTOCOL", 32, 128, false).comment("Protocol."),
+    varchar_column!("BASE_URL", 2048, 8192, false).comment("Configured remote provider base URL."),
     SystemColumn::new(
         "GENERATION",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
-    SystemColumn::new("ENABLED", ColumnType::LongLong, "bigint", "bigint", false),
+    ).comment("Generation."),
+    SystemColumn::new("IS_ENABLED", ColumnType::LongLong, "bigint", "bigint", false).comment("Whether this object is enabled."),
     SystemColumn::new(
-        "CREDENTIAL_AVAILABLE",
+        "IS_CREDENTIAL_AVAILABLE",
         ColumnType::LongLong,
         "bigint",
         "bigint",
         false,
-    ),
+    ).comment("Whether no credential is required or the referenced credential key is locally available; does not validate a remote provider."),
 ];
 const AI_SECRETS_COLUMNS: &[SystemColumn] = &[
-    varchar_column!("SECRET_NAME", 64, 256, false),
+    varchar_column!("SECRET_NAME", 64, 256, false).comment("Secret name."),
     SystemColumn::new(
         "SECRET_ID",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
+    )
+    .comment("Stable AI secret identity."),
     SystemColumn::new(
         "GENERATION",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
+    )
+    .comment("Generation."),
     SystemColumn::new(
         "CRYPTO_GENERATION",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
-    varchar_column!("KEY_ID", 64, 256, false),
-    SystemColumn::new("AVAILABLE", ColumnType::LongLong, "bigint", "bigint", false),
+    )
+    .comment("Crypto generation."),
+    varchar_column!("KEY_ID", 64, 256, false).comment("Encryption key identity; not key material."),
+    SystemColumn::new(
+        "IS_AVAILABLE",
+        ColumnType::LongLong,
+        "bigint",
+        "bigint",
+        false,
+    )
+    .comment("Whether the secret encryption key is locally available."),
 ];
 const AI_RUNTIME_COLUMNS: &[SystemColumn] = &[
-    varchar_column!("METRIC", 64, 256, false),
+    varchar_column!("METRIC_NAME", 64, 256, false).comment("Name of the reported metric."),
     SystemColumn::new(
-        "VALUE",
+        "METRIC_VALUE",
         ColumnType::LongLong,
         "bigint",
         "bigint unsigned",
         false,
-    ),
+    )
+    .comment("Metric value; interpret together with its documented unit and scope."),
 ];
 
 const ROW_SECURITY_POLICY_COLUMNS: &[SystemColumn] = &[
-    varchar_column!("TABLE_SCHEMA", 64, 256, false),
-    varchar_column!("TABLE_NAME", 64, 256, false),
-    varchar_column!("POLICY_NAME", 64, 256, false),
-    varchar_column!("COMMAND", 16, 64, false),
-    varchar_column!("KIND", 16, 64, false),
-    SystemColumn::longtext("ROLES", false),
-    SystemColumn::longtext("USING_EXPRESSION", true),
-    SystemColumn::longtext("CHECK_EXPRESSION", true),
-    SystemColumn::int("ENABLED", false),
-    SystemColumn::unsigned_bigint("POLICY_VERSION", false),
+    varchar_column!("TABLE_SCHEMA", 64, 256, false).comment("Schema containing the table."),
+    varchar_column!("TABLE_NAME", 64, 256, false).comment("Table name."),
+    varchar_column!("POLICY_NAME", 64, 256, false).comment("Policy name."),
+    varchar_column!("COMMAND", 16, 64, false).comment("Command."),
+    varchar_column!("POLICY_KIND", 16, 64, false)
+        .comment("Row security policy kind, permissive or restrictive."),
+    SystemColumn::longtext("ROLES", false).comment("Roles."),
+    SystemColumn::longtext("USING_EXPRESSION", true).comment("Using expression."),
+    SystemColumn::longtext("CHECK_EXPRESSION", true).comment("Check expression."),
+    SystemColumn::int("IS_ENABLED", false).comment("Whether this object is enabled."),
+    SystemColumn::unsigned_bigint("POLICY_VERSION", false)
+        .comment("Version of the row security policy."),
 ];
 
 const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
@@ -1942,24 +1996,27 @@ const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
     def("USER_ATTRIBUTES", USER_ATTRIBUTES_COLUMNS),
     legacy_def("global_variables", VARIABLES_COLUMNS),
     legacy_def("session_variables", VARIABLES_COLUMNS),
-    mydb_def("mydb_row_security_policies", ROW_SECURITY_POLICY_COLUMNS),
-    mydb_def("ai_models", AI_MODELS_COLUMNS),
-    mydb_def("ai_connections", AI_CONNECTIONS_COLUMNS),
-    mydb_def("ai_secrets", AI_SECRETS_COLUMNS),
-    mydb_def("ai_runtime_status", AI_RUNTIME_COLUMNS),
-    mydb_def("mydb_sequences", SEQUENCES_COLUMNS),
-    mydb_def("mydb_ddl_jobs", MYDB_DDL_JOBS_COLUMNS),
-    mydb_def("mydb_xa_recover", MYDB_XA_RECOVER_COLUMNS),
-    mydb_def("mydb_cursors", MYDB_CURSORS_COLUMNS),
-    mydb_def("mydb_caches", MYDB_CACHES_COLUMNS),
-    mydb_def("mydb_plan_cache", MYDB_PLAN_CACHE_COLUMNS),
-    mydb_def("mydb_memory_advisor", MYDB_MEMORY_ADVISOR_COLUMNS),
-    mydb_def("mydb_vector_indexes", MYDB_VECTOR_INDEXES_COLUMNS),
-    mydb_def("mydb_undo_history", MYDB_UNDO_HISTORY_COLUMNS),
-    mydb_def("mydb_temporal_history", MYDB_TEMPORAL_HISTORY_COLUMNS),
-    mydb_def("mydb_stats_health", MYDB_STATS_HEALTH_COLUMNS),
-    mydb_def("mydb_zone_maps", ZONE_MAPS_COLUMNS),
-    mydb_def("mydb_zone_map_storage", ZONE_MAP_STORAGE_COLUMNS),
+    mydb_def("MYDB_ROW_SECURITY_POLICIES", ROW_SECURITY_POLICY_COLUMNS),
+    mydb_def("MYDB_AI_MODELS", AI_MODELS_COLUMNS),
+    mydb_def("MYDB_AI_CONNECTIONS", AI_CONNECTIONS_COLUMNS),
+    mydb_def("MYDB_AI_SECRETS", AI_SECRETS_COLUMNS),
+    mydb_def("MYDB_AI_RUNTIME_STATUS", AI_RUNTIME_COLUMNS),
+    mydb_def("MYDB_SEQUENCES", SEQUENCES_COLUMNS),
+    mydb_def("MYDB_DDL_JOBS", MYDB_DDL_JOBS_COLUMNS),
+    mydb_def(
+        "MYDB_PREPARED_XA_TRANSACTIONS",
+        MYDB_PREPARED_XA_TRANSACTIONS_COLUMNS,
+    ),
+    mydb_def("MYDB_CURSORS", MYDB_CURSORS_COLUMNS),
+    mydb_def("MYDB_CACHES", MYDB_CACHES_COLUMNS),
+    mydb_def("MYDB_PLAN_CACHE_ENTRIES", MYDB_PLAN_CACHE_ENTRIES_COLUMNS),
+    mydb_def("MYDB_MEMORY_ADVISOR", MYDB_MEMORY_ADVISOR_COLUMNS),
+    mydb_def("MYDB_VECTOR_INDEXES", MYDB_VECTOR_INDEXES_COLUMNS),
+    mydb_def("MYDB_UNDO_HISTORY", MYDB_UNDO_HISTORY_COLUMNS),
+    mydb_def("MYDB_TEMPORAL_HISTORY", MYDB_TEMPORAL_HISTORY_COLUMNS),
+    mydb_def("MYDB_STATS_HEALTH", MYDB_STATS_HEALTH_COLUMNS),
+    mydb_def("MYDB_ZONE_MAPS", ZONE_MAPS_COLUMNS),
+    mydb_def("MYDB_ZONE_MAP_STORAGE", ZONE_MAP_STORAGE_COLUMNS),
     plugin_empty_def(
         "ndb_transid_mysql_connection_map",
         NDB_TRANSID_MYSQL_CONNECTION_MAP_COLUMNS,
@@ -2361,6 +2418,7 @@ pub(crate) fn columns_for_table_name(table_name: &str) -> Result<Vec<Column>, Qu
                     collation_coercibility: Some(2),
                     dynamic_parameter: false,
                     round_decimal_result: false,
+                    canonical_metadata_name: true,
                     wire_type: None,
                     schema: def.schema.to_string(),
                     table: def.name.to_string(),
@@ -2595,13 +2653,13 @@ fn rows(
         ("information_schema", "innodb_temp_table_info") => {
             Ok(innodb_temp_table_info_rows(db))
         }
-        ("information_schema", "ai_models" | "ai_connections" | "ai_secrets" | "ai_runtime_status") => crate::engine::ai::metadata::rows(db, table),
+        ("information_schema", "mydb_ai_models" | "mydb_ai_connections" | "mydb_ai_secrets" | "mydb_ai_runtime_status") => crate::engine::ai::metadata::rows(db, table),
         ("information_schema", "mydb_sequences") => sequence_rows(db),
         ("information_schema", "mydb_ddl_jobs") => Ok(mydb_ddl_jobs_rows(db)),
-        ("information_schema", "mydb_xa_recover") => Ok(mydb_xa_recover_rows(db)),
+        ("information_schema", "mydb_prepared_xa_transactions") => Ok(mydb_prepared_xa_transactions_rows(db)),
         ("information_schema", "mydb_cursors") => Ok(mydb_cursors_rows(db)),
         ("information_schema", "mydb_caches") => Ok(mydb_caches_rows(db)),
-        ("information_schema", "mydb_plan_cache") => Ok(mydb_plan_cache_rows(db)),
+        ("information_schema", "mydb_plan_cache_entries") => Ok(mydb_plan_cache_entries_rows(db)),
         ("information_schema", "mydb_memory_advisor") => Ok(mydb_memory_advisor_rows(db)),
         ("information_schema", "mydb_vector_indexes") => Ok(mydb_vector_indexes_rows(db, request)),
         ("information_schema", "mydb_undo_history") => Ok(mydb_undo_history_rows(db)),
@@ -3509,7 +3567,7 @@ fn append_system_columns_rows(
             Value::String(privileges),
             core_metadata
                 .map(|metadata| s(metadata.comment))
-                .unwrap_or_else(|| s("")),
+                .unwrap_or_else(|| s(column.comment)),
             core_metadata
                 .map(|metadata| s(metadata.generation_expression))
                 .unwrap_or_else(|| s("")),
@@ -7033,7 +7091,7 @@ fn mydb_caches_rows(db: &Database) -> Vec<Vec<Value>> {
 
 /// One row per resident physical-plan cache entry. Empty when no engine is
 /// registered (e.g. a bare test double) or the cache is cold.
-fn mydb_plan_cache_rows(db: &Database) -> Vec<Vec<Value>> {
+fn mydb_plan_cache_entries_rows(db: &Database) -> Vec<Vec<Value>> {
     if !can_view_process_metadata(db) {
         return Vec::new();
     }
@@ -7124,7 +7182,7 @@ fn mydb_vector_indexes_rows(db: &Database, request: &SystemScanRequest) -> Vec<V
                 meta.nlist
                     .map(|v| Value::Int(v as i64))
                     .unwrap_or(Value::Null),
-                // NLIST / INSERTS_SINCE_TRAIN: IVF-only, NULL for HNSW and cold.
+                // NLIST / INSERTS_SINCE_TRAINING: IVF-only, NULL for HNSW and cold.
                 opt_i64(stats.filter(|st| st.nlist > 0).map(|st| st.nlist as i64)),
                 opt_i64(stats.map(|st| st.list_avg_entries as i64)),
                 opt_i64(stats.map(|st| st.list_max_entries as i64)),
@@ -7268,7 +7326,7 @@ fn mydb_temporal_history_rows(db: &Database) -> Vec<Vec<Value>> {
 
 /// PGA-style work-area arbiter snapshot. One row per metric so a
 /// human-friendly description column can travel alongside the value.
-/// Used by `SELECT * FROM information_schema.mydb_memory_advisor`.
+/// Used by `SELECT * FROM information_schema.MYDB_MEMORY_ADVISOR`.
 fn mydb_memory_advisor_rows(db: &Database) -> Vec<Vec<Value>> {
     if !can_view_process_metadata(db) {
         return Vec::new();
@@ -7805,7 +7863,7 @@ fn mydb_undo_history_rows(db: &Database) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn mydb_xa_recover_rows(db: &Database) -> Vec<Vec<Value>> {
+fn mydb_prepared_xa_transactions_rows(db: &Database) -> Vec<Vec<Value>> {
     if !can_view_dynamic_metadata(db, "XA_RECOVER_ADMIN") {
         return Vec::new();
     }
@@ -8256,7 +8314,6 @@ mod tests {
 
     #[test]
     fn information_schema_registry_uses_namespaced_native_tables() {
-        assert_eq!(INFORMATION_SCHEMA_REGISTRY.len(), 104);
         let mut names = std::collections::BTreeSet::new();
         let mut class_counts = [0usize; 4];
         for registration in INFORMATION_SCHEMA_REGISTRY {
@@ -8271,9 +8328,10 @@ mod tests {
                 InformationSchemaCompatibility::MysqlOptionalPlugin => class_counts[2] += 1,
                 InformationSchemaCompatibility::MydbNative => {
                     class_counts[3] += 1;
-                    assert!(
-                        (registration.table.name.starts_with("mydb_")
-                            || registration.table.name.starts_with("ai_"))
+                    assert!(registration.table.name.starts_with("MYDB_"));
+                    assert_eq!(
+                        registration.table.name,
+                        registration.table.name.to_ascii_uppercase()
                     );
                 }
             }
@@ -8286,7 +8344,8 @@ mod tests {
                 );
             }
         }
-        assert_eq!(class_counts, [76, 3, 7, 18]);
+        assert_eq!(&class_counts[..3], &[76, 3, 7]);
+        assert!(class_counts[3] > 0);
         assert!(!names.contains("zone_maps"));
         assert!(!names.contains("zone_map_storage"));
         assert!(names.contains("mydb_zone_maps"));
@@ -8325,6 +8384,7 @@ mod tests {
                 .iter()
                 .find(|entry| entry.table.name.eq_ignore_ascii_case(name))
                 .unwrap_or_else(|| panic!("missing MySQL 8.0.46 table {name}"));
+            assert_eq!(registration.table.name, name, "canonical MySQL table name");
             let expected_columns = manifest["columns"]
                 .as_array()
                 .expect("columns array")
@@ -8450,9 +8510,52 @@ mod tests {
 
     #[test]
     fn registered_columns_have_mysql_metadata() {
+        let mut tables = std::collections::BTreeSet::new();
         for def in system_table_definitions() {
+            assert!(tables.insert((
+                def.schema.to_ascii_lowercase(),
+                def.name.to_ascii_lowercase()
+            )));
             assert!(!def.columns.is_empty(), "{}.{}", def.schema, def.name);
+            let mut names = std::collections::BTreeSet::new();
+            let native = def.schema == "information_schema"
+                && find_information_schema_registration(def.name).is_some_and(|entry| {
+                    entry.compatibility == InformationSchemaCompatibility::MydbNative
+                });
             for (idx, column) in def.columns.iter().enumerate() {
+                assert!(
+                    names.insert(column.name.to_ascii_lowercase()),
+                    "duplicate {}.{}",
+                    def.name,
+                    column.name
+                );
+                if native {
+                    assert!(column
+                        .name
+                        .bytes()
+                        .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == b'_'));
+                    assert!(
+                        !column.name.starts_with('_')
+                            && !column.name.ends_with('_')
+                            && !column.name.contains("__")
+                    );
+                    assert!(
+                        !column.comment.is_empty(),
+                        "{}.{} needs a description",
+                        def.name,
+                        column.name
+                    );
+                    assert!(!matches!(
+                        column.name,
+                        "ALGO"
+                            | "DECLARED_DIM"
+                            | "RUNTIME_DIM"
+                            | "TABLE_DEPS"
+                            | "KMEANS_ITERS"
+                            | "TRAIN_SAMPLE_MULT"
+                            | "RERANK_MULT"
+                    ));
+                }
                 assert!(
                     !column.name.is_empty(),
                     "{}.{} #{idx}",
@@ -8466,6 +8569,17 @@ mod tests {
                     def.schema,
                     def.name
                 );
+            }
+            for index in def.indexes {
+                for column in index.columns {
+                    assert!(
+                        names.contains(&column.to_ascii_lowercase()),
+                        "{}.{} references missing column {}",
+                        def.name,
+                        index.name,
+                        column
+                    );
+                }
             }
         }
     }
@@ -8513,14 +8627,33 @@ mod tests {
         assert_eq!(matrix["counts"]["mysql80_community"], 76);
         assert_eq!(matrix["counts"]["mysql_legacy_compat"], 3);
         assert_eq!(matrix["counts"]["mysql_optional_plugin_compat"], 7);
-        assert_eq!(matrix["counts"]["mydb_native"], 13);
+        assert_eq!(
+            matrix["counts"]["mydb_native"],
+            INFORMATION_SCHEMA_REGISTRY
+                .iter()
+                .filter(|entry| entry.compatibility == InformationSchemaCompatibility::MydbNative)
+                .count()
+        );
         let surfaces = matrix["surfaces"].as_array().expect("surfaces array");
-        assert_eq!(surfaces.len(), 99);
+        assert_eq!(surfaces.len(), INFORMATION_SCHEMA_REGISTRY.len());
         let mut seen = std::collections::BTreeSet::new();
         for surface in surfaces {
             let schema = surface["schema"].as_str().expect("schema");
             let object = surface["object"].as_str().expect("object");
             assert!(seen.insert((schema, object)), "duplicate {schema}.{object}");
+            let registration = INFORMATION_SCHEMA_REGISTRY
+                .iter()
+                .find(|entry| entry.table.schema == schema && entry.table.name == object)
+                .expect("matrix object must exactly match its registration");
+            let class = match registration.compatibility {
+                InformationSchemaCompatibility::Mysql80Community => "mysql80_community",
+                InformationSchemaCompatibility::MysqlLegacy => "mysql_legacy_compat",
+                InformationSchemaCompatibility::MysqlOptionalPlugin => {
+                    "mysql_optional_plugin_compat"
+                }
+                InformationSchemaCompatibility::MydbNative => "mydb_native",
+            };
+            assert_eq!(surface["compatibility_class"], class);
             assert!(matches!(
                 surface["producer"].as_str(),
                 Some("real_producer" | "honest_empty")
@@ -8559,9 +8692,9 @@ mod tests {
         assert!(seen.contains(&("information_schema", "INNODB_TRX")));
         assert!(!seen.contains(&("information_schema", "zone_maps")));
         assert!(!seen.contains(&("information_schema", "zone_map_storage")));
-        assert!(seen.contains(&("information_schema", "mydb_zone_maps")));
-        assert!(seen.contains(&("information_schema", "mydb_zone_map_storage")));
-        assert!(seen.contains(&("information_schema", "mydb_temporal_history")));
+        assert!(seen.contains(&("information_schema", "MYDB_ZONE_MAPS")));
+        assert!(seen.contains(&("information_schema", "MYDB_ZONE_MAP_STORAGE")));
+        assert!(seen.contains(&("information_schema", "MYDB_TEMPORAL_HISTORY")));
     }
 }
 use std::collections::HashSet;

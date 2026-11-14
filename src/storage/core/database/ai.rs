@@ -98,7 +98,7 @@ impl Database {
             );
             for key in removed {
                 txn.replace(
-                    crate::storage::data_dictionary::DD_GLOBAL_PRIVILEGES,
+                    crate::storage::data_dictionary::DD_GRANTS,
                     CatalogRowSelector::PrimaryValues(vec![Value::String(key)]),
                     Vec::new(),
                 );

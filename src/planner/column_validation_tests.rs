@@ -3,6 +3,7 @@ use super::*;
 fn binding_scope() -> ColumnScope<'static> {
     ColumnScope {
         tables: vec![ScopeTable {
+            canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
             name: "t".into(),
             alias: None,
             columns: vec!["a".into(), "b".into()],
@@ -94,6 +95,7 @@ fn column_validation_window_frames_exclude_aliases_and_hidden_sources() {
     let engine = open_test_engine(dir.path());
     let mut scope = binding_scope();
     scope.tables.push(ScopeTable {
+        canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
         name: "hidden".into(),
         alias: None,
         columns: vec!["hidden_col".into()],

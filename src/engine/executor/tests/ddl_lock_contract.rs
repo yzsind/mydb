@@ -373,7 +373,7 @@ fn index_retirement_preparation_failure_preserves_definition_and_files() {
         let engine = open_strict_test_engine(dir.path());
         assert_eq!(
             engine
-                .execute("SELECT * FROM mysql.mydb_ddl_retirements")
+                .execute("SELECT * FROM mysql.ddl_retirements")
                 .unwrap_err()
                 .code(),
             3554

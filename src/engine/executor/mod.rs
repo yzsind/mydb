@@ -4480,6 +4480,39 @@ impl QueryEngine for StorageQueryEngine {
         )?;
         let (db_name, name) =
             crate::storage::split_table_name(&session.current_database, table_name);
+        let qualified = qualify_table_name(session, table_name);
+        if let Some(error) =
+            crate::engine::information_schema::hidden_system_table_error(&qualified)
+        {
+            return Err(error);
+        }
+        if crate::engine::information_schema::find_system_table_name(&qualified).is_some() {
+            let columns = crate::engine::information_schema::columns_for_table_name(&qualified)?;
+            let mut out = Vec::with_capacity(columns.len());
+            for column in columns {
+                if (!wildcard.is_empty()
+                    && !field_list_like_match(wildcard.as_bytes(), column.name.as_bytes()))
+                    || crate::engine::show::column_privileges_for_show(
+                        &self.db,
+                        session,
+                        &db_name,
+                        &name,
+                        &column.name,
+                    )
+                    .is_empty()
+                {
+                    continue;
+                }
+                let mut packet = crate::mysql::protocol::column_definition_packet_full(
+                    &column.name,
+                    column.column_type,
+                    &column.source,
+                );
+                crate::mysql::protocol::write_lenenc_int(&mut packet, 0);
+                out.push(packet);
+            }
+            return Ok(out);
+        }
         let schema = self.db.table(&qualify_table_name(session, table_name))?;
         let mut out = Vec::with_capacity(schema.columns.len());
         let pattern_bytes = if wildcard.is_empty() {
@@ -4528,115 +4561,121 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         statement: Statement,
     ) -> Option<Result<QueryResponse, QueryError>> {
-        self.attach_expression_registry(session);
-        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
-        let _group_concat_scope =
-            select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
-        let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
-        if let Err(err) = session.check_cancelled() {
-            return Some(Err(err));
-        }
-        // SAFETY: db/session outlive this statement, including the constant
-        // SELECT lane that bypasses dispatch. Sequence calls remain serial.
-        let sequence_dependent = crate::planner::sql_mentions_sequence_fn(sql);
-        let _sequence_ctx = unsafe {
-            crate::engine::expr::install_sequence_eval_context(
-                std::ptr::NonNull::from(self.db.as_ref()),
-                std::ptr::NonNull::from(&*session),
-            )
-        };
-        let _load_file_ctx = unsafe {
-            crate::engine::expr::install_load_file_eval_context(
-                std::ptr::NonNull::from(self.db.as_ref()),
-                std::ptr::NonNull::from(&*session),
-            )
-        };
-        let _force_serial = (sequence_dependent
-            || crate::planner::sql_mentions_load_file_fn(sql)
-            || crate::engine::http::may_call(&self.db, sql))
-        .then(crate::planner::force_serial_scope);
-        // Prepared-statement EXECUTE bypasses `execute_statement` (which is
-        // where L8 quota enforcement normally runs). Charge the per-account
-        // budget here so sqlx / Connector/J prepared-binding apps don't sneak
-        // past the limit.
-        let full_routine_dispatch = matches!(statement, Statement::Call(_))
-            || routines::statement_references_stored_function(&self.db, session, &statement);
-        // Routine statements re-enter the full dispatcher, which charges the
-        // account itself. Keep the lightweight path's accounting exactly once.
-        if !session.internal_system_session && !full_routine_dispatch {
-            let limits = &session.account_limits;
-            if let Err(err) = crate::engine::auth::charge_question(
-                &session.authenticated_as,
-                limits.max_questions,
-            ) {
+        // Deferred CTE/system scans capture their execution context after the
+        // inner dispatcher returns. Keep the registry installed through result
+        // wrapping so direct API executions have the same context as the wire.
+        select::with_shared_session_registry(&self.registry, || {
+            self.attach_expression_registry(session);
+            let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
+            let _group_concat_scope =
+                select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
+            let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+            if let Err(err) = session.check_cancelled() {
                 return Some(Err(err));
             }
-            if crate::replication::is_replica_write_statement(&statement) {
-                if let Err(err) = crate::engine::auth::charge_update(
+            // SAFETY: db/session outlive this statement, including the constant
+            // SELECT lane that bypasses dispatch. Sequence calls remain serial.
+            let sequence_dependent = crate::planner::sql_mentions_sequence_fn(sql);
+            let _sequence_ctx = unsafe {
+                crate::engine::expr::install_sequence_eval_context(
+                    std::ptr::NonNull::from(self.db.as_ref()),
+                    std::ptr::NonNull::from(&*session),
+                )
+            };
+            let _load_file_ctx = unsafe {
+                crate::engine::expr::install_load_file_eval_context(
+                    std::ptr::NonNull::from(self.db.as_ref()),
+                    std::ptr::NonNull::from(&*session),
+                )
+            };
+            let _force_serial = (sequence_dependent
+                || crate::planner::sql_mentions_load_file_fn(sql)
+                || crate::engine::http::may_call(&self.db, sql))
+            .then(crate::planner::force_serial_scope);
+            // Prepared-statement EXECUTE bypasses `execute_statement` (which is
+            // where L8 quota enforcement normally runs). Charge the per-account
+            // budget here so sqlx / Connector/J prepared-binding apps don't sneak
+            // past the limit.
+            let full_routine_dispatch = matches!(statement, Statement::Call(_))
+                || routines::statement_references_stored_function(&self.db, session, &statement);
+            // Routine statements re-enter the full dispatcher, which charges the
+            // account itself. Keep the lightweight path's accounting exactly once.
+            if !session.internal_system_session && !full_routine_dispatch {
+                let limits = &session.account_limits;
+                if let Err(err) = crate::engine::auth::charge_question(
                     &session.authenticated_as,
-                    limits.max_updates,
+                    limits.max_questions,
                 ) {
                     return Some(Err(err));
                 }
-            }
-        }
-        let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
-        if let Some(simple_kind) =
-            simple_txn_control_kind(sql.trim_matches(|c: char| c.is_whitespace() || c == ';'))
-        {
-            let result = dispatch_simple_txn_control(&self.db, session, simple_kind);
-            finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
-            return Some(result);
-        }
-        if self.plan_cache_enabled {
-            self.db.record_plan_cache_hit();
-        }
-        let use_shared_plan_cache =
-            should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement);
-        let _http_scope = crate::engine::http::enter(&self.db);
-        if crate::engine::http::may_call(&self.db, sql) {
-            crate::engine::http::activate();
-        }
-        let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
-        let result = if use_shared_plan_cache && !statement_skips_plan_cache_hint(&statement) {
-            // Prepared statements feed the plan cache through the same hint
-            // mechanism as COM_QUERY. Reuse the PREPARE-time strings when
-            // available; the disabled path avoids this key construction.
-            let (normalized_sql, database) = match crate::engine::cache::current_prepared_hint() {
-                Some(prep) => (prep.normalized_sql, prep.database),
-                None => {
-                    let normalized = normalize_sql(sql);
-                    (
-                        Arc::<str>::from(normalized.as_str()),
-                        Arc::<str>::from(session.current_database.as_str()),
-                    )
+                if crate::replication::is_replica_write_statement(&statement) {
+                    if let Err(err) = crate::engine::auth::charge_update(
+                        &session.authenticated_as,
+                        limits.max_updates,
+                    ) {
+                        return Some(Err(err));
+                    }
                 }
-            };
-            let hint = crate::engine::cache::QueryHint {
-                normalized_sql,
-                database,
-                semantics: plan_semantics(&self.db, session),
-                parameterized: true,
-                plan_cache: Arc::downgrade(&self.plan_cache),
-            };
-            crate::engine::cache::with_query_hint(hint, || {
+            }
+            let preserve_warnings = begin_statement_diagnostics(&self.db, session, sql);
+            if let Some(simple_kind) =
+                simple_txn_control_kind(sql.trim_matches(|c: char| c.is_whitespace() || c == ';'))
+            {
+                let result = dispatch_simple_txn_control(&self.db, session, simple_kind);
+                finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
+                return Some(result);
+            }
+            if self.plan_cache_enabled {
+                self.db.record_plan_cache_hit();
+            }
+            let use_shared_plan_cache =
+                should_use_shared_plan_cache(self.plan_cache_enabled, session, &statement);
+            let _http_scope = crate::engine::http::enter(&self.db);
+            if crate::engine::http::may_call(&self.db, sql) {
+                crate::engine::http::activate();
+            }
+            let _cancel_guard = crate::engine::cancel::install_session_cancel_context(session);
+            let result = if use_shared_plan_cache && !statement_skips_plan_cache_hint(&statement) {
+                // Prepared statements feed the plan cache through the same hint
+                // mechanism as COM_QUERY. Reuse the PREPARE-time strings when
+                // available; the disabled path avoids this key construction.
+                let (normalized_sql, database) = match crate::engine::cache::current_prepared_hint()
+                {
+                    Some(prep) => (prep.normalized_sql, prep.database),
+                    None => {
+                        let normalized = normalize_sql(sql);
+                        (
+                            Arc::<str>::from(normalized.as_str()),
+                            Arc::<str>::from(session.current_database.as_str()),
+                        )
+                    }
+                };
+                let hint = crate::engine::cache::QueryHint {
+                    normalized_sql,
+                    database,
+                    semantics: plan_semantics(&self.db, session),
+                    parameterized: true,
+                    plan_cache: Arc::downgrade(&self.plan_cache),
+                };
+                crate::engine::cache::with_query_hint(hint, || {
+                    self.execute_qualified_parsed_statement(session, sql, statement)
+                })
+            } else {
                 self.execute_qualified_parsed_statement(session, sql, statement)
-            })
-        } else {
-            self.execute_qualified_parsed_statement(session, sql, statement)
-        };
-        // Sequence state belongs to the live connection. A deferred cursor
-        // must not outlive that state or evaluate on a worker's copied session.
-        let result = if sequence_dependent {
-            result.and_then(QueryResponse::materialize)
-        } else {
-            result
-        };
-        let result =
-            result.and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
-        drop(_cancel_guard);
-        finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
-        Some(result)
+            };
+            // Sequence state belongs to the live connection. A deferred cursor
+            // must not outlive that state or evaluate on a worker's copied session.
+            let result = if sequence_dependent {
+                result.and_then(QueryResponse::materialize)
+            } else {
+                result
+            };
+            let result = result
+                .and_then(|response| response.localize_timestamps(&session.sysvars.time_zone));
+            drop(_cancel_guard);
+            finish_statement_diagnostics(&self.db, session, preserve_warnings, &result);
+            Some(result)
+        })
     }
 
     fn execute_prepared_select(
@@ -4647,11 +4686,14 @@ impl QueryEngine for StorageQueryEngine {
         sql: &str,
         params: &[crate::types::Value],
     ) -> Option<Result<QueryResponse, QueryError>> {
-        self.attach_expression_registry(session);
-        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
+        // Callers try this memo first for every prepared statement. Reject
+        // non-SELECT statements before capturing the statement's
+        // authorization snapshot; their own path captures it again.
         if !matches!(parsed.as_ref(), Statement::Select(_)) {
             return None;
         }
+        self.attach_expression_registry(session);
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);

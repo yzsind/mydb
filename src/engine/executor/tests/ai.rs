@@ -586,7 +586,7 @@ fn ai_model_privileges_roles_and_prepared_recheck_revocation() {
         let visible = materialize(exec(
             engine,
             &mut reader,
-            "SELECT MODEL_NAME FROM information_schema.AI_MODELS",
+            "SELECT MODEL_NAME FROM information_schema.MYDB_AI_MODELS",
         ));
         assert_eq!(visible.rows.len(), 1);
         exec(
@@ -984,7 +984,7 @@ fn ai_model_grammar_preserves_sql_modes_quoted_names_and_unicode_schemas() {
             "SELECT AI_GENERATE('业务.db.if','中文与 UTF-8 😀')",
         ));
         assert_eq!(rows.rows.len(), 1);
-        let rows=materialize(exec(engine,session,"SELECT MODEL_SCHEMA,MODEL_NAME FROM information_schema.AI_MODELS WHERE MODEL_SCHEMA='业务.db'"));
+        let rows=materialize(exec(engine,session,"SELECT MODEL_SCHEMA,MODEL_NAME FROM information_schema.MYDB_AI_MODELS WHERE MODEL_SCHEMA='业务.db'"));
         assert_eq!(
             rows.rows,
             vec![vec![

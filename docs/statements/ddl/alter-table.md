@@ -27,7 +27,7 @@ Modifies table structure, constraints, indexes, partitions, and table options.
 
 - `FORCE` performs a physical rebuild through the COPY generation pipeline. It preserves the logical definition and data; unsupported storage/lock combinations fail explicitly.
 - Supported actions are strictly validated by the executor; unknown actions return 1235/1064 and are never silently dropped.
-- Online DDL uses jobs to manage progress; COPY uses a shadow generation, and online BTREE index builds retain the heap while building a private index. Progress can be monitored through information_schema.mydb_ddl_jobs.
+- Online DDL uses jobs to manage progress; COPY uses a shadow generation, and online BTREE index builds retain the heap while building a private index. Progress can be monitored through information_schema.MYDB_DDL_JOBS.
 - `ADD PRIMARY KEY` supports DML during the build phase by default and also accepts `ALGORITHM=INPLACE, LOCK=NONE`; prepare and publish use brief writer barriers that allow readers. It can be built together with regular and unique BTREE indexes, all published together once every validation passes.
 - While the primary key is being built, the old table constraints remain in effect; on successful publication, the primary key and NOT NULL take effect together. If NULLs remain at the end, 1138 is returned; duplicate keys return 1062; on failure, already committed DML and the old definition are preserved, NULLs are not converted to default values, and the behavior is unaffected by non-strict SQL mode.
 - `LOCK=SHARED/EXCLUSIVE` blocks writes as requested; mixed operations such as primary key plus column changes, or replacing the primary key, do not support `LOCK=NONE` and explicitly return 1846. Additive index/primary-key publication preserves older snapshots through snapshot-specific optimizer facts; physical generation changes may still return 1412 to an older snapshot.
@@ -57,7 +57,7 @@ INSTANT is only available for implemented metadata actions; it is not a synonym 
 
 Requires ALTER on the table. Foreign-key addition also requires REFERENCES; RENAME uses DROP on source and CREATE+INSERT on destination in addition to ALTER. The ordinary persistent ALTER is an implicit-commit boundary. All actions are checked before choosing an atomic publication path; an error does not establish that earlier user DML remains pending.
 
-DDL can wait for long transactions at preparation/publication even with LOCK=NONE. Track supported jobs through information_schema.mydb_ddl_jobs and CANCEL DDL JOB. A cancellation accepted before finalization prevents publication; poll the job for its terminal result. Snapshot readers can receive 1412 after physical generation replacement and must reopen their transaction. See [limits](../../limits.md) for naming/enforcement boundaries.
+DDL can wait for long transactions at preparation/publication even with LOCK=NONE. Track supported jobs through information_schema.MYDB_DDL_JOBS and CANCEL DDL JOB. A cancellation accepted before finalization prevents publication; poll the job for its terminal result. Snapshot readers can receive 1412 after physical generation replacement and must reopen their transaction. See [limits](../../limits.md) for naming/enforcement boundaries.
 
 ## Examples
 

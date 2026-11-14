@@ -335,8 +335,9 @@ Key configurable ranges:
 | Temp disk reserve (`MYDB_TEMP_DISK_RESERVE_PCT`) | 2% of total filesystem capacity | 0 – 90% |
 | Spill per query | 0 = unlimited | 0 – 18,446,744,073,709,551,615 |
 | CTE resident threshold | = query budget (floor 256 KiB) | 0 = spill immediately |
-| Catalog cache (`MYDB_CATALOG_CACHE_MB`) | 5% of target (2% if target ≤ 1 GiB), capped 256 MiB | 0 = disabled |
+| Catalog cache (`MYDB_CATALOG_CACHE_MB`) | 5% of target (2% if target ≤ 1 GiB), capped 4 GiB | 0 = disabled |
 | Plan cache entries | 4096 per cache (the caches use the same configured capacity) | > 0 |
+| Parsed-statement / shared SELECT plan cache bytes | 1% of memory target per cache | 1 MiB – 4 GiB per cache |
 | Routine program cache | 1024 | ≥ 1 |
 | HNSW bulk build memory | 80% of memory target | > 0 |
 | Allocator | mimalloc (`fast-alloc` feature) | idle reclaim at 110% of target |

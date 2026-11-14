@@ -127,7 +127,7 @@ production-grade MySQL replacement.
   read-compatible barriers. Explicit `LOCK=EXCLUSIVE` still excludes readers.
   Column/generated-column changes that require a physical rewrite, rebuilds, and some partition publications still wait for readers, so not every
   `ALTER TABLE` can be called read-nonblocking. See [ALTER TABLE](statements/ddl/alter-table.md).
-- `information_schema.mydb_ddl_jobs` keeps the most recent 64 COPY jobs in COMMITTED/FAILED/CANCELLED terminal states, so background errors no longer vanish into logs; online change-log capacity is charged to
+- `information_schema.MYDB_DDL_JOBS` keeps the most recent 64 COPY jobs in COMMITTED/FAILED/CANCELLED terminal states, so background errors no longer vanish into logs; online change-log capacity is charged to
   `DdlOnlineLog`, and budget failure aborts the DDL instead of allowing ungoverned memory growth.
 - **Parallel B-tree and FULLTEXT `ADD/CREATE INDEX`**: ➕ supports `CREATE /*+ PARALLEL(n) */ INDEX`
   and `ALTER /*+ PARALLEL(n) */ TABLE ... ADD INDEX`; this hint is a mydb extension,
@@ -225,10 +225,10 @@ for syntax and operational limits.
 - KEY / LINEAR KEY use mydb's own deterministic column hash, so concrete physical partition placement is not guaranteed to match MySQL. Logical data restored across engines is re-routed by the target engine; programs relying on explicit `PARTITION(pN)` targeting must not assume identical physical buckets between the two engines.
 - HASH uses mathematical unsigned modulo for unsigned values, without MySQL's signed-bit reinterpretation. Constant partition expressions are a supported extension. Subpartition counts must be uniform across logical partitions; unequal counts return 1485. `information_schema.PARTITIONS.CREATE_TIME` reports the parent table's creation time rather than a separate partition lifecycle timestamp.
 - RANGE / RANGE COLUMNS write routing uses binary search over ordered boundaries; equality, NULL-safe equality, IN, range, AND/OR, and contradictory predicates share the pruning path, and an empty partition set opens no heap. A parent partition and its HASH/KEY subpartition can be pruned simultaneously down to one physical leaf under a full equality key. Integer `DIV` is allowed in partition expressions; `/`, bitwise operators, and LIST `DEFAULT` are explicitly rejected.
-- Repartitioning DDL is **crash safe**: streaming build-then-swap (COALESCE / REORGANIZE / REPARTITION / REMOVE PARTITIONING / ADD PARTITIONS), with the persistence phase fixed at `INTENT / SNAPSHOT_BUILD / CATCH_UP / QUIESCE / SWAPPED / CLEANUP / DONE|FAILED`; startup recovery idempotently rolls forward or back according to the physical generation in the catalog. `CANCEL DDL JOB <job_id>` is accepted only before the swap; status and progress are in `information_schema.mydb_ddl_jobs`.
+- Repartitioning DDL is **crash safe**: streaming build-then-swap (COALESCE / REORGANIZE / REPARTITION / REMOVE PARTITIONING / ADD PARTITIONS), with the persistence phase fixed at `INTENT / SNAPSHOT_BUILD / CATCH_UP / QUIESCE / SWAPPED / CLEANUP / DONE|FAILED`; startup recovery idempotently rolls forward or back according to the physical generation in the catalog. `CANCEL DDL JOB <job_id>` is accepted only before the swap; status and progress are in `information_schema.MYDB_DDL_JOBS`.
 - `REBUILD PARTITION` rewrites only the target physical leaves into a new storage generation, compacting heap/LOB and rebuilding local indexes in bulk; `OPTIMIZE PARTITION` additionally analyzes only the target leaves — unselected leaves are not scanned; `CHECK PARTITION` validates row-routing membership and heap/B-tree equivalence.
 - `ANALYZE PARTITION` persists per-leaf row counts, heap pages, column/index sketches, and check status; the CBO merges costs over the pruned leaf set. Partition-wise hash join is enabled when the topology is identical and the equality join covers the full partition key, and partition-wise aggregate when `GROUP BY` covers the full partition key.
-- Partition bulk DML, physical DDL, and statistics builds are charged to the unified governor categories `PartitionDmlBatch`, `PartitionDdl`, and `PartitionStats` respectively; current values and rejection counts are exposed via `SHOW STATUS`, `information_schema.mydb_memory_advisor`, and the memory summary views.
+- Partition bulk DML, physical DDL, and statistics builds are charged to the unified governor categories `PartitionDmlBatch`, `PartitionDdl`, and `PartitionStats` respectively; current values and rejection counts are exposed via `SHOW STATUS`, `information_schema.MYDB_MEMORY_ADVISOR`, and the memory summary views.
 - Per-partition physical options: `ENGINE` accepts only the `mydb`/`InnoDB` current-engine aliases and is not persisted; `DATA/INDEX DIRECTORY`, `TABLESPACE`, `MAX_ROWS`, `MIN_ROWS`, and `NODEGROUP` return explicit not-supported errors and are never silently ignored.
 - FULLTEXT, SPATIAL, HNSW, and IVF can be used on partitioned tables; this is a mydb extension enabled by default that no longer requires a runtime switch.
 
@@ -899,11 +899,13 @@ InnoDB/WAL/replication transactions; the InnoDB name in `SHOW CREATE TABLE`
 exists purely for MySQL-compatible display.
 - `mysql`: `user`, `db`, `tables_priv`, `columns_priv`, `procs_priv`, `global_grants`, `role_edges`, `default_roles`, `password_history`, `help_*`, `time_zone*`, `server_cost`/`engine_cost`, `innodb_{table,index}_stats`, `slave_*_info`, `gtid_executed`, etc.; `general_log`/`slow_log` are CSV-engine tables.
 
-➕ **mydb-specific IS views** (namespaced by the `mydb_` prefix): `mydb_ddl_jobs`, `mydb_xa_recover`, `mydb_cursors`, `mydb_caches`, `mydb_plan_cache`, `mydb_vector_indexes`, `mydb_memory_advisor`, `mydb_undo_history`, `mydb_temporal_history`, `mydb_stats_health`, `mydb_zone_maps`, `mydb_zone_map_storage`, `mydb_sequences`.
+➕ **mydb-specific IS views** (namespaced by the `MYDB_` prefix): `MYDB_DDL_JOBS`, `MYDB_PREPARED_XA_TRANSACTIONS`, `MYDB_CURSORS`, `MYDB_CACHES`, `MYDB_PLAN_CACHE_ENTRIES`, `MYDB_VECTOR_INDEXES`, `MYDB_MEMORY_ADVISOR`, `MYDB_UNDO_HISTORY`, `MYDB_TEMPORAL_HISTORY`, `MYDB_STATS_HEALTH`, `MYDB_ZONE_MAPS`, `MYDB_ZONE_MAP_STORAGE`, `MYDB_SEQUENCES`, `MYDB_ROW_SECURITY_POLICIES`, `MYDB_AI_MODELS`, `MYDB_AI_CONNECTIONS`, `MYDB_AI_SECRETS`, `MYDB_AI_RUNTIME_STATUS`.
+
+Native table and column names follow the [metadata naming contract](metadata-naming.md).
 
 The machine-readable [metadata compatibility matrix](mysql80-metadata-compat-matrix.json)
-contains 99 registered surfaces: 76 Community, 3 legacy, 7 optional-plugin and
-13 mydb-native entries. `mydb_sequences` exposes catalog-backed recovery and
+contains 104 registered surfaces: 76 Community, 3 legacy, 7 optional-plugin and
+18 mydb-native entries. `MYDB_SEQUENCES` exposes catalog-backed recovery and
 synchronization state, filtered by SELECT/UPDATE privileges on each sequence.
 
 ### SHOW Statements
@@ -936,7 +938,7 @@ synchronization state, filtered by SELECT/UPDATE privileges on each sequence.
 - **HNSW**: `CREATE INDEX … USING HNSW`, with `WITH (metric=..., m=..., ef_construction=..., ef_search=..., quantization=...)`; compressed candidates are re-ranked using visible native heap values.
 - **IVF**: `CREATE INDEX … USING IVF`, with `WITH (metric=..., nlist=..., nprobe=..., kmeans_iters=..., train_sample=..., quantization=...)`; queries probe by centroid and inverted list, and `OPTIMIZE TABLE` can retrain.
 - **Quantization**: `none` (default), SQ8, SQ4, PQ, and scaled centered BQ for numeric L2/COSINE/DOT. BINARY indexes reject quantization. COMMENT is descriptive text and former parameter syntax is rejected.
-- **Training and diagnostics**: PQ requires at least `2^pq_bits` training rows; pending models execute exact scans. `EXPLAIN` reports quantization and the effective re-ranking pool; `information_schema.mydb_vector_indexes` reports configuration, training state, model/code bytes, exceptions, and query counters. See [vector datatypes and indexes](vector-indexes.md).
+- **Training and diagnostics**: PQ requires at least `2^pq_bits` training rows; pending models execute exact scans. `EXPLAIN` reports quantization and the effective re-ranking pool; `information_schema.MYDB_VECTOR_INDEXES` reports configuration, training state, model/code bytes, exceptions, and query counters. See [vector datatypes and indexes](vector-indexes.md).
 - **Queries**: `ORDER BY DISTANCE(...) LIMIT k` goes through the unified `VectorIndexScan`; no index, small tables, or `NO_VECTOR_INDEX` take the exact `VectorBruteScan` (partitioned tables included).
 - **Parameterized KNN**: prepared / auto-param; the plan cache keys the query-vector expression instead of hard-coding the first vector.
 - **Transactions and boundaries**: transaction deltas provide read-your-writes; shared vector index changes follow commit, rollback, savepoint, and XA boundaries. Invalid vector values report 50001 and dimension mismatches report 50002; cosine indexes reject zero vectors. LIMIT/OFFSET and visibility rules apply to both exact and approximate paths, but ANN candidate selection does not guarantee the same nearest-neighbor rows or recall as a brute-force scan.
@@ -1193,7 +1195,7 @@ degenerate into no-ops.
 
 ## 14. Version and Runtime
 
-- **Product version**: `1.2.0`; the MySQL handshake/SQL compatibility baseline remains 8.0.46, and the version string may append the product version and build date.
+- **Product version**: `1.2.1`; the MySQL handshake/SQL compatibility baseline remains 8.0.46, and the version string may append the product version and build date.
 - **Default port**: 8738; **pre-created database**: `test` (`DATABASE()` is NULL when the connection specifies no database, and unqualified table names report 1046); **default data directory**: `./data`.
 - **Default account**: `'root'@'localhost'` / `root` (bootstrap only; changeable via `MYDB_ROOT_PASSWORD`);
   the local TCP loopback matches localhost, and no remote root account is created by default.

@@ -2384,7 +2384,7 @@ fn checkpoint_during_committed_vector_batch_never_overstates_snapshot_coverage()
             query_rows(&recovered, &format!("SELECT {tail}")),
             query_rows(&recovered, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}"))
         );
-        assert_eq!(scalar(&recovered,"SELECT LIVE_NODES FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"20","a partial retirement collector left live superseded versions");
+        assert_eq!(scalar(&recovered,"SELECT LIVE_NODES FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"),"20","a partial retirement collector left live superseded versions");
         assert_eq!(
             crate::storage::Database::vector_build_heap_scans_for_test(),
             scans
@@ -2549,7 +2549,7 @@ fn pinned_readers_keep_linear_vector_retirement_obligations() {
                 .pending_vector_retirement_versions_for_test(),
             0
         );
-        assert_eq!(scalar(&engine,"SELECT LIVE_NODES FROM information_schema.mydb_vector_indexes WHERE INDEX_NAME='vx'"),"1");
+        assert_eq!(scalar(&engine,"SELECT LIVE_NODES FROM information_schema.MYDB_VECTOR_INDEXES WHERE INDEX_NAME='vx'"),"1");
         assert_eq!(
             scalar(
                 &engine,
@@ -2662,7 +2662,7 @@ fn resident_checkpoint_retirements_stay_bounded_without_background_workers() {
         }
     }
     for (name, _, _, _) in &fixtures {
-        let coverage = scalar(&engine, &format!("SELECT LAST_PERSISTED_LSN FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME='{name}' AND INDEX_NAME='vx'"));
+        let coverage = scalar(&engine, &format!("SELECT LAST_PERSISTED_LSN FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME='{name}' AND INDEX_NAME='vx'"));
         assert!(
             coverage.parse::<u64>().unwrap() > 0,
             "resident coverage must be observable: {name}"

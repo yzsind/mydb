@@ -32,9 +32,18 @@ pub(crate) fn vector_err(message: impl Into<String>) -> QueryError {
 pub(crate) const MAX_DIM: usize = 16383;
 
 pub(crate) fn to_f32<T: VectorInput + ?Sized>(internal: &T) -> Vec<f32> {
-    (0..internal.dimension() as usize)
-        .map(|i| internal.element(i) as f32)
-        .collect()
+    let dimension = internal.dimension() as usize;
+    if internal.datatype() == crate::vector::VectorDataType::Float32 {
+        // FLOAT32 widens to f64 and back losslessly; decode the payload directly.
+        let payload = internal.payload();
+        if payload.len() == dimension * 4 {
+            return payload
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+                .collect();
+        }
+    }
+    (0..dimension).map(|i| internal.element(i) as f32).collect()
 }
 
 pub(crate) fn from_f32(values: &[f32]) -> VectorValue {

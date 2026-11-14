@@ -92,8 +92,8 @@ MySQL binlog does not replicate independent sequence runtime state. Use native W
 SELECT SEQUENCE_SCHEMA, SEQUENCE_NAME, COUNTER_ID,
        ALLOCATED_VALUE, RESUME_VALUE, IS_CALLED, STATE_LSN,
        CHECKPOINTED_STATE_LSN, LOCAL_DURABLE_STATE_LSN,
-       SYNC_POLICY, PENDING, SYNC_CONFIG_EPOCH
-FROM information_schema.mydb_sequences;
+       SYNC_POLICY, IS_PENDING, SYNC_CONFIG_EPOCH
+FROM information_schema.MYDB_SEQUENCES;
 
 SHOW GLOBAL STATUS LIKE 'Mydb_sequence%';
 SHOW SESSION STATUS LIKE 'Mydb_sequence%';

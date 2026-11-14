@@ -1780,6 +1780,13 @@ impl Database {
         self.auth_snapshot.load_full()
     }
 
+    /// Identity of the published authorization catalog, read without
+    /// touching its shared reference count. Only meaningful for comparison
+    /// with an `Arc` the caller keeps alive.
+    pub(crate) fn auth_catalog_ptr(&self) -> *const crate::engine::auth::AuthCatalog {
+        std::sync::Arc::as_ptr(&*self.auth_snapshot.load())
+    }
+
     pub fn auth_epoch(&self) -> Result<u64, QueryError> {
         Ok(self.auth_snapshot.load().epoch)
     }

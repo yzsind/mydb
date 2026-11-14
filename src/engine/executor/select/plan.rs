@@ -1220,7 +1220,11 @@ fn refresh_native_result_column_names(
                 if let Some(alias) = alias {
                     column.name.clone_from(alias);
                 } else {
-                    column.name = expr_name(expr);
+                    column.name = crate::engine::expr::result_column_name(
+                        expr,
+                        None,
+                        crate::engine::expr::metadata_column_name(&column.name, &column.source),
+                    );
                 }
             }
         }

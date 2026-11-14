@@ -3213,7 +3213,7 @@ fn partition_analyze_reconciles_live_delta_and_collects_joint_stats() {
     assert!(!table.stats.multi_column_stats.is_empty());
     assert!(table.stats.indexes["myidx"].leaf_page_count.is_some());
     assert_eq!(partition_test_rows(&engine,
-        "SELECT TABLE_ROWS, MODIFIED_ROWS FROM information_schema.mydb_stats_health WHERE TABLE_NAME='ps_fix'"),
+        "SELECT TABLE_ROWS, MODIFIED_ROWS FROM information_schema.MYDB_STATS_HEALTH WHERE TABLE_NAME='ps_fix'"),
         vec![vec![Value::Int(4), Value::Int(0)]]);
     engine
         .execute("INSERT INTO ps_fix VALUES (3,3,3),(103,3,3)")
@@ -3595,7 +3595,7 @@ fn partition_ddl_job_is_persistent_observable_and_cancellable_before_swap() {
         }
         let QueryResponse::ResultSet(jobs) = engine
             .execute(
-                "SELECT JOB_ID, STATE FROM information_schema.mydb_ddl_jobs \
+                "SELECT JOB_ID, STATE FROM information_schema.MYDB_DDL_JOBS \
                  WHERE TABLE_NAME='job_t'",
             )
             .unwrap()
@@ -3610,7 +3610,7 @@ fn partition_ddl_job_is_persistent_observable_and_cancellable_before_swap() {
         engine.execute(&format!("CANCEL DDL JOB {job_id}")).unwrap();
         let QueryResponse::ResultSet(jobs) = engine
             .execute(
-                "SELECT STATE FROM information_schema.mydb_ddl_jobs \
+                "SELECT STATE FROM information_schema.MYDB_DDL_JOBS \
                  WHERE TABLE_NAME='job_t'",
             )
             .unwrap()
@@ -3630,7 +3630,7 @@ fn partition_ddl_job_is_persistent_observable_and_cancellable_before_swap() {
     assert_eq!(rows.rows[0][0], Value::Int(4));
     assert_eq!(partition_names(&engine, "job_t").len(), 2);
     let QueryResponse::ResultSet(jobs) = engine
-        .execute("SELECT * FROM information_schema.mydb_ddl_jobs WHERE TABLE_NAME='job_t'")
+        .execute("SELECT * FROM information_schema.MYDB_DDL_JOBS WHERE TABLE_NAME='job_t'")
         .unwrap()
     else {
         panic!("expected result set");
@@ -5623,7 +5623,7 @@ fn partition_online_reorg_replays_final_tail_with_lobs_and_expression_indexes() 
     .map(|sql| engine.execute_with_session(&mut session, sql));
     let jobs = partition_test_rows(
         &engine,
-        "SELECT JOB_ID FROM information_schema.mydb_ddl_jobs WHERE TABLE_NAME='t'",
+        "SELECT JOB_ID FROM information_schema.MYDB_DDL_JOBS WHERE TABLE_NAME='t'",
     );
     tail.release();
     let result = ddl.join().unwrap();

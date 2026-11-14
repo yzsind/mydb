@@ -1,4 +1,7 @@
 const INDEX_MAGIC: &[u8; 8] = b"MYDBIDX1";
+/// Contents of an `.idx.failed` marker written by crash recovery when it
+/// chooses a heap rebuild over replaying the index's logical redo.
+const PLANNED_REBUILD_MARKER: &[u8] = b"planned logical redo rebuild";
 // Bumped from 5 → 6 when the per-KeyPart on-disk tag set was widened
 // from 6 variants (Null/Int/UInt/Float/Bytes/String) to 12 variants
 // covering every `ColumnKind` (adding Float32/Float64 in
@@ -2662,14 +2665,20 @@ impl IndexFile {
             ));
         }
 
-        if path
-            .with_extension("idx.failed")
-            .try_exists()
-            .map_err(io_err)?
-        {
+        let marker = path.with_extension("idx.failed");
+        if marker.try_exists().map_err(io_err)? {
+            // Crash recovery plans a heap rebuild instead of replaying a long
+            // logical-redo tail (`precheck_recovery_index`). Report that as
+            // planned so operators do not mistake it for a structural failure.
+            let planned = fs::read(&marker)
+                .is_ok_and(|contents| contents == PLANNED_REBUILD_MARKER);
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
-                "index requires rebuild after failed structural recovery",
+                if planned {
+                    "index rebuild planned by crash recovery instead of logical redo replay"
+                } else {
+                    "index requires rebuild after failed structural recovery"
+                },
             ));
         }
         Ok(())
@@ -2687,7 +2696,7 @@ impl IndexFile {
     pub(super) fn persist_planned_rebuild_marker(path: &Path) -> Result<(), QueryError> {
         let mut marker = File::create(path.with_extension("idx.failed")).map_err(io_err)?;
         marker
-            .write_all(b"planned logical redo rebuild")
+            .write_all(PLANNED_REBUILD_MARKER)
             .map_err(io_err)?;
         marker.sync_all().map_err(io_err)?;
         if let Some(parent) = path.parent() {

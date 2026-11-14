@@ -149,7 +149,7 @@ The commonly used parameters follow. Unless stated otherwise, `0` means no limit
 | `mydb_undo_buffer_bytes` | 1 MiB | Frame buffer per write shard; 0 means write-through |
 | `mydb_undo_purge_interval_ms` | 1000 | Background purge period |
 | `mydb_undo_purge_batch_records` | 4096 | Maximum number of records cleaned per batch |
-| `mydb_undo_mem_cache_limit` | 64 MiB | Cap of the resident payload cache; the metadata floor is non-evictable, cold payloads are read from disk |
+| `mydb_undo_mem_cache_limit` | 64 MiB | Cap of the resident payload cache; payloads are evicted in batches of one eighth of the cap, so the cap is soft by one batch; the metadata floor is non-evictable, cold payloads are read from disk |
 | `mydb_undo_txn_max_bytes` | 0 | Logical undo cap per transaction; exceeding it returns 50021 |
 | `mydb_undo_tablespace_max_bytes` | 0 | Shared disk pressure threshold |
 | `mydb_undo_retention_guarantee` | 0 | When 1, the disk threshold is a retention guarantee; failed admission returns 50020 |
@@ -198,9 +198,9 @@ When a DDL waits for a long time, check transaction-duration MDL, explicit `LOCK
 ### Inspecting Undo and Overall State
 
 ```sql
-SELECT txn_id, table_id, record_count, bytes,
+SELECT txn_id, table_id, record_count, UNDO_BYTES,
        chain_depth, oldest_created_unix_ms
-FROM information_schema.mydb_undo_history
+FROM information_schema.MYDB_UNDO_HISTORY
 ORDER BY record_count DESC;
 
 SHOW ENGINE MYDB STATUS;

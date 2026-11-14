@@ -12,12 +12,12 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
         )
     })?;
     let admin = system || can(db, &auth, "AI_ADMIN");
-    if table != "ai_models" && !admin {
+    if table != "mydb_ai_models" && !admin {
         return Err(error("ER_AI_ACCESS_DENIED", "AI_ADMIN required"));
     }
     let state = db.ai_catalog()?;
     let rows = match table {
-        "ai_models" => state
+        "mydb_ai_models" => state
             .models
             .iter()
             .filter(|(_, m)| {
@@ -47,7 +47,7 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
                 ]
             })
             .collect(),
-        "ai_connections" => {
+        "mydb_ai_connections" => {
             let keys = load_keys(db.data_dir(), &state, false).ok();
             state
                 .connections
@@ -70,7 +70,7 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
                 })
                 .collect()
         }
-        "ai_secrets" => {
+        "mydb_ai_secrets" => {
             let keys = load_keys(db.data_dir(), &state, false).ok();
             state
                 .secrets
@@ -90,7 +90,7 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
                 })
                 .collect()
         }
-        "ai_runtime_status" => super::runtime::status()
+        "mydb_ai_runtime_status" => super::runtime::status()
             .into_iter()
             .map(|(key, value)| vec![Value::String(key.into()), Value::UInt(value)])
             .collect(),

@@ -699,13 +699,32 @@ impl Database {
                 "candidate scoring requires a fixed VECTOR column",
             ));
         };
+        // Reuse the query's cosine reduction for the entire heap rerank.
+        // The prepared scorer retains the ordinary FLOAT32 reduction order
+        // and validates exceptional payloads before taking the wide fallback.
+        let prepare_float = datatype == crate::vector::VectorDataType::Float32
+            && query.datatype == crate::vector::VectorDataType::Float32
+            && query.dimension == dimension
+            && metric == crate::engine::vector::Metric::Cosine;
         let _metadata =
             crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new_recoverable(
                 crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
-                row_ids.len().saturating_mul(
-                    std::mem::size_of::<RowId>() + std::mem::size_of::<(RowId, f64, Vec<Value>)>(),
-                ),
+                row_ids
+                    .len()
+                    .saturating_mul(
+                        std::mem::size_of::<RowId>()
+                            + std::mem::size_of::<(RowId, f64, Vec<Value>)>(),
+                    )
+                    .saturating_add(if prepare_float {
+                        datatype.payload_len(dimension)
+                    } else {
+                        0
+                    }),
             )?;
+        let decoded = prepare_float.then(|| crate::engine::vector::to_f32(query));
+        let prepared = decoded.as_deref().map(|values| {
+            crate::engine::vector::distance::PreparedF32Distance::new(values, metric)
+        });
         let mut ordered = row_ids.to_vec();
         ordered.sort_unstable();
         ordered.dedup();
@@ -769,10 +788,14 @@ impl Database {
                             payload: &body
                                 [range.offset_in_payload..range.offset_in_payload + range.width],
                         };
-                        crate::engine::vector::validate_internal(&value)?;
-                        let score = crate::engine::vector::distance::typed_ordering_distance(
-                            query, &value, metric,
-                        )?;
+                        let score = if let Some(prepared) = &prepared {
+                            prepared.score_checked_bytes(value.payload)?
+                        } else {
+                            crate::engine::vector::validate_internal(&value)?;
+                            crate::engine::vector::distance::typed_ordering_distance(
+                                query, &value, metric,
+                            )?
+                        };
                         let mut values = Vec::new();
                         if let Some(columns) = projection {
                             let count = crate::storage::decode_row_schema_columns_into_with_plan_ext_for_layout(
@@ -810,9 +833,16 @@ impl Database {
                 ) {
                     out.push((
                         row,
-                        crate::engine::vector::distance::typed_ordering_distance(
-                            query, value, metric,
-                        )?,
+                        if let Some(prepared) = prepared
+                            .as_ref()
+                            .filter(|_| value.datatype == crate::vector::VectorDataType::Float32)
+                        {
+                            prepared.score_checked_bytes(&value.payload)?
+                        } else {
+                            crate::engine::vector::distance::typed_ordering_distance(
+                                query, value, metric,
+                            )?
+                        },
                         projection.map_or_else(Vec::new, |columns| {
                             columns
                                 .iter()

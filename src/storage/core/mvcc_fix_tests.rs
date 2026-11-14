@@ -776,3 +776,119 @@ fn mvcc_fix_checkpoint_excludes_registered_but_unlogged_begin() {
     );
     db.rollback_txn(id).unwrap();
 }
+
+/// A deferred (buffered, not yet logged) insert must never reach the WAL
+/// inside another transaction's full-page image. If a checkpoint opens a new
+/// FPI window while a loser's row sits unlogged on a page, the next writer of
+/// that page logs its pre-image; recovery replays that image, and the loser's
+/// row has no record in its own undo chain to compensate it.
+#[test]
+fn crash_loser_buffered_insert_is_not_resurrected_by_peer_page_image() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let config = test_storage_config(DurabilityMode::Strict, true);
+    let db = Arc::new(Database::open_with_config(dir.path(), config.clone()).unwrap());
+    db.create_table(
+        "t",
+        vec![lob_col("id", DataType::Int, true), lob_col("v", DataType::Int, false)],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_txn().unwrap();
+    db.insert_rows(seed, "test.t", vec![vec![Value::Int(1), Value::Int(10)]])
+        .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    db.checkpoint().unwrap();
+
+    let loser = db.begin_dml_txn().unwrap();
+    db.insert_rows(loser, "test.t", vec![vec![Value::Int(2), Value::Int(20)]])
+        .unwrap();
+    // A new checkpoint window: the page's LSN predates it, so the next
+    // mutation of the page logs a full image of its current bytes.
+    db.checkpoint().unwrap();
+
+    let peer = db.begin_dml_txn().unwrap();
+    db.insert_rows(peer, "test.t", vec![vec![Value::Int(3), Value::Int(30)]])
+        .unwrap();
+    db.commit_txn(peer.txn_id).unwrap();
+
+    db.buffer_pool.shutdown_flusher();
+    std::mem::forget(db);
+    let db = Database::open_with_config(dir.path(), config).unwrap();
+    let mut ids = db
+        .scan_rows(
+            "test.t",
+            TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        )
+        .unwrap()
+        .into_iter()
+        .map(|row| row.values[0].clone())
+        .collect::<Vec<_>>();
+    ids.sort_by_key(|value| match value {
+        Value::Int(id) => *id,
+        _ => i64::MAX,
+    });
+    assert_eq!(ids, vec![Value::Int(1), Value::Int(3)]);
+}
+
+/// An image owed while a buffered writer held the page is logged once that
+/// writer appends its WAL, whether it commits or rolls back; the page then
+/// becomes flushable again and recovery sees exactly the decided rows.
+#[test]
+fn owed_page_image_is_logged_when_the_buffered_owner_finishes() {
+    for commit in [true, false] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let config = test_storage_config(DurabilityMode::Strict, true);
+        let db = Arc::new(Database::open_with_config(dir.path(), config.clone()).unwrap());
+        db.create_table(
+            "t",
+            vec![lob_col("id", DataType::Int, true), lob_col("v", DataType::Int, false)],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let seed = db.begin_txn().unwrap();
+        db.insert_rows(seed, "test.t", vec![vec![Value::Int(1), Value::Int(10)]])
+            .unwrap();
+        db.commit_txn(seed.txn_id).unwrap();
+        db.checkpoint().unwrap();
+        let owner = db.begin_dml_txn().unwrap();
+        db.insert_rows(owner, "test.t", vec![vec![Value::Int(2), Value::Int(20)]])
+            .unwrap();
+        db.checkpoint().unwrap();
+        let peer = db.begin_dml_txn().unwrap();
+        db.insert_rows(peer, "test.t", vec![vec![Value::Int(3), Value::Int(30)]])
+            .unwrap();
+        db.commit_txn(peer.txn_id).unwrap();
+        // The peer's image waits for the owner: one owed page, pinned by the
+        // owner's buffered insert and by the owed image itself.
+        assert_eq!(db.buffer_pool.owed_page_images_for_test(), (1, 2));
+        if commit {
+            db.commit_txn(owner.txn_id).unwrap();
+        } else {
+            db.rollback_txn(owner.txn_id).unwrap();
+        }
+        assert_eq!(db.buffer_pool.owed_page_images_for_test(), (0, 0));
+        // The page no longer holds any deferred pin, owed image included, so
+        // a checkpoint writes it back and recovery starts from the result.
+        db.checkpoint().unwrap();
+        db.buffer_pool.shutdown_flusher();
+        std::mem::forget(db);
+        let db = Database::open_with_config(dir.path(), config).unwrap();
+        let mut ids = db
+            .scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+            )
+            .unwrap()
+            .into_iter()
+            .map(|row| match row.values[0] {
+                Value::Int(id) => id,
+                _ => unreachable!(),
+            })
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        let expected: &[i64] = if commit { &[1, 2, 3] } else { &[1, 3] };
+        assert_eq!(ids, expected, "owner commit={commit}");
+    }
+}

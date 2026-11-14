@@ -1,6 +1,6 @@
 {
   "counts": {
-    "mydb_native": 13,
+    "mydb_native": 18,
     "mysql80_community": 76,
     "mysql_legacy_compat": 3,
     "mysql_optional_plugin_compat": 7
@@ -726,11 +726,11 @@
     },
     {
       "compatibility_class": "mydb_native",
-      "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_sequences",
+      "data_source": "row_security_catalog",
+      "object": "MYDB_ROW_SECURITY_POLICIES",
       "producer": "real_producer",
       "pushdown": [],
-      "replication_semantics": "classified_by_row",
+      "replication_semantics": "replicated_catalog",
       "schema": "information_schema",
       "shape": "extension_stable",
       "test_coverage": [
@@ -741,23 +741,53 @@
     },
     {
       "compatibility_class": "mydb_native",
-      "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_ddl_jobs",
+      "data_source": "ai_catalog",
+      "object": "MYDB_AI_MODELS",
       "producer": "real_producer",
       "pushdown": [],
-      "replication_semantics": "classified_by_row",
+      "replication_semantics": "replicated_catalog_with_node_local_key_availability",
       "schema": "information_schema",
       "shape": "extension_stable",
       "test_coverage": [
         "registry_contract",
         "producer_scenario"
       ],
-      "visibility": "object_policy"
+      "visibility": "ai_use_or_model_use_or_ai_admin"
     },
     {
       "compatibility_class": "mydb_native",
-      "data_source": "node_runtime",
-      "object": "mydb_xa_recover",
+      "data_source": "ai_catalog",
+      "object": "MYDB_AI_CONNECTIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog_with_node_local_key_availability",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "ai_admin"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "ai_catalog",
+      "object": "MYDB_AI_SECRETS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "replicated_catalog_with_node_local_key_availability",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "ai_admin"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "ai_runtime",
+      "object": "MYDB_AI_RUNTIME_STATUS",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "node_local",
@@ -767,12 +797,57 @@
         "registry_contract",
         "producer_scenario"
       ],
-      "visibility": "process"
+      "visibility": "ai_admin"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "MYDB_SEQUENCES",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "mydb_catalog_or_runtime",
+      "object": "MYDB_DDL_JOBS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "classified_by_row",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "prepared_xa_transactions",
+      "object": "MYDB_PREPARED_XA_TRANSACTIONS",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "node_local_recoverable_state",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "xa_recover_admin"
     },
     {
       "compatibility_class": "mydb_native",
       "data_source": "node_runtime",
-      "object": "mydb_cursors",
+      "object": "MYDB_CURSORS",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "node_local",
@@ -787,7 +862,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "node_runtime",
-      "object": "mydb_caches",
+      "object": "MYDB_CACHES",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "node_local",
@@ -802,7 +877,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "node_runtime",
-      "object": "mydb_plan_cache",
+      "object": "MYDB_PLAN_CACHE_ENTRIES",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "node_local",
@@ -817,7 +892,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "node_runtime",
-      "object": "mydb_memory_advisor",
+      "object": "MYDB_MEMORY_ADVISOR",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "node_local",
@@ -832,7 +907,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_vector_indexes",
+      "object": "MYDB_VECTOR_INDEXES",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "classified_by_row",
@@ -847,7 +922,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "node_runtime",
-      "object": "mydb_undo_history",
+      "object": "MYDB_UNDO_HISTORY",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "node_local",
@@ -862,7 +937,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_temporal_history",
+      "object": "MYDB_TEMPORAL_HISTORY",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "classified_by_row",
@@ -877,7 +952,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_stats_health",
+      "object": "MYDB_STATS_HEALTH",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "classified_by_row",
@@ -892,7 +967,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_zone_maps",
+      "object": "MYDB_ZONE_MAPS",
       "producer": "real_producer",
       "pushdown": [
         "TABLE_SCHEMA",
@@ -911,7 +986,7 @@
     {
       "compatibility_class": "mydb_native",
       "data_source": "mydb_catalog_or_runtime",
-      "object": "mydb_zone_map_storage",
+      "object": "MYDB_ZONE_MAP_STORAGE",
       "producer": "real_producer",
       "pushdown": [],
       "replication_semantics": "classified_by_row",

@@ -874,6 +874,7 @@ static OPTION_SPECS: &[OptionSpec] = &[
         OptionKind::Enum(&["off", "on", "auto"])
     ),
     spec!("plan_cache", "MYDB_PLAN_CACHE", OptionKind::Bool),
+    spec!("hnsw_query_memo", "MYDB_HNSW_QUERY_MEMO", OptionKind::Bool),
     OptionSpec {
         name: "query_mem_limit_mb",
         env: "MYDB_QUERY_MEM_LIMIT_MB",
@@ -2125,6 +2126,9 @@ mod tests {
 
     #[test]
     fn size_and_boolean_values_are_canonicalized() {
+        let memo = find_spec("hnsw_query_memo").unwrap().0;
+        assert_eq!(validate_spec(memo, "off").unwrap(), "OFF");
+        assert!(validate_spec(memo, "invalid").is_err());
         let max_packet = find_spec("max-allowed-packet").unwrap().0;
         assert_eq!(validate_spec(max_packet, "128M").unwrap(), "134217728");
         let general = find_spec("general_log").unwrap().0;

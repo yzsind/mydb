@@ -989,6 +989,12 @@ mod tests {
             DurabilityMode::Strict,
             Duration::from_secs(5),
         );
+        // The periodic cleaner retires the oldest dirty page every 25 ms. If it
+        // wrote this page back between the first two writes, the second write
+        // would start a new dirty epoch and the first-dirty LSN and FPI/delta
+        // sequence below would no longer be deterministic. Only the explicit
+        // `file.flush()` may write the page back here.
+        pool.shutdown_flusher();
         let file = PageFile::new(
             dir.path().join("delta.zm"),
             17,

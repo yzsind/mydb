@@ -595,6 +595,9 @@ impl BufferPool {
             wait_ms: AtomicU64::new(0),
             background_flushes: AtomicU64::new(0),
             last_checkpoint_lsn: AtomicU64::new(0),
+            redo_age_target_lsn: AtomicU64::new(0),
+            redo_age_samples: parking_lot::Mutex::new(VecDeque::new()),
+            deferred_drain_requests: AtomicU64::new(0),
             page_wal_publish_gate: parking_lot::RwLock::new(()),
             misses: CachePadded::new(AtomicU64::new(0)),
             read_ios: AtomicU64::new(0),
@@ -1156,6 +1159,35 @@ impl BufferPool {
         }
     }
 
+    /// Publish the bookkeeping for one dirtying event. A newly dirty frame is
+    /// counted and registered; a frame whose recLSN moved while it stayed
+    /// dirty (deferred change finalized, older LSN published late) gets a
+    /// fresh oldest-dirty candidate. Without the latter its previous entry is
+    /// discarded as stale on pop and the page drops out of age cleaning for
+    /// good, pinning the checkpoint redo floor at its recLSN.
+    fn publish_dirty_mark(&self, frame: &Frame, mark: DirtyMark, dirty_lsn: u64) {
+        match mark {
+            DirtyMark::NewlyDirty => {
+                self.dirty_pages.fetch_add(1, Ordering::Relaxed);
+                self.note_dirty(&frame.key, dirty_lsn);
+            }
+            DirtyMark::RecLsnMoved => {
+                self.note_dirty(&frame.key, frame.first_dirty_lsn.load(Ordering::Acquire));
+            }
+            DirtyMark::Unchanged => {}
+        }
+    }
+
+    /// Account one transaction-owned deferred WAL pin on `frame`. When the age
+    /// cleaner has asked for this frame's write-back, the pinning transaction
+    /// is told to drain its WAL buffer at its next statement boundary.
+    fn take_txn_deferred_pin(frame: &Frame) {
+        frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+        if frame.flush_wanted.load(Ordering::Relaxed) {
+            btree_logical_wal::request_txn_wal_drain();
+        }
+    }
+
     /// B1 - compact every over-sized `dirty_oldest` heap in this worker's
     /// shard stripe. Called from the background IO worker loop, where no frame
     /// lock is held, so the `frames.read()` inside
@@ -1280,7 +1312,7 @@ impl BufferPool {
         if !self.try_pin_existing(&frame, AccessIntent::Scan) {
             return false;
         }
-        frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+        Self::take_txn_deferred_pin(&frame);
         frame.unpin();
         self.notify_frame_waiters();
         true
@@ -1309,7 +1341,7 @@ impl BufferPool {
                 }
             }
         }
-        pinned.frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+        Self::take_txn_deferred_pin(&pinned.frame);
         let mut reservation = DeferredReservation {
             frame: &pinned.frame,
             published: false,
@@ -1335,29 +1367,44 @@ impl BufferPool {
     /// oltp_update_index (20 threads, 1M rows): fixing this doubles TPS and
     /// cuts WAL bytes ~10×. The raw frame image receives the LSN immediately;
     /// its checksum remains deferred until full-image exposure or flush.
-    fn finalize_deferred(self: &Arc<Self>, key: &PageKey, lsn: u64) {
+    ///
+    /// Returns whether the page still owes a full-page image (see
+    /// `Frame::fpi_owed`) after this release.
+    fn finalize_deferred(self: &Arc<Self>, key: &PageKey, lsn: u64) -> bool {
         if let Ok(Some(frame)) = self.lookup_frame(key) {
             if lsn != 0 {
                 frame.dirty_lsn.fetch_max(lsn, Ordering::AcqRel);
-                frame.note_first_dirty_lsn(lsn);
+                if frame.note_first_dirty_lsn(lsn) && frame.dirty.load(Ordering::Acquire) {
+                    self.note_dirty(&frame.key, lsn);
+                }
                 if let Ok(mut bytes) = frame.write_bytes() {
                     set_page_lsn(&mut bytes, lsn);
                     frame.checksum_dirty.store(true, Ordering::Release);
                 }
             }
-            frame.deferred_pins.fetch_sub(1, Ordering::AcqRel);
+            // SeqCst pairs with `defer_page_image_while_unlogged`: either it
+            // observes this release, or this load observes its owed flag.
+            frame.deferred_pins.fetch_sub(1, Ordering::SeqCst);
+            return frame.fpi_owed.load(Ordering::SeqCst);
         }
+        false
     }
 
+    /// Release a transaction's deferred pins at their real LSNs. Returns the
+    /// pages that still owe a full-page image; the caller logs each once its
+    /// owners are gone (`HeapFile::log_owed_page_image`).
     fn finalize_deferred_batch(
         self: &Arc<Self>,
         finalized: &[(PageKey, u64)],
-    ) -> Result<(), QueryError> {
+    ) -> Result<Vec<PageKey>, QueryError> {
         // Publish every real LSN and release every pin first. The same page
         // may occur in several records; scheduling before the final release
         // lets a cleaner consume the hint while that page is still deferred.
+        let mut owed: Vec<PageKey> = Vec::new();
         for (key, lsn) in finalized {
-            self.finalize_deferred(key, *lsn);
+            if self.finalize_deferred(key, *lsn) && !owed.contains(key) {
+                owed.push(key.clone());
+            }
         }
         // Fresh-page initialization makes large heap batches resident, so they
         // can now use deferred WAL. Retain the ordinary append path's bounded
@@ -1378,7 +1425,58 @@ impl BufferPool {
             )?;
             start = end;
         }
-        Ok(())
+        Ok(owed)
+    }
+
+    /// Decide whether a full-page image of `key` may be logged now. While
+    /// other transactions hold unlogged (txn-buffered) changes on the page,
+    /// the image is owed instead: it takes one deferred pin of its own so the
+    /// page cannot be written back before the image exists. The caller holds
+    /// the page's heap latch, which excludes new buffered writers and every
+    /// other image decision for this page.
+    fn defer_page_image_while_unlogged(
+        self: &Arc<Self>,
+        key: &PageKey,
+    ) -> Result<PageImageDecision, QueryError> {
+        let Some(frame) = self.lookup_frame(key)? else {
+            return Ok(PageImageDecision::LogNow { owed: false });
+        };
+        if !frame.fpi_owed.load(Ordering::SeqCst) {
+            if frame.deferred_pins.load(Ordering::SeqCst) == 0 {
+                return Ok(PageImageDecision::LogNow { owed: false });
+            }
+            // A frame that can no longer be pinned is being evicted, which
+            // requires zero deferred pins: no unlogged change remains.
+            if !self.add_deferred_pin(key) {
+                return Ok(PageImageDecision::LogNow { owed: false });
+            }
+            frame.fpi_owed.store(true, Ordering::SeqCst);
+        }
+        // Once only the image's own pin remains, every owner has appended its
+        // WAL and the latch holder logs the image immediately.
+        Ok(if frame.deferred_pins.load(Ordering::SeqCst) == 1 {
+            PageImageDecision::LogNow { owed: true }
+        } else {
+            PageImageDecision::Deferred
+        })
+    }
+
+    /// Whether `key` owes a full-page image that no unlogged change blocks.
+    fn page_image_ready(&self, key: &PageKey) -> Result<bool, QueryError> {
+        Ok(self.lookup_frame(key)?.is_some_and(|frame| {
+            frame.fpi_owed.load(Ordering::SeqCst)
+                && frame.deferred_pins.load(Ordering::SeqCst) == 1
+        }))
+    }
+
+    /// Release an owed full-page image after it was logged at `lsn`, or with
+    /// `lsn == 0` when the page's file no longer exists.
+    fn settle_page_image(self: &Arc<Self>, key: &PageKey, lsn: u64) {
+        if let Ok(Some(frame)) = self.lookup_frame(key) {
+            if frame.fpi_owed.swap(false, Ordering::SeqCst) {
+                self.finalize_deferred(key, lsn);
+            }
+        }
     }
 
     /// Remove an evicted/discarded frame's registration. The caller must hold
@@ -1484,15 +1582,23 @@ impl BufferPool {
         Ok(out)
     }
 
+    /// Pop this stripe's oldest dirty candidates: always the `base_pages`
+    /// oldest, plus up to `max_pages` in total whose recLSN is below
+    /// `urgent_below` (the redo age target). Unselected candidates are
+    /// requeued.
     fn pop_oldest_dirty_frames_striped(
         &self,
         worker_id: usize,
         stride: usize,
+        base_pages: usize,
         max_pages: usize,
+        urgent_below: u64,
     ) -> Result<Vec<Arc<Frame>>, QueryError> {
+        let max_pages = max_pages.max(base_pages);
         if max_pages == 0 {
             return Ok(Vec::new());
         }
+        let urgent = |lsn: u64| lsn != 0 && lsn < urgent_below;
         let mut candidates = Vec::new();
         for (idx, shard) in self.shards.iter().enumerate() {
             if stride > 1 && idx % stride != worker_id {
@@ -1503,7 +1609,13 @@ impl BufferPool {
                 // Look past a bounded number of temporarily pinned oldest
                 // pages so one busy frame cannot starve the shard, while
                 // preserving every still-current candidate for a later tick.
-                let probe_limit = max_pages.saturating_mul(8).max(16);
+                let mut probe_limit = base_pages.saturating_mul(8).max(16);
+                if oldest
+                    .peek()
+                    .is_some_and(|Reverse(candidate)| urgent(candidate.first_lsn))
+                {
+                    probe_limit = probe_limit.max(max_pages.saturating_mul(2));
+                }
                 while popped.len() < probe_limit {
                     let Some(Reverse(candidate)) = oldest.pop() else {
                         break;
@@ -1554,8 +1666,16 @@ impl BufferPool {
                 candidate.first_lsn
             }
         });
-        if candidates.len() > max_pages {
-            for (candidate, _) in candidates.drain(max_pages..) {
+        let keep = candidates
+            .iter()
+            .enumerate()
+            .take_while(|(position, (candidate, _))| {
+                *position < base_pages || urgent(candidate.first_lsn)
+            })
+            .count()
+            .min(max_pages);
+        if candidates.len() > keep {
+            for (candidate, _) in candidates.drain(keep..) {
                 let shard_idx = self.shard_index(&candidate.key);
                 if let Ok(mut oldest) = self.shards[shard_idx].dirty_oldest.lock() {
                     oldest.push(Reverse(candidate));
@@ -1566,7 +1686,7 @@ impl BufferPool {
             .into_iter()
             .map(|(_, frame)| frame)
             .collect::<Vec<_>>();
-        Ok(oldest_frames_in_io_order(frames, max_pages))
+        Ok(oldest_frames_in_io_order(frames, keep))
     }
 
     fn heap_file_key(path: PathBuf, table_id: u64) -> BufferPageFileKey {
@@ -1852,10 +1972,8 @@ impl BufferPool {
                 // write lock. A reader can therefore never observe mutated
                 // bytes while still seeing `checksum_dirty=false`.
                 pinned.frame.checksum_dirty.store(true, Ordering::Release);
-                if pinned.frame.mark_dirty(dirty_lsn) {
-                    self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-                    self.note_dirty(&pinned.frame.key, dirty_lsn);
-                }
+                let mark = pinned.frame.mark_dirty(dirty_lsn);
+                self.publish_dirty_mark(&pinned.frame, mark, dirty_lsn);
                 self.mark_raw_structure_validated(&pinned.frame);
             }
             result
@@ -1895,13 +2013,11 @@ impl BufferPool {
                 self.write_requests.fetch_add(1, Ordering::Relaxed);
                 frame.checksum_dirty.store(true, Ordering::Release);
                 if btree_logical_wal::is_deferred() {
-                    frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+                    Self::take_txn_deferred_pin(&frame);
                     btree_logical_wal::push_deferred_key(frame.key.clone());
                 }
-                if frame.mark_dirty(dirty_lsn) {
-                    self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-                    self.note_dirty(&frame.key, dirty_lsn);
-                }
+                let mark = frame.mark_dirty(dirty_lsn);
+                self.publish_dirty_mark(&frame, mark, dirty_lsn);
                 self.mark_raw_structure_validated(&frame);
                 frame.prefetch.store(false, Ordering::Release);
             }
@@ -1979,10 +2095,8 @@ impl BufferPool {
         bytes.copy_from_slice(&after);
         self.write_requests.fetch_add(1, Ordering::Relaxed);
         pinned.frame.checksum_dirty.store(false, Ordering::Release);
-        if pinned.frame.mark_dirty(lsn) {
-            self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-            self.note_dirty(&pinned.frame.key, lsn);
-        }
+        let mark = pinned.frame.mark_dirty(lsn);
+        self.publish_dirty_mark(&pinned.frame, mark, lsn);
         // Zone-map callers return checked patches. Vector callers validate the
         // base above and stamp a finalized replacement before publication.
         // Retain those proofs under the byte latch, avoiding another full CRC
@@ -2025,13 +2139,11 @@ impl BufferPool {
             self.write_requests.fetch_add(1, Ordering::Relaxed);
             pinned.frame.checksum_dirty.store(true, Ordering::Release);
             if btree_logical_wal::is_deferred() {
-                pinned.frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+                Self::take_txn_deferred_pin(&pinned.frame);
                 btree_logical_wal::push_deferred_key(pinned.frame.key.clone());
             }
-            if pinned.frame.mark_dirty(dirty_lsn) {
-                self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-                self.note_dirty(&pinned.frame.key, dirty_lsn);
-            }
+            let mark = pinned.frame.mark_dirty(dirty_lsn);
+            self.publish_dirty_mark(&pinned.frame, mark, dirty_lsn);
             self.mark_raw_structure_validated(&pinned.frame);
             pinned.frame.prefetch.store(false, Ordering::Release);
         }
@@ -2100,13 +2212,11 @@ impl BufferPool {
                 for frame in [&first_frame, &second_frame] {
                     frame.checksum_dirty.store(true, Ordering::Release);
                     if btree_logical_wal::is_deferred() {
-                        frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+                        Self::take_txn_deferred_pin(&frame);
                         btree_logical_wal::push_deferred_key(frame.key.clone());
                     }
-                    if frame.mark_dirty(dirty_lsn) {
-                        self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-                        self.note_dirty(&frame.key, dirty_lsn);
-                    }
+                    let mark = frame.mark_dirty(dirty_lsn);
+                    self.publish_dirty_mark(&frame, mark, dirty_lsn);
                     self.mark_raw_structure_validated(frame);
                     frame.prefetch.store(false, Ordering::Release);
                 }
@@ -3187,13 +3297,11 @@ impl BufferPool {
                     self.write_requests.fetch_add(1, Ordering::Relaxed);
                     frame.checksum_dirty.store(false, Ordering::Release);
                     if btree_logical_wal::is_deferred() {
-                        frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+                        Self::take_txn_deferred_pin(&frame);
                         btree_logical_wal::push_deferred_key(frame.key.clone());
                     }
-                    if frame.mark_dirty_with_intent(dirty_lsn, admission) {
-                        self.dirty_pages.fetch_add(1, Ordering::Relaxed);
-                        self.note_dirty(&frame.key, dirty_lsn);
-                    }
+                    let mark = frame.mark_dirty_with_intent(dirty_lsn, admission);
+                    self.publish_dirty_mark(&frame, mark, dirty_lsn);
                     frame.prefetch.store(false, Ordering::Release);
                     Ok(())
                 })();
@@ -3226,7 +3334,7 @@ impl BufferPool {
             ));
             self.write_requests.fetch_add(1, Ordering::Relaxed);
             if btree_logical_wal::is_deferred() {
-                frame.deferred_pins.fetch_add(1, Ordering::AcqRel);
+                Self::take_txn_deferred_pin(&frame);
                 btree_logical_wal::push_deferred_key(frame.key.clone());
             }
             shard.insert(key.clone(), frame.clone());
@@ -4040,6 +4148,24 @@ impl BufferPool {
             .unwrap_or(0)
     }
 
+    /// Test probe: resident frames that owe a full-page image, and how many
+    /// deferred pins they hold in total.
+    #[cfg(test)]
+    fn owed_page_images_for_test(&self) -> (usize, u32) {
+        let mut owed = 0;
+        let mut pins = 0;
+        for shard in &self.shards {
+            let frames = shard.frames.read().unwrap();
+            for frame in frames.values() {
+                if frame.fpi_owed.load(Ordering::SeqCst) {
+                    owed += 1;
+                    pins += frame.deferred_pins.load(Ordering::SeqCst);
+                }
+            }
+        }
+        (owed, pins)
+    }
+
     fn snapshot(&self) -> BufferPoolSnapshot {
         // PERF-5 - walk resident frames in place under each shard read
         // lock instead of `all_frames()`, which cloned every `Arc<Frame>`
@@ -4203,6 +4329,8 @@ impl BufferPool {
             evict_sync_dirty_flushes: self.evict_sync_dirty_flushes.load(Ordering::Relaxed),
             evict_sync_dirty_flush_us: self.evict_sync_dirty_flush_us.load(Ordering::Relaxed),
             cooldown_deferred_flushes: self.cooldown_deferred_flushes.load(Ordering::Relaxed),
+            redo_age_target_lsn: self.redo_age_target_lsn.load(Ordering::Relaxed),
+            deferred_drain_requests: self.deferred_drain_requests.load(Ordering::Relaxed),
             headroom_flushes: self.headroom_flushes.load(Ordering::Relaxed),
             checkpoint_flush_pages: self.checkpoint_flush_pages.load(Ordering::Relaxed),
             checkpoint_flush_us: self.checkpoint_flush_us.load(Ordering::Relaxed),
@@ -5441,36 +5569,36 @@ impl BufferPool {
         if self.durability == DurabilityMode::Memory || max_pages == 0 {
             return Ok(());
         }
+        let base_pages = max_pages as usize;
+        // Pages older than the redo age target are what keeps the next
+        // checkpoint's redo floor (and so crash-recovery replay) behind the
+        // configured bound. Retire them with a full cleaner batch per tick
+        // instead of the small maintenance budget.
+        let urgent_below = self.redo_age_target_lsn.load(Ordering::Acquire);
+        let max_pages = BUFFER_POOL_FLUSH_BATCH_PAGES.max(base_pages);
+        let urgent = |frame: &Arc<Frame>| {
+            let lsn = frame.first_dirty_lsn.load(Ordering::Acquire);
+            lsn != 0 && lsn < urgent_below
+        };
         let frames = if oldest_dirty_queue_enabled() {
-            let queued =
-                self.pop_oldest_dirty_frames_striped(worker_id, stride, max_pages as usize)?;
+            let queued = self.pop_oldest_dirty_frames_striped(
+                worker_id,
+                stride,
+                base_pages,
+                max_pages,
+                urgent_below,
+            )?;
             if queued.is_empty() {
                 // The heap is an acceleration structure, never the source of
                 // truth. A stale/missing candidate must not strand a dirty
                 // frame forever and pin the recovery floor. Falling back only
                 // after an empty queue keeps the normal tick O(log n).
-                oldest_frames_in_io_order(
-                    self.collect_dirty_frames_striped(worker_id, stride)?
-                        .into_iter()
-                        .filter(|frame| {
-                            frame.pin_count.load(Ordering::Acquire) == 0 && frame.is_ready()
-                        })
-                        .collect::<Vec<_>>(),
-                    max_pages as usize,
-                )
+                self.oldest_striped_dirty_frames(worker_id, stride, base_pages, max_pages, &urgent)?
             } else {
                 queued
             }
         } else {
-            oldest_frames_in_io_order(
-                self.collect_dirty_frames_striped(worker_id, stride)?
-                    .into_iter()
-                    .filter(|frame| {
-                        frame.pin_count.load(Ordering::Acquire) == 0 && frame.is_ready()
-                    })
-                    .collect::<Vec<_>>(),
-                max_pages as usize,
-            )
+            self.oldest_striped_dirty_frames(worker_id, stride, base_pages, max_pages, &urgent)?
         };
         // P0-2 - maintenance write-backs also honour the cooldown: the
         // oldest-LSN arm would otherwise rewrite the same hot pages every
@@ -5510,12 +5638,77 @@ impl BufferPool {
         // retried without waiting for another clean→dirty transition.
         for frame in &frames {
             if frame.dirty.load(Ordering::Acquire) {
+                // Overlapping transactions can keep a hot page deferred-pinned
+                // at every instant. Ask the pinning transactions to drain at
+                // their next statement boundary so the age target is reachable.
+                if urgent(frame)
+                    && frame.deferred_pins.load(Ordering::Acquire) != 0
+                    && !frame.flush_wanted.swap(true, Ordering::Relaxed)
+                {
+                    self.deferred_drain_requests.fetch_add(1, Ordering::Relaxed);
+                }
                 self.note_dirty(&frame.key, frame.first_dirty_lsn.load(Ordering::Acquire));
             }
         }
         self.background_flushes
             .fetch_add(flushed as u64, Ordering::Relaxed);
         Ok(())
+    }
+
+    /// Queue-free selection for `flush_oldest_dirty_striped_limited`.
+    fn oldest_striped_dirty_frames(
+        &self,
+        worker_id: usize,
+        stride: usize,
+        base_pages: usize,
+        max_pages: usize,
+        urgent: &impl Fn(&Arc<Frame>) -> bool,
+    ) -> Result<Vec<Arc<Frame>>, QueryError> {
+        let frames = self
+            .collect_dirty_frames_striped(worker_id, stride)?
+            .into_iter()
+            .filter(|frame| frame.pin_count.load(Ordering::Acquire) == 0 && frame.is_ready())
+            .collect::<Vec<_>>();
+        let wanted = frames
+            .iter()
+            .filter(|frame| urgent(frame))
+            .count()
+            .clamp(base_pages, max_pages);
+        Ok(oldest_frames_in_io_order(frames, wanted))
+    }
+
+    /// Record the WAL position once per checkpointer poll and derive the redo
+    /// age target: the LSN that was current `lag` ago. The cleaners keep every
+    /// recLSN at or above it, so each fuzzy checkpoint's redo floor trails its
+    /// Begin by about `lag` instead of whatever the oldest hot page dictates.
+    pub(crate) fn observe_redo_age(&self, next_lsn: u64, lag: Duration) {
+        if self.durability == DurabilityMode::Memory {
+            return;
+        }
+        let now_us = self.now_us();
+        let lag_us = lag.as_micros().min(u128::from(u64::MAX)) as u64;
+        let mut samples = self.redo_age_samples.lock();
+        if samples.back().is_none_or(|&(_, lsn)| lsn != next_lsn) {
+            samples.push_back((now_us, next_lsn));
+        }
+        let horizon = now_us.saturating_sub(lag_us);
+        let mut target = None;
+        while let Some(&(at_us, lsn)) = samples.front() {
+            if at_us > horizon {
+                break;
+            }
+            target = Some(lsn);
+            // Keep the newest sample at or before the horizon: the next
+            // observation may still need it.
+            if samples.get(1).is_some_and(|&(next_at, _)| next_at <= horizon) {
+                samples.pop_front();
+            } else {
+                break;
+            }
+        }
+        if let Some(target) = target {
+            self.redo_age_target_lsn.fetch_max(target, Ordering::AcqRel);
+        }
     }
 
     fn flush_frame_batch(&self, frames: &[Arc<Frame>]) -> Result<usize, QueryError> {
@@ -5670,6 +5863,7 @@ impl BufferPool {
                 set_page_lsn_if_formatted(&mut bytes_guard, dirty_lsn);
                 frame.checksum_dirty.store(false, Ordering::Release);
             }
+            frame.begin_writeback_window();
             images.extend_from_slice(&bytes_guard);
             snapshots.push(FlushSnapshot {
                 epoch: frame.dirty_epoch.load(Ordering::Acquire),
@@ -5703,26 +5897,22 @@ impl BufferPool {
         let mut cleared_count = 0_u64;
         let writeback_us = self.now_us();
         for (frame, snapshot) in frames.iter().zip(&snapshots) {
-            let cleared = {
+            let outcome = {
                 let _bytes_guard = frame.bytes.read().map_err(|_| {
                     error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "buffer frame read lock poisoned",
                     )
                 })?;
-                if frame.dirty_epoch.load(Ordering::Acquire) == snapshot.epoch
-                    && frame.generation.load(Ordering::Acquire) == snapshot.generation
-                {
-                    let was_dirty = frame.dirty.swap(false, Ordering::AcqRel);
-                    frame.dirty_lsn.store(0, Ordering::Release);
-                    frame.first_dirty_lsn.store(0, Ordering::Release);
-                    // P0-2 - write-back stamp for the cleaner cooldown (see
-                    // `flush_frame_with_wal`).
-                    frame.flushed_at_us.store(writeback_us, Ordering::Release);
-                    was_dirty
-                } else {
+                self.complete_writeback(frame, snapshot.epoch, snapshot.generation, writeback_us)
+            };
+            let cleared = match outcome {
+                WritebackOutcome::Cleaned(was_dirty) => was_dirty,
+                WritebackOutcome::Advanced(rec_lsn) => {
+                    self.note_dirty(&frame.key, rec_lsn);
                     false
                 }
+                WritebackOutcome::Stale => false,
             };
             if cleared {
                 cleared_count += 1;
@@ -5744,6 +5934,43 @@ impl BufferPool {
 
     fn flush_frame(&self, frame: &Arc<Frame>) -> Result<bool, QueryError> {
         self.flush_frame_with_wal(frame, 0)
+    }
+
+    /// Settle a frame after its write-back image reached the file. The caller
+    /// holds the frame's byte read latch, which excludes every image mutation.
+    ///
+    /// - Unchanged since the snapshot: the frame is clean.
+    /// - Re-dirtied meanwhile: the written image still covers every change up
+    ///   to the snapshot, so the recLSN advances to the first change after it
+    ///   (ARIES flush-with-concurrent-update). Frames whose dirty epoch must
+    ///   start with a full-page image (zone map, vector: see
+    ///   `with_logged_page_replacement`) keep their anchor instead.
+    /// - Another generation: nothing is learned.
+    fn complete_writeback(
+        &self,
+        frame: &Frame,
+        epoch: u64,
+        generation: u64,
+        writeback_us: u64,
+    ) -> WritebackOutcome {
+        if frame.generation.load(Ordering::Acquire) != generation {
+            return WritebackOutcome::Stale;
+        }
+        // P0-2 - stamp the completed write-back so the background cleaners
+        // can defer this frame if it re-dirties within the cooldown window
+        // (hot-write-set detection).
+        frame.flushed_at_us.store(writeback_us, Ordering::Release);
+        frame.flush_wanted.store(false, Ordering::Relaxed);
+        if frame.dirty_epoch.load(Ordering::Acquire) == epoch {
+            let was_dirty = frame.dirty.swap(false, Ordering::AcqRel);
+            frame.dirty_lsn.store(0, Ordering::Release);
+            frame.first_dirty_lsn.store(0, Ordering::Release);
+            return WritebackOutcome::Cleaned(was_dirty);
+        }
+        if frame.key.file.kind.anchors_dirty_epochs() || !frame.dirty.load(Ordering::Acquire) {
+            return WritebackOutcome::Stale;
+        }
+        WritebackOutcome::Advanced(frame.advance_rec_lsn_after_writeback())
     }
 
     fn flush_frame_with_wal(
@@ -5795,6 +6022,7 @@ impl BufferPool {
                 set_page_lsn_if_formatted(&mut bytes_guard, dirty_lsn);
                 frame.checksum_dirty.store(false, Ordering::Release);
             }
+            frame.begin_writeback_window();
             (
                 frame.dirty_epoch.load(Ordering::Acquire),
                 dirty_lsn,
@@ -5819,6 +6047,8 @@ impl BufferPool {
             },
         );
         result?;
+        #[cfg(test)]
+        redo_age_tests::after_writeback(&frame.key);
         // Clear the dirty bit under the bytes READ lock so the epoch
         // check and the swap are atomic with respect to writers — every
         // dirtying path swaps bytes / bumps `dirty_epoch` while holding
@@ -5827,6 +6057,7 @@ impl BufferPool {
         // stolen: the frame would sit clean with unflushed bytes,
         // recoverable via WAL redo only until the next checkpoint
         // truncates the log.
+        let mut advanced = None;
         let cleared = {
             let _bytes_guard = frame.bytes.read().map_err(|_| {
                 error(
@@ -5834,21 +6065,18 @@ impl BufferPool {
                     "buffer frame read lock poisoned",
                 )
             })?;
-            if frame.dirty_epoch.load(Ordering::Acquire) == epoch
-                && frame.generation.load(Ordering::Acquire) == generation
-            {
-                let was_dirty = frame.dirty.swap(false, Ordering::AcqRel);
-                frame.dirty_lsn.store(0, Ordering::Release);
-                frame.first_dirty_lsn.store(0, Ordering::Release);
-                // P0-2 - stamp the completed write-back so the background
-                // cleaners can defer this frame if it re-dirties within the
-                // cooldown window (hot-write-set detection).
-                frame.flushed_at_us.store(self.now_us(), Ordering::Release);
-                was_dirty
-            } else {
-                false
+            match self.complete_writeback(frame, epoch, generation, self.now_us()) {
+                WritebackOutcome::Cleaned(was_dirty) => was_dirty,
+                WritebackOutcome::Advanced(rec_lsn) => {
+                    advanced = Some(rec_lsn);
+                    false
+                }
+                WritebackOutcome::Stale => false,
             }
         };
+        if let Some(rec_lsn) = advanced {
+            self.note_dirty(&frame.key, rec_lsn);
+        }
         if cleared {
             self.dirty_pages.fetch_sub(1, Ordering::Relaxed);
             self.prune_clean_dirty_keys(
@@ -8421,6 +8649,43 @@ fn write_all_at(file: &File, buf: &[u8], offset: u64) -> std::io::Result<()> {
     let mut file = file.try_clone()?;
     file.seek(SeekFrom::Start(offset))?;
     file.write_all(buf)
+}
+
+/// Lower `slot` to `lsn` when it is zero or larger. Returns whether it changed.
+fn lower_nonzero_lsn(slot: &AtomicU64, lsn: u64) -> bool {
+    if lsn == 0 {
+        return false;
+    }
+    let mut current = slot.load(Ordering::Acquire);
+    loop {
+        if current != 0 && current <= lsn {
+            return false;
+        }
+        match slot.compare_exchange(current, lsn, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return true,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+/// Result of `BufferPool::complete_writeback`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum WritebackOutcome {
+    /// The frame is clean; carries whether this call cleared the dirty bit.
+    Cleaned(bool),
+    /// Still dirty with an advanced recLSN (zero: only unlogged changes).
+    Advanced(u64),
+    Stale,
+}
+
+/// How a dirtying event changed a frame's recovery bookkeeping.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DirtyMark {
+    /// Clean -> dirty: count it and register it.
+    NewlyDirty,
+    /// Already dirty, but its recLSN was set or lowered: requeue it.
+    RecLsnMoved,
+    Unchanged,
 }
 
 /// Pick the `wanted` oldest dirty frames by recovery LSN, then restore
@@ -11439,7 +11704,10 @@ impl Frame {
             dirty: AtomicBool::new(false),
             dirty_lsn: AtomicU64::new(0),
             first_dirty_lsn: AtomicU64::new(0),
+            redirty_first_lsn: AtomicU64::new(0),
+            flush_wanted: AtomicBool::new(false),
             deferred_pins: AtomicU32::new(0),
+            fpi_owed: AtomicBool::new(false),
             dirty_epoch: AtomicU64::new(0),
             checksum_dirty: AtomicBool::new(false),
             packed_leaf: parking_lot::Mutex::new(None),
@@ -11505,7 +11773,10 @@ impl Frame {
             dirty: AtomicBool::new(true),
             dirty_lsn: AtomicU64::new(dirty_lsn),
             first_dirty_lsn: AtomicU64::new(dirty_lsn),
+            redirty_first_lsn: AtomicU64::new(dirty_lsn),
+            flush_wanted: AtomicBool::new(false),
             deferred_pins: AtomicU32::new(0),
+            fpi_owed: AtomicBool::new(false),
             dirty_epoch: AtomicU64::new(1),
             checksum_dirty: AtomicBool::new(false),
             packed_leaf: parking_lot::Mutex::new(None),
@@ -11529,24 +11800,30 @@ impl Frame {
         }
     }
 
-    fn mark_dirty(&self, dirty_lsn: u64) -> bool {
+    fn mark_dirty(&self, dirty_lsn: u64) -> DirtyMark {
         self.mark_dirty_with_intent(dirty_lsn, AccessIntent::Normal)
     }
 
-    fn mark_dirty_with_intent(&self, dirty_lsn: u64, intent: AccessIntent) -> bool {
+    fn mark_dirty_with_intent(&self, dirty_lsn: u64, intent: AccessIntent) -> DirtyMark {
         if self.has_root_routing.load(Ordering::Relaxed) {
             self.invalidate_root_routing();
         }
         self.dirty_lsn.fetch_max(dirty_lsn, Ordering::AcqRel);
         let was_clean = !self.dirty.swap(true, Ordering::AcqRel);
-        self.note_first_dirty_lsn(dirty_lsn);
+        let rec_lsn_moved = self.note_first_dirty_lsn(dirty_lsn);
         self.dirty_epoch.fetch_add(1, Ordering::AcqRel);
         self.index_header_validated_epoch
             .store(u64::MAX, Ordering::Release);
         self.heap_header_validated_epoch
             .store(u64::MAX, Ordering::Release);
         self.touch(intent);
-        was_clean
+        if was_clean {
+            DirtyMark::NewlyDirty
+        } else if rec_lsn_moved {
+            DirtyMark::RecLsnMoved
+        } else {
+            DirtyMark::Unchanged
+        }
     }
 
     fn publish_io_state(&self, state: FrameIoState) {
@@ -11576,25 +11853,41 @@ impl Frame {
         self.io_wait_cv.notify_all();
     }
 
-    fn note_first_dirty_lsn(&self, dirty_lsn: u64) {
+    /// Fold a WAL LSN that dirtied this frame into its recLSN. Returns whether
+    /// the recLSN changed (set from zero or lowered), in which case the
+    /// oldest-dirty queue needs a fresh candidate: the previous entry no
+    /// longer matches and is discarded as stale when popped.
+    ///
+    /// The write-back window tracker is updated first. `advance_rec_lsn_after_
+    /// writeback` relies on that order to never lose a concurrent note.
+    fn note_first_dirty_lsn(&self, dirty_lsn: u64) -> bool {
         if dirty_lsn == 0 {
-            return;
+            return false;
         }
-        let mut current = self.first_dirty_lsn.load(Ordering::Acquire);
-        loop {
-            if current != 0 && current <= dirty_lsn {
-                return;
-            }
-            match self.first_dirty_lsn.compare_exchange(
-                current,
-                dirty_lsn,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            ) {
-                Ok(_) => return,
-                Err(observed) => current = observed,
-            }
-        }
+        lower_nonzero_lsn(&self.redirty_first_lsn, dirty_lsn);
+        lower_nonzero_lsn(&self.first_dirty_lsn, dirty_lsn)
+    }
+
+    /// Called under the byte write latch that snapshots the write-back image:
+    /// from here on `redirty_first_lsn` covers only changes the image lacks.
+    fn begin_writeback_window(&self) {
+        self.redirty_first_lsn.store(0, Ordering::Release);
+    }
+
+    /// The write-back image is durable in the file but writers re-dirtied the
+    /// frame meanwhile. Everything at or below the snapshot is on disk, so the
+    /// recLSN becomes the lowest LSN noted since the snapshot (zero when only
+    /// deferred, still unlogged, changes followed; their finalization sets it).
+    /// Called under the byte read latch, which excludes every image mutation.
+    /// Returns the new recLSN.
+    fn advance_rec_lsn_after_writeback(&self) -> u64 {
+        let window = self.redirty_first_lsn.load(Ordering::Acquire);
+        self.first_dirty_lsn.store(window, Ordering::Release);
+        // A finalization racing with the store above lowers the tracker
+        // before the recLSN; re-reading the tracker afterwards folds it in.
+        let late = self.redirty_first_lsn.load(Ordering::Acquire);
+        lower_nonzero_lsn(&self.first_dirty_lsn, late);
+        self.first_dirty_lsn.load(Ordering::Acquire)
     }
 
     fn take_raw_page_lease(&self) -> Option<RawPageLease> {
@@ -11873,6 +12166,10 @@ mod sparse_run_completion_tests {
 #[cfg(test)]
 #[path = "buffer/dirty_registry_tests.rs"]
 mod dirty_registry_tests;
+
+#[cfg(test)]
+#[path = "buffer/redo_age_tests.rs"]
+mod redo_age_tests;
 
 /// Prefetch notifications are demand-driven and can arrive thousands of times
 /// per second. They must not turn the periodic writeback budget into a budget

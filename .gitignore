@@ -11,6 +11,7 @@ logs/
 # Machine-local benchmarks, profiling tools, and private experiment drivers.
 /scripts-internal/
 /tests/*
+!/tests/fuzz/
 !/tests/fixtures/
 /tests/fixtures/*
 !/tests/fixtures/storage-format-v1/
@@ -18,7 +19,6 @@ logs/
 !/tests/fixtures/mysql80/
 !/tests/fixtures/xml-functions-mysql80.json
 docs/benchmark-results/
-docs/benchmarks/
 docs/performance
 docs/validation
 artifacts/

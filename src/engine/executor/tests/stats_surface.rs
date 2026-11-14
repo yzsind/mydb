@@ -220,7 +220,7 @@ fn analyze_drop_histogram_clears_named_column() {
     let before = rows_of(
         engine
             .execute(
-                "SELECT HAS_HISTOGRAM FROM information_schema.mydb_stats_health \
+                "SELECT HAS_HISTOGRAM FROM information_schema.MYDB_STATS_HEALTH \
                  WHERE TABLE_NAME='hd'",
             )
             .unwrap(),
@@ -245,7 +245,7 @@ fn analyze_drop_histogram_clears_named_column() {
     let after = rows_of(
         engine
             .execute(
-                "SELECT HAS_HISTOGRAM FROM information_schema.mydb_stats_health \
+                "SELECT HAS_HISTOGRAM FROM information_schema.MYDB_STATS_HEALTH \
                  WHERE TABLE_NAME='hd'",
             )
             .unwrap(),

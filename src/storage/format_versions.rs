@@ -12,7 +12,7 @@
 /// files use name-independent object/generation directories. RENAME INDEX is
 /// catalog-only; pre-v49 directories are intentionally rejected.
 /// v51: AUTO_INCREMENT dynamic metadata moved from per-table `.ai` sidecars
-/// into `mysql.innodb_dynamic_metadata`.
+/// into `mysql.table_dynamic_metadata`.
 /// v52: pending primary-key definitions and primary read-view fences.
 /// v53: monotonic per-table physical index identity highwater.
 /// v54: primary publication identity for physical-replica recovery.

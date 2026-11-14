@@ -351,7 +351,6 @@ fn execute_select_with_cte_joins_inner(
     stmt: Select,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
-    use crate::engine::expr::expr_name;
     // Materialise FROM[0] and each join target, then evaluate the joins.
     // When every join is a plain comma/CROSS join (no ON, not lateral) and a
     // WHERE clause is present, route through the equi-join-aware greedy path:
@@ -481,9 +480,15 @@ fn execute_select_with_cte_joins_inner(
                 }
             }
             SelectItem::Expr { expr, alias } => {
-                let name = alias.clone().unwrap_or_else(|| expr_name(expr));
                 let descriptor = infer_expr_descriptor(expr, &all_sources);
                 let origin = source_column_for_expr(expr, &all_sources);
+                let name = crate::engine::expr::result_column_name(
+                    expr,
+                    alias.as_deref(),
+                    origin.and_then(|column| {
+                        crate::engine::expr::metadata_column_name(&column.name, &column.source)
+                    }),
+                );
                 let column_type = if matches!(
                     descriptor.kind,
                     crate::engine::expr_type::ExprTypeKind::Unknown
@@ -501,6 +506,14 @@ fn execute_select_with_cte_joins_inner(
                             descriptor,
                         )
                     });
+                if origin.is_none() {
+                    source.canonical_metadata_name |= all_sources.iter().any(|source| {
+                        source
+                            .columns
+                            .iter()
+                            .any(|column| column.source.canonical_metadata_name)
+                    });
+                }
                 if origin.is_none()
                     && !matches!(
                         descriptor.kind,
@@ -4987,7 +5000,32 @@ pub(super) fn describe_select_columns(
     db: &Database,
     stmt: &Select,
 ) -> Result<Vec<Column>, QueryError> {
+    // USING/NATURAL publish merged columns. Bind that projection before any
+    // metadata-only shortcut concatenates the independent source fields.
+    if stmt
+        .joins
+        .iter()
+        .any(|join| join.natural || !join.using_columns.is_empty())
+    {
+        let mut described = stmt.clone();
+        crate::planner::resolve_join_using_natural(db, &mut described)?;
+        for join in &mut described.joins {
+            join.natural = false;
+            join.using_columns.clear();
+        }
+        return describe_select_columns(db, &described);
+    }
     planner::validate_outer_aggregate_nesting(db, stmt)?;
+    // Metadata fast paths must apply the same DISTINCT/ORDER BY binding rules
+    // as execution, without running the query or costing a physical plan.
+    if stmt.distinct
+        && !stmt.order_by.is_empty()
+        && stmt.values.is_none()
+        && stmt.json_table.is_none()
+        && !select_references_system_table(stmt)
+    {
+        planner::validate_select_column_references(db, stmt)?;
+    }
     if stmt.values.is_some() {
         return describe_values_select_columns(stmt);
     }
@@ -5082,8 +5120,52 @@ pub(super) fn describe_select_columns(
     let Some(table_name) = stmt.table.as_deref() else {
         return describe_const_select_columns_with_db(Some(db), stmt);
     };
-    if is_system_table_query(table_name) {
-        let fields = system_table_fields(db, table_name)?;
+    if let Some(error) = crate::engine::information_schema::hidden_system_table_error(table_name) {
+        return Err(error);
+    }
+    if crate::engine::information_schema::find_system_table_name(table_name).is_some() {
+        let mut fields = Vec::new();
+        for source in stmt
+            .from
+            .iter()
+            .take(1)
+            .chain(stmt.joins.iter().map(|join| &join.table))
+        {
+            if let Some(error) =
+                crate::engine::information_schema::hidden_system_table_error(&source.name)
+            {
+                return Err(error);
+            }
+            if crate::engine::information_schema::find_system_table_name(&source.name).is_some() {
+                for field in system_table_fields(db, &source.name)? {
+                    let mut meta = (*field.meta).clone();
+                    meta.alias.clone_from(&source.alias);
+                    if let Some(alias) = &source.alias {
+                        meta.source.table.clone_from(alias);
+                    }
+                    fields.push(PlanField {
+                        meta: plan::intern_col_meta(meta),
+                        value: Value::Null,
+                    });
+                }
+            } else if let Some(cte) = crate::planner::try_plan_cte_scan(source) {
+                let mut metadata = Vec::new();
+                plan::collect_plan_fields(&cte, &mut metadata);
+                fields.extend(metadata.into_iter().map(|meta| PlanField {
+                    meta: plan::intern_col_meta(meta),
+                    value: Value::Null,
+                }));
+            } else {
+                let schema = db.table(&source.name)?;
+                let table = crate::planner::PlanTable::new(schema.id, schema, source.alias.clone());
+                let mut metadata = Vec::new();
+                plan::push_table_fields(&mut metadata, &table, None);
+                fields.extend(metadata.into_iter().map(|meta| PlanField {
+                    meta: plan::intern_col_meta(meta),
+                    value: Value::Null,
+                }));
+            }
+        }
         return system_result_columns(stmt, &fields);
     }
     if stmt.joins.is_empty() && stmt.from.len() == 1 {
@@ -7104,6 +7186,9 @@ pub(super) fn execute_system_select(
         .map(|f| {
             let mut meta = (*f.meta).clone();
             meta.alias = table_ref.alias.clone();
+            if let Some(alias) = &table_ref.alias {
+                meta.source.table.clone_from(alias);
+            }
             self::plan::PlanField {
                 meta: self::plan::intern_col_meta(meta),
                 value: f.value,
@@ -7426,29 +7511,10 @@ fn zone_map_diagnostic_filter(expr: &Expr) -> Option<ZoneMapDiagnosticFilter> {
 }
 
 fn system_result_columns(stmt: &Select, fields: &[PlanField]) -> Result<Vec<Column>, QueryError> {
-    let sample = PlanRow {
-        fields: fields.to_vec(),
-        group: None,
-        agg_values: None,
-        schema: PlanRow::empty_schema(),
-    };
-    let mut columns = Vec::new();
-    for item in &stmt.projection {
-        match item {
-            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
-                columns.extend(
-                    fields
-                        .iter()
-                        .map(|field| col(&field.column, field.column_type)),
-                );
-            }
-            SelectItem::Expr { expr, alias } => columns.push(col(
-                &alias.clone().unwrap_or_else(|| expr_name(expr)),
-                plan_expr_result_type(expr, &sample)?,
-            )),
-        }
-    }
-    Ok(columns)
+    plan::empty_result_columns_from_fields(
+        stmt,
+        fields.iter().map(|field| (*field.meta).clone()).collect(),
+    )
 }
 
 pub(super) fn is_system_table_query(table_name: &str) -> bool {

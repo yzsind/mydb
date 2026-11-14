@@ -69,12 +69,12 @@ The source table still enforces the old schema's constraints. If a concurrent tr
 
 ## Observability
 
-Progress: `information_schema.mydb_ddl_jobs`.
+Progress: `information_schema.MYDB_DDL_JOBS`.
 
 BTREE index jobs expose their index subjects and support `CANCEL DDL JOB`.
 Column-validation and constraint jobs have distinct object kinds. A bounded
 history retains terminal results in memory; a completed job can remain visible
-with `CANCEL_ALLOWED=0`. An acknowledged cancellation before the finalization
+with `CAN_CANCEL=0`. An acknowledged cancellation before the finalization
 gate prevents publication, including when the final replay batch is empty.
 
 `SHOW ENGINE MYDB STATUS` adds:

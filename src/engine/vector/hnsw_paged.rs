@@ -237,9 +237,9 @@ impl std::ops::Deref for QueryNavEdges {
     }
 }
 
-const QUERY_CACHE_ENTRIES: usize = 512;
+pub(crate) const QUERY_CACHE_ENTRIES: usize = 512;
 const QUERY_CACHE_WAYS: usize = 8;
-const QUERY_CACHE_MAX_K: usize = 128;
+pub(crate) const QUERY_CACHE_MAX_K: usize = 128;
 
 #[derive(Debug)]
 struct QueryCacheEntry {
@@ -254,14 +254,33 @@ struct QueryCacheEntry {
 /// is owned by the immutable navigation arena. Graph mutations invalidate
 /// its epoch; vector overwrites also drop the arena and its immutable codes.
 /// Full query bits are checked after the hash, making collisions performance-only. Fixed slots keep
-/// admission and capacity accounting deterministic.
+/// admission and capacity accounting deterministic. Each set owns its lock so
+/// publishing a miss does not block hits in unrelated sets.
 #[derive(Debug)]
 pub(crate) struct QueryNavCache {
+    enabled: bool,
     max_k: usize,
-    sets: parking_lot::RwLock<Vec<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]>>,
+    sets: Vec<parking_lot::RwLock<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]>>,
 }
 
 impl QueryNavCache {
+    /// Bound complete keys, candidate arrays and one in-flight replacement.
+    /// Capacity follows vector width and admitted memory, never query traffic.
+    pub(crate) fn allocation(
+        dimension: usize,
+        max_k: usize,
+        limit: usize,
+    ) -> Option<(usize, usize)> {
+        let budget = (limit / 16).min(64 * 1024 * 1024);
+        let entry = dimension
+            .checked_mul(4)?
+            .checked_add(12 + 128)?
+            .checked_add(max_k.checked_mul(std::mem::size_of::<(RowId, f64)>())?)?;
+        let entries =
+            (budget / entry).saturating_sub(1).min(4096) / QUERY_CACHE_WAYS * QUERY_CACHE_WAYS;
+        (entries >= QUERY_CACHE_WAYS).then(|| (entries, (entries + 1) * entry))
+    }
+
     pub(crate) fn new() -> Self {
         Self::with_max_k(QUERY_CACHE_MAX_K)
     }
@@ -271,15 +290,23 @@ impl QueryNavCache {
     }
 
     pub(crate) fn with_capacity(max_k: usize, entries: usize) -> Self {
-        let mut sets: Vec<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]> =
-            std::iter::repeat_with(|| std::array::from_fn(|_| None))
+        let mut sets: Vec<parking_lot::RwLock<[Option<QueryCacheEntry>; QUERY_CACHE_WAYS]>> =
+            std::iter::repeat_with(|| parking_lot::RwLock::new(std::array::from_fn(|_| None)))
                 .take((entries / QUERY_CACHE_WAYS).max(1))
                 .collect();
         sets.shrink_to_fit();
         Self {
+            enabled: crate::startup_config::var("MYDB_HNSW_QUERY_MEMO")
+                .ok()
+                .and_then(|value| crate::util::env::parse_bool(&value))
+                .unwrap_or(true),
             max_k,
-            sets: parking_lot::RwLock::new(sets),
+            sets,
         }
+    }
+
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
     }
 
     #[inline]
@@ -300,6 +327,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn get(&self, query: &[f32], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
+        if !self.enabled {
+            return None;
+        }
         // SAFETY: every f32 bit pattern may be borrowed as initialized bytes.
         let bytes = unsafe {
             std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
@@ -308,6 +338,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn get_bytes(&self, query: &[u8], k: usize, ef: usize) -> Option<Vec<(RowId, f64)>> {
+        if !self.enabled {
+            return None;
+        }
         self.get_key(query, k, ef, Self::hash_bytes(query, k, ef))
     }
 
@@ -328,8 +361,8 @@ impl QueryNavCache {
         if k > self.max_k {
             return None;
         }
-        let sets = self.sets.read();
-        for entry in sets[(hash as usize) % sets.len()].iter().flatten() {
+        let set = self.sets[(hash as usize) % self.sets.len()].read();
+        for entry in set.iter().flatten() {
             if entry.hash == hash
                 && entry.k == k
                 && entry.ef == ef
@@ -342,6 +375,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn insert(&self, query: &[f32], k: usize, ef: usize, result: &[(RowId, f64)]) {
+        if !self.enabled {
+            return;
+        }
         // SAFETY: the byte view is bounded by the initialized f32 slice.
         let bytes = unsafe {
             std::slice::from_raw_parts(query.as_ptr().cast::<u8>(), std::mem::size_of_val(query))
@@ -350,6 +386,9 @@ impl QueryNavCache {
     }
 
     pub(crate) fn insert_bytes(&self, query: &[u8], k: usize, ef: usize, result: &[(RowId, f64)]) {
+        if !self.enabled {
+            return;
+        }
         self.insert_key(query, k, ef, result, Self::hash_bytes(query, k, ef));
     }
 
@@ -357,21 +396,30 @@ impl QueryNavCache {
         if k > self.max_k || result.len() > self.max_k {
             return;
         }
-        let mut sets = self.sets.write();
-        let entry = QueryCacheEntry {
+        let index = (hash as usize) % self.sets.len();
+        let mut set = self.sets[index].write();
+        let slot = set
+            .iter()
+            .position(|current| {
+                current.as_ref().is_some_and(|entry| {
+                    entry.hash == hash
+                        && entry.k == k
+                        && entry.ef == ef
+                        && entry.query_bytes.as_ref() == query
+                })
+            })
+            .or_else(|| set.iter().position(Option::is_none))
+            .unwrap_or(((hash >> 32) as usize) % QUERY_CACHE_WAYS);
+        // Free a victim before allocating its replacement. Independent set
+        // writers must not multiply the cache's admitted replacement scratch.
+        drop(set[slot].take());
+        set[slot] = Some(QueryCacheEntry {
             hash,
             k,
             ef,
             query_bytes: query.into(),
             result: Arc::from(result),
-        };
-        let index = (hash as usize) % sets.len();
-        let set = &mut sets[index];
-        let slot = set
-            .iter()
-            .position(|current| current.is_none())
-            .unwrap_or(((hash >> 32) as usize) % QUERY_CACHE_WAYS);
-        set[slot] = Some(entry);
+        });
     }
 }
 
@@ -2008,6 +2056,10 @@ pub(crate) struct PagedHnsw {
     mutation_gate: Arc<parking_lot::RwLock<()>>,
     reverse_latches: [parking_lot::Mutex<()>; 256],
     next_calibration: AtomicU64,
+    /// Node count at which a complete pass proved SQ8 navigation calibration
+    /// infeasible (`u64::MAX` = unknown). Refresh skips repeating that full
+    /// index pass until the node set changes.
+    calibration_infeasible_at: AtomicU64,
     metric: Metric,
     m: usize,
     m0: usize,
@@ -2096,6 +2148,7 @@ impl PagedHnsw {
             mutation_gate: Arc::new(parking_lot::RwLock::new(())),
             reverse_latches: std::array::from_fn(|_| parking_lot::Mutex::new(())),
             next_calibration: AtomicU64::new(64),
+            calibration_infeasible_at: AtomicU64::new(u64::MAX),
             row_index: parking_lot::RwLock::new(None),
             restored_retirements: parking_lot::RwLock::new((
                 std::collections::HashSet::new(),
@@ -2514,6 +2567,13 @@ impl PagedHnsw {
     /// Synchronously refresh after CREATE/OPTIMIZE so the first user query
     /// starts on the compact path. Admission failure is expected for an
     /// optional cache and leaves the paged implementation as the oracle.
+    /// A cold build that observed every indexed row already established that
+    /// no SQ8 calibration exists for the current node set.
+    pub(crate) fn note_navigation_calibration_infeasible(&self) {
+        self.calibration_infeasible_at
+            .store(self.file.node_count(), Ordering::Release);
+    }
+
     pub(crate) fn refresh_query_navigation(&self) -> Result<(), QueryError> {
         let _gate = self.navigation_gate.write();
         if self.query_nav.read().as_ref().is_some_and(|arena| {
@@ -2527,9 +2587,14 @@ impl PagedHnsw {
             && (self.navigation_quant_enabled && paged_quant_enabled())
             && (self.file.navigation_quantization().is_none()
                 || self.file.meta().nav_exact_nodes != 0)
+            && self.calibration_infeasible_at.load(Ordering::Acquire) != self.file.node_count()
         {
             self.invalidate_query_navigation();
             self.file.recalibrate_navigation(&[])?;
+            if self.file.navigation_quantization().is_none() {
+                self.calibration_infeasible_at
+                    .store(self.file.node_count(), Ordering::Release);
+            }
         }
         if self.file.prepare_navigation_mapping()? {
             self.query_nav.write().take();
@@ -2648,14 +2713,19 @@ impl PagedHnsw {
     /// Transcribe a fully linked dense in-memory graph through the storage
     /// layer's sequential direct writer. Only one vector/node is copied at a
     /// time; there is no second table-sized `rows` or exported-links batch.
-    pub(crate) fn materialize_memory_graph(&self, graph: &HnswIndex) -> Result<(), QueryError> {
+    pub(crate) fn materialize_memory_graph(
+        &self,
+        graph: &HnswIndex,
+        threads: usize,
+    ) -> Result<(), QueryError> {
         let timing = std::env::var("MYDB_HNSW_BUILD_TIMING").is_ok();
         let started = std::time::Instant::now();
-        self.file.bulk_build_direct(
+        self.file.bulk_build_direct_parallel(
             graph.build_node_count(),
             graph.build_entry(),
             |id| graph.build_node_top_layer(id),
             |id, vector, neighbors| Ok(graph.copy_build_node_into(id, vector, neighbors)),
+            threads,
         )?;
         if timing {
             eprintln!(
@@ -3759,6 +3829,22 @@ impl PagedHnsw {
     /// neighbour. Rejected redundant edges are not added back merely to
     /// fill capacity: M is an upper bound, not a required degree.
     fn select_neighbors(
+        &self,
+        candidates: &[Scored],
+        m: usize,
+        scratch: &mut Scratch,
+    ) -> Result<Vec<Scored>, QueryError> {
+        // Cold builds keep pruned connections, as the in-memory builder does.
+        // Incremental DML does not: full lists would make every later reverse
+        // edge re-run the O(m0²) heuristic instead of appending into slack.
+        let mut selected = self.select_neighbors_diverse(candidates, m, scratch)?;
+        if self.file.in_bulk_build() {
+            super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        }
+        Ok(selected)
+    }
+
+    fn select_neighbors_diverse(
         &self,
         candidates: &[Scored],
         m: usize,
@@ -5583,6 +5669,92 @@ mod build_adj_tests {
 mod query_nav_allocation_tests {
     use super::{query_navigation_allocation, QueryNavCache, QueryNavStorage, QUERY_CACHE_MAX_K};
     use crate::storage::RowId;
+
+    #[test]
+    fn disabled_query_memo_neither_reuses_nor_publishes_candidates() {
+        let mut cache = QueryNavCache::new();
+        let values = [(
+            RowId {
+                page_id: 1,
+                slot_id: 2,
+            },
+            3.0,
+        )];
+        cache.insert(&[1.0, 2.0], 1, 64, &values);
+        cache.insert_bytes(&[1, 2], 1, 64, &values);
+        cache.enabled = false;
+        assert!(!cache.enabled());
+        assert!(cache.get(&[1.0, 2.0], 1, 64).is_none());
+        assert!(cache.get_bytes(&[1, 2], 1, 64).is_none());
+        cache.insert(&[3.0, 4.0], 1, 64, &values);
+        cache.insert_bytes(&[3, 4], 1, 64, &values);
+        cache.enabled = true;
+        assert!(cache.get(&[3.0, 4.0], 1, 64).is_none());
+        assert!(cache.get_bytes(&[3, 4], 1, 64).is_none());
+    }
+
+    #[test]
+    fn query_memo_capacity_accounts_wide_keys_results_and_replacement() {
+        for dimension in [1usize, 33, 768, 16383, 65532] {
+            for max_k in [1usize, 128, 1024] {
+                for limit in [0usize, 1024, 8 << 20, 256 << 20, 4usize << 30] {
+                    if let Some((entries, bytes)) =
+                        QueryNavCache::allocation(dimension, max_k, limit)
+                    {
+                        assert!((8..=4096).contains(&entries));
+                        assert_eq!(entries % 8, 0);
+                        let payload =
+                            dimension * 4 + 12 + max_k * std::mem::size_of::<(RowId, f64)>();
+                        assert!(bytes >= (entries + 1) * payload);
+                        assert!(bytes <= (limit / 16).min(64 << 20));
+                    }
+                }
+            }
+        }
+        assert!(QueryNavCache::allocation(usize::MAX, 128, usize::MAX).is_none());
+        assert!(QueryNavCache::allocation(33, usize::MAX, usize::MAX).is_none());
+    }
+
+    #[test]
+    fn concurrent_query_memos_preserve_full_keys_and_search_budgets() {
+        let cache = QueryNavCache::with_capacity(128, 512);
+        crate::util::thread_spawn::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|worker| {
+                    let cache = &cache;
+                    scope.spawn(move || {
+                        for iteration in 0..256 {
+                            let row = iteration % 32;
+                            let key = vec![worker as u8, row as u8, 0, 255, 17];
+                            let expected = vec![(
+                                RowId {
+                                    page_id: worker,
+                                    slot_id: row,
+                                },
+                                row as f64,
+                            )];
+                            cache.insert_bytes(&key, 1, 64, &expected);
+                            if let Some(actual) = cache.get_bytes(&key, 1, 64) {
+                                assert_eq!(actual, expected);
+                            }
+                            assert!(cache.get_bytes(&key, 1, 65).is_none());
+                            assert!(cache.get_bytes(&key, 2, 64).is_none());
+                        }
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+        });
+        for set in &cache.sets {
+            let set = set.read();
+            let mut keys = std::collections::HashSet::new();
+            for entry in set.iter().flatten() {
+                assert!(keys.insert(entry.query_bytes.as_ref()));
+            }
+        }
+    }
 
     #[test]
     fn million_high_dimensional_rows_fit_navigation_only_budget() {

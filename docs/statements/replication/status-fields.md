@@ -63,7 +63,7 @@ SQL result columns are ordered as listed. LSNs and binlog positions are unsigned
 | `Last_Seen_Ms` | BIGINT | Last slot contact timestamp, Unix milliseconds. |
 | `First_Registered_Ms` | BIGINT | Initial slot registration timestamp, Unix milliseconds. |
 
-A disconnected `active` slot can still pin WAL; `invalidated`/`abandoned` slots do not. ACK is constrained by valid source/receiver bounds and is not a direct SQL read of the replica. Do not promote using Received_LSN, Local_Next_LSN or an old RR read snapshot as a catch-up proof. Wait for Durable_Applied_LSN, then start a fresh read. Sequence synchronization configuration is observable through information_schema.mydb_sequences.SYNC_CONFIG_EPOCH; it is not the Role Epoch column.
+A disconnected `active` slot can still pin WAL; `invalidated`/`abandoned` slots do not. ACK is constrained by valid source/receiver bounds and is not a direct SQL read of the replica. Do not promote using Received_LSN, Local_Next_LSN or an old RR read snapshot as a catch-up proof. Wait for Durable_Applied_LSN, then start a fresh read. Sequence synchronization configuration is observable through information_schema.MYDB_SEQUENCES.SYNC_CONFIG_EPOCH; it is not the Role Epoch column.
 
 ## SHOW REPLICA STATUS
 

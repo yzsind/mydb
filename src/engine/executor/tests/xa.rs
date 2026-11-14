@@ -103,7 +103,7 @@ fn xa_one_phase_commit_skips_prepare() {
         row_count(
             &engine,
             &mut s,
-            "SELECT FORMAT_ID FROM information_schema.mydb_xa_recover"
+            "SELECT FORMAT_ID FROM information_schema.MYDB_PREPARED_XA_TRANSACTIONS"
         ),
         0
     );
@@ -497,7 +497,7 @@ fn xa_information_schema_recover_view_lists_branch() {
         row_count(
             &engine,
             &mut s,
-            "SELECT FORMAT_ID FROM information_schema.mydb_xa_recover",
+            "SELECT FORMAT_ID FROM information_schema.MYDB_PREPARED_XA_TRANSACTIONS",
         ),
         1
     );
@@ -506,7 +506,7 @@ fn xa_information_schema_recover_view_lists_branch() {
         row_count(
             &engine,
             &mut s,
-            "SELECT FORMAT_ID FROM information_schema.mydb_xa_recover",
+            "SELECT FORMAT_ID FROM information_schema.MYDB_PREPARED_XA_TRANSACTIONS",
         ),
         0
     );

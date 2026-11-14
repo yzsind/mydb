@@ -1806,6 +1806,44 @@ fn knn_recall_vs_bruteforce(
 }
 
 #[test]
+fn cosine_hnsw_parallel_registry_scan_covers_rows_and_rejects_zero_vectors() {
+    // 960-d rows stay inline at ~3 per page, so 400 rows span well over the
+    // 64-page threshold of the parallel registry scan.
+    let _env = HnswEnv::set(&[("MYDB_HNSW_BUILD_THREADS", "4")]);
+    let dir = tempfile::tempdir().unwrap();
+    // Strict durability takes the direct offline scan used in production.
+    let engine = open_strict_hnsw_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(960) NOT NULL)")
+        .unwrap();
+    let vectors = gen_vectors(400, 960, 0x5eed_1234_abcd_0001);
+    bulk_insert_vectors(&engine, &vectors);
+    engine
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
+        .unwrap();
+    let probe =
+        format!(
+        "SELECT id FROM items ORDER BY DISTANCE(emb, STRING_TO_VECTOR('[{}]'), 'COSINE') LIMIT 1",
+        vectors[123].iter().map(|v| v.to_string()).collect::<Vec<_>>().join(",")
+    );
+    assert_eq!(cell(&engine, &probe), "124");
+    engine.execute("DROP INDEX idx_emb ON items").unwrap();
+    let zero = format!(
+        "INSERT INTO items VALUES (1000, STRING_TO_VECTOR('[{}]'))",
+        vec!["0"; 960].join(",")
+    );
+    engine.execute(&zero).unwrap();
+    let err = engine
+        .execute("CREATE INDEX idx_emb ON items(emb) USING HNSW WITH (metric=cosine)")
+        .unwrap_err();
+    assert!(
+        err.message()
+            .contains("COSINE indexes reject existing zero vectors"),
+        "{err:?}"
+    );
+}
+
+#[test]
 fn hnsw_parallel_build_matches_brute_force_recall() {
     // M4: with MYDB_HNSW_BUILD_THREADS>1 the cold-build path splits the
     // heap into disjoint page ranges and concurrent workers each call
@@ -2023,7 +2061,7 @@ fn m5_ef_search_sysvar_registered_with_defaults() {
     assert_eq!(cell(&engine, "SELECT @@SESSION.mydb_hnsw_ef_search"), "64");
     assert_eq!(
         cell(&engine, "SELECT @@SESSION.mydb_hnsw_ef_dynamic_factor"),
-        "4"
+        "2"
     );
     assert_eq!(
         cell(&engine, "SELECT @@SESSION.mydb_hnsw_iterative_scan"),
@@ -3139,10 +3177,10 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
         )
         .unwrap();
 
-    // Cold (never queried): catalog metadata present, LOADED = 0, runtime NULL.
-    let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
+    // Cold (never queried): catalog metadata present, IS_LOADED = 0, runtime NULL.
+    let base = "FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME = 'items'";
     assert_eq!(
-        col_strings(&engine, &format!("SELECT METRIC {base}")),
+        col_strings(&engine, &format!("SELECT DISTANCE_METRIC {base}")),
         vec!["COSINE"]
     );
     assert_eq!(
@@ -3158,11 +3196,11 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
         vec!["80"]
     );
     assert_eq!(
-        col_strings(&engine, &format!("SELECT DECLARED_DIM {base}")),
+        col_strings(&engine, &format!("SELECT DECLARED_DIMENSIONS {base}")),
         vec!["6"]
     );
     assert_eq!(
-        col_strings(&engine, &format!("SELECT LOADED {base}")),
+        col_strings(&engine, &format!("SELECT IS_LOADED {base}")),
         vec!["1"]
     );
 
@@ -3175,9 +3213,9 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
         &format!("SELECT id FROM items ORDER BY DISTANCE(emb, '{q}', 'COSINE') LIMIT 3"),
     );
 
-    // Warm: LOADED = 1, backend reported, live nodes == row count.
+    // Warm: IS_LOADED = 1, backend reported, live nodes == row count.
     assert_eq!(
-        col_strings(&engine, &format!("SELECT LOADED {base}")),
+        col_strings(&engine, &format!("SELECT IS_LOADED {base}")),
         vec!["1"]
     );
     assert_eq!(
@@ -3185,7 +3223,7 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
         vec!["30"]
     );
     assert_eq!(
-        col_strings(&engine, &format!("SELECT RUNTIME_DIM {base}")),
+        col_strings(&engine, &format!("SELECT RUNTIME_DIMENSIONS {base}")),
         vec!["6"]
     );
     let backend = col_strings(&engine, &format!("SELECT BACKEND {base}"));
@@ -3196,9 +3234,9 @@ fn mydb_vector_indexes_view_reports_catalog_and_runtime() {
     let extended = rows(
         &engine,
         &format!(
-            "SELECT PAGED_FILE_SIZE_BYTES, NAV_PAGES, SQ8_EXACT_FALLBACK_NODES, \
+            "SELECT PAGED_FILE_SIZE_BYTES, NAVIGATION_PAGES, SQ8_EXACT_FALLBACK_NODES, \
                     TOMBSTONES_ON_DISK, SQ8_COVERED_NODES, \
-                    DEFAULT_NPROBE, KMEANS_ITERS, TRAIN_SAMPLE_MULT {base}"
+                    DEFAULT_NPROBE, KMEANS_ITERATIONS, TRAIN_SAMPLE_MULTIPLIER {base}"
         ),
     );
     assert_eq!(extended.len(), 1);
@@ -3235,8 +3273,8 @@ fn vector_with_validation_show_create_roundtrip_and_json_explain() {
     assert_eq!(
         col_strings(
             &engine,
-            "SELECT CONCAT(METRIC, ':', M, ':', EF_CONSTRUCTION, ':', DEFAULT_EF_SEARCH) \
-             FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME='items_copy'",
+            "SELECT CONCAT(DISTANCE_METRIC, ':', M, ':', EF_CONSTRUCTION, ':', DEFAULT_EF_SEARCH) \
+             FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME='items_copy'",
         ),
         vec!["COSINE:20:96:48"]
     );
@@ -3685,7 +3723,7 @@ fn optimize_table_compacts_hnsw_tombstones() {
     let _ = id_list(&engine, knn);
     engine.execute("DELETE FROM items WHERE id <= 10").unwrap();
 
-    let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
+    let base = "FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME = 'items'";
     assert_eq!(
         col_strings(&engine, &format!("SELECT STALE_NODES {base}")),
         vec!["10"],
@@ -3745,7 +3783,7 @@ fn optimize_table_rebuilds_paged_hnsw_and_reclaims_tombstones() {
     // apples-to-apples. Automatic checkpoint compaction is disabled above;
     // explicit OPTIMIZE must be the operation that reclaims tombstones.
     engine.checkpoint().unwrap();
-    let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME='items'";
+    let base = "FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME='items'";
     assert_eq!(
         col_strings(&engine, &format!("SELECT TOMBSTONES_ON_DISK {base}")),
         vec!["24"]
@@ -3832,7 +3870,7 @@ fn warm_all_vector_graphs_preloads_cold_indexes() {
     // The replica-promotion path (M8) calls `warm_all_vector_graphs` so a
     // freshly-promoted master answers its first KNN without a cold-build stall.
     // Here we exercise that primitive directly: a never-queried index is cold
-    // (LOADED=0); after warming it is hot with all rows present.
+    // (IS_LOADED=0); after warming it is hot with all rows present.
     let _env = HnswEnv::set(&[("MYDB_HNSW_BUILD_ON_DDL", "off")]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
@@ -3855,10 +3893,10 @@ fn warm_all_vector_graphs_preloads_cold_indexes() {
 
     let table = engine.database().table("items").unwrap();
     engine.database().evict_table_vector_graphs(table.id);
-    let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
+    let base = "FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME = 'items'";
     // Cold: the index has never been queried, so no graph is warm.
     assert_eq!(
-        col_strings(&engine, &format!("SELECT LOADED {base}")),
+        col_strings(&engine, &format!("SELECT IS_LOADED {base}")),
         vec!["0"]
     );
 
@@ -3866,7 +3904,7 @@ fn warm_all_vector_graphs_preloads_cold_indexes() {
     engine.database().warm_all_vector_graphs().unwrap();
 
     assert_eq!(
-        col_strings(&engine, &format!("SELECT LOADED {base}")),
+        col_strings(&engine, &format!("SELECT IS_LOADED {base}")),
         vec!["1"],
         "warm_all must build the cold graph"
     );
@@ -4397,10 +4435,10 @@ fn ivf_information_schema_reports_algo_and_nlist() {
     engine
         .execute("CREATE INDEX idx_emb ON items(emb) USING IVF WITH (nlist=5)")
         .unwrap();
-    let base = "FROM information_schema.mydb_vector_indexes WHERE TABLE_NAME = 'items'";
-    // ALGO is available even when cold.
+    let base = "FROM information_schema.MYDB_VECTOR_INDEXES WHERE TABLE_NAME = 'items'";
+    // ALGORITHM is available even when cold.
     assert_eq!(
-        col_strings(&engine, &format!("SELECT ALGO {base}")),
+        col_strings(&engine, &format!("SELECT ALGORITHM {base}")),
         vec!["IVF"]
     );
     assert_eq!(
@@ -4446,7 +4484,7 @@ fn ivf_information_schema_reports_algo_and_nlist() {
         vec!["30"]
     );
     assert_eq!(
-        col_strings(&engine, &format!("SELECT LOADED {base}")),
+        col_strings(&engine, &format!("SELECT IS_LOADED {base}")),
         vec!["1"]
     );
     assert_eq!(

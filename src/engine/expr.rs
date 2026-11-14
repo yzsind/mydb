@@ -27404,6 +27404,40 @@ pub(crate) fn expr_column_index(expr: &Expr, table: &TableSchema) -> Option<usiz
     expr_column_name(expr).and_then(|name| table.column_index(name).ok())
 }
 
+/// Metadata naming is explicit provenance, independent of the schema containing
+/// an ordinary user table and of a computed expression's physical origin.
+pub(crate) fn metadata_column_name<'a>(
+    name: &'a str,
+    source: &crate::types::ColumnSource,
+) -> Option<&'a str> {
+    source.canonical_metadata_name.then_some(name)
+}
+
+/// Group binding may wrap a reference without changing its naming policy.
+pub(crate) fn is_direct_column_reference(mut expr: &Expr) -> bool {
+    while let Expr::GroupKeyRef { expr: inner, .. } = expr {
+        expr = inner;
+    }
+    matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_))
+}
+
+/// Explicit aliases win; only direct references inherit a published name.
+pub(crate) fn result_column_name(
+    expr: &Expr,
+    alias: Option<&str>,
+    source_name: Option<&str>,
+) -> String {
+    if let Some(alias) = alias {
+        return alias.to_string();
+    }
+    if is_direct_column_reference(expr) {
+        if let Some(name) = source_name {
+            return name.to_string();
+        }
+    }
+    expr_name(expr)
+}
+
 pub(crate) fn expr_name(expr: &Expr) -> String {
     fn identifier_output_name(name: &str) -> String {
         // Derived/set-operation qualification can preserve the SQL-rendered

@@ -358,7 +358,12 @@ impl CompactHnswStats {
             1.0
         };
         let inv_norm = if norm > 0.0 { norm.recip() } else { 1.0 };
-        for (i, &x) in vector.iter().enumerate() {
+        let inv_rows = ((self.rows + 1) as f64).recip();
+        for ((&x, mean), deviation) in vector
+            .iter()
+            .zip(self.means.iter_mut())
+            .zip(self.deviations.iter_mut())
+        {
             let x = (x as f64 * inv_norm) as f32;
             if !x.is_finite() {
                 self.valid = false;
@@ -366,11 +371,41 @@ impl CompactHnswStats {
             }
             self.vmin = self.vmin.min(x);
             self.vmax = self.vmax.max(x);
-            let delta = x as f64 - self.means[i];
-            self.means[i] += delta / (self.rows + 1) as f64;
-            self.deviations[i] += delta * (x as f64 - self.means[i]);
+            let delta = x as f64 - *mean;
+            *mean += delta * inv_rows;
+            *deviation += delta * (x as f64 - *mean);
         }
         self.rows += 1;
+    }
+
+    /// Combine statistics of a disjoint row set (Chan et al. parallel
+    /// variance), so a partitioned heap scan yields one global summary.
+    pub(crate) fn merge(&mut self, other: CompactHnswStats) {
+        if other.rows == 0 {
+            self.valid &= other.valid;
+            return;
+        }
+        if self.rows == 0 {
+            let valid = self.valid && other.valid;
+            *self = other;
+            self.valid = valid;
+            return;
+        }
+        if self.dim != other.dim {
+            self.valid = false;
+            return;
+        }
+        self.valid &= other.valid;
+        self.vmin = self.vmin.min(other.vmin);
+        self.vmax = self.vmax.max(other.vmax);
+        let (a, b) = (self.rows as f64, other.rows as f64);
+        let total = a + b;
+        for i in 0..self.dim {
+            let delta = other.means[i] - self.means[i];
+            self.means[i] += delta * (b / total);
+            self.deviations[i] += other.deviations[i] + delta * delta * (a * b / total);
+        }
+        self.rows += other.rows;
     }
 
     pub(crate) fn rows(&self) -> usize {
@@ -540,6 +575,10 @@ struct Probe<'a> {
     /// When SQ8 navigation is active: the arena, the quantized query codes, and
     /// the query's precomputed `‖q‖²` (so each probe is one `sdot` + two adds).
     quant: Option<(&'a QuantArena, &'a [i8], i32)>,
+    /// Cached cosine `‖query‖²` for graph construction, where both endpoints
+    /// carry cached norms and edge geometry uses [`cosine_with_norms`] just
+    /// like neighbour selection. Query-time probes leave it `None`.
+    cosine_norm: Option<f32>,
 }
 
 impl Probe<'_> {
@@ -628,13 +667,15 @@ const HNSW_BUILD_SOFT_CAP_MULT: usize = 2;
 
 /// Cold-build deferred-diversity link default. When on, [`HnswIndex::link_all`]
 /// keeps every navigable list at ≤ m during the link fan-out via a cheap
-/// drop-farthest (parking the evicted reverse edges), so navigation traverses
-/// ≤ m-degree lists — about half the per-neighbour random arena fetches that
-/// dominate the build — and the parked edges are merged back and diversity-pruned
-/// once in Phase D. The shipped graph is the same degree-bounded structure (the
-/// Phase-D candidate set is a superset of the soft-cap path's), so recall is
-/// unchanged. `MYDB_HNSW_BUILD_DEFERRED=0` restores the soft-cap path.
-const HNSW_BUILD_DEFERRED: bool = true;
+/// drop-farthest (parking the evicted reverse edges) and merges the parked
+/// edges back in Phase D. That halves construction-time navigation work, but
+/// the graph navigated *during* the build is then a nearest-only kNN graph
+/// without the diversity heuristic's long links, so every later insertion
+/// finds poorer candidates: on 1M × 768-d cosine data it cost ~3 recall
+/// points at equal search effort. The default therefore keeps diversity-pruned
+/// lists throughout (the soft-cap path); `MYDB_HNSW_BUILD_DEFERRED=1` restores
+/// the faster, lower-quality variant.
+const HNSW_BUILD_DEFERRED: bool = false;
 
 /// Default navigable headroom above `m` for the deferred build (see
 /// [`BuildAux::nav_slack`]). A small value keeps the during-build scaffolding
@@ -756,6 +797,17 @@ thread_local! {
     /// and DML/insert threads both get amortised-zero allocation this way.
     static SCRATCH: RefCell<SearchScratch> = RefCell::new(SearchScratch::new());
 }
+
+#[cfg(test)]
+thread_local! {
+    static NODE_RESERVED_TEST_HOOK: RefCell<Option<Box<dyn FnOnce(u32)>>> = const {
+        RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+#[path = "hnsw_publication_tests.rs"]
+mod publication_tests;
 
 /// Per-node state. Stored **inline** in the [`NodeSlab`] at a stable address
 /// (segments never move once allocated), so navigation borrows `&Node`
@@ -882,6 +934,21 @@ impl NodeSlab {
         }
     }
 
+    /// Borrow a claimed slot only after initialization. Callers must exclude
+    /// slab reclamation, just as for `get`.
+    fn get_initialized(&self, id: u32) -> Option<&Node> {
+        let (bucket, off) = slab_slot(id as usize);
+        let flags = self.ready[bucket].load(Ordering::Acquire);
+        // SAFETY: the flag bucket, if allocated, remains live under the
+        // caller's structural guard. Acquire publishes the node before any
+        // reference to its bytes is formed.
+        if flags.is_null() || !unsafe { &*flags.add(off) }.load(Ordering::Acquire) {
+            None
+        } else {
+            Some(self.get(id))
+        }
+    }
+
     /// Append a node, returning its id. The node is built by `make` from its
     /// freshly-assigned id (the HNSW level assignment is seeded by it). Lock-
     /// free except for the at-most-once-per-bucket allocation.
@@ -897,6 +964,13 @@ impl NodeSlab {
                     format!("HNSW graph exceeded its {SLAB_CAPACITY} node id space"),
                 )
             })?;
+        #[cfg(test)]
+        NODE_RESERVED_TEST_HOOK.with(|hook| {
+            let hook = hook.borrow_mut().take();
+            if let Some(hook) = hook {
+                hook(id as u32);
+            }
+        });
         let node = make(id as u32);
         let (bucket, off) = slab_slot(id);
         let mut base = self.dir[bucket].load(Ordering::Acquire);
@@ -934,9 +1008,9 @@ impl NodeSlab {
     ///
     /// Invariant (upheld by every caller): `id` was produced by a prior `push`
     /// and reached here either through a neighbour list / entry point (so its
-    /// slot is written and visible), through `published_len`'s acquire edge,
-    /// or in a structural write-locked full scan. All callers also exclude
-    /// concurrent `clear` with structural or exclusive ownership.
+    /// slot is written and visible), through `published_len` / `get_initialized`'s
+    /// acquire edge, or in a structural write-locked full scan. All callers
+    /// also exclude concurrent `clear` with structural or exclusive ownership.
     #[inline]
     fn get(&self, id: u32) -> &Node {
         let id = id as usize;
@@ -944,6 +1018,14 @@ impl NodeSlab {
         let (bucket, off) = slab_slot(id);
         let base = self.dir[bucket].load(Ordering::Acquire);
         debug_assert!(!base.is_null());
+        #[cfg(debug_assertions)]
+        {
+            let flags = self.ready[bucket].load(Ordering::Acquire);
+            assert!(
+                !flags.is_null() && unsafe { &*flags.add(off) }.load(Ordering::Acquire),
+                "hnsw node id {id} is not initialized"
+            );
+        }
         // SAFETY: see method invariant. The bucket is allocated (id < len) and
         // never moves; the slot was written before publication.
         unsafe { &*base.add(off) }
@@ -1115,9 +1197,37 @@ pub(crate) struct HnswIndex {
     codes_only: bool,
     // Set only by the exclusive cold builder, until all scoped readers join.
     frozen_build_vectors: AtomicBool,
+    /// Dense (vector, norm) view of every node, valid only while
+    /// `frozen_build_vectors` is set; it removes the node-slab load from each
+    /// construction distance.
+    frozen_rows: FrozenRows,
     // Temporary cold-build graphs own the caller's admitted workspace. Keep
     // this last so all graph allocations are freed before releasing admission.
     build_reservation: Option<BuildReservation>,
+}
+
+/// One node's immutable cold-build payload: vector address, length and
+/// cached cosine norm.
+#[derive(Clone, Copy)]
+struct FrozenRow {
+    ptr: *const f32,
+    len: u32,
+    norm: f32,
+}
+
+#[derive(Default)]
+struct FrozenRows(Vec<FrozenRow>);
+
+// SAFETY: rows point into node vectors that `link_all_frozen` keeps alive and
+// unmodified (exclusive `&mut self`) for as long as readers may use them; the
+// view is consulted only while `frozen_build_vectors` is set.
+unsafe impl Send for FrozenRows {}
+unsafe impl Sync for FrozenRows {}
+
+impl std::fmt::Debug for FrozenRows {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FrozenRows({})", self.0.len())
+    }
 }
 
 struct BuildReservation {
@@ -1187,6 +1297,7 @@ impl HnswIndex {
             identity_lineage: AtomicU64::new(0),
             codes_only: false,
             frozen_build_vectors: AtomicBool::new(false),
+            frozen_rows: FrozenRows::default(),
             build_reservation: None,
         }
     }
@@ -2013,8 +2124,27 @@ impl HnswIndex {
         self.nodes.get(id)
     }
 
+    /// The dense cold-build row for `id`, while the build owns the vectors.
+    #[inline]
+    fn frozen_row(&self, id: u32) -> Option<FrozenRow> {
+        if !self.frozen_build_vectors.load(Ordering::Acquire) {
+            return None;
+        }
+        self.frozen_rows.0.get(id as usize).copied()
+    }
+
+    #[inline]
+    fn node_cosine_norm(&self, id: u32) -> f32 {
+        self.frozen_row(id)
+            .map_or_else(|| self.nodes.get(id).cosine_norm, |row| row.norm)
+    }
+
     #[inline]
     fn with_node_vector<T>(&self, id: u32, f: impl FnOnce(&[f32]) -> T) -> T {
+        if let Some(row) = self.frozen_row(id) {
+            // SAFETY: see `FrozenRows`; the row is immutable while frozen.
+            return f(unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) });
+        }
         let node = self.nodes.get(id);
         if self.frozen_build_vectors.load(Ordering::Acquire) {
             // SAFETY: only link_all_frozen can set this flag. Its exclusive
@@ -2025,6 +2155,45 @@ impl HnswIndex {
         } else {
             f(&node.vector.read())
         }
+    }
+
+    /// Timing hint for exact-f32 construction: start fetching the head of a
+    /// neighbour's vector before it is scored. Only frozen build vectors can
+    /// be borrowed without their lock; other states are left to demand loads.
+    #[inline]
+    fn prefetch_frozen_vector(&self, id: u32) {
+        let Some(row) = self.frozen_row(id) else {
+            return;
+        };
+        let bytes = (row.len as usize * std::mem::size_of::<f32>()).min(512);
+        let base = row.ptr.cast::<i8>();
+        for offset in (0..bytes).step_by(64) {
+            prefetch_read(base.wrapping_add(offset));
+        }
+    }
+
+    /// Exact cosine construction distances for one to four frozen rows at
+    /// once. A short group repeats its first row; each lane is reduced
+    /// independently, so padding never changes a real row's distance.
+    #[inline]
+    fn frozen_cosine_batch4(&self, probe: &Probe, group: &[u32]) -> Option<[f64; 4]> {
+        let query_norm = probe.cosine_norm?;
+        let id = |j: usize| group[if j < group.len() { j } else { 0 }];
+        let rows = [
+            self.frozen_row(id(0))?,
+            self.frozen_row(id(1))?,
+            self.frozen_row(id(2))?,
+            self.frozen_row(id(3))?,
+        ];
+        // SAFETY: see `FrozenRows`.
+        let slices =
+            rows.map(|row| unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) });
+        Some(super::distance::cosine_with_norms_batch4(
+            probe.query,
+            slices,
+            query_norm,
+            rows.map(|row| row.norm),
+        ))
     }
 
     #[inline]
@@ -2045,6 +2214,12 @@ impl HnswIndex {
                 // exact f32 fallback. Bit-identical to the widen-subtract SSD.
                 return arena.ssd_from_query(qcodes, qnorm, id) as f64 * (arena.dist_mul as f64);
             }
+        }
+        if let Some(query_norm) = probe.cosine_norm {
+            let node_norm = self.node_cosine_norm(id);
+            return self.with_node_vector(id, |v| {
+                super::distance::cosine_with_norms(probe.query, v, query_norm, node_norm)
+            });
         }
         self.with_node_vector(id, |v| ordering_distance(probe.query, v, self.metric))
     }
@@ -2297,13 +2472,19 @@ impl HnswIndex {
             for &nb in nbr_buf.iter() {
                 probe.prefetch(nb);
             }
-            for k in 0..nbr_buf.len() {
-                let nb = nbr_buf[k];
-                let d = self.probe_dist(probe, nb);
-                if d < cur_d {
-                    cur_d = d;
-                    cur = nb;
-                    changed = true;
+            for group in nbr_buf.chunks(4) {
+                let batch = if probe.quant.is_none() {
+                    self.frozen_cosine_batch4(probe, group)
+                } else {
+                    None
+                };
+                for (k, &nb) in group.iter().enumerate() {
+                    let d = batch.map_or_else(|| self.probe_dist(probe, nb), |b| b[k]);
+                    if d < cur_d {
+                        cur_d = d;
+                        cur = nb;
+                        changed = true;
+                    }
                 }
             }
             scratch.nbr_buf = nbr_buf;
@@ -2396,8 +2577,20 @@ impl HnswIndex {
             for &nb in &nbr_buf {
                 probe.prefetch(nb);
             }
+            if probe.quant.is_none() {
+                for &nb in &nbr_buf {
+                    self.prefetch_frozen_vector(nb);
+                }
+            }
             for group in nbr_buf.chunks(4) {
-                let distances: [f64; 4] = if BATCH && group.len() == 4 {
+                let frozen = if BATCH && probe.quant.is_none() {
+                    self.frozen_cosine_batch4(probe, group)
+                } else {
+                    None
+                };
+                let distances: [f64; 4] = if let Some(batch) = frozen {
+                    batch
+                } else if BATCH && group.len() == 4 {
                     if let Some((arena, qcodes, qnorm)) = probe.quant {
                         if group.iter().all(|&id| self.quant_covers(arena, id)) {
                             let dots = dot_i8_batch4_ptrs(
@@ -2474,8 +2667,10 @@ impl HnswIndex {
 
     /// Neighbour-selection heuristic (Algorithm 4): keep a candidate only if it
     /// is closer to the query than to any already-selected neighbour, which
-    /// spreads connections out and improves graph navigability. Rejected
-    /// redundant edges are not refilled merely to reach the degree bound.
+    /// spreads connections out and improves graph navigability. Remaining
+    /// slots are then refilled with the nearest rejected candidates ("keep
+    /// pruned connections"): in high dimensions the heuristic alone leaves
+    /// most of the degree bound unused, which costs recall at equal effort.
     /// Node-to-node distance for the build heuristic. Uses the SQ8 arena when it
     /// covers both nodes (contiguous int8 codes, 4× less traffic) and falls back
     /// to exact f32 otherwise. The arena scales its integer SSD back to ~real
@@ -2488,12 +2683,15 @@ impl HnswIndex {
                 return l2_ssd_i8(ar.codes_for(a), ar.codes_for(b)) as f64 * (ar.scale_sq as f64);
             }
         }
-        let left = self.nodes.get(a);
-        let right = self.nodes.get(b);
         self.with_node_vector(a, |va| {
             self.with_node_vector(b, |vb| {
                 if self.metric == Metric::Cosine {
-                    super::distance::cosine_with_norms(va, vb, left.cosine_norm, right.cosine_norm)
+                    super::distance::cosine_with_norms(
+                        va,
+                        vb,
+                        self.node_cosine_norm(a),
+                        self.node_cosine_norm(b),
+                    )
                 } else {
                     ordering_distance(va, vb, self.metric)
                 }
@@ -2504,7 +2702,24 @@ impl HnswIndex {
     /// Returns the selected candidates (id + distance-to-query), so callers that
     /// need the edge distance — the deferred build's drop-farthest, which stores
     /// it to avoid recomputation — get it without a second pass.
+    /// `keep_pruned` refills the degree bound; cold builds pass `true`.
+    /// Incremental DML passes `false`: full lists would make every later
+    /// reverse edge re-run the O(m²) heuristic instead of using slack.
     fn select_neighbors(
+        &self,
+        candidates: &[Scored],
+        m: usize,
+        arena: Option<&QuantArena>,
+        keep_pruned: bool,
+    ) -> Vec<Scored> {
+        let mut selected = self.select_neighbors_diverse(candidates, m, arena);
+        if keep_pruned {
+            super::hnsw_core::fill_pruned(&mut selected, candidates, m, |s| s.id);
+        }
+        selected
+    }
+
+    fn select_neighbors_diverse(
         &self,
         candidates: &[Scored],
         m: usize,
@@ -2549,6 +2764,7 @@ impl HnswIndex {
         existing: &[u32],
         m: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
     ) -> Vec<u32> {
         if existing.len() <= m {
             return existing.to_vec();
@@ -2561,7 +2777,7 @@ impl HnswIndex {
             })
             .collect();
         scored.sort_unstable();
-        self.select_neighbors(&scored, m, arena)
+        self.select_neighbors(&scored, m, arena, keep_pruned)
             .into_iter()
             .map(|s| s.id)
             .collect()
@@ -2584,8 +2800,9 @@ impl HnswIndex {
         m: usize,
         soft_cap: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
     ) {
-        self.wire_edge_with_snapshot_hook(id, nb, level, m, soft_cap, arena, || {});
+        self.wire_edge_with_snapshot_hook(id, nb, level, m, soft_cap, arena, keep_pruned, || {});
     }
 
     fn wire_edge_with_snapshot_hook(
@@ -2596,6 +2813,7 @@ impl HnswIndex {
         m: usize,
         soft_cap: usize,
         arena: Option<&QuantArena>,
+        keep_pruned: bool,
         after_snapshot: impl FnOnce(),
     ) {
         // id == nb would self-lock the same mutex twice. Defensive guard;
@@ -2655,7 +2873,7 @@ impl HnswIndex {
 
         let mut candidate_list = candidate_list;
         loop {
-            let pruned = self.prune_select(nb, &candidate_list, m, arena);
+            let pruned = self.prune_select(nb, &candidate_list, m, arena, keep_pruned);
             let mut nbrs = self.node_at(nb).neighbors.lock();
             let Some(layer) = nbrs.get_mut(level) else {
                 return;
@@ -2992,6 +3210,7 @@ impl HnswIndex {
                         .map(|(q, n)| (a.as_ref(), q.as_slice(), *n))
                 }
             }),
+            cosine_norm: (self.metric == Metric::Cosine).then_some(node.cosine_norm),
         };
 
         SCRATCH.with(|cell| {
@@ -3055,9 +3274,19 @@ impl HnswIndex {
                 // several reverse edges. `max` leaves the cold-build value
                 // unchanged (`2·m ≥ m + slack`).
                 let soft_cap = (m_layer * cap_mult).max(m_layer + incremental_soft_cap_slack());
-                // Insert M links; layer 0 reserves 2*M for later reverse links.
                 let select_arena = self.selection_arena(arena.as_deref());
-                let selected = self.select_neighbors(&ranked, self.m, select_arena);
+                // A cold build links up to m0 forward edges on layer 0, as its
+                // degree bound allows; selecting only m left the base layer at
+                // ~⅓ of that bound in high dimensions once diversity pruning
+                // ran. Incremental inserts (`cap_mult == 1`, no build aux) keep
+                // the m fanout: filling m0 on birth doubles DML maintenance.
+                let cold_build = cap_mult > 1 || aux.is_some();
+                let forward_m = if lc == 0 && cold_build {
+                    m_layer
+                } else {
+                    self.m
+                };
+                let selected = self.select_neighbors(&ranked, forward_m, select_arena, cold_build);
                 for s in &selected {
                     let nb = s.id;
                     if nb == id {
@@ -3075,7 +3304,7 @@ impl HnswIndex {
                         // Eager / soft-cap mode: reverse edge prunes by the
                         // diversity heuristic once the list exceeds `soft_cap`.
                         None => {
-                            self.wire_edge(id, nb, lc, m_layer, soft_cap, select_arena);
+                            self.wire_edge(id, nb, lc, m_layer, soft_cap, select_arena, cold_build);
                         }
                     }
                 }
@@ -3127,9 +3356,25 @@ impl HnswIndex {
                 self.0.store(false, Ordering::Release);
             }
         }
+        let rows = (0..self.nodes.len() as u32)
+            .map(|id| {
+                let node = self.nodes.get(id);
+                // SAFETY: `&mut self` excludes every vector writer.
+                let vector = unsafe { &*node.vector.data_ptr() };
+                FrozenRow {
+                    ptr: vector.as_ptr(),
+                    len: vector.len() as u32,
+                    norm: node.cosine_norm,
+                }
+            })
+            .collect();
+        self.frozen_rows = FrozenRows(rows);
         self.frozen_build_vectors.store(true, Ordering::Release);
-        let _reset = Reset(&self.frozen_build_vectors);
-        self.link_all(threads);
+        {
+            let _reset = Reset(&self.frozen_build_vectors);
+            self.link_all(threads);
+        }
+        self.frozen_rows = FrozenRows::default();
     }
 
     pub(crate) fn link_all(&self, threads: usize) {
@@ -3235,7 +3480,38 @@ impl HnswIndex {
                 "[hnsw] connectivity repair: {:?} (n={len})",
                 repair_started.elapsed()
             );
+            self.log_degree_histogram();
         }
+    }
+
+    /// Diagnostic: layer-0 / upper-layer degree statistics of the built graph.
+    fn log_degree_histogram(&self) {
+        let len = self.nodes.len();
+        let mut hist = vec![0usize; self.m0 + 2];
+        let (mut sum0, mut upper_nodes, mut upper_sum) = (0usize, 0usize, 0usize);
+        for id in 0..len as u32 {
+            let nbrs = self.nodes.get(id).neighbors.lock();
+            let d = nbrs.first().map_or(0, Vec::len);
+            sum0 += d;
+            hist[d.min(self.m0 + 1)] += 1;
+            for layer in nbrs.iter().skip(1) {
+                upper_nodes += 1;
+                upper_sum += layer.len();
+            }
+        }
+        let buckets: Vec<String> = hist
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| **c > 0)
+            .map(|(d, c)| format!("{d}:{c}"))
+            .collect();
+        eprintln!(
+            "[hnsw] degree: layer0_avg={:.2} upper_avg={:.2} upper_lists={} hist0=[{}]",
+            sum0 as f64 / len.max(1) as f64,
+            upper_sum as f64 / upper_nodes.max(1) as f64,
+            upper_nodes,
+            buckets.join(" ")
+        );
     }
 
     /// Repair only disconnected cold graphs. Ordinary connected graphs keep
@@ -3273,6 +3549,34 @@ impl HnswIndex {
             return;
         }
         let arena = self.quant.read().clone();
+        // Usually few components are detached: make room only on the anchors
+        // that receive a bridge edge, then verify reachability once more.
+        let mut anchor = entry;
+        for id in 0..count as u32 {
+            if !seen[id as usize] {
+                let mut neighbors = self.nodes.get(anchor).neighbors.lock();
+                if neighbors[0].len() >= self.m0 {
+                    neighbors[0] = self.prune_select(
+                        anchor,
+                        &neighbors[0],
+                        self.m0 - 1,
+                        self.selection_arena(arena.as_deref()),
+                        true,
+                    );
+                }
+                neighbors[0].push(id);
+                drop(neighbors);
+                visit(id, &mut seen, &mut stack);
+                anchor = id;
+            }
+        }
+        seen.fill(false);
+        visit(entry, &mut seen, &mut stack);
+        if seen.iter().all(|&v| v) {
+            return;
+        }
+        // A pruned anchor edge was some node's only path: fall back to
+        // reserving a spare slot everywhere before bridging again.
         // Each prune changes only its own adjacency and reads immutable
         // payloads. No cross-node adjacency latch is acquired here.
         parallel_claim_ids(0, count as u32, threads.max(1), |id| {
@@ -3282,6 +3586,7 @@ impl HnswIndex {
                 &neighbors[0],
                 self.m0 - 1,
                 self.selection_arena(arena.as_deref()),
+                true,
             );
         });
         seen.fill(false);
@@ -3331,7 +3636,7 @@ impl HnswIndex {
                         }
                     }
                     if cand.len() > m_layer {
-                        nbrs[lc] = self.prune_select(id, &cand, m_layer, ar);
+                        nbrs[lc] = self.prune_select(id, &cand, m_layer, ar, true);
                     } else {
                         nbrs[lc] = cand;
                     }
@@ -3368,7 +3673,7 @@ impl HnswIndex {
                 for lc in 0..nbrs.len() {
                     let m_layer = if lc == 0 { self.m0 } else { self.m };
                     if nbrs[lc].len() > m_layer {
-                        let pruned = self.prune_select(id, &nbrs[lc], m_layer, ar);
+                        let pruned = self.prune_select(id, &nbrs[lc], m_layer, ar, true);
                         nbrs[lc] = pruned;
                     }
                 }
@@ -3385,6 +3690,7 @@ impl HnswIndex {
     /// k-nearest-neighbour search. Returns up to `k` `(row_id, ordering_dist)`
     /// pairs ascending by distance, skipping tombstoned nodes. `ef_search` is
     /// the dynamic candidate-list size at layer 0 (clamped to ≥ k).
+    #[inline]
     pub(crate) fn advance_cursor(
         &self,
         cursor: &mut super::cursor::VectorSearchCursor,
@@ -3438,11 +3744,16 @@ impl HnswIndex {
                 cursor.work.distances += 1;
             }
         }
-        if effort >= self.nodes.len() {
-            let end = cursor
-                .scan_position
-                .saturating_add(1024)
-                .min(self.nodes.len());
+        let node_count = self.nodes.len();
+        if effort >= node_count {
+            // Claimed slots may still be under construction. A cursor cannot
+            // skip a hole and then prove exhaustion: request heap completion
+            // instead. New appends beyond this captured range belong to a
+            // later view, or invalidate this cursor through mutation_epoch.
+            if self.nodes.published_len() < node_count {
+                return Ok(false);
+            }
+            let end = cursor.scan_position.saturating_add(1024).min(node_count);
             for id in cursor.scan_position as u32..end as u32 {
                 if cursor.hnsw.visited.contains(&(id as u64)) {
                     continue;
@@ -3465,12 +3776,12 @@ impl HnswIndex {
                 crate::engine::cancel::check_cancelled()?;
             }
             cursor.scan_position = end;
-            if end < self.nodes.len() {
+            if end < node_count {
                 cursor.resume_work = true;
                 return Ok(epoch == self.mutation_epoch.load(Ordering::Acquire));
             }
             cursor.hnsw.frontier.clear();
-            cursor.hnsw.expanded = self.nodes.len();
+            cursor.hnsw.expanded = node_count;
             return Ok(epoch == self.mutation_epoch.load(Ordering::Acquire));
         }
         let mut neighbors = Vec::new();
@@ -3538,12 +3849,16 @@ impl HnswIndex {
             // scores the slab directly, covering such components and avoiding
             // graph/quantization work without changing bounded ANN searches.
             let mut out = Vec::with_capacity(node_count);
-            for id in 0..node_count as u32 {
-                let node = self.node_at(id);
-                if !node.deleted.load(Ordering::Acquire) {
-                    let distance =
-                        self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
-                    out.push((node.row_id, distance));
+            if self.nodes.published_len() < node_count {
+                self.score_initialized_nodes(query, node_count, &mut out);
+            } else {
+                for id in 0..node_count as u32 {
+                    let node = self.node_at(id);
+                    if !node.deleted.load(Ordering::Acquire) {
+                        let distance =
+                            self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                        out.push((node.row_id, distance));
+                    }
                 }
             }
             if out.len() > k {
@@ -3569,6 +3884,7 @@ impl HnswIndex {
                 (Some(a), Some((qc, qn))) => Some((a.as_ref(), qc.as_slice(), *qn)),
                 _ => None,
             },
+            cosine_norm: None,
         };
         let score_epoch = self.update_epoch.load(Ordering::Acquire);
         let used_quant = probe.quant.is_some();
@@ -3617,6 +3933,36 @@ impl HnswIndex {
         }
         out.sort_unstable_by(cmp);
         out
+    }
+
+    /// Score an incomplete publication range without adding another live loop
+    /// bound or per-node flag checks to the fully published fast path.
+    #[cold]
+    fn score_initialized_nodes(
+        &self,
+        query: &[f32],
+        node_count: usize,
+        out: &mut Vec<(RowId, f64)>,
+    ) {
+        let initialized = self.nodes.published_len().min(node_count);
+        for id in 0..initialized as u32 {
+            let node = self.node_at(id);
+            if !node.deleted.load(Ordering::Acquire) {
+                let distance =
+                    self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                out.push((node.row_id, distance));
+            }
+        }
+        for id in initialized as u32..node_count as u32 {
+            let Some(node) = self.nodes.get_initialized(id) else {
+                continue;
+            };
+            if !node.deleted.load(Ordering::Acquire) {
+                let distance =
+                    self.with_node_vector(id, |v| ordering_distance(query, v, self.metric));
+                out.push((node.row_id, distance));
+            }
+        }
     }
 
     // ---- serialization ----
@@ -3933,6 +4279,36 @@ use crc32fast::hash as crc32;
 #[allow(unused_must_use)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn compact_stats_merge_matches_serial_observation() {
+        let rows: Vec<Vec<f32>> = (0..997)
+            .map(|r| {
+                (0..24)
+                    .map(|i| ((r * 37 + i * 11) % 101) as f32 / 9.0 - 5.0)
+                    .collect()
+            })
+            .collect();
+        for metric in [Metric::Cosine, Metric::L2] {
+            let mut serial = CompactHnswStats::new(metric);
+            rows.iter().for_each(|row| serial.observe(row));
+            let mut merged = CompactHnswStats::new(metric);
+            for part in rows.chunks(130) {
+                let mut stats = CompactHnswStats::new(metric);
+                part.iter().for_each(|row| stats.observe(row));
+                merged.merge(stats);
+            }
+            merged.merge(CompactHnswStats::new(metric));
+            assert_eq!(merged.rows(), serial.rows());
+            assert_eq!((merged.vmin, merged.vmax), (serial.vmin, serial.vmax));
+            assert_eq!(merged.quantizable(), serial.quantizable());
+            for i in 0..24 {
+                assert!((merged.means[i] - serial.means[i]).abs() < 1e-9);
+                let scale = serial.deviations[i].abs().max(1.0);
+                assert!((merged.deviations[i] - serial.deviations[i]).abs() / scale < 1e-9);
+            }
+        }
+    }
     use std::collections::HashSet;
     use std::sync::Arc;
 
@@ -4126,10 +4502,10 @@ mod tests {
         for (i, x) in [0.0, 10.0, 20.0, 1.0].into_iter().enumerate() {
             index.append_node(rid(i as u32), vec![x]).unwrap();
         }
-        index.wire_edge(1, 0, 0, 1, 2, None);
-        index.wire_edge_with_snapshot_hook(2, 0, 0, 1, 1, None, || {
+        index.wire_edge(1, 0, 0, 1, 2, None, false);
+        index.wire_edge_with_snapshot_hook(2, 0, 0, 1, 1, None, false, || {
             // T2 lands after T1 snapshots [1, 2], and keeps the nearer id=3.
-            index.wire_edge(3, 0, 0, 1, 1, None);
+            index.wire_edge(3, 0, 0, 1, 1, None, false);
             assert_eq!(index.nodes.get(0).neighbors.lock()[0], vec![3]);
         });
         assert_eq!(index.nodes.get(0).neighbors.lock()[0], vec![3]);
@@ -4150,6 +4526,7 @@ mod tests {
         let probe = Probe {
             query: &query,
             quant: Some((&old, &codes, super::super::distance::ssq_i8(&codes))),
+            cosine_norm: None,
         };
         assert_eq!(index.probe_dist(&probe, 32), 0.0);
         for i in 0..8u32 {
@@ -4525,6 +4902,7 @@ mod tests {
                             } else {
                                 None
                             },
+                            cosine_norm: None,
                         };
                         for ef in [1, 17, 64, 100] {
                             let scalar = index.search_layer_impl::<false>(

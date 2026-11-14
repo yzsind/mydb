@@ -325,7 +325,7 @@ fn atomic_saturating_add(counter: &AtomicUsize, delta: usize) -> usize {
 }
 
 /// Snapshot of manager state, suitable for emitting through
-/// `SHOW ENGINE MYDB STATUS` and `information_schema.mydb_memory_advisor`.
+/// `SHOW ENGINE MYDB STATUS` and `information_schema.MYDB_MEMORY_ADVISOR`.
 #[derive(Clone, Debug, Default)]
 pub struct WorkAreaSnapshot {
     pub target_bytes: usize,

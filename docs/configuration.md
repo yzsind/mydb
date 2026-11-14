@@ -181,8 +181,8 @@ plan cache failures; it does not affect SQL semantics.
 
 Parsed-statement and shared SELECT plan caches also have independent byte
 admission ceilings: each is sized at 1% of the startup working-set target,
-clamped to 1–64 MiB. Byte pressure evicts cached entries; an entry larger than
-its cache ceiling executes normally without being retained. Byte estimates
+clamped to 1 MiB–4 GiB per cache. Byte pressure evicts cached entries; an entry
+larger than its cache ceiling executes normally without being retained. Byte estimates
 include AST payloads and compiled-plan structures, so entry-count caps cannot
 retain an unbounded number of large SQL statements.
 
@@ -383,7 +383,7 @@ This is a best-effort eviction policy, not an additional SQL error threshold. Ex
 `memory_reclaim_attempts` and `memory_reclaim_buffer_bytes` include this work.
 
 The default ceiling of the catalog descriptor cache is 2% when
-`MYDB_MEMORY_TARGET<=1GiB` and 5% for larger targets, never exceeding 256 MiB;
+`MYDB_MEMORY_TARGET<=1GiB` and 5% for larger targets, never exceeding 4 GiB;
 the startup environment variable `MYDB_CATALOG_CACHE_MB` can override the value,
 and at runtime it can be adjusted with `SET GLOBAL mydb_catalog_cache_mb=N`. At
 v46 startup only object headers and the ID→name index are resident; column,
@@ -437,6 +437,20 @@ construction graph is admitted; only compressed payloads survive publication. Th
   The small validation bitmap and bounded query memo are charged to the memory
   governor; clean mapped pages remain reclaimable by the OS. This does not pin
   the entire index in RAM or guarantee a warm filesystem cache after restart.
+  Finalized FLOAT32 mappings size their candidate memo by vector width and the
+  working-set target, with at most 4096 entries and a 64 MiB reservation cap.
+  Smaller targets and declined larger reservations retain the original small
+  memo when it can be admitted.
+  Memo hits reuse graph candidates; heap visibility and exact row scoring still
+  run for every statement. Graph mutations revoke the mapping and its memo.
+  Eligible cosine mappings can also admit a lazy exact FLOAT32 norm cache,
+  bounded by 1/256 of the working-set target and 64 MiB. It uses four bytes per
+  addressable node slot and is revoked with the mapping; admission failure keeps
+  the original distance path. Cached norms preserve the existing SIMD reduction.
+- `MYDB_HNSW_QUERY_MEMO` / `hnsw_query_memo` defaults to `ON`. Set it to `OFF`
+  to measure graph searches without candidate-memo hits or publication. Index
+  mappings, navigation payloads, exact row norms, and heap caching remain enabled.
+  This diagnostic switch does not change search effort or the rerank pool.
 - INSERT, UPDATE and DELETE revoke the mapping before changing index pages and
   drain in-flight mapped readers. Subsequent queries use the live WAL/buffer-pool
   path and see incremental maintenance immediately; no navigation rebuild is
@@ -685,7 +699,7 @@ engineering records (partition-ddl-completion-2026-09-18).
 production builds always use shadow COPY. Offline COPY also covers LOBs, vectors,
 and partitions; the Memory backend publishes private memory handles to avoid
 reopening empty indexes. Progress is visible in
-`information_schema.mydb_ddl_jobs`; cumulative scan/convert/index/replay/swap
+`information_schema.MYDB_DDL_JOBS`; cumulative scan/convert/index/replay/swap
 durations, source/shadow/spill bytes, direct heap build counts, and peak batch
 bytes are provided by the `ddl_copy_*` lines of `SHOW ENGINE MYDB STATUS`.
 
@@ -721,7 +735,7 @@ incremental log reuses the online DDL spill capability. The final tail uses the
 dirty rows, 4 MiB of row data, and 4096 entries / 1 MiB of index changes; it
 fails explicitly when it cannot converge. The `online_constraint_*` lines of
 `SHOW ENGINE MYDB STATUS` report scan, recomputation, and barrier durations;
-progress and cancellation use `information_schema.mydb_ddl_jobs` /
+progress and cancellation use `information_schema.MYDB_DDL_JOBS` /
 `CANCEL DDL JOB`. Design and verification background is archived in the
 project's internal engineering records (online-constraints-20260914).
 
@@ -825,7 +839,7 @@ is invalidated. Explicit ANALYZE still performs a full rebuild in bounded batche
 Progress updates by covered zone; queries read summary pages on demand and never
 rescan the whole table because of a cache miss. When cache admission fails or page
 contents cannot be verified, queries fall back conservatively. A per-table
-maintenance failure is recorded in `information_schema.mydb_zone_map_storage.last_error`,
+maintenance failure is recorded in `information_schema.MYDB_ZONE_MAP_STORAGE.LAST_ERROR`,
 retried after a default 30 seconds from the end of the failure, while other tables
 keep being maintained. A rebuild error is not cleared by later successful sidecar
 writes.
@@ -904,12 +918,12 @@ when off, the Zone Map diagnostics table is empty.
   round it waits 10 seconds. The batch sizes and scheduling interval are currently
   source constants and are not controlled by the quiet-window or failure-retry
   variables above.
-- `information_schema.mydb_zone_map_storage.MEMORY_FALLBACKS_GLOBAL` is a
+- `information_schema.MYDB_ZONE_MAP_STORAGE.MEMORY_FALLBACKS_GLOBAL` is a
   process-cumulative counter; the diagnostics row of every table shows the same
   global value and must not be summed per table. The remaining storage usage
   columns are still accounted per storage object.
-- `information_schema.mydb_zone_map_storage.state=PENDING` means the trusted sidecar
-  has Unknown zones awaiting maintenance. `mydb_zone_maps` outputs `Unknown` and NULL
+- `information_schema.MYDB_ZONE_MAP_STORAGE.STATE=PENDING` means the trusted sidecar
+  has Unknown zones awaiting maintenance. `MYDB_ZONE_MAPS` outputs `Unknown` and NULL
   bounds for columns not yet built and no longer misreports imported data as zero
   summaries; `READY` means the base is trusted but does not guarantee a prunable
   summary for every column.
@@ -1294,7 +1308,7 @@ metadata commits are also subject to disk latency. `MYDB_LOB_SHRINK_DISABLE` /
 `MYDB_LOB_SHRINK_MIN_FREE_PAGES` only control the extra shrink of free LOB tail
 pages after replay and do not disable OPTIMIZE's full physical rebuild.
 
-Progress/cancellation: `information_schema.mydb_ddl_jobs`,
+Progress/cancellation: `information_schema.MYDB_DDL_JOBS`,
 `CANCEL DDL JOB <job_id>`. In `SHOW ENGINE MYDB STATUS`,
 `ddl_copy_barrier_wait_us`, `ddl_copy_lock_hold_us`, `ddl_copy_lock_hold_max_us`,
 and `ddl_copy_final_tail_rows` are the shared online COPY cumulative metrics; the

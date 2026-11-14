@@ -238,7 +238,38 @@ pub(crate) fn context_integer_slot(
     Some(value)
 }
 
+/// The last top-level statement snapshot captured on this thread. A snapshot
+/// is immutable, so consecutive statements can share it while nothing it was
+/// derived from has changed: the same database, authorization generation and
+/// policy settings, and the same published auth and row-security catalogs.
+/// The catalogs are compared by identity; the cached snapshot keeps both
+/// alive, so a newer publication can never reuse their addresses. This turns
+/// two process-wide reference-count round trips and an allocation per
+/// statement into thread-local loads.
+fn cached_statement_snapshot(
+    db: &Database,
+    generation: u64,
+    policy: &crate::engine::auth::PolicySnapshot,
+) -> Option<Arc<AuthorizationSnapshot>> {
+    STATEMENT_SNAPSHOT.with(|slot| {
+        let slot = slot.borrow();
+        let snapshot = slot.as_ref()?;
+        let (owner, auth, captured_generation, policies) = snapshot.auth.get()?;
+        (*owner == db as *const Database as usize
+            && *captured_generation == generation
+            && snapshot.policy == *policy
+            && Arc::as_ptr(auth) == db.auth_catalog_ptr()
+            && Arc::as_ptr(policies) == db.row_security_catalog_ptr())
+        .then(|| Arc::clone(snapshot))
+    })
+}
+
+fn remember_statement_snapshot(snapshot: &Arc<AuthorizationSnapshot>) {
+    STATEMENT_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(Arc::clone(snapshot)));
+}
+
 thread_local! {
+    static STATEMENT_SNAPSHOT: std::cell::RefCell<Option<Arc<AuthorizationSnapshot>>> = const { std::cell::RefCell::new(None) };
     static EXECUTION: std::cell::RefCell<Option<RlsExecutionContext>> = const { std::cell::RefCell::new(None) };
     static TRUSTED_INTERNAL: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
@@ -272,13 +303,18 @@ impl EvaluationScope {
             let snapshot = loop {
                 let generation = crate::engine::auth::authorization_generation();
                 let policy = crate::engine::auth::PolicySnapshot::capture();
+                if let Some(snapshot) = cached_statement_snapshot(db, generation, &policy) {
+                    break snapshot;
+                }
                 let catalogs = capture_catalogs(db);
                 if generation != crate::engine::auth::authorization_generation() {
                     continue;
                 }
                 let auth = std::sync::OnceLock::new();
                 let _ = auth.set(catalogs);
-                break Arc::new(AuthorizationSnapshot { auth, policy });
+                let snapshot = Arc::new(AuthorizationSnapshot { auth, policy });
+                remember_statement_snapshot(&snapshot);
+                break snapshot;
             };
             let captured = EvaluationSnapshot {
                 authorization: snapshot,
