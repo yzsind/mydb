@@ -15810,6 +15810,12 @@ fn assert_strict_group_commit_and_recovery(preflushed: bool) {
         // A checkpoint or data-page writeback can make commit WAL durable
         // before its owner reaches the group-commit registration point.
         db.flush_dirty_data().unwrap();
+        // Writeback only covers page LSNs and may find pages already clean.
+        // Establish the terminal commit records' durability explicitly before
+        // asserting that their owners need no additional group-commit batch.
+        let last_lsn = db.log.lock().last_lsn();
+        LogManager::sync_durable_to(&db.log, last_lsn).unwrap();
+        assert!(db.log.lock().durable_lsn() >= last_lsn);
     }
     // Bootstrap, DDL and DML writeback may synchronize WAL independently.
     // Measure only the released concurrent commit phase.
@@ -28732,6 +28738,49 @@ fn compact_memory_seed_preserves_dictionary_rows_roots_and_private_mutations() {
                     )
                     .unwrap();
                     assert_eq!(serde_json::to_value(db.catalog()).unwrap(), catalog);
+                    if cached {
+                        let table = crate::storage::data_dictionary::dd_table_schema(
+                            crate::storage::data_dictionary::DD_CHECK_CONSTRAINTS,
+                        )
+                        .unwrap();
+                        let table_id = table.id;
+                        let index = table.indexes.iter().find(|index| index.primary).unwrap();
+                        assert!(!db
+                            .index_cache
+                            .read()
+                            .contains_key(&(table.id, normalize_name(&index.name))));
+                        let barrier = std::sync::Barrier::new(8);
+                        let handles = std::thread::scope(|scope| {
+                            let workers: Vec<_> = (0..8)
+                                .map(|worker| {
+                                    let db = &db;
+                                    let barrier = &barrier;
+                                    scope.spawn(move || {
+                                        barrier.wait();
+                                        let handle =
+                                            db.index_handle(table_id, &index.name).unwrap();
+                                        let key = IndexKey::from(vec![KeyPart::Int(worker)]);
+                                        let row = test_row_id(worker + 1, 8);
+                                        handle.write().insert(key.clone(), row, true).unwrap();
+                                        (handle, key, row)
+                                    })
+                                })
+                                .collect();
+                            workers
+                                .into_iter()
+                                .map(|worker| worker.join().unwrap())
+                                .collect::<Vec<_>>()
+                        });
+                        let handle = &handles[0].0;
+                        assert!(handles
+                            .iter()
+                            .all(|(other, _, _)| Arc::ptr_eq(handle, other)));
+                        assert_eq!(handle.read().entries().unwrap().len(), handles.len());
+                        for (_, key, row) in &handles {
+                            handle.write().delete(key.clone(), *row).unwrap();
+                        }
+                        handle.read().validate_structure().unwrap();
+                    }
                     for (id, rows) in &expected {
                         assert_eq!(&db.scan_dd_table(*id).unwrap(), rows);
                         let table = crate::storage::data_dictionary::dd_table_schema(*id).unwrap();

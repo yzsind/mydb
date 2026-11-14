@@ -3,6 +3,7 @@ use std::{
     fs,
     io::{self, Read},
     path::Path,
+    sync::OnceLock,
 };
 
 use rand::RngCore;
@@ -49,8 +50,14 @@ impl Control {
         bytes[20..24].copy_from_slice(&u32::from(self.initialized).to_le_bytes());
         // Reader/writer required-feature masks at 24..40 are initially zero.
         bytes[40..56].copy_from_slice(&self.uuid);
-        bytes[56..88]
-            .copy_from_slice(&Sha256::digest(versions::native_replication_compatibility()));
+        // The compatibility vector contains only compiled format versions.
+        // Reuse its digest while validating every control file's actual bytes.
+        static FORMAT_DIGEST: OnceLock<[u8; 32]> = OnceLock::new();
+        bytes[56..88].copy_from_slice(
+            FORMAT_DIGEST.get_or_init(|| {
+                Sha256::digest(versions::native_replication_compatibility()).into()
+            }),
+        );
         bytes[88..92].copy_from_slice(&versions::CATALOG_VERSION.to_le_bytes());
         let checksum = crc32fast::hash(&bytes[..124]);
         bytes[124..].copy_from_slice(&checksum.to_le_bytes());

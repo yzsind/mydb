@@ -241,7 +241,8 @@ impl Coordinator {
                         && (pending > 1 || self.recent_contention(allowance))
                         && coalescing_window_enabled()
                     {
-                        let nanos = (state.last_sync_ns.load(Ordering::Relaxed) / 16).min(250_000);
+                        let nanos =
+                            coalescing_window_ns(state.last_sync_ns.load(Ordering::Relaxed));
                         if nanos != 0 {
                             std::thread::sleep(Duration::from_nanos(nanos));
                         }
@@ -284,7 +285,16 @@ impl Coordinator {
                 std::hint::spin_loop();
                 spins += 1;
             } else {
-                std::thread::sleep(Duration::from_micros(50));
+                // Regression processes can wait through both a collection
+                // window and a device barrier. Avoid waking every process at
+                // the production latency polling rate throughout that wait.
+                #[cfg(test)]
+                let poll = Duration::from_nanos(
+                    (state.last_sync_ns.load(Ordering::Relaxed) / 8).clamp(50_000, 500_000),
+                );
+                #[cfg(not(test))]
+                let poll = Duration::from_micros(50);
+                std::thread::sleep(poll);
             }
         }
     }
@@ -313,6 +323,29 @@ impl Coordinator {
                 .as_nanos()
                 .saturating_sub(u128::from(last - 1))
                 <= allowance.as_nanos()
+    }
+}
+
+fn coalescing_window_ns(last_sync_ns: u64) -> u64 {
+    #[cfg(test)]
+    {
+        static DIVISOR: OnceLock<u64> = OnceLock::new();
+        let divisor = *DIVISOR.get_or_init(|| {
+            std::env::var("MYDB_TEST_DEVICE_SYNC_WINDOW_DIVISOR")
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .filter(|value| (1..=16).contains(value))
+                .unwrap_or(1)
+        });
+        // Isolated regression processes share one device and frequently
+        // publish the next batch just after its first ready ticket. Spend
+        // at most one barrier collecting peers, capped at four ms; every
+        // request still drains its own file and waits for a full barrier.
+        return (last_sync_ns / divisor).min(4_000_000 / divisor);
+    }
+    #[cfg(not(test))]
+    {
+        (last_sync_ns / 16).min(250_000)
     }
 }
 
