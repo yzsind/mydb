@@ -36,6 +36,15 @@ Two kinds of reads must be distinguished:
 
 `START TRANSACTION` by itself does not fix the RR snapshot; the first consistent read does. `START TRANSACTION WITH CONSISTENT SNAPSHOT` is effective only under RR; other isolation levels produce a warning. Both READ ONLY and READ WRITE RR transactions establish the snapshot on the first consistent read; WITH CONSISTENT SNAPSHOT pins it at transaction start. `READ ONLY` is only an access mode: RC read-only transactions still refresh the snapshot per statement, and all DML returns 1792.
 
+The absence of InnoDB-style gap/next-key locks in RR is an intentional concurrency
+design choice. Such locks can block concurrent inserts into scanned index ranges,
+increase lock contention, and introduce deadlock cycles involving range locks
+and inserts. mydb instead combines MVCC transaction snapshots for stable
+consistent reads with locks on actual heap rows and unique keys for writes and
+constraint enforcement. This design avoids gap-lock overhead and the deadlock
+patterns caused by those locks, favoring concurrency without locking index gaps.
+Row-lock and unique-key-lock conflicts can still cause waits and deadlocks.
+
 RR does not use row locks to prevent phantoms, nor does it automatically serialize the "read A, read B, then write different records" write-skew pattern. Workloads that depend on range invariants should use `SERIALIZABLE`, explicitly lock a summary row, or enforce the constraint as a UNIQUE/FK/CHECK constraint the database can atomically check.
 
 Under `SERIALIZABLE`, table S and the IX needed for writes merge into SIX; requesting S from IX in the reverse direction also merges into SIX. The upgrade must re-check the other holders — S must not be treated as implicitly including IX. When two transactions first read the same table and then write different rows, the upgrades wait or go through deadlock/timeout handling; neither can bypass the other's S. See [Current Explicit Boundaries](#current-explicit-boundaries) for table-lock granularity and the boundaries around system tables and temporary tables.
