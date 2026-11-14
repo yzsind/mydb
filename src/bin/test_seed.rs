@@ -76,7 +76,8 @@ where
     let _ = fs::remove_file(seed_dir.join("system/mydb.lock"));
 
     // Keep all heap allocation metadata and populated dictionary indexes.
-    // Empty indexes can be initialized in private memory before readers start.
+    // Empty indexes are initialized on first use in private memory. The
+    // ordinary index-handle cache serializes root creation and publication.
     let memory_seed_dir = seed_dir.parent().unwrap().join("memory-seed");
     copy_seed_tree(&seed_dir, &memory_seed_dir)?;
     if !empty_indexes.is_empty() {
@@ -176,7 +177,6 @@ pub(crate) fn compact_memory_seed(
     empty_indexes: &[(u64, Vec<PathBuf>)],
 ) -> io::Result<()> {
     let catalog = root.join("system/catalog");
-    let tables: Vec<_> = empty_indexes.iter().map(|(id, _)| *id).collect();
     for relative in empty_indexes.iter().flat_map(|(_, paths)| paths) {
         let path = root.join(relative);
         fs::remove_file(&path)?;
@@ -196,10 +196,7 @@ pub(crate) fn compact_memory_seed(
             }
         }
     }
-    fs::write(
-        root.join(".mydb-test-empty-dd.json"),
-        serde_json::to_vec(&tables)?,
-    )
+    Ok(())
 }
 
 fn query_error(error: mydb::types::QueryError) -> io::Error {

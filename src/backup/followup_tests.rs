@@ -1081,14 +1081,41 @@ fn release_audit_reconciles_more_than_1024_unacknowledged_ranges() {
     let f = Fixture::new();
     let sync = crate::platform::fs::FixtureSyncBatch::new(f.root.path()).unwrap();
     let state = f.coordinator.control.lock().unwrap().clone().unwrap();
-    for _ in 0..1030 {
-        f.source.execute("UPDATE t SET v=v+1 WHERE id=1").unwrap();
-    }
     let log = f.source.db_handle().wal_log();
-    let prefixes = log
-        .lock()
-        .pin_prefix_after(state.cursor, state.hint)
-        .unwrap();
+    let mut updates = 0;
+    let prefixes = loop {
+        for _ in 0..32 {
+            f.source.execute("UPDATE t SET v=v+1 WHERE id=1").unwrap();
+            updates += 1;
+        }
+        let prefixes = log
+            .lock()
+            .pin_prefix_after(state.cursor, state.hint)
+            .unwrap();
+        // One committed update can span multiple archive events, while a
+        // batched frame can span multiple LSNs. Size this fixture by actual
+        // frames so it crosses the event cap without creating unused ranges.
+        let mut events = 0;
+        for prefix in &prefixes {
+            crate::wal::visit_pinned_range(
+                prefix,
+                prefix.first_lsn.max(state.cursor + 1) - 1,
+                u64::MAX,
+                |_, _, _, _, _| {
+                    events += 1;
+                    Ok(())
+                },
+            )
+            .unwrap();
+        }
+        if events > 1024 {
+            break prefixes;
+        }
+        assert!(
+            updates <= 1024,
+            "committed updates did not produce enough archive events"
+        );
+    };
     let repo = super::repository::Repository::open(&f.repository, None).unwrap();
     let mut count = 0;
     let mut archived_head = state.cursor;

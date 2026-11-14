@@ -9,27 +9,60 @@ slow-timeout = "30s"
 # Bound persistence-heavy fixtures as a group so their fsync/page-cleaner
 # traffic cannot saturate the filesystem used by the short SQL fixtures.
 [test-groups.persistence]
-max-threads = 8
+max-threads = 24
+
+# Each image matrix already starts parallel HNSW build workers.
+[test-groups.parallel-vector-builds]
+max-threads = 2
 
 [profile.default]
-# SQL/spill fixtures also create many files and internally parallel workers.
-# Bound process fan-out to reduce filesystem/CPU contention on the ten-core
-# test host; internally-concurrent recovery/FK cases reserve extra slots.
-test-threads = 16
+# Short, process-isolated fixtures can fill slots while durable work waits.
+# Resource groups bound filesystem-heavy fixtures and internally parallel
+# HNSW matrices independently; timing-sensitive cases reserve all slots.
+test-threads = 96
 
 [[profile.default.scripts]]
 filter = "all()"
 setup = "mydb-test-seed"
 
+[[profile.default.overrides]]
+filter = 'test(quantized_hnsw_parallel_paged_image_survives_restart_and_dml)'
+test-group = 'parallel-vector-builds'
+
+[[profile.default.overrides]]
+filter = 'test(/engine::executor::tests::(vector_datatypes|vector_quantization)::/)'
+test-group = 'persistence'
+
+# Overlap the multilevel directory fixture with final archive cleanup.
+[[profile.default.overrides]]
+filter = 'test(zone_map_page_directory_streams_multilevel_and_selects_columns)'
+priority = -20
+
+# Large archive cleanup runs after concurrent fixture metadata traffic.
+[[profile.default.overrides]]
+filter = 'test(release_audit_reconciles_more_than_1024_unacknowledged_ranges)'
+priority = -10
+
+# The writer progress assertion needs an uncontended process slot.
+[[profile.default.overrides]]
+filter = 'test(persistent_wal_writer_drains_without_publishing_durability)'
+priority = 100
+threads-required = "num-test-threads"
+
+# Recovery matrices must overlap the remaining short fixtures.
+[[profile.default.overrides]]
+filter = 'test(spatial_index_crash_recovery_at_every_split_publication)'
+priority = 95
+
 # Start the known long-running stress/recovery cases first so they overlap the
 # thousands of short parser/executor tests instead of forming a serial tail.
 [[profile.default.overrides]]
 filter = 'test(/(clean_checkpoint_wal_collapse_recovers_on_reopen|btree_concurrent_reads_do_not_descend_into_freed_merge_pages|buffer_pool_dirty_oldest_heap_stays_bounded_under_reflush|parallel_redo_matches_serial_redo|oversized_build_falls_back_to_materialized|wide_dd_descriptors_survive_repeated_drop_recreate_purge_and_reopen|star_join_order_prefers_sparse_dimension_over_dense_date_domain)/)'
-priority = 100
+priority = 99
 
 [[profile.default.overrides]]
 filter = 'test(/(fk_reference_lock_avoids_payment_style_deadlock|concurrent_composite_pk_insert_batches_commit_and_recover_consistently|wal_redo_recovers_(committed_index_batch|index_meta_page)_without_page_fallback|concurrent_batch_inserts_allocate_distinct_auto_increment_ranges)/)'
-priority = 100
+priority = 99
 threads-required = 5
 
 # Overlap expensive semantic/stress fixtures with the short parser cases;
@@ -54,12 +87,6 @@ priority = 80
 [[profile.default.overrides]]
 filter = 'test(/engine::executor::tests::function_compat::/)'
 threads-required = 2
-
-# This large repository's cleanup contends with short fixtures' metadata
-# operations. Queue it after the main workload without reserving extra slots.
-[[profile.default.overrides]]
-filter = 'test(release_audit_reconciles_more_than_1024_unacknowledged_ranges)'
-priority = -10
 
 [[profile.default.overrides]]
 filter = 'test(/(^(storage|backup|repl)::|engine::executor::(load_data::tests|tests::(online_ddl|optimize_online|ddl_hardening|partitioning|vector_type|metadata_audit|xa))::)/)'

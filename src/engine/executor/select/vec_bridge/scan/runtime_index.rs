@@ -693,7 +693,13 @@ mod integration_tests {
     fn runtime_index_candidates_preserve_rows_and_bound_stale_statistics() {
         use crate::engine::executor::select::bloom::ExactIntKeySetBuilder;
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        // This fixture advances the repair history horizon explicitly below.
+        // A background purge must not retire it before the pending-state check.
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            crate::storage::StorageConfig::from_env(),
+        )
+        .unwrap();
         engine
             .execute("CREATE TABLE runtime_rids (k BIGINT, v INT, INDEX by_k(k))")
             .unwrap();
