@@ -451,11 +451,17 @@ for mydb-specific behavior, see [Window Functions](function/aggregate-window/REA
 | SERIALIZABLE | ◑: uses table-level shared locks to restrict concurrent writes; granularity differs from InnoDB range locks |
 
 > **Important design decision**: mydb's RR consistent reads use snapshot
-> isolation. Repeated consistent reads within a fixed snapshot do not see rows
+> isolation. Omitting InnoDB-style gap/next-key locks is intentional: range locks
+> can block concurrent inserts, increase contention, and introduce deadlock
+> patterns involving range locks and inserts. mydb favors MVCC snapshots plus
+> heap-row and unique-key locks to avoid that overhead and improve concurrency;
+> other lock conflicts can still cause deadlocks. Repeated consistent reads
+> within a fixed snapshot do not see rows
 > inserted later, but locking reads/writes do not establish InnoDB
 > gap/next-key/predicate locks, so RR range locking cannot be relied upon to
 > stop other transactions from inserting. For "no-insert-in-range" semantics,
-> use SERIALIZABLE (table-level S locks). This is an engine design difference.
+> use SERIALIZABLE (table-level S locks). See [MVCC and locking](mvcc-and-locking.md#snapshot-lifecycle-and-isolation-levels)
+> for the design and semantic boundaries.
 > MySQL's default isolation level is RR; for its exact locking semantics see
 > [InnoDB Transaction Isolation Levels](https://dev.mysql.com/doc/refman/8.0/en/innodb-transaction-isolation-levels.html).
 

@@ -83,6 +83,7 @@ jobs:
     name: Test (shard ${{ matrix.shard }}/3)
     needs: test-build
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -100,7 +101,13 @@ jobs:
           python3 scripts/run_ci_tests.py
           --archive /tmp/mydb/test-archive/tests.tar.zst
           --output /tmp/mydb/test-run
-          -- --no-fail-fast --partition hash:${{ matrix.shard }}/3
+          -- --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/3
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.shard }}
+          path: /tmp/mydb/test-results
+          retention-days: 7
 
   # Retain the aggregate status check, including when a build/shard fails.
   test:
@@ -196,6 +203,7 @@ jobs:
     name: MySQL MTR semantic non-regression
     needs: test-build
     runs-on: ubuntu-24.04
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: taiki-e/install-action@v2
@@ -221,7 +229,7 @@ jobs:
           python3 scripts/run_ci_tests.py
           --archive /tmp/mydb/test-archive/tests.tar.zst
           --output /tmp/mydb/mtr-run
-          -- --run-ignored only --no-capture mtr_triage
+          -- --profile ci --run-ignored only --no-capture mtr_triage
       - if: always()
         uses: actions/upload-artifact@v4
         with:

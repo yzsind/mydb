@@ -3818,9 +3818,8 @@ fn explain_analyze_runtime_filter_is_independent_of_local_predicate_kernel() {
     engine.execute("ANALYZE TABLE build_side").unwrap();
     engine.execute("ANALYZE TABLE probe_side").unwrap();
 
-    // String IN is intentionally outside the old CompiledPredicate subset
-    // (its table-aware collation rule keeps that evaluator conservative).
-    // The common batch expression kernel evaluates it, while the unopened
+    // A computed string operand remains outside the borrowed scan kernels.
+    // The common batch expression oracle evaluates it, while the unopened
     // storage source must still accept the exact join membership filter and
     // materialize only the 320 matching probe rows.
     let QueryResponse::ResultSet(rs) = engine
@@ -3829,7 +3828,7 @@ fn explain_analyze_runtime_filter_is_independent_of_local_predicate_kernel() {
              SELECT /*+ HASH_JOIN(build_side,probe_side) */ build_side.v \
              FROM build_side JOIN probe_side \
                ON build_side.id = probe_side.build_id \
-             WHERE probe_side.label IN ('keep', 'other')",
+             WHERE CONCAT(probe_side.label,'') IN ('keep', 'other')",
         )
         .unwrap()
     else {
@@ -3852,7 +3851,6 @@ fn explain_analyze_runtime_filter_is_independent_of_local_predicate_kernel() {
     );
     assert!(
         probe_scan.contains("execution_mode=vector")
-            && probe_scan.contains("scalar_rows=320")
             && probe_scan.contains("fallback_expression_rows=320"),
         "an unsupported local expression must use the scalar oracle inside the same filtered batch pipeline without rescanning input: {text}"
     );

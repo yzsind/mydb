@@ -9,17 +9,16 @@ slow-timeout = "30s"
 # Bound persistence-heavy fixtures as a group so their fsync/page-cleaner
 # traffic cannot saturate the filesystem used by the short SQL fixtures.
 [test-groups.persistence]
-max-threads = 24
+max-threads = 8
 
 # Each image matrix already starts parallel HNSW build workers.
 [test-groups.parallel-vector-builds]
 max-threads = 2
 
 [profile.default]
-# Short, process-isolated fixtures can fill slots while durable work waits.
-# Resource groups bound filesystem-heavy fixtures and internally parallel
-# HNSW matrices independently; timing-sensitive cases reserve all slots.
-test-threads = 96
+# Bound process fan-out and filesystem contention; internally parallel and
+# timing-sensitive fixtures also retain their resource reservations.
+test-threads = 16
 
 [[profile.default.scripts]]
 filter = "all()"
@@ -101,3 +100,12 @@ priority = 10
 [[profile.default.overrides]]
 filter = 'test(b14_vec_like_kernel_beats_row_oracle_release)'
 threads-required = "num-test-threads"
+
+# Inherit the bounded default concurrency, setup, resource groups, priorities
+# and exclusive timing tests. Stop stalled CI tests and retain their results.
+[profile.ci]
+slow-timeout = { period = "60s", terminate-after = 10 }
+global-timeout = "25m"
+
+[profile.ci.junit]
+path = "/tmp/mydb/test-results/junit.xml"

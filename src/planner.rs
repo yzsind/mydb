@@ -18711,6 +18711,64 @@ fn keyset_join_estimates_one_match(
     projects_unique_key && mentions_table && filter_covered
 }
 
+/// A membership-filtered row still has a match when joined to the same
+/// filtered source, even if sampled statistics cannot establish uniqueness.
+/// This is a cardinality floor only: repeated source keys may still multiply
+/// rows, and no predicate or join is removed on the strength of this signal.
+fn keyset_join_preserves_prefiltered_rows(
+    prefiltered_plan: &PhysicalPlan,
+    source_plan: &PhysicalPlan,
+    prefiltered_key: &Expr,
+    source_key: &Expr,
+) -> bool {
+    fn matches_source(subquery: &Select, plan: &PhysicalPlan, key: &Expr) -> bool {
+        match plan {
+            PhysicalPlan::SeqScan { table, filter, .. }
+            | PhysicalPlan::ZoneMapScan { table, filter, .. }
+            | PhysicalPlan::ParallelSeqScan { table, filter, .. }
+            | PhysicalPlan::ParallelZoneMapScan { table, filter, .. } => {
+                let Some(column) = expr_column_name(key) else {
+                    return false;
+                };
+                table.schema.column_index(column).is_ok()
+                    && expr_matches_table_column(key, table, column)
+                    && matches!(
+                        subquery.projection.as_slice(),
+                        [SelectItem::Expr { expr, .. }]
+                            if expr_matches_table_column(expr, table, column)
+                    )
+                    && subquery_mentions_table(subquery, table)
+                    && filter.as_ref().is_none_or(|filter| {
+                        expr_is_deterministic(filter)
+                            && keyset_subquery_covers_filter(subquery, filter)
+                    })
+            }
+            PhysicalPlan::Filter {
+                input, predicate, ..
+            }
+            | PhysicalPlan::Apply {
+                outer: input,
+                predicate,
+                ..
+            } => {
+                expr_is_deterministic(predicate)
+                    && keyset_subquery_covers_filter(subquery, predicate)
+                    && matches_source(subquery, input, key)
+            }
+            PhysicalPlan::Sort { input, .. }
+            | PhysicalPlan::IncrementalSort { input, .. }
+            | PhysicalPlan::Materialize { input, .. }
+            | PhysicalPlan::Exchange { input, .. } => matches_source(subquery, input, key),
+            // A source LIMIT, aggregate, extra join, or bounded index access
+            // can remove keys independently of the matched scan predicate.
+            _ => false,
+        }
+    }
+
+    keyset_subquery_for_plan_key(prefiltered_plan, prefiltered_key)
+        .is_some_and(|subquery| matches_source(subquery, source_plan, source_key))
+}
+
 fn keyset_subquery_for_plan_key<'a>(plan: &'a PhysicalPlan, key: &Expr) -> Option<&'a Select> {
     fn in_filter<'a>(filter: &'a Expr, table: &PlanTable, key: &Expr) -> Option<&'a Select> {
         match filter {
@@ -18791,11 +18849,60 @@ fn keyset_subquery_for_plan_key<'a>(plan: &'a PhysicalPlan, key: &Expr) -> Optio
             filter: Some(filter),
             ..
         } => in_filter(filter, table, key),
-        PhysicalPlan::HashJoin { left, right, .. }
-        | PhysicalPlan::NestedLoopJoin { left, right, .. }
-        | PhysicalPlan::AdaptiveJoin { left, right, .. } => keyset_subquery_for_plan_key(left, key)
-            .or_else(|| keyset_subquery_for_plan_key(right, key)),
-        PhysicalPlan::IndexNestedLoopJoin { left, .. } => keyset_subquery_for_plan_key(left, key),
+        PhysicalPlan::HashJoin {
+            left,
+            right,
+            join_type,
+            ..
+        }
+        | PhysicalPlan::NestedLoopJoin {
+            left,
+            right,
+            join_type,
+            ..
+        }
+        | PhysicalPlan::AdaptiveJoin {
+            left,
+            right,
+            join_type,
+            ..
+        } => match join_type {
+            JoinType::Inner | JoinType::Cross => keyset_subquery_for_plan_key(left, key)
+                .or_else(|| keyset_subquery_for_plan_key(right, key)),
+            JoinType::Left | JoinType::Semi | JoinType::Anti => {
+                keyset_subquery_for_plan_key(left, key)
+            }
+            JoinType::Right => keyset_subquery_for_plan_key(right, key),
+            JoinType::Full => None,
+        },
+        PhysicalPlan::IndexNestedLoopJoin {
+            left,
+            join_type: JoinType::Inner | JoinType::Left | JoinType::Semi | JoinType::Anti,
+            ..
+        } => keyset_subquery_for_plan_key(left, key),
+        PhysicalPlan::Filter {
+            input, predicate, ..
+        }
+        | PhysicalPlan::Apply {
+            outer: input,
+            predicate,
+            ..
+        } => {
+            let column = expr_column_name(key)?;
+            let tables = collect_physical_plan_tables(input);
+            let mut sources = tables.iter().filter(|table| {
+                table.schema.column_index(column).is_ok()
+                    && expr_matches_table_column(key, table, column)
+            });
+            let direct = sources.next().and_then(|table| {
+                sources
+                    .next()
+                    .is_none()
+                    .then(|| in_filter(predicate, table, key))
+                    .flatten()
+            });
+            direct.or_else(|| keyset_subquery_for_plan_key(input, key))
+        }
         PhysicalPlan::HashAggregate { input, .. }
         | PhysicalPlan::HashRollupAggregate { input, .. }
         | PhysicalPlan::HashGroupingSetsAggregate { input, .. }
@@ -18809,8 +18916,6 @@ fn keyset_subquery_for_plan_key<'a>(plan: &'a PhysicalPlan, key: &Expr) -> Optio
         | PhysicalPlan::ParallelTopK { input, .. }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Projection { input, .. }
-        | PhysicalPlan::Filter { input, .. }
-        | PhysicalPlan::Apply { outer: input, .. }
         | PhysicalPlan::Materialize { input, .. }
         | PhysicalPlan::WindowAgg { input, .. }
         | PhysicalPlan::StreamingDistinct { input, .. }
@@ -18916,13 +19021,20 @@ fn subquery_mentions_table(subquery: &Select, table: &PlanTable) -> bool {
         .iter()
         .chain(subquery.joins.iter().map(|join| &join.table))
         .any(|table_ref| {
-            matches_table(
-                table_ref.alias.as_deref().unwrap_or_else(|| {
-                    table_ref.name.rsplit('.').next().unwrap_or(&table_ref.name)
-                }),
-                &table.schema.name,
-                table.alias.as_deref(),
-            )
+            let same_relation = table_ref.name.eq_ignore_ascii_case(&table.schema.name)
+                || table_ref.name.eq_ignore_ascii_case(&format!(
+                    "{}.{}",
+                    table.schema.database, table.schema.name
+                ));
+            same_relation
+                && table_ref.system_time.is_none()
+                && matches_table(
+                    table_ref.alias.as_deref().unwrap_or_else(|| {
+                        table_ref.name.rsplit('.').next().unwrap_or(&table_ref.name)
+                    }),
+                    &table.schema.name,
+                    table.alias.as_deref(),
+                )
         })
 }
 

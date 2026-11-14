@@ -3043,6 +3043,177 @@ fn equijoin_shared_keyset_uses_unindexed_unique_statistics() {
 }
 
 #[test]
+fn applied_membership_preserves_join_cardinality_without_unique_statistics() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE member_domain(k INT,label VARCHAR(8),text_key VARCHAR(8),decimal_key DECIMAL(10,2),date_key DATE)",
+        "CREATE TABLE member_events(fk INT,text_fk VARCHAR(8),decimal_fk DECIMAL(10,2),date_fk DATE)",
+        "INSERT INTO member_domain VALUES(1,'a','v1',1.25,'2024-01-01'),(1,'a','v1',1.25,'2024-01-01'),(2,'b','v2',2.25,'2024-01-02'),(3,'c','v3',3.25,'2024-01-03'),(4,'d','v4',4.25,'2024-01-04'),(5,'e','v5',5.25,'2024-01-05'),(NULL,'z',NULL,NULL,NULL)",
+        "INSERT INTO member_events SELECT k,text_key,decimal_key,date_key FROM member_domain",
+        "ANALYZE TABLE member_domain,member_events",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let db = engine.db_for_tests();
+    for (foreign_key, domain_key) in [
+        ("fk", "k"),
+        ("text_fk", "text_key"),
+        ("decimal_fk", "decimal_key"),
+        ("date_fk", "date_key"),
+    ] {
+        let mut schema = db.table("member_domain").unwrap();
+        let stats = Arc::make_mut(&mut schema)
+            .stats
+            .columns
+            .get_mut(domain_key)
+            .unwrap();
+        stats.frequency.source = crate::storage::FrequencySource::Sample;
+        stats.frequency.complete = false;
+        let source_table = PlanTable::new(schema.id, schema, Some("d".into()));
+        assert!(!keyset_source_key_is_estimated_unique(
+            &source_table,
+            domain_key
+        ));
+        let scan = |table: PlanTable, filter, rows| PhysicalPlan::SeqScan {
+            table,
+            filter,
+            estimated_rows: rows,
+            access_rows: rows,
+            cost: crate::engine::cbo::Cost::ZERO,
+            possible_keys: Vec::new(),
+            runtime_filters: Vec::new(),
+            hint_note: None,
+            projected_columns: None,
+        };
+        let event_schema = db.table("member_events").unwrap();
+        let input = scan(
+            PlanTable::new(event_schema.id, event_schema, Some("e".into())),
+            None,
+            25.0,
+        );
+        let source = scan(
+            source_table.clone(),
+            Some(parsed_filter(
+                "SELECT * FROM member_domain d WHERE d.label='a'",
+            )),
+            2.0,
+        );
+        let predicate = parsed_filter(&format!(
+            "SELECT * FROM member_events e WHERE e.{foreign_key} IN \
+             (SELECT d.{domain_key} FROM member_domain d WHERE d.label='a')"
+        ));
+        let input = PhysicalPlan::Apply {
+            outer: Box::new(input),
+            predicate,
+            estimated_rows: 5.0,
+            cost: crate::engine::cbo::Cost::ZERO,
+        };
+        let event_key = Expr::CompoundIdentifier(vec!["e".into(), foreign_key.into()]);
+        let source_key = Expr::CompoundIdentifier(vec!["d".into(), domain_key.into()]);
+        for (left, right, left_key, right_key) in [
+            (&input, &source, &event_key, &source_key),
+            (&source, &input, &source_key, &event_key),
+        ] {
+            let rows = estimate_equijoin_rows(
+                left,
+                right,
+                std::slice::from_ref(left_key),
+                std::slice::from_ref(right_key),
+                estimated_rows(left),
+                estimated_rows(right),
+            );
+            assert!(
+                rows >= 5.0,
+                "membership already established this domain for {domain_key}: {rows}"
+            );
+        }
+        let different_source = scan(
+            source_table.clone(),
+            Some(parsed_filter(
+                "SELECT * FROM member_domain d WHERE d.label='b'",
+            )),
+            1.0,
+        );
+        let estimate = |right: &PhysicalPlan, right_rows| {
+            estimate_equijoin_rows(
+                &input,
+                right,
+                std::slice::from_ref(&event_key),
+                std::slice::from_ref(&source_key),
+                5.0,
+                right_rows,
+            )
+        };
+        assert!(estimate(&different_source, 1.0) < 5.0);
+        assert!(
+            estimate(&source, 10.0) > 5.0,
+            "duplicate-key fanout remains costed"
+        );
+        assert_eq!(estimate(&source, 0.0), 0.0);
+
+        let mut other_table = source_table;
+        Arc::make_mut(&mut other_table.schema).name = "different_domain".into();
+        let same_alias_other_relation = scan(
+            other_table,
+            Some(parsed_filter(
+                "SELECT * FROM different_domain d WHERE d.label='a'",
+            )),
+            1.0,
+        );
+        assert!(estimate(&same_alias_other_relation, 1.0) < 5.0);
+        for condition in [
+            format!("e.{foreign_key} NOT IN (SELECT d.{domain_key} FROM member_domain d WHERE d.label='a')"),
+            format!("e.{foreign_key} IN (SELECT d.{domain_key} FROM member_domain d WHERE d.label='a') OR e.{foreign_key} IS NULL"),
+        ] {
+            let mut alternative = input.clone();
+            let PhysicalPlan::Apply { predicate, .. } = &mut alternative else {
+                unreachable!()
+            };
+            *predicate = parsed_filter(&format!("SELECT * FROM member_events e WHERE {condition}"));
+            assert!(!keyset_join_preserves_prefiltered_rows(
+                &alternative,
+                &source,
+                &event_key,
+                &source_key,
+            ));
+        }
+        for join_type in [JoinType::Inner, JoinType::Left, JoinType::Full] {
+            let joined = PhysicalPlan::HashJoin {
+                left: Box::new(source.clone()),
+                right: Box::new(input.clone()),
+                join_type,
+                left_keys: vec![source_key.clone()],
+                right_keys: vec![event_key.clone()],
+                null_safe: vec![false],
+                build_side: BuildSide::Right,
+                residual: None,
+                output_projection: None,
+                estimated_rows: 5.0,
+                cost: crate::engine::cbo::Cost::ZERO,
+            };
+            assert_eq!(
+                keyset_subquery_for_plan_key(&joined, &event_key).is_some(),
+                join_type == JoinType::Inner,
+                "a NULL-extended side must not establish membership"
+            );
+        }
+        let QueryResponse::ResultSet(result) = engine
+            .execute(&format!(
+                "SELECT COUNT(*) FROM member_events e JOIN member_domain d \
+                 ON e.{foreign_key}=d.{domain_key} WHERE d.label='a'"
+            ))
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("expected a count")
+        };
+        assert_eq!(result.rows[0][0].to_display_string(), "4");
+    }
+}
+
+#[test]
 fn sip_keyset_prefilter_makes_matching_unique_join_lossless() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -5858,6 +6029,76 @@ fn uncertain_multicolumn_domains_keep_marginal_bounds_and_contradictions() {
 }
 
 #[test]
+fn runtime_filter_prices_key_domain_before_deferred_membership() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE filter_events(k BIGINT,v INT)",
+        "CREATE TABLE filter_domain(k BIGINT,flag INT)",
+        "INSERT INTO filter_events SELECT n,1 FROM generate_series(1,1000) g(n)",
+        "INSERT INTO filter_domain SELECT n,IF(MOD(n,10)=0,1,0) FROM generate_series(1,1000) g(n)",
+        "ANALYZE TABLE filter_events,filter_domain",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let db = engine.db_for_tests();
+    let scan = |name: &str, filter, rows| {
+        let schema = db.table(name).unwrap();
+        PhysicalPlan::SeqScan {
+            table: PlanTable::new(schema.id, schema, None),
+            filter: Some(filter),
+            estimated_rows: rows,
+            access_rows: 1000.0,
+            cost: crate::engine::cbo::Cost::scalar(1000.0),
+            possible_keys: Vec::new(),
+            runtime_filters: Vec::new(),
+            hint_note: None,
+            projected_columns: None,
+        }
+    };
+    let mut probe = scan(
+        "filter_events",
+        parsed_filter("SELECT 1 WHERE k IN (SELECT k FROM filter_domain WHERE flag=1)"),
+        100.0,
+    );
+    let build = scan(
+        "filter_domain",
+        parsed_filter("SELECT 1 WHERE flag=1"),
+        100.0,
+    );
+    let key = Expr::Identifier("k".into());
+    let output =
+        estimate_equijoin_rows(&probe, &build, &[key.clone()], &[key.clone()], 100.0, 100.0);
+    assert_eq!(
+        output, 100.0,
+        "the explicit join is logically lossless after IN"
+    );
+    let rate = runtime_filter_pre_apply_match_rate(&probe, &build, &key, &key).unwrap();
+    assert!(
+        (rate - 0.1).abs() < 1e-9,
+        "pre-Apply domain coverage: {rate}"
+    );
+    let (work, latency) = runtime_filter_apply_qualification_cpu(&probe, &key).unwrap();
+    assert_eq!(work, latency, "Apply remains a serial batch consumer");
+    let PhysicalPlan::SeqScan { filter, .. } = &mut probe else {
+        unreachable!()
+    };
+    *filter = Some(parsed_filter(
+        "SELECT 1 WHERE k<=10 AND k IN (SELECT k FROM filter_domain WHERE flag=1)",
+    ));
+    assert_eq!(
+        runtime_filter_pre_apply_match_rate(&probe, &build, &key, &key),
+        Some(1.0),
+        "retain ordinary scan-local key restrictions instead of the full base domain"
+    );
+    let PhysicalPlan::SeqScan { table, .. } = &mut probe else {
+        unreachable!()
+    };
+    Arc::make_mut(&mut table.schema).stats.columns.remove("k");
+    assert!(runtime_filter_pre_apply_match_rate(&probe, &build, &key, &key).is_none());
+}
+
+#[test]
 fn runtime_hash_filter_cost_credits_only_deferred_apply_cpu() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
@@ -5898,7 +6139,8 @@ fn runtime_hash_filter_cost_credits_only_deferred_apply_cpu() {
     };
     assert_eq!(
         runtime_filter_apply_qualification_cpu(&parallel, &key),
-        Some((work, work / 4.0))
+        Some((work, work)),
+        "Exchange parallelizes the scan, not the deferred Apply consumer"
     );
     let PhysicalPlan::SeqScan { filter, .. } = &mut plan else {
         unreachable!()

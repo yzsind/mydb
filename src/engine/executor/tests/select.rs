@@ -23893,3 +23893,108 @@ fn distinct_set_boundary_omits_only_redundant_same_domain_deduplication() {
         "a binary outer domain must retain the inner case-insensitive DISTINCT"
     );
 }
+
+#[test]
+fn broad_parameterized_text_filters_keep_borrowed_decode_and_rebind() {
+    use crate::engine::params::with_params;
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for collation in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_0900_as_cs"] {
+        for text_type in ["VARCHAR(16)", "CHAR(16)"] {
+            engine
+                .execute("DROP TABLE IF EXISTS borrowed_text")
+                .unwrap();
+            engine.execute(&format!(
+                "CREATE TABLE borrowed_text(id INT, country {text_type} COLLATE {collation},                  region {text_type} COLLATE {collation}, payload VARCHAR(80))"
+            )).unwrap();
+            engine.execute(
+                "INSERT INTO borrowed_text SELECT n,IF(MOD(n,5)=0,NULL,'Zone'),                  CASE MOD(n,5) WHEN 0 THEN NULL WHEN 1 THEN 'Alpha' WHEN 2 THEN 'ÀLPHA'                  WHEN 3 THEN 'beta ' ELSE 'Gamma' END,CONCAT('payload-',n)                  FROM generate_series(1,1000) g(n)"
+            ).unwrap();
+            engine.execute("ANALYZE TABLE borrowed_text").unwrap();
+            let query = "SELECT /*+ FULL_SCAN(borrowed_text) PARALLEL(4) */ id,payload                  FROM borrowed_text WHERE (country=? AND region IN (?,?,?))                  OR (country=? AND region IN (?,?,?)) ORDER BY id";
+            let mut session = SessionContext::default();
+            let prepared = engine.prepare_cached(&mut session, query, 8).unwrap();
+            // Check kernel routing separately from parallel worker-stat attribution.
+            let analyze_query = format!(
+                "EXPLAIN ANALYZE {}",
+                query.replace("PARALLEL(4)", "PARALLEL(1)")
+            );
+            let analyze_prepared = engine
+                .prepare_cached(&mut session, &analyze_query, 8)
+                .unwrap();
+            for values in [
+                [
+                    Some("Zone"),
+                    Some("alpha"),
+                    Some("beta"),
+                    None,
+                    Some("Zone"),
+                    Some("Gamma"),
+                    Some("other"),
+                    None,
+                ],
+                [
+                    Some("Zone"),
+                    Some("Gamma"),
+                    Some("other"),
+                    None,
+                    Some("Zone"),
+                    Some("Gamma"),
+                    Some("other"),
+                    None,
+                ],
+                [
+                    None,
+                    Some("Alpha"),
+                    Some("beta"),
+                    None,
+                    Some("Zone"),
+                    Some("ÀLPHA"),
+                    Some("other"),
+                    None,
+                ],
+            ] {
+                let params = values
+                    .map(|v| v.map_or(Value::Null, |v| Value::String(v.into())))
+                    .to_vec();
+                let rows = |session: &mut SessionContext| {
+                    with_params(params.clone(), || {
+                        collect_select_response_rows(
+                            engine
+                                .execute_prepared_statement(session, query, (*prepared).clone())
+                                .unwrap()
+                                .unwrap(),
+                        )
+                    })
+                };
+                let vector =
+                    with_test_env(&[("MYDB_VECTORIZED", Some("on"))], || rows(&mut session));
+                let oracle =
+                    with_test_env(&[("MYDB_VECTORIZED", Some("off"))], || rows(&mut session));
+                assert_eq!(vector, oracle, "{collation}, {text_type}, {values:?}");
+                let analyzed = with_test_env(&[("MYDB_VECTORIZED", Some("on"))], || {
+                    with_params(params, || {
+                        collect_select_response_rows(
+                            engine
+                                .execute_prepared_statement(
+                                    &mut session,
+                                    &analyze_query,
+                                    (*analyze_prepared).clone(),
+                                )
+                                .unwrap()
+                                .unwrap(),
+                        )
+                    })
+                });
+                let Value::String(text) = &analyzed[0][0] else {
+                    panic!("EXPLAIN text expected")
+                };
+                assert!(
+                    text.contains("expression_mode=decoded"),
+                    "{collation}, {text_type}: {text}"
+                );
+                assert!(!text.contains("fallback_expression_rows="), "{text}");
+            }
+        }
+    }
+}

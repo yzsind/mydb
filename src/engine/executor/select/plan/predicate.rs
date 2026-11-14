@@ -491,8 +491,8 @@ impl DecodedPredicateProgram {
     }
 
     /// Whether evaluating this program while the row payload is borrowed
-    /// avoids constructing an owned string for a LIKE or substring predicate. This is a
-    /// materially different cost shape from fixed-width/date comparisons:
+    /// avoids constructing owned strings for comparisons, IN, LIKE or
+    /// substring predicates. This is a different cost shape from numeric scans:
     /// the latter are usually cheaper in the common batch filter when most
     /// rows survive, while text kernels benefit from matching the borrowed bytes
     /// even at a high selectivity.
@@ -500,7 +500,9 @@ impl DecodedPredicateProgram {
         self.leaves.iter().any(|leaf| {
             matches!(
                 leaf,
-                DecodedPredicateLeaf::StringLike { .. } | DecodedPredicateLeaf::SubstringIn { .. }
+                DecodedPredicateLeaf::StringCmp { .. }
+                    | DecodedPredicateLeaf::StringLike { .. }
+                    | DecodedPredicateLeaf::SubstringIn { .. }
             )
         })
     }

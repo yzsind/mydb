@@ -1,19 +1,22 @@
-# Docker Build and Deployment
+# Docker Deployment
 
-The repository root provides the local image build files. The image enables TLS,
-`fast-alloc`, and `zstd-compression` by default, and the database process runs as
-the non-root user with UID/GID `10001:10001`. It contains the server, backup CLI,
-SQL client, timezone data, and third-party license/source notices:
+Pull the prebuilt `ninedata/mydb:latest` image from Docker Hub to get started.
+The image enables TLS, `fast-alloc`, and `zstd-compression` by default, and the
+database process runs as the non-root user with UID/GID `10001:10001`. It contains
+the server, backup CLI, SQL client, timezone data, and third-party license/source
+notices.
+
+## Quick start
 
 ```bash
-docker build -t mydb:local .
+docker pull ninedata/mydb:latest
 
 docker volume create mydb-data
-docker run --name mydb \
+docker run -d --name mydb \
   -p 127.0.0.1:8738:8738 \
   -v mydb-data:/var/lib/mydb \
   -e MYDB_ROOT_PASSWORD='change-me' \
-  mydb:local
+  ninedata/mydb:latest
 
 docker exec -it mydb mysql -h127.0.0.1 -P8738 -uroot -p --ssl
 ```
@@ -39,13 +42,69 @@ examples use the ephemeral local certificate. Remote deployments should install
 a trusted certificate and use identity verification as described in
 [configuration](configuration.md).
 
-To build a Linux AMD64 image on an Apple Silicon Mac:
+## Configuration and storage
+
+The image automatically reads `/etc/mydb/mydb.cnf`. A complete config file can
+be read-only mounted at that path to replace the image's default configuration:
+
+```bash
+chmod 0644 ./mydb.cnf
+docker run -d --name mydb \
+  -p 127.0.0.1:8738:8738 \
+  -v mydb-data:/var/lib/mydb \
+  -v ./mydb.cnf:/etc/mydb/mydb.cnf:ro \
+  -e MYDB_ROOT_PASSWORD='change-me' \
+  ninedata/mydb:latest
+```
+
+A custom configuration in a container must listen on `0.0.0.0` and should set
+`data_dir` to `/var/lib/mydb`; otherwise the port may be unreachable from
+outside the container or the data may not be written to the declared volume.
+The config file must be a plain UTF-8 file and must not allow group/other
+writes; `0644` is the recommended permission. To use another path inside the
+container, pass `--config` explicitly; that argument disables the automatic
+loading of the fixed path:
+
+```bash
+docker run --rm \
+  -v ./custom.cnf:/run/mydb/custom.cnf:ro \
+  ninedata/mydb:latest --config /run/mydb/custom.cnf
+```
+
+All existing `MYDB_*` environment variables can be passed directly via `-e` or
+`--env-file`. For example:
+
+```bash
+docker run -d --name mydb \
+  -p 127.0.0.1:8738:8738 \
+  -v mydb-data:/var/lib/mydb \
+  --env-file ./mydb.env \
+  -e MYDB_MEMORY_TARGET=1G \
+  ninedata/mydb:latest --slow-sql-ms 250
+```
+
+Configuration precedence inside the container is: image default or mounted
+config < `MYDB_*` environment variables < CLI arguments in the container
+command. A named volume is the recommended default; if you bind mount a host
+data directory, that directory must be writable by UID/GID `10001:10001`.
+On macOS Docker Desktop, keep database and backup repositories on Linux named
+volumes. This release review reproduced transient hard-link lookup failures on
+shared host folders; those folders are outside the accepted storage path.
+The database retains its generation/EOF checks and fails an affected backup
+instead of publishing it.
+`docker stop` sends `SIGTERM`, and mydb runs its existing connection drain,
+checkpoint, and graceful shutdown procedures.
+
+## Optional: build from source
+
+The repository root also provides a Dockerfile for optional source builds.
+To build a local Linux AMD64 image on an Apple Silicon Mac:
 
 ```bash
 docker buildx build \
   --platform linux/amd64 \
   --progress=plain \
-  -t registry.example.com/namespace/mydb:1.2.1 \
+  -t mydb:local \
   --load \
   .
 ```
@@ -84,57 +143,5 @@ contents of Rust `1.95.0-slim-bookworm` (including the build machine
 architecture) and Debian `bookworm-slim` (including the target architecture).
 `--load` loads the result into the local daemon; use `--push` instead when
 pushing directly to a registry.
-
-The image automatically reads `/etc/mydb/mydb.cnf`. A complete config file can
-be read-only mounted at that path to replace the image's default configuration:
-
-```bash
-chmod 0644 ./mydb.cnf
-docker run --name mydb \
-  -p 127.0.0.1:8738:8738 \
-  -v mydb-data:/var/lib/mydb \
-  -v ./mydb.cnf:/etc/mydb/mydb.cnf:ro \
-  -e MYDB_ROOT_PASSWORD='change-me' \
-  mydb:local
-```
-
-A custom configuration in a container must listen on `0.0.0.0` and should set
-`data_dir` to `/var/lib/mydb`; otherwise the port may be unreachable from
-outside the container or the data may not be written to the declared volume.
-The config file must be a plain UTF-8 file and must not allow group/other
-writes; `0644` is the recommended permission. To use another path inside the
-container, pass `--config` explicitly; that argument disables the automatic
-loading of the fixed path:
-
-```bash
-docker run --rm \
-  -v ./custom.cnf:/run/mydb/custom.cnf:ro \
-  mydb:local --config /run/mydb/custom.cnf
-```
-
-All existing `MYDB_*` environment variables can be passed directly via `-e` or
-`--env-file`. For example:
-
-```bash
-docker run --name mydb \
-  -p 127.0.0.1:8738:8738 \
-  -v mydb-data:/var/lib/mydb \
-  --env-file ./mydb.env \
-  -e MYDB_MEMORY_TARGET=1G \
-  mydb:local --slow-sql-ms 250
-```
-
-Configuration precedence inside the container is: image default or mounted
-config < `MYDB_*` environment variables < CLI arguments in the container
-command. A named volume is the recommended default; if you bind mount a host
-data directory, that directory must be writable by UID/GID `10001:10001`.
-On macOS Docker Desktop, keep database and backup repositories on Linux named
-volumes. This release review reproduced transient hard-link lookup failures on
-shared host folders; those folders are outside the accepted storage path.
-The database retains its generation/EOF checks and fails an affected backup
-instead of publishing it.
-`docker stop` sends `SIGTERM`, and mydb runs its existing connection drain,
-checkpoint, and graceful shutdown procedures.
-
 
 [Back to product introduction](../README.md) · [Full configuration reference](configuration.md)

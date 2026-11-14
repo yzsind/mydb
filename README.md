@@ -190,17 +190,18 @@ calls, including JDBC URLs for local evaluation.
 
 ### Docker
 
-Build and run a container (stop any local instance using port `8738` first):
+Pull the prebuilt image from Docker Hub and run a container (stop any local
+instance using port `8738` first):
 
 ```bash
-docker build -t mydb:local .
+docker pull ninedata/mydb:latest
 docker volume create mydb-data
 
-docker run --name mydb \
+docker run -d --name mydb \
   -p 127.0.0.1:8738:8738 \
   -v mydb-data:/var/lib/mydb \
   -e MYDB_ROOT_PASSWORD='change-me' \
-  mydb:local
+  ninedata/mydb:latest
 
 docker exec -it mydb mysql -h127.0.0.1 -P8738 -uroot -p --ssl
 ```
@@ -208,8 +209,8 @@ docker exec -it mydb mysql -h127.0.0.1 -P8738 -uroot -p --ssl
 Enter `change-me` for the password on a fresh volume. Stop with `docker stop
 mydb` and restart with `docker start mydb`; the named volume retains the data.
 Bridge/NAT connections through the published port do not match `root@localhost` —
-create a dedicated account in that SQL session for host connections. Local image
-builds enable TLS, `fast-alloc`, and the MySQL replication receiver by default.
+create a dedicated account in that SQL session for host connections. The image
+enables TLS, `fast-alloc`, and the MySQL replication receiver by default.
 See the [Docker deployment guide](docs/docker.md) for certificates, mounted
 configuration, cross-architecture builds, and connecting from the host.
 
@@ -394,7 +395,7 @@ See [sequences](docs/statements/ddl/create-sequence.md), [series generation](doc
 ## Compatibility boundaries
 
 - **MySQL compatibility has explicit scope**: the classic protocol is supported, X Protocol is not; the native storage engine is not file- or plugin-ABI-compatible with InnoDB.
-- **Transaction semantics differ**: the default isolation level is `READ COMMITTED`; `REPEATABLE READ` is snapshot isolation without InnoDB gap/next-key locks; `SERIALIZABLE` range-insert prevention uses table-level shared locks.
+- **Transaction semantics differ**: the default isolation level is `READ COMMITTED`; `REPEATABLE READ` intentionally uses MVCC snapshot isolation without InnoDB gap/next-key locks to avoid range-lock contention, insert blocking, and the associated deadlock patterns. `SERIALIZABLE` range-insert prevention uses table-level shared locks. See [MVCC and locking](docs/mvcc-and-locking.md#snapshot-lifecycle-and-isolation-levels) for the design and semantic boundaries.
 - **Replication has prerequisites**: MySQL → MyDB replication is built into every server build and requires ROW/FULL binlog on the source; native physical replication uses controlled, manual role switching with no automatic leader election.
 - **Time travel has a window**: table-level `FOR SYSTEM_TIME AS OF` depends on undo retention settings, and the default retention window is `0`; queries across schema DDL boundaries are explicitly rejected.
 
