@@ -1,6 +1,7 @@
 """Executable checks for authorization, RRF, reranking and versioned evidence."""
 import json
 import os
+import ssl
 import uuid
 import math
 import pymysql
@@ -12,10 +13,14 @@ def main():
                                  port=int(os.getenv("MYDB_PORT", "8738")),
                                  user=os.getenv("MYDB_USER", "root"),
                                  password=os.getenv("MYDB_PASSWORD", "root"),
-                                 autocommit=True, charset="utf8mb4", ssl_disabled=True)
+                                 autocommit=True, charset="utf8mb4",
+                                 ssl={"check_hostname": False, "verify_mode": ssl.CERT_NONE})
     database = "hybrid_demo_" + uuid.uuid4().hex
     try:
         with connection.cursor() as cursor:
+            cursor.execute("SHOW SESSION STATUS LIKE 'Ssl_cipher'")
+            if not cursor.fetchone()[1]:
+                raise RuntimeError("TLS is required")
             cursor.execute("CREATE DATABASE " + database)
             cursor.execute("USE " + database)
             for sql in schema_sql(3):

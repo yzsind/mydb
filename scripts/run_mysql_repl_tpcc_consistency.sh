@@ -123,7 +123,7 @@ PROP="props.mydb-repl-master"
 cat > "${PROP}" <<PROPS
 db=mysql
 driver=com.mysql.cj.jdbc.Driver
-conn=jdbc:mysql://127.0.0.1:${MYSQL_PORT}/tpcc?useSSL=false&allowPublicKeyRetrieval=true
+conn=jdbc:mysql://127.0.0.1:${MYSQL_PORT}/tpcc
 user=tpcc
 password=tpcc
 warehouses=${BSQL_WAREHOUSES}
@@ -155,7 +155,7 @@ PROP="props.mydb-repl-master"
 cat > "${PROP}" <<PROPS
 db=mysql
 driver=com.mysql.cj.jdbc.Driver
-conn=jdbc:mysql://127.0.0.1:${MYSQL_PORT}/tpcc?useSSL=false&allowPublicKeyRetrieval=true
+conn=jdbc:mysql://127.0.0.1:${MYSQL_PORT}/tpcc
 user=tpcc
 password=tpcc
 warehouses=${BSQL_WAREHOUSES}

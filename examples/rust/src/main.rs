@@ -1,4 +1,4 @@
-use mysql::{prelude::Queryable, Conn, IsolationLevel, OptsBuilder, TxOpts};
+use mysql::{prelude::Queryable, Conn, IsolationLevel, OptsBuilder, SslOpts, TxOpts};
 use std::{
     env,
     error::Error,
@@ -29,6 +29,12 @@ fn connect() -> Result<Conn> {
             .pass(Some(env_or("MYDB_PASSWORD", "root")))
             .db_name(Some(env_or("MYDB_DB", "test")))
             .prefer_socket(false)
+            // Local examples accept mydb's temporary self-signed certificate and require TLS.
+            .ssl_opts(Some(
+                SslOpts::default()
+                    .with_danger_accept_invalid_certs(true)
+                    .with_danger_skip_domain_validation(true),
+            ))
             .tcp_connect_timeout(Some(Duration::from_secs(5)))
             .read_timeout(Some(Duration::from_secs(15)))
             .write_timeout(Some(Duration::from_secs(15)))

@@ -88,7 +88,7 @@ PROPS="$(mktemp /tmp/mydb/repl-tpcc-props.XXXXXX)"
 cat >"$PROPS" <<EOF
 db=mysql
 driver=com.mysql.cj.jdbc.Driver
-conn=jdbc:mysql://${HOST}:${MASTER_PORT}/tpcc?useSSL=false&allowPublicKeyRetrieval=true&serverTimezone=UTC&cachePrepStmts=true&useServerPrepStmts=true&prepStmtCacheSize=256&prepStmtCacheSqlLimit=2048&maintainTimeStats=false&rewriteBatchedStatements=true
+conn=jdbc:mysql://${HOST}:${MASTER_PORT}/tpcc?serverTimezone=UTC&cachePrepStmts=true&useServerPrepStmts=true&prepStmtCacheSize=256&prepStmtCacheSqlLimit=2048&maintainTimeStats=false&rewriteBatchedStatements=true
 user=root
 password=${PASSWORD}
 warehouses=${WAREHOUSES}

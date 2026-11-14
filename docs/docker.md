@@ -29,14 +29,15 @@ GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, ALTER, INDEX, DROP ON test.* TO 'a
 ```
 
 ```bash
-mysql -h127.0.0.1 -P8738 -uapp -p --ssl-mode=REQUIRED test -e 'SELECT 1'
+mysql -h127.0.0.1 -P8738 -uapp -p test -e 'SELECT 1'
 docker exec mydb mydb-backup --help
 ```
 
 The SQL client bundled by Debian also supports `--ssl`; an external MySQL 8.0
-client uses `--ssl-mode`. These first-start examples use the ephemeral local
-certificate. Remote deployments should install a trusted certificate and use
-identity verification as described in [configuration](configuration.md).
+client negotiates TLS by default when the server offers it. These first-start
+examples use the ephemeral local certificate. Remote deployments should install
+a trusted certificate and use identity verification as described in
+[configuration](configuration.md).
 
 To build a Linux AMD64 image on an Apple Silicon Mac:
 
