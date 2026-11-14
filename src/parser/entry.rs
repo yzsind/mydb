@@ -1675,7 +1675,9 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
             reject_invalid_show_mydb_memory(sql)?;
         }
         if matches!(head_kw, b"SHOW" | b"RESTORE" | b"PURGE") {
-            if let Some(command) = crate::recyclebin::parse(sql).map_err(|e| parse_error_full_span(sql, e.message()))? {
+            if let Some(command) = crate::recyclebin::parse(sql)
+                .map_err(|e| parse_error_full_span(sql, e.message()))?
+            {
                 return Ok(Statement::RecycleBin(command));
             }
         }

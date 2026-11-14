@@ -1568,18 +1568,24 @@ const SEQUENCES_COLUMNS: &[SystemColumn] = &[
 ];
 
 const MYDB_RECYCLEBIN_COLUMNS: &[SystemColumn] = &[
-    SystemColumn::unsigned_bigint("RECYCLE_ID", false).comment("Unique recycling operation object identity."),
+    SystemColumn::unsigned_bigint("RECYCLE_ID", false)
+        .comment("Unique recycling operation object identity."),
     v!("RECYCLE_NAME").comment("Read-only table name in the protected recycle schema."),
     v!("ORIGIN_SCHEMA").comment("Schema before recycling."),
     v!("ORIGIN_TABLE").comment("Table name before recycling."),
     v!("OPERATION").comment("DDL operation that retained this table."),
-    SystemColumn::unsigned_bigint("RECYCLED_MS", false).comment("Recycle time in Unix milliseconds."),
-    SystemColumn::unsigned_bigint("EXPIRES_MS", false).comment("Retention target in Unix milliseconds."),
+    SystemColumn::unsigned_bigint("RECYCLED_MS", false)
+        .comment("Recycle time in Unix milliseconds."),
+    SystemColumn::unsigned_bigint("EXPIRES_MS", false)
+        .comment("Retention target in Unix milliseconds."),
     v!("STATE").comment("RECYCLED or irreversible PURGING state."),
-    SystemColumn::text("OMITTED_OBJECTS", false).comment("Attached objects not restored automatically."),
+    SystemColumn::text("OMITTED_OBJECTS", false)
+        .comment("Attached objects not restored automatically."),
     SystemColumn::text("LAST_ERROR", false).comment("Last physical cleanup diagnostic."),
-    SystemColumn::unsigned_bigint("OPERATION_ID", false).comment("Transaction grouping entries from one DDL."),
-    SystemColumn::unsigned_bigint("DATA_BYTES", false).comment("Observed file length at recycling."),
+    SystemColumn::unsigned_bigint("OPERATION_ID", false)
+        .comment("Transaction grouping entries from one DDL."),
+    SystemColumn::unsigned_bigint("DATA_BYTES", false)
+        .comment("Observed file length at recycling."),
     v!("PURGE_REASON").comment("Manual, expiration, or disk pressure reclamation reason."),
 ];
 const MYDB_DDL_JOBS_COLUMNS: &[SystemColumn] = &[
@@ -2808,8 +2814,19 @@ pub(crate) fn object_visible_to_session(
     table: Option<&str>,
 ) -> bool {
     if schema.eq_ignore_ascii_case(crate::recyclebin::DATABASE) {
-        return session.internal_system_session || db.with_auth_catalog(|auth| auth.account_has_privilege(
-            &session.authorization_context(), &RequiredPrivilege { privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()), scope: PrivilegeScope::Global }, false)).unwrap_or(false);
+        return session.internal_system_session
+            || db
+                .with_auth_catalog(|auth| {
+                    auth.account_has_privilege(
+                        &session.authorization_context(),
+                        &RequiredPrivilege {
+                            privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()),
+                            scope: PrivilegeScope::Global,
+                        },
+                        false,
+                    )
+                })
+                .unwrap_or(false);
     }
     if !is_privilege_filter_enabled() || session.internal_system_session {
         return true;
@@ -3038,8 +3055,17 @@ impl Visibility {
 
     fn allow(&self, schema: &str, table: Option<&str>) -> bool {
         if schema.eq_ignore_ascii_case(crate::recyclebin::DATABASE) {
-            return self.unrestricted || self.guard.as_ref().is_some_and(|(auth, ctx)| auth.account_has_privilege(ctx,
-                &RequiredPrivilege { privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()), scope: PrivilegeScope::Global }, false));
+            return self.unrestricted
+                || self.guard.as_ref().is_some_and(|(auth, ctx)| {
+                    auth.account_has_privilege(
+                        ctx,
+                        &RequiredPrivilege {
+                            privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()),
+                            scope: PrivilegeScope::Global,
+                        },
+                        false,
+                    )
+                });
         }
         if self.unrestricted {
             return true;

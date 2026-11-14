@@ -1,4 +1,3 @@
-mod recyclebin;
 mod ai;
 mod bug_report_1107;
 mod collated_constant_in;
@@ -12,6 +11,7 @@ mod function_runtime_fixes;
 mod github_release_audit;
 mod http;
 mod metadata_naming;
+mod recyclebin;
 mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;

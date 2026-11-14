@@ -1056,7 +1056,9 @@ pub(super) fn reject_system_catalog_dml(
         return Ok(());
     }
     if database == crate::recyclebin::DATABASE {
-        return Err(crate::recyclebin::failure("recycle-bin tables are read only"));
+        return Err(crate::recyclebin::failure(
+            "recycle-bin tables are read only",
+        ));
     }
     if db.is_base_table(&database, &table) {
         return Ok(());
@@ -2489,39 +2491,79 @@ fn ctas_load_rows(
 }
 
 fn execute_recyclebin(
-    db: &Arc<Database>, session: &mut SessionContext, command: crate::recyclebin::Command,
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    command: crate::recyclebin::Command,
 ) -> Result<QueryResponse, QueryError> {
     use crate::recyclebin::Command;
-    let _timeout = crate::recyclebin::MdlTimeoutGuard::enter(session.sysvars.lock_wait_timeout.or_else(crate::engine::api::configured_global_lock_wait_timeout));
+    let _timeout = crate::recyclebin::MdlTimeoutGuard::enter(
+        session
+            .sysvars
+            .lock_wait_timeout
+            .or_else(crate::engine::api::configured_global_lock_wait_timeout),
+    );
     match command {
         Command::Show { database, pattern } => {
-            let rows = db.recyclebin_entries()?.into_iter().filter(|e| {
-                database.as_ref().is_none_or(|d| e.origin_database.eq_ignore_ascii_case(d))
-                    && pattern.as_ref().is_none_or(|p| crate::recyclebin::like(&e.origin_table, p))
-            }).map(|entry| crate::recyclebin::metadata_row(&entry)).collect();
+            let rows = db
+                .recyclebin_entries()?
+                .into_iter()
+                .filter(|e| {
+                    database
+                        .as_ref()
+                        .is_none_or(|d| e.origin_database.eq_ignore_ascii_case(d))
+                        && pattern
+                            .as_ref()
+                            .is_none_or(|p| crate::recyclebin::like(&e.origin_table, p))
+                })
+                .map(|entry| crate::recyclebin::metadata_row(&entry))
+                .collect();
             Ok(crate::recyclebin::result(rows))
         }
         Command::Restore { name, target } => {
             let entry = db.recyclebin_entry(&name)?;
-            let target = target.map(|name| crate::storage::table_key(name.database.as_deref().unwrap_or(&session.current_database), &name.table))
-                .unwrap_or_else(|| crate::storage::table_key(&entry.origin_database, &entry.origin_table));
-            let (database, table) = crate::storage::split_table_name(&session.current_database, &target);
-            let required = RequiredPrivilege { privilege: Privilege::Create, scope: PrivilegeScope::Table { database, table } };
-            if !db.with_auth_catalog(|auth| auth.account_has_privilege(&session.authorization_context(), &required, false))? {
-                return Err(error(crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR, "RESTORE requires CREATE on the target"));
+            let target = target
+                .map(|name| {
+                    crate::storage::table_key(
+                        name.database
+                            .as_deref()
+                            .unwrap_or(&session.current_database),
+                        &name.table,
+                    )
+                })
+                .unwrap_or_else(|| {
+                    crate::storage::table_key(&entry.origin_database, &entry.origin_table)
+                });
+            let (database, table) =
+                crate::storage::split_table_name(&session.current_database, &target);
+            let required = RequiredPrivilege {
+                privilege: Privilege::Create,
+                scope: PrivilegeScope::Table { database, table },
+            };
+            if !db.with_auth_catalog(|auth| {
+                auth.account_has_privilege(&session.authorization_context(), &required, false)
+            })? {
+                return Err(error(
+                    crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR,
+                    "RESTORE requires CREATE on the target",
+                ));
             }
             implicit_commit_for_ddl(db, session)?;
-            let ctx = (session.sql_log_bin && crate::binlog::enabled()).then(|| super::binlog_ctx_from_session(session));
+            let ctx = (session.sql_log_bin && crate::binlog::enabled())
+                .then(|| super::binlog_ctx_from_session(session));
             for omitted in db.restore_recycled_table_logged(&name, Some(&target), ctx.as_ref())? {
-                crate::engine::api::push_statement_warning(crate::error::ConditionLevel::Warning,
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET, format!("RESTORE omitted {omitted}"));
+                crate::engine::api::push_statement_warning(
+                    crate::error::ConditionLevel::Warning,
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                    format!("RESTORE omitted {omitted}"),
+                );
             }
             Ok(QueryResponse::Ok)
         }
         Command::Purge { name } => {
             implicit_commit_for_ddl(db, session)?;
-            if let Some(name) = name { db.purge_recycled_table(&name)?; }
-            else {
+            if let Some(name) = name {
+                db.purge_recycled_table(&name)?;
+            } else {
                 db.purge_recyclebin_all()?;
             }
             Ok(QueryResponse::Ok)
@@ -4461,22 +4503,36 @@ pub(super) fn authorize_prepared_statement_with_epoch(
     };
     let bound_required = bound.as_ref().map(|r| r.requirements());
     let required_privileges = bound_required.as_deref().unwrap_or(required_privileges);
-    let protected = |required: &RequiredPrivilege| matches!(&required.scope, PrivilegeScope::Table { database, table }
+    let protected = |required: &RequiredPrivilege| {
+        matches!(&required.scope, PrivilegeScope::Table { database, table }
         if database.eq_ignore_ascii_case(crate::recyclebin::DATABASE)
-        || (database.eq_ignore_ascii_case("information_schema") && table.eq_ignore_ascii_case("MYDB_RECYCLEBIN")));
+        || (database.eq_ignore_ascii_case("information_schema") && table.eq_ignore_ascii_case("MYDB_RECYCLEBIN")))
+    };
     let recycle_required = if required_privileges.iter().any(protected) {
         crate::recyclebin::validate_query_access(statement, &session.current_database)?;
         let mut mapped = Vec::with_capacity(required_privileges.len());
         for required in required_privileges {
             if protected(required) {
-                if required.privilege != Privilege::Select || matches!(statement, Statement::CreateView { .. } | Statement::AlterView { .. }) {
+                if required.privilege != Privilege::Select
+                    || matches!(
+                        statement,
+                        Statement::CreateView { .. } | Statement::AlterView { .. }
+                    )
+                {
                     return Err(crate::recyclebin::failure("recycle-bin objects support read-only queries, not writes or persistent views"));
                 }
-                mapped.push(RequiredPrivilege { privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()), scope: PrivilegeScope::Global });
-            } else { mapped.push(required.clone()); }
+                mapped.push(RequiredPrivilege {
+                    privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()),
+                    scope: PrivilegeScope::Global,
+                });
+            } else {
+                mapped.push(required.clone());
+            }
         }
         Some(mapped)
-    } else { None };
+    } else {
+        None
+    };
     let required_privileges = recycle_required.as_deref().unwrap_or(required_privileges);
     let explain_view_privileges = explain_dml_view_privileges(db, session, statement);
     // F8: statements with no required privileges (SELECT 1 / SHOW WARNINGS

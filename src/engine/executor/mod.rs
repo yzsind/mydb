@@ -6465,7 +6465,10 @@ impl StorageQueryEngine {
             None
         };
         let binloggable_ddl = is_ddl
-            && !matches!(statement, Statement::OptimizeTable { .. } | Statement::RecycleBin(_))
+            && !matches!(
+                statement,
+                Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+            )
             && !statement_is_temp_ddl(session, &statement);
         let ddl_binlog_context =
             (binloggable_ddl && session.sql_log_bin && crate::binlog::enabled()).then(|| {
@@ -6532,7 +6535,10 @@ impl StorageQueryEngine {
             ..QueryLogMetadata::default()
         };
         let binloggable_ddl = is_ddl
-            && !matches!(statement, Statement::OptimizeTable { .. } | Statement::RecycleBin(_))
+            && !matches!(
+                statement,
+                Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+            )
             && !statement_is_temp_ddl(session, &statement);
         let ddl_binlog_context =
             (binloggable_ddl && session.sql_log_bin && crate::binlog::enabled()).then(|| {
@@ -6571,7 +6577,10 @@ impl StorageQueryEngine {
             ..QueryLogMetadata::default()
         };
         let binloggable_ddl = is_ddl
-            && !matches!(statement, Statement::OptimizeTable { .. } | Statement::RecycleBin(_))
+            && !matches!(
+                statement,
+                Statement::OptimizeTable { .. } | Statement::RecycleBin(_)
+            )
             && !statement_is_temp_ddl(session, &statement);
         let ddl_binlog_context =
             (binloggable_ddl && session.sql_log_bin && crate::binlog::enabled()).then(|| {

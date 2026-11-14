@@ -1106,27 +1106,78 @@ mod online_apply {
         let (replica, _replica_dir, shutdown, join) = spawn_replica(service.bind_addr()).await;
         let writer = Arc::clone(&source);
         let name = tokio::task::spawn_blocking(move || {
-            for sql in ["CREATE TABLE recycled(id INT PRIMARY KEY,v LONGTEXT)", "INSERT INTO recycled VALUES(7,REPEAT('a',20000))", "TRUNCATE TABLE recycled"] { writer.execute(sql).unwrap(); }
-            writer.database_for_replication().recyclebin_entries().unwrap().pop().unwrap().name()
-        }).await.unwrap();
+            for sql in [
+                "CREATE TABLE recycled(id INT PRIMARY KEY,v LONGTEXT)",
+                "INSERT INTO recycled VALUES(7,REPEAT('a',20000))",
+                "TRUNCATE TABLE recycled",
+            ] {
+                writer.execute(sql).unwrap();
+            }
+            writer
+                .database_for_replication()
+                .recyclebin_entries()
+                .unwrap()
+                .pop()
+                .unwrap()
+                .name()
+        })
+        .await
+        .unwrap();
         let expected = vec![vec![Value::Int(7), Value::Int(20000)]];
-        assert_eq!(poll_select_exact(&replica, &format!("SELECT id,LENGTH(v) FROM __mydb_recyclebin__.{name}"), &expected, 5000).await, expected);
-        assert_eq!(replica.database_for_replication().maintain_recyclebin().unwrap(), 0);
+        assert_eq!(
+            poll_select_exact(
+                &replica,
+                &format!("SELECT id,LENGTH(v) FROM __mydb_recyclebin__.{name}"),
+                &expected,
+                5000
+            )
+            .await,
+            expected
+        );
+        assert_eq!(
+            replica
+                .database_for_replication()
+                .maintain_recyclebin()
+                .unwrap(),
+            0
+        );
         let writer = Arc::clone(&source);
         tokio::task::spawn_blocking(move || {
-            writer.execute(&format!("RESTORE TABLE {name} TO recovered")).unwrap();
-        }).await.unwrap();
-        assert_eq!(poll_select_exact(&replica, "SELECT id,LENGTH(v) FROM recovered", &expected, 5000).await, expected);
+            writer
+                .execute(&format!("RESTORE TABLE {name} TO recovered"))
+                .unwrap();
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            poll_select_exact(
+                &replica,
+                "SELECT id,LENGTH(v) FROM recovered",
+                &expected,
+                5000
+            )
+            .await,
+            expected
+        );
         let writer = Arc::clone(&source);
         tokio::task::spawn_blocking(move || {
             writer.execute("DROP TABLE recovered").unwrap();
             let db = writer.database_for_replication();
             let name = db.recyclebin_entries().unwrap().pop().unwrap().name();
             writer.execute(&format!("PURGE RECYCLEBIN {name}")).unwrap();
-            for _ in 0..3 { db.maintain_recyclebin().unwrap(); }
-        }).await.unwrap();
+            for _ in 0..3 {
+                db.maintain_recyclebin().unwrap();
+            }
+        })
+        .await
+        .unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        while !replica.database_for_replication().recyclebin_entries().unwrap().is_empty() {
+        while !replica
+            .database_for_replication()
+            .recyclebin_entries()
+            .unwrap()
+            .is_empty()
+        {
             assert!(std::time::Instant::now() < deadline);
             tokio::time::sleep(Duration::from_millis(20)).await;
         }

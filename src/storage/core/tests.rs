@@ -5116,7 +5116,7 @@ fn dropped_table_stays_dropped_after_recovery() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
-    db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+        db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
         db.create_table(
             "t",
             vec![ColumnDef {

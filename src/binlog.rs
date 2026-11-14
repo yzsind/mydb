@@ -1145,7 +1145,9 @@ impl std::fmt::Display for AllocatedGtid {
 
 #[derive(Debug, Clone)]
 enum BinlogTxnOp {
-    Spool { spool: Arc<EncodedSpool> },
+    Spool {
+        spool: Arc<EncodedSpool>,
+    },
     Encoded {
         events: Vec<(u8, Vec<u8>, bool)>,
     },
@@ -3955,7 +3957,7 @@ impl BinlogSourceManager {
             Entry::Occupied(mut entry) => {
                 if let [BinlogTxnOp::Spool { spool }] = entry.get().ops.as_slice() {
                     let spool = Arc::clone(spool);
-                    drop(entry); drop(state);
+                    drop(state);
                     return spool.append(&self.config, &op);
                 }
                 let pending = entry.get_mut();
@@ -4090,7 +4092,9 @@ impl BinlogSourceManager {
             txn_id,
             pending: Some(pending),
         };
-        let staged = if let [BinlogTxnOp::Spool { spool }] = lease.pending.as_ref().unwrap().ops.as_slice() {
+        let staged = if let [BinlogTxnOp::Spool { spool }] =
+            lease.pending.as_ref().unwrap().ops.as_slice()
+        {
             self.stage_spooled_txn_commit(Arc::clone(spool), commit_scn)?
         } else {
             let encoded = encode_pending_ops(&lease.pending.as_ref().unwrap().ops)?;
@@ -4219,7 +4223,13 @@ impl BinlogSourceManager {
             return Err(io_error(std::io::Error::other(message.clone())));
         }
         state.requested_order = state.requested_order.max(order);
-        let replaced = state.writes.insert(order, StagedWrite { chunks, spool: None });
+        let replaced = state.writes.insert(
+            order,
+            StagedWrite {
+                chunks,
+                spool: None,
+            },
+        );
         debug_assert!(replaced.is_none(), "duplicate binlog commit order");
         self.group_sync.cv.notify_all();
         Ok(())
@@ -4307,10 +4317,20 @@ impl BinlogSourceManager {
             if let Some(spool) = &write.spool {
                 self.finish_staged_file(writer.as_mut(), &file_chunks, false)?;
                 file_chunks.clear();
-                let file = &mut writer.as_mut().expect("spooled transaction has a prefix").file;
-                let (calls, bytes) = spool.body.write_body(&self.config, file, spool.body_position)?;
-                self.group_sync.write_calls.fetch_add(calls, Ordering::Relaxed);
-                self.group_sync.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+                let file = &mut writer
+                    .as_mut()
+                    .expect("spooled transaction has a prefix")
+                    .file;
+                let (calls, bytes) =
+                    spool
+                        .body
+                        .write_body(&self.config, file, spool.body_position)?;
+                self.group_sync
+                    .write_calls
+                    .fetch_add(calls, Ordering::Relaxed);
+                self.group_sync
+                    .write_bytes
+                    .fetch_add(bytes, Ordering::Relaxed);
                 let suffix: Vec<_> = spool.suffix.iter().collect();
                 self.finish_staged_file(writer.as_mut(), &suffix, sync)?;
             }
@@ -4397,11 +4417,21 @@ impl BinlogSourceManager {
             // Published disk bounds provide the complete streaming fallback.
             state.events.clear();
             state.rebuild_file_index();
-            if let Some(info) = state.files.iter_mut().find(|info| info.name == commit.reference.file) {
+            if let Some(info) = state
+                .files
+                .iter_mut()
+                .find(|info| info.name == commit.reference.file)
+            {
                 info.size = info.size.max(commit.reference.end_pos);
             }
-            let prefixes: Vec<_> = state.files.iter().map(|info| (info.name.clone(), info.size)).collect();
-            for (file, end) in prefixes { state.disk_prefixes.insert(file, end); }
+            let prefixes: Vec<_> = state
+                .files
+                .iter()
+                .map(|info| (info.name.clone(), info.size))
+                .collect();
+            for (file, end) in prefixes {
+                state.disk_prefixes.insert(file, end);
+            }
         }
         for chunk in std::mem::take(&mut commit.chunks) {
             state.push_event(chunk);
@@ -4743,7 +4773,12 @@ fn encode_pending_ops(ops: &[BinlogTxnOp]) -> Result<Vec<(u8, Vec<u8>, bool)>, Q
     let mut encoded = Vec::new();
     for op in ops {
         match op {
-            BinlogTxnOp::Spool { .. } => return Err(error(crate::error::catalog::ER_GET_ERRNO, "file-backed binlog must use streaming publication")),
+            BinlogTxnOp::Spool { .. } => {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "file-backed binlog must use streaming publication",
+                ))
+            }
             BinlogTxnOp::Encoded { events } => encoded.extend(events.iter().cloned()),
             BinlogTxnOp::Query { database, sql, ctx } => {
                 encoded.push((

@@ -240,7 +240,8 @@ pub const ER_AI_KEY_ROTATION_INCOMPLETE: ErrorSpec = ErrorSpec::new(
     "ER_AI_KEY_ROTATION_INCOMPLETE",
 );
 
-pub const MYDB_ER_RECYCLEBIN: ErrorSpec = ErrorSpec::new(ErrorDomain::MyDb, 50140, *b"HY000", "MYDB_ER_RECYCLEBIN");
+pub const MYDB_ER_RECYCLEBIN: ErrorSpec =
+    ErrorSpec::new(ErrorDomain::MyDb, 50140, *b"HY000", "MYDB_ER_RECYCLEBIN");
 
 pub const MYDB_ERROR_SPECS: &[ErrorSpec] = &[
     MYDB_ER_INVALID_VECTOR_VALUE,

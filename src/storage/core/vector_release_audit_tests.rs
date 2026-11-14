@@ -49,7 +49,10 @@ fn vector_release_failstop_retirement_does_not_persist_false_corruption() {
 fn vector_release_dropped_maintenance_handle_cannot_fence_replacement() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = engine(dir.path());
-        engine.database().set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+    engine
+        .database()
+        .set_recyclebin_variable("mydb_recyclebin", 0)
+        .unwrap();
     engine.execute("CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL, INDEX ix(v) USING HNSW WITH(quantization=sq8))").unwrap();
     let db = engine.database();
     let table = db.table("test.t").unwrap();

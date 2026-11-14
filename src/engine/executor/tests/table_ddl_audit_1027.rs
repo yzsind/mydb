@@ -259,7 +259,10 @@ fn ddl_1027_null_validation_reports_data_error_when_budget_is_small() {
 fn ddl_1027_drop_removes_empty_object_directories() {
     let dir = fixture();
     let engine = open_strict_test_engine(dir.path());
-        engine.database().set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+    engine
+        .database()
+        .set_recyclebin_variable("mydb_recyclebin", 0)
+        .unwrap();
     engine.execute("CREATE TABLE t(a INT PRIMARY KEY)").unwrap();
     engine.execute("INSERT INTO t VALUES(1)").unwrap();
     let id = engine.database().table("test.t").unwrap().id;
@@ -276,7 +279,10 @@ fn ddl_1027_copy_and_drop_remove_empty_shadow_directories() {
     for lock in ["EXCLUSIVE", "SHARED", "NONE"] {
         let dir = fixture();
         let engine = open_relaxed_test_engine(dir.path());
-        engine.database().set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+        engine
+            .database()
+            .set_recyclebin_variable("mydb_recyclebin", 0)
+            .unwrap();
         engine
             .execute("CREATE TABLE t(id INT PRIMARY KEY,v INT)")
             .unwrap();
@@ -325,7 +331,10 @@ fn ddl_1027_create_losing_drop_race_cleans_files_after_restart() {
         let storage_ids;
         {
             let engine = Arc::new(open_strict_test_engine(dir.path()));
-        engine.database().set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+            engine
+                .database()
+                .set_recyclebin_variable("mydb_recyclebin", 0)
+                .unwrap();
             let hook = engine.database().install_create_finalize_test_hook();
             let worker = engine.clone();
             let create = std::thread::spawn(move || {
@@ -391,7 +400,10 @@ fn ddl_1027_create_losing_drop_race_cleans_files_after_restart() {
             }
         }
         let engine = open_strict_test_engine(dir.path());
-        engine.database().set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+        engine
+            .database()
+            .set_recyclebin_variable("mydb_recyclebin", 0)
+            .unwrap();
         if replacement {
             assert_eq!(rows(&engine, "SELECT a FROM t"), vec![vec![Value::Int(91)]]);
         } else {

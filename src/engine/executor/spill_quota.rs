@@ -196,7 +196,9 @@ impl VolumeSpace {
 }
 
 pub(crate) fn available_percent(path: &Path) -> Option<u64> {
-    volume_free_bytes(path).filter(|s| s.total != 0).map(|s| (u128::from(s.available) * 100 / u128::from(s.total)) as u64)
+    volume_free_bytes(path)
+        .filter(|s| s.total != 0)
+        .map(|s| (u128::from(s.available) * 100 / u128::from(s.total)) as u64)
 }
 
 pub(crate) fn available_bytes(path: &Path) -> Option<u64> {

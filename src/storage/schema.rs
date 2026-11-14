@@ -1209,7 +1209,11 @@ impl TableSchema {
             ));
         }
         if name == "recyclebin" {
-            indexes.push(make_index("IDX_EXPIRES", vec!["expires_ms".into(), "recycle_id".into()], false));
+            indexes.push(make_index(
+                "IDX_EXPIRES",
+                vec!["expires_ms".into(), "recycle_id".into()],
+                false,
+            ));
         }
         if name == "foreign_keys" {
             let mut reverse = make_index(

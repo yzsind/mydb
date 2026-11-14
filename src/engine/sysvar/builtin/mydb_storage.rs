@@ -54,13 +54,30 @@ pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::settable(
         SysVarDef::new("mydb_recyclebin", Scope::Both, DataType::Bool)
             .with_doc("Retain dropped and truncated persistent tables in the recycle bin."),
-        |ctx| SysVarValue::Bool(ctx.session.and_then(|s| s.sysvars.mydb_recyclebin)
-            .filter(|_| ctx.scope == Scope::Session)
-            .unwrap_or_else(|| ctx.db.map(|db| db.recyclebin_variable("mydb_recyclebin") != 0).unwrap_or(true))),
+        |ctx| {
+            SysVarValue::Bool(
+                ctx.session
+                    .and_then(|s| s.sysvars.mydb_recyclebin)
+                    .filter(|_| ctx.scope == Scope::Session)
+                    .unwrap_or_else(|| {
+                        ctx.db
+                            .map(|db| db.recyclebin_variable("mydb_recyclebin") != 0)
+                            .unwrap_or(true)
+                    }),
+            )
+        },
         |ctx: &mut WriteCtx<'_>, value: SysVarValue| {
             let enabled = value.as_bool().unwrap_or(true);
-            if ctx.scope == Scope::Session { ctx.session.sysvars.mydb_recyclebin = Some(enabled); Ok(()) }
-            else { ctx.db.ok_or_else(|| crate::recyclebin::failure("recycle-bin settings require a database"))?.set_recyclebin_variable("mydb_recyclebin", enabled as u64) }
+            if ctx.scope == Scope::Session {
+                ctx.session.sysvars.mydb_recyclebin = Some(enabled);
+                Ok(())
+            } else {
+                ctx.db
+                    .ok_or_else(|| {
+                        crate::recyclebin::failure("recycle-bin settings require a database")
+                    })?
+                    .set_recyclebin_variable("mydb_recyclebin", enabled as u64)
+            }
         },
     ));
     for (name, default, max) in [
@@ -72,9 +89,18 @@ pub(crate) fn register(reg: &mut Registry) {
         reg.register(SysVar::settable(
             SysVarDef::new(name, Scope::Global, DataType::UInt { min: 0, max })
                 .with_doc("Recycle-bin retention and asynchronous reclamation policy."),
-            move |ctx| SysVarValue::UInt(ctx.db.map(|db| db.recyclebin_variable(name)).unwrap_or(default)),
+            move |ctx| {
+                SysVarValue::UInt(
+                    ctx.db
+                        .map(|db| db.recyclebin_variable(name))
+                        .unwrap_or(default),
+                )
+            },
             move |ctx: &mut WriteCtx<'_>, value: SysVarValue| {
-                ctx.db.ok_or_else(|| crate::recyclebin::failure("recycle-bin settings require a database"))?
+                ctx.db
+                    .ok_or_else(|| {
+                        crate::recyclebin::failure("recycle-bin settings require a database")
+                    })?
                     .set_recyclebin_variable(name, value.as_u64().unwrap_or(default))
             },
         ));

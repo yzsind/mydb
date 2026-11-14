@@ -1238,7 +1238,10 @@ fn hnsw_drop_table_removes_snapshot_file() {
     ]);
     let dir = tempfile::tempdir().unwrap();
     let engine = open_strict_test_engine(dir.path());
-        engine.database().set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+    engine
+        .database()
+        .set_recyclebin_variable("mydb_recyclebin", 0)
+        .unwrap();
     engine
         .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(3) NOT NULL)")
         .unwrap();

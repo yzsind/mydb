@@ -927,11 +927,21 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
                 ),
             ],
         )),
-        Arc::new(TableSchema::system_table(DD_RECYCLEBIN, "recyclebin", vec![
-            ucol("recycle_id", DataTypeKind::BigInt, false),
-            ucol("expires_ms", DataTypeKind::BigInt, false),
-            col("entry_json", DataTypeKind::Text { max_len: 16 * 1024 * 1024 }, false),
-        ])),
+        Arc::new(TableSchema::system_table(
+            DD_RECYCLEBIN,
+            "recyclebin",
+            vec![
+                ucol("recycle_id", DataTypeKind::BigInt, false),
+                ucol("expires_ms", DataTypeKind::BigInt, false),
+                col(
+                    "entry_json",
+                    DataTypeKind::Text {
+                        max_len: 16 * 1024 * 1024,
+                    },
+                    false,
+                ),
+            ],
+        )),
         Arc::new(sequence_values_table()),
         Arc::new(TableSchema::system_table(
             DD_SEQUENCE_RETIREMENTS,

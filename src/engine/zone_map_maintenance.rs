@@ -30,8 +30,12 @@ impl ZoneMapMaintenanceHandle {
             let _reclaim = super::executor::mem_budget::ReclaimDatabaseScope::enter(&recycle_db);
             while !shutdown.is_requested() {
                 let interval = recycle_db.recyclebin_variable("mydb_recyclebin_gc_interval_ms");
-                if shutdown.wait_timeout(Duration::from_millis(interval.max(1000))) { break; }
-                run_maintenance_task("recycle-bin cleanup", || recycle_db.maintain_recyclebin_until(&|| shutdown.is_requested()));
+                if shutdown.wait_timeout(Duration::from_millis(interval.max(1000))) {
+                    break;
+                }
+                run_maintenance_task("recycle-bin cleanup", || {
+                    recycle_db.maintain_recyclebin_until(&|| shutdown.is_requested())
+                });
             }
         });
         let worker = BackgroundWorker::spawn("mydb-zone-map", move |worker_shutdown| {
@@ -56,7 +60,10 @@ impl ZoneMapMaintenanceHandle {
                 });
             }
         });
-        Self { worker, recyclebin_worker }
+        Self {
+            worker,
+            recyclebin_worker,
+        }
     }
 
     pub fn shutdown(&self) {
