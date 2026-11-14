@@ -3701,7 +3701,7 @@ struct DenseI64Lookup {
 const DENSE_I64_EMPTY: u32 = u32::MAX;
 // 2M × u32 = 8 MiB per worker. This is deliberately an operator-internal
 // work-area choice, not a query-shape threshold; wider domains use Packed64.
-const DENSE_I64_MAX_SLOTS: usize = 2_000_000;
+pub(crate) const DENSE_I64_MAX_SLOTS: usize = 2_000_000;
 
 impl DenseI64Lookup {
     fn try_from_batch(group_columns: &[usize], batch: &Batch) -> Option<Self> {
@@ -3775,6 +3775,145 @@ impl DenseI64Lookup {
         self.slots
             .capacity()
             .saturating_mul(std::mem::size_of::<u32>())
+    }
+}
+
+pub(crate) static DENSE_INTEGER_ACTIVATIONS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DENSE_INTEGER_FALLBACKS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Exact direct addressing for a small Cartesian domain of signed integer
+/// grouping keys. Canonical keys, states and radix partitions stay unchanged;
+/// an outlier simply retires this optional lookup accelerator.
+struct DenseIntegerTupleLookup {
+    domains: Vec<(i64, usize)>,
+    slots: Vec<u32>,
+}
+impl DenseIntegerTupleLookup {
+    fn domains_for_bounds(bounds: &[(i64, i64)]) -> Option<(Vec<(i64, usize)>, usize)> {
+        let mut domains = Vec::with_capacity(bounds.len());
+        let mut size = 1usize;
+        for &(min, max) in bounds {
+            let required = i128::from(max) - i128::from(min) + 1;
+            if required <= 0 || required >= DENSE_I64_MAX_SLOTS as i128 {
+                return None;
+            }
+            let span = (required as usize)
+                .next_power_of_two()
+                .min(DENSE_I64_MAX_SLOTS - 1);
+            let slack = (span - required as usize) / 2;
+            let start = if min >= 0 && i128::from(max) < span as i128 {
+                0
+            } else if max <= 0 && i128::from(min) >= 1 - span as i128 {
+                1 - span as i128
+            } else {
+                (i128::from(min) - slack as i128).clamp(
+                    i128::from(i64::MIN),
+                    i128::from(i64::MAX) - span as i128 + 1,
+                )
+            };
+            size = size.checked_mul(span.checked_add(1)?)?;
+            if size > DENSE_I64_MAX_SLOTS {
+                return None;
+            }
+            domains.push((i64::try_from(start).ok()?, span));
+        }
+        Some((domains, size))
+    }
+    fn from_bounds(bounds: &[(i64, i64)]) -> Option<Self> {
+        let (domains, size) = Self::domains_for_bounds(bounds)?;
+        let mut slots = Vec::new();
+        slots.try_reserve_exact(size).ok()?;
+        slots.resize(size, DENSE_I64_EMPTY);
+        Some(Self { domains, slots })
+    }
+    fn batch_bounds(columns: &[usize], batch: &Batch) -> Option<Vec<(i64, i64)>> {
+        if batch.visible_rows() < 1024 || columns.is_empty() || columns.len() > 8 {
+            return None;
+        }
+        let mut bounds = Vec::with_capacity(columns.len());
+        for &column in columns {
+            let ColumnVector::I64 { data, nulls } = batch.columns().get(column)? else {
+                return None;
+            };
+            let mut min = i64::MAX;
+            let mut max = i64::MIN;
+            for row in batch.visible_indices() {
+                if nulls.as_ref().is_some_and(|valid| !valid.get(row)) {
+                    continue;
+                }
+                min = min.min(data[row]);
+                max = max.max(data[row]);
+            }
+            if min == i64::MAX && max == i64::MIN {
+                min = 0;
+                max = 0;
+            }
+            bounds.push((min, max));
+        }
+        Some(bounds)
+    }
+    fn from_batch(columns: &[usize], batch: &Batch) -> Option<Self> {
+        Self::from_bounds(&Self::batch_bounds(columns, batch)?)
+    }
+    fn supports_batch(columns: &[usize], batch: &Batch) -> bool {
+        Self::batch_bounds(columns, batch)
+            .and_then(|bounds| Self::domains_for_bounds(&bounds))
+            .is_some()
+    }
+    #[inline]
+    fn index(&self, keys: &[i64], nullmask: u8) -> Option<usize> {
+        let mut index = 0usize;
+        let mut stride = 1usize;
+        for (column, (&(min, span), &key)) in self.domains.iter().zip(keys).enumerate() {
+            let token = if nullmask & (1 << column) != 0 {
+                0
+            } else {
+                if key < min {
+                    return None;
+                }
+                let delta = key.wrapping_sub(min) as u64;
+                if delta >= span as u64 {
+                    return None;
+                }
+                delta as usize + 1
+            };
+            index += token * stride;
+            stride *= span + 1;
+        }
+        Some(index)
+    }
+    fn expanded(&self, keys: &[i64], nullmask: u8, stored: &[i64], nulls: &[u8]) -> Option<Self> {
+        let width = self.domains.len();
+        let mut bounds = vec![(i64::MAX, i64::MIN); width];
+        for (values, &mask) in stored
+            .chunks_exact(width)
+            .zip(nulls)
+            .chain(std::iter::once((keys, &nullmask)))
+        {
+            for (column, &value) in values.iter().enumerate() {
+                if mask & (1 << column) == 0 {
+                    bounds[column].0 = bounds[column].0.min(value);
+                    bounds[column].1 = bounds[column].1.max(value);
+                }
+            }
+        }
+        for bound in &mut bounds {
+            if *bound == (i64::MAX, i64::MIN) {
+                *bound = (0, 0);
+            }
+        }
+        let mut result = Self::from_bounds(&bounds)?;
+        for (group, (values, &mask)) in stored.chunks_exact(width).zip(nulls).enumerate() {
+            let index = result.index(values, mask)?;
+            result.slots[index] = group as u32;
+        }
+        Some(result)
+    }
+    fn allocated_bytes(&self) -> usize {
+        self.slots.capacity() * std::mem::size_of::<u32>()
+            + self.domains.capacity() * std::mem::size_of::<(i64, usize)>()
     }
 }
 
@@ -4380,6 +4519,9 @@ struct FixedWidthStateArena {
     keys: Vec<i64>,
     nulls: Vec<u8>,
     state_chunks: Vec<Vec<InlineAggState>>,
+    /// Updated at the mutation boundary, so charging a batch never walks
+    /// every resident group to discover unchanged accumulator allocations.
+    state_heap_bytes: usize,
     /// Pure COUNT layouts retain eight bytes per slot instead of the largest
     /// general aggregate enum. Keys and spill codecs remain unchanged.
     count_states: Option<Vec<i64>>,
@@ -4395,6 +4537,8 @@ struct FixedWidthStateArena {
     n_aggs: usize,
     funcs: Vec<AggregateKind>,
     dense_i64: Option<DenseI64Lookup>,
+    dense_integer_tuple: Option<DenseIntegerTupleLookup>,
+    dense_integer_tuple_probed: bool,
     /// Single-i64 inputs may arrive in nondecreasing key order (clustered
     /// scans and ordered indexes). Such groups never need lookup after their
     /// run closes, so append them without populating the open-addressing
@@ -4849,6 +4993,84 @@ impl FixedWidthStateArena {
         Some(aggregate)
     }
 
+    fn exact_integer_average_domain(
+        group_columns: &[usize],
+        aggs: &[AggregateSpec],
+        schema: &BatchSchema,
+    ) -> bool {
+        !group_columns.is_empty()
+            && group_columns.len() <= 8
+            && group_columns.iter().all(|column| {
+                schema.fields().get(*column).is_some_and(|field| {
+                    field.source.flags & crate::mysql::protocol::UNSIGNED_FLAG == 0
+                        && matches!(
+                            field.column_type,
+                            ColumnType::Tiny
+                                | ColumnType::Short
+                                | ColumnType::MediumInt
+                                | ColumnType::Long
+                                | ColumnType::LongLong
+                        )
+                })
+            })
+            && aggs.iter().any(|spec| spec.func == AggregateKind::Avg)
+            && aggs.iter().all(|spec| match spec.func {
+                AggregateKind::Count | AggregateKind::CountStar => true,
+                AggregateKind::Sum
+                | AggregateKind::Avg
+                | AggregateKind::Min
+                | AggregateKind::Max => {
+                    schema.fields().get(spec.input_column).is_some_and(|field| {
+                        matches!(
+                            field.column_type,
+                            ColumnType::Tiny
+                                | ColumnType::Short
+                                | ColumnType::MediumInt
+                                | ColumnType::Long
+                                | ColumnType::LongLong
+                                | ColumnType::Decimal { .. }
+                        )
+                    })
+                }
+                _ => false,
+            })
+    }
+
+    fn has_exact_dense_average(
+        group_columns: &[usize],
+        aggs: &[AggregateSpec],
+        batch: &Batch,
+    ) -> bool {
+        Self::exact_integer_average_domain(group_columns, aggs, batch.schema())
+            && aggs.iter().all(|spec| match spec.func {
+                AggregateKind::Count | AggregateKind::CountStar => true,
+                AggregateKind::Sum
+                | AggregateKind::Avg
+                | AggregateKind::Min
+                | AggregateKind::Max => {
+                    batch
+                        .columns()
+                        .get(spec.input_column)
+                        .is_some_and(|column| {
+                            matches!(
+                                column,
+                                ColumnVector::I64 { .. }
+                                    | ColumnVector::U64 { .. }
+                                    | ColumnVector::Bool { .. }
+                                    | ColumnVector::Decimal32 { .. }
+                                    | ColumnVector::Decimal64 { .. }
+                                    | ColumnVector::Decimal128 { .. }
+                                    | ColumnVector::DecimalWide { .. }
+                                    | ColumnVector::Null { .. }
+                            )
+                        })
+                }
+                _ => false,
+            })
+            && crate::util::env::flag("MYDB_AGG_DENSE_INTEGER_KEYS", true)
+            && DenseIntegerTupleLookup::supports_batch(group_columns, batch)
+    }
+
     fn has_decimal_state_column(aggs: &[AggregateSpec], batch: &Batch) -> bool {
         aggs.iter().any(|spec| {
             spec.func == AggregateKind::Sum
@@ -4903,6 +5125,7 @@ impl FixedWidthStateArena {
             keys: Vec::with_capacity(seed.saturating_mul(key_kinds.len())),
             nulls: Vec::with_capacity(seed),
             state_chunks: Vec::new(),
+            state_heap_bytes: 0,
             count_states,
             decimal_state_columns,
             decimal_state_slots,
@@ -4911,6 +5134,8 @@ impl FixedWidthStateArena {
             n_aggs,
             funcs,
             dense_i64: None,
+            dense_integer_tuple: None,
+            dense_integer_tuple_probed: false,
             monotonic_i64_unindexed,
             monotonic_i64_last: None,
             partition_groups: std::array::from_fn(|_| Vec::new()),
@@ -4962,7 +5187,7 @@ impl FixedWidthStateArena {
         self.mask = new_mask;
     }
 
-    fn materialize_monotonic_i64_index(&mut self) {
+    fn materialize_canonical_hash_index(&mut self) {
         let wanted = ((self.hashes.len().max(1) * 10).saturating_add(6) / 7).max(1024);
         let capacity = wanted.next_power_of_two();
         let mask = capacity - 1;
@@ -4992,7 +5217,7 @@ impl FixedWidthStateArena {
         };
         for run in &runs {
             for (key, key_is_null, sum) in run.cursor() {
-                let group = self.probe_or_insert_i64(key, u8::from(key_is_null));
+                let group = self.probe_or_insert(&[key], u8::from(key_is_null));
                 if let Some(sum) = sum {
                     self.decimal_state_columns[0]
                         .as_mut()
@@ -5066,6 +5291,46 @@ impl FixedWidthStateArena {
 
     #[inline]
     fn probe_or_insert(&mut self, keys: &[i64], nullmask: u8) -> usize {
+        let Some(lookup) = self.dense_integer_tuple.as_ref() else {
+            return self.probe_or_insert_uncached(keys, nullmask);
+        };
+        let mut slot = lookup.index(keys, nullmask);
+        if slot.is_none() {
+            self.dense_integer_tuple = self
+                .dense_integer_tuple
+                .take()
+                .and_then(|lookup| lookup.expanded(keys, nullmask, &self.keys, &self.nulls));
+            if self.dense_integer_tuple.is_none() {
+                DENSE_INTEGER_FALLBACKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.materialize_canonical_hash_index();
+            }
+            slot = self
+                .dense_integer_tuple
+                .as_ref()
+                .and_then(|lookup| lookup.index(keys, nullmask));
+        }
+        if let Some(slot) = slot {
+            let group = self.dense_integer_tuple.as_ref().unwrap().slots[slot];
+            if group != DENSE_I64_EMPTY {
+                return group as usize;
+            }
+            // Retain canonical state and radix ownership, but do not build a
+            // second index beside direct addressing. Rebuild it only if a
+            // later outlier retires this bounded domain.
+            let hash = Self::hash_key(keys, nullmask);
+            let group = self.hashes.len();
+            self.hashes.push(hash);
+            self.partition_groups[(hash & PARTITION_MASK) as usize].push(group as u32);
+            self.keys.extend_from_slice(keys);
+            self.nulls.push(nullmask);
+            self.append_group_states(group);
+            self.dense_integer_tuple.as_mut().unwrap().slots[slot] = group as u32;
+            return group;
+        }
+        self.probe_or_insert_uncached(keys, nullmask)
+    }
+
+    fn probe_or_insert_uncached(&mut self, keys: &[i64], nullmask: u8) -> usize {
         if let [key] = keys {
             return self.probe_or_insert_i64(*key, nullmask);
         }
@@ -5114,7 +5379,7 @@ impl FixedWidthStateArena {
                     return self.append_monotonic_i64_group(key, nullmask);
                 }
                 None => return self.append_monotonic_i64_group(key, nullmask),
-                _ => self.materialize_monotonic_i64_index(),
+                _ => self.materialize_canonical_hash_index(),
             }
         }
         let mut retire_dense = false;
@@ -5239,8 +5504,44 @@ impl FixedWidthStateArena {
         if self.defer_i64_decimal_dedup {
             self.materialize_compressed_i64_decimal_runs();
         }
+        if !self.dense_integer_tuple_probed {
+            self.dense_integer_tuple_probed = true;
+            if self.hashes.is_empty()
+                && self
+                    .key_kinds
+                    .iter()
+                    .all(|k| matches!(k, CompactKeyKind::I64))
+                && crate::util::env::flag("MYDB_AGG_DENSE_INTEGER_KEYS", true)
+            {
+                let ordered = if group_columns.len() == 1 {
+                    let column = &batch.columns()[group_columns[0]];
+                    let mut previous = None;
+                    batch.visible_indices().all(|row| {
+                        let (key, is_null) = CompactKeyKind::I64.raw_at(column, row).unwrap();
+                        let value = (is_null, key);
+                        let ordered = previous.is_none_or(|old| old <= value);
+                        previous = Some(value);
+                        ordered
+                    })
+                } else {
+                    false
+                };
+                if !ordered {
+                    self.dense_integer_tuple =
+                        DenseIntegerTupleLookup::from_batch(group_columns, batch);
+                    if self.dense_integer_tuple.is_some() {
+                        DENSE_INTEGER_ACTIVATIONS
+                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        self.monotonic_i64_unindexed = false;
+                        self.slots = vec![0; 1024];
+                        self.mask = 1023;
+                    }
+                }
+            }
+        }
         if self.hashes.is_empty()
             && self.dense_i64.is_none()
+            && self.dense_integer_tuple.is_none()
             && !self.monotonic_i64_unindexed
             && matches!(self.key_kinds.as_slice(), [CompactKeyKind::I64])
         {
@@ -5274,32 +5575,7 @@ impl FixedWidthStateArena {
             }
             if self.decimal_state_slots.is_empty() {
                 for (slot, spec) in aggs.iter().enumerate() {
-                    if matches!(spec.func, AggregateKind::CountStar) {
-                        self.state_mut(group, slot).update_count_star();
-                        continue;
-                    }
-                    let column = &batch.columns()[spec.input_column];
-                    if column.is_null(row) {
-                        continue;
-                    }
-                    if let Some((data, scale)) = column.as_decimal_i32_slice() {
-                        self.state_mut(group, slot)
-                            .update_decimal_parts(i128::from(data[row]), scale)?;
-                    } else if let Some((data, scale)) = column.as_decimal_i64_slice() {
-                        self.state_mut(group, slot)
-                            .update_decimal_parts(i128::from(data[row]), scale)?;
-                    } else if let Some((data, scale)) = column.as_decimal_i128_slice() {
-                        self.state_mut(group, slot)
-                            .update_decimal_parts(data[row], scale)?;
-                    } else {
-                        crate::engine::expr::with_optional_compare_collation(
-                            spec.comparison_collation,
-                            || {
-                                self.state_mut(group, slot)
-                                    .update_ref(&column.value_at(row))
-                            },
-                        )?;
-                    }
+                    self.update_inline_state_from_column(group, slot, spec, batch, row)?;
                 }
                 continue;
             }
@@ -5343,25 +5619,20 @@ impl FixedWidthStateArena {
         if column.is_null(row) {
             return Ok(());
         }
-        if let Some((data, scale)) = column.as_decimal_i32_slice() {
-            self.state_mut(group, slot)
-                .update_decimal_parts(i128::from(data[row]), scale)?;
-        } else if let Some((data, scale)) = column.as_decimal_i64_slice() {
-            self.state_mut(group, slot)
-                .update_decimal_parts(i128::from(data[row]), scale)?;
-        } else if let Some((data, scale)) = column.as_decimal_i128_slice() {
-            self.state_mut(group, slot)
-                .update_decimal_parts(data[row], scale)?;
-        } else {
-            crate::engine::expr::with_optional_compare_collation(
-                spec.comparison_collation,
-                || {
-                    self.state_mut(group, slot)
-                        .update_ref(&column.value_at(row))
-                },
-            )?;
-        }
-        Ok(())
+        self.update_state(group, slot, |state| {
+            if let Some((data, scale)) = column.as_decimal_i32_slice() {
+                state.update_decimal_parts(i128::from(data[row]), scale)
+            } else if let Some((data, scale)) = column.as_decimal_i64_slice() {
+                state.update_decimal_parts(i128::from(data[row]), scale)
+            } else if let Some((data, scale)) = column.as_decimal_i128_slice() {
+                state.update_decimal_parts(data[row], scale)
+            } else {
+                crate::engine::expr::with_optional_compare_collation(
+                    spec.comparison_collation,
+                    || state.update_ref(&column.value_at(row)),
+                )
+            }
+        })
     }
 
     fn consume_fixed_decimal_runs<T: Copy>(
@@ -5596,7 +5867,7 @@ impl FixedWidthStateArena {
             let group = if self.defer_i64_decimal_dedup {
                 self.append_deferred_i64_group(key, u8::from(key_is_null))
             } else {
-                self.probe_or_insert_i64(key, u8::from(key_is_null))
+                self.probe_or_insert(&[key], u8::from(key_is_null))
             };
             let decimal_state_column = self.decimal_state_columns[0]
                 .as_mut()
@@ -5703,7 +5974,11 @@ impl FixedWidthStateArena {
                 }
                 crate::engine::expr::with_optional_compare_collation(
                     aggs[slot].comparison_collation,
-                    || layout_slot.merge_fixed(self.state_mut(group, slot), batch.columns(), row),
+                    || {
+                        self.update_state(group, slot, |state| {
+                            layout_slot.merge_fixed(state, batch.columns(), row)
+                        })
+                    },
                 )?;
             }
         }
@@ -5731,6 +6006,11 @@ impl FixedWidthStateArena {
                     .map(DenseI64Lookup::allocated_bytes)
                     .unwrap_or(0),
             )
+            .saturating_add(
+                self.dense_integer_tuple
+                    .as_ref()
+                    .map_or(0, DenseIntegerTupleLookup::allocated_bytes),
+            )
             .saturating_add(self.partition_groups.iter().fold(0usize, |bytes, groups| {
                 bytes.saturating_add(groups.capacity().saturating_mul(std::mem::size_of::<u32>()))
             }))
@@ -5756,13 +6036,7 @@ impl FixedWidthStateArena {
                         .saturating_mul(std::mem::size_of::<InlineAggState>()),
                 )
             }))
-            .saturating_add(
-                self.state_chunks
-                    .iter()
-                    .flatten()
-                    .map(InlineAggState::heap_bytes)
-                    .sum::<usize>(),
-            )
+            .saturating_add(self.state_heap_bytes)
             .saturating_add(
                 self.decimal_state_columns
                     .iter()
@@ -5820,6 +6094,24 @@ impl FixedWidthStateArena {
         let chunk = group / self.groups_per_chunk;
         let within = group % self.groups_per_chunk;
         &mut self.state_chunks[chunk][within * self.n_aggs + aggregate]
+    }
+
+    #[inline]
+    fn update_state<R>(
+        &mut self,
+        group: usize,
+        aggregate: usize,
+        update: impl FnOnce(&mut InlineAggState) -> R,
+    ) -> R {
+        let state = self.state_mut(group, aggregate);
+        let before = state.heap_bytes();
+        let result = update(state);
+        let after = state.heap_bytes();
+        self.state_heap_bytes = self
+            .state_heap_bytes
+            .saturating_sub(before)
+            .saturating_add(after);
+        result
     }
 
     fn finalized_value(&self, group: usize, aggregate: usize) -> Value {
@@ -7084,6 +7376,20 @@ impl HashAggregateCore {
     }
 
     fn bind_partition_domain(&mut self, schema: &BatchSchema) {
+        // Worker layout admission may depend on batch size/domain density.
+        // Every worker and spill epoch must nevertheless use the same radix
+        // hash, including a short/all-NULL worker that retains generic buckets.
+        if crate::util::env::flag("MYDB_AGG_DENSE_INTEGER_KEYS", true)
+            && FixedWidthStateArena::exact_integer_average_domain(
+                &self.group_columns,
+                &self.aggs,
+                schema,
+            )
+        {
+            self.compact_partition_hash =
+                Some(CompactPartitionHash::Fixed(self.group_columns.len()));
+        }
+
         // Workers may see an all-NULL lane first and choose different
         // kernels. Partition routing must follow the declared key domain.
         if !self.group_columns.is_empty()
@@ -7293,6 +7599,7 @@ impl HashAggregateCore {
                 self.aggs.is_empty()
                     || FixedWidthStateArena::count_keys_warrant_compact_state(&self.group_columns, &self.aggs, batch)
                     || FixedWidthStateArena::has_decimal_state_column(&self.aggs, batch)
+                    || FixedWidthStateArena::has_exact_dense_average(&self.group_columns,&self.aggs,batch)
                     || self
                         .mem_budget
                         .as_ref()
@@ -10563,33 +10870,87 @@ fn merge_dictionary_count_spill_path(
     while let Some(batch) = spill::read_owned_batch(&mut reader, schema.clone())? {
         layout.validate_batch(&batch)?;
         let columns = batch.columns();
-        for row in 0..batch.num_rows() {
-            let key = match columns[0].value_at(row) {
-                Value::Bytes(key) => key,
-                _ => {
-                    return Err(crate::storage::error(
-                        crate::error::catalog::ER_INTERNAL_ERROR,
-                        "dictionary COUNT spill lost its canonical key",
-                    ));
+        // The spill reader already validates native text lanes. Bind their
+        // complete UTF-8 views once per batch instead of rescanning each
+        // short group value when a new representative is retained.
+        let text_columns = columns
+            .iter()
+            .skip(1)
+            .take(group_count)
+            .map(|column| match column {
+                ColumnVector::Utf8 { data, .. } => {
+                    std::str::from_utf8(data).map(Some).map_err(|_| {
+                        crate::error::catalog::ER_INTERNAL_ERROR
+                            .error("dictionary spill lost valid UTF-8")
+                    })
                 }
+                _ => Ok(None),
+            })
+            .collect::<Result<Vec<_>, QueryError>>()?;
+        for row in 0..batch.num_rows() {
+            // Most partial epochs repeat a group. Borrow the native key for
+            // lookup and allocate only when inserting a new canonical key.
+            let key = match &columns[0] {
+                ColumnVector::Bytes { offsets, data, .. } if !columns[0].is_null(row) => {
+                    std::borrow::Cow::Borrowed(
+                        &data[offsets[row] as usize..offsets[row + 1] as usize],
+                    )
+                }
+                column => match column.value_at(row) {
+                    Value::Bytes(key) => std::borrow::Cow::Owned(key),
+                    _ => {
+                        return Err(crate::storage::error(
+                            crate::error::catalog::ER_INTERNAL_ERROR,
+                            "dictionary COUNT spill lost its canonical key",
+                        ));
+                    }
+                },
             };
-            let entry = if let Some(&index) = by_key.get(key.as_slice()) {
-                index
-            } else {
-                let index = buckets.len();
-                let key_values = columns
-                    .iter()
-                    .skip(1)
-                    .take(group_count)
-                    .map(|column| column.value_at(row))
-                    .collect();
-                buckets.push(GroupBucket::new(
-                    key.clone(),
-                    key_values,
-                    vec![AggState::default(); aggs.len()],
-                ));
-                by_key.insert(key, index);
-                index
+            let entry = match by_key.raw_entry_mut().from_key(key.as_ref()) {
+                hashbrown::hash_map::RawEntryMut::Occupied(entry) => *entry.get(),
+                hashbrown::hash_map::RawEntryMut::Vacant(entry) => {
+                    let index = buckets.len();
+                    let key_values = columns
+                        .iter()
+                        .skip(1)
+                        .take(group_count)
+                        .zip(&text_columns)
+                        .map(|(column, text)| {
+                            if let (Some(text), ColumnVector::Utf8 { offsets, .. }) = (text, column)
+                            {
+                                if column.is_null(row) {
+                                    return Ok(Value::Null);
+                                }
+                                let value = text
+                                    .get(offsets[row] as usize..offsets[row + 1] as usize)
+                                    .ok_or_else(|| {
+                                        crate::error::catalog::ER_INTERNAL_ERROR
+                                            .error("dictionary spill lost UTF-8 boundaries")
+                                    })?;
+                                return Ok(
+                                    if value.len() <= crate::types::SMALL_STRING_INLINE_CAP {
+                                        Value::SmallString(
+                                            crate::types::SmallStringBuf::from_slice(
+                                                value.as_bytes(),
+                                            ),
+                                        )
+                                    } else {
+                                        Value::String(value.to_owned())
+                                    },
+                                );
+                            }
+                            Ok(column.value_at(row))
+                        })
+                        .collect::<Result<Vec<_>, QueryError>>()?;
+                    let key = key.into_owned();
+                    buckets.push(GroupBucket::new(
+                        key.clone(),
+                        key_values,
+                        vec![AggState::default(); aggs.len()],
+                    ));
+                    entry.insert(key, index);
+                    index
+                }
             };
             for (slot, codec) in layout.slots.iter().enumerate() {
                 codec.merge(
@@ -11301,6 +11662,312 @@ pub fn run_hash_agg(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_average_workers_share_partition_hash_with_short_batches() {
+        let schema = schema_kv();
+        let specs = [
+            AggregateKind::Sum,
+            AggregateKind::CountStar,
+            AggregateKind::Avg,
+        ]
+        .into_iter()
+        .map(|func| AggregateSpec {
+            func,
+            input_column: 1,
+            comparison_collation: None,
+        })
+        .collect::<Vec<_>>();
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let budget = Arc::new(MemBudget::new(1 << 30));
+        crate::engine::executor::mem_budget::with_query_budget(budget.clone(), || {
+            let large = make_batch(
+                &schema,
+                &(0..2048).map(|i| (i % 128, 1)).collect::<Vec<_>>(),
+            );
+            let small = make_batch(&schema, &(0..16).map(|i| (i, 2)).collect::<Vec<_>>());
+            let mut workers = (0..2)
+                .map(|_| {
+                    HashAggregateCore::with_budget(
+                        vec![0],
+                        specs.clone(),
+                        schema.clone(),
+                        budget.clone(),
+                        root.path(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            workers[0].consume_batch(&large).unwrap();
+            workers[1].consume_batch(&small).unwrap();
+            assert!(workers[0].fixed_width.is_some());
+            assert!(workers[1].fixed_width.is_none());
+            HashAggregateCore::align_parallel_partitioning(workers.iter_mut()).unwrap();
+            let partials = workers
+                .iter_mut()
+                .map(|worker| {
+                    (0..NUM_PARTITIONS)
+                        .map(|p| worker.take_partition_merged_snapshot(p).unwrap())
+                        .collect()
+                })
+                .collect();
+            let mut rows = merge_worker_partition_snapshots(partials, &specs).unwrap();
+            rows.sort_by_key(|row| match row[0] {
+                Value::Int(v) => v,
+                _ => panic!(),
+            });
+            assert_eq!(rows.len(), 128);
+            for (i, row) in rows.iter().enumerate() {
+                assert_eq!(
+                    row[1],
+                    Value::DecimalCompact(if i < 16 { 18 } else { 16 }, 0)
+                );
+                assert_eq!(row[2], Value::Int(if i < 16 { 17 } else { 16 }));
+            }
+        });
+    }
+
+    #[test]
+    fn fixed_width_heap_accounting_tracks_wide_averages_and_minmax_replacement() {
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ("k", ColumnType::LongLong),
+                (
+                    "v",
+                    ColumnType::Decimal {
+                        precision: 65,
+                        scale: 2,
+                    },
+                ),
+                ("s", ColumnType::VarString),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let specs = [
+            (AggregateKind::Sum, 1),
+            (AggregateKind::Avg, 1),
+            (AggregateKind::Min, 2),
+            (AggregateKind::Max, 2),
+            (AggregateKind::Count, 1),
+        ]
+        .into_iter()
+        .map(|(func, input_column)| AggregateSpec {
+            func,
+            input_column,
+            comparison_collation: None,
+        })
+        .collect::<Vec<_>>();
+        let batch = |negative, label: &str| {
+            Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values((0..128).map(|row| Value::Int(row % 3)).collect()),
+                    ColumnVector::from_values(
+                        (0..128)
+                            .map(|row| {
+                                if row % 11 == 0 {
+                                    Value::Null
+                                } else {
+                                    Value::Decimal128(
+                                        if negative { -i128::MAX } else { i128::MAX },
+                                        2,
+                                    )
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values(
+                        (0..128)
+                            .map(|row| {
+                                if row % 13 == 0 {
+                                    Value::Null
+                                } else {
+                                    Value::String(label.to_string())
+                                }
+                            })
+                            .collect(),
+                    ),
+                ],
+            )
+        };
+        let first = batch(false, &"m".repeat(300));
+        let mut arena = FixedWidthStateArena::try_new(&[0], &specs, &first).unwrap();
+        for input in [
+            first,
+            batch(false, "a"),
+            batch(true, &"z".repeat(600)),
+            batch(true, "b"),
+        ] {
+            arena.consume_batch(&[0], &specs, &input).unwrap();
+            let actual = arena
+                .state_chunks
+                .iter()
+                .flatten()
+                .map(InlineAggState::heap_bytes)
+                .sum::<usize>();
+            assert!(
+                actual > 0,
+                "wide AVG and variable-width extrema own heap storage"
+            );
+            assert_eq!(arena.state_heap_bytes, actual);
+            assert!(arena.allocated_bytes() >= actual);
+        }
+    }
+
+    #[test]
+    fn dense_integer_groups_keep_exact_states_through_growth_nulls_and_outliers() {
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ("a", ColumnType::LongLong),
+                ("b", ColumnType::LongLong),
+                (
+                    "v",
+                    ColumnType::Decimal {
+                        precision: 30,
+                        scale: 4,
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let batch = |pass: i64| {
+            Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(
+                        (0..4096)
+                            .map(|i| {
+                                if i % 31 == 0 {
+                                    Value::Null
+                                } else {
+                                    Value::Int((i * 17) % 3 + pass - 1)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values(
+                        (0..4096)
+                            .map(|i| {
+                                if i % 29 == 0 {
+                                    Value::Null
+                                } else {
+                                    Value::Int((i * 73) % 257 + pass * 127)
+                                }
+                            })
+                            .collect(),
+                    ),
+                    ColumnVector::from_values(
+                        (0..4096)
+                            .map(|i| {
+                                if i % 7 == 0 {
+                                    Value::Null
+                                } else {
+                                    Value::DecimalCompact((i % 101) - 50, 4)
+                                }
+                            })
+                            .collect(),
+                    ),
+                ],
+            )
+        };
+        let outlier = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(vec![Value::Int(i64::MIN), Value::Int(i64::MAX)]),
+                ColumnVector::from_values(vec![Value::Int(i64::MAX), Value::Int(i64::MIN)]),
+                ColumnVector::from_values(vec![
+                    Value::DecimalCompact(1, 4),
+                    Value::DecimalCompact(-1, 4),
+                ]),
+            ],
+        );
+        for keys in [vec![0], vec![0, 1]] {
+            let run = |gate| {
+                crate::util::env::with_vars(&[("MYDB_AGG_DENSE_INTEGER_KEYS", Some(gate))], || {
+                    let budget = Arc::new(MemBudget::new(128 << 20));
+                    crate::engine::executor::mem_budget::with_query_budget(budget, || {
+                        let specs = [
+                            AggregateKind::Sum,
+                            AggregateKind::Avg,
+                            AggregateKind::Count,
+                            AggregateKind::Min,
+                            AggregateKind::Max,
+                        ]
+                        .into_iter()
+                        .map(|func| AggregateSpec {
+                            func,
+                            input_column: 2,
+                            comparison_collation: None,
+                        })
+                        .collect();
+                        let mut core = HashAggregateCore::new(keys.clone(), specs);
+                        let first = batch(0);
+                        let first = if keys.len() == 1 {
+                            Batch::new(
+                                schema.clone(),
+                                vec![
+                                    ColumnVector::from_values(
+                                        (0..4096)
+                                            .map(|i| {
+                                                if i % 31 == 0 {
+                                                    Value::Null
+                                                } else {
+                                                    Value::Int(1 + (i * 104729) % 1_600_000)
+                                                }
+                                            })
+                                            .collect(),
+                                    ),
+                                    first.columns()[1].clone(),
+                                    first.columns()[2].clone(),
+                                ],
+                            )
+                        } else {
+                            first
+                        };
+                        core.consume_batch(&first).unwrap();
+                        if gate == "on" {
+                            assert!(core
+                                .fixed_width
+                                .as_ref()
+                                .unwrap()
+                                .dense_integer_tuple
+                                .is_some());
+                        }
+                        core.consume_batch(&batch(1)).unwrap();
+                        core.consume_batch(&outlier).unwrap();
+                        if gate == "on" {
+                            assert!(core
+                                .fixed_width
+                                .as_ref()
+                                .unwrap()
+                                .dense_integer_tuple
+                                .is_none());
+                        }
+                        core.consume_batch(&batch(0)).unwrap();
+                        let mut rows = core.finalize().unwrap();
+                        rows.sort_by_key(|row| format!("{row:?}"));
+                        rows
+                    })
+                })
+            };
+            assert_eq!(run("on"), run("off"), "keys={keys:?}");
+        }
+    }
 
     #[test]
     fn mixed_integer_and_decimal_sums_keep_every_state_column_compact() {
@@ -13549,6 +14216,114 @@ mod tests {
         assert!(rows.iter().all(|row| row[1] == Value::Int(32)));
         drop(agg);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn dictionary_spill_replay_preserves_unicode_nulls_and_repeated_epoch_sums() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let schema = Arc::new(BatchSchema::new(
+            [
+                ("label", ColumnType::VarString),
+                ("id", ColumnType::LongLong),
+                (
+                    "v",
+                    ColumnType::Decimal {
+                        precision: 20,
+                        scale: 2,
+                    },
+                ),
+            ]
+            .into_iter()
+            .map(|(name, column_type)| BatchField {
+                table: "t".into(),
+                alias: None,
+                name: name.into(),
+                column_type,
+                source: Default::default(),
+            })
+            .collect(),
+        ));
+        let batch = Batch::new(
+            schema.clone(),
+            vec![
+                ColumnVector::from_values(
+                    (0..8192)
+                        .map(|r| match r % 5 {
+                            0 => Value::Null,
+                            1 => Value::String(String::new()),
+                            2 => Value::String("Ä中文🙂".into()),
+                            3 => Value::String("a longer Unicode representative 日本語".into()),
+                            _ => Value::String("tail".into()),
+                        })
+                        .collect(),
+                ),
+                ColumnVector::from_values(
+                    (0..8192)
+                        .map(|r| {
+                            if r % 7 == 0 {
+                                Value::Null
+                            } else {
+                                Value::Int(r % 11)
+                            }
+                        })
+                        .collect(),
+                ),
+                ColumnVector::from_values(
+                    (0..8192)
+                        .map(|r| {
+                            if r % 13 == 0 {
+                                Value::Null
+                            } else {
+                                Value::DecimalCompact(r % 31 - 15, 2)
+                            }
+                        })
+                        .collect(),
+                ),
+            ],
+        );
+        let specs = vec![AggregateSpec {
+            comparison_collation: None,
+            func: AggregateKind::Sum,
+            input_column: 2,
+        }];
+        let shared = Arc::new(SharedHashAggSpill::new(
+            root.path().to_path_buf(),
+            schema.clone(),
+            &[0, 1],
+            specs.clone(),
+        ));
+        let mut worker = HashAggregateCore::with_budget(
+            vec![0, 1],
+            specs.clone(),
+            schema,
+            Arc::new(MemBudget::new(64 << 20)),
+            root.path(),
+        )
+        .with_shared_spill(shared.clone());
+        let mut oracle = HashAggregateCore::new(vec![0, 1], specs.clone());
+        for _ in 0..3 {
+            worker.consume_batch(&batch).unwrap();
+            oracle.consume_batch(&batch).unwrap();
+            assert!(worker.dictionary_count.is_some());
+            worker.do_spill_dictionary_count().unwrap();
+        }
+        let actual =
+            merge_worker_partition_snapshots(vec![shared.partition_snapshots().unwrap()], &specs)
+                .unwrap();
+        let expected = oracle.finalize().unwrap();
+        let canonical = |rows: Vec<Vec<Value>>| {
+            let mut rows = rows
+                .into_iter()
+                .map(|row| {
+                    row.iter()
+                        .map(crate::storage::value_to_string)
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>();
+            rows.sort();
+            rows
+        };
+        assert_eq!(canonical(actual), canonical(expected));
     }
 
     #[test]

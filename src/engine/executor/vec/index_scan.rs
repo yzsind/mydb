@@ -61,6 +61,11 @@ enum ScanState {
         values: Vec<RowId>,
         offset: usize,
     },
+    SharedRowIds {
+        input: Arc<SharedRowIdInput>,
+        offset: usize,
+        end: usize,
+    },
     SpilledRowIds {
         _tmp: crate::engine::executor::select::grace::SpillTmpDir,
         reader: crate::engine::executor::spill_quota::TrackedSpillReader,
@@ -77,6 +82,12 @@ enum ScanState {
         high: Option<IndexBound>,
     },
     Done,
+}
+
+struct SharedRowIdInput {
+    values: Vec<RowId>,
+    _charge: crate::engine::executor::mem_budget::ScopedCharge,
+    _metadata: crate::engine::executor::mem_budget::ScopedCharge,
 }
 
 /// A physical cursor's direction is a type property, so merge comparisons
@@ -956,6 +967,135 @@ impl IndexBatchStream {
         Ok(stream)
     }
 
+    /// Share an already sorted resident RID domain across page-disjoint
+    /// readers. The original allocation and its reservation have one owner;
+    /// no worker copies the complete domain or opens an index cursor again.
+    pub(crate) fn into_row_id_workers(mut self, degree: usize) -> Result<Vec<Self>, QueryError> {
+        let ScanState::RowIds { values, offset: 0 } = &self.state else {
+            return Ok(vec![self]);
+        };
+        if degree <= 1
+            || values.is_empty()
+            || values.windows(2).any(|pair| pair[0] >= pair[1])
+            || self.count_rowids_as_index_entries
+            || self.covering
+            || self.seen.is_some()
+            || self.predicate_first.is_some()
+            || !self.exact_runtime_filters.is_empty()
+            || self.prefix_limits.iter().any(Option::is_some)
+        {
+            return Ok(vec![self]);
+        }
+        let degree = degree.min(values.len());
+        let metadata_bytes = degree.saturating_mul(
+            std::mem::size_of::<Self>()
+                .saturating_add(4096)
+                .saturating_add(self.schema_cols.len().saturating_mul(256)),
+        );
+        let mut metadata = self.runtime_lookup_charge.sibling();
+        let cap = crate::engine::executor::mem_budget::current_budget()
+            .map_or(1 << 20, |budget| budget.limit() / 16);
+        if !metadata.add_within(metadata_bytes, cap) {
+            return Ok(vec![self]);
+        }
+        let mut ranges = Vec::with_capacity(degree + 1);
+        ranges.push(0);
+        for worker in 1..degree {
+            let mut boundary = values.len() / degree * worker;
+            while boundary < values.len()
+                && values[boundary - 1].page_id == values[boundary].page_id
+            {
+                boundary += 1;
+            }
+            if boundary < values.len() && boundary > *ranges.last().unwrap() {
+                ranges.push(boundary);
+            }
+        }
+        ranges.push(values.len());
+        if ranges.len() <= 2 {
+            return Ok(vec![self]);
+        }
+        let mut workers = Vec::with_capacity(ranges.len() - 1);
+        for _ in 0..ranges.len() - 1 {
+            let Some(mut worker) = Self::new(
+                &self.db,
+                self.txn,
+                &self.table,
+                &self.index,
+                IndexBatchAccess::Lookup {
+                    key: IndexKey::from(Vec::new()),
+                    exact: true,
+                },
+                false,
+                Some(&self.schema_cols),
+            )?
+            else {
+                return Ok(vec![self]);
+            };
+            worker.count_rowids_as_index_entries = false;
+            worker.properties = BatchProperties::UNORDERED_SINGLE;
+            worker.configure_parallel_mrr();
+            workers.push(worker);
+        }
+        let ScanState::RowIds { values, .. } = std::mem::replace(&mut self.state, ScanState::Done)
+        else {
+            unreachable!()
+        };
+        let charge = std::mem::replace(
+            &mut self.runtime_lookup_charge,
+            crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        );
+        let input = Arc::new(SharedRowIdInput {
+            values,
+            _charge: charge,
+            _metadata: metadata,
+        });
+        for (worker, range) in workers.iter_mut().zip(ranges.windows(2)) {
+            worker.state = ScanState::SharedRowIds {
+                input: input.clone(),
+                offset: range[0],
+                end: range[1],
+            };
+        }
+        Ok(workers)
+    }
+
+    fn configure_parallel_mrr(&mut self) {
+        let mrr = crate::engine::executor::select::plan::MrrWorkArea::new();
+        let projected_width =
+            16usize.saturating_add(self.schema_cols.iter().fold(0usize, |bytes, column_index| {
+                let Some(column) = self.table.schema.columns.get(*column_index) else {
+                    return bytes;
+                };
+                let width = self
+                    .table
+                    .schema
+                    .stats
+                    .columns
+                    .get(&column.name.to_ascii_lowercase())
+                    .and_then(|stats| stats.average_width_bytes)
+                    .unwrap_or(column.data_type.key_byte_length() as f64)
+                    .ceil() as usize;
+                bytes.saturating_add(width)
+            }));
+        // The transient fetch result owns one Vec<Value> per row
+        // before conversion into typed columns. Include both stack
+        // shapes plus the established 32-byte RID/map allowance.
+        self.mrr_resident_bytes_per_row = projected_width
+            .saturating_add(std::mem::size_of::<Vec<Value>>())
+            .saturating_add(
+                self.schema_cols
+                    .len()
+                    .saturating_mul(std::mem::size_of::<Value>()),
+            )
+            .saturating_add(32);
+        self.batch_rows = mrr.window_rows_for_resident_bytes(
+            self.mrr_resident_bytes_per_row,
+            PARALLEL_MRR_MAX_BATCH_ROWS,
+        );
+        self.mrr = Some(mrr);
+    }
+
     /// Split a forward range over contiguous B-tree leaf slices. Covering
     /// workers project keys directly; non-covering workers use a governed,
     /// wider MRR window before their page-local heap fetch. The returned
@@ -1030,42 +1170,7 @@ impl IndexBatchStream {
                 high: high.clone(),
             };
             if !covering {
-                let mrr = crate::engine::executor::select::plan::MrrWorkArea::new();
-                let projected_width = 16usize.saturating_add(worker.schema_cols.iter().fold(
-                    0usize,
-                    |bytes, column_index| {
-                        let Some(column) = worker.table.schema.columns.get(*column_index) else {
-                            return bytes;
-                        };
-                        let width = worker
-                            .table
-                            .schema
-                            .stats
-                            .columns
-                            .get(&column.name.to_ascii_lowercase())
-                            .and_then(|stats| stats.average_width_bytes)
-                            .unwrap_or(column.data_type.key_byte_length() as f64)
-                            .ceil() as usize;
-                        bytes.saturating_add(width)
-                    },
-                ));
-                // The transient fetch result owns one Vec<Value> per row
-                // before conversion into typed columns. Include both stack
-                // shapes plus the established 32-byte RID/map allowance.
-                worker.mrr_resident_bytes_per_row = projected_width
-                    .saturating_add(std::mem::size_of::<Vec<Value>>())
-                    .saturating_add(
-                        worker
-                            .schema_cols
-                            .len()
-                            .saturating_mul(std::mem::size_of::<Value>()),
-                    )
-                    .saturating_add(32);
-                worker.batch_rows = mrr.window_rows_for_resident_bytes(
-                    worker.mrr_resident_bytes_per_row,
-                    PARALLEL_MRR_MAX_BATCH_ROWS,
-                );
-                worker.mrr = Some(mrr);
+                worker.configure_parallel_mrr();
             }
             out.push(worker);
         }
@@ -1995,6 +2100,7 @@ impl IndexBatchStream {
                 ScanState::Done => return Ok(None),
                 ScanState::Uninitialized(_)
                 | ScanState::RowIds { .. }
+                | ScanState::SharedRowIds { .. }
                 | ScanState::SpilledRowIds { .. } => unreachable!(),
             }
         }
@@ -2091,6 +2197,16 @@ impl IndexBatchStream {
                     let end = (*offset + self.batch_rows).min(values.len());
                     let chunk = values[*offset..end].to_vec();
                     *offset = end;
+                    chunk
+                }
+                ScanState::SharedRowIds { input, offset, end } => {
+                    if *offset >= *end {
+                        self.state = ScanState::Done;
+                        return Ok(None);
+                    }
+                    let stop = offset.saturating_add(self.batch_rows).min(*end);
+                    let chunk = input.values[*offset..stop].to_vec();
+                    *offset = stop;
                     chunk
                 }
                 ScanState::SpilledRowIds {
@@ -2215,6 +2331,7 @@ impl IndexBatchStream {
                 ScanState::RepairAwareReverse(cursor) => cursor.is_finished(),
                 ScanState::Reverse(cursor) => cursor.is_finished(),
                 ScanState::RowIds { values, offset } => *offset >= values.len(),
+                ScanState::SharedRowIds { offset, end, .. } => *offset >= *end,
                 ScanState::SpilledRowIds { remaining, .. } => *remaining == 0,
                 ScanState::Done => true,
                 ScanState::LeafRange {
@@ -3017,6 +3134,111 @@ mod tests {
     use crate::engine::api::QueryResponse;
     use crate::engine::executor::StorageQueryEngine;
     use crate::storage::{DurabilityMode, IsolationLevel, StorageConfig};
+
+    #[test]
+    fn parallel_resident_row_ids_share_one_reservation_and_preserve_mvcc() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            StorageConfig {
+                durability: DurabilityMode::Memory,
+                ..StorageConfig::from_env()
+            },
+        )
+        .unwrap();
+        engine.execute("CREATE TABLE shared_rids (id INT PRIMARY KEY, k BIGINT, amount DECIMAL(20,2), pad VARCHAR(3000), INDEX ik(k))").unwrap();
+        engine.execute("INSERT INTO shared_rids SELECT n, CASE WHEN MOD(n,7)=0 THEN NULL ELSE n-300 END, n*1.25, REPEAT('x',2048) FROM generate_series(1,600) gs(n)").unwrap();
+        let db = engine.db_for_tests();
+        let scn = db.visible_scn();
+        let _snapshot = db.register_statement_snapshot(scn);
+        let txn = TxnView::read_only(scn, IsolationLevel::RepeatableRead);
+        let stored = db.scan_rows("test.shared_rids", txn).unwrap();
+        let mut ids: Vec<_> = stored.iter().map(|row| row.row_id).collect();
+        ids.sort_unstable();
+        let mut expected: Vec<_> = stored.iter().map(|row| row.values[..3].to_vec()).collect();
+        expected.sort_by_key(|row| match row[0] {
+            Value::Int(id) => id,
+            _ => unreachable!(),
+        });
+        let schema = db.snapshot_table_schema("test.shared_rids").unwrap();
+        let index = schema
+            .indexes
+            .iter()
+            .find(|index| index.primary)
+            .unwrap()
+            .clone();
+        let table = PlanTable::new(schema.id, schema, None);
+        engine
+            .execute("UPDATE shared_rids SET k=900, amount=999.99 WHERE MOD(id,3)=0")
+            .unwrap();
+        engine
+            .execute("DELETE FROM shared_rids WHERE MOD(id,5)=0")
+            .unwrap();
+        let budget = Arc::new(MemBudget::new(32 << 20));
+        with_query_budget(budget.clone(), || {
+            let source = IndexBatchStream::from_row_ids(
+                db,
+                txn,
+                &table,
+                &index,
+                ids.clone(),
+                Some(&[0, 1, 2]),
+            )
+            .unwrap()
+            .unwrap();
+            let address = match &source.state {
+                ScanState::RowIds { values, .. } => values.as_ptr(),
+                _ => unreachable!(),
+            };
+            let workers = source.into_row_id_workers(3).unwrap();
+            assert_eq!(workers.len(), 3);
+            let mut last_page = None;
+            for worker in &workers {
+                let ScanState::SharedRowIds { input, offset, end } = &worker.state else {
+                    panic!("shared RID input")
+                };
+                assert_eq!(
+                    input.values.as_ptr(),
+                    address,
+                    "workers must not copy the RID domain"
+                );
+                assert_ne!(last_page, Some(input.values[*offset].page_id));
+                last_page = Some(input.values[*end - 1].page_id);
+            }
+            let mut actual = Vec::new();
+            for mut worker in workers {
+                while let Some(batch) = worker.next_batch().unwrap() {
+                    actual.extend(batch.visible_indices().map(|row| batch.row(row)));
+                }
+            }
+            actual.sort_by_key(|row| match row[0] {
+                Value::Int(id) => id,
+                _ => unreachable!(),
+            });
+            assert_eq!(
+                actual, expected,
+                "all workers must read the captured snapshot"
+            );
+        });
+        assert_eq!(budget.used(), 0);
+        let budget = Arc::new(MemBudget::new(32 << 10));
+        with_query_budget(budget.clone(), || {
+            let source =
+                IndexBatchStream::from_row_ids(db, txn, &table, &index, ids, Some(&[0, 1, 2]))
+                    .unwrap()
+                    .unwrap();
+            let readers = source.into_row_id_workers(3).unwrap();
+            assert_eq!(
+                readers.len(),
+                1,
+                "optional metadata must not exceed its workspace"
+            );
+            drop(readers);
+            assert!(budget.terminal_oom().is_none());
+        });
+        assert_eq!(budget.used(), 0);
+    }
 
     #[test]
     fn parallel_raw_integer_runtime_filters_preserve_ranges_nulls_and_snapshots() {

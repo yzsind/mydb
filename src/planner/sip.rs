@@ -226,7 +226,11 @@ pub(crate) fn propagate_sideways_dimension_filters(db: &Database, select: &mut S
             .keys()
             .filter(|a| {
                 let filters = const_filters.get(*a).map(Vec::as_slice).unwrap_or(&[]);
-                row_count_of(a) <= source_row_limit(filters) && source_is_selective(a, filters)
+                tables
+                    .iter()
+                    .any(|table| table.alias == **a && table.schema.id != 0)
+                    && row_count_of(a) <= source_row_limit(filters)
+                    && source_is_selective(a, filters)
             })
             .cloned()
             .collect();
@@ -264,10 +268,12 @@ pub(crate) fn propagate_sideways_dimension_filters(db: &Database, select: &mut S
                     let target_alias = neighbor.clone();
                     let target_col = new_path.last().unwrap().to_col.clone();
                     let key = (target_alias.clone(), target_col.clone());
-                    let transit_too_big = new_path
-                        .iter()
-                        .take(new_path.len() - 1)
-                        .any(|s| row_count_of(&s.to_alias) > max_transit_rows);
+                    let transit_too_big = new_path.iter().take(new_path.len() - 1).any(|s| {
+                        row_count_of(&s.to_alias) > max_transit_rows
+                            || tables
+                                .iter()
+                                .any(|table| table.alias == s.to_alias && table.schema.id == 0)
+                    });
                     // SIP only pays off when the target is a *larger* fact
                     // table the small filtered source can shrink. When the
                     // target is no larger than the source, the synthesized
@@ -281,8 +287,11 @@ pub(crate) fn propagate_sideways_dimension_filters(db: &Database, select: &mut S
                     // visibility of an equal-or-smaller join, so leave it
                     // alone. (Real star schemas always satisfy fact > dim, so
                     // this never suppresses a beneficial push.)
-                    let target_not_larger =
-                        row_count_of(&target_alias) <= row_count_of(source_alias);
+                    let target_not_larger = row_count_of(&target_alias)
+                        <= row_count_of(source_alias)
+                        || tables
+                            .iter()
+                            .any(|table| table.alias == target_alias && table.schema.id == 0);
                     if !transit_too_big
                         && !target_not_larger
                         && !added.contains(&key)
@@ -351,9 +360,6 @@ pub(super) fn collect_sip_tables(db: &Database, select: &Select) -> Option<Vec<S
         if join.derived.is_some() || join.lateral {
             return None;
         }
-        if crate::engine::executor::cte::has_cte(&join.table.name) {
-            return None;
-        }
         let sip_table = sip_table_from_ref(db, &join.table)?;
         if !seen_aliases.insert(sip_table.alias.clone()) {
             return None;
@@ -368,15 +374,20 @@ pub(super) fn sip_table_from_ref(db: &Database, table: &TableRef) -> Option<SipT
     if table.sample.is_some() {
         return None;
     }
-    if crate::engine::executor::cte::has_cte(&table.name) {
-        return None;
-    }
     let alias = table
         .alias
         .clone()
         .unwrap_or_else(|| sip_short_table_name(&table.name))
         .to_ascii_lowercase();
-    let schema = db.table(&table.name).ok()?;
+    // Materialized siblings still participate in name/ambiguity resolution.
+    // They never become synthesized subquery sources or transit relations.
+    let schema = if let Some(cte) = crate::engine::executor::cte::lookup_cte(&table.name) {
+        let mut schema = TableSchema::synthetic_for_planning(&table.name, &cte.columns);
+        schema.stats.row_count = cte.estimated_rows.max(0.0) as u64;
+        Arc::new(schema)
+    } else {
+        db.table(&table.name).ok()?
+    };
     let columns: HashSet<String> = schema
         .iter_visible_columns()
         .map(|(_, c)| c.name.to_ascii_lowercase())

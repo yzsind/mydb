@@ -1,6 +1,7 @@
 //! scan execution and preparation.
 
 use super::*;
+mod runtime_index;
 
 /// A `BatchOperator` that reads directly from storage into columnar
 /// `Batch`es, bypassing the `PlanRow` intermediate representation.
@@ -1961,6 +1962,29 @@ pub(super) fn try_build_direct_batch_scan<'a>(
                     }
                     _ => Box::new(stream),
                 };
+                let stream = if use_zone_map
+                    || matches!(
+                        inner,
+                        PhysicalPlan::SeqScan {
+                            hint_note: Some(_),
+                            ..
+                        } | PhysicalPlan::ParallelSeqScan {
+                            hint_note: Some(_),
+                            ..
+                        }
+                    ) {
+                    stream
+                } else {
+                    runtime_index::wrap_filtered(
+                        db,
+                        txn,
+                        table,
+                        scan_projection_columns(table, proj),
+                        runtime_filters,
+                        stream,
+                        f,
+                    )?
+                };
                 return Ok(Some(VecBatchInput { stream, template }));
             }
             // The local predicate was not selective enough to justify its
@@ -2047,8 +2071,36 @@ pub(super) fn try_build_direct_batch_scan<'a>(
             analyze_plan: Some(plan),
             analyze_recorded: false,
         });
+        let filtered: Box<dyn BatchOperator + 'a> =
+            Box::new(SparseSelectionCoalesceStream::new(filtered));
+        // A nonselective local predicate can still receive a selective join
+        // domain after construction. Keep the optional RID source outside the
+        // full predicate, with the same access-hint and zone-map boundaries.
+        let filtered = if use_zone_map
+            || matches!(
+                inner,
+                PhysicalPlan::SeqScan {
+                    hint_note: Some(_),
+                    ..
+                } | PhysicalPlan::ParallelSeqScan {
+                    hint_note: Some(_),
+                    ..
+                }
+            ) {
+            filtered
+        } else {
+            runtime_index::wrap_filtered(
+                db,
+                txn,
+                table,
+                scan_projection_columns(table, proj),
+                runtime_filters,
+                filtered,
+                f,
+            )?
+        };
         return Ok(Some(VecBatchInput {
-            stream: Box::new(SparseSelectionCoalesceStream::new(filtered)),
+            stream: filtered,
             template,
         }));
     }
@@ -2095,6 +2147,28 @@ pub(super) fn try_build_direct_batch_scan<'a>(
     if use_zone_map {
         ZONE_MAP_BATCH_SCAN_HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
+    let fixed_access = matches!(
+        inner,
+        PhysicalPlan::SeqScan {
+            hint_note: Some(_),
+            ..
+        } | PhysicalPlan::ParallelSeqScan {
+            hint_note: Some(_),
+            ..
+        }
+    );
+    let stream = if use_zone_map || fixed_access {
+        stream
+    } else {
+        runtime_index::wrap(
+            db,
+            txn,
+            table,
+            scan_projection_columns(table, proj),
+            runtime_filters,
+            stream,
+        )
+    };
     Ok(Some(VecBatchInput { stream, template }))
 }
 

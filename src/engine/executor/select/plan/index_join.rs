@@ -5426,7 +5426,7 @@ pub(super) fn try_inl_secondary_intersect(
 /// `None` is deliberately the missing/stale-statistics fallback: a runtime
 /// filter is optional, so uncertain costing must preserve bounded work rather
 /// than speculatively scanning a large secondary index.
-pub(super) fn estimate_runtime_keyset_index_entries(
+pub(in crate::engine::executor::select) fn estimate_runtime_keyset_index_entries(
     row_count: u64,
     ndv: u64,
     key_count: usize,
@@ -5561,6 +5561,7 @@ pub(super) fn try_inlj_runtime_keyset_intersect(
             &lookup_keys,
             txn,
             entry_budget,
+            !index.unique,
         )?
         else {
             INLJ_RUNTIME_KEYSET_INTERSECT_BUDGET_REJECTED

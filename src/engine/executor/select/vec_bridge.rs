@@ -65,6 +65,9 @@ pub(super) use aggregation::*;
 mod compute;
 use compute::*;
 mod analyzed_workers;
+pub(crate) mod count_witness;
+pub(in crate::engine::executor) mod group_input_filter;
+pub(in crate::engine::executor) mod join_domain;
 mod projection_parallel;
 mod rollup_preaggregate;
 
@@ -137,6 +140,9 @@ macro_rules! batch_wrapper_method {
         }
     };
     (install_runtime_filter) => {
+        fn benefits_from_runtime_key_components(&self, keys: &[Expr]) -> bool {
+            self.upstream.benefits_from_runtime_key_components(keys)
+        }
         fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
             self.upstream.install_runtime_filter(filter)
         }
@@ -470,6 +476,16 @@ fn vec_hash_agg_group_fields_from_values(
 
 /// Bind metadata-only rows without materializing any input or cloning its AST.
 fn plan_output_template(plan: &PhysicalPlan) -> Vec<PlanField> {
+    // These nodes preserve their input relation's schema. In particular, a
+    // filter above a set expression must retain its projected output names,
+    // rather than collecting the first branch's pre-projection join fields.
+    match plan {
+        PhysicalPlan::Filter { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::Materialize { input, .. }
+        | PhysicalPlan::Exchange { input, .. } => return plan_output_template(input),
+        _ => {}
+    }
     // Set operations expose each branch's projected relation, including
     // aliases and the common comparison/output types. The legacy field
     // collector treats Projection as transparent and would expose the left
@@ -1628,6 +1644,26 @@ fn hash_aggregate_node(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
         | PhysicalPlan::ParallelIndexAggregate { .. }) => Some(node),
         PhysicalPlan::Projection {
             input,
+            projection,
+            distinct: true,
+            ..
+        }
+        | PhysicalPlan::StreamingDistinct {
+            input, projection, ..
+        } if projection.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Expr {
+                    expr: Expr::GroupKeyRef { .. },
+                    ..
+                }
+            )
+        }) =>
+        {
+            hash_aggregate_node(input)
+        }
+        PhysicalPlan::Projection {
+            input,
             distinct: false,
             ..
         }
@@ -2577,6 +2613,10 @@ impl BatchOperator for AnalyzedBatchOperator<'_> {
         self.inner.sample_scan_pages(max_pages)
     }
 
+    fn benefits_from_runtime_key_components(&self, keys: &[Expr]) -> bool {
+        self.inner.benefits_from_runtime_key_components(keys)
+    }
+
     fn install_runtime_filter(&mut self, mut filter: crate::planner::RuntimeFilter) -> bool {
         // ANALYZE is observational only and must never form an execution
         // boundary. In particular, a parent hash join installs its build-side
@@ -2776,7 +2816,9 @@ fn try_native_vec_input_stream_checked<'a>(
                         .flatten(),
                     range_plan_key: matches!(
                         plan,
-                        PhysicalPlan::IndexMerge { .. }
+                        PhysicalPlan::SeqScan { .. }
+                            | PhysicalPlan::ParallelSeqScan { .. }
+                            | PhysicalPlan::IndexMerge { .. }
                             | PhysicalPlan::IndexLookup { .. }
                             | PhysicalPlan::IndexMultiLookup { .. }
                             | PhysicalPlan::IndexRangeScan { .. }
@@ -3021,6 +3063,37 @@ impl Drop for NativePlanBatchCursor {
     }
 }
 
+/// Execute a preplanned SELECT through the same complete output boundary as
+/// ordinary CTE materialization. Legacy projection after raw aggregation can
+/// otherwise bypass query-output proofs (including DISTINCT count witnesses).
+pub(in crate::engine::executor) fn try_stream_analyzed_select(
+    db: &Arc<Database>,
+    txn: TxnView,
+    select: &crate::parser::Select,
+    plan: &PhysicalPlan,
+    filter: Option<crate::planner::RuntimeFilter>,
+) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
+    let output = if final_projection(plan).is_some() {
+        let output = Arc::new(plan.clone());
+        analyze_stats::bind_plan_clone(&output, plan);
+        output
+    } else {
+        let input = Box::new(plan.clone());
+        analyze_stats::bind_plan_clone(&input, plan);
+        Arc::new(PhysicalPlan::Projection {
+            input,
+            projection: select.projection.clone(),
+            distinct: select.distinct,
+            estimated_rows: crate::planner::estimated_rows(plan),
+            cost: crate::planner::plan_cost(plan),
+        })
+    };
+    let budget =
+        mem_budget::current_budget().unwrap_or_else(|| Arc::new(mem_budget::MemBudget::from_env()));
+    let context = super::execution_context::ExecutionContext::capture_with_budget(txn, budget);
+    try_stream_native_plan_with_group_filter(db.clone(), txn, output, context, filter)
+}
+
 /// Convert a fully lowered physical graph to the sole protocol row boundary.
 /// The graph is preflighted before the worker is spawned; once opened, native
 /// batches cross a bounded channel and become rows only as the client pulls
@@ -3032,12 +3105,31 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
     plan: Arc<PhysicalPlan>,
     execution_context: super::execution_context::ExecutionContext,
 ) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
+    try_stream_native_plan_with_group_filter(db, txn, plan, execution_context, None)
+}
+
+pub(in crate::engine::executor) fn try_stream_native_plan_with_group_filter(
+    db: Arc<Database>,
+    txn: TxnView,
+    plan: Arc<PhysicalPlan>,
+    execution_context: super::execution_context::ExecutionContext,
+    filter: Option<crate::planner::RuntimeFilter>,
+) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
     // Worker producers cannot borrow the live connection's routine, sequence,
     // or external-effect context. Callers retain their synchronous native/row
     // fallback instead of moving connection-local effects onto a worker.
     if crate::planner::connection_thread_execution_required() {
         return Ok(None);
     }
+    let group_filter = match filter {
+        Some(filter) => {
+            let Some(target) = group_input_filter::target(&plan, &filter) else {
+                return Ok(None);
+            };
+            Some((target, filter))
+        }
+        None => None,
+    };
 
     preflight_runtime_parameters(&plan)?;
     let Some(template) = preflight_query_output_template(&plan)? else {
@@ -3071,7 +3163,10 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
         let _snapshot_guard = snapshot_guard;
         let _active_worker = super::stream::ActiveStreamWorker::enter();
         let result = execution_context.run(&db, || -> Result<(), QueryError> {
-            let Some(mut input) = try_build_query_output_batch(&db, txn, &worker_plan)? else {
+            let Some(mut input) = group_input_filter::with_filter(group_filter, || {
+                try_build_query_output_batch(&db, txn, &worker_plan)
+            })?
+            else {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_UNKNOWN_ERROR,
                     "physical batch graph changed capability after preflight",
@@ -3736,7 +3831,10 @@ fn try_build_query_output_batch_in_set_domain<'a>(
         }
         _ => plan,
     };
-    let Some(mut input) = try_native_vec_input_stream(db, txn, input_plan)? else {
+    let Some(mut input) = count_witness::with_rule(count_witness::prove(plan), || {
+        try_native_vec_input_stream(db, txn, input_plan)
+    })?
+    else {
         return Ok(None);
     };
     if let Some(stream) = projection_parallel::try_parallel_projection(
@@ -4400,15 +4498,7 @@ fn try_build_vec_filter_input<'a>(
     // input subtree. In particular, a HashJoin child can start scan workers
     // while constructing its BatchOperator; discovering an unsupported
     // expression after that point would violate the no-I/O fallback contract.
-    let mut planned_metas = Vec::new();
-    super::plan::collect_plan_fields(input, &mut planned_metas);
-    let planned_template: Vec<PlanField> = planned_metas
-        .into_iter()
-        .map(|meta| PlanField {
-            meta: super::plan::intern_col_meta(meta),
-            value: Value::Null,
-        })
-        .collect();
+    let planned_template = plan_output_template(input);
     let schema = template_to_batch_schema(&planned_template);
     let resolved_predicate = if is_apply {
         let outer_template = PlanRow::from_fields(planned_template.clone());
@@ -4453,8 +4543,10 @@ fn try_build_vec_filter_input<'a>(
     };
     if let Some(bound) = runtime_index_bound.as_ref() {
         let _ = stream.install_runtime_index_bound(bound);
+        install_materialized_integer_domains(stream.as_mut(), bound, &planned_template);
     }
     let properties = stream.properties();
+    stream = join_domain::wrap_disjunction(input, predicate, stream)?;
     if template.is_empty() {
         return Ok(Some(VecBatchInput { stream, template }));
     }
@@ -4485,6 +4577,78 @@ fn try_build_vec_filter_input<'a>(
         })
     };
     Ok(Some(VecBatchInput { stream, template }))
+}
+
+/// Positive conjunctive IN domains are necessary conditions, never replacements
+/// for the parent predicate. Integer-only binding avoids lossy SQL coercions.
+fn install_materialized_integer_domains(
+    stream: &mut dyn BatchOperator,
+    predicate: &Expr,
+    template: &[PlanField],
+) {
+    if let Expr::Binary {
+        left,
+        op: crate::parser::BinaryOp::And,
+        right,
+    } = predicate
+    {
+        install_materialized_integer_domains(stream, left, template);
+        install_materialized_integer_domains(stream, right, template);
+        return;
+    }
+    let Expr::InList {
+        expr,
+        list,
+        negated: false,
+    } = predicate
+    else {
+        return;
+    };
+    let Some(column) = expr_column_index_in_template(expr, template) else {
+        return;
+    };
+    if !matches!(
+        template[column].column_type,
+        ColumnType::Tiny
+            | ColumnType::Short
+            | ColumnType::MediumInt
+            | ColumnType::Long
+            | ColumnType::LongLong
+    ) {
+        return;
+    }
+    let integer = |expr: &Expr| -> Option<Option<i128>> {
+        match expr {
+            Expr::BoundValue(Value::Int(v)) | Expr::Literal(crate::parser::Literal::Int(v)) => {
+                Some(Some(i128::from(*v)))
+            }
+            Expr::BoundValue(Value::UInt(v)) | Expr::Literal(crate::parser::Literal::UInt(v)) => {
+                Some(Some(i128::from(*v)))
+            }
+            Expr::BoundValue(Value::Null) | Expr::Literal(crate::parser::Literal::Null) => {
+                Some(None)
+            }
+            _ => None,
+        }
+    };
+    if list.iter().any(|value| integer(value).is_none()) {
+        return;
+    }
+    let Ok(mut builder) = super::bloom::ExactIntKeySetBuilder::with_capacity(list.len()) else {
+        return;
+    };
+    for value in list {
+        if let Some(Some(value)) = integer(value) {
+            builder.insert(value);
+        }
+    }
+    let Ok(filter) = builder.finish() else { return };
+    stream.install_runtime_filter(crate::planner::RuntimeFilter::ExactIntKey {
+        keys: vec![expr.as_ref().clone()],
+        null_safe: vec![false],
+        filter: Arc::new(filter),
+        rejected: Arc::new(std::sync::OnceLock::new()),
+    });
 }
 
 /// Count of times the native vec `Filter`-over-join leaf engaged (once per
@@ -5221,6 +5385,16 @@ fn try_build_inlj_batch_input<'a>(
 /// (`projected_columns`) is honoured; the filter still reads the full row, so a
 /// predicate column pruned from the output projection is evaluated correctly.
 fn try_build_cte_batch_scan<'a>(
+    plan: &'a PhysicalPlan,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    let Some(mut input) = try_build_cte_batch_scan_unfiltered(plan)? else {
+        return Ok(None);
+    };
+    input.stream = join_domain::filterable_cte(input.stream, &input.template);
+    Ok(Some(input))
+}
+
+fn try_build_cte_batch_scan_unfiltered<'a>(
     plan: &'a PhysicalPlan,
 ) -> Result<Option<VecBatchInput<'a>>, QueryError> {
     let inner = peel_projection(plan);

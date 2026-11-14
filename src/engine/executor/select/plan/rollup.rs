@@ -1,4 +1,5 @@
 use super::*;
+mod ordered_sum;
 
 /// Bound retained row input by actual capacity, including stale/missing CBO
 /// estimates. The prefix is transferred to the sorter without reopening input.
@@ -726,6 +727,62 @@ impl RollupTopKCollector {
                 prefix_len,
                 key_values,
                 agg_values,
+            },
+        );
+        Ok(())
+    }
+
+    /// A rejected candidate need not own a copy of every group key. The
+    /// boundary test is identical to push_candidate, including peer ties.
+    fn push_borrowed_sums(
+        &mut self,
+        slots: &[super::aggregate::AggregateSlot],
+        prefix_len: usize,
+        key_values: &[Value],
+        agg_values: &[Value],
+    ) -> Result<(), QueryError> {
+        let partition = self.eval_compact_partition_key(prefix_len, key_values, agg_values);
+        let order = self.order_keys.as_ref().and_then(|keys| {
+            keys.iter()
+                .map(|key| Self::eval_compact_key(*key, prefix_len, key_values, agg_values))
+                .collect::<Option<smallvec::SmallVec<[Value; 4]>>>()
+        });
+        let (Some(partition), Some(order)) = (partition, order) else {
+            return self.push_finalized_state(
+                slots,
+                self.group_by_len,
+                prefix_len,
+                key_values.to_vec(),
+                agg_values.to_vec(),
+            );
+        };
+        if let Some(bucket) = self
+            .partitions
+            .get(partition.as_slice())
+            .filter(|b| b.boundary != usize::MAX)
+        {
+            let ordering = crate::engine::executor::sort::compare_sort_keys(
+                &self.sort_fields,
+                &order,
+                &bucket.candidates[bucket.boundary].order_key,
+            );
+            if ordering == std::cmp::Ordering::Greater
+                || (ordering == std::cmp::Ordering::Equal
+                    && matches!(
+                        self.hint.kind,
+                        crate::engine::executor::dispatch::RankKind::RowNumber
+                    ))
+            {
+                return Ok(());
+            }
+        }
+        self.push_candidate(
+            &partition,
+            order.into_vec(),
+            RollupTopKPayload::Compact {
+                prefix_len,
+                key_values: key_values.to_vec(),
+                agg_values: agg_values.to_vec(),
             },
         );
         Ok(())
@@ -1746,6 +1803,21 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
     let mut row = PlanRow::default();
     while stream.next_into(&mut row)? {
         crate::engine::cancel::check_cancelled()?;
+        if prev_full.is_none()
+            && having.is_none()
+            && !needs_sample_fields
+            && !slots.is_empty()
+            && slots
+                .iter()
+                .all(|slot| slot.name.eq_ignore_ascii_case("SUM"))
+            && ordered_rollup_can_cascade(slots, &row)
+            && !crate::util::env::var("MYDB_ORDERED_ROLLUP_REUSE")
+                .is_ok_and(|v| matches!(v.as_str(), "0" | "off" | "false"))
+        {
+            if let RollupEmitTarget::TopK(collector) = out {
+                return ordered_sum::execute(stream, row, group_by, slots, collector);
+            }
+        }
         let cascade = *cascade.get_or_insert_with(|| ordered_rollup_can_cascade(slots, &row));
         let (group_exprs, slot_exprs, collations) = prepared.get_or_insert_with(|| {
             let schema = super::eval::input_schema_for_plan_row(&row);

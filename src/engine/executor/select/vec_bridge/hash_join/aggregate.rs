@@ -47,7 +47,7 @@ impl HashJoinBatchOperator<'_> {
         }
         let preserve_build = (self.join_type == JoinType::Left && self.build_is_left)
             || (self.join_type == JoinType::Right && !self.build_is_left);
-        if self.residual.is_some() || self.reverse_semi_anti {
+        if self.residual.is_some() || self.reduce_build_from_probe {
             return Ok(false);
         }
 

@@ -711,8 +711,6 @@ fn explain_analyze_with_cte_formatted(
     format: ExplainFormat,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
-    use std::collections::HashMap;
-
     // Phase 1: plan the display trees once.
     let (
         body_plan,
@@ -742,64 +740,79 @@ fn explain_analyze_with_cte_formatted(
 
             let query_start = std::time::Instant::now();
 
-            let mut visible: HashMap<String, std::sync::Arc<crate::engine::api::CteResult>> =
-                HashMap::new();
-            let mut timings: Vec<(String, u64, f64)> = Vec::with_capacity(with.ctes.len());
-            for cte in &with.ctes {
-                let key = cte.name.to_ascii_lowercase();
-                let start = std::time::Instant::now();
-                let result = if lossy_ctes.contains(&key) {
-                    // The CTE body's display plan was built via the
-                    // inline-derived rewriter and a SetOp inner only
-                    // contributed its leftmost branch. Re-plan the body
-                    // through the legacy dispatch path so the materialised
-                    // row set is complete (per-node stats inside this CTE
-                    // are forfeited as a result).
-                    super::cte::materialize_single_cte(db, session, cte, visible.clone(), registry)?
-                } else {
-                    // Materialise any inline-derived synthetic CTEs the
-                    // owner's display plan references — must be visible
-                    // before the owner's plan executes so its CteScan
-                    // leaves can resolve. Order is innermost-first
-                    // (registration order from the rewriter).
-                    if let Some(inline_list) = per_cte_inline.get(&key) {
-                        for (inl_key, inl_select) in inline_list {
-                            let Some(inl_plan) = cte_plans.get(inl_key) else {
-                                continue;
-                            };
-                            let inl_result =
-                                super::cte::with_cte_registry(visible.clone(), || {
-                                    materialize_analyzed_inline(
-                                        db, txn, inl_key, inl_select, inl_plan, registry,
-                                    )
-                                })?;
-                            visible.insert(inl_key.clone(), std::sync::Arc::new(inl_result));
+            let timings = std::sync::Mutex::new(Vec::with_capacity(with.ctes.len()));
+            let mut visible = super::cte::materialize_ctes_with(
+                db,
+                session,
+                &with.ctes,
+                &with.body,
+                registry,
+                &|db, session, cte, visible, registry, filter| {
+                    let key = cte.name.to_ascii_lowercase();
+                    let start = std::time::Instant::now();
+                    let mut visible = visible;
+                    let result = if lossy_ctes.contains(&key) {
+                        // The CTE body's display plan was built via the
+                        // inline-derived rewriter and a SetOp inner only
+                        // contributed its leftmost branch. Re-plan the body
+                        // through the legacy dispatch path so the materialised
+                        // row set is complete (per-node stats inside this CTE
+                        // are forfeited as a result).
+                        super::cte::materialize_single_cte(
+                            db,
+                            session,
+                            cte,
+                            visible.clone(),
+                            registry,
+                        )?
+                    } else {
+                        // Materialise any inline-derived synthetic CTEs the
+                        // owner's display plan references — must be visible
+                        // before the owner's plan executes so its CteScan
+                        // leaves can resolve. Order is innermost-first
+                        // (registration order from the rewriter).
+                        if let Some(inline_list) = per_cte_inline.get(&key) {
+                            for (inl_key, inl_select) in inline_list {
+                                let Some(inl_plan) = cte_plans.get(inl_key) else {
+                                    continue;
+                                };
+                                let inl_result =
+                                    super::cte::with_cte_registry(visible.clone(), || {
+                                        materialize_analyzed_inline(
+                                            db, txn, inl_key, inl_select, inl_plan, registry,
+                                        )
+                                    })?;
+                                visible.insert(inl_key.clone(), std::sync::Arc::new(inl_result));
+                            }
                         }
-                    }
-                    super::cte::analyze_materialize_cte(
-                        db,
-                        session,
-                        cte,
-                        &cte_plans,
-                        cte_extras.get(&key).map(|v| v.as_slice()),
-                        &key,
-                        txn,
-                        visible.clone(),
-                        registry,
-                    )?
-                };
-                let elapsed_ms = start.elapsed().as_nanos() as f64 / 1_000_000.0;
-                // A spilled CTE reports rows.len() == 0 (rows live on disk);
-                // `estimated_rows` then carries the real spilled row count
-                // (for a materialised in-memory result it equals rows.len()).
-                let rows_count = if result.nrows() == 0 {
-                    result.estimated_rows as u64
-                } else {
-                    result.nrows() as u64
-                };
-                timings.push((cte.name.clone(), rows_count, elapsed_ms));
-                visible.insert(key, std::sync::Arc::new(result));
-            }
+                        super::cte::analyze_materialize_cte(
+                            db,
+                            session,
+                            cte,
+                            &cte_plans,
+                            cte_extras.get(&key).map(|v| v.as_slice()),
+                            &key,
+                            txn,
+                            visible.clone(),
+                            registry,
+                            filter,
+                        )?
+                    };
+                    let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                    let rows = if result.nrows() == 0 {
+                        result.estimated_rows as u64
+                    } else {
+                        result.nrows() as u64
+                    };
+                    timings.lock().expect("CTE timing lock poisoned").push((
+                        cte.name.clone(),
+                        rows,
+                        elapsed_ms,
+                    ));
+                    Ok(result)
+                },
+            )?;
+            let timings = timings.into_inner().expect("CTE timing lock poisoned");
 
             // Pre-materialise body-level inline-derived stubs the same way
             // (only when the body's display plan is executable and not
@@ -1659,6 +1672,9 @@ fn plan_cte_inner_for_explain(
         inline_derived: &mut Vec<(String, InlineDerivedSelect)>,
         is_lossy: &mut bool,
     ) -> Option<(planner::PhysicalPlan, Vec<String>)> {
+        if let Ok(Some(plan)) = super::cte::streaming_aggregate::try_plan(db, select) {
+            return Some((plan, select.hint_warnings.clone()));
+        }
         refresh_stale_stats_for_select(db, select).ok()?;
         if let Ok(planned) = planner::plan_select(db, select) {
             return Some((planned.physical, planned.hint_warnings));
@@ -5350,6 +5366,9 @@ fn json_close_node_with_actual(out: &mut String, indent: &str, actual: Option<No
                 ", \"index_entries_examined\": {}, \"heap_rows_fetched\": {}, \"heap_page_probes\": {}",
                 s.index_entries_examined, s.heap_rows_fetched, s.heap_page_probes
             ));
+        }
+        if s.runtime_index_probes > 0 {
+            extra.push_str(&format!(", \"runtime_index_probes\": {}, \"runtime_index_candidates\": {}, \"runtime_index_fallbacks\": {}", s.runtime_index_probes, s.runtime_index_candidates, s.runtime_index_fallbacks));
         }
         if s.index_merge_branches > 0 {
             extra.push_str(&format!(

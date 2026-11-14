@@ -99,6 +99,92 @@ struct Encoder<'a> {
     weights: Option<crate::engine::executor::collation_cache::CollationKeyCache>,
 }
 
+/// Reuse the proven tuple encoding for one external-merge head at a time.
+/// Lane changes disable the caller's complete merge optimization before that
+/// head enters the tournament; previous homogeneous comparisons remain valid.
+pub(crate) struct RowEncoder {
+    fields: std::sync::Arc<[SortField]>,
+    lanes: Vec<Option<Lane>>,
+    weights: Option<crate::engine::executor::collation_cache::CollationKeyCache>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl RowEncoder {
+    pub(crate) fn new(fields: std::sync::Arc<[SortField]>) -> Option<Self> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let charge = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::Executor,
+            fields
+                .len()
+                .saturating_mul(std::mem::size_of::<Option<Lane>>())
+                .saturating_add(std::mem::size_of::<Self>()),
+        )?;
+        Some(Self {
+            lanes: vec![None; fields.len()],
+            fields,
+            weights: None,
+            _charge: charge,
+        })
+    }
+    pub(crate) fn bound(keys: &[Value], cached: &[Option<Vec<u8>>]) -> Option<usize> {
+        keys.iter()
+            .enumerate()
+            .try_fold(0usize, |bytes, (i, value)| {
+                let size = if matches!(value, Value::Null) {
+                    1
+                } else if matches!(value, Value::String(_) | Value::SmallString(_)) {
+                    cached.get(i).and_then(Option::as_ref).map_or_else(
+                        || {
+                            crate::types::value_str(value)
+                                .map(|s| s.len().saturating_mul(16).saturating_add(3))
+                        },
+                        |s| Some(s.len().saturating_mul(2).saturating_add(3)),
+                    )?
+                } else {
+                    value_lane(value)?;
+                    33
+                };
+                bytes.checked_add(size)
+            })
+    }
+    pub(crate) fn encode(
+        &mut self,
+        keys: &[Value],
+        cached: &[Option<Vec<u8>>],
+        output: &mut Vec<u8>,
+    ) -> bool {
+        if keys.len() != self.fields.len() {
+            return false;
+        }
+        let mut encoder = Encoder {
+            fields: &self.fields,
+            lanes: std::mem::take(&mut self.lanes),
+            arena: std::mem::take(output),
+            offsets: Vec::new(),
+            weights: self.weights.take(),
+        };
+        encoder.arena.clear();
+        let success = keys
+            .iter()
+            .zip(self.fields.iter())
+            .enumerate()
+            .all(|(i, (value, field))| {
+                encoder.push_field_cached(
+                    i,
+                    value,
+                    *field,
+                    cached.get(i).and_then(Option::as_deref),
+                )
+            });
+        self.lanes = encoder.lanes;
+        self.weights = encoder.weights;
+        *output = encoder.arena;
+        success
+    }
+}
+
 impl<'a> Encoder<'a> {
     fn new(fields: &'a [SortField], rows: usize) -> Self {
         Self {
@@ -128,6 +214,16 @@ impl<'a> Encoder<'a> {
     }
 
     fn push_field(&mut self, field_idx: usize, value: &Value, field: SortField) -> bool {
+        self.push_field_cached(field_idx, value, field, None)
+    }
+
+    fn push_field_cached(
+        &mut self,
+        field_idx: usize,
+        value: &Value,
+        field: SortField,
+        cached: Option<&[u8]>,
+    ) -> bool {
         if matches!(value, Value::Null) {
             self.arena.push(if field.nulls_first { 0x00 } else { 0x02 });
             return true;
@@ -175,10 +271,20 @@ impl<'a> Encoder<'a> {
                 self.arena
                     .extend_from_slice(&f32_order_bits(*v).to_be_bytes());
             }
-            Value::String(s) => self.push_str_payload(s.as_str(), field.collation_id),
+            Value::String(s) => {
+                if let Some(weights) = cached {
+                    self.push_weights(weights)
+                } else {
+                    self.push_str_payload(s.as_str(), field.collation_id)
+                }
+            }
             Value::SmallString(s) => {
                 let s = std::str::from_utf8(s.as_slice()).unwrap_or("");
-                self.push_str_payload(s, field.collation_id)
+                if let Some(weights) = cached {
+                    self.push_weights(weights)
+                } else {
+                    self.push_str_payload(s, field.collation_id)
+                }
             }
             _ => return false,
         }
@@ -188,6 +294,16 @@ impl<'a> Encoder<'a> {
             }
         }
         true
+    }
+
+    fn push_weights(&mut self, weights: &[u8]) {
+        for &byte in weights {
+            self.arena.push(byte);
+            if byte == 0 {
+                self.arena.push(0xff);
+            }
+        }
+        self.arena.extend_from_slice(&[0, 0]);
     }
 
     fn push_str_payload(&mut self, s: &str, collation: Option<u16>) {

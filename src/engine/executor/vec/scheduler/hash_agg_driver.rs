@@ -241,6 +241,92 @@ const ROLLUP_WORKER_MESSAGES: ParallelWorkerMessages = ParallelWorkerMessages {
 /// aggregate consumer. The producer remains on the calling thread because a
 /// `BatchOperator` is not required to be `Send`; workers receive only owned
 /// batches and install the complete execution context before touching them.
+/// Independent local reducers replicate their key domain. For a broad,
+/// densely sampled integer domain, limit that replication before allocating
+/// worker states. This only chooses CPU concurrency; live grants still own
+/// all memory admission and spill decisions.
+fn dense_group_worker_count(
+    requested: usize,
+    group_columns: &[usize],
+    aggs: &[AggregateSpec],
+    first: &Batch,
+    budget: Option<usize>,
+) -> usize {
+    use crate::engine::executor::vec::batch::ColumnVector;
+    use vec_hash_agg::AggregateKind;
+    let Some(budget) = budget else {
+        return requested;
+    };
+    if requested < 2
+        || !crate::util::env::flag("MYDB_AGG_MEMORY_DEGREE", true)
+        || first.visible_rows() < 1024
+        || aggs.is_empty()
+        || aggs.iter().any(|spec| {
+            !matches!(
+                spec.func,
+                AggregateKind::Sum
+                    | AggregateKind::Avg
+                    | AggregateKind::Count
+                    | AggregateKind::CountStar
+                    | AggregateKind::Min
+                    | AggregateKind::Max
+            )
+        })
+    {
+        return requested;
+    }
+    let [column] = group_columns else {
+        return requested;
+    };
+    let Some(ColumnVector::I64 { data, nulls }) = first.columns().get(*column) else {
+        return requested;
+    };
+    let mut min = i64::MAX;
+    let mut max = i64::MIN;
+    let mut distinct = hashbrown::HashSet::new();
+    let mut sampled = 0usize;
+    let mut runs = 0usize;
+    let mut previous = None;
+    for row in first.visible_indices().take(32_768) {
+        if nulls.as_ref().is_some_and(|valid| !valid.get(row)) {
+            continue;
+        }
+        let key = data[row];
+        if previous != Some(key) {
+            runs += 1;
+            previous = Some(key);
+        }
+        min = min.min(key);
+        max = max.max(key);
+        distinct.insert(key);
+        sampled += 1;
+    }
+    // Adjacent repetitions represent one key run, rather than evidence of
+    // a small global domain. Revisited runs, small/ordered samples and
+    // extreme or sparse domains retain the existing general route.
+    let domain = i128::from(max) - i128::from(min) + 2;
+    if sampled < 1024
+        || distinct.len() < 128
+        || distinct.len() < runs * 3 / 4
+        || domain < (distinct.len() * 4) as i128
+        || domain > vec_hash_agg::DENSE_I64_MAX_SLOTS as i128
+    {
+        return requested;
+    }
+    // Compact numeric states need roughly a key/hash directory plus a
+    // narrow accumulator per aggregate. Leave half the query budget for
+    // upstream buffers, concurrent reducers and finalization. Estimates
+    // affect degree only, never correctness or a hard memory reservation.
+    let per_key = 32usize.saturating_add(aggs.len().saturating_mul(16));
+    let replica = (domain as usize).saturating_mul(per_key).max(1);
+    let affordable = (budget / 2 / replica).max(1);
+    let mut workers = requested;
+    while workers > affordable && workers > 1 {
+        workers = workers.div_ceil(2);
+    }
+    workers
+}
+
 fn run_parallel_hash_agg_workers<PrepareBatch>(
     stream: &mut dyn BatchOperator,
     initial: Vec<Batch>,
@@ -257,6 +343,13 @@ where
 {
     debug_assert!(worker_count > 1);
     debug_assert!(!initial.is_empty());
+    let worker_count = dense_group_worker_count(
+        worker_count,
+        group_columns,
+        aggs,
+        &initial[0],
+        spill_context.map(|context| context.budget.limit()),
+    );
 
     let mut senders = Vec::with_capacity(worker_count);
     let mut receivers = Vec::with_capacity(worker_count);
@@ -1614,6 +1707,115 @@ pub fn run_hash_agg_parallel_stream_with_count_topk(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dense_group_degree_bounds_replication_and_preserves_aggregation() {
+        use vec_hash_agg::AggregateKind;
+        crate::util::env::with_vars(&[("MYDB_AGG_MEMORY_DEGREE", Some("on"))], || {
+            let schema = schema_kv();
+            let pairs = (0..2048i64)
+                .map(|row| ((row * 7919) % 16000, row % 17 - 8))
+                .collect::<Vec<_>>();
+            let first = make_batch(&schema, &pairs);
+            let aggs = vec![
+                AggregateSpec {
+                    comparison_collation: None,
+                    func: AggregateKind::Sum,
+                    input_column: 1,
+                },
+                AggregateSpec {
+                    comparison_collation: None,
+                    func: AggregateKind::CountStar,
+                    input_column: 0,
+                },
+            ];
+            let bytes = 8 * 1024 * 1024;
+            assert_eq!(
+                dense_group_worker_count(16, &[0], &aggs, &first, Some(bytes)),
+                4
+            );
+            let repeated = pairs
+                .iter()
+                .flat_map(|pair| std::iter::repeat_n(*pair, 8))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                dense_group_worker_count(
+                    16,
+                    &[0],
+                    &aggs,
+                    &make_batch(&schema, &repeated),
+                    Some(bytes)
+                ),
+                4,
+                "adjacent repetitions do not imply a small global key domain"
+            );
+            assert_eq!(dense_group_worker_count(16, &[0], &aggs, &first, None), 16);
+            assert_eq!(
+                dense_group_worker_count(16, &[0], &aggs, &first, Some(usize::MAX)),
+                16
+            );
+            for keys in [
+                (0..2048).map(|n| (n % 8, 1)).collect::<Vec<_>>(),
+                (0..2048).map(|n| (n, 1)).collect(),
+                (0..2048).map(|n| (n * 1_000_000_000_000, 1)).collect(),
+            ] {
+                assert_eq!(
+                    dense_group_worker_count(
+                        16,
+                        &[0],
+                        &aggs,
+                        &make_batch(&schema, &keys),
+                        Some(bytes)
+                    ),
+                    16
+                );
+            }
+            let mut batches = vec![first.clone(); 5];
+            // A later sparse/extreme key must still enter the same canonical
+            // aggregate even though the initial dense sample selected degree.
+            batches.push(make_batch(&schema, &[(i64::MIN, -3), (i64::MAX, 7)]));
+            let mut serial = MaterializedBatchOperator::new(schema.clone(), batches.clone());
+            let mut expected =
+                vec_hash_agg::run_hash_agg(&mut serial, vec![0], aggs.clone()).unwrap();
+            let dir = tempfile::tempdir().unwrap();
+            let budget = Arc::new(MemBudget::new(bytes));
+            let context = parallel_spill_context(
+                schema.clone(),
+                budget.clone(),
+                dir.path().to_path_buf(),
+                &[0],
+                &aggs,
+            );
+            let mut stream = MaterializedBatchOperator::new(schema, batches);
+            let mut sinks = crate::engine::executor::mem_budget::with_query_budget(budget, || {
+                let ParallelStreamBuild::Parallel(sinks) = build_parallel_stream_sinks(
+                    &mut stream,
+                    vec![0],
+                    aggs.clone(),
+                    16,
+                    Some(context.clone()),
+                    None,
+                )
+                .unwrap() else {
+                    panic!("parallel sinks")
+                };
+                sinks
+            });
+            assert_eq!(sinks.len(), 4);
+            let output = take_parallel_worker_partials(&mut sinks, Some(&context)).unwrap();
+            let mut actual =
+                vec_hash_agg::merge_worker_partition_snapshots(output.partitions, &aggs).unwrap();
+            let sort = |rows: &mut Vec<Vec<Value>>| {
+                rows.sort_by_key(|row| match row[0] {
+                    Value::Int(key) => key,
+                    _ => unreachable!(),
+                })
+            };
+            sort(&mut expected);
+            sort(&mut actual);
+            assert_eq!(actual, expected);
+        });
+    }
 
     #[test]
     fn spilled_finalize_limits_simultaneous_expanded_partitions() {

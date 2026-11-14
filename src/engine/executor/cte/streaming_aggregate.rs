@@ -67,7 +67,7 @@ pub(super) fn try_materialize<'q>(
         .transpose()
 }
 
-/// A scalar aggregate can consume a derived set expression directly in both
+/// An aggregate can consume a derived set expression directly in both
 /// CTE materialization and ordinary SELECT execution. Capability is checked
 /// before opening either branch; the same accumulator retains AVG semantics.
 pub(crate) fn try_execute(
@@ -75,6 +75,27 @@ pub(crate) fn try_execute(
     txn: crate::storage::TxnView,
     select: &Select,
 ) -> Result<Option<QueryResponse>, QueryError> {
+    let Some(plan) = try_plan(db, select)? else {
+        return Ok(None);
+    };
+    let mut response = execute_fused_plan(db, txn, plan)?;
+    if let Some(QueryResponse::StreamingResultSet(stream)) = &mut response {
+        let mut described = super::super::select::describe_select_columns(db, select)?;
+        for (column, native) in described.iter_mut().zip(&stream.columns) {
+            if native.source.collation_coercibility.is_some() {
+                column.source.collation_coercibility = native.source.collation_coercibility;
+            }
+        }
+        stream.columns = described;
+    }
+    Ok(response)
+}
+
+/// Plan the fused graph once for both execution and EXPLAIN.
+pub(crate) fn try_plan(
+    db: &Arc<Database>,
+    select: &Select,
+) -> Result<Option<PhysicalPlan>, QueryError> {
     let Some(crate::parser::SubQuery::SetOp(source)) = &select.derived else {
         return Ok(None);
     };
@@ -84,14 +105,12 @@ pub(crate) fn try_execute(
             .iter()
             .any(|table| !table.column_aliases.is_empty())
         || !select.joins.is_empty()
-        || select.selection.is_some()
-        || !select.group_by.is_empty()
         || !select.grouping_sets.is_empty()
-        || select.group_by_modifier != crate::parser::GroupByModifier::None
+        || !matches!(
+            select.group_by_modifier,
+            crate::parser::GroupByModifier::None | crate::parser::GroupByModifier::Rollup
+        )
         || select.having.is_some()
-        || !select.order_by.is_empty()
-        || select.limit.is_some()
-        || select.offset.is_some()
         || select.distinct
         || select.for_update
         || select.lock_clause.is_some()
@@ -103,43 +122,207 @@ pub(crate) fn try_execute(
     {
         return Ok(None);
     }
-    // Unqualified arguments bind directly to the set operation's output
-    // names. Other scopes stay on the existing materialization path.
+    // The derived alias belongs to this query boundary, while the native
+    // producer exposes the set expression's output names. Bind only that
+    // one scope; nested queries retain their own ordinary materializer.
+    let alias = select.from[0]
+        .alias
+        .as_deref()
+        .unwrap_or(&select.from[0].name);
+    let mut bound = select.clone();
+    crate::planner::resolve_order_by_output_refs(db, &mut bound)?;
+    let bind = |expr: &mut Expr| {
+        crate::parser::visit::try_rewrite_value_expr(expr, |node| {
+            while let Expr::GroupKeyRef { expr, .. } = node {
+                *node = *expr.clone();
+            }
+            match node {
+                Expr::CompoundIdentifier(parts) => {
+                    if parts.len() != 2 || !parts[0].eq_ignore_ascii_case(alias) {
+                        return Err(());
+                    }
+                    *node = Expr::Identifier(parts[1].clone());
+                }
+                Expr::Subquery(_)
+                | Expr::InSubquery { .. }
+                | Expr::Exists { .. }
+                | Expr::QuantifiedComparison { .. } => return Err(()),
+                _ => {}
+            }
+            Ok(true)
+        })
+    };
+    for item in &mut bound.projection {
+        if let SelectItem::Expr { expr, .. } = item {
+            if bind(expr).is_err() {
+                return Ok(None);
+            }
+        }
+    }
+    for key in &mut bound.group_by {
+        if bind(key).is_err() {
+            return Ok(None);
+        }
+    }
+    if let Some(predicate) = &mut bound.selection {
+        if bind(predicate).is_err() {
+            return Ok(None);
+        }
+    }
+    for order in &mut bound.order_by {
+        if bind(&mut order.expr).is_err() {
+            return Ok(None);
+        }
+    }
+    if (bound.limit.is_some() && crate::planner::limit_usize(bound.limit.as_ref()).is_none())
+        || (bound.offset.is_some() && crate::planner::limit_usize(bound.offset.as_ref()).is_none())
+    {
+        return Ok(None);
+    }
+    if bound.group_by_modifier == crate::parser::GroupByModifier::Rollup {
+        crate::planner::bind_rollup_select_for_execution(db, &mut bound)?;
+    }
+    let select = &bound;
+    if select
+        .group_by
+        .iter()
+        .any(|key| !matches!(key, Expr::Identifier(_)))
+    {
+        return Ok(None);
+    }
     if select.projection.is_empty() || !select.projection.iter().all(|item| {
-        matches!(item, SelectItem::Expr { expr: Expr::Function { name, args, .. }, .. }
+        matches!(item, SelectItem::Expr { expr: Expr::GroupKeyRef{..}|Expr::Grouping(_), .. })
+        || matches!(item, SelectItem::Expr { expr, .. }
+            if select.group_by.iter().any(|key| crate::engine::expr_program::expr_semantically_eq(key, expr)))
+        || matches!(item, SelectItem::Expr { expr: Expr::Function { name, args, .. }, .. }
             if matches!(name.to_ascii_uppercase().as_str(), "SUM" | "AVG" | "COUNT"
                 | "STDDEV_POP" | "STDDEV_SAMP" | "VAR_POP" | "VAR_SAMP" | "BIT_AND" | "BIT_OR" | "BIT_XOR")
                 && args.iter().all(scalar_argument))
-    }) { return Ok(None) }
-    let Some(input) = crate::planner::plan_query_physical(db, source)? else {
+    }) { return Ok(None); }
+    let Some(mut input) = crate::planner::plan_query_physical(db, source)? else {
         return Ok(None);
     };
+    // Retain the consumer's exact WHERE evaluation after set semantics and
+    // before grouping, including predicates also pushed into the branches.
+    if let Some(predicate) = &select.selection {
+        input = PhysicalPlan::Filter {
+            estimated_rows: crate::planner::estimated_rows(&input),
+            cost: crate::planner::plan_cost(&input),
+            input: Box::new(input),
+            predicate: predicate.clone(),
+        };
+    }
     let input_cost = crate::planner::plan_cost(&input);
+    let groups = if select.group_by.is_empty() {
+        1.0
+    } else {
+        crate::planner::estimate_group_by_rows_for_plan(
+            &input,
+            &select.group_by,
+            crate::planner::estimated_rows(&input),
+        )
+    };
     let cost = crate::engine::cbo::operator_cost::hash_aggregate(
         &crate::engine::cbo::CboContext::from_db(db),
         &input_cost,
         crate::planner::estimated_rows(&input),
-        1.0,
+        groups,
         select.projection.len() as f64 * 32.0,
     );
-    let mut plan = PhysicalPlan::Projection {
-        input: Box::new(PhysicalPlan::HashAggregate {
+    let mut plan = if select.group_by_modifier == crate::parser::GroupByModifier::Rollup {
+        PhysicalPlan::HashRollupAggregate {
             input: Box::new(input),
-            group_by: Vec::new(),
+            group_by: select.group_by.clone(),
             having: None,
             aggregates: crate::planner::collect_aggregate_calls(select),
-            estimated_rows: 1.0,
-            cost: cost.clone(),
-        }),
+            estimated_rows: groups + select.group_by.len() as f64,
+            cost,
+        }
+    } else {
+        PhysicalPlan::HashAggregate {
+            input: Box::new(input),
+            group_by: select.group_by.clone(),
+            having: None,
+            aggregates: crate::planner::collect_aggregate_calls(select),
+            estimated_rows: groups,
+            cost,
+        }
+    };
+    let limit = crate::planner::limit_usize(select.limit.as_ref());
+    let offset = crate::planner::limit_usize(select.offset.as_ref());
+    let binding = crate::planner::limit_binding_of(select);
+    if !select.order_by.is_empty() {
+        let cost = crate::planner::plan_cost(&plan);
+        plan = if let Some(k) = limit
+            .and_then(|n| n.checked_add(offset.unwrap_or(0)))
+            .filter(|k| *k <= crate::planner::topk_max_heap_from_env())
+        {
+            PhysicalPlan::TopK {
+                input: Box::new(plan),
+                order_by: select.order_by.clone(),
+                dedup_projection: None,
+                k,
+                offset: offset.unwrap_or(0),
+                binding,
+                estimated_rows: groups.min(k as f64),
+                cost: crate::engine::cbo::operator_cost::top_k(
+                    &cost,
+                    groups,
+                    k as f64,
+                    select.projection.len() as f64 * 32.0,
+                ),
+            }
+        } else {
+            PhysicalPlan::Sort {
+                input: Box::new(plan),
+                order_by: select.order_by.clone(),
+                estimated_rows: groups,
+                cost: crate::engine::cbo::operator_cost::sort(
+                    &crate::engine::cbo::CboContext::from_db(db),
+                    &cost,
+                    groups,
+                    select.projection.len() as f64 * 32.0,
+                ),
+            }
+        };
+    }
+    let cost = crate::planner::plan_cost(&plan);
+    let rows = crate::planner::estimated_rows(&plan);
+    plan = PhysicalPlan::Projection {
+        input: Box::new(plan),
         projection: select.projection.clone(),
         distinct: false,
-        estimated_rows: 1.0,
+        estimated_rows: rows,
         cost,
     };
+    if limit.is_some() || offset.is_some() {
+        let cost = crate::engine::cbo::operator_cost::limit(
+            &crate::planner::plan_cost(&plan),
+            rows,
+            limit.map_or(rows, |n| n as f64),
+            offset.unwrap_or(0) as f64,
+        );
+        plan = PhysicalPlan::Limit {
+            input: Box::new(plan),
+            limit,
+            offset,
+            binding,
+            estimated_rows: limit.map_or(rows, |n| rows.min(n as f64)),
+            cost,
+        };
+    }
     crate::planner::parallelize_fused_aggregate(&mut plan);
     if !super::super::select::vec_bridge::preflight_query_output_supported(&plan)? {
         return Ok(None);
     }
+    Ok(Some(plan))
+}
+
+fn execute_fused_plan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    plan: PhysicalPlan,
+) -> Result<Option<QueryResponse>, QueryError> {
     let budget = super::super::mem_budget::current_budget()
         .unwrap_or_else(|| Arc::new(super::super::mem_budget::MemBudget::from_env()));
     let stream = {
@@ -160,4 +343,130 @@ pub(crate) fn try_execute(
     #[cfg(test)]
     HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     Ok(Some(QueryResponse::StreamingResultSet(stream)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::{
+        executor::vec::config::{with_vec_mode, VecMode},
+        StorageQueryEngine,
+    };
+    #[test]
+    fn ordered_grouped_set_consumer_keeps_native_aggregation_and_paging() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        for sql in [
+            "CREATE TABLE ordered_groups(g INT,v DECIMAL(18,4))",
+            "INSERT INTO ordered_groups VALUES(1,1.2500),(1,2.5000),(2,NULL),(3,-1.2500),(NULL,3.0000)",
+        ] { engine.execute(sql).unwrap(); }
+        for suffix in [
+            "ORDER BY g LIMIT 3",
+            "ORDER BY sv DESC,g LIMIT 2 OFFSET 1",
+            "ORDER BY x.g DESC LIMIT 2",
+            "ORDER BY g",
+        ] {
+            let query = format!("SELECT g,SUM(v) sv,AVG(v) av,COUNT(*) ct FROM (SELECT g,v FROM ordered_groups UNION ALL SELECT g,v FROM ordered_groups) x GROUP BY g {suffix}");
+            let before = HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let actual = with_vec_mode(VecMode::On, || {
+                engine.execute(&query).unwrap().materialize().unwrap()
+            });
+            assert!(
+                HITS.load(std::sync::atomic::Ordering::Relaxed) > before,
+                "the ordered consumer must avoid materializing the set: {query}"
+            );
+            let expected_query = format!("SELECT g,SUM(v) sv,AVG(v) av,COUNT(*)*2 ct FROM ordered_groups GROUP BY g {suffix}").replace("SUM(v) sv", "SUM(v)*2 sv").replace("x.g", "ordered_groups.g");
+            let expected = with_vec_mode(VecMode::Off, || {
+                engine
+                    .execute(&expected_query)
+                    .unwrap()
+                    .materialize()
+                    .unwrap()
+            });
+            let QueryResponse::ResultSet(actual) = actual else {
+                panic!()
+            };
+            let QueryResponse::ResultSet(expected) = expected else {
+                panic!()
+            };
+            assert_eq!(actual.rows, expected.rows, "{query}");
+        }
+    }
+    #[test]
+    fn grouped_set_consumer_fuses_without_changing_distinct_null_or_decimal_semantics() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        for sql in ["CREATE TABLE fused_groups(g INT,v DECIMAL(18,4),n INT)",
+            "INSERT INTO fused_groups VALUES(1,1.2500,2),(1,1.2500,2),(1,2.5000,4),(2,NULL,2),(NULL,3.0000,4)"] {engine.execute(sql).unwrap();}
+        for source in [
+            "SELECT g,v,n FROM fused_groups UNION ALL SELECT g,v,n FROM fused_groups WHERE n=2",
+            "SELECT g,v,n FROM fused_groups UNION SELECT g,v,n FROM fused_groups WHERE n=2",
+            "SELECT g,v,n FROM fused_groups INTERSECT SELECT g,v,n FROM fused_groups WHERE n=2",
+            "SELECT g,v,n FROM fused_groups EXCEPT SELECT g,v,n FROM fused_groups WHERE n=2",
+            "SELECT g,v,n FROM fused_groups WHERE n<0 UNION SELECT g,v,n FROM fused_groups WHERE n<0",
+        ] {
+            let sql=format!("SELECT g,SUM(v) sv,AVG(v*n) av,COUNT(*) ct,COUNT(v) cv FROM ({source}) x WHERE g IN (1,2) OR g IS NULL GROUP BY g");
+            let run=|mode,query:&str|with_vec_mode(mode,||{
+                let QueryResponse::ResultSet(mut r)=engine.execute(query).unwrap().materialize().unwrap()else{panic!()};
+                r.rows.sort_by_key(|r|format!("{r:?}"));r
+            });
+            let before=HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let actual=run(VecMode::On,&sql);
+            assert!(HITS.load(std::sync::atomic::Ordering::Relaxed)>before,"{source}");
+            let expected=run(VecMode::Off,&format!("{sql} HAVING COUNT(*)>=0 LIMIT 1000000"));
+            assert_eq!(actual.columns,expected.columns,"{source}");assert_eq!(actual.rows,expected.rows,"{source}");
+            let cte=format!("WITH a AS ({sql}) SELECT a.g,a.sv,a.av,a.ct,a.cv FROM a JOIN a b ON a.g<=>b.g");
+            let before=HITS.load(std::sync::atomic::Ordering::Relaxed);
+            let actual=run(VecMode::On,&cte);
+            assert!(HITS.load(std::sync::atomic::Ordering::Relaxed)>before,"shared filtered grouped CTE: {source}");
+            let expected=run(VecMode::Off,&cte);
+            assert_eq!(actual.columns,expected.columns);assert_eq!(actual.rows,expected.rows);
+        }
+        let Statement::Select(invalid)=crate::parser::parse_statement("SELECT g,n,SUM(v) FROM (SELECT g,v,n FROM fused_groups UNION SELECT g,v,n FROM fused_groups) x GROUP BY g").unwrap()else{panic!()};
+        let db = engine.db_for_tests();
+        assert!(
+            try_execute(
+                &db,
+                TxnView::read_only(db.visible_scn(), IsolationLevel::ReadCommitted),
+                &invalid
+            )
+            .unwrap()
+            .is_none(),
+            "ungrouped projections retain normal SQL validation"
+        );
+    }
+    #[test]
+    fn grouped_joined_union_consumer_uses_the_native_source() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        for sql in [
+            "CREATE TABLE fusion_dim(k INT,period INT,brand INT,cls INT,category INT,maker INT,label VARCHAR(12))",
+            "CREATE TABLE fusion_lines(invoice INT,k INT,qty INT,total DECIMAL(18,2))",
+            "CREATE TABLE fusion_returns(invoice INT,k INT,qty INT,total DECIMAL(18,2))",
+            "INSERT INTO fusion_dim VALUES(1,1,3,4,5,6,'keep'),(2,2,3,4,5,6,'keep')",
+            "INSERT INTO fusion_lines VALUES(1,1,3,10.25),(2,2,4,15.50),(3,2,NULL,NULL)",
+            "INSERT INTO fusion_returns VALUES(1,1,1,2.25)",
+        ] { engine.execute(sql).unwrap(); }
+        let branch="SELECT d.period,d.brand,d.cls,d.category,d.maker,l.qty-COALESCE(r.qty,0) qty,l.total-COALESCE(r.total,0.0) amount FROM fusion_lines l JOIN fusion_dim d ON l.k=d.k LEFT JOIN fusion_returns r ON l.invoice=r.invoice AND l.k=r.k WHERE d.label='keep'";
+        let query=format!("WITH grouped AS (SELECT period,brand,cls,category,maker,SUM(qty) qty,SUM(amount) amount FROM ({branch} UNION {branch} UNION {branch}) detail GROUP BY period,brand,cls,category,maker) SELECT a.brand,a.qty,b.qty,a.amount,b.amount FROM grouped a JOIN grouped b ON a.brand=b.brand AND a.cls=b.cls AND a.category=b.category AND a.maker=b.maker WHERE a.period=2 AND b.period=1");
+        let before = HITS.load(std::sync::atomic::Ordering::Relaxed);
+        let actual = with_vec_mode(VecMode::On, || {
+            engine.execute(&query).unwrap().materialize().unwrap()
+        });
+        assert!(
+            HITS.load(std::sync::atomic::Ordering::Relaxed) > before,
+            "{query}"
+        );
+        let expected = with_vec_mode(VecMode::Off, || {
+            engine.execute(&query).unwrap().materialize().unwrap()
+        });
+        let QueryResponse::ResultSet(actual) = actual else {
+            panic!()
+        };
+        let QueryResponse::ResultSet(expected) = expected else {
+            panic!()
+        };
+        assert_eq!(actual.columns, expected.columns);
+        assert_eq!(actual.rows, expected.rows);
+    }
 }
