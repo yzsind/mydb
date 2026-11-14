@@ -899,6 +899,20 @@ impl<'a> CatalogTxn<'a> {
             if self.ai_mutation {
                 crate::engine::ai::catalog_faults::hit("after_dd_rows")?;
             }
+            #[cfg(test)]
+            if stage_ddl_binlog
+                && self.replacements.iter().any(|replacement| {
+                    replacement.dd_table_id == crate::storage::data_dictionary::DD_RECYCLEBIN
+                })
+                && std::env::var("MYDB_RECYCLEBIN_TEST_CRASH").ok().as_deref()
+                    == Some("after_dd_rows")
+            {
+                self.db.flush_txn_wal_buffer(txn.txn_id, None)?;
+                self.db.flush_dirty_data()?;
+                let lsn = self.db.log.lock().last_lsn();
+                LogManager::sync_durable_to(&self.db.log, lsn)?;
+                std::process::exit(86);
+            }
             if stage_ddl_binlog {
                 crate::binlog::stage_current_ddl_transaction(txn.txn_id)?;
             }
@@ -1474,6 +1488,8 @@ impl Database {
             !matches!(
                 mutation,
                 CatalogMutation::Table(_)
+                    | CatalogMutation::Recycle(_, _)
+                    | CatalogMutation::Retirement(_, _)
                     | CatalogMutation::TableVersion(_, _)
                     | CatalogMutation::SequenceValue(_, _)
                     | CatalogMutation::SequenceRetirement(_, _)
@@ -1677,6 +1693,15 @@ impl Database {
                         CatalogRowSelector::PrimaryValues(vec![Value::UInt(counter_id)]),
                         value.map(|v| v.to_row()).into_iter().collect(),
                     );
+                }
+                CatalogMutation::Retirement(id, manifest) => {
+                    txn.replace(crate::storage::data_dictionary::DD_DDL_RETIREMENTS,
+                        CatalogRowSelector::PrimaryValues(vec![Value::UInt(id), Value::UInt(0), Value::UInt(0)]),
+                        vec![vec![Value::UInt(id), Value::UInt(0), Value::UInt(0), Value::String(manifest)]]);
+                }
+                CatalogMutation::Recycle(id, json) => {
+                    let rows = json.map(|json| serde_json::from_str::<crate::recyclebin::Entry>(&json).map_err(|e| crate::recyclebin::failure(e.to_string())).and_then(|entry| entry.row())).transpose()?.into_iter().collect();
+                    txn.replace(crate::storage::data_dictionary::DD_RECYCLEBIN, CatalogRowSelector::PrimaryValues(vec![Value::UInt(id)]), rows);
                 }
                 CatalogMutation::Auth => {
                     let rows = dd_rows_for_auth(&catalog.auth)?;
@@ -2341,6 +2366,8 @@ impl Database {
 }
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum CatalogMutation {
+    Recycle(u64, Option<String>),
+    Retirement(u64, String),
     Schema(String),
     Table(u64),
     TableVersion(u64, u64),

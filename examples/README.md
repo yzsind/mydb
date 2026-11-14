@@ -11,7 +11,7 @@ failure.
 | Language | Source | Client dependencies | Run command |
 | --- | --- | --- | --- |
 | Java | [java/JdbcDemo.java](java/JdbcDemo.java) | JDK 8+, Connector/J jar | `bash examples/run_java_demo.sh` |
-| Python | [python/demo.py](python/demo.py) | Python 3.9+, PyMySQL 1.1.2 with RSA authentication dependencies | `bash examples/run_client_demo.sh python` |
+| Python | [python/demo.py](python/demo.py) | Python 3.9+, PyMySQL 1.1.2 | `bash examples/run_client_demo.sh python` |
 | Go | [go/main.go](go/main.go) | Go 1.24+, go-sql-driver/mysql 1.10.0 | `bash examples/run_client_demo.sh go` |
 | C++ | [cpp/demo.cpp](cpp/demo.cpp) | C++17 compiler, MySQL 8+ C client headers and libmysqlclient | `bash examples/run_client_demo.sh cpp` |
 | Rust | [rust/src/main.rs](rust/src/main.rs) | Rust/Cargo, mysql crate 28.0.4 | `bash examples/run_client_demo.sh rust` |
@@ -51,8 +51,13 @@ All four languages read `MYDB_HOST` (default `127.0.0.1`), `MYDB_PORT` (default
 password is allowed), and `MYDB_DB` (default `test`). The initial database must
 exist. The account needs privileges to create/drop databases, perform table and
 index DDL, read/write data, and create/execute/drop stored procedures. Defaults
-are intended for local TCP connections with TLS disabled. Java-specific
+require TLS and accept mydb's temporary self-signed certificate for local use.
+They do not verify server identity. For remote use, configure a trusted CA and
+hostname verification in the respective client. Java-specific
 `MYDB_JDBC_*` variables do not affect the other languages.
+
+Rust enables the mysql crate's `native-tls` feature, using the platform TLS
+backend. On Linux, install the OpenSSL development libraries and `pkg-config`.
 
 The script places temporary build artifacts under `/tmp/mydb`. The C++ executable
 is deleted on exit. Go and Rust caches are retained by default in
@@ -155,10 +160,26 @@ exit status.
 | `MYDB_JDBC_URL` | Constructed from the address and database above | Optional complete JDBC URL; can add or override connection properties |
 
 The password is read from an environment variable, so it need not appear in
-source code or command-line arguments. Default connection properties are intended
-for local examples and set `sslMode=DISABLED` and `allowPublicKeyRetrieval=true`.
+source code or command-line arguments. The examples leave `sslMode` and
+`allowPublicKeyRetrieval` unset, using the driver's defaults of `PREFERRED` and
+`false`. This works with the default `caching_sha2_password` account, including
+when the authentication cache is empty. The minimal connection URL is:
+
+```text
+jdbc:mysql://127.0.0.1:8738/test
+```
+
+The server enables TLS automatically and generates a temporary self-signed
+certificate when no certificate is configured. The driver negotiates TLS by
+default when offered, without verifying server identity. `PREFERRED` permits
+plaintext fallback when TLS is unavailable; use `sslMode=REQUIRED` to require
+encryption during negotiation. Do not add `useSSL=false` or `sslMode=DISABLED`.
+Both JDBC examples check the session's `Ssl_cipher` and reject unencrypted
+sessions.
+
 For remote connections, use `MYDB_JDBC_URL` to configure
-`sslMode=VERIFY_IDENTITY`, trusted certificates, and other properties.
+`sslMode=VERIFY_IDENTITY`, trusted certificates, and other properties; see
+[TLS configuration](../docs/configuration.md#tls).
 
 Verify server-side and client-side preparation separately:
 

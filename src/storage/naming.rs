@@ -143,7 +143,13 @@ pub(crate) fn register_builtin_databases(catalog: &mut Catalog) {
             created_ms: 0,
             updated_ms: 0,
         });
-    for name in ["information_schema", "mysql", "performance_schema", "sys"] {
+    for name in [
+        "information_schema",
+        "mysql",
+        "performance_schema",
+        "sys",
+        crate::recyclebin::DATABASE,
+    ] {
         catalog
             .databases
             .entry(name.to_string())

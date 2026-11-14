@@ -1189,7 +1189,7 @@ impl Database {
                 .tables
                 .iter()
                 .filter_map(|(key, table)| {
-                    if table.system || crate::storage::naming::is_system_database(&table.database) {
+                    if table.system || table.database == crate::recyclebin::DATABASE || crate::storage::naming::is_system_database(&table.database) {
                         return None;
                     }
                     let delta = self.table_modification_delta(table.id);

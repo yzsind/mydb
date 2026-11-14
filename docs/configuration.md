@@ -73,8 +73,29 @@ reserve CPUs exclusively for the database.
 The server defaults to `ssl_mode=auto`: it advertises TLS and generates an
 ephemeral self-signed certificate when no certificate or key is configured.
 Advertising TLS still allows plaintext connections unless
-`require_secure_transport=ON` is set. The MySQL 8.0 client's
-`--ssl-mode=REQUIRED` requires encryption but does not verify server identity.
+`require_secure_transport=ON` is set. The MySQL 8.0 client defaults to
+`--ssl-mode=PREFERRED`: it negotiates TLS when the server offers it, so ordinary
+connection examples omit this option. `PREFERRED` can fall back to plaintext
+when TLS is unavailable. Use `--ssl-mode=REQUIRED` to require encryption without
+verifying server identity.
+
+Keep the default `caching_sha2_password` authentication plugin and use TLS for
+client connections. A local MySQL Connector/J connection can use:
+
+```text
+jdbc:mysql://127.0.0.1:8738/test
+```
+
+Do not add `useSSL=false` or `sslMode=DISABLED` to this URL. Over TLS, SHA-2 full
+authentication does not need RSA public-key retrieval, so
+`allowPublicKeyRetrieval` can remain unset (Connector/J defaults it to `false`).
+Connector/J defaults to `sslMode=PREFERRED`, which negotiates TLS when offered
+and accepts the temporary self-signed certificate without verifying server
+identity. It can fall back to plaintext when TLS is unavailable. To require
+encryption, explicitly append `?sslMode=REQUIRED`; this mode fails if the server
+does not offer TLS and also does not verify the certificate or hostname. The
+[runnable client examples](../examples/README.md) use encrypted connections by
+default.
 
 For a stable server identity, install a CA-signed PEM certificate chain and its
 matching PEM private key, then add these options to the server's config file:
@@ -98,6 +119,17 @@ Connect with a hostname covered by the certificate and the issuing CA:
 mysql -hdb.example.com -P8738 -uapp -p \
   --ssl-mode=VERIFY_IDENTITY --ssl-ca=/path/to/ca.pem test
 ```
+
+For Connector/J, use
+`jdbc:mysql://db.example.com:8738/test?sslMode=VERIFY_IDENTITY` and configure the
+issuing CA in the JVM trust store or with `trustCertificateKeyStoreUrl`,
+`trustCertificateKeyStoreType`, and `trustCertificateKeyStorePassword`.
+
+If TLS is deliberately disabled, SHA-2 full authentication needs RSA encryption.
+Connector/J then requires a preconfigured trusted `serverRSAPublicKeyFile` or an
+explicit `allowPublicKeyRetrieval=true`. This is a client-side policy and cannot
+be enabled by the server. Successful cached authentication does not remove this
+requirement for subsequent full authentications, such as after a server restart.
 
 `ssl_mode=disabled` disables server TLS and cannot be combined with certificate
 or key options. The server's `auto`/`disabled` values differ from the client's
@@ -1664,3 +1696,7 @@ account. Complete keys can be retrieved through TLS MySQL `SHOW API KEY`.
 The master key is environment-only `MYDB_REST_ENCRYPT_KEY` or the independently
 managed `<data_dir>/rest-keys.mydb`. Master-key values cannot be supplied in
 ordinary startup configuration or command-line arguments.
+
+## Recycle Bin
+
+The [recycle bin](recycle-bin.md) is enabled by default for persistent DROP TABLE, TRUNCATE TABLE and tables removed by DROP DATABASE. It has a seven-day retention target and permits early reclamation under disk pressure. See its configuration table for GLOBAL/SESSION variables, startup option names, defaults and bounds.

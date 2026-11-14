@@ -1,5 +1,6 @@
 impl Database {
     pub fn set_storage_variable(&self, name: &str, value: u64) -> Result<(), QueryError> {
+        if name.starts_with("mydb_recyclebin") { return self.set_recyclebin_variable(name, value); }
         match normalize_name(name).as_str() {
             "mydb_buffer_pool_pages" => self.set_buffer_pool_pages(value),
             "mydb_buffer_pool_quota_heap_pct" => self.set_buffer_pool_quota_pct(0, value),

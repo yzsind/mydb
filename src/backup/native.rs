@@ -1110,6 +1110,70 @@ mod tests {
     }
 
     #[test]
+    fn recyclebin_native_backup_retains_queryable_objects() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let source = StorageQueryEngine::open(root.path().join("source")).unwrap();
+        for sql in [
+            "CREATE TABLE retained(id INT PRIMARY KEY,v LONGTEXT)",
+            "INSERT INTO retained VALUES(1,REPEAT('x',20000))",
+            "DROP TABLE retained",
+        ] {
+            source.execute(sql).unwrap();
+        }
+        let name = source
+            .db_handle()
+            .recyclebin_entries()
+            .unwrap()
+            .pop()
+            .unwrap()
+            .name();
+        let destination = root.path().join("snapshot");
+        let manifest = create_backup(
+            source.db_handle(),
+            &BackupRequest {
+                repository: destination.clone(),
+            },
+            &random_uuid(),
+            &AtomicBool::new(false),
+            |_, _, _| {},
+        )
+        .unwrap();
+        verify(&destination).unwrap();
+        let snapshot = StorageQueryEngine::open(&destination).unwrap();
+        let QueryResponse::ResultSet(result) = snapshot
+            .execute(&format!(
+                "SELECT id,LENGTH(v) FROM __mydb_recyclebin__.{name}"
+            ))
+            .unwrap()
+        else {
+            panic!("expected rows");
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(1), Value::Int(20000)]]);
+        assert_eq!(snapshot.db_handle().maintain_recyclebin().unwrap(), 0);
+        assert!(snapshot.execute(&format!("RESTORE TABLE {name}")).is_err());
+        snapshot.shutdown().unwrap();
+        drop(snapshot);
+        let independent = root.path().join("independent");
+        restore_image(
+            &destination,
+            &independent,
+            manifest.end_lsn,
+            manifest.end_commit_unix_us,
+            true,
+            |_| Ok(()),
+        )
+        .unwrap();
+        let recovered = StorageQueryEngine::open(&independent).unwrap();
+        recovered.execute(&format!("RESTORE TABLE {name}")).unwrap();
+        let QueryResponse::ResultSet(result) =
+            recovered.execute("SELECT LENGTH(v) FROM retained").unwrap()
+        else {
+            panic!("expected rows");
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(20000)]]);
+    }
+
+    #[test]
     fn native_snapshot_round_trip_is_immutable_and_promotes() {
         fs::create_dir_all("/tmp/mydb").unwrap();
         let root = tempfile::tempdir_in(fs::canonicalize("/tmp/mydb").unwrap()).unwrap();

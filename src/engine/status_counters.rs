@@ -677,6 +677,9 @@ pub(crate) fn status_var_defs() -> &'static [StatusVarDef] {
         );
         add(
             &[
+                "Mydb_recyclebin_pressure",
+                "Mydb_recyclebin_pressure_purges",
+                "Mydb_recyclebin_cleanup_failures",
                 "Mydb_active_transactions",
                 "Mydb_undo_bytes",
                 "Mydb_undo_records",

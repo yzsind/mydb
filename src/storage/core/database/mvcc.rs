@@ -813,6 +813,7 @@ impl Database {
         txn_id: u64,
         table: &TableSchema,
     ) -> Result<(), QueryError> {
+        if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.handle_table_lock_outcome(
             txn_id,
             table.id,

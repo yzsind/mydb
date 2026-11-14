@@ -41,7 +41,7 @@ public:
     Connection() {
         require(handle_ != nullptr, "mysql_init failed");
         unsigned int connect_timeout = 5, io_timeout = 15;
-        mysql_ssl_mode ssl_mode = SSL_MODE_DISABLED;
+        mysql_ssl_mode ssl_mode = SSL_MODE_REQUIRED;
         require(mysql_options(get(), MYSQL_OPT_CONNECT_TIMEOUT, &connect_timeout) == 0 &&
                 mysql_options(get(), MYSQL_OPT_READ_TIMEOUT, &io_timeout) == 0 &&
                 mysql_options(get(), MYSQL_OPT_WRITE_TIMEOUT, &io_timeout) == 0 &&

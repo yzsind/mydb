@@ -1414,6 +1414,10 @@ pub(crate) fn global_status_pairs(
 
     // mydb-native counters surfaced via the same SHOW STATUS table so
     // dashboards can graph them alongside their MySQL counterparts.
+    let recycle = db.recyclebin_status();
+    push("Mydb_recyclebin_pressure", recycle[0]);
+    push("Mydb_recyclebin_pressure_purges", recycle[1]);
+    push("Mydb_recyclebin_cleanup_failures", recycle[2]);
     push("Mydb_active_transactions", st.active_transactions as u64);
     push("Mydb_undo_bytes", st.undo_bytes);
     push("Mydb_undo_records", st.undo_records as u64);

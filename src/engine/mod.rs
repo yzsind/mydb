@@ -84,7 +84,7 @@ pub(crate) mod perf_setup;
 mod perf_statement_stats;
 pub(crate) mod performance_schema_mysql80_generated;
 pub mod session_registry;
-mod show;
+pub(crate) mod show;
 pub(crate) mod status_counters;
 pub(crate) mod sys_schema;
 pub(crate) mod system;

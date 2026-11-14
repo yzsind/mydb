@@ -51,6 +51,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 
 | Document | Contents |
 | --- | --- |
+| [Recycle Bin](recycle-bin.md) | Retained DROP/TRUNCATE tables, read-only queries, restore and reclamation |
 | [Backup and Recovery](backup-and-recovery.md) | Physical backups, WAL archiving, PITR, verification, and retention |
 | [Native Replication](native-replication.md) | Physical replication, role switching, and operations |
 | [MVCC and Locking](mvcc-and-locking.md) | Isolation, locking reads, deadlocks, savepoints, and concurrency diagnostics |

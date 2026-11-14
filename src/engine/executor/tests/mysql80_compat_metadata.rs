@@ -681,7 +681,7 @@ fn every_information_schema_registration_obeys_row_contract() {
     let definitions = crate::engine::information_schema::system_table_definitions()
         .filter(|definition| definition.schema == "information_schema")
         .collect::<Vec<_>>();
-    assert_eq!(definitions.len(), 104);
+    assert_eq!(definitions.len(), 105);
 
     for definition in definitions {
         let result = rows(

@@ -31,7 +31,8 @@
 /// v69: stable table-local SQL ROWID tags on physical partition leaves.
 /// v70: row security table metadata and policies.
 /// v71: recoverable REST API key credential dictionary.
-pub const CATALOG_VERSION: u32 = 71;
+/// v72: transactional recycle-bin ownership and reclamation metadata.
+pub const CATALOG_VERSION: u32 = 72;
 /// v27: adds `AutoIncrementAdvance` and the AUTO_INCREMENT coverage fence in
 /// `CheckpointEnd`.
 /// v29: CRC covers the WAL frame header and payload.

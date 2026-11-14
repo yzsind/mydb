@@ -1,4 +1,6 @@
-// Crash-safe DROP TABLE: intent log + startup recovery.
+// Crash-safe object retirement: transactional DD manifests and startup recovery.
+// New whole-table and index retirements commit their ownership with DDL. Local
+// JSON intents remain for unpublished private objects and recovery fixtures.
 //
 // DROP TABLE must move a table and every physical file it owns from "present"
 // to "absent" atomically. The naive "delete files, then commit the catalog"
@@ -49,6 +51,10 @@ pub(crate) struct DropTableIntent {
     /// Relative paths of paged / derived vector index files (`.hnsw` / `.hvec`). Their buffer-pool pages are discarded before the unlink so a
     /// writeback cannot resurrect the file.
     vector_files: Vec<String>,
+    /// Stable index-owned directories also cover publications completed after
+    /// the object was recycled. Their ownership never depends on SQL names.
+    #[serde(default)]
+    vector_directories: Vec<String>,
 }
 
 impl Database {
@@ -78,9 +84,7 @@ impl Database {
     }
 
     fn retirement_selector(intent: &DropTableIntent) -> CatalogRowSelector {
-        let (index_id, generation) = intent
-            .retired_index
-            .expect("catalog retirement names an index");
+        let (index_id, generation) = intent.retired_index.unwrap_or((0, 0));
         CatalogRowSelector::PrimaryValues(vec![
             Value::UInt(intent.table_id),
             Value::UInt(generation),
@@ -113,12 +117,7 @@ impl Database {
                 format!("invalid catalog retirement: {err}"),
             )
         })?;
-        let (index_id, generation) = intent.retired_index.ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "catalog retirement has no index identity",
-            )
-        })?;
+        let (index_id, generation) = intent.retired_index.unwrap_or((0, 0));
         if values.get(..3)
             != Some(
                 [
@@ -230,6 +229,15 @@ impl Database {
     ) -> Result<usize, QueryError> {
         use crate::storage::data_dictionary::DD_DDL_RETIREMENTS;
         let _role = self.zone_map_gate.read_recursive();
+        if self.is_snapshot_read_only() {
+            return Ok(0);
+        }
+        let Some(_maintenance) = self.backup_maintenance_gate.try_read() else {
+            return Ok(0);
+        };
+        if self.capture.active.load(Ordering::Acquire) {
+            return Ok(0);
+        }
         let Some(mut cursor) = self.ddl_retirement_cleanup.try_lock() else {
             return Ok(0);
         };
@@ -328,6 +336,7 @@ impl Database {
     fn build_drop_table_intent(&self, table: &TableSchema) -> Result<DropTableIntent, QueryError> {
         let mut files = Vec::new();
         let mut vector_files = Vec::new();
+        let mut vector_directories = Vec::new();
         for sid in table.storage_ids() {
             files.push(self.relative_path(&self.table_path(sid)));
             files.push(self.relative_path(&self.overflow_path(sid)));
@@ -335,6 +344,7 @@ impl Database {
             for index in &table.indexes {
                 files.push(self.relative_path(&self.index_path_for_table_schema(table, sid, &index.name)));
                 if index.is_vector() {
+                    vector_directories.push(self.relative_path(&self.vector_index_path_for_parts(sid, table.active_generation.max(1), index.index_id, "vmanifest").with_extension("vector")));
                     vector_files.extend(self.owned_vector_files(table, index, sid)?.iter().map(|path| self.relative_path(path)));
                 }
             }
@@ -347,6 +357,7 @@ impl Database {
             table_name: table.name.clone(),
             files,
             vector_files,
+            vector_directories,
         })
     }
 
@@ -418,7 +429,47 @@ impl Database {
     /// "deleted" (recreate-then-delete). The intent log is the *additional* belt
     /// that covers the window where a `FileDelete` record is not yet durable.
     fn purge_dropped_table_files(&self, intent: &DropTableIntent) -> bool {
+        self.purge_dropped_table_files_until(intent, &|| false)
+    }
+
+    fn purge_dropped_table_files_until(&self, intent: &DropTableIntent, should_stop: &dyn Fn() -> bool) -> bool {
+        if should_stop() { return false; }
+        if let Some(table) = self.table_by_id(intent.table_id) {
+            match self.build_drop_table_intent(&table) {
+                Ok(current) if intent.files.iter().chain(&intent.vector_files).any(|path|
+                    current.files.iter().chain(&current.vector_files).any(|owned| owned == path)) => return false,
+                Err(_) => return false,
+                _ => {},
+            }
+        }
+        // Finish any in-flight vector publication before enumerating exact
+        // index-owned roots. Removed objects cannot start another publication.
+        let _vector_snapshot = if intent.vector_files.is_empty() && intent.vector_directories.is_empty() {
+            None
+        } else {
+            match self.vector_purge_snapshot_gate.try_write() { Some(guard) => Some(guard), None => return false }
+        };
         let result = (|| -> Result<(), QueryError> {
+            let mut intent = intent.clone();
+            let mut vector_files = intent.vector_files.iter().cloned().collect::<BTreeSet<_>>();
+            for relative in &intent.vector_directories {
+                if should_stop() { return Err(error(crate::error::catalog::ER_QUERY_INTERRUPTED, "retired-file cleanup interrupted; retry pending")); }
+                let directory = Path::new(relative);
+                if !directory.starts_with("objects/indexes") || directory.components().any(|c| !matches!(c, std::path::Component::Normal(_))) {
+                    return Err(vector::persistence::corrupt());
+                }
+                match fs::read_dir(self.data_dir.join(directory)) {
+                    Ok(entries) => for entry in entries {
+                        if should_stop() { return Err(error(crate::error::catalog::ER_QUERY_INTERRUPTED, "retired-file cleanup interrupted; retry pending")); }
+                        let entry = entry.map_err(io_err)?;
+                        if !entry.file_type().map_err(io_err)?.is_file() { return Err(vector::persistence::corrupt()); }
+                        vector_files.insert(self.relative_path(&entry.path()));
+                    },
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+                    Err(err) => return Err(io_err(err)),
+                }
+            }
+            intent.vector_files = vector_files.into_iter().collect();
             #[cfg(test)]
             if DDL_CLEANUP_FAILURE.with(|fail| fail.replace(false)) {
                 return Err(error(
@@ -432,6 +483,7 @@ impl Database {
                     .discard_pages_for_path(&self.data_dir.join(rel))?;
             }
             for rel in intent.files.iter().chain(&intent.vector_files) {
+                if should_stop() { return Err(error(crate::error::catalog::ER_QUERY_INTERRUPTED, "retired-file cleanup interrupted; retry pending")); }
                 max_lsn = max_lsn.max(self.append_wal(
                     txn_id_for_ddl(),
                     WalPayload::FileDelete {
@@ -447,11 +499,14 @@ impl Database {
                 self.sync_commit_lsn(max_lsn)?;
             }
             for rel in intent.files.iter().chain(&intent.vector_files) {
+                if should_stop() { return Err(error(crate::error::catalog::ER_QUERY_INTERRUPTED, "retired-file cleanup interrupted; retry pending")); }
                 match std::fs::remove_file(self.data_dir.join(rel)) {
                     Ok(()) => {}
                     Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                     Err(err) => return Err(io_err(err)),
                 }
+                #[cfg(test)]
+                recyclebin_crash_point("after_file_delete");
             }
             {
                 let mut handles = self.vector_retired_graphs.lock();
@@ -463,7 +518,7 @@ impl Database {
                 self.delete_auto_increment_metadata(intent.table_id)?;
             }
             self.remove_empty_object_directories(intent.files.iter().chain(&intent.vector_files)
-                .map(|rel| self.data_dir.join(rel)))?;
+                .map(|rel| self.data_dir.join(rel)).chain(intent.vector_directories.iter().map(|rel| self.data_dir.join(rel).join("__empty_owner__"))))?;
             Ok(())
         })();
         if let Err(err) = result {

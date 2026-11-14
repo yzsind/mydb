@@ -1375,6 +1375,9 @@ impl Database {
                             }
                             self.primary_definition_highwater
                                 .fetch_max(table.primary_definition_scn, Ordering::Release);
+                            if table.row_generation_txn_id == txn_id {
+                                self.primary_definition_highwater.fetch_max(commit_scn, Ordering::Release);
+                            }
                             if table.primary_definition_scn != 0 {
                                 self.table_locks_sharded
                                     .set_schema_floor(table.id, table.schema_version);

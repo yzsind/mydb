@@ -5,6 +5,6 @@ edition = "2021"
 publish = false
 
 [dependencies]
-mysql = { version = "=28.0.4", default-features = false, features = ["minimal-rust"] }
+mysql = { version = "=28.0.4", default-features = false, features = ["minimal-rust", "native-tls"] }
 
 [workspace]
