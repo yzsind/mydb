@@ -5,7 +5,11 @@ Examples are independent demonstrations. Use a disposable local instance and sch
 ## Shared Tables
 
 ```sql
-CREATE DATABASE IF NOT EXISTS statement_examples;
+-- This reset permanently discards only the disposable example schema.
+SET SESSION mydb_recyclebin = OFF;
+DROP DATABASE IF EXISTS statement_examples;
+CREATE DATABASE statement_examples;
+SET SESSION mydb_recyclebin = ON;
 USE statement_examples;
 CREATE TABLE customer (
   id BIGINT PRIMARY KEY, customer_id BIGINT UNIQUE,
@@ -16,6 +20,12 @@ CREATE TABLE customer (
 CREATE TABLE orders (
   id BIGINT PRIMARY KEY, customer_id BIGINT NOT NULL,
   total DECIMAL(20,2) NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE sales (
+  id BIGINT, sale_year INT, PRIMARY KEY(id, sale_year)
+) PARTITION BY RANGE(sale_year) (
+  PARTITION p2024 VALUES LESS THAN (2025),
+  PARTITION p_future VALUES LESS THAN MAXVALUE
 );
 CREATE TABLE account (id BIGINT PRIMARY KEY, balance DECIMAL(20,2) NOT NULL);
 CREATE TABLE accounts (id BIGINT PRIMARY KEY, tenant_id BIGINT, balance DECIMAL(20,2));

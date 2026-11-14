@@ -234,3 +234,35 @@ Both executables produced **identical ordered Top-100 IDs for all 1,000 queries*
 Additional L2 checks reused three synthetic indexes with 10,000 rows at 128, 384, and 1536 dimensions. Each executable ran two rounds of 1- and 8-client tests, with 100 Top-10 queries and five seconds per level. All 300 synthetic queries also returned identical ordered Top-10 IDs before and after the change; recall was unchanged in every configuration. These short checks complement the regression tests; they do not establish performance for all dimensions or workloads.
 
 Both executables identify rustc 1.95.0 in their ELF metadata. The optimized executable SHA-256 is `dfcac1a719c8e74fb419e54ec9bbc5c91b1826102f70b5339abb8c56b2bc6b12`. The original build and PostgreSQL measurements in the preceding tables are retained as dated observations; this follow-up does not establish a new simultaneous PostgreSQL comparison.
+
+## Public query replay procedure
+
+The historical full benchmark runner was maintained internally. The public
+[query replay tool](../scripts/vector_query_bench.py) provides a standalone warm
+cosine query/recall measurement against an already loaded table; it does not
+claim to regenerate the historical loading or index-build times. The SQL above
+specifies those stages and their timing boundaries. The round tables in this
+report are the public result record; keep their build and memo settings attached
+when citing them.
+
+Prepare JSONL with one object per query: `id`, numeric `vector` array, and
+`neighbors` containing ordered ground-truth IDs. For the recorded dataset these
+come from test.parquet (`id`, `emb`) and neighbors.parquet (`id`, `neighbors_id`),
+joined by id. Preserve original FLOAT32 inputs and record any textual rounding.
+Install PyMySQL/cryptography for MyDB or psycopg for PostgreSQL in a virtual
+environment. With the previously created vbench table and index:
+
+```bash
+export VECTOR_BENCH_PASSWORD='replace-with-local-benchmark-password'
+python3 scripts/vector_query_bench.py --engine mydb --host 127.0.0.1 \
+  --port 8738 --user root --database test --queries /tmp/mydb/queries.jsonl \
+  --k 100 --ef 200 --dynamic-factor 2 --clients 16 --duration 10 --rounds 3 \
+  --output /tmp/mydb/mydb-query-results.json
+```
+
+Start the server with MYDB_HNSW_QUERY_MEMO=OFF for the main graph-search series.
+For PostgreSQL run the tool with `--engine postgres` and its connection details;
+the tool sets hnsw.ef_search but does not create the extension or index. Keep
+engine configuration, effective MyDB ef, EXPLAIN, query ordering, recall, source
+fingerprint and the memo-ON series separately. Never interpolate QPS across
+recall levels without marking the interpolation and retaining measured points.

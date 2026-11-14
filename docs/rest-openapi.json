@@ -3,7 +3,7 @@
   "info": {
     "title": "mydb REST SQL API",
     "version": "1.0.0",
-    "description": "SQL and transactional sessions authenticated with database-owned API keys. Keys are administered only through TLS MySQL SQL; 1024 per account, no expiration by default, full credential retrieval supported."
+    "description": "SQL and transactional sessions authenticated with database-owned API keys. Keys are administered only through TLS MySQL SQL; 1024 per account, no expiration by default, full credential retrieval supported. Schema describes canonical JSON numbers; typed decimal preserves values outside safe integer representation. Runtime SQL type constraints remain authoritative."
   },
   "security": [
     {
@@ -25,9 +25,12 @@
               },
               "application/x-ndjson": {
                 "schema": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "NDJSON; every line validates against StreamEvent. NDJSON events end with complete or error; EOF alone is not completion."
                 },
-                "description": "NDJSON events end with complete or error; EOF alone is not completion."
+                "x-event-schema": {
+                  "$ref": "#/components/schemas/StreamEvent"
+                }
               }
             }
           },
@@ -36,12 +39,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -65,6 +63,14 @@
               "type": "string",
               "pattern": "^[A-Za-z0-9_-]{16,64}$"
             }
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            },
+            "description": "application/json or application/x-ndjson; quality weights supported."
           }
         ]
       }
@@ -78,8 +84,16 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Session"
                 }
+              }
+            },
+            "headers": {
+              "Location": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Path of the created SQL session."
               }
             }
           },
@@ -88,12 +102,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -120,7 +129,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Session"
                 }
               }
             }
@@ -130,12 +139,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -163,12 +167,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -200,9 +199,12 @@
               },
               "application/x-ndjson": {
                 "schema": {
-                  "type": "string"
+                  "type": "string",
+                  "description": "NDJSON; every line validates against StreamEvent. NDJSON events end with complete or error; EOF alone is not completion."
                 },
-                "description": "NDJSON events end with complete or error; EOF alone is not completion."
+                "x-event-schema": {
+                  "$ref": "#/components/schemas/StreamEvent"
+                }
               }
             }
           },
@@ -211,12 +213,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -248,6 +245,14 @@
               "type": "string",
               "pattern": "^[A-Za-z0-9_-]{16,64}$"
             }
+          },
+          {
+            "name": "Accept",
+            "in": "header",
+            "schema": {
+              "type": "string"
+            },
+            "description": "application/json or application/x-ndjson; quality weights supported."
           }
         ]
       }
@@ -261,7 +266,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Session"
                 }
               }
             }
@@ -271,12 +276,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -303,7 +303,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/RequestStatus"
                 }
               }
             }
@@ -313,12 +313,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -345,7 +340,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/RequestStatus"
                 }
               }
             }
@@ -355,12 +350,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -387,7 +377,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "$ref": "#/components/schemas/Status"
                 }
               }
             }
@@ -397,12 +387,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -419,7 +404,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "status": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "status"
+                  ]
                 }
               }
             }
@@ -429,12 +422,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -452,7 +440,15 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object"
+                  "type": "object",
+                  "properties": {
+                    "ready": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "ready"
+                  ]
                 }
               }
             }
@@ -462,12 +458,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "object",
-                  "properties": {
-                    "error": {
-                      "$ref": "#/components/schemas/Error"
-                    }
-                  }
+                  "$ref": "#/components/schemas/Failure"
                 }
               }
             }
@@ -489,12 +480,27 @@
       "Parameter": {
         "oneOf": [
           {
-            "type": [
-              "null",
-              "boolean",
-              "string",
-              "number"
-            ]
+            "oneOf": [
+              {
+                "type": [
+                  "null",
+                  "boolean",
+                  "string"
+                ]
+              },
+              {
+                "type": "integer",
+                "minimum": -9007199254740991,
+                "maximum": 9007199254740991
+              },
+              {
+                "type": "number",
+                "not": {
+                  "type": "integer"
+                }
+              }
+            ],
+            "description": "Use typed decimal/int64/uint64 for integral values outside the safe JSON integer range. SQL type, scale, finite floating range and binary/vector payload constraints are also checked by the server."
           },
           {
             "type": "object",
@@ -621,10 +627,16 @@
         "type": "object",
         "properties": {
           "database": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sql": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "params": {
             "type": "array",
@@ -633,7 +645,10 @@
             }
           },
           "statements": {
-            "type": "array",
+            "type": [
+              "array",
+              "null"
+            ],
             "minItems": 1,
             "maxItems": 1024,
             "items": {
@@ -645,7 +660,10 @@
             "default": false
           },
           "timeout_ms": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "minimum": 1
           }
         },
@@ -655,20 +673,29 @@
             "required": [
               "sql"
             ],
-            "not": {
-              "required": [
-                "statements"
-              ]
+            "properties": {
+              "sql": {
+                "type": "string"
+              },
+              "statements": {
+                "type": "null"
+              }
             }
           },
           {
             "required": [
               "statements"
             ],
-            "not": {
-              "required": [
-                "sql"
-              ]
+            "properties": {
+              "statements": {
+                "type": "array"
+              },
+              "sql": {
+                "type": "null"
+              },
+              "params": {
+                "maxItems": 0
+              }
             }
           }
         ]
@@ -677,7 +704,10 @@
         "type": "object",
         "properties": {
           "database": {
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "additionalProperties": false
@@ -765,11 +795,11 @@
           "results": {
             "type": "array",
             "items": {
-              "type": "object"
+              "$ref": "#/components/schemas/Result"
             }
           },
           "session": {
-            "type": "object"
+            "$ref": "#/components/schemas/Session"
           },
           "error": {
             "oneOf": [
@@ -801,6 +831,644 @@
             "type": "boolean"
           }
         }
+      },
+      "Column": {
+        "type": "object",
+        "properties": {
+          "name": {
+            "type": "string"
+          },
+          "sql_type": {
+            "type": "string"
+          },
+          "encoding": {
+            "enum": [
+              "integer_string",
+              "decimal_string",
+              "float",
+              "base64",
+              "json_text",
+              "vector_text",
+              "text"
+            ]
+          },
+          "unsigned": {
+            "type": "boolean"
+          },
+          "length": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "precision": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "scale": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "decimals": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "collation_id": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "schema": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "table": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "org_table": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "org_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "bits": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "vector_type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "type": "object",
+                "properties": {
+                  "datatype": {
+                    "type": "string"
+                  },
+                  "dimension": {
+                    "type": "integer",
+                    "minimum": 0
+                  }
+                },
+                "required": [
+                  "datatype",
+                  "dimension"
+                ]
+              }
+            ]
+          }
+        },
+        "required": [
+          "name",
+          "sql_type",
+          "encoding",
+          "unsigned"
+        ]
+      },
+      "Cell": {
+        "oneOf": [
+          {
+            "type": [
+              "null",
+              "string",
+              "number"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "non_finite": {
+                "enum": [
+                  "nan",
+                  "infinity",
+                  "-infinity"
+                ]
+              }
+            },
+            "required": [
+              "non_finite"
+            ]
+          }
+        ]
+      },
+      "Row": {
+        "type": "array",
+        "items": {
+          "$ref": "#/components/schemas/Cell"
+        }
+      },
+      "Diagnostics": {
+        "type": "object",
+        "properties": {
+          "warning_count": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "warnings_truncated": {
+            "type": "boolean"
+          },
+          "warnings": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "properties": {
+                "level": {
+                  "type": "string"
+                },
+                "mysql_errno": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "sqlstate": {
+                  "type": "string"
+                },
+                "message": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "level",
+                "mysql_errno",
+                "sqlstate",
+                "message"
+              ]
+            }
+          },
+          "autocommit": {
+            "type": "boolean"
+          },
+          "in_transaction": {
+            "type": "boolean"
+          },
+          "time_zone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "warning_count",
+          "warnings",
+          "warnings_truncated",
+          "autocommit",
+          "in_transaction",
+          "time_zone"
+        ]
+      },
+      "OkResult": {
+        "type": "object",
+        "properties": {
+          "statement_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "result_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "diagnostics": {
+            "$ref": "#/components/schemas/Diagnostics"
+          },
+          "kind": {
+            "const": "ok"
+          },
+          "affected_rows": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "matched_rows": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "last_insert_id": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          },
+          "info": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "statement_index",
+          "result_index",
+          "diagnostics",
+          "kind",
+          "affected_rows",
+          "last_insert_id"
+        ]
+      },
+      "ResultSet": {
+        "type": "object",
+        "properties": {
+          "statement_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "result_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "diagnostics": {
+            "$ref": "#/components/schemas/Diagnostics"
+          },
+          "kind": {
+            "const": "result_set"
+          },
+          "columns": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Column"
+            }
+          },
+          "rows": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/Row"
+            }
+          },
+          "row_count": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        },
+        "required": [
+          "statement_index",
+          "result_index",
+          "diagnostics",
+          "kind",
+          "columns",
+          "rows",
+          "row_count"
+        ]
+      },
+      "Result": {
+        "oneOf": [
+          {
+            "$ref": "#/components/schemas/OkResult"
+          },
+          {
+            "$ref": "#/components/schemas/ResultSet"
+          }
+        ]
+      },
+      "Session": {
+        "type": "object",
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "connection_id": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "database": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "autocommit": {
+            "type": "boolean"
+          },
+          "in_transaction": {
+            "type": "boolean"
+          },
+          "closed": {
+            "type": "boolean"
+          },
+          "time_zone": {
+            "type": "string"
+          },
+          "busy": {
+            "type": "boolean"
+          },
+          "expires_at_ms": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": [
+          "closed"
+        ],
+        "description": "SQL responses and session-control endpoints expose different subsets. Error fallbacks may contain only closed. expires_at_ms is Unix milliseconds on session control responses."
+      },
+      "ResultSetEnd": {
+        "type": "object",
+        "properties": {
+          "statement_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "result_index": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "diagnostics": {
+            "$ref": "#/components/schemas/Diagnostics"
+          },
+          "row_count": {
+            "type": "string",
+            "pattern": "^[0-9]+$"
+          }
+        },
+        "required": [
+          "statement_index",
+          "result_index",
+          "diagnostics",
+          "row_count"
+        ]
+      },
+      "StreamEvent": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "request_start"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "session_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "request_id",
+              "session_id"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "result_start"
+              },
+              "statement_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "result_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "columns": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Column"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "statement_index",
+              "result_index",
+              "columns"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "rows"
+              },
+              "statement_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "result_index": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "rows": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Row"
+                }
+              }
+            },
+            "required": [
+              "type",
+              "statement_index",
+              "result_index",
+              "rows"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "result_end"
+              },
+              "result": {
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/OkResult"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ResultSetEnd"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "type",
+              "result"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "complete"
+              },
+              "request_id": {
+                "type": "string"
+              },
+              "session": {
+                "$ref": "#/components/schemas/Session"
+              }
+            },
+            "required": [
+              "type",
+              "request_id",
+              "session"
+            ]
+          },
+          {
+            "type": "object",
+            "properties": {
+              "type": {
+                "const": "error"
+              },
+              "error": {
+                "$ref": "#/components/schemas/Error"
+              },
+              "session": {
+                "$ref": "#/components/schemas/Session"
+              }
+            },
+            "required": [
+              "type",
+              "error",
+              "session"
+            ]
+          }
+        ],
+        "description": "One JSON object per NDJSON line. Only complete establishes success; error is terminal and EOF alone is inconclusive."
+      },
+      "RequestStatus": {
+        "type": "object",
+        "properties": {
+          "request_id": {
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "accepted",
+              "running",
+              "cancel_requested",
+              "completed",
+              "failed",
+              "cancelled"
+            ]
+          },
+          "execution_outcome": {
+            "enum": [
+              "not_started",
+              "unknown",
+              "succeeded",
+              "failed"
+            ]
+          },
+          "transaction_state": {
+            "enum": [
+              "idle",
+              "active",
+              "closed",
+              "unknown"
+            ]
+          },
+          "rollback_confirmed": {
+            "type": "boolean"
+          },
+          "http_status": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "error": {
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "cancel_requested": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "request_id",
+          "state",
+          "execution_outcome"
+        ]
+      },
+      "Status": {
+        "type": "object",
+        "properties": {
+          "connections_limit": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sessions": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "inflight": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "requests": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "memory_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "executed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "failed": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "cancelled": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "received_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "sent_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "request_elapsed_us": {
+            "type": "integer",
+            "minimum": 0
+          }
+        },
+        "required": []
+      },
+      "Failure": {
+        "type": "object",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/Error"
+          },
+          "execution_outcome": {
+            "type": "string"
+          },
+          "request_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        },
+        "required": [
+          "error"
+        ]
       }
     }
   }

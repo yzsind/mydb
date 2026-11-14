@@ -134,3 +134,5 @@ Use [Reporting Issues](reporting-issues.md) when recovery fails explicitly.
 - [MVCC and Locking](mvcc-and-locking.md)
 - [SQL ROWID](rowid.md)
 - [Hardware and OS Requirements](hardware-and-os-requirements.md)
+
+Use [Changing MyDB Versions](changing-versions.md) for format checks, logical reload, validation and rollback planning.

@@ -94,3 +94,12 @@ identity, configuration, data, warmup, throughput, latency, and failures.
 [Client examples](../examples/README.md) and
 [correctness regression tools](../scripts/README.md) provide starting points.
 
+
+## Vector measurements
+
+The [November 12 Cohere 1M report](vector-cohere-1m-hnsw-benchmark-2026-11-12.md)
+is the source for the README and Docker Hub HNSW summary. Its main comparison
+uses candidate memo OFF, MyDB resolved ef=400 versus pgvector ef=200, and close
+but unequal recall. The report separately records memo ON and a later optimization
+experiment. Do not combine timings or recall from those different series. The
+MySQL results above are separate October experiments with different builds.

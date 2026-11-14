@@ -145,3 +145,10 @@ architecture) and Debian `bookworm-slim` (including the target architecture).
 pushing directly to a registry.
 
 [Back to product introduction](../README.md) · [Full configuration reference](configuration.md)
+
+For supported persisted global variables, values saved by `SET PERSIST` are
+loaded after these startup inputs and can override them on an existing volume.
+Inspect `performance_schema.persisted_variables` and `SHOW GLOBAL VARIABLES`;
+use `RESET PERSIST variable_name` to remove a saved override for the next restart.
+See [configuration precedence](configuration.md#precedence-and-when-settings-take-effect)
+and [changing versions](changing-versions.md).

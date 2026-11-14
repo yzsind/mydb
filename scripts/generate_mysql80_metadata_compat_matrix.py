@@ -147,6 +147,10 @@ def main() -> int:
                     "ai_use_or_model_use_or_ai_admin" if upper == "MYDB_AI_MODELS"
                     else "ai_admin"
                 )
+            elif upper == "MYDB_RECYCLEBIN":
+                surface["data_source"] = "transactional_recycle_bin_catalog"
+                surface["replication_semantics"] = "source_owned_physical_replication"
+                surface["visibility"] = "recyclebin_admin"
             elif upper == "MYDB_ROW_SECURITY_POLICIES":
                 surface["data_source"] = "row_security_catalog"
                 surface["replication_semantics"] = "replicated_catalog"

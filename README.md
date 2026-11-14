@@ -41,21 +41,20 @@ cover different development builds and TPC-derived results are unaudited. See
 the [detailed comparison](docs/performance-comparison.md) for all results, test
 conditions, and limitations.
 
-**MyDB vs. PostgreSQL 18.6 + pgvector 0.8.7** · Cohere 1M vectors (768-dim FLOAT32, cosine, top-100):
+**Cohere 1M HNSW**, November 12, 2026, 768-dimensional FLOAT32 cosine top-100:
 
-| Workload | MyDB | pgvector | Advantage |
-| --- | ---: | ---: | ---: |
-| Bulk load · 1M vectors¹ | 34 s | 318 s | **9.4x speedup** |
-| HNSW index build · `m=16, ef_construction=64` | 53 s | 118 s | **2.2x speedup** |
-| HNSW search · recall 94.8% vs 94.4%, 16 clients | 5,200 queries/s · p99 5.6 ms | 1,954 queries/s · p99 14.7 ms | **2.7x throughput** |
-| HNSW search · same settings, 1 client | 670 queries/s | 179 queries/s | **3.7x throughput** |
-| IVF index build · 1,000 lists | 30 s | 99 s | **3.4x speedup** |
-| IVF search · recall 0.96, 16 clients² | 1,066 queries/s | 132 queries/s | **8.1x throughput** |
+| Measurement | MyDB, candidate memo OFF | PostgreSQL 18.6 + pgvector 0.8.7 |
+| --- | ---: | ---: |
+| Search, 16 clients, median of three rounds | 3,005.3 queries/s | 1,968.5 queries/s |
+| Recall@100 | 94.283% | 94.341% |
+| HNSW build, one run | 92.017 s | 258.007 s |
 
-Same 16-vCPU host, identical index parameters (HNSW `ef_search=200`, no
-quantization), and durable commits. ¹ Multi-row INSERT from the same client:
-binary prepared statements for MyDB, text literals for PostgreSQL.
-² pgvector IVFFlat `probes=64`; MyDB interpolated to the same recall.
+The measured search throughput ratio is 1.53x. Both configured ef=200; MyDB's
+resolved ef was 400. These are warm repeated-query measurements on one 16-vCPU
+host, with no per-engine cgroup cap. See the [full report](docs/vector-cohere-1m-hnsw-benchmark-2026-11-12.md)
+for source/build identity, candidate memo ON results, loading precision differences
+and reproducibility. They are historical development measurements, not a current
+release performance guarantee.
 
 ## Quick Start
 
@@ -79,7 +78,7 @@ On Windows, run the equivalent command in PowerShell:
 .\mydb.exe --data-dir ./data
 ```
 
-The server listens locally on port `8738` and stores data in `./data`. No Rust
+The server listens on all IPv4 interfaces (`0.0.0.0:8738`) and stores data in `./data`. No Rust
 toolchain or config file is needed. With a MySQL 8.0 client installed, connect
 from another terminal:
 

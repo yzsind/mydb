@@ -2,7 +2,7 @@
 
 This document summarizes mydb's product capabilities in the default build. It describes what mydb supports, while [MySQL Compatibility](mysql80-compatibility.md) explains the differences from MySQL 8.0.46.
 
-mydb is a single-node general-purpose relational database serving clients over the MySQL classic protocol. It is currently in development toward its first product release and is suitable for feature validation, compatibility testing, and evaluation in controlled environments; it should not yet be regarded as a release that can directly replace production MySQL.
+mydb is a single-node general-purpose relational database serving clients over the MySQL classic protocol. It is currently a public preview while its first production-ready product version is under development and is suitable for feature validation, compatibility testing, and evaluation in controlled environments; it should not yet be regarded as a release that can directly replace production MySQL.
 
 ## 1. Capability Map
 

@@ -9,6 +9,80 @@ Native replication is a mydb→mydb WAL stream independent of the MySQL binlog. 
 
 The local WAL tail cannot be inferred as applied within the process. After an apply failure, reconnection requests data from the last `durable_applied_lsn + 1`; a Database still alive within the same process skips the prefix it has already applied successfully, preventing a repeated BEGIN from temporarily overriding the visibility of already-committed transactions. Reconnect reconciles the progress watermark with the minimum of the engine's successfully applied position and the locally durable WAL position; received but failed records are retried. Restartpoints also preserve the WAL needed by the persisted progress file. After a process restart, recovery redoes the local WAL before advancing progress.
 
+## Local two-node rehearsal
+
+Use a disposable directory tree and two terminals. The SQL ports are 14837/14838;
+reserve native listener ports 13316/13317 for the current and future master.
+Choose unused ports. Build `cargo build --locked --bin mydb`, then set the same
+protected environment in both terminals (do not use a real production token):
+
+```bash
+mkdir -p /tmp/mydb/native-rehearsal
+export MYDB_REPL_AUTH_TOKEN='local-rehearsal-token-replace-me'
+export MYDB_MEMORY_TARGET=512M
+```
+
+Terminal A, fresh source:
+
+```bash
+MYDB_ROLE=master MYDB_REPL_BIND_HOST=127.0.0.1 MYDB_REPL_PORT=13316 \
+  ./target/debug/mydb --data-dir /tmp/mydb/native-rehearsal/a --port 14837
+```
+
+Connect locally as root and create seed data on A before starting B:
+
+```sql
+CREATE TABLE test.repl_check(id INT PRIMARY KEY, value INT);
+INSERT INTO test.repl_check VALUES(1,10);
+SHOW MYDB MASTER STATUS;
+```
+
+Terminal B, fresh replica:
+
+```bash
+MYDB_ROLE=replica MYDB_REPL_MASTER_HOST=127.0.0.1 MYDB_REPL_MASTER_PORT=13316 \
+  MYDB_REPL_BIND_HOST=127.0.0.1 MYDB_REPL_PORT=13317 \
+  ./target/debug/mydb --data-dir /tmp/mydb/native-rehearsal/b --port 14838
+```
+
+B opens its SQL listener only after its base seed is installed. Connect using
+`mysql -h127.0.0.1 -P14838 -uroot -p test`. On A insert another row, then read
+SHOW MYDB MASTER STATUS and record its Durable_LSN. Poll SHOW MYDB REPLICA STATUS
+on B until Durable_Applied_LSN reaches that recorded position, checking errors
+and resync state each time. Use a fresh read statement on B to verify both rows;
+a fixed sleep is not a catch-up barrier. See [status fields](statement/replication/status-fields.md).
+
+For a planned switch, stop application writes and follow [Planned Switchover](#planned-switchover):
+A runs STOP MASTER WRITES WAIT 30; copy its actual Fence_LSN and Fence_Token into
+B's PROMOTE command. After B is confirmed master, A runs
+`DEMOTE TO REPLICA WITH MASTER='127.0.0.1:13317'`. Check A's applied watermark
+against B and verify a write on B appears on A. Never resume writes on both.
+Restart existing directories with MYDB_ROLE=auto and the node's original listener
+port/token settings; an explicit stale startup role fails. On failure inspect
+Role/Resync_Required/Last_Status, retain files and complete any pending transition
+before changing endpoints or requesting a controlled resync.
+
+## Remote mutual TLS example
+
+Loopback plaintext above is a local rehearsal. For remote peers, configure on
+both nodes a CA and a node certificate/key, readable only by the server account:
+
+```ini
+[mydb]
+repl_tls_mode = verify_identity
+repl_tls_ca = /etc/mydb/repl-ca.pem
+repl_tls_cert = /etc/mydb/node-cert.pem
+repl_tls_key = /etc/mydb/node-key.pem
+repl_bind_host = 0.0.0.0
+repl_port = 3316
+```
+
+Use the source DNS name as repl_master_host on the replica, with a matching SAN
+in the source certificate (or set repl_tls_server_name deliberately). Each peer
+needs its own valid certificate and the same environment-only auth token. Keep
+SQL TLS configuration separate from native replication TLS. For a controlled
+role reversal both nodes need reachable listeners and valid peer identities.
+
 ## Configuration
 
 Both peers require the same `MYDB_REPL_AUTH_TOKEN` (16–4096 bytes), supplied through a protected environment. Use a randomly generated secret and rotate it on both peers together. Authentication is checked before creating a slot or serving any WAL/base backup, including loopback connections; mTLS remains mandatory for non-loopback transport. A missing or invalid token fails startup explicitly. The master requires at least `MYDB_ROLE=master`; a new replica is configured with `MYDB_ROLE=replica`, `MYDB_REPL_MASTER_HOST`, and `MYDB_REPL_MASTER_PORT`. Existing data directories should use `MYDB_ROLE=auto` instead, with roles changed only through administrative SQL; startup fails when the explicit environment role conflicts with the persisted role. `FORCE_RESYNC` uses the persisted role for its controlled restart, overriding a stale initial role in the original environment. Ordinary startup still rejects conflicting explicit roles.

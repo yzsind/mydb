@@ -10,3 +10,9 @@
 | Component | [INSTALL](install-component.md) · [UNINSTALL](uninstall-component.md) |
 
 RESOURCE GROUP entries are explicit unsupported errors. INSTALL/UNINSTALL supports the built-in validate_password component, not arbitrary plugin binaries. Additional local administration includes [HTTP policy](../integration/reload-http-config.md), [AI policy](../integration/reload-ai-config.md), [AI key rotation](../integration/rotate-ai-encryption-key.md) and [API Key master-key rotation](../account/rotate-api-key-master-key.md). See [privilege and commit rules](../execution-contracts.md).
+
+## Recycle bin administration
+
+- [SHOW RECYCLEBIN](show-recyclebin.md)
+- [RESTORE TABLE](restore-table.md)
+- [PURGE RECYCLEBIN](purge-recyclebin.md)

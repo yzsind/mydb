@@ -65,3 +65,5 @@ with fresh names and the documented privileges. HTTP examples require the
 require configured models and AI_USE. External operations are not undone by SQL
 rollback. No function-page example grants production credentials or isolation beyond
 its explicit current contract.
+
+JSON_TABLE is a table function, not a scalar function: see [JSON_TABLE](../json-table.md) for row paths, typed columns, lateral input and nested expansion.

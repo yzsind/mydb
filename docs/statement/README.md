@@ -135,3 +135,9 @@ The table lists canonical statement entry points; slash-separated names share a 
 | Metadata-only/declarative properties | Declared routine determinism/data-access characteristics and documented table compatibility options do not promise a separate physical engine or purity proof |
 
 Use the linked page for exact syntax, privileges, errors and transaction boundaries. The matrix describes SQL entry points, not a promise that all MySQL option combinations are supported.
+
+## Recycle bin administration
+
+- [SHOW RECYCLEBIN](admin/show-recyclebin.md)
+- [RESTORE TABLE](admin/restore-table.md)
+- [PURGE RECYCLEBIN](admin/purge-recyclebin.md)

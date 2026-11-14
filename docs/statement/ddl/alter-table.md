@@ -62,7 +62,7 @@ DDL can wait for long transactions at preparation/publication even with LOCK=NON
 ## Examples
 
 ```sql
-ALTER TABLE customer ADD COLUMN last_login TIMESTAMP NULL;
+ALTER TABLE customer ADD COLUMN last_seen_at TIMESTAMP NULL;
 ALTER TABLE orders ADD INDEX idx_orders_customer_created (customer_id, created_at);
 ALTER TABLE sales DROP PARTITION p2024;
 CREATE TABLE customer_without_pk(id BIGINT NOT NULL);

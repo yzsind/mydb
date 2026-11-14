@@ -75,3 +75,5 @@ Result names are sorted and unique. Use `LIKE` or `WHERE` to select variables.
 An invalid `WHERE` expression returns an error rather than silently excluding
 rows. Results have the fixed columns `Variable_name` and `Value`, including
 when the statement is prepared.
+
+Use [operations troubleshooting](operations-troubleshooting.md) for symptom-based queries, counter interpretation and next actions.

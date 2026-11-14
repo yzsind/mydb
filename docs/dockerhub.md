@@ -61,19 +61,11 @@ These measurements used the same 16-vCPU host, 10 GiB database memory limits,
 and durable commits. They cover different development builds; TPC-derived
 results are unaudited and are not official TPC benchmark results.
 
-For a Cohere dataset of one million 768-dimensional FLOAT32 vectors, using
-cosine distance and top-100 retrieval:
-
-| Workload | MyDB | PostgreSQL 18.6 + pgvector 0.8.7 | Advantage |
-| --- | ---: | ---: | ---: |
-| HNSW index build, `m=16, ef_construction=64` | 53 s | 118 s | 2.2x speedup |
-| HNSW search, 16 clients | 5,200 queries/s | 1,954 queries/s | 2.7x throughput |
-| HNSW search p99 latency, 16 clients | 5.6 ms | 14.7 ms | Lower tail latency |
-
-The vector comparison used the same 16-vCPU host, identical index parameters,
-`ef_search=200`, no quantization, and durable commits. Recall was 94.8% for
-MyDB and 94.4% for pgvector. Actual performance depends on data, hardware,
-configuration, and query patterns.
+The public [Cohere HNSW report](https://github.com/yzsind/mydb/blob/main/docs/vector-cohere-1m-hnsw-benchmark-2026-11-12.md)
+records 3,005.3 vs 1,968.5 queries/s at 16 clients (1.53x), candidate memo OFF,
+and recall 94.283% vs 94.341%. MyDB resolved ef=400; pgvector used ef=200.
+Build times were 92.017 vs 258.007 seconds. These November 12 development results
+use warm repeated queries; see the report for full conditions and limitations.
 
 ## Quick start
 
@@ -231,3 +223,14 @@ repositories.
 ## License
 
 MyDB is licensed under the Apache License 2.0.
+
+For supported persisted global variables, values saved by `SET PERSIST` are
+loaded after these startup inputs and can override them on an existing volume.
+Inspect `performance_schema.persisted_variables` and `SHOW GLOBAL VARIABLES`;
+use `RESET PERSIST variable_name` to remove a saved override for the next restart.
+See [configuration precedence](configuration.md#precedence-and-when-settings-take-effect)
+and [changing versions](changing-versions.md).
+
+This file is the Docker Hub publication copy. Update it together with the project
+README and linked public reports when publishing; [Docker](docker.md) is the
+canonical deployment guide. See [documentation maintenance](documentation-maintenance.md).

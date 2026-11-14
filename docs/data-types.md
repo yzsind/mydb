@@ -456,3 +456,5 @@ CREATE TABLE products (
 A production schema should further validate, against real queries, the index byte counts
 after character set, precision/range, default expressions, spatial reference systems, vector
 dimensions, and import behavior under strict `sql_mode`.
+
+JSON row projection is documented in [JSON_TABLE](json-table.md).

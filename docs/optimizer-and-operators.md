@@ -424,3 +424,5 @@ trace of the previous statement under examination.
    planning problems from kernel problems.
 6. If necessary, compare alternative plans with hints and record the query,
    statistics, session settings, and EXPLAIN output when reporting a problem.
+
+Use [operations troubleshooting](operations-troubleshooting.md) for symptom-based queries, counter interpretation and next actions.

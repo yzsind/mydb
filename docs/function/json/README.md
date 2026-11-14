@@ -79,3 +79,5 @@ JSON_STORAGE_SIZE reports MySQL binary-JSON encoding size, not mydb heap/JSONB
 allocation. JSON_STORAGE_FREE is a compatibility value of zero for valid input;
 it does not measure reusable storage. JSON schemas use the Draft 4 subset supported
 by the validator; see the two schema-function pages for success/failure forms.
+
+JSON_TABLE is a table function, not a scalar function: see [JSON_TABLE](../../json-table.md) for row paths, typed columns, lateral input and nested expansion.

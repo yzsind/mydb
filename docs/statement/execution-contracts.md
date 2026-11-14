@@ -45,6 +45,8 @@ Table and column grants can authorize accesses within their scope; global grants
 | PURGE BINARY LOGS | BINLOG_ADMIN |
 | FLUSH BINARY LOGS / RESET BINARY LOGS AND GTIDS | RELOAD |
 | Native mydb replication administration and SHOW | SYSTEM_VARIABLES_ADMIN; FORCE_RESYNC additionally needs SHUTDOWN |
+| SHOW RECYCLEBIN / retained-table SELECT / PURGE RECYCLEBIN | RECYCLEBIN_ADMIN |
+| RESTORE TABLE | RECYCLEBIN_ADMIN plus CREATE on destination |
 | All backup SQL, including SHOW | BACKUP_ADMIN |
 
 The effective privilege set includes activated roles. SUPER implies some administration checks but is not a replacement for every extension capability: AI_ADMIN/AI_USE, HTTP_ADMIN, ROW_SECURITY_ADMIN, RLS_CONTEXT_ADMIN, and API_KEY_ADMIN have their own rules. See the relevant [extension references](../README.md). Authentication or privilege errors can occur before an unsupported-capability error.
@@ -66,6 +68,10 @@ The effective privilege set includes activated roles. SUPER implies some adminis
 | SET autocommit from 0 to 1 | Commits current transaction; setting the current value again does not imply a new data change |
 | User variables / named prepared definitions | Session state; not restored by ordinary data ROLLBACK |
 | Sequence allocation, created export files, HTTP/AI external calls | Side effects are not undone by a data ROLLBACK |
+
+RESTORE TABLE and PURGE RECYCLEBIN are DDL boundaries. PURGE ALL commits batches
+separately and can partially finish before an error; physical deletion follows
+the committed irreversible PURGING decision asynchronously. See [recycle bin](../recycle-bin.md).
 
 A failed DDL statement can leave the old object definition intact while earlier user DML has already committed. DDL atomic publication and rollback of the caller's transaction are separate guarantees. A live XA branch rejects commands that would implicitly commit it. Transaction-ending commands and access-mode restrictions are described in [Transactions](transaction/README.md).
 

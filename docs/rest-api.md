@@ -276,3 +276,12 @@ connection and its affected SQL session; other HTTP/2 streams on that connection
 may also be interrupted. Memory and execution slots remain charged until their
 actual owners release them. Buffered result metadata and OK packets count toward
 the protocol memory budget, even when there are no result rows.
+
+The [OpenAPI schema](rest-openapi.json) defines result-set/OK variants, column
+encodings, sessions, request state and each NDJSON event. It describes canonical
+JSON number values: use typed decimal/int64/uint64 for integral values outside
+the safe JSON integer range, including numbers written with a decimal point.
+The engine additionally enforces decimal precision/scale, finite floating ranges,
+vector shape and SQL conversion rules. SQL FLOAT nonfinite output is JSON null;
+DOUBLE nonfinite output uses the non_finite object. A schema cannot encode every
+SQL type conversion or the lexical distinction between 1 and 1.0.

@@ -17,6 +17,11 @@ Deletes a database and all objects in it. `SCHEMA` is a synonym.
 - Returns 1008 when the database does not exist; IF EXISTS turns this into a Note.
 - A committed DROP cannot be recovered by transaction ROLLBACK; back up first.
 
+Eligible persistent tables are retained in the [recycle bin](../../recycle-bin.md)
+by default. The database, routines, grants and other attached objects are not
+restored as a unit. Recreate the database or restore tables into another existing
+database; expiry or disk pressure can remove retained data before recovery.
+
 ## Privileges, Transactions, and Dependencies
 
 Requires DROP on the schema. The current transaction is implicitly committed before the drop. A missing database is 1008, or a Note with IF EXISTS. Removing a persistent schema invalidates dependent cross-schema views; querying an invalid view returns 1356. RLS dependency checks and AI model ownership can block removal (drop schema AI models explicitly first). Session temporary objects are not a backup of the deleted persistent schema. Use SHOW CREATE and a verified backup before relying on a recoverable definition.

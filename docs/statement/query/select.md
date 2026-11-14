@@ -144,3 +144,5 @@ The method names and REPEATABLE clause follow SQL-standard sampling conventions.
 - [SELECT INTO file](select-into-file.md)
 - [EXPLAIN](explain.md)
 - CTEs and RETURNING in [INSERT](../dml/insert.md), [UPDATE](../dml/update.md), and [DELETE](../dml/delete.md)
+
+See [JSON_TABLE](../../json-table.md) for full table-function syntax and examples.

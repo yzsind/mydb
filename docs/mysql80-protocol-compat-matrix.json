@@ -1,6 +1,6 @@
 {
   "baseline": "MySQL Community Server 8.0.46",
-  "reviewed_at": "2026-08-21",
+  "reviewed_at": "2026-11-14",
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
@@ -45,5 +45,20 @@
     "STATEMENT or MIXED binlog",
     "MINIMAL or NOBLOB row image",
     "multi-threaded replica apply"
-  ]
+  ],
+  "evidence": {
+    "review_scope": "Source and documentation contract review; focused regression and local protocol rehearsal. This fingerprint is a review trigger, not proof all combinations are supported.",
+    "source_sha256": {
+      "src/mysql/protocol.rs": "cec9d31bf841b246bc926a631dc3bc9cd0d831fdc11c46cdc10c2e6031f113bc",
+      "src/mysql/server.rs": "49fb84a0b3ec74ff15b38c2e6826de6dbb752bfb3227dc4aa1f1e86630a0f043",
+      "src/mysql/session.rs": "7854990006ba24e94327ba9b6691c9b4c527e8038ad18c99c5179f4526c79620",
+      "src/binlog.rs": "d4d59d4a63591c1ffe3f6b9816d0771b9561f96bf57177dfd8289123f2dffe36"
+    },
+    "test_sources": [
+      "src/mysql/session/stream_header_contract_tests.rs",
+      "src/rest/tests.rs",
+      "src/engine/executor/tests/rest_access_keys.rs"
+    ],
+    "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
+  }
 }

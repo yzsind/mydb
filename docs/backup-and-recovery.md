@@ -2,7 +2,7 @@
 
 This guide covers creating, inspecting, querying, restoring, archiving, and retaining native physical backups in mydb. It is intended for database administrators and operations staff. Current repository, image, bundle, and catalog versions are listed in the generated [storage format registry](storage-format-versions.md).
 
-mydb is still developing its first product release. Rehearse recovery in the target deployment environment before using these procedures. For recovery across versions, check the [storage format versions](storage-format-versions.md); the product version alone does not establish physical format compatibility.
+mydb is a public preview; its first production-ready product version is still under development. Rehearse recovery in the target deployment environment before using these procedures. For recovery across versions, check the [storage format versions](storage-format-versions.md); the product version alone does not establish physical format compatibility.
 
 ## 1. Capabilities and Recovery Scope
 
@@ -540,30 +540,6 @@ The implementation sets explicit resource limits, such as 64 MiB per metadata ob
 
 WAL protection also fixes the temporal history retention window at capture time. Before changing that window, switching source lineage, or selecting a nonpersistent mode, stop protection as required to avoid breaking the recovery chain. Recovery uses strict validation; do not rely on forced tolerance or salvage settings to bypass corruption.
 
-## 13. Command Reference and Related Documentation
-
-| Entry point | Description |
-| --- | --- |
-| `mydb-backup init` | Initialize repository encoding and optional key binding |
-| `mydb-backup list` | List published bases |
-| `mydb-backup verify` | Check integrity, optionally including actual recovery |
-| `mydb-backup restore` | Create an independent read-only or writable recovery image |
-| `mydb-backup promote` | Make a stopped, independent recovery image writable |
-| `mydb-backup confirm` | Verify and confirm installation durability for a complete independent image or repository |
-| `mydb-backup recoverability` / `keys` / `diagnostics` | Recoverable intervals, key dependencies, and latest verification or rehearsal results |
-| `mydb-backup inspect-operation` / `gc` / `checkpoint` | Ownership diagnostics, physical garbage collection, and catalog snapshots/cold history compaction |
-| `mydb-backup prune` | Preview or apply retention pruning |
-| `mydb-backup export` / `import` | Export a self-contained bundle or import into an empty target repository |
-
-See `mydb-backup --help` for complete arguments. Unknown commands, duplicate options, missing arguments, and mutually exclusive targets produce errors. The tool exits with code 0 on success and 1 on failure; failures include an error message, SQLSTATE, and available diagnostics on standard error.
-
-Related documentation:
-
-- [Backup SQL Reference](statement/backup/README.md)
-- [Startup Configuration](configuration.md)
-- [Native Physical Replication](native-replication.md)
-- [Storage Format Versions](storage-format-versions.md)
-
 ## 14. Recovery Planning, Diagnostics, and Interruption Handling
 
 Before recovery, run a complete preflight check that shares the selection rules used by actual recovery:
@@ -613,3 +589,27 @@ File generation leases and bounded reopening support more than 1024 files and 51
 `keys` lists key IDs, fingerprints, dependency counts/bytes, and key availability without exposing key material. The first version fixes one WAL key per repository. Rotation uses a new key, a new repository, and a new full backup. Retain the old repository and key until the old recovery window retires. In a handover window with business writes stopped, verify closure of the old stream, the new full backup, and continuation of the new stream. This procedure does not provide continuous PITR across repositories. For storage encryption key rotation without business downtime, use a verified filesystem encryption solution. Bases and bundles containing them may still be plaintext; WAL encryption does not encrypt full backups.
 
 The generated [storage format registry](storage-format-versions.md) lists repository, bundle, native image, image mode, catalog checkpoint, and lineage versions. No migration from historical development formats is provided.
+
+## 13. Command Reference and Related Documentation
+
+| Entry point | Description |
+| --- | --- |
+| `mydb-backup init` | Initialize repository encoding and optional key binding |
+| `mydb-backup list` | List published bases |
+| `mydb-backup verify` | Check integrity, optionally including actual recovery |
+| `mydb-backup restore` | Create an independent read-only or writable recovery image |
+| `mydb-backup promote` | Make a stopped, independent recovery image writable |
+| `mydb-backup confirm` | Verify and confirm installation durability for a complete independent image or repository |
+| `mydb-backup recoverability` / `keys` / `diagnostics` | Recoverable intervals, key dependencies, and latest verification or rehearsal results |
+| `mydb-backup inspect-operation` / `gc` / `checkpoint` | Ownership diagnostics, physical garbage collection, and catalog snapshots/cold history compaction |
+| `mydb-backup prune` | Preview or apply retention pruning |
+| `mydb-backup export` / `import` | Export a self-contained bundle or import into an empty target repository |
+
+See `mydb-backup --help` for complete arguments. Unknown commands, duplicate options, missing arguments, and mutually exclusive targets produce errors. The tool exits with code 0 on success and 1 on failure; failures include an error message, SQLSTATE, and available diagnostics on standard error.
+
+Related documentation:
+
+- [Backup SQL Reference](statement/backup/README.md)
+- [Startup Configuration](configuration.md)
+- [Native Physical Replication](native-replication.md)
+- [Storage Format Versions](storage-format-versions.md)

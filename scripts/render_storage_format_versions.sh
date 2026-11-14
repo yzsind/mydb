@@ -36,6 +36,9 @@ cat >"$tmp_file" <<EOF
 <!-- Automatically generated; do not edit. -->
 # Storage Format Versions
 
+This table describes this source checkout; use the matching tag for release binaries.
+See [changing versions](changing-versions.md) before reusing existing data.
+
 The current development format is incompatible with earlier versions. If versions do not match, use a new \`MYDB_DATA_DIR\` or rebuild the data directory; mydb does not migrate it silently.
 
 | Format | Version |

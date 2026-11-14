@@ -54,6 +54,7 @@ All names below belong to `information_schema`.
 | `MYDB_AI_RUNTIME_STATUS` | A node-local AI runtime metric |
 | `MYDB_ROW_SECURITY_POLICIES` | A row security policy |
 | `MYDB_SEQUENCES` | A sequence and its recovery and synchronization state |
+| `MYDB_RECYCLEBIN` | A retained table and its restoration/cleanup state; requires RECYCLEBIN_ADMIN |
 | `MYDB_DDL_JOBS` | A tracked DDL job |
 | `MYDB_PREPARED_XA_TRANSACTIONS` | A prepared XA transaction |
 | `MYDB_CURSORS` | A live server-side cursor |

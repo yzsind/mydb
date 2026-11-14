@@ -816,6 +816,21 @@
     },
     {
       "compatibility_class": "mydb_native",
+      "data_source": "transactional_recycle_bin_catalog",
+      "object": "MYDB_RECYCLEBIN",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "source_owned_physical_replication",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "recyclebin_admin"
+    },
+    {
+      "compatibility_class": "mydb_native",
       "data_source": "mydb_catalog_or_runtime",
       "object": "MYDB_DDL_JOBS",
       "producer": "real_producer",
@@ -1599,21 +1614,6 @@
         "honest_empty_shape"
       ],
       "visibility": "object_policy"
-    },
-    {
-      "compatibility_class": "mydb_native",
-      "data_source": "transactional_recycle_bin_catalog",
-      "object": "MYDB_RECYCLEBIN",
-      "producer": "real_producer",
-      "pushdown": [],
-      "replication_semantics": "source_owned_physical_replication",
-      "schema": "information_schema",
-      "shape": "extension_stable",
-      "test_coverage": [
-        "registry_contract",
-        "producer_scenario"
-      ],
-      "visibility": "recyclebin_admin"
     }
   ],
   "version": 2

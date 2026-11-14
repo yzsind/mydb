@@ -49,3 +49,5 @@ MYDB_PERFORMANCE_SCHEMA_EVENTS_STATEMENTS_HISTORY_LONG_SIZE=20000
 Subsystems that mydb does not have — Group Replication, InnoDB redo, clone, firewall,
 NDB, and the enterprise thread pool — keep their exact structure and are explicitly
 empty.
+
+Use [operations troubleshooting](operations-troubleshooting.md) for symptom-based queries, counter interpretation and next actions.

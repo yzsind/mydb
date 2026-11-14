@@ -45,6 +45,14 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: scripts/render_storage_format_versions.sh --check
       - run: python3 scripts/check_docs.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install jsonschema==4.26.0 openapi-spec-validator==0.9.0
+      - run: python3 scripts/check_documentation_contracts.py
+      - run: python3 scripts/check_function_test_coverage.py --check
+      - run: python3 scripts/generate_mysql80_metadata_compat_matrix.py --check
+      - run: python3 scripts/generate_public_references.py --check
       - run: python3 scripts/generate_mysql80_information_schema_rust.py --check
       - run: python3 scripts/generate_mysql80_performance_schema_rust.py --check
       - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
@@ -143,6 +151,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends mysql-client openssl
       - run: cargo build --locked --features tools --bin mydb --bin mydb-backup
       - run: cargo build --locked --manifest-path clients/mydb-cli/Cargo.toml
+      - run: python -m pip install jsonschema==4.26.0
+      - run: python scripts/test_documentation_examples.py --binary target/debug/mydb --output /tmp/mydb/documentation-examples-ci
       - run: python clients/mydb-cli/tests/acceptance.py --cli clients/mydb-cli/target/debug/mydb-cli --server-binary target/debug/mydb --output /tmp/mydb/cli-acceptance-ci
       - run: python scripts/test_native_readiness.py --binary target/debug/mydb --output /tmp/mydb/native-readiness-ci
       - run: python scripts/test_backup_recovery.py --profile debug --rows 1000 --pairs 1
@@ -157,6 +167,7 @@ jobs:
           path: |
             /tmp/mydb/cli-acceptance-ci
             /tmp/mydb/native-readiness-ci
+            /tmp/mydb/documentation-examples-ci
             /tmp/mydb/native-acceptance-*
             /tmp/mydb/backup-recovery-*
             /tmp/mydb/release-security-ci

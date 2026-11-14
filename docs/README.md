@@ -79,3 +79,15 @@ Public product, SQL, deployment, and operations documentation. Start with the
 - [Protocol compatibility matrix](mysql80-protocol-compat-matrix.json)
 - [REST OpenAPI 3.1](rest-openapi.json)
 - [Unicode license](UNICODE-LICENSE.txt)
+
+## Deployment workflows and reference maintenance
+
+- [MySQL migration](mysql-migration.md)
+- [Security deployment](security-deployment.md)
+- [Operations troubleshooting](operations-troubleshooting.md)
+- [Changing versions](changing-versions.md)
+- [Startup option registry](configuration-registry.md)
+- [JSON_TABLE](json-table.md)
+- [Cohere 1M HNSW measurements](vector-cohere-1m-hnsw-benchmark-2026-11-12.md)
+- [Docker Hub publication copy](dockerhub.md)
+- [Documentation scope and maintenance](documentation-maintenance.md)
