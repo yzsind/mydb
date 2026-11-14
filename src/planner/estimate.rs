@@ -2768,9 +2768,9 @@ pub(super) fn estimate_hash_join_operator_cost(
             && right_keys.len() == 1
             && !null_safe.iter().any(|safe| *safe)
         {
-            let probe_key = match build_side {
-                BuildSide::Left => &right_keys[0],
-                BuildSide::Right => &left_keys[0],
+            let (build_plan, build_key, probe_key) = match build_side {
+                BuildSide::Left => (left, &left_keys[0], &right_keys[0]),
+                BuildSide::Right => (right, &right_keys[0], &left_keys[0]),
             };
             if let Some((work, latency)) =
                 runtime_filter_apply_qualification_cpu(probe_plan, probe_key)
@@ -2778,7 +2778,11 @@ pub(super) fn estimate_hash_join_operator_cost(
                 // Match the conservative false-positive allowance used by
                 // hash-probe/Grace costing. This changes only avoidable CPU;
                 // the standalone child retains its complete fallback cost.
-                let rejected = (1.0 - match_rate.clamp(0.0, 1.0)) * (1.0 - 0.125);
+                let filter_match_rate = runtime_filter_pre_apply_match_rate(
+                    probe_plan, build_plan, probe_key, build_key,
+                )
+                .unwrap_or(match_rate);
+                let rejected = (1.0 - filter_match_rate.clamp(0.0, 1.0)) * (1.0 - 0.125);
                 let saved =
                     (latency * rejected).min((probe_cost.total - probe_cost.startup).max(0.0));
                 cost.total = (cost.total - saved).max(cost.startup);
@@ -2787,6 +2791,8 @@ pub(super) fn estimate_hash_join_operator_cost(
                     "hash_join_runtime_apply_cost",
                     serde_json::json!({
                         "rejected_fraction": rejected,
+                        "post_apply_match_rate": match_rate,
+                        "pre_apply_match_rate": filter_match_rate,
                         "saved_latency": saved,
                         "saved_cpu_work": work * rejected,
                     }),
@@ -2875,6 +2881,24 @@ pub(crate) fn estimate_equijoin_rows(
     let left_keys = effective_left_keys.as_slice();
     let right_keys = effective_right_keys.as_slice();
 
+    let keyset_floor = if left_keys.len() == 1 {
+        let left_floor =
+            if keyset_join_preserves_prefiltered_rows(left, right, &left_keys[0], &right_keys[0]) {
+                left_rows
+            } else {
+                0.0
+            };
+        let right_floor =
+            if keyset_join_preserves_prefiltered_rows(right, left, &right_keys[0], &left_keys[0]) {
+                right_rows
+            } else {
+                0.0
+            };
+        left_floor.max(right_floor)
+    } else {
+        0.0
+    };
+
     let dense_domain_rows = if left_keys.len() == 1 && right_keys.len() == 1 {
         estimate_dense_filtered_domain_join_rows(
             left,
@@ -2954,6 +2978,7 @@ pub(crate) fn estimate_equijoin_rows(
         // intentionally absent.
         let raw = left_rows * right_rows * selectivity;
         return raw
+            .max(keyset_floor)
             .max(dense_domain_rows.unwrap_or(0.0))
             .clamp(0.0, left_rows * right_rows);
     }
@@ -2962,6 +2987,7 @@ pub(crate) fn estimate_equijoin_rows(
         .unwrap_or_else(|| {
             left_rows * right_rows * crate::engine::cbo::cbo_consts().default_join_selectivity()
         })
+        .max(keyset_floor)
         .clamp(0.0, left_rows * right_rows)
 }
 

@@ -505,10 +505,7 @@ pub(super) fn runtime_filter_apply_qualification_cpu(
 ) -> Option<(f64, f64)> {
     use crate::engine::cbo::selectivity::Selectivity;
     match plan {
-        PhysicalPlan::Exchange { input, degree, .. } => {
-            let (work, _) = runtime_filter_apply_qualification_cpu(input, key)?;
-            Some((work, work / f64::from((*degree).max(1))))
-        }
+        PhysicalPlan::Exchange { input, .. } => runtime_filter_apply_qualification_cpu(input, key),
         PhysicalPlan::SeqScan {
             table,
             filter: Some(predicate),
@@ -612,28 +609,67 @@ pub(super) fn runtime_filter_apply_qualification_cpu(
             if work <= 0.0 {
                 return None;
             }
-            let degree = match plan {
-                PhysicalPlan::ParallelSeqScan { degree, .. } => (*degree).max(1),
-                _ => {
-                    let degree = if parallel_planner_config().disabled {
-                        1
-                    } else {
-                        cpu_bound_parallel_degree(default_parallel_degree())
-                    };
-                    if degree > 1
-                        && parallelized_probe_scan_cost_for_hash_join(plan, degree).is_some()
-                    {
-                        degree
-                    } else {
-                        1
-                    }
-                }
-            };
-            Some((work, work / f64::from(degree)))
+            // Apply's batch-filter consumer evaluates these tests serially;
+            // parallel scan workers and Exchange do not parallelize it.
+            Some((work, work))
         }
         _ => None,
     }
 }
+
+/// Runtime filters reach the scan before deferred membership qualification.
+/// Its key universe must therefore exclude Apply's own reduction, while
+/// retaining ordinary scan-local restrictions on the same key. In particular,
+/// a logically lossless join can still avoid most of Apply's input CPU.
+pub(super) fn runtime_filter_pre_apply_match_rate(
+    probe: &PhysicalPlan,
+    build: &PhysicalPlan,
+    probe_key: &Expr,
+    build_key: &Expr,
+) -> Option<f64> {
+    use crate::engine::cbo::selectivity::Selectivity;
+    if let PhysicalPlan::Exchange { input, .. } = probe {
+        return runtime_filter_pre_apply_match_rate(input, build, probe_key, build_key);
+    }
+    let mut local_scan = probe.clone();
+    let (table, filter, rows, access_rows) = match &mut local_scan {
+        PhysicalPlan::SeqScan {
+            table,
+            filter,
+            estimated_rows,
+            access_rows,
+            ..
+        }
+        | PhysicalPlan::ParallelSeqScan {
+            table,
+            filter,
+            estimated_rows,
+            access_rows,
+            ..
+        } => (table, filter, estimated_rows, access_rows),
+        _ => return None,
+    };
+    let mut conjuncts = Vec::new();
+    split_conjuncts(filter.as_ref()?, &mut conjuncts);
+    let local = combine_conjuncts(
+        conjuncts
+            .into_iter()
+            .filter(|expr| !sip_expr_has_subquery(expr))
+            .collect(),
+    );
+    *rows = local.as_ref().map_or(*access_rows, |predicate| {
+        crate::engine::cbo::selectivity::default_selectivity().predicate_rows(
+            &table.schema,
+            predicate,
+            *access_rows,
+        )
+    });
+    *filter = local;
+    let universe = equijoin_ndv_in_plan(&local_scan, probe_key)?;
+    let build_ndv = equijoin_ndv_in_plan(build, build_key)?.min(estimated_rows(build).max(0.0));
+    Some((build_ndv / universe.max(1.0)).clamp(0.0, 1.0))
+}
+
 pub(super) fn hash_join_parallel_probe_degree_for_cost(build_rows: f64, probe_rows: f64) -> u32 {
     if crate::util::env::var("MYDB_HASH_JOIN_PARALLEL_PROBE_DISABLE")
         .map(|v| v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on"))
