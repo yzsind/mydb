@@ -65,7 +65,9 @@ pub(super) use aggregation::*;
 mod compute;
 use compute::*;
 mod analyzed_workers;
-mod join_domain;
+pub(crate) mod count_witness;
+pub(in crate::engine::executor) mod group_input_filter;
+pub(in crate::engine::executor) mod join_domain;
 mod projection_parallel;
 mod rollup_preaggregate;
 
@@ -1642,6 +1644,26 @@ fn hash_aggregate_node(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
         | PhysicalPlan::ParallelIndexAggregate { .. }) => Some(node),
         PhysicalPlan::Projection {
             input,
+            projection,
+            distinct: true,
+            ..
+        }
+        | PhysicalPlan::StreamingDistinct {
+            input, projection, ..
+        } if projection.iter().all(|item| {
+            matches!(
+                item,
+                SelectItem::Expr {
+                    expr: Expr::GroupKeyRef { .. },
+                    ..
+                }
+            )
+        }) =>
+        {
+            hash_aggregate_node(input)
+        }
+        PhysicalPlan::Projection {
+            input,
             distinct: false,
             ..
         }
@@ -3041,6 +3063,37 @@ impl Drop for NativePlanBatchCursor {
     }
 }
 
+/// Execute a preplanned SELECT through the same complete output boundary as
+/// ordinary CTE materialization. Legacy projection after raw aggregation can
+/// otherwise bypass query-output proofs (including DISTINCT count witnesses).
+pub(in crate::engine::executor) fn try_stream_analyzed_select(
+    db: &Arc<Database>,
+    txn: TxnView,
+    select: &crate::parser::Select,
+    plan: &PhysicalPlan,
+    filter: Option<crate::planner::RuntimeFilter>,
+) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
+    let output = if final_projection(plan).is_some() {
+        let output = Arc::new(plan.clone());
+        analyze_stats::bind_plan_clone(&output, plan);
+        output
+    } else {
+        let input = Box::new(plan.clone());
+        analyze_stats::bind_plan_clone(&input, plan);
+        Arc::new(PhysicalPlan::Projection {
+            input,
+            projection: select.projection.clone(),
+            distinct: select.distinct,
+            estimated_rows: crate::planner::estimated_rows(plan),
+            cost: crate::planner::plan_cost(plan),
+        })
+    };
+    let budget =
+        mem_budget::current_budget().unwrap_or_else(|| Arc::new(mem_budget::MemBudget::from_env()));
+    let context = super::execution_context::ExecutionContext::capture_with_budget(txn, budget);
+    try_stream_native_plan_with_group_filter(db.clone(), txn, output, context, filter)
+}
+
 /// Convert a fully lowered physical graph to the sole protocol row boundary.
 /// The graph is preflighted before the worker is spawned; once opened, native
 /// batches cross a bounded channel and become rows only as the client pulls
@@ -3052,12 +3105,31 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
     plan: Arc<PhysicalPlan>,
     execution_context: super::execution_context::ExecutionContext,
 ) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
+    try_stream_native_plan_with_group_filter(db, txn, plan, execution_context, None)
+}
+
+pub(in crate::engine::executor) fn try_stream_native_plan_with_group_filter(
+    db: Arc<Database>,
+    txn: TxnView,
+    plan: Arc<PhysicalPlan>,
+    execution_context: super::execution_context::ExecutionContext,
+    filter: Option<crate::planner::RuntimeFilter>,
+) -> Result<Option<crate::engine::api::StreamingResultSet>, QueryError> {
     // Worker producers cannot borrow the live connection's routine, sequence,
     // or external-effect context. Callers retain their synchronous native/row
     // fallback instead of moving connection-local effects onto a worker.
     if crate::planner::connection_thread_execution_required() {
         return Ok(None);
     }
+    let group_filter = match filter {
+        Some(filter) => {
+            let Some(target) = group_input_filter::target(&plan, &filter) else {
+                return Ok(None);
+            };
+            Some((target, filter))
+        }
+        None => None,
+    };
 
     preflight_runtime_parameters(&plan)?;
     let Some(template) = preflight_query_output_template(&plan)? else {
@@ -3091,7 +3163,10 @@ pub(in crate::engine::executor) fn try_stream_native_plan(
         let _snapshot_guard = snapshot_guard;
         let _active_worker = super::stream::ActiveStreamWorker::enter();
         let result = execution_context.run(&db, || -> Result<(), QueryError> {
-            let Some(mut input) = try_build_query_output_batch(&db, txn, &worker_plan)? else {
+            let Some(mut input) = group_input_filter::with_filter(group_filter, || {
+                try_build_query_output_batch(&db, txn, &worker_plan)
+            })?
+            else {
                 return Err(crate::storage::error(
                     crate::error::catalog::ER_UNKNOWN_ERROR,
                     "physical batch graph changed capability after preflight",
@@ -3744,7 +3819,10 @@ fn try_build_query_output_batch_in_set_domain<'a>(
         }
         _ => plan,
     };
-    let Some(mut input) = try_native_vec_input_stream(db, txn, input_plan)? else {
+    let Some(mut input) = count_witness::with_rule(count_witness::prove(plan), || {
+        try_native_vec_input_stream(db, txn, input_plan)
+    })?
+    else {
         return Ok(None);
     };
     if let Some(stream) = projection_parallel::try_parallel_projection(

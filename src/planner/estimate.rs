@@ -783,6 +783,65 @@ pub(super) fn estimate_like_rows(
     escape: Option<char>,
     total_rows: f64,
 ) -> f64 {
+    // A complete frequency domain can evaluate LIKE directly. A string
+    // prefix interval is only a candidate superset under SQL collations:
+    // punctuation, accents and escaped wildcards need the actual matcher.
+    // Partial frequencies still establish a lower bound on matching mass.
+    let known = table
+        .stats
+        .columns
+        .get(&normalize_expr_column(column))
+        .map(|stats| {
+            let collation = table
+                .columns
+                .iter()
+                .find(|candidate| {
+                    candidate
+                        .name
+                        .eq_ignore_ascii_case(&normalize_expr_column(column))
+                })
+                .and_then(|candidate| candidate.collation.as_deref())
+                .and_then(|name| crate::charset::resolve_collation(name).ok());
+            let pattern = Value::String(pattern.to_owned());
+            let matching = stats
+                .top_values
+                .iter()
+                .filter(|frequency| {
+                    matches!(
+                        crate::engine::expr::eval_like_values_with_collation(
+                            &frequency.value,
+                            &pattern,
+                            false,
+                            escape,
+                            collation,
+                        ),
+                        Value::Int(1)
+                    )
+                })
+                .map(|frequency| frequency.count as f64)
+                .sum::<f64>()
+                * stats_scale(table, total_rows);
+            (
+                stats,
+                matching.clamp(0.0, non_null_rows(table, column, total_rows)),
+            )
+        });
+    if let Some((stats, matching)) = known {
+        if stats.frequency.complete
+            && stats.frequency.source != crate::storage::FrequencySource::LowerBound
+        {
+            return if matching > 0.0
+                || stats.frequency.source == crate::storage::FrequencySource::Exact
+            {
+                matching
+            } else {
+                // A complete sample is not a proof of population absence.
+                (total_rows / stats.frequency.sample_rows.max(1) as f64)
+                    .min(non_null_rows(table, column, total_rows))
+            };
+        }
+    }
+    let floor = known.map_or(0.0, |(_, matching)| matching);
     let shape = crate::engine::expr::analyze_like_sargable_pattern(pattern, escape);
     if let Some(crate::engine::expr::LikeSargablePattern::Literal(literal)) = shape.as_ref() {
         return estimate_eq_rows(table, column, &Value::String(literal.clone()), total_rows);
@@ -816,7 +875,7 @@ pub(super) fn estimate_like_rows(
                     .saturating_sub(prefix.chars().count())
             })
             .unwrap_or(0);
-        return apply_like_residual_discount(range_rows, residual);
+        return apply_like_residual_discount(range_rows, residual).max(floor);
     }
     // Fully unanchored (`'%foo%'`, `'%foo'`, `'_foo'`): the configured
     // default is already the selectivity of a complete LIKE pattern, not of
@@ -832,7 +891,7 @@ pub(super) fn estimate_like_rows(
     let literal_chars = crate::engine::expr::like_literal_segments(pattern, escape)
         .map(|segments| segments.iter().map(|segment| segment.chars().count()).sum())
         .unwrap_or(0);
-    apply_like_residual_discount(base, unanchored_like_literal_tail(literal_chars))
+    apply_like_residual_discount(base, unanchored_like_literal_tail(literal_chars)).max(floor)
 }
 
 pub(super) fn estimate_column_predicate_rows(

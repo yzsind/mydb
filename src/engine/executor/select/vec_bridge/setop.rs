@@ -481,25 +481,37 @@ impl SetOpBatchOperator<'_> {
             .blocking_output
             .as_mut()
             .expect("blocking SetOp output initialized");
-        let mut rows = Vec::with_capacity(DEFAULT_BATCH_ROWS);
-        while rows.len() < DEFAULT_BATCH_ROWS {
-            let Some(row) = output.next_row()? else {
+        let mut columns: Vec<Vec<Value>> = (0..self.schema.len())
+            .map(|_| Vec::with_capacity(DEFAULT_BATCH_ROWS))
+            .collect();
+        let mut buffer = Vec::new();
+        let mut count = 0;
+        while count < DEFAULT_BATCH_ROWS {
+            let Some(mut row) = output.next_row_reuse(std::mem::take(&mut buffer))? else {
                 break;
             };
-            rows.push(row);
+            if row.len() != columns.len() {
+                return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                    .error("set-operation output width mismatch"));
+            }
+            for (column, value) in columns.iter_mut().zip(row.drain(..)) {
+                column.push(value);
+            }
+            buffer = row;
+            count += 1;
         }
-        if rows.is_empty() {
+        if count == 0 {
             self.record_stats();
             Ok(None)
         } else {
-            let batch = value_rows_into_batches(self.schema.clone(), rows)
-                .into_iter()
-                .next();
-            if let Some(batch) = batch.as_ref() {
-                self.batches = self.batches.saturating_add(1);
-                self.output_rows = self.output_rows.saturating_add(batch.visible_rows() as u64);
-            }
-            Ok(batch)
+            let batch = Batch::with_row_count(
+                self.schema.clone(),
+                columns.into_iter().map(ColumnVector::from_values).collect(),
+                count,
+            );
+            self.batches = self.batches.saturating_add(1);
+            self.output_rows = self.output_rows.saturating_add(count as u64);
+            Ok(Some(batch))
         }
     }
 }

@@ -47,6 +47,43 @@ impl PackedRow {
     pub(super) fn encoded(&self) -> &[u8] {
         &self.0
     }
+
+    pub(super) fn decode(
+        &self,
+        ncols: usize,
+        mut row: Vec<Value>,
+        inline_strings: bool,
+        charge: &mut mem_budget::ScopedCharge,
+    ) -> Result<Vec<Value>, QueryError> {
+        use std::io::Read;
+        row.clear();
+        charge.add_force(
+            row.capacity()
+                .max(ncols)
+                .saturating_mul(std::mem::size_of::<Value>()),
+        )?;
+        mem_budget::try_reserve_vec_exact(&mut row, ncols, "decoded set representative")?;
+        let mut reader = std::io::Cursor::new(self.encoded());
+        for _ in 0..ncols {
+            let mut tag = [0];
+            reader.read_exact(&mut tag).map_err(io_error)?;
+            let available = self.0.len() as u64 - reader.position();
+            row.push(spill_value::read_payload_limited(
+                &mut reader,
+                tag[0],
+                inline_strings,
+                io_error,
+                Some(charge),
+                Some(available),
+            )?);
+        }
+        if reader.position() != self.0.len() as u64 {
+            return Err(
+                crate::error::catalog::ER_UNKNOWN_ERROR.error("invalid packed set row width")
+            );
+        }
+        Ok(row)
+    }
 }
 
 #[cfg(test)]
@@ -86,6 +123,13 @@ mod tests {
         ];
         for (index, row) in [row, vec![]].into_iter().enumerate() {
             let packed = PackedRow::encode(&row, PackedRow::encoded_len(&row).unwrap()).unwrap();
+            let mut charge = mem_budget::ScopedCharge::new(0);
+            let decoded = packed
+                .decode(row.len(), Vec::new(), false, &mut charge)
+                .unwrap();
+            let round_trip =
+                PackedRow::encode(&decoded, PackedRow::encoded_len(&decoded).unwrap()).unwrap();
+            assert_eq!(packed.encoded(), round_trip.encoded());
             for prefix in [vec![], vec![Value::UInt(4), Value::UInt(7)]] {
                 let path = dir.path().join(format!("payload-{index}-{}", prefix.len()));
                 let mut writer =

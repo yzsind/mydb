@@ -1,8 +1,10 @@
-//! Optional bounded index candidates for an unopened, unfiltered heap scan.
+//! Optional bounded index candidates for an unopened heap scan.
 use super::*;
 use crate::planner::{PlanTable, RuntimeFilter};
 use crate::storage::{IndexSchema, RowId};
 mod intersection;
+mod local;
+mod narrow;
 
 struct Choice {
     index: IndexSchema,
@@ -22,6 +24,7 @@ fn entry_limit(
     keys: usize,
     workspace: usize,
     allow_locality_discovery: bool,
+    constant_domain: bool,
 ) -> Option<usize> {
     let entries =
         super::super::super::plan::estimate_runtime_keyset_index_entries(rows, ndv, keys)?;
@@ -30,7 +33,13 @@ fn entry_limit(
     // row selectivity. Complete tuple filters also hash multiple lanes for
     // every scanned row. A heap exceeding host/cgroup memory also necessarily
     // pays cold-page traffic. Admit bounded locality discovery for that work.
-    let page_limit = if allow_locality_discovery {
+    let page_limit = if constant_domain && allow_locality_discovery {
+        // An exact local predicate may cluster many qualifying rows on each
+        // selected page. Discover its real footprint inside the same RID
+        // workspace and row-fraction bounds; adoption still requires fewer
+        // than half the original heap pages after MVCC-safe RID collection.
+        rows / 16
+    } else if allow_locality_discovery {
         pages.saturating_mul(2)
     } else {
         pages / 2
@@ -63,6 +72,15 @@ pub(super) struct RuntimeIndexScan<'a> {
 }
 
 impl RuntimeIndexScan<'_> {
+    fn scan_degree(&self) -> usize {
+        // A full batch predicate can hide native-worker extraction while its
+        // properties still retain the physical scan's concurrency ceiling.
+        match self.original.properties().partitioning {
+            BatchPartitioning::RoundRobin { partitions } => partitions.max(1),
+            _ => 1,
+        }
+    }
+
     fn adopt_indexed(
         &mut self,
         indexed: vec_index_scan::IndexBatchStream,
@@ -71,14 +89,7 @@ impl RuntimeIndexScan<'_> {
         // Retain the planner's concurrency ceiling. Small domains keep the
         // serial lane; large page-disjoint domains reuse bounded scan queues,
         // captured snapshots, cancellation and the existing MRR governor.
-        let degree = if pages >= 4096 && self.original.is_native_parallel_scan() {
-            match self.original.properties().partitioning {
-                BatchPartitioning::RoundRobin { partitions } => partitions,
-                _ => 1,
-            }
-        } else {
-            1
-        };
+        let degree = if pages >= 4096 { self.scan_degree() } else { 1 };
         let mut workers = indexed.into_row_id_workers(degree)?;
         self.indexed = Some(if workers.len() > 1 {
             Box::new(super::ParallelIndexBatchStream::new(
@@ -155,8 +166,9 @@ impl RuntimeIndexScan<'_> {
             .stats
             .heap_page_count
             .saturating_mul(crate::storage::PAGE_SIZE as u64);
-        let allow_locality_discovery =
-            composite_filter || heap_bytes > mem_budget::effective_memory_limit_bytes() as u64;
+        let allow_locality_discovery = composite_filter
+            || heap_bytes > mem_budget::effective_memory_limit_bytes() as u64
+            || (self.residual.is_some() && heap_bytes > local::residency_limit());
         // All filters must be checkable against the candidate projection. A
         // scan's private predicate-only columns need the original reader.
         for filter in &self.filters {
@@ -235,6 +247,7 @@ impl RuntimeIndexScan<'_> {
                     filter.len(),
                     workspace,
                     allow_locality_discovery,
+                    self.residual.is_some(),
                 ) else {
                     continue;
                 };
@@ -268,9 +281,15 @@ impl RuntimeIndexScan<'_> {
             .is_none()
             .then(|| self.intersection_choice())
             .flatten();
+        let narrow = (choice.is_none() && intersection.is_none())
+            .then(|| self.narrow_choice())
+            .flatten();
         self.opened = true;
         if let Some(intersection) = intersection {
             return self.start_intersection(intersection);
+        }
+        if let Some(narrow) = narrow {
+            return self.start_narrow(narrow);
         }
         let Some(choice) = choice else {
             return Ok(());
@@ -387,7 +406,10 @@ impl BatchOperator for RuntimeIndexScan<'_> {
     }
     fn properties(&self) -> BatchProperties {
         if self.indexed.is_some()
-            || (!self.opened && (self.choice().is_some() || self.intersection_choice().is_some()))
+            || (!self.opened
+                && (self.choice().is_some()
+                    || self.intersection_choice().is_some()
+                    || self.narrow_choice().is_some()))
         {
             BatchProperties::UNORDERED_SINGLE
         } else {
@@ -398,6 +420,7 @@ impl BatchOperator for RuntimeIndexScan<'_> {
         !self.opened
             && self.choice().is_none()
             && self.intersection_choice().is_none()
+            && self.narrow_choice().is_none()
             && self.original.is_native_parallel_scan()
     }
     fn take_parallel_workers(
@@ -407,7 +430,11 @@ impl BatchOperator for RuntimeIndexScan<'_> {
         Option<Vec<Box<dyn crate::engine::executor::vec::stream::ParallelBatchWorker>>>,
         QueryError,
     > {
-        if self.opened || self.choice().is_some() || self.intersection_choice().is_some() {
+        if self.opened
+            || self.choice().is_some()
+            || self.intersection_choice().is_some()
+            || self.narrow_choice().is_some()
+        {
             return Ok(None);
         }
         self.original.take_parallel_workers(degree)
@@ -518,7 +545,15 @@ impl BatchOperator for RuntimeIndexScan<'_> {
                 .map(|row| row as u32)
                 .collect();
             if !selected.is_empty() {
-                return Ok(Some(batch.with_selection(Selection::Indices(selected))));
+                let batch = batch.with_selection(Selection::Indices(selected));
+                // Optional local access can retain private predicate lanes.
+                // They never cross the original scan's output boundary.
+                return if batch.columns().len() == self.schema.len() {
+                    Ok(Some(batch))
+                } else {
+                    let columns = (0..self.schema.len()).collect::<Vec<_>>();
+                    super::super::project_cte_batch(batch, &self.schema, &columns).map(Some)
+                };
             }
         }
     }
@@ -550,12 +585,13 @@ pub(super) fn wrap<'a>(
 }
 
 /// A local predicate must remain authoritative when optional RID access
-/// bypasses its original storage reader. Decline if it needs private columns.
+/// bypasses its original storage reader. Proven local integer predicates may
+/// retain private lanes inside that optional source only.
 pub(super) fn wrap_filtered<'a>(
     db: &Arc<Database>,
     txn: TxnView,
     table: &PlanTable,
-    columns: Vec<usize>,
+    mut columns: Vec<usize>,
     filters: &[RuntimeFilter],
     original: Box<dyn BatchOperator + 'a>,
     predicate: &Expr,
@@ -564,7 +600,29 @@ pub(super) fn wrap_filtered<'a>(
         return Ok(original);
     }
     let schema = original.schema().clone();
-    let Some(residual) = expr_batch::BatchExprProgram::compile(predicate, &schema)? else {
+    let mut filters = filters.to_vec();
+    let local = (!txn.historical && !txn.dirty_read)
+        .then(|| local::domains(table, predicate))
+        .flatten();
+    let residual_schema = if let Some(local) = local {
+        let mut private = std::collections::BTreeSet::new();
+        if super::super::super::plan::collect_table_column_refs(
+            predicate,
+            &table.schema,
+            &mut private,
+        ) {
+            for column in private {
+                if !columns.contains(&column) {
+                    columns.push(column);
+                }
+            }
+            filters.extend(local);
+        }
+        super::super::template_to_batch_schema(&super::build_scan_template(table, Some(&columns)))
+    } else {
+        schema.clone()
+    };
+    let Some(residual) = expr_batch::BatchExprProgram::compile(predicate, &residual_schema)? else {
         return Ok(original);
     };
     Ok(Box::new(RuntimeIndexScan {
@@ -574,7 +632,7 @@ pub(super) fn wrap_filtered<'a>(
         columns,
         schema,
         original,
-        filters: filters.to_vec(),
+        filters,
         indexed: None,
         probes: Vec::new(),
         opened: false,
@@ -589,14 +647,22 @@ mod tests {
     #[test]
     fn runtime_index_candidates_require_page_advantage_and_workspace() {
         for composite in [false, true] {
-            assert!(entry_limit(1_000_000, 50_000, 10_000, 10, 1 << 20, composite).is_some());
-            assert!(entry_limit(1_000_000, 50_000, 10_000, 1000, 1 << 20, composite).is_none());
-            assert!(entry_limit(1_000_000, 0, 10_000, 10, 1 << 20, composite).is_none());
-            assert!(entry_limit(1_000_000, 50_000, 0, 10, 1 << 20, composite).is_none());
-            assert!(entry_limit(1_000_000, 50_000, 10_000, 10, 1024, composite).is_none());
+            assert!(
+                entry_limit(1_000_000, 50_000, 10_000, 10, 1 << 20, composite, false).is_some()
+            );
+            assert!(
+                entry_limit(1_000_000, 50_000, 10_000, 1000, 1 << 20, composite, false).is_none()
+            );
+            assert!(entry_limit(1_000_000, 0, 10_000, 10, 1 << 20, composite, false).is_none());
+            assert!(entry_limit(1_000_000, 50_000, 0, 10, 1 << 20, composite, false).is_none());
+            assert!(entry_limit(1_000_000, 50_000, 10_000, 10, 1024, composite, false).is_none());
         }
-        assert!(entry_limit(1_000_000, 50_000, 10_000, 400, 1 << 22, false).is_none());
-        assert!(entry_limit(1_000_000, 50_000, 10_000, 400, 1 << 22, true).is_some());
+        assert!(entry_limit(1_000_000, 50_000, 10_000, 400, 1 << 22, false, false).is_none());
+        assert!(entry_limit(1_000_000, 50_000, 10_000, 400, 1 << 22, true, false).is_some());
+        assert!(entry_limit(57_000_000, 580_000, 26, 1, 256 << 20, true, false).is_none());
+        assert!(entry_limit(57_000_000, 580_000, 26, 1, 256 << 20, true, true).is_some());
+        assert!(entry_limit(57_000_000, 580_000, 10, 1, 256 << 20, true, true).is_none());
+        assert!(entry_limit(57_000_000, 580_000, 26, 1, 1 << 20, true, true).is_none());
     }
 }
 

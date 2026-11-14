@@ -351,7 +351,7 @@ pub(super) fn hash_agg_output_preflight_for_template(
     let mut aggregate_fields = Vec::with_capacity(aggregates.len());
     let mut aggregate_keys = Vec::with_capacity(aggregates.len());
     for (slot_index, aggregate) in aggregates.iter().enumerate() {
-        let (column_type, source) = if let Some((function, input, result_type)) =
+        let (column_type, mut source) = if let Some((function, input, result_type)) =
             translate_aggregate_extended(aggregate, &template, &schema)
         {
             let mut source = match input {
@@ -444,6 +444,29 @@ pub(super) fn hash_agg_output_preflight_for_template(
             }
             (result_type, source)
         };
+        // Numeric aggregate expressions retain numeric coercibility even
+        // when their result is projected as a CTE column. Keep MIN/MAX's
+        // catalog descriptor and existing wire widths/flags intact.
+        if let Expr::Function { name, .. } = aggregate {
+            if matches!(
+                name.to_ascii_uppercase().as_str(),
+                "SUM"
+                    | "AVG"
+                    | "COUNT"
+                    | "STD"
+                    | "STDDEV"
+                    | "STDDEV_POP"
+                    | "STDDEV_SAMP"
+                    | "VARIANCE"
+                    | "VAR_POP"
+                    | "VAR_SAMP"
+                    | "BIT_AND"
+                    | "BIT_OR"
+                    | "BIT_XOR"
+            ) {
+                source.collation_coercibility = Some(5);
+            }
+        }
         aggregate_fields.push(BatchField {
             table: "__agg".into(),
             alias: None,
@@ -490,6 +513,8 @@ pub(super) fn hash_agg_output_preflight_for_template(
 }
 
 pub(super) struct DeferredHashAggBatchOperator<'a> {
+    pub(super) input_filter: Option<crate::planner::RuntimeFilter>,
+    pub(super) count_witness: Option<super::count_witness::Rule>,
     pub(super) db: &'a Arc<Database>,
     pub(super) txn: TxnView,
     pub(super) plan: &'a PhysicalPlan,
@@ -519,10 +544,25 @@ impl DeferredHashAggBatchOperator<'_> {
         self.started = analyze_stats::is_recording().then(std::time::Instant::now);
         self.io_start = self.started.map(|_| self.db.buffer_stats_counts());
 
-        let input = match try_native_vec_input_stream(self.db, self.txn, self.input_plan)? {
+        let mut input = match try_native_vec_input_stream(self.db, self.txn, self.input_plan)? {
             Some(input) => input,
             None => row_batch_input(self.db, self.txn, self.input_plan)?,
         };
+        if let Some(filter) = self.input_filter.take() {
+            // Push when possible, and retain the local membership test across
+            // outer joins or operators that cannot install the full domain.
+            input.stream.install_runtime_filter(filter.clone());
+            input.stream = join_domain::filterable_cte(input.stream, &input.template);
+            if !input.stream.install_runtime_filter(filter) {
+                return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                    .error("group input filter changed binding after preflight"));
+            }
+            #[cfg(test)]
+            group_input_filter::HITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(rule) = self.count_witness.take() {
+            input = super::count_witness::wrap(input, rule);
+        }
         let having_program = self.having_program.take();
         let count_topk = self.count_topk.take();
         let count_topk_active = count_topk.is_some();
@@ -728,6 +768,8 @@ pub(super) fn try_build_vec_hash_agg_input_with_count_topk<'a>(
     }
     Ok(Some(VecBatchInput {
         stream: Box::new(DeferredHashAggBatchOperator {
+            input_filter: group_input_filter::current(plan),
+            count_witness: super::count_witness::current(plan),
             db,
             txn,
             plan,

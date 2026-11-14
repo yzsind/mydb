@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn dense_noncovering_point_domains_compete_with_sequential_access() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE point_domains(id BIGINT PRIMARY KEY,k INT,v VARCHAR(100),INDEX by_k(k))",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO point_domains VALUES(1,NULL,'one'),(2,1,'two'),(3,2,'three')")
+        .unwrap();
+    engine.execute("ANALYZE TABLE point_domains").unwrap();
+    let db = engine.db_for_tests();
+    let mut schema = db.table("point_domains").unwrap();
+    let stats = &mut Arc::make_mut(&mut schema).stats;
+    stats.row_count = 100_000_000;
+    stats.heap_page_count = 2_000_000;
+    let column = stats.columns.get_mut("k").unwrap();
+    column.distinct_count = 4;
+    column.null_count = 20_000_000;
+    column.top_values.clear();
+    column.histogram.clear();
+    column.frequency = Default::default();
+    stats
+        .indexes
+        .get_mut("by_k")
+        .unwrap()
+        .prefix_distinct_counts = vec![4];
+    let table = PlanTable::new(schema.id, schema.clone(), None);
+    for predicate in ["k IS NULL", "k=1", "k IN (1,2)"] {
+        let filter = parsed_filter(&format!("SELECT * FROM point_domains WHERE {predicate}"));
+        let plan = choose_scan(db, &table, Some(filter.clone()), &ScanHints::none()).unwrap();
+        assert!(
+            matches!(
+                plan,
+                PhysicalPlan::SeqScan { .. } | PhysicalPlan::ZoneMapScan { .. }
+            ),
+            "a dense noncovering domain must price the heap scan: {predicate}: {plan:?}"
+        );
+        let Statement::Select(forced) =
+            crate::parser::parse_statement("SELECT * FROM point_domains FORCE INDEX(by_k)")
+                .unwrap()
+        else {
+            panic!()
+        };
+        let mut hints = ScanHints::none();
+        hints.index_hints = &forced.from[0].index_hints;
+        let plan = choose_scan(db, &table, Some(filter), &hints).unwrap();
+        assert!(matches!(
+            plan,
+            PhysicalPlan::IndexLookup { .. } | PhysicalPlan::IndexMultiLookup { .. }
+        ));
+    }
+    let stats = &mut Arc::make_mut(&mut schema).stats;
+    stats.columns.get_mut("k").unwrap().distinct_count = 1_000_000;
+    stats
+        .indexes
+        .get_mut("by_k")
+        .unwrap()
+        .prefix_distinct_counts = vec![1_000_000];
+    let table = PlanTable::new(schema.id, schema, None);
+    let plan = choose_scan(
+        db,
+        &table,
+        Some(parsed_filter("SELECT * FROM point_domains WHERE k=1")),
+        &ScanHints::none(),
+    )
+    .unwrap();
+    assert!(
+        matches!(plan, PhysicalPlan::IndexLookup { .. }),
+        "sparse point access remains indexed: {plan:?}"
+    );
+}
+
+#[test]
 fn independent_inner_join_can_precede_a_preserved_join() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -5895,4 +5970,111 @@ fn runtime_hash_filter_cost_credits_only_deferred_apply_cpu() {
     };
     *filter = Some(parsed_filter("SELECT 1 WHERE v>0 AND SHA2(s,512)<>''"));
     assert!(runtime_filter_apply_qualification_cpu(&plan, &key).is_none());
+}
+
+#[test]
+fn like_selectivity_uses_complete_frequencies_with_sql_collation() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE pattern_frequencies(v VARCHAR(32) COLLATE utf8mb4_0900_ai_ci)")
+        .unwrap();
+    engine.execute("INSERT INTO pattern_frequencies VALUES('>10000'),('>10000'),('<1000'),('Unknown'),('UNKNOWN'),('éclair'),('eclair'),('a_b'),('axb'),(NULL)").unwrap();
+    engine.execute("ANALYZE TABLE pattern_frequencies").unwrap();
+    let table = engine.db_for_tests().table("pattern_frequencies").unwrap();
+    let stats = table.stats.columns.get("v").unwrap();
+    assert!(stats.frequency.complete);
+    assert_eq!(
+        stats.frequency.source,
+        crate::storage::FrequencySource::Exact
+    );
+    for (pattern, escape, expected) in [
+        (">10000%", None, 2.0),
+        ("%known", None, 2.0),
+        ("É%", None, 2.0),
+        ("a!_b", Some('!'), 1.0),
+        ("a_b", None, 2.0),
+        ("%", None, 9.0),
+        ("missing%", None, 0.0),
+    ] {
+        let actual = estimate::estimate_like_rows(&table, "v", pattern, escape, 10.0);
+        assert_eq!(actual, expected, "pattern {pattern}");
+        assert_eq!(
+            estimate::estimate_like_rows(&table, "v", pattern, escape, 100.0),
+            expected * 10.0,
+            "scaled pattern {pattern}"
+        );
+    }
+    let mut binary = (*table).clone();
+    binary.columns[0].collation = Some("utf8mb4_bin".into());
+    assert_eq!(
+        estimate::estimate_like_rows(&binary, "v", "%known", None, 10.0),
+        1.0
+    );
+    assert_eq!(
+        estimate::estimate_like_rows(&binary, "v", "É%", None, 10.0),
+        0.0
+    );
+}
+
+#[test]
+fn exact_integer_arithmetic_bounds_reuse_literal_statistics_and_access() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE arithmetic_bounds(k INT,v VARCHAR(12),INDEX by_k(k),INDEX by_v(v))",
+        "INSERT INTO arithmetic_bounds VALUES(1,'01'),(2,'2'),(2,'02'),(3,' 2'),(4,'2.0'),(5,NULL),(NULL,'five')",
+        "ANALYZE TABLE arithmetic_bounds",
+    ] {engine.execute(sql).unwrap();}
+    let table = engine.db_for_tests().table("arithmetic_bounds").unwrap();
+    for (expression, literal) in [
+        ("k=1+1", "k=2"),
+        ("k BETWEEN 1+0 AND 1+2", "k BETWEEN 1 AND 3"),
+        ("k IN (1,1+1,2*2)", "k IN (1,2,4)"),
+        ("k>=8-6", "k>=2"),
+        ("v=1+1", "v=2"),
+    ] {
+        let estimate = |predicate: &str| {
+            estimate_filter_rows(
+                &table,
+                &parsed_filter(&format!(
+                    "SELECT * FROM arithmetic_bounds WHERE {predicate}"
+                )),
+                7.0,
+            )
+        };
+        assert_eq!(estimate(expression), estimate(literal), "{expression}");
+        let run = |predicate: &str| {
+            let response = engine
+                .execute(&format!(
+                    "SELECT k,v FROM arithmetic_bounds WHERE {predicate} ORDER BY k,v"
+                ))
+                .unwrap()
+                .materialize()
+                .unwrap();
+            let crate::engine::api::QueryResponse::ResultSet(result) = response else {
+                panic!()
+            };
+            result.rows
+        };
+        assert_eq!(run(expression), run(literal), "{expression}");
+    }
+    let expression = |text: &str| {
+        let Statement::Select(select) =
+            crate::parser::parse_statement(&format!("SELECT {text}")).unwrap()
+        else {
+            panic!()
+        };
+        let SelectItem::Expr { expr, .. } = select.projection.into_iter().next().unwrap() else {
+            panic!()
+        };
+        expr
+    };
+    assert_eq!(
+        expr_literal_value(&expression("(1999+2)*2-1")),
+        Some(Value::Int(4001))
+    );
+    for text in ["9223372036854775807+1", "1/0", "1.25+2.5", "RAND()+1"] {
+        assert!(expr_literal_value(&expression(text)).is_none(), "{text}");
+    }
 }

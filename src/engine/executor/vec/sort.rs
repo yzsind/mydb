@@ -610,6 +610,7 @@ impl RunReader {
 /// comparison; numeric and mixed-domain keys retain the shared comparator.
 struct MergeStringKeys {
     keys: Vec<Option<Vec<u8>>>,
+    encoded: Vec<u8>,
     charge: crate::engine::executor::mem_budget::ScopedCharge,
 }
 
@@ -617,6 +618,7 @@ impl MergeStringKeys {
     fn new() -> Self {
         Self {
             keys: Vec::new(),
+            encoded: Vec::new(),
             charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
         }
     }
@@ -661,12 +663,44 @@ impl MergeStringKeys {
                 *slot = None;
             }
         }
-        let bytes = self.keys.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+        let bytes = self.encoded.capacity()
+            + self.keys.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
             + self.keys.iter().flatten().map(Vec::capacity).sum::<usize>();
         if bytes > self.charge.charged() {
             self.charge.add_force(bytes - self.charge.charged())?;
         }
         Ok(())
+    }
+
+    fn encode(
+        &mut self,
+        encoder: &mut crate::engine::executor::sort::key_encode::RowEncoder,
+        row: &SortRow,
+    ) -> Result<bool, QueryError> {
+        let Some(bound) = crate::engine::executor::sort::key_encode::RowEncoder::bound(
+            row.keys.as_slice(),
+            &self.keys,
+        ) else {
+            return Ok(false);
+        };
+        let cap = crate::engine::executor::mem_budget::current_budget()
+            .map_or(65536, |b| (b.limit() / 128).min(65536));
+        if bound > cap {
+            return Ok(false);
+        }
+        if bound > self.encoded.capacity() {
+            let extra = bound - self.encoded.capacity();
+            if !self.charge.add_within(extra, usize::MAX) {
+                return Ok(false);
+            }
+            let additional = bound.saturating_sub(self.encoded.len());
+            crate::engine::executor::mem_budget::try_reserve_vec_exact(
+                &mut self.encoded,
+                additional,
+                "merge encoded tuple",
+            )?;
+        }
+        Ok(encoder.encode(row.keys.as_slice(), &self.keys, &mut self.encoded))
     }
 }
 
@@ -676,6 +710,7 @@ struct HeapRow {
     charge: crate::engine::executor::mem_budget::ScopedCharge,
     fields: Arc<[crate::engine::executor::sort::SortField]>,
     payload_ties: bool,
+    encoded_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl PartialEq for HeapRow {
@@ -691,6 +726,24 @@ impl PartialOrd for HeapRow {
 }
 impl Ord for HeapRow {
     fn cmp(&self, other: &Self) -> Ordering {
+        if self
+            .encoded_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let order = self.string_keys.encoded.cmp(&other.string_keys.encoded);
+            if order != Ordering::Equal {
+                return order;
+            }
+            return (if self.payload_ties {
+                crate::engine::executor::sort::compare_payload_rows(
+                    &self.row.payload,
+                    &other.row.payload,
+                )
+            } else {
+                Ordering::Equal
+            })
+            .then_with(|| self.row.ordinal.cmp(&other.row.ordinal));
+        }
         for (index, field) in self.fields.iter().enumerate() {
             let order = match (
                 &self.string_keys.keys[index],
@@ -729,6 +782,8 @@ impl Ord for HeapRow {
 struct RunMerger {
     readers: Vec<RunReader>,
     tree: crate::engine::executor::select::loser_tree::LoserTree<HeapRow, ()>,
+    encoder: Option<crate::engine::executor::sort::key_encode::RowEncoder>,
+    encoded_enabled: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RunMerger {
@@ -742,11 +797,21 @@ impl RunMerger {
     ) -> Result<Self, QueryError> {
         let mut readers = Vec::with_capacity(runs.len());
         let mut heads = Vec::with_capacity(runs.len());
+        let mut encoder = crate::engine::executor::sort::key_encode::sort_key_encode_enabled()
+            .then(|| crate::engine::executor::sort::key_encode::RowEncoder::new(fields.clone()))
+            .flatten();
+        let encoded_enabled = Arc::new(std::sync::atomic::AtomicBool::new(encoder.is_some()));
         for run in runs {
             let mut reader = RunReader::open(run, &tmp, schema.clone(), key_count, runs.len())?;
             let head = if let Some(row) = reader.next_row()? {
                 let mut string_keys = MergeStringKeys::new();
                 string_keys.update(&row.row, &fields, None)?;
+                if let Some(encoding) = encoder.as_mut() {
+                    if !string_keys.encode(encoding, &row.row)? {
+                        encoder = None;
+                        encoded_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 Some((
                     HeapRow {
                         row: row.row,
@@ -754,6 +819,7 @@ impl RunMerger {
                         charge: row.charge,
                         fields: fields.clone(),
                         payload_ties,
+                        encoded_enabled: encoded_enabled.clone(),
                     },
                     (),
                 ))
@@ -765,6 +831,8 @@ impl RunMerger {
         }
         Ok(Self {
             readers,
+            encoder,
+            encoded_enabled,
             tree: crate::engine::executor::select::loser_tree::LoserTree::new(heads),
         })
     }
@@ -780,6 +848,13 @@ impl RunMerger {
         let next = if let Some(row) = self.readers[run].next_row()? {
             let mut string_keys = item.string_keys;
             string_keys.update(&row.row, &item.fields, Some(&output.row))?;
+            if let Some(encoding) = self.encoder.as_mut() {
+                if !string_keys.encode(encoding, &row.row)? {
+                    self.encoder = None;
+                    self.encoded_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
             Some((
                 HeapRow {
                     row: row.row,
@@ -787,6 +862,7 @@ impl RunMerger {
                     charge: row.charge,
                     fields: item.fields,
                     payload_ties: item.payload_ties,
+                    encoded_enabled: item.encoded_enabled,
                 },
                 (),
             ))
@@ -1618,6 +1694,160 @@ impl BatchOperator for ExternalSortBatchOperator<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encoded_merge_tuples_preserve_collation_null_direction_and_late_lane_fallback() {
+        use crate::engine::executor::{mem_budget, sort::key_encode::with_sort_key_encode};
+        let budget = Arc::new(mem_budget::MemBudget::new(32 << 20));
+        mem_budget::with_query_budget(budget.clone(), || {
+            with_sort_key_encode(true, || {
+                for collation in [45, 63, 255, 309] {
+                    for reverse in [false, true] {
+                        let root =
+                            tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+                        let tmp = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                            root.path(),
+                            "sort",
+                        )
+                        .unwrap();
+                        let fields: Arc<[_]> = vec![
+                            crate::engine::executor::sort::SortField {
+                                ascending: !reverse,
+                                nulls_first: true,
+                                collation_id: Some(collation),
+                            },
+                            crate::engine::executor::sort::SortField {
+                                ascending: reverse,
+                                nulls_first: false,
+                                collation_id: None,
+                            },
+                            crate::engine::executor::sort::SortField {
+                                ascending: false,
+                                nulls_first: true,
+                                collation_id: None,
+                            },
+                        ]
+                        .into();
+                        let mut expected = (0..192u64)
+                            .map(|i| {
+                                let text = ["A", "a ", "é", "e", "ß", "ss", "中", "a\0b"]
+                                    [(i % 8) as usize];
+                                (
+                                    vec![
+                                        if i % 17 == 0 {
+                                            Value::Null
+                                        } else {
+                                            Value::String(text.into())
+                                        },
+                                        Value::Int((i % 7) as i64 - 3),
+                                        Value::DecimalCompact((i % 11) as i64 - 5, 2),
+                                    ],
+                                    i,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let spill_schema = spill_schema(&schema(), 3);
+                        let mut runs = Vec::new();
+                        for (index, chunk) in expected.chunks(24).enumerate() {
+                            let mut rows = chunk
+                                .iter()
+                                .map(|(keys, ordinal)| SortRow {
+                                    keys: SortKeyValues::Many(keys.clone()),
+                                    payload: vec![
+                                        Value::Int(*ordinal as i64),
+                                        Value::String("retained".into()),
+                                    ],
+                                    ordinal: *ordinal,
+                                })
+                                .collect::<Vec<_>>();
+                            runs.push(
+                                flush_run(
+                                    &tmp,
+                                    &mut rows,
+                                    &fields,
+                                    false,
+                                    spill_schema.clone(),
+                                    index,
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        expected.sort_by(|a, b| {
+                            crate::engine::executor::sort::compare_sort_keys(&fields, &a.0, &b.0)
+                                .then(a.1.cmp(&b.1))
+                        });
+                        let mut merge =
+                            RunMerger::open(&tmp, &runs, spill_schema, 3, fields, false).unwrap();
+                        assert!(merge
+                            .encoded_enabled
+                            .load(std::sync::atomic::Ordering::Relaxed));
+                        let mut actual = Vec::new();
+                        while let Some(row) = merge.next_sort_row().unwrap() {
+                            actual.push(row.row.ordinal);
+                        }
+                        assert_eq!(actual, expected.iter().map(|r| r.1).collect::<Vec<_>>());
+                        assert!(merge
+                            .encoded_enabled
+                            .load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                }
+                let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+                let tmp = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                    root.path(),
+                    "sort",
+                )
+                .unwrap();
+                let fields: Arc<[_]> = vec![crate::engine::executor::sort::SortField {
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }]
+                .into();
+                let schema = spill_schema(&schema(), 1);
+                let mut runs = Vec::new();
+                for (i, keys) in [
+                    vec![Value::Int(1), Value::UInt(u64::MAX)],
+                    vec![Value::Int(2), Value::Int(3)],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut rows = keys
+                        .into_iter()
+                        .map(|key| SortRow {
+                            keys: SortKeyValues::One(key),
+                            payload: vec![Value::Int(0), Value::String("p".into())],
+                            ordinal: 0,
+                        })
+                        .collect::<Vec<_>>();
+                    runs.push(
+                        flush_run(&tmp, &mut rows, &fields, false, schema.clone(), i).unwrap(),
+                    );
+                }
+                let mut merge = RunMerger::open(&tmp, &runs, schema, 1, fields, false).unwrap();
+                assert!(merge
+                    .encoded_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed));
+                let mut values = Vec::new();
+                while let Some(row) = merge.next_sort_row().unwrap() {
+                    values.push(row.row.keys.as_slice()[0].clone());
+                }
+                assert!(!merge
+                    .encoded_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed));
+                assert_eq!(
+                    values,
+                    vec![
+                        Value::Int(1),
+                        Value::Int(2),
+                        Value::Int(3),
+                        Value::UInt(u64::MAX)
+                    ]
+                );
+            })
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
     use super::*;
     use crate::engine::executor::vec::stream::{BatchOrdering, BatchPartitioning};
 
@@ -1678,6 +1908,9 @@ mod tests {
                                 charge: ScopedCharge::new(0),
                                 fields: fields.clone(),
                                 payload_ties: false,
+                                encoded_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                                    false,
+                                )),
                             }
                         };
                         let mut reused = MergeStringKeys::new();

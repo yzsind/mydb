@@ -3771,6 +3771,12 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
             crate::engine::executor::select::plan::MRR_RIDS .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
         "mrr_unique_pages" =>
             crate::engine::executor::select::plan::MRR_UNIQUE_PAGES .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
+        "hash_agg_dense_integer_activations" => crate::engine::executor::vec::hash_agg::DENSE_INTEGER_ACTIVATIONS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "hash_agg_dense_integer_fallbacks" => crate::engine::executor::vec::hash_agg::DENSE_INTEGER_FALLBACKS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "group_count_witness_candidates" => crate::engine::executor::select::vec_bridge::count_witness::CANDIDATES.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "group_count_witness_activations" => crate::engine::executor::select::vec_bridge::count_witness::ACTIVATIONS.load(std::sync::atomic::Ordering::Relaxed).to_string(),
+        "group_count_witness_rows_skipped" =>
+            crate::engine::executor::select::vec_bridge::count_witness::ROWS_SKIPPED.load(std::sync::atomic::Ordering::Relaxed).to_string(),
         "mrr_page_reuses" =>
             crate::engine::executor::select::plan::MRR_PAGE_REUSES .load(std::sync::atomic::Ordering::Relaxed) .to_string(),
         "mrr_workarea_flushes" =>

@@ -152,7 +152,7 @@ struct Branch<'a> {
 /// Only warning-free scalar comparisons are evaluated in the domain pass.
 /// Other functions, conversions, arithmetic and subqueries retain the ordinary
 /// post-join evaluation point, including their errors and diagnostics.
-fn safe_predicate(expr: &Expr) -> bool {
+pub(in crate::engine::executor) fn safe_predicate(expr: &Expr) -> bool {
     match expr {
         Expr::Identifier(_) | Expr::CompoundIdentifier(_) => true,
         Expr::Literal(Literal::Int(_) | Literal::UInt(_) | Literal::Null | Literal::Bool(_)) => {
@@ -214,6 +214,140 @@ fn cte_rows(plan: &PhysicalPlan) -> Option<usize> {
 
 fn substantial_build_work(bytes: f64, query_budget: usize) -> bool {
     bytes > query_budget.saturating_mul(2) as f64
+}
+
+/// Materialized optional groups can restrict an unopened grouped producer.
+/// The caller proves the outer-join disjunction and group-key lineage; this
+/// pass validates numeric predicates, NULL rejection, tuple lanes and budget.
+pub(in crate::engine::executor) fn grouped_producer_domain(
+    plans: &[PhysicalPlan],
+    predicates: &[Expr],
+    key_names: &[Vec<String>],
+    target_keys: Vec<Expr>,
+) -> Result<Option<RuntimeFilter>, QueryError> {
+    let Some(budget) = mem_budget::current_budget() else {
+        return Ok(None);
+    };
+    let mut rows = 0usize;
+    let mut branches = Vec::new();
+    for ((plan, predicate), names) in plans.iter().zip(predicates).zip(key_names) {
+        if !safe_predicate(predicate) {
+            return Ok(None);
+        }
+        rows = rows.saturating_add(cte_rows(plan).unwrap_or(0));
+        let template = plan_output_template(plan);
+        let Some(keys) = names
+            .iter()
+            .map(|name| {
+                let index =
+                    expr_column_index_in_template(&Expr::Identifier(name.clone()), &template)?;
+                integer(template[index].column_type).then_some(index)
+            })
+            .collect::<Option<Vec<_>>>()
+        else {
+            return Ok(None);
+        };
+        if keys.len() != target_keys.len() {
+            return Ok(None);
+        }
+        let numeric = crate::parser::visit::try_inspect_value_expr(predicate, |node| {
+            if matches!(node, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
+                let Some(index) = expr_column_index_in_template(node, &template) else {
+                    return Err(());
+                };
+                if !matches!(
+                    template[index].column_type,
+                    ColumnType::Tiny
+                        | ColumnType::Short
+                        | ColumnType::MediumInt
+                        | ColumnType::Long
+                        | ColumnType::LongLong
+                        | ColumnType::Decimal { .. }
+                        | ColumnType::Float
+                        | ColumnType::Double
+                ) {
+                    return Err(());
+                }
+            }
+            Ok(true)
+        })
+        .is_ok();
+        if !numeric {
+            return Ok(None);
+        }
+        let schema = template_to_batch_schema(&template);
+        let Some(program) = expr_batch::BatchExprProgram::compile(predicate, &schema)? else {
+            return Ok(None);
+        };
+        let nulls = Batch::with_row_count(
+            schema.clone(),
+            (0..schema.len())
+                .map(|_| ColumnVector::Null { len: 1 })
+                .collect(),
+            1,
+        );
+        if program.eval_predicate_bitmap(&nulls)?.get(0) {
+            return Ok(None);
+        }
+        branches.push(Branch {
+            plan,
+            keys,
+            predicate: program,
+        });
+    }
+    let bytes = BloomFilter::estimated_byte_size(rows);
+    if bytes > (budget.limit() / 4).min(128 << 20) {
+        return Ok(None);
+    }
+    let Ok(charge) = mem_budget::OwnedMemCharge::new_optional_pipeline(budget, bytes) else {
+        return Ok(None);
+    };
+    let pair = target_keys.len() == 2;
+    let mut filter = if pair {
+        BloomFilter::new_int_pair(rows)
+    } else {
+        BloomFilter::new(rows)
+    };
+    filter.attach_charge(Arc::new(charge));
+    let mut key = Vec::with_capacity(target_keys.len());
+    for branch in branches {
+        let Some(mut input) = try_build_cte_batch_scan_unfiltered(branch.plan)? else {
+            return Ok(None);
+        };
+        while let Some(batch) = input.stream.next_batch()? {
+            crate::engine::cancel::check_cancelled()?;
+            let qualified = branch.predicate.eval_predicate_bitmap(&batch)?;
+            for row in batch.visible_indices() {
+                if !qualified.get(row) {
+                    continue;
+                }
+                key.clear();
+                for &index in &branch.keys {
+                    if batch.columns()[index].is_null(row) {
+                        break;
+                    }
+                    key.push(ValueKey::from(&batch.columns()[index].value_at(row)));
+                }
+                if key.len() != target_keys.len() {
+                    continue;
+                }
+                if pair {
+                    let [ValueKey::Int(a), ValueKey::Int(b)] = key.as_slice() else {
+                        return Ok(None);
+                    };
+                    filter.insert_int_pair(*a, *b);
+                } else {
+                    filter.insert(key.as_slice());
+                }
+            }
+        }
+    }
+    Ok(Some(RuntimeFilter::BloomKey {
+        null_safe: vec![false; target_keys.len()],
+        keys: target_keys,
+        filter: Arc::new(filter),
+        rejected: None,
+    }))
 }
 
 pub(super) fn wrap_disjunction<'a>(

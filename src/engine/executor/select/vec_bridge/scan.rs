@@ -2071,8 +2071,36 @@ pub(super) fn try_build_direct_batch_scan<'a>(
             analyze_plan: Some(plan),
             analyze_recorded: false,
         });
+        let filtered: Box<dyn BatchOperator + 'a> =
+            Box::new(SparseSelectionCoalesceStream::new(filtered));
+        // A nonselective local predicate can still receive a selective join
+        // domain after construction. Keep the optional RID source outside the
+        // full predicate, with the same access-hint and zone-map boundaries.
+        let filtered = if use_zone_map
+            || matches!(
+                inner,
+                PhysicalPlan::SeqScan {
+                    hint_note: Some(_),
+                    ..
+                } | PhysicalPlan::ParallelSeqScan {
+                    hint_note: Some(_),
+                    ..
+                }
+            ) {
+            filtered
+        } else {
+            runtime_index::wrap_filtered(
+                db,
+                txn,
+                table,
+                scan_projection_columns(table, proj),
+                runtime_filters,
+                filtered,
+                f,
+            )?
+        };
         return Ok(Some(VecBatchInput {
-            stream: Box::new(SparseSelectionCoalesceStream::new(filtered)),
+            stream: filtered,
             template,
         }));
     }

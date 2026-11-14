@@ -1361,7 +1361,7 @@ impl LimitBinding {
 
 /// Extract the parameter indices of placeholder LIMIT / OFFSET clauses on
 /// a SELECT, for stamping into limit-consuming plan nodes.
-fn limit_binding_of(select: &Select) -> LimitBinding {
+pub(crate) fn limit_binding_of(select: &Select) -> LimitBinding {
     LimitBinding {
         limit_param: match select.limit {
             Some(LimitValue::Placeholder(idx) | LimitValue::OffsetCommaPlaceholder(idx)) => {
@@ -8958,7 +8958,7 @@ fn parallel_cost_from_serial(
 /// Maximum K for which the planner emits a TopK heap operator. Beyond
 /// this threshold, fall back to a full Sort (which Phase C will switch
 /// to external sort with spill). Tunable via `MYDB_TOPK_MAX_HEAP`.
-fn topk_max_heap_from_env() -> usize {
+pub(crate) fn topk_max_heap_from_env() -> usize {
     crate::util::env::var("MYDB_TOPK_MAX_HEAP")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
@@ -8972,7 +8972,7 @@ fn topk_max_heap_from_env() -> usize {
 /// value. Cached plans re-resolve at execution via [`LimitBinding`];
 /// the auto-param fingerprint folds a magnitude bucket of the literal
 /// in, so a reused plan only ever sees values within 2× of the peek.
-fn limit_usize(value: Option<&LimitValue>) -> Option<usize> {
+pub(crate) fn limit_usize(value: Option<&LimitValue>) -> Option<usize> {
     match value {
         Some(LimitValue::Rows(value)) => Some(*value),
         Some(LimitValue::Placeholder(idx) | LimitValue::OffsetCommaPlaceholder(idx)) => {
@@ -12765,11 +12765,12 @@ fn choose_scan(
     // one covering, one not — get identical cost estimates and the CBO
     // can't prefer the covering one.
     let will_cover = table.system_time.is_none() && index_would_cover(&choice.index, hints);
-    // Only a range path can be rejected by the final seq-vs-index safety
-    // comparison. Preserve fallback inputs for that shape alone; lookup and
-    // multi-lookup plans avoid these otherwise wasted deep clones.
-    let seq_fallback_inputs = matches!(&choice.kind, IndexAccessKind::Range { .. })
-        .then(|| (filter.clone(), possible_keys.clone()));
+    // Dense point and IN domains can visit most heap pages too. Keep the
+    // fallback only for accesses large enough to enter the final comparison;
+    // ordinary selective point probes avoid cloning these planning inputs.
+    let compare_seq = !choice.index.primary
+        && estimate_index_access_rows(&table.schema, &choice, total_rows) > 1000.0;
+    let seq_fallback_inputs = compare_seq.then(|| (filter.clone(), possible_keys.clone()));
     let has_force = hints.index_hints.iter().any(|h| {
         matches!(h.hint_type, IndexHintType::Force)
             && matches!(h.scope, IndexHintScope::All | IndexHintScope::Join)
@@ -13085,27 +13086,34 @@ fn choose_scan(
             }
         }
     }
-    // CBO cost comparison: prefer a sequential scan whenever it is
-    // cheaper than the chosen non-clustered IndexRangeScan.
-    //
-    // Both costs were already computed above
-    // (operator_cost::seq_scan / index_range_scan) so the comparison
-    // is essentially free. Trusting the cost model directly catches
-    // cases the old 50%-selectivity gate missed — e.g. a 5%-selective
-    // predicate where ~70k random heap fetches still cost more than a
-    // single sequential pass over the heap. The downstream
-    // `apply_parallel_hints()` pass may then wrap the chosen SeqScan in
-    // `Exchange { ParallelSeqScan }` when that is cheaper still.
-    if let PhysicalPlan::IndexRangeScan {
-        index,
-        cost: index_cost,
-        access_rows: matched,
-        ..
-    } = &index_plan
-    {
+    // Price complete heap access for ranges and dense noncovering point
+    // domains under the same sequential/parallel alternative.
+    let comparison = match &index_plan {
+        PhysicalPlan::IndexRangeScan {
+            index,
+            cost,
+            access_rows,
+            ..
+        }
+        | PhysicalPlan::IndexLookup {
+            index,
+            cost,
+            access_rows,
+            covering: false,
+            ..
+        }
+        | PhysicalPlan::IndexMultiLookup {
+            index,
+            cost,
+            access_rows,
+            covering: false,
+            ..
+        } => Some((index, cost, *access_rows)),
+        _ => None,
+    };
+    if let Some((index, index_cost, matched)) = comparison {
         // Skip the comparison when:
-        //   * the index is the primary key (clustered: no extra random
-        //     I/O, cost model already accurate);
+        //   * the primary access path retains its existing route policy;
         //   * an order-preserving LIMIT whose blocking alternative cannot be
         //     costed at this scan. Simple single-table shapes compare the
         //     ordered index against Zone Map/SeqScan plus a conservative
@@ -13114,7 +13122,7 @@ fn choose_scan(
         //     difference is negligible and existing regression tests pin
         //     the index choice.
         let ordered_cost_comparable = !order_preserving_with_limit || ordered_limit.is_some();
-        if !index.primary && ordered_cost_comparable && total_rows > 0.0 && *matched > 1000.0 {
+        if !index.primary && ordered_cost_comparable && total_rows > 0.0 && matched > 1000.0 {
             let scan_cost = anticipated_seq_scan_cost_parts(
                 table,
                 seq_output_rows,
@@ -13146,8 +13154,8 @@ fn choose_scan(
                 );
             }
             if complete_seq_cost <= index_cost.weighted_total() {
-                let (seq_filter, seq_possible_keys) =
-                    seq_fallback_inputs.expect("only index range scans reach sequential fallback");
+                let (seq_filter, seq_possible_keys) = seq_fallback_inputs
+                    .expect("dense heap access retains sequential fallback inputs");
                 return Ok(set_scan_query_hint_note(
                     materialize_seq_scan(
                         table,
@@ -24137,7 +24145,7 @@ pub(crate) fn has_aggregate_expr(expr: &Expr) -> bool {
 // call sites keep working.
 pub use crate::parser::is_aggregate_function;
 
-fn expr_literal_value(expr: &Expr) -> Option<Value> {
+pub(crate) fn expr_literal_value(expr: &Expr) -> Option<Value> {
     match expr {
         Expr::Literal(lit) => Some(match lit {
             crate::parser::Literal::Null => Value::Null,
@@ -24154,6 +24162,26 @@ fn expr_literal_value(expr: &Expr) -> Option<Value> {
             }
         }),
         Expr::BoundValue(value) => Some(value.clone()),
+        // Result metadata can require keeping constant arithmetic in the
+        // AST. Its exact signed-integer value is nevertheless a valid bound
+        // for statistics and index access. Do not evaluate general functions
+        // or lossy/mode-dependent arithmetic while choosing an access path.
+        Expr::Binary { left, op, right }
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul) =>
+        {
+            let (Value::Int(left), Value::Int(right)) =
+                (expr_literal_value(left)?, expr_literal_value(right)?)
+            else {
+                return None;
+            };
+            match op {
+                BinaryOp::Add => left.checked_add(right),
+                BinaryOp::Sub => left.checked_sub(right),
+                BinaryOp::Mul => left.checked_mul(right),
+                _ => unreachable!(),
+            }
+            .map(Value::Int)
+        }
         // sqlparser represents `-5` as unary negation over the positive
         // literal. Treat it as a constant here too; otherwise predicates such
         // as `gmt_offset = -5` miss MCV/NDV statistics and fall back to the

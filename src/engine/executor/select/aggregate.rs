@@ -2303,6 +2303,7 @@ pub(crate) enum InlineAggState {
 }
 
 impl InlineAggState {
+    #[inline]
     pub(crate) fn heap_bytes(&self) -> usize {
         use crate::engine::executor::memory_footprint::AllocatedBytes;
         match self {

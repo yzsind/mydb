@@ -3,6 +3,7 @@ use super::*;
 
 mod compact_key;
 mod external_reduce;
+mod lazy;
 mod packed_row;
 
 /// Turn a branch response into `(columns, cursor)` without materialising:
@@ -1049,10 +1050,53 @@ fn reduce_setop_spill_partition(
     peak_state_bytes: &mut usize,
     metrics: &mut SetOpReplayMetrics,
 ) -> Result<(), QueryError> {
+    reduce_setop_spill_partition_into(
+        collations,
+        op,
+        all,
+        ncols,
+        path,
+        partition_tag,
+        depth,
+        replay_cap,
+        dir,
+        output_runs,
+        next_run,
+        work_handle,
+        memory_charge,
+        peak_state_bytes,
+        metrics,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reduce_setop_spill_partition_into(
+    collations: &[Option<u16>],
+    op: SetOp,
+    all: bool,
+    ncols: usize,
+    path: &std::path::Path,
+    partition_tag: &str,
+    depth: u32,
+    replay_cap: usize,
+    dir: &crate::engine::executor::select::grace::SpillTmpDir,
+    output_runs: &mut Vec<std::path::PathBuf>,
+    next_run: &mut usize,
+    work_handle: &crate::engine::executor::work_area::WorkAreaHandle,
+    memory_charge: &mut crate::engine::executor::mem_budget::ScopedCharge,
+    peak_state_bytes: &mut usize,
+    metrics: &mut SetOpReplayMetrics,
+    direct_output: Option<&mut Option<(Vec<PackedSetEntry>, usize)>>,
+) -> Result<(), QueryError> {
     crate::engine::cancel::check_cancelled()?;
     let Some(mut reader) =
         crate::engine::executor::select::grace::ValueRowReader::open(path, dir.charger())?
     else {
+        if direct_output.is_some() {
+            return Err(crate::error::catalog::ER_UNKNOWN_ERROR
+                .error("missing set-operation input partition"));
+        }
         return Ok(());
     };
     if reader.column_count() != ncols.saturating_add(3) {
@@ -1270,7 +1314,11 @@ fn reduce_setop_spill_partition(
 
     drop(reader);
     crate::engine::executor::spill_quota::remove_spill_file(path, &dir.charger())?;
-    let entries = compact_set_count_state(op, all, state)?;
+    let entries = compact_set_count_state_with_order(op, all, state, direct_output.is_none())?;
+    if let Some(output) = direct_output {
+        *output = Some((entries, state_bytes));
+        return Ok(());
+    }
     if !entries.is_empty() {
         let run_path = dir.path().join(format!("setrun-{}", *next_run));
         *next_run = (*next_run).saturating_add(1);
@@ -1363,6 +1411,15 @@ fn compact_set_count_state<Row>(
     all: bool,
     state: hashbrown::HashMap<SetRowKey, SetCountEntry<Row>, ahash::RandomState>,
 ) -> Result<Vec<(u64, u64, Row)>, QueryError> {
+    compact_set_count_state_with_order(op, all, state, true)
+}
+
+fn compact_set_count_state_with_order<Row>(
+    op: SetOp,
+    all: bool,
+    state: hashbrown::HashMap<SetRowKey, SetCountEntry<Row>, ahash::RandomState>,
+    preserve_order: bool,
+) -> Result<Vec<(u64, u64, Row)>, QueryError> {
     let winners = state
         .values()
         .filter(|entry| set_count_repeats(op, all, entry) > 0)
@@ -1377,7 +1434,9 @@ fn compact_set_count_state<Row>(
             entries.push((entry.first_ordinal, repeats, entry.row));
         }
     }
-    entries.sort_unstable_by_key(|(ordinal, _, _)| *ordinal);
+    if preserve_order {
+        entries.sort_unstable_by_key(|(ordinal, _, _)| *ordinal);
+    }
     Ok(entries)
 }
 
@@ -1390,9 +1449,12 @@ struct SpilledSetOutput {
     output_read_recorded: bool,
 }
 
+type PackedSetEntry = (u64, u64, packed_row::PackedRow);
+
 enum IncrementalSetOutputInner {
     InMemory(std::vec::IntoIter<(u64, u64, Vec<Value>)>),
     Spilled(SpilledSetOutput),
+    Partitioned(Box<lazy::PartitionedSetOutput>),
 }
 
 /// Pull-based result of a blocking set operation. Multiplicity stays compact
@@ -1424,9 +1486,14 @@ impl IncrementalSetOutput {
         }
     }
 
-    fn next_compact(&mut self) -> Result<Option<(u64, u64, Vec<Value>)>, QueryError> {
+    fn next_compact(
+        &mut self,
+        mut buffer: Vec<Value>,
+        inline_strings: bool,
+    ) -> Result<Option<(u64, u64, Vec<Value>)>, QueryError> {
         match &mut self.inner {
             IncrementalSetOutputInner::InMemory(entries) => Ok(entries.next()),
+            IncrementalSetOutputInner::Partitioned(output) => output.next(buffer, inline_strings),
             IncrementalSetOutputInner::Spilled(output) => loop {
                 if output.reader.is_none() {
                     let Some(path) = output.output_path.as_ref() else {
@@ -1449,7 +1516,12 @@ impl IncrementalSetOutput {
                 let Some(reader) = output.reader.as_mut() else {
                     return Ok(None);
                 };
-                let Some(mut tagged) = reader.next()? else {
+                let decoded = if inline_strings {
+                    reader.next_inline_reuse(std::mem::take(&mut buffer))?
+                } else {
+                    reader.next()?
+                };
+                let Some(mut tagged) = decoded else {
                     if !output.output_read_recorded {
                         SETOP_SPILL_BYTES_READ.fetch_add(
                             output.output_spill_bytes,
@@ -1482,15 +1554,30 @@ impl IncrementalSetOutput {
     }
 
     pub(crate) fn next_row(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+        self.next_row_with_buffer(Vec::new(), false)
+    }
+    pub(crate) fn next_row_reuse(
+        &mut self,
+        buffer: Vec<Value>,
+    ) -> Result<Option<Vec<Value>>, QueryError> {
+        self.next_row_with_buffer(buffer, true)
+    }
+    fn next_row_with_buffer(
+        &mut self,
+        mut buffer: Vec<Value>,
+        inline_strings: bool,
+    ) -> Result<Option<Vec<Value>>, QueryError> {
         crate::engine::cancel::check_cancelled()?;
         if let Some((row, remaining)) = self.repeated.as_mut() {
             if *remaining > 0 {
                 *remaining -= 1;
-                return Ok(Some(row.clone()));
+                buffer.clear();
+                buffer.extend(row.iter().cloned());
+                return Ok(Some(buffer));
             }
         }
         self.repeated = None;
-        let Some((_, repeats, row)) = self.next_compact()? else {
+        let Some((_, repeats, row)) = self.next_compact(buffer, inline_strings)? else {
             return Ok(None);
         };
         if repeats > 1 {
@@ -1835,6 +1922,22 @@ where
     let input_writer_opens = writers.opens();
     let input_spill_bytes = writers.finish()?;
     drop(state);
+    if !preserve_order {
+        return lazy::start(
+            collations,
+            op,
+            all,
+            ncols,
+            dir,
+            partitions,
+            (query_limit / 2).max(1 << 20),
+            memory_charge,
+            work_handle,
+            peak_state_bytes,
+            input_spill_bytes,
+            input_writer_opens,
+        );
+    }
     let mut output_runs = Vec::new();
     let mut next_run = 0usize;
     let replay_cap = (query_limit / 2).max(1 << 20);
@@ -2382,13 +2485,15 @@ mod set_count_spill_tests {
                         || Ok(right.next()),
                     )
                     .unwrap();
-                    let IncrementalSetOutputInner::Spilled(spilled) = &output.inner else {
-                        panic!("wide rows must spill")
+                    let path = match &output.inner {
+                        IncrementalSetOutputInner::Spilled(spilled) => {
+                            spilled.dir.path().to_path_buf()
+                        }
+                        IncrementalSetOutputInner::Partitioned(output) => {
+                            output.dir.path().to_path_buf()
+                        }
+                        _ => panic!("wide rows must spill"),
                     };
-                    let path = spilled.dir.path().to_path_buf();
-                    if !ordered {
-                        assert!(spilled.remaining_paths.len() > 0);
-                    }
                     let mut rows = Vec::new();
                     while let Some(row) = output.next_row().unwrap() {
                         rows.push(format!("{row:?}"));
@@ -2439,21 +2544,21 @@ mod set_count_spill_tests {
                     || Ok(right.next()),
                 )
                 .unwrap();
-                let IncrementalSetOutputInner::Spilled(spilled) = &output.inner else {
-                    panic!("must spill")
+                let IncrementalSetOutputInner::Partitioned(partitioned) = &output.inner else {
+                    panic!("must use lazy partition replay")
                 };
-                let dir = spilled.dir.path().to_path_buf();
+                let dir = partitioned.dir.path().to_path_buf();
                 if missing {
                     crate::engine::executor::spill_quota::remove_spill_file(
-                        spilled.output_path.as_ref().unwrap(),
-                        &spilled.dir.charger(),
+                        partitioned.first_path().unwrap(),
+                        &partitioned.dir.charger(),
                     )
                     .unwrap();
                     assert!(output
                         .next_row()
                         .unwrap_err()
                         .message()
-                        .contains("missing set-operation output run"));
+                        .contains("missing set-operation input partition"));
                 } else {
                     assert!(output.next_row().unwrap().is_some());
                     token.cancel_local();
@@ -2805,6 +2910,7 @@ mod set_count_spill_tests {
             .expect("incremental spillable INTERSECT");
         let spill_dir = match &output.inner {
             IncrementalSetOutputInner::Spilled(spilled) => spilled.dir.path().to_path_buf(),
+            IncrementalSetOutputInner::Partitioned(output) => output.dir.path().to_path_buf(),
             IncrementalSetOutputInner::InMemory(_) => panic!("tiny budget must force spill"),
         };
         let spill_files = std::fs::read_dir(&spill_dir)
@@ -2880,6 +2986,7 @@ mod set_count_spill_tests {
             .expect("recursive set-op spill");
         let spill_dir = match &output.inner {
             IncrementalSetOutputInner::Spilled(spilled) => spilled.dir.path().to_path_buf(),
+            IncrementalSetOutputInner::Partitioned(output) => output.dir.path().to_path_buf(),
             IncrementalSetOutputInner::InMemory(_) => panic!("tiny budget must force spill"),
         };
         let names = std::fs::read_dir(&spill_dir)
@@ -3607,6 +3714,140 @@ mod adaptive_partition_tests {
             assert_eq!(rows, 20000);
             let opens = SETOP_SPILL_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
             assert!(opens<=4*parts as u64+4,"{opens} opens for {parts} partitions: routing must not thrash an undersized writer pool");
+        });
+        assert_eq!(budget.used(), 0);
+        assert_eq!(budget.spill_bytes(), 0);
+    }
+}
+
+#[cfg(test)]
+mod lazy_partition_tests {
+    use super::*;
+    fn row(k: i64) -> Vec<Value> {
+        vec![
+            Value::Int(k),
+            Value::UInt(u64::MAX - k as u64),
+            Value::Decimal128(k as i128 * 125, 2),
+            Value::String(format!("Abé{k}:{}", "x".repeat(128))),
+            if k % 7 == 0 {
+                Value::Null
+            } else {
+                Value::Date(k as i32)
+            },
+            Value::Bytes(vec![(k % 255) as u8, 0]),
+            Value::Time(k - 3600),
+        ]
+    }
+    #[test]
+    fn unordered_partition_replay_emits_rows_without_output_run_files() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        for (op, all) in [
+            (SetOp::Union, false),
+            (SetOp::Intersect, false),
+            (SetOp::Intersect, true),
+            (SetOp::Except, false),
+            (SetOp::Except, true),
+        ] {
+            let budget = Arc::new(crate::engine::executor::mem_budget::MemBudget::new(1 << 20));
+            crate::engine::executor::mem_budget::with_query_budget(budget.clone(), || {
+                let before = SETOP_SPILL_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed);
+                let mut left = 0;
+                let mut right = 0;
+                let mut output = combine_unordered_set_sources_spillable(
+                    &[],
+                    op,
+                    all,
+                    7,
+                    dir.path(),
+                    || {
+                        if left == 7000 {
+                            return Ok(None);
+                        }
+                        let r = row(left % 3500);
+                        left += 1;
+                        Ok(Some(r))
+                    },
+                    || {
+                        if right == 7000 {
+                            return Ok(None);
+                        }
+                        let r = row(right % 3500 + 1750);
+                        right += 1;
+                        Ok(Some(r))
+                    },
+                )
+                .unwrap();
+                let mut keys = Vec::new();
+                while let Some(actual) = output.next_row().unwrap() {
+                    let Value::Int(k) = actual[0] else { panic!() };
+                    let expected = row(k);
+                    let encode = |r: &[Value]| {
+                        packed_row::PackedRow::encode(
+                            r,
+                            packed_row::PackedRow::encoded_len(r).unwrap(),
+                        )
+                        .unwrap()
+                    };
+                    assert_eq!(encode(&actual).encoded(), encode(&expected).encoded());
+                    keys.push(k);
+                }
+                keys.sort_unstable();
+                let expected = (0..5250)
+                    .flat_map(|k| {
+                        let l = if k < 3500 { 2usize } else { 0 };
+                        let r = if k >= 1750 { 2usize } else { 0 };
+                        let n = match (op, all) {
+                            (SetOp::Union, _) => usize::from(l + r > 0),
+                            (SetOp::Intersect, false) => usize::from(l > 0 && r > 0),
+                            (SetOp::Intersect, true) => l.min(r),
+                            (SetOp::Except, false) => usize::from(l > 0 && r == 0),
+                            (SetOp::Except, true) => l.saturating_sub(r),
+                        };
+                        std::iter::repeat_n(k, n)
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(keys, expected);
+                let opens =
+                    SETOP_SPILL_FILE_OPENS.load(std::sync::atomic::Ordering::Relaxed) - before;
+                assert!(opens<=2*SETOP_SPILL_FANOUT as u64,"{op:?} all={all}: {opens} opens; no reduced output files should be written/read");
+                drop(output);
+            });
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        }
+    }
+    #[test]
+    fn lazy_unordered_replay_repartitions_skewed_state_and_releases_every_file() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let make = |k| vec![Value::Int(k), Value::String("x".repeat(4096))];
+        let keys = (0..200000)
+            .filter(|&k| setop_partition_for(&[], &make(k), 0) == 0)
+            .take(500)
+            .collect::<Vec<_>>();
+        assert_eq!(keys.len(), 500);
+        let budget = Arc::new(crate::engine::executor::mem_budget::MemBudget::new(1 << 20));
+        crate::engine::executor::mem_budget::with_query_budget(budget.clone(), || {
+            let before = SETOP_SPILL_REPARTITIONS.load(std::sync::atomic::Ordering::Relaxed);
+            let mut input = keys.iter().copied().map(make);
+            let mut output = combine_unordered_set_sources_spillable(
+                &[],
+                SetOp::Union,
+                false,
+                2,
+                dir.path(),
+                || Ok(input.next()),
+                || Ok(None),
+            )
+            .unwrap();
+            let mut rows = Vec::new();
+            while let Some(row) = output.next_row().unwrap() {
+                let Value::Int(k) = row[0] else { panic!() };
+                rows.push(k);
+            }
+            rows.sort_unstable();
+            assert_eq!(rows, keys);
+            assert!(SETOP_SPILL_REPARTITIONS.load(std::sync::atomic::Ordering::Relaxed) > before);
+            drop(output);
         });
         assert_eq!(budget.used(), 0);
         assert_eq!(budget.spill_bytes(), 0);

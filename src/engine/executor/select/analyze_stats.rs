@@ -723,7 +723,10 @@ pub(super) fn plan_key(plan: &PhysicalPlan) -> Option<PlanNodeId> {
     })
 }
 
-pub(super) fn bind_plan_clone(executed: &PhysicalPlan, display: &PhysicalPlan) {
+pub(in crate::engine::executor) fn bind_plan_clone(
+    executed: &PhysicalPlan,
+    display: &PhysicalPlan,
+) {
     STATS_COLLECTOR.with(|cell| {
         if let Some(collector) = cell.borrow().as_ref() {
             collector

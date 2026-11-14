@@ -1784,20 +1784,29 @@ impl Database {
         let exact = resolved
             .first()
             .is_some_and(|key| key.0.len() >= index.columns.len());
-        if self.has_pending_index_repairs() {
-            // Rare in-flight-repair path: reuse the materialised lookup
-            // and map each entry back onto its probe-key index.
-            let entries = self.lookup_index_entries_many_visible_with_handle(
-                index_handle,
-                table,
-                index,
-                keys,
-                txn,
-            )?;
-            return Ok(map_index_entries_to_key_indices(keys, &entries));
+        // A raw RID can point at an older visible row version that owns a
+        // different key. Validate ownership for old/own-write views and when
+        // repair publication overlaps the raw lookup.
+        let validate = || {
+            let mut entries=self.lookup_index_entries_many_visible_with_handle(
+                index_handle,table,index,&resolved,txn)?;
+            let mask=self.filter_visible_index_entries_mask_exact(table,index,&entries,txn)?;
+            let mut visible=mask.into_iter();
+            entries.retain(|_|visible.next().unwrap_or(false));
+            Ok(map_index_entries_to_key_indices(&resolved,&entries))
+        };
+        let repair_version=self.index_repair_version();
+        if self.has_pending_index_repairs() || txn.txn_id!=0 || txn.dirty_read
+            || txn.historical || txn.snapshot_scn<self.visible_scn() {
+            return validate();
         }
-        let index_file = index_handle.read();
-        index_file.lookup_entries_many_sorted_keyed(&resolved, exact, !index.unique)
+        let index_file=index_handle.read();
+        let entries=index_file.lookup_entries_many_sorted_keyed(&resolved,exact,!index.unique)?;
+        drop(index_file);
+        if self.index_repair_version()!=repair_version || txn.snapshot_scn<self.visible_scn() {
+            return validate();
+        }
+        Ok(entries)
     }
 
     /// Bounded keyed lookup used by optional secondary-index intersections.
@@ -4051,5 +4060,29 @@ impl SnapshotLeafRepairs {
             }
         }
         Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod keyed_snapshot_tests {
+    use super::*;
+    #[test]
+    fn keyed_index_candidates_recheck_snapshot_key_ownership() {
+        let dir=tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine=crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine.execute("CREATE TABLE f(k INT,v INT,INDEX by_k(k))").unwrap();
+        engine.execute("INSERT INTO f VALUES(1,10)").unwrap();
+        let db=engine.db_for_tests();
+        let table=db.table("f").unwrap();
+        let index=table.indexes.iter().find(|i|i.name=="by_k").unwrap();
+        let handle=db.cached_index_handle(table.id,"by_k").unwrap();
+        let keys=vec![IndexKey(vec![KeyPart::Int(1)].into()),IndexKey(vec![KeyPart::Int(2)].into())];
+        let (old,_snapshot)=db.read_only_statement_view_with_guard(IsolationLevel::RepeatableRead,None);
+        engine.execute("UPDATE f SET k=2").unwrap();
+        let old_entries=db.lookup_index_entries_many_keyed_with_handle(&handle,&table,index,&keys,old).unwrap();
+        assert_eq!(old_entries.iter().map(|&(i,_)|i).collect::<Vec<_>>(),vec![0]);
+        let current=TxnView::read_only(u64::MAX,IsolationLevel::ReadCommitted);
+        let current_entries=db.lookup_index_entries_many_keyed_with_handle(&handle,&table,index,&keys,current).unwrap();
+        assert_eq!(current_entries.iter().map(|&(i,_)|i).collect::<Vec<_>>(),vec![1]);
     }
 }

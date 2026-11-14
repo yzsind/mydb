@@ -2273,7 +2273,22 @@ impl BatchOperator for HashJoinBatchOperator<'_> {
     }
 
     fn install_runtime_filter(&mut self, filter: crate::planner::RuntimeFilter) -> bool {
+        let tuple_domain = match &filter {
+            crate::planner::RuntimeFilter::BloomKey { keys, .. }
+            | crate::planner::RuntimeFilter::KeySet { keys, .. } => keys.len() > 1,
+            _ => false,
+        };
         if self.probe.install_runtime_filter(filter.clone()) {
+            if tuple_domain
+                && matches!(
+                    self.join_type,
+                    crate::parser::JoinType::Semi | crate::parser::JoinType::Anti
+                )
+                && self.state.is_none()
+                && self.grace_output.is_none()
+            {
+                self.reduce_build_from_probe = true;
+            }
             // A newly filtered preserved CTE domain may be orders of magnitude
             // smaller than the nominal build. Buffer it within the existing
             // quota and reduce only build keys, retaining full LEFT/RIGHT and

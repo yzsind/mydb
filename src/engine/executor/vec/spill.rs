@@ -23,6 +23,7 @@ use super::schema::BatchSchema;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
+mod compressed;
 mod typed;
 
 // Column-block format tags.
@@ -32,6 +33,8 @@ const BLOCK_BYTES: u8 = 0x12;
 const BLOCK_UTF8: u8 = 0x13;
 const BLOCK_PACKED_I64: u8 = 0x14;
 const BLOCK_TYPED: u8 = 0x15;
+const BLOCK_COMPRESSED_UTF8: u8 = 0x16;
+const BLOCK_COMPRESSED_BYTES: u8 = 0x17;
 
 /// Write a `Batch` to `w` in the wire format described above. Each
 /// column is preceded by a block tag that tells the reader how the
@@ -72,6 +75,9 @@ pub fn write_batch<W: Write>(w: &mut W, batch: &Batch) -> Result<(), QueryError>
     write_u32(w, count(n)?)?;
     write_u32(w, count(batch.columns().len())?)?;
     for c in batch.columns() {
+        if compressed::try_write(w, c, n)? {
+            continue;
+        }
         if let ColumnVector::Generic { values } = c {
             let size = values.iter().try_fold(0u32, |total, value| match value {
                 Value::Bytes(bytes) => u32::try_from(bytes.len())
@@ -293,6 +299,14 @@ fn read_batch_body<R: Read>(
         let mut tag = [0u8; 1];
         r.read_exact(&mut tag).map_err(io_err)?;
         match tag[0] {
+            BLOCK_COMPRESSED_UTF8 | BLOCK_COMPRESSED_BYTES => {
+                columns.push(compressed::read(
+                    r,
+                    nrows,
+                    tag[0] == BLOCK_COMPRESSED_UTF8,
+                    &mut charge,
+                )?);
+            }
             BLOCK_TYPED => columns.push(typed::read_column(r, nrows, &mut charge)?),
             BLOCK_RAW_VALUES => {
                 charge.add_force(nrows.saturating_mul(std::mem::size_of::<Value>()))?;

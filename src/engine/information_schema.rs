@@ -7642,6 +7642,36 @@ fn mydb_memory_advisor_rows(db: &Database) -> Vec<Vec<Value>> {
             "HashJoin spill directories created since process start",
         ),
         (
+            "group_count_witness_candidates",
+            crate::engine::executor::select::vec_bridge::count_witness::CANDIDATES
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "Complete grouped-count witness proofs considered",
+        ),
+        (
+            "group_count_witness_activations",
+            crate::engine::executor::select::vec_bridge::count_witness::ACTIVATIONS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "Grouped-count input filters admitted within the query budget",
+        ),
+        (
+            "group_count_witness_rows_skipped",
+            crate::engine::executor::select::vec_bridge::count_witness::ROWS_SKIPPED
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "Rows omitted after a qualifying grouped-count key witness",
+        ),
+        (
+            "hash_agg_dense_integer_activations",
+            crate::engine::executor::vec::hash_agg::DENSE_INTEGER_ACTIVATIONS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "Aggregate workers admitted to bounded direct integer-key lookup",
+        ),
+        (
+            "hash_agg_dense_integer_fallbacks",
+            crate::engine::executor::vec::hash_agg::DENSE_INTEGER_FALLBACKS
+                .load(std::sync::atomic::Ordering::Relaxed),
+            "Direct integer-key lookups retired at domain or allocation limits",
+        ),
+        (
             "hash_agg_spill_count",
             crate::engine::executor::spill_quota::hash_agg_spill_count(),
             "HashAgg spill directories created since process start",
