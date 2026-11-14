@@ -1141,6 +1141,7 @@ pub(crate) const HIDDEN_DD_TABLES: &[&str] = &[
     "innodb_dynamic_metadata",
     "table_dynamic_metadata",
     "ddl_retirements",
+    "recyclebin",
 ];
 
 pub(crate) fn is_hidden_dd_table(schema: &str, table: &str) -> bool {

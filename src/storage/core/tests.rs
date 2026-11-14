@@ -5034,6 +5034,7 @@ fn wal_redo_recovers_committed_heap_and_catalog_files() {
 fn drop_table_file_delete_wal_does_not_copy_table_bytes() {
     let dir = tempfile::tempdir().unwrap();
     let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
     db.create_table(
         "t",
         vec![
@@ -5115,6 +5116,7 @@ fn dropped_table_stays_dropped_after_recovery() {
     let dir = tempfile::tempdir().unwrap();
     {
         let db = Database::open_with_durability(dir.path(), DurabilityMode::Strict).unwrap();
+    db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
         db.create_table(
             "t",
             vec![ColumnDef {
@@ -14235,6 +14237,7 @@ fn wide_dd_descriptors_survive_repeated_drop_recreate_purge_and_reopen() {
     // test the serial tail of the whole nextest run.
     for cycle in 0..3 {
         let db = Database::open_with_config(dir.path(), config.clone()).unwrap();
+        db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
         if cycle != 0 {
             for table in (0..1).rev() {
                 db.drop_table(&format!("test.wide_{table}")).unwrap();
@@ -27577,6 +27580,361 @@ fn release_audit_replica_restartpoint_retains_inflight_begin() {
         "in-flight BEGIN must survive restartpoint"
     );
     assert!(db.storage_status().checkpoint_lsn <= begin_lsn);
+}
+
+#[test]
+fn recyclebin_metadata_native_replay_hides_uncommitted_replacement() {
+    fn copy_tree(source: &Path, target: &Path) {
+        fs::create_dir_all(target).unwrap();
+        for entry in fs::read_dir(source).unwrap() {
+            let entry = entry.unwrap();
+            let target = target.join(entry.file_name());
+            if entry.file_type().unwrap().is_dir() {
+                copy_tree(&entry.path(), &target);
+            } else {
+                fs::copy(entry.path(), target).unwrap();
+            }
+        }
+    }
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let source_dir = root.path().join("source");
+    let replica_dir = root.path().join("replica");
+    let source = open_relaxed_test_db(&source_dir);
+    create_checkpoint_test_table(&source);
+    source.drop_table("t").unwrap();
+    let mut entry = source.recyclebin_entries().unwrap().pop().unwrap();
+    let name = entry.name();
+    source.checkpoint().unwrap();
+    copy_tree(&source_dir, &replica_dir);
+    let mut role = crate::repl::role::RoleState::new_standalone();
+    role.role = crate::repl::role::Role::Replica;
+    crate::repl::role::save(&replica_dir, &role).unwrap();
+    let start = source.wal_log().lock().next_lsn();
+    let writer = source.begin_txn().unwrap();
+    source
+        .append_wal(
+            writer.txn_id,
+            WalPayload::CatalogDelta {
+                object_ids: Vec::new(),
+                invalidate_all: false,
+            },
+        )
+        .unwrap();
+    entry.last_error = "committed source diagnostic".into();
+    source
+        .apply_catalog_row_replacement(
+            writer,
+            &CatalogRowReplacement {
+                dd_table_id: crate::storage::data_dictionary::DD_RECYCLEBIN,
+                selector: CatalogRowSelector::PrimaryValues(vec![Value::UInt(entry.id)]),
+                rows: vec![entry.row().unwrap()],
+            },
+        )
+        .unwrap();
+    source.commit_txn(writer.txn_id).unwrap();
+    let log = source.wal_log();
+    let end = log.lock().last_lsn();
+    crate::wal::LogManager::sync_durable_to(&log, end).unwrap();
+    let scan = crate::wal::LogManager::scan_replay(&source_dir).unwrap();
+    let commit = scan
+        .records
+        .records()
+        .find_map(|record| {
+            let record = record.unwrap();
+            (record.txn_id == writer.txn_id
+                && matches!(&record.payload, WalPayload::CommitTxn { .. }))
+            .then_some(record.lsn)
+        })
+        .unwrap();
+    {
+        let target = Arc::new(open_relaxed_test_db(&replica_dir));
+        assert!(target.physical_replica_mode());
+        let mut applier = crate::repl::replica::applier::Applier::with_database(
+            &replica_dir,
+            target.wal_log(),
+            Arc::clone(&target),
+            crate::repl::replica::progress::ReplicaProgress::default(),
+        );
+        let mut reader = crate::wal::WalReader::open(&log, start).unwrap();
+        while let Some(chunk) = reader.next_chunk(commit - 1, 1 << 20).unwrap() {
+            applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+        }
+        assert!(target
+            .recyclebin_entry(&name)
+            .unwrap()
+            .last_error
+            .is_empty());
+        let listed = target.recyclebin_entries().unwrap();
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].last_error.is_empty());
+        while let Some(chunk) = reader.next_chunk(end, 1 << 20).unwrap() {
+            applier.apply_chunk(&chunk, &role.node_uuid, 1).unwrap();
+        }
+        assert_eq!(
+            target.recyclebin_entry(&name).unwrap().last_error,
+            entry.last_error
+        );
+        assert_eq!(
+            target.recyclebin_entries().unwrap()[0].last_error,
+            entry.last_error
+        );
+        crate::wal::LogManager::sync_durable_to(&target.wal_log(), end).unwrap();
+        target.flush_dirty_data().unwrap();
+    }
+    let restarted = open_relaxed_test_db(&replica_dir);
+    assert_eq!(
+        restarted.recyclebin_entry(&name).unwrap().last_error,
+        entry.last_error
+    );
+}
+
+#[test]
+fn recyclebin_metadata_reads_hide_uncommitted_delete_from_purge_all() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    create_checkpoint_test_table(&db);
+    db.drop_table("t").unwrap();
+    let name = db.recyclebin_entries().unwrap().pop().unwrap().name();
+    let entry = db.recyclebin_entry(&name).unwrap();
+    let serial = db.recyclebin_ddl.lock();
+    let writer = db.begin_txn().unwrap();
+    db.apply_catalog_row_replacement(
+        writer,
+        &CatalogRowReplacement {
+            dd_table_id: crate::storage::data_dictionary::DD_RECYCLEBIN,
+            selector: CatalogRowSelector::PrimaryValues(vec![Value::UInt(entry.id)]),
+            rows: Vec::new(),
+        },
+    )
+    .unwrap();
+    let (send, recv) = std::sync::mpsc::channel();
+    let worker_db = Arc::clone(&db);
+    let worker = std::thread::spawn(move || {
+        let _timeout = crate::recyclebin::MdlTimeoutGuard::enter(Some(10));
+        send.send(worker_db.purge_recyclebin_all()).unwrap();
+    });
+    let early = recv.recv_timeout(Duration::from_millis(100));
+    db.rollback_txn(writer.txn_id).unwrap();
+    drop(serial);
+    let result = if let Ok(result) = &early {
+        result.clone()
+    } else {
+        recv.recv_timeout(Duration::from_secs(5)).unwrap()
+    };
+    worker.join().unwrap();
+    assert!(
+        early.is_err(),
+        "PURGE ALL silently skipped an uncommitted deletion"
+    );
+    result.unwrap();
+    assert!(db.recyclebin_entry(&name).unwrap().purging);
+}
+
+#[test]
+fn recyclebin_metadata_reads_hide_uncommitted_delete() {
+    recyclebin_metadata_uncommitted_change("delete");
+}
+
+#[test]
+fn recyclebin_metadata_reads_hide_uncommitted_update() {
+    recyclebin_metadata_uncommitted_change("update");
+}
+
+#[test]
+fn recyclebin_metadata_reads_hide_uncommitted_insert() {
+    recyclebin_metadata_uncommitted_change("insert");
+}
+
+fn recyclebin_metadata_uncommitted_change(operation: &str) {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    create_checkpoint_test_table(&db);
+    db.drop_table("t").unwrap();
+    let original = db.recyclebin_entries().unwrap().pop().unwrap();
+    let mut changed = original.clone();
+    changed.last_error = "uncommitted diagnostic".into();
+    let writer = db.begin_txn().unwrap();
+    if operation == "insert" {
+        changed.id += 1_000_000;
+    }
+    db.apply_catalog_row_replacement(
+        writer,
+        &CatalogRowReplacement {
+            dd_table_id: crate::storage::data_dictionary::DD_RECYCLEBIN,
+            selector: CatalogRowSelector::PrimaryValues(vec![Value::UInt(changed.id)]),
+            rows: if operation == "delete" {
+                Vec::new()
+            } else {
+                vec![changed.row().unwrap()]
+            },
+        },
+    )
+    .unwrap();
+    let listed = db.recyclebin_entries();
+    let found = db.recyclebin_entry(&original.name());
+    let inserted = db.recyclebin_entry(&changed.name());
+    db.rollback_txn(writer.txn_id).unwrap();
+    let listed = listed.unwrap();
+    assert_eq!(
+        listed.len(),
+        1,
+        "{operation}: uncommitted changes altered enumeration"
+    );
+    assert_eq!(listed[0].last_error, original.last_error, "{operation}");
+    assert_eq!(
+        found.unwrap().last_error,
+        original.last_error,
+        "{operation}: dirty point lookup"
+    );
+    if operation == "insert" {
+        assert!(
+            inserted.is_err(),
+            "uncommitted recycle entry became visible"
+        );
+    }
+    assert_eq!(
+        db.recyclebin_entry(&original.name()).unwrap().last_error,
+        original.last_error
+    );
+}
+
+#[test]
+fn recyclebin_background_gc_skips_busy_catalog_ddl() {
+    for purging in [false, true] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = Arc::new(open_relaxed_test_db(dir.path()));
+        create_checkpoint_test_table(&db);
+        db.drop_table("t").unwrap();
+        let entry = db.recyclebin_entries().unwrap().pop().unwrap();
+        if purging {
+            db.purge_recycled_table(&entry.name()).unwrap();
+        }
+        db.set_recyclebin_test_free_percent(0);
+        let guard = db.recyclebin_ddl.lock();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker_db = Arc::clone(&db);
+        let worker = std::thread::spawn(move || {
+            send.send(worker_db.maintain_recyclebin()).unwrap();
+        });
+        let result = recv.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        worker.join().unwrap();
+        assert_eq!(
+            result
+                .expect("background cleanup waited for foreground DDL")
+                .unwrap(),
+            0
+        );
+        assert_eq!(db.recyclebin_entry(&entry.name()).unwrap().purging, purging);
+        for _ in 0..3 {
+            db.maintain_recyclebin().unwrap();
+        }
+        assert!(db.recyclebin_entries().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn recyclebin_foreground_catalog_lock_honors_timeout() {
+    for restore in [false, true] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = Arc::new(open_relaxed_test_db(dir.path()));
+        create_checkpoint_test_table(&db);
+        db.drop_table("t").unwrap();
+        let name = db.recyclebin_entries().unwrap().pop().unwrap().name();
+        let guard = db.recyclebin_ddl.lock();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker_db = Arc::clone(&db);
+        let worker = std::thread::spawn(move || {
+            let _timeout = crate::recyclebin::MdlTimeoutGuard::enter(Some(0));
+            let result = if restore {
+                worker_db.restore_recycled_table(&name, None).map(|_| ())
+            } else {
+                worker_db.purge_recycled_table(&name)
+            };
+            send.send(result).unwrap();
+        });
+        let result = recv.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(result
+            .expect("catalog lock ignored lock_wait_timeout")
+            .unwrap_err()
+            .is(crate::error::catalog::ER_LOCK_WAIT_TIMEOUT));
+        assert_eq!(db.recyclebin_entries().unwrap().len(), 1);
+        assert!(db.table("t").is_err());
+    }
+}
+
+#[test]
+fn recyclebin_foreground_catalog_lock_honors_cancellation() {
+    for restore in [false, true] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = Arc::new(open_relaxed_test_db(dir.path()));
+        create_checkpoint_test_table(&db);
+        db.drop_table("t").unwrap();
+        let name = db.recyclebin_entries().unwrap().pop().unwrap().name();
+        let guard = db.recyclebin_ddl.lock();
+        let token = crate::engine::cancel::QueryCancelToken::noop();
+        let worker_token = token.clone();
+        let (send, recv) = std::sync::mpsc::channel();
+        let worker_db = Arc::clone(&db);
+        let worker_name = name.clone();
+        let worker = std::thread::spawn(move || {
+            let _cancel = crate::engine::cancel::enter(worker_token);
+            let result = if restore {
+                worker_db
+                    .restore_recycled_table(&worker_name, None)
+                    .map(|_| ())
+            } else {
+                worker_db.purge_recycled_table(&worker_name)
+            };
+            send.send(result).unwrap();
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let owns_namespace = || {
+            db.mdl.snapshot().iter().any(|row| {
+                row.object_name.as_deref() == Some(name.as_str()) && row.lock_status == "GRANTED"
+            })
+        };
+        while !owns_namespace() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let reached_catalog_lock = owns_namespace();
+        token.cancel_local();
+        let result = recv.recv_timeout(Duration::from_secs(1));
+        drop(guard);
+        worker.join().unwrap();
+        assert!(
+            reached_catalog_lock,
+            "worker did not reach the catalog wait"
+        );
+        assert!(result
+            .expect("catalog lock ignored cancellation")
+            .unwrap_err()
+            .is(crate::error::catalog::ER_QUERY_INTERRUPTED));
+        assert!(!db.recyclebin_entry(&name).unwrap().purging);
+        assert!(db.table("t").is_err());
+        assert!(!owns_namespace(), "cancelled operation retained MDL");
+    }
+}
+
+#[test]
+fn recyclebin_nonexistent_purge_does_not_take_namespace_lease() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    let guard = db.recyclebin_ddl.lock();
+    let (send, recv) = std::sync::mpsc::channel();
+    let worker_db = Arc::clone(&db);
+    let worker = std::thread::spawn(move || {
+        send.send(worker_db.purge_recycled_table("r_999999"))
+            .unwrap();
+    });
+    let result = recv.recv_timeout(Duration::from_secs(1));
+    drop(guard);
+    worker.join().unwrap();
+    assert!(result
+        .expect("nonexistent purge can invert DDL/namespace lock ordering")
+        .is_err());
 }
 
 #[test]

@@ -2634,6 +2634,7 @@ pub struct SessionContext {
 /// like a stock MySQL session.
 #[derive(Debug, Clone)]
 pub struct SessionSysVarState {
+    pub mydb_recyclebin: Option<bool>,
     pub max_error_count: u64,
     pub auto_increment_increment: u64,
     pub auto_increment_offset: u64,
@@ -2839,6 +2840,7 @@ impl Default for SessionSysVarState {
             crate::engine::sysvar::builtin::charset::server_charset_defaults();
         const RAND_MAX: u64 = 0x3FFF_FFFF;
         Self {
+            mydb_recyclebin: None,
             max_error_count: crate::engine::sysvar::builtin::orm_stubs::max_error_count(),
             max_allowed_packet:
                 crate::engine::sysvar::builtin::connection::max_allowed_packet_bytes(),

@@ -5,6 +5,7 @@ use super::*;
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum Statement {
+    RecycleBin(crate::recyclebin::Command),
     ApiKey(crate::engine::access_keys::Command),
     Ai(crate::engine::ai::sql::AiStatement),
     RowSecurity(rls::RlsStatement),

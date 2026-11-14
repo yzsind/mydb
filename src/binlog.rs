@@ -25,6 +25,9 @@ use crate::storage::error;
 use crate::storage::schema::{DataTypeKind, TableSchema};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
+mod stream;
+pub(crate) use stream::begin_bulk_transaction_spool;
+use stream::{EncodedSpool, StagedWrite};
 mod admin;
 pub(crate) use admin::admin_result_columns;
 use admin::AdminCommand;
@@ -468,6 +471,7 @@ pub struct BinaryLogInfo {
 pub struct BinlogCommit {
     reference: crate::wal::WalBinlogRef,
     chunks: Vec<BinlogEventChunk>,
+    streamed: bool,
     /// Process-local append sequence. Transaction commits use this to preserve
     /// binlog order at the WAL-append and dump-publication boundaries while
     /// allowing the expensive binlog/WAL fsyncs to run outside COMMIT_GATE.
@@ -645,7 +649,7 @@ struct BinlogGroupSyncState {
     /// Arc<Vec<u8>> chunks here is cheap (the BinlogCommit owns the other
     /// references) and, crucially, prevents a later append(2) from blocking
     /// behind an fsync already running on the same file.
-    writes: BTreeMap<u64, Vec<BinlogEventChunk>>,
+    writes: BTreeMap<u64, StagedWrite>,
     /// Owned by the leader while I/O is in flight, otherwise parked here.
     /// Never hold the group-state latch across file operations.
     writer: Option<BinlogAppendFile>,
@@ -1141,6 +1145,7 @@ impl std::fmt::Display for AllocatedGtid {
 
 #[derive(Debug, Clone)]
 enum BinlogTxnOp {
+    Spool { spool: Arc<EncodedSpool> },
     Encoded {
         events: Vec<(u8, Vec<u8>, bool)>,
     },
@@ -1227,6 +1232,7 @@ fn binlog_table_resident_bytes(table: &BinlogTable) -> usize {
 /// missed and live elements are not double-counted.
 fn binlog_op_nested_bytes(op: &BinlogTxnOp) -> usize {
     match op {
+        BinlogTxnOp::Spool { .. } => 0,
         BinlogTxnOp::Encoded { events } => events
             .capacity()
             .saturating_mul(std::mem::size_of::<(u8, Vec<u8>, bool)>())
@@ -3947,6 +3953,11 @@ impl BinlogSourceManager {
                 entry.insert(PendingBinlogTxn { ops, memory_charge });
             }
             Entry::Occupied(mut entry) => {
+                if let [BinlogTxnOp::Spool { spool }] = entry.get().ops.as_slice() {
+                    let spool = Arc::clone(spool);
+                    drop(entry); drop(state);
+                    return spool.append(&self.config, &op);
+                }
                 let pending = entry.get_mut();
                 if pending.ops.len() == pending.ops.capacity() {
                     // Allocate the replacement first so an admission failure
@@ -4079,8 +4090,12 @@ impl BinlogSourceManager {
             txn_id,
             pending: Some(pending),
         };
-        let encoded = encode_pending_ops(&lease.pending.as_ref().unwrap().ops)?;
-        let staged = self.stage_encoded_txn_commit(encoded, commit_scn)?;
+        let staged = if let [BinlogTxnOp::Spool { spool }] = lease.pending.as_ref().unwrap().ops.as_slice() {
+            self.stage_spooled_txn_commit(Arc::clone(spool), commit_scn)?
+        } else {
+            let encoded = encode_pending_ops(&lease.pending.as_ref().unwrap().ops)?;
+            self.stage_encoded_txn_commit(encoded, commit_scn)?
+        };
         lease.pending.take();
         Ok(Some(staged))
     }
@@ -4166,6 +4181,7 @@ impl BinlogSourceManager {
         Ok(BinlogCommit {
             reference,
             chunks,
+            streamed: false,
             order,
             order_state: Arc::clone(&self.commit_order),
             group_sync: Arc::clone(&self.group_sync),
@@ -4203,7 +4219,7 @@ impl BinlogSourceManager {
             return Err(io_error(std::io::Error::other(message.clone())));
         }
         state.requested_order = state.requested_order.max(order);
-        let replaced = state.writes.insert(order, chunks);
+        let replaced = state.writes.insert(order, StagedWrite { chunks, spool: None });
         debug_assert!(replaced.is_none(), "duplicate binlog commit order");
         self.group_sync.cv.notify_all();
         Ok(())
@@ -4267,13 +4283,13 @@ impl BinlogSourceManager {
 
     fn write_staged_batch(
         &self,
-        writes: &BTreeMap<u64, Vec<BinlogEventChunk>>,
+        writes: &BTreeMap<u64, StagedWrite>,
         writer: &mut Option<BinlogAppendFile>,
     ) -> Result<(), QueryError> {
         let mut file_chunks: Vec<&BinlogEventChunk> = Vec::new();
         let sync = !writes.is_empty() && self.sync_due(false);
-        for chunks in writes.values() {
-            for chunk in chunks {
+        for write in writes.values() {
+            for chunk in &write.chunks {
                 if writer.as_ref().map(|writer| writer.name.as_str()) != Some(chunk.file.as_str()) {
                     self.finish_staged_file(writer.as_mut(), &file_chunks, sync)?;
                     file_chunks.clear();
@@ -4287,6 +4303,16 @@ impl BinlogSourceManager {
                     self.group_sync.file_opens.fetch_add(1, Ordering::Relaxed);
                 }
                 file_chunks.push(chunk);
+            }
+            if let Some(spool) = &write.spool {
+                self.finish_staged_file(writer.as_mut(), &file_chunks, false)?;
+                file_chunks.clear();
+                let file = &mut writer.as_mut().expect("spooled transaction has a prefix").file;
+                let (calls, bytes) = spool.body.write_body(&self.config, file, spool.body_position)?;
+                self.group_sync.write_calls.fetch_add(calls, Ordering::Relaxed);
+                self.group_sync.write_bytes.fetch_add(bytes, Ordering::Relaxed);
+                let suffix: Vec<_> = spool.suffix.iter().collect();
+                self.finish_staged_file(writer.as_mut(), &suffix, sync)?;
             }
         }
         self.finish_staged_file(writer.as_mut(), &file_chunks, sync)?;
@@ -4366,6 +4392,17 @@ impl BinlogSourceManager {
             commit.published = true;
             return Ok(());
         };
+        if commit.streamed {
+            // Cached events cannot represent a hole in the middle of a file.
+            // Published disk bounds provide the complete streaming fallback.
+            state.events.clear();
+            state.rebuild_file_index();
+            if let Some(info) = state.files.iter_mut().find(|info| info.name == commit.reference.file) {
+                info.size = info.size.max(commit.reference.end_pos);
+            }
+            let prefixes: Vec<_> = state.files.iter().map(|info| (info.name.clone(), info.size)).collect();
+            for (file, end) in prefixes { state.disk_prefixes.insert(file, end); }
+        }
         for chunk in std::mem::take(&mut commit.chunks) {
             state.push_event(chunk);
         }
@@ -4706,6 +4743,7 @@ fn encode_pending_ops(ops: &[BinlogTxnOp]) -> Result<Vec<(u8, Vec<u8>, bool)>, Q
     let mut encoded = Vec::new();
     for op in ops {
         match op {
+            BinlogTxnOp::Spool { .. } => return Err(error(crate::error::catalog::ER_GET_ERRNO, "file-backed binlog must use streaming publication")),
             BinlogTxnOp::Encoded { events } => encoded.extend(events.iter().cloned()),
             BinlogTxnOp::Query { database, sql, ctx } => {
                 encoded.push((

@@ -549,6 +549,10 @@ impl Database {
         .saturating_mul(1_000);
         retained_undo_txns.extend(temporal_history.txn_ids_committed_since(retain_since_us));
         let runtime_config = RuntimeStorageConfig::from_storage_config(&config);
+        let recycle = runtime_config.recyclebin;
+        if recycle.min_free_pct >= recycle.target_free_pct || recycle.target_free_pct > 90 || !(1..=31_536_000).contains(&recycle.retention_seconds) || !(1000..=3_600_000).contains(&recycle.gc_interval_ms) {
+            return Err(crate::recyclebin::failure("invalid recycle-bin startup policy"));
+        }
         // M3.1 - Use persistent undo journal when not running in Memory mode.
         let undo_started = Instant::now();
         let mut undo = if snapshot_read_only {
@@ -898,6 +902,14 @@ impl Database {
             alter_copy_job_history: Mutex::new(VecDeque::with_capacity(64)),
             reorg_storage_locs: Mutex::new(HashMap::new()),
             partition_ddl_journal_lock: Mutex::new(()),
+            recyclebin_ddl: parking_lot::Mutex::new(()),
+            recyclebin_scan: parking_lot::Mutex::new(None),
+            recyclebin_oldest_scan: parking_lot::Mutex::new(None),
+            recyclebin_pressure: AtomicBool::new(false),
+            recyclebin_pressure_purges: AtomicU64::new(0),
+            recyclebin_cleanup_failures: AtomicU64::new(0),
+            #[cfg(test)]
+            recyclebin_test_free_pct: AtomicU64::new(u64::MAX),
             ddl_retirement_cleanup: parking_lot::Mutex::new(None),
             partition_cleanup_background: AtomicBool::new(false),
             xa_reservations: parking_lot::Mutex::new(HashMap::new()),

@@ -1696,3 +1696,7 @@ account. Complete keys can be retrieved through TLS MySQL `SHOW API KEY`.
 The master key is environment-only `MYDB_REST_ENCRYPT_KEY` or the independently
 managed `<data_dir>/rest-keys.mydb`. Master-key values cannot be supplied in
 ordinary startup configuration or command-line arguments.
+
+## Recycle Bin
+
+The [recycle bin](recycle-bin.md) is enabled by default for persistent DROP TABLE, TRUNCATE TABLE and tables removed by DROP DATABASE. It has a seven-day retention target and permits early reclamation under disk pressure. See its configuration table for GLOBAL/SESSION variables, startup option names, defaults and bounds.

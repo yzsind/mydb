@@ -62,3 +62,5 @@ stable `MYDB-DIAG-*` identifiers in server diagnostics. Clients receive the
 corresponding MySQL condition and a message suitable for applications.
 Preserve the diagnostic identifier and relevant server logs when reporting a
 problem.
+
+Recycle-bin administration errors use `50140 / HY000` (`MYDB_ER_RECYCLEBIN`), with a specific diagnostic for an invalid entry, unavailable state, read-only operation, missing dependency or cleanup failure. Authorization and SQL syntax retain the existing MySQL error codes. See [Recycle Bin](recycle-bin.md).

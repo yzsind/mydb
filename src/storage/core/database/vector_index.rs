@@ -5032,7 +5032,7 @@ impl Database {
 
     /// Load every Public vector object and validate required state.
     pub(crate) fn warm_all_vector_graphs(&self) -> Result<(), QueryError> {
-        for table in self.user_table_snapshots()? {
+        for table in self.active_user_table_snapshots()? {
             for index in table
                 .indexes
                 .iter()

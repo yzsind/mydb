@@ -1,6 +1,6 @@
 {
   "counts": {
-    "mydb_native": 18,
+    "mydb_native": 19,
     "mysql80_community": 76,
     "mysql_legacy_compat": 3,
     "mysql_optional_plugin_compat": 7
@@ -1599,6 +1599,21 @@
         "honest_empty_shape"
       ],
       "visibility": "object_policy"
+    },
+    {
+      "compatibility_class": "mydb_native",
+      "data_source": "transactional_recycle_bin_catalog",
+      "object": "MYDB_RECYCLEBIN",
+      "producer": "real_producer",
+      "pushdown": [],
+      "replication_semantics": "source_owned_physical_replication",
+      "schema": "information_schema",
+      "shape": "extension_stable",
+      "test_coverage": [
+        "registry_contract",
+        "producer_scenario"
+      ],
+      "visibility": "recyclebin_admin"
     }
   ],
   "version": 2

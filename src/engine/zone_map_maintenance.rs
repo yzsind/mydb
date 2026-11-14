@@ -9,12 +9,14 @@ use crate::storage::Database;
 /// Unknown and the next ten-second pass retries it.
 pub struct ZoneMapMaintenanceHandle {
     worker: BackgroundWorker,
+    recyclebin_worker: BackgroundWorker,
 }
 
 impl ZoneMapMaintenanceHandle {
     pub(crate) fn disabled() -> Self {
         Self {
             worker: BackgroundWorker::disabled(),
+            recyclebin_worker: BackgroundWorker::disabled(),
         }
     }
 
@@ -22,6 +24,16 @@ impl ZoneMapMaintenanceHandle {
         if db.is_snapshot_read_only() {
             return Self::disabled();
         }
+        let recycle_db = Arc::clone(&db);
+        let recyclebin_worker = BackgroundWorker::spawn("mydb-recycle-bin", move |shutdown| {
+            crate::util::thread_priority::lower_current_thread_priority();
+            let _reclaim = super::executor::mem_budget::ReclaimDatabaseScope::enter(&recycle_db);
+            while !shutdown.is_requested() {
+                let interval = recycle_db.recyclebin_variable("mydb_recyclebin_gc_interval_ms");
+                if shutdown.wait_timeout(Duration::from_millis(interval.max(1000))) { break; }
+                run_maintenance_task("recycle-bin cleanup", || recycle_db.maintain_recyclebin_until(&|| shutdown.is_requested()));
+            }
+        });
         let worker = BackgroundWorker::spawn("mydb-zone-map", move |worker_shutdown| {
             // Rebuilds rescan whole zones. After a bulk load that backlog can
             // keep this thread busy for minutes; it must not take CPU from
@@ -44,10 +56,11 @@ impl ZoneMapMaintenanceHandle {
                 });
             }
         });
-        Self { worker }
+        Self { worker, recyclebin_worker }
     }
 
     pub fn shutdown(&self) {
+        self.recyclebin_worker.shutdown();
         self.worker.shutdown();
     }
 }

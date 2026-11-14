@@ -684,6 +684,7 @@ fn execute_statement_inner(
     // we mirror it into a thread-local that the binlog record_* helpers
     // consult (they don't otherwise have access to the session).
     let _sql_log_bin_guard = crate::binlog::SessionSqlLogBinGuard::new(session.sql_log_bin);
+    let _recycle_policy = crate::recyclebin::PolicyGuard::enter(session.sysvars.mydb_recyclebin);
     // Make the Database + session reachable to `nextval`/`currval`/`lastval`/
     // `setval` during expression evaluation in this statement (and any nested
     // sub-statements). SAFETY: `db` and `session` outlive this call; sequence
@@ -1053,6 +1054,9 @@ pub(super) fn reject_system_catalog_dml(
     }
     if crate::engine::sys_schema::is_sys_config(&database, &table) {
         return Ok(());
+    }
+    if database == crate::recyclebin::DATABASE {
+        return Err(crate::recyclebin::failure("recycle-bin tables are read only"));
     }
     if db.is_base_table(&database, &table) {
         return Ok(());
@@ -2021,6 +2025,7 @@ fn execute_create_table_as_select(
             Ok(intent) => intent,
             Err(err) => {
                 let _ = tx::rollback_session_txn(db, session);
+                let _permanent_cleanup = crate::recyclebin::PolicyGuard::enter(Some(false));
                 let _ = db.drop_table(&qualified);
                 return Err(err);
             }
@@ -2481,6 +2486,47 @@ fn ctas_load_rows(
     })?;
     super::insert::finalize_insert_info(records, true);
     Ok(affected)
+}
+
+fn execute_recyclebin(
+    db: &Arc<Database>, session: &mut SessionContext, command: crate::recyclebin::Command,
+) -> Result<QueryResponse, QueryError> {
+    use crate::recyclebin::Command;
+    let _timeout = crate::recyclebin::MdlTimeoutGuard::enter(session.sysvars.lock_wait_timeout.or_else(crate::engine::api::configured_global_lock_wait_timeout));
+    match command {
+        Command::Show { database, pattern } => {
+            let rows = db.recyclebin_entries()?.into_iter().filter(|e| {
+                database.as_ref().is_none_or(|d| e.origin_database.eq_ignore_ascii_case(d))
+                    && pattern.as_ref().is_none_or(|p| crate::recyclebin::like(&e.origin_table, p))
+            }).map(|entry| crate::recyclebin::metadata_row(&entry)).collect();
+            Ok(crate::recyclebin::result(rows))
+        }
+        Command::Restore { name, target } => {
+            let entry = db.recyclebin_entry(&name)?;
+            let target = target.map(|name| crate::storage::table_key(name.database.as_deref().unwrap_or(&session.current_database), &name.table))
+                .unwrap_or_else(|| crate::storage::table_key(&entry.origin_database, &entry.origin_table));
+            let (database, table) = crate::storage::split_table_name(&session.current_database, &target);
+            let required = RequiredPrivilege { privilege: Privilege::Create, scope: PrivilegeScope::Table { database, table } };
+            if !db.with_auth_catalog(|auth| auth.account_has_privilege(&session.authorization_context(), &required, false))? {
+                return Err(error(crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR, "RESTORE requires CREATE on the target"));
+            }
+            implicit_commit_for_ddl(db, session)?;
+            let ctx = (session.sql_log_bin && crate::binlog::enabled()).then(|| super::binlog_ctx_from_session(session));
+            for omitted in db.restore_recycled_table_logged(&name, Some(&target), ctx.as_ref())? {
+                crate::engine::api::push_statement_warning(crate::error::ConditionLevel::Warning,
+                    crate::error::catalog::ER_NOT_SUPPORTED_YET, format!("RESTORE omitted {omitted}"));
+            }
+            Ok(QueryResponse::Ok)
+        }
+        Command::Purge { name } => {
+            implicit_commit_for_ddl(db, session)?;
+            if let Some(name) = name { db.purge_recycled_table(&name)?; }
+            else {
+                db.purge_recyclebin_all()?;
+            }
+            Ok(QueryResponse::Ok)
+        }
+    }
 }
 
 fn ctas_persistent_load(
@@ -4063,6 +4109,7 @@ fn auth_required_privileges(
                 vec![global(Privilege::Dynamic("REPLICATION_SLAVE_ADMIN".into()))]
             }
         }
+        Statement::RecycleBin(_) => vec![global(Privilege::Dynamic("RECYCLEBIN_ADMIN".into()))],
         Statement::BackupAdmin { .. } => {
             vec![global(Privilege::Dynamic("BACKUP_ADMIN".to_string()))]
         }
@@ -4414,6 +4461,23 @@ pub(super) fn authorize_prepared_statement_with_epoch(
     };
     let bound_required = bound.as_ref().map(|r| r.requirements());
     let required_privileges = bound_required.as_deref().unwrap_or(required_privileges);
+    let protected = |required: &RequiredPrivilege| matches!(&required.scope, PrivilegeScope::Table { database, table }
+        if database.eq_ignore_ascii_case(crate::recyclebin::DATABASE)
+        || (database.eq_ignore_ascii_case("information_schema") && table.eq_ignore_ascii_case("MYDB_RECYCLEBIN")));
+    let recycle_required = if required_privileges.iter().any(protected) {
+        crate::recyclebin::validate_query_access(statement, &session.current_database)?;
+        let mut mapped = Vec::with_capacity(required_privileges.len());
+        for required in required_privileges {
+            if protected(required) {
+                if required.privilege != Privilege::Select || matches!(statement, Statement::CreateView { .. } | Statement::AlterView { .. }) {
+                    return Err(crate::recyclebin::failure("recycle-bin objects support read-only queries, not writes or persistent views"));
+                }
+                mapped.push(RequiredPrivilege { privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()), scope: PrivilegeScope::Global });
+            } else { mapped.push(required.clone()); }
+        }
+        Some(mapped)
+    } else { None };
+    let required_privileges = recycle_required.as_deref().unwrap_or(required_privileges);
     let explain_view_privileges = explain_dml_view_privileges(db, session, statement);
     // F8: statements with no required privileges (SELECT 1 / SHOW WARNINGS
     // / session-local SET / etc.) skip the catalog lock entirely. Returning
@@ -7764,6 +7828,9 @@ pub(super) fn execute_qualified_statement(
             Statement::Revoke(r) => Some(&r.kind),
             _ => None,
         };
+        if session.sql_log_bin && kind.is_some_and(|kind| matches!(kind, GrantKind::Privileges { privileges, .. } if privileges.iter().any(|p| p.name.eq_ignore_ascii_case("RECYCLEBIN_ADMIN")))) {
+            return Err(crate::mysql::errors::unsupported("RECYCLEBIN_ADMIN in MySQL logical binlog; grant local privileges with sql_log_bin=OFF"));
+        }
         if session.sql_log_bin && kind.is_some_and(|kind| matches!(kind, GrantKind::Privileges { privileges, .. } if privileges.iter().any(|p| p.name.eq_ignore_ascii_case("API_KEY_ADMIN")))) {
             return Err(crate::mysql::errors::unsupported("API_KEY_ADMIN in MySQL logical binlog; grant local privileges with sql_log_bin=OFF"));
         }
@@ -8013,6 +8080,7 @@ pub(super) fn execute_qualified_statement(
         Statement::MydbReplicationAdmin { sql } => {
             crate::repl::handle_admin_sql_with_session(&sql, session)
         }
+        Statement::RecycleBin(command) => execute_recyclebin(db, session, command),
         Statement::BackupAdmin { command } => crate::backup::sql::execute(db, &command),
         Statement::BinlogAdmin { sql } => {
             if sql

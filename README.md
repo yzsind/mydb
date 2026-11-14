@@ -371,6 +371,8 @@ The full coverage map, transactional differences, and unsupported features are l
 | **`SHOW MYDB MEMORY`** | Inspect global memory usage for capacity planning and diagnostics. |
 | **Native backup and replication** | Online physical backup, WAL archiving, PITR, and an independent primary/replica physical replication protocol. |
 
+Persistent DROP/TRUNCATE tables are protected by the default-on [recycle bin](docs/recycle-bin.md), including read-only inspection, restore and asynchronous reclamation.
+
 See [sequences](docs/statements/ddl/create-sequence.md), [series generation](docs/generate-series.md), [backup and recovery](docs/backup-and-recovery.md), and [native replication](docs/native-replication.md).
 
 ## Compatibility boundaries

@@ -1,3 +1,4 @@
+mod recyclebin;
 mod ai;
 mod bug_report_1107;
 mod collated_constant_in;

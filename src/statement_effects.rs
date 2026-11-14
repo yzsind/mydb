@@ -85,6 +85,7 @@ const LOCKING_READ: StatementEffects = StatementEffects {
 pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
     use Statement as S;
     match statement {
+        S::RecycleBin(command) => if matches!(command, crate::recyclebin::Command::Show { .. }) { READ_ONLY } else { CATALOG_NONDISPATCH },
         S::AlterSystemReloadHttpConfig => READ_ONLY,
         S::ShowHttpStatus => READ_ONLY,
         S::RowSecurity(command) => match command {

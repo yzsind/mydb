@@ -18,6 +18,7 @@ extern crate self as mydb;
 #[cfg(test)]
 mod test_seed_setup;
 
+pub mod recyclebin;
 pub mod backup;
 pub mod binlog;
 #[cfg(test)]

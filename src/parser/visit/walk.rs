@@ -10,6 +10,7 @@ macro_rules! define_walk {
         ) {
             visitor.enter_statement(statement);
             match statement {
+                Statement::RecycleBin(_) => {},
                 Statement::RowSecurity(command) => {
                     match command {
                         crate::parser::rls::RlsStatement::SetContext { value, .. } => walk_expr(visitor, value),

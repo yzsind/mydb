@@ -1567,6 +1567,21 @@ const SEQUENCES_COLUMNS: &[SystemColumn] = &[
         .comment("Generation of the sequence synchronization configuration."),
 ];
 
+const MYDB_RECYCLEBIN_COLUMNS: &[SystemColumn] = &[
+    SystemColumn::unsigned_bigint("RECYCLE_ID", false).comment("Unique recycling operation object identity."),
+    v!("RECYCLE_NAME").comment("Read-only table name in the protected recycle schema."),
+    v!("ORIGIN_SCHEMA").comment("Schema before recycling."),
+    v!("ORIGIN_TABLE").comment("Table name before recycling."),
+    v!("OPERATION").comment("DDL operation that retained this table."),
+    SystemColumn::unsigned_bigint("RECYCLED_MS", false).comment("Recycle time in Unix milliseconds."),
+    SystemColumn::unsigned_bigint("EXPIRES_MS", false).comment("Retention target in Unix milliseconds."),
+    v!("STATE").comment("RECYCLED or irreversible PURGING state."),
+    SystemColumn::text("OMITTED_OBJECTS", false).comment("Attached objects not restored automatically."),
+    SystemColumn::text("LAST_ERROR", false).comment("Last physical cleanup diagnostic."),
+    SystemColumn::unsigned_bigint("OPERATION_ID", false).comment("Transaction grouping entries from one DDL."),
+    SystemColumn::unsigned_bigint("DATA_BYTES", false).comment("Observed file length at recycling."),
+    v!("PURGE_REASON").comment("Manual, expiration, or disk pressure reclamation reason."),
+];
 const MYDB_DDL_JOBS_COLUMNS: &[SystemColumn] = &[
     i64c!("JOB_ID").comment("DDL job identity."),
     v!("TABLE_SCHEMA").comment("Schema containing the table."),
@@ -2002,6 +2017,7 @@ const INFORMATION_SCHEMA_REGISTRY: &[InformationSchemaRegistration] = &[
     mydb_def("MYDB_AI_SECRETS", AI_SECRETS_COLUMNS),
     mydb_def("MYDB_AI_RUNTIME_STATUS", AI_RUNTIME_COLUMNS),
     mydb_def("MYDB_SEQUENCES", SEQUENCES_COLUMNS),
+    mydb_def("MYDB_RECYCLEBIN", MYDB_RECYCLEBIN_COLUMNS),
     mydb_def("MYDB_DDL_JOBS", MYDB_DDL_JOBS_COLUMNS),
     mydb_def(
         "MYDB_PREPARED_XA_TRANSACTIONS",
@@ -2655,6 +2671,10 @@ fn rows(
         }
         ("information_schema", "mydb_ai_models" | "mydb_ai_connections" | "mydb_ai_secrets" | "mydb_ai_runtime_status") => crate::engine::ai::metadata::rows(db, table),
         ("information_schema", "mydb_sequences") => sequence_rows(db),
+        ("information_schema", "mydb_recyclebin") => {
+            crate::recyclebin::require_current_admin(db)?;
+            Ok(db.recyclebin_entries()?.iter().map(crate::recyclebin::metadata_row).collect())
+        },
         ("information_schema", "mydb_ddl_jobs") => Ok(mydb_ddl_jobs_rows(db)),
         ("information_schema", "mydb_prepared_xa_transactions") => Ok(mydb_prepared_xa_transactions_rows(db)),
         ("information_schema", "mydb_cursors") => Ok(mydb_cursors_rows(db)),
@@ -2787,6 +2807,10 @@ pub(crate) fn object_visible_to_session(
     schema: &str,
     table: Option<&str>,
 ) -> bool {
+    if schema.eq_ignore_ascii_case(crate::recyclebin::DATABASE) {
+        return session.internal_system_session || db.with_auth_catalog(|auth| auth.account_has_privilege(
+            &session.authorization_context(), &RequiredPrivilege { privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()), scope: PrivilegeScope::Global }, false)).unwrap_or(false);
+    }
     if !is_privilege_filter_enabled() || session.internal_system_session {
         return true;
     }
@@ -3013,6 +3037,10 @@ impl Visibility {
     }
 
     fn allow(&self, schema: &str, table: Option<&str>) -> bool {
+        if schema.eq_ignore_ascii_case(crate::recyclebin::DATABASE) {
+            return self.unrestricted || self.guard.as_ref().is_some_and(|(auth, ctx)| auth.account_has_privilege(ctx,
+                &RequiredPrivilege { privilege: Privilege::Dynamic("RECYCLEBIN_ADMIN".into()), scope: PrivilegeScope::Global }, false));
+        }
         if self.unrestricted {
             return true;
         }

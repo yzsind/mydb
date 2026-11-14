@@ -2211,7 +2211,7 @@ pub(crate) fn create_table_sql(table: &TableSchema) -> Result<String, QueryError
     create_table_sql_with_auto_increment(table, None)
 }
 
-fn create_table_sql_with_auto_increment(
+pub(crate) fn create_table_sql_with_auto_increment(
     table: &TableSchema,
     next_value: Option<u64>,
 ) -> Result<String, QueryError> {
@@ -3132,6 +3132,9 @@ pub(crate) fn show_engine_mydb_status(db: &Database) -> QueryResponse {
         crate::engine::executor::mem_budget::controlled_memory_rejections_by_category();
     let work_area = crate::engine::executor::work_area::snapshot();
     let rows = status_rows! {
+        "recyclebin_pressure" => db.recyclebin_status()[0].to_string(),
+        "recyclebin_pressure_purges" => db.recyclebin_status()[1].to_string(),
+        "recyclebin_cleanup_failures" => db.recyclebin_status()[2].to_string(),
         "durability" => status.durability.to_string(),
         "ddl_copy_total" => ddl_copy[0].to_string(),
         "ddl_copy_scan_us" => ddl_copy[1].to_string(),

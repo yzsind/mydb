@@ -1153,6 +1153,7 @@ impl TableSchema {
             "extended_stats" => vec!["table_id", "scope_id", "kind", "ordinal"],
             "column_histograms" => vec!["table_id", "column_id"],
             "table_dynamic_metadata" => vec!["table_id"],
+            "recyclebin" => vec!["recycle_id"],
             "ddl_retirements" => vec!["table_id", "generation", "index_id"],
             "columns" => vec!["table_id", "column_id"],
             "indexes" => vec!["table_id", "name"],
@@ -1206,6 +1207,9 @@ impl TableSchema {
                 vec!["schema_name".to_string(), "name".to_string()],
                 false,
             ));
+        }
+        if name == "recyclebin" {
+            indexes.push(make_index("IDX_EXPIRES", vec!["expires_ms".into(), "recycle_id".into()], false));
         }
         if name == "foreign_keys" {
             let mut reverse = make_index(
