@@ -43,6 +43,15 @@ metric/type combinations raise an error. `IVF` with `quantization=none` stores
 and scores native payloads. Hamming IVF uses binary majority centers; Jaccard
 IVF uses sampled medoids scored with Jaccard distance.
 
+Unquantized FLOAT32, FLOAT16 and BFLOAT16 IVF indexes with L2, COSINE or DOT
+also keep an 8-bit scan code per row (one byte per dimension plus 8 bytes),
+trained with the coarse centers. A list scan reads the codes, derives a strict
+lower and upper bound of every row's exact distance, and reads the native
+payload only for rows whose lower bound can still enter the result. Results
+equal an exact scan of the probed lists; the codes add about one byte per
+dimension to each row's index storage. Rows inserted before the coarse centers
+are trained, and rows outside the bounded domain, are always scored exactly.
+
 ## Displaying vectors in SQL clients
 
 Native VECTOR results use MySQL's VECTOR wire type with little-endian FLOAT32
@@ -120,7 +129,11 @@ heap values still determine final query distances. Unsupported calibrations and
 insufficient memory retain the ordinary construction path.
 Internal SQ8 navigation also declines calibrations whose global code step would
 erase the variation on a coordinate axis. Sparse outliers retain exact navigation
-instead of widening the calibration for every other vector.
+instead of widening the calibration for every other vector. Paged FLOAT32 HNSW
+indexes whose data fails that test navigate on a per-dimension 8-bit scan code
+instead (ranges clipped to the mean ± 8 standard deviations per axis); rows
+whose code residual is too large keep exact navigation, and the final candidate
+pool is always rescored exactly. `MYDB_HNSW_NAV_CODE=0` disables the scan code.
 
 Eligible single-table distance ordering can use KNN truncation. JOIN,
 aggregation, DISTINCT and window queries retain their complete relational
@@ -293,11 +306,12 @@ SQ8, SQ4, PQ and BQ support FLOAT32, FLOAT16, BFLOAT16 and INT8 with L2,
 COSINE and DOT. BINARY supports only quantization=none. Quantization changes
 index payloads, not the column datatype, heap values or SQL distance functions.
 For paged FLOAT32 HNSW with L2 or COSINE, `quantization=none` preserves
-original index vectors and may use auxiliary SQ8 codes for graph navigation.
+original index vectors and may use auxiliary SQ8 codes or per-dimension scan
+codes for graph navigation.
 The compact navigation cache keeps the complete rerank pool; final distances
 come from the MVCC-visible heap values. Navigation remains approximate and
-can change ANN candidate coverage. DOT and unrepresentable probes retain
-exact navigation. This auxiliary cache does not change the declared persistent
+can change ANN candidate coverage. DOT uses only the scan code, and
+unrepresentable probes retain exact navigation. This auxiliary cache does not change the declared persistent
 quantization model or the stored column values.
 
 - SQ8 and SQ4 use per-dimension affine calibration over the complete build

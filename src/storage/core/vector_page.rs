@@ -223,8 +223,12 @@ fn native_geometry(dim: usize) -> Option<(crate::vector::VectorDataType, u32)> {
     ))
 }
 
+/// FLOAT32 records carry the exact row and one navigation lane of
+/// `dim + 8` bytes. The lane holds either the global SQ8 code (`dim` i8
+/// codes then an i32 norm) or a per-dimension scan code
+/// (`scan_codes::ScanCodec` record), as selected by the meta page.
 fn vector_record_lanes(dim: usize) -> usize {
-    native_geometry(dim).map_or(dim * 5 + 4, |(datatype, dimension)| {
+    native_geometry(dim).map_or(dim * 5 + 8, |(datatype, dimension)| {
         datatype.payload_len(dimension) + 8
     })
 }
@@ -232,7 +236,7 @@ fn vector_record_lanes(dim: usize) -> usize {
 /// Fixed on-disk size of a node record with the given `top_layer`, reserving
 /// the maximum neighbour footprint so all edge edits are in-place.
 ///
-///   flags(1) + top_layer(1) + row_id(8) + vector(dim*4) + sq8(dim) + norm(4)
+///   flags(1) + top_layer(1) + row_id(8) + vector(dim*4) + nav lane(dim+8)
 ///     + sum_{l=0}^{top_layer} ( count(2) + cap(l)*4-byte NodeId )
 fn node_record_size(top_layer: usize, dim: usize, m: usize, m0: usize) -> usize {
     // v3 persists the SQ8 navigation row next to the exact vector.  The page
@@ -318,7 +322,15 @@ pub(crate) struct VectorMeta {
     pub nav_mid: f32,
     pub nav_inv_scale: f32,
     pub nav_dist_mul: f32,
+    /// Rows without a usable lane of the active navigation code (EXACT_NAV
+    /// rows for global SQ8, rows lacking NAV_CODE for the scan code).
     pub nav_exact_nodes: u64,
+    /// Per-dimension scan-code navigation (exclusive with `nav_quant_valid`):
+    /// the codec lives in an overflow chain at `nav_codec_head`; rows whose
+    /// residual exceeds `nav_codec_limit` navigate on their exact row.
+    pub nav_codec_valid: bool,
+    pub nav_codec_limit: f32,
+    pub nav_codec_head: u64,
     pub quant_model_head: u64,
     pub quant_generation: u64,
     pub native_definition_head: u64,
@@ -352,6 +364,9 @@ impl VectorMeta {
             nav_inv_scale: 1.0,
             nav_dist_mul: 1.0,
             nav_exact_nodes: 0,
+            nav_codec_valid: false,
+            nav_codec_limit: 0.0,
+            nav_codec_head: 0,
             quant_model_head: 0,
             quant_generation: 0,
             native_definition_head: 0,
@@ -380,14 +395,16 @@ fn encode_vector_meta(meta: &VectorMeta) -> Vec<u8> {
     write_u16(&mut buf, 44, meta.ef_construction);
     write_u64(&mut buf, 48, meta.entry_vid);
     write_u32(&mut buf, 56, meta.max_layer);
+    write_u32(&mut buf, 60, meta.nav_codec_limit.to_bits());
     write_u64(&mut buf, 64, meta.node_next_page_id);
-    // [72..80] reserved (the abandoned freelist prototype never had a writer).
+    write_u64(&mut buf, 72, meta.nav_codec_head);
     write_u64(&mut buf, 80, meta.node_count);
     write_u64(&mut buf, 88, meta.tombstone_count);
     buf[96] = u8::from(meta.finalized);
     buf[97] = u8::from(meta.query_ready);
     write_u64(&mut buf, 104, meta.built_lsn);
     buf[112] = u8::from(meta.nav_quant_valid);
+    buf[113] = u8::from(meta.nav_codec_valid);
     write_u32(&mut buf, 116, meta.nav_mid.to_bits());
     write_u32(&mut buf, 120, meta.nav_inv_scale.to_bits());
     write_u32(&mut buf, 124, meta.nav_dist_mul.to_bits());
@@ -471,6 +488,9 @@ fn decode_vector_meta(buf: &[u8]) -> Result<VectorMeta, QueryError> {
         nav_inv_scale: f32::from_bits(read_u32(buf, 120)),
         nav_dist_mul: f32::from_bits(read_u32(buf, 124)),
         nav_exact_nodes: read_u64(buf, 128),
+        nav_codec_valid: buf[113] != 0,
+        nav_codec_limit: f32::from_bits(read_u32(buf, 60)),
+        nav_codec_head: read_u64(buf, 72),
         quant_model_head: read_u64(buf, 144),
         quant_generation: read_u64(buf, 152),
         native_definition_head: read_u64(buf, 160),
@@ -507,13 +527,44 @@ const REC_FLAG_INITIALIZED: u8 = 0b0000_0001;
 const REC_FLAG_TOMBSTONE: u8 = 0b0000_0010;
 const REC_FLAG_EXACT_NAV: u8 = 0b0000_0100;
 const REC_FLAG_LINKED: u8 = 0b0000_1000;
+/// The navigation lane holds a scan code within the residual limit. Scan-code
+/// rows also keep EXACT_NAV, so global-SQ8 readers never decode the lane.
+const REC_FLAG_NAV_CODE: u8 = 0b0001_0000;
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 struct PersistedNavQuant {
     valid: bool,
     metric: u8,
     mid: f32,
     inv_scale: f32,
+    /// Per-dimension scan code and its residual limit (exclusive with
+    /// `valid`).
+    codec: Option<(Arc<crate::engine::vector::scan_codes::ScanCodec>, f32)>,
+}
+
+impl PersistedNavQuant {
+    /// Whether a record with these flags lacks the active navigation lane.
+    #[inline]
+    fn lacks_lane(&self, flags: u8) -> bool {
+        if self.codec.is_some() {
+            flags & REC_FLAG_NAV_CODE == 0
+        } else {
+            flags & REC_FLAG_EXACT_NAV != 0
+        }
+    }
+}
+
+/// Encode `vector`'s scan-code lane into `lane`; `false` (lane unspecified)
+/// when the row is outside the code's domain or above its residual limit.
+#[inline]
+fn encode_nav_code(
+    codec: &crate::engine::vector::scan_codes::ScanCodec,
+    limit: f32,
+    vector: &[f32],
+    lane: &mut [u8],
+) -> bool {
+    codec.encode(vector, lane)
+        && crate::engine::vector::scan_codes::ScanCodec::record_residual(lane) <= limit
 }
 
 #[inline]
@@ -530,7 +581,11 @@ fn navigation_inv_norm(vector: &[f32], metric: u8) -> f64 {
 }
 
 #[inline]
-fn persisted_nav_is_exact(vector: &[f32], quant: PersistedNavQuant) -> bool {
+fn persisted_nav_is_exact(vector: &[f32], quant: &PersistedNavQuant) -> bool {
+    if let Some((codec, limit)) = &quant.codec {
+        let mut lane = vec![0u8; codec.record_len()];
+        return !encode_nav_code(codec, *limit, vector, &mut lane);
+    }
     if !quant.valid {
         return true;
     }
@@ -546,18 +601,30 @@ fn write_persisted_nav_row(
     rec_off: usize,
     dim: usize,
     vector: &[f32],
-    quant: PersistedNavQuant,
+    quant: &PersistedNavQuant,
 ) {
     let code_off = rec_off + 10 + dim * 4;
     let norm_off = code_off + dim;
+    let lane = code_off..code_off + dim + 8;
+    if let Some((codec, limit)) = &quant.codec {
+        buf[rec_off] |= REC_FLAG_EXACT_NAV;
+        if encode_nav_code(codec, *limit, vector, &mut buf[lane.clone()]) {
+            buf[rec_off] |= REC_FLAG_NAV_CODE;
+        } else {
+            buf[rec_off] &= !REC_FLAG_NAV_CODE;
+            buf[lane].fill(0);
+        }
+        return;
+    }
+    buf[rec_off] &= !REC_FLAG_NAV_CODE;
     let inv_norm = navigation_inv_norm(vector, quant.metric);
     if persisted_nav_is_exact(vector, quant) {
         buf[rec_off] |= REC_FLAG_EXACT_NAV;
-        buf[code_off..code_off + dim].fill(0);
-        write_u32(buf, norm_off, 0);
+        buf[lane].fill(0);
         return;
     }
     buf[rec_off] &= !REC_FLAG_EXACT_NAV;
+    buf[norm_off + 4..norm_off + 8].fill(0);
     let mut norm = 0i32;
     for (dst, &value) in buf[code_off..code_off + dim].iter_mut().zip(vector) {
         let value = (value as f64 * inv_norm) as f32;
@@ -581,7 +648,7 @@ fn node_page_append(
     dim: usize,
     m: usize,
     m0: usize,
-    quant: PersistedNavQuant,
+    quant: &PersistedNavQuant,
 ) -> Option<u16> {
     let rec_size = node_record_size(top_layer, dim, m, m0);
     // Need the record plus one new directory slot (2 bytes).
@@ -663,6 +730,68 @@ fn node_page_append_native(
     write_u16(buf, NODE_OFF_SLOT_COUNT, slot_count + 1);
     write_u16(buf, NODE_OFF_HEAP_TOP, rec_off as u16);
     Some(slot_count)
+}
+
+// IVF scan-code page: a node page without slots (so node scans skip it, like
+// overflow pages) holding fixed-stride code records of one list:
+//   [32..40] list u64   [40..44] count u32   [44..48] IVF_CODE_TAG
+//   [48..]   count × { data vid u64, code record } at `ivf_code_stride`.
+// Overflow pages keep [44..48] zero. A code record's location is
+// `vid_make(page_id, index)`.
+const IVF_CODE_TAG: u32 = 0x4356_4931; // "1IVC"
+const IVF_CODE_OFF_LIST: usize = 32;
+const IVF_CODE_OFF_COUNT: usize = 40;
+const IVF_CODE_OFF_TAG: usize = 44;
+const IVF_CODE_OFF_RECORDS: usize = 48;
+
+pub(crate) fn ivf_code_stride(code_len: usize) -> usize {
+    (8 + code_len).next_multiple_of(8)
+}
+
+fn ivf_code_capacity(code_len: usize) -> usize {
+    ((PAGE_SIZE - IVF_CODE_OFF_RECORDS) / ivf_code_stride(code_len)).min(u16::MAX as usize)
+}
+
+fn format_ivf_code_page(buf: &mut [u8], list: u64) {
+    format_empty_node_page(buf);
+    write_u16(buf, NODE_OFF_HEAP_TOP, NODE_OFF_DIRECTORY as u16);
+    write_u64(buf, IVF_CODE_OFF_LIST, list);
+    write_u32(buf, IVF_CODE_OFF_COUNT, 0);
+    write_u32(buf, IVF_CODE_OFF_TAG, IVF_CODE_TAG);
+}
+
+/// Record count of a well-formed code page for `code_len`-byte codes.
+fn ivf_code_page_count(buf: &[u8], code_len: usize) -> Option<usize> {
+    if buf.len() != PAGE_SIZE
+        || read_u32(buf, IVF_CODE_OFF_TAG) != IVF_CODE_TAG
+        || read_u16(buf, NODE_OFF_SLOT_COUNT) != 0
+    {
+        return None;
+    }
+    let count = read_u32(buf, IVF_CODE_OFF_COUNT) as usize;
+    (count <= ivf_code_capacity(code_len)).then_some(count)
+}
+
+fn ivf_code_page_push(buf: &mut [u8], list: u64, data_vid: VecId, code: &[u8]) -> Option<u16> {
+    let count = ivf_code_page_count(buf, code.len())?;
+    if read_u64(buf, IVF_CODE_OFF_LIST) != list || count >= ivf_code_capacity(code.len()) {
+        return None;
+    }
+    let start = IVF_CODE_OFF_RECORDS + count * ivf_code_stride(code.len());
+    write_u64(buf, start, data_vid);
+    buf[start + 8..start + 8 + code.len()].copy_from_slice(code);
+    write_u32(buf, IVF_CODE_OFF_COUNT, count as u32 + 1);
+    Some(count as u16)
+}
+
+/// The code record at `index` of a well-formed code page.
+#[inline]
+fn ivf_code_page_record(buf: &[u8], index: usize, code_len: usize) -> Option<&[u8]> {
+    if index >= ivf_code_page_count(buf, code_len)? {
+        return None;
+    }
+    let start = IVF_CODE_OFF_RECORDS + index * ivf_code_stride(code_len) + 8;
+    buf.get(start..start + code_len)
 }
 
 /// Locate a record offset by slot, validating bounds.
@@ -765,7 +894,7 @@ fn node_page_write_vector_into(
     slot: u16,
     dim: usize,
     vector: &[f32],
-    quant: PersistedNavQuant,
+    quant: &PersistedNavQuant,
 ) -> (bool, bool, bool) {
     let Ok(rec_off) = node_record_offset(buf, slot) else {
         return (false, false, false);
@@ -773,13 +902,13 @@ fn node_page_write_vector_into(
     if buf[rec_off] & REC_FLAG_INITIALIZED == 0 {
         return (false, false, false);
     }
-    let old_exact = buf[rec_off] & REC_FLAG_EXACT_NAV != 0;
+    let old_exact = quant.lacks_lane(buf[rec_off]);
     let vec_off = rec_off + 10;
     for (i, v) in vector.iter().take(dim).enumerate() {
         write_u32(buf, vec_off + i * 4, v.to_bits());
     }
     write_persisted_nav_row(buf, rec_off, dim, vector, quant);
-    let new_exact = buf[rec_off] & REC_FLAG_EXACT_NAV != 0;
+    let new_exact = quant.lacks_lane(buf[rec_off]);
     (true, old_exact, new_exact)
 }
 
@@ -1013,6 +1142,11 @@ struct VectorMetaState {
     /// first write can skip the full-page before-image (no torn disk image
     /// exists yet) — same optimisation as B-tree `pristine_alloc_pages`.
     pristine_pages: HashSet<u64>,
+    /// Decoded navigation scan code and the overflow head it was read from.
+    nav_codec: Option<(u64, Arc<crate::engine::vector::scan_codes::ScanCodec>)>,
+    /// A scan code rows are written with but whose chain is not durable yet
+    /// (`meta.nav_codec_valid` stays false until it is published).
+    nav_codec_staged: Option<Arc<crate::engine::vector::scan_codes::ScanCodec>>,
 }
 
 impl VectorIndexFile {
@@ -1101,12 +1235,14 @@ impl VectorIndexFile {
     {
         let _mapping_write = self.navigation_write();
         let layout = self.bulk_layout(node_count, top_layer, false)?;
+        self.stage_published_navigation_codec()?;
         self.bulk_reset_frames(false)?;
         if node_count == 0 {
             self.bulk_sync_empty(layout.last_page)?;
-            return self.bulk_publish(entry, &layout, node_count);
+            self.bulk_publish(entry, &layout, node_count)?;
+            return self.publish_navigation_codec();
         }
-        let nav_quant = self.persisted_nav_quant();
+        let nav_quant = self.persisted_nav_quant()?;
         let pages = (layout.last_page + 1 - layout.first_page) as usize;
         let chunks = pages.div_ceil(BULK_WRITE_BATCH_PAGES);
         let threads = threads.clamp(1, chunks);
@@ -1119,13 +1255,13 @@ impl VectorIndexFile {
         })?;
         let cursor = std::sync::atomic::AtomicUsize::new(0);
         let nav_exact_nodes = AtomicU64::new(0);
-        let (layout_ref, fetch_ref) = (&layout, &fetch);
+        let (layout_ref, fetch_ref, nav_quant) = (&layout, &fetch, &nav_quant);
         crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
             let workers: Vec<_> = (0..threads)
                 .map(|_| {
                     let (cursor, nav_exact_nodes) = (&cursor, &nav_exact_nodes);
                     scope.spawn(move || -> Result<(), QueryError> {
-                        let mut packer = BulkPagePacker::new(self, file, nav_quant);
+                        let mut packer = BulkPagePacker::new(self, file, nav_quant.clone());
                         loop {
                             let chunk = cursor.fetch_add(1, Ordering::Relaxed);
                             if chunk >= chunks {
@@ -1160,7 +1296,8 @@ impl VectorIndexFile {
         self.bulk_sync_file(file, layout.last_page)?;
         drop(file_guard);
         self.meta_state.lock().meta.nav_exact_nodes = nav_exact_nodes.into_inner();
-        self.bulk_publish(entry, &layout, node_count)
+        self.bulk_publish(entry, &layout, node_count)?;
+        self.publish_navigation_codec()
     }
 
     /// Pack compressed native nodes and links once, preserving preceding model
@@ -1320,6 +1457,9 @@ impl VectorIndexFile {
     {
         let _mapping_write = self.navigation_write();
         let layout = self.bulk_layout(node_count, top_layer, native)?;
+        if !native {
+            self.stage_published_navigation_codec()?;
+        }
         self.bulk_reset_frames(native)?;
         if node_count > 0 {
             let file_guard = self.file.lock();
@@ -1329,7 +1469,7 @@ impl VectorIndexFile {
                     "vector index file is closed during bulk build",
                 )
             })?;
-            let mut packer = BulkPagePacker::new(self, file, self.persisted_nav_quant());
+            let mut packer = BulkPagePacker::new(self, file, self.persisted_nav_quant()?);
             packer.pack_range(&layout, 0..node_count, native, &mut fetch)?;
             packer.flush()?;
             self.bulk_sync_file(file, layout.last_page)?;
@@ -1341,6 +1481,9 @@ impl VectorIndexFile {
             self.bulk_sync_empty(layout.last_page)?;
         }
         self.bulk_publish(entry, &layout, node_count)?;
+        if !native {
+            self.publish_navigation_codec()?;
+        }
         Ok(layout.vids)
     }
 
@@ -1451,6 +1594,8 @@ impl VectorIndexFile {
                 meta,
                 meta_image,
                 pristine_pages: HashSet::new(),
+                nav_codec: None,
+                nav_codec_staged: None,
             }),
             dim_fixed,
             m_fixed,
@@ -1604,14 +1749,23 @@ impl VectorIndexFile {
         node_id_to_vid(node_id)
     }
 
-    fn persisted_nav_quant(&self) -> PersistedNavQuant {
+    fn persisted_nav_quant(&self) -> Result<PersistedNavQuant, QueryError> {
+        let staged = self.meta_state.lock().nav_codec_staged.clone();
+        let codec = match staged {
+            Some(codec) => {
+                let limit = codec.exact_residual_limit();
+                Some((codec, limit))
+            }
+            None => self.navigation_codec()?,
+        };
         let meta = self.meta_state.lock();
-        PersistedNavQuant {
+        Ok(PersistedNavQuant {
             valid: meta.meta.nav_quant_valid,
             metric: meta.meta.metric,
             mid: meta.meta.nav_mid,
             inv_scale: meta.meta.nav_inv_scale,
-        }
+            codec,
+        })
     }
 
     pub(crate) fn navigation_quantization(&self) -> Option<(f32, f32, f32)> {
@@ -1621,6 +1775,108 @@ impl VectorIndexFile {
             meta.meta.nav_inv_scale,
             meta.meta.nav_dist_mul,
         ))
+    }
+
+    /// Whether rows carry a navigation lane of either kind.
+    pub(crate) fn has_navigation_lane(&self) -> bool {
+        let meta = self.meta_state.lock();
+        meta.meta.nav_quant_valid || meta.meta.nav_codec_valid
+    }
+
+    /// The active per-dimension scan code and its residual limit, decoded
+    /// from its overflow chain once per head. A missing or corrupt chain is
+    /// an error, never a silent fallback.
+    pub(crate) fn navigation_codec(
+        &self,
+    ) -> Result<Option<(Arc<crate::engine::vector::scan_codes::ScanCodec>, f32)>, QueryError> {
+        let (head, limit) = {
+            let state = self.meta_state.lock();
+            if !state.meta.nav_codec_valid {
+                return Ok(None);
+            }
+            let (head, limit) = (state.meta.nav_codec_head, state.meta.nav_codec_limit);
+            if let Some((cached, codec)) = &state.nav_codec {
+                if *cached == head {
+                    return Ok(Some((codec.clone(), limit)));
+                }
+            }
+            (head, limit)
+        };
+        let corrupt = || {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt vector navigation codec",
+            )
+        };
+        if head == 0 || !limit.is_finite() || limit < 0.0 {
+            return Err(corrupt());
+        }
+        let bytes = self.read_quantization_blob(head, 6 + 8 * self.dim_fixed)?;
+        let codec = crate::engine::vector::scan_codes::ScanCodec::deserialize(&bytes)
+            .map_err(|_| corrupt())?;
+        if codec.dimension() != self.dim_fixed || codec.metric().as_u8() != self.meta().metric {
+            return Err(corrupt());
+        }
+        let codec = Arc::new(codec);
+        self.meta_state.lock().nav_codec = Some((head, codec.clone()));
+        Ok(Some((codec, limit)))
+    }
+
+    /// Stage a per-dimension navigation scan code (replacing any global SQ8
+    /// calibration) before a build writes rows with it. Queries keep exact
+    /// navigation until [`Self::publish_navigation_codec`] makes its overflow
+    /// chain durable after the node image: a direct bulk image rewrites the
+    /// file from page 1, so no chain may precede it.
+    pub(crate) fn stage_navigation_codec(
+        &self,
+        codec: crate::engine::vector::scan_codes::ScanCodec,
+    ) -> Result<(), QueryError> {
+        if native_geometry(self.dim_fixed).is_some()
+            || codec.dimension() != self.dim_fixed
+            || codec.metric().as_u8() != self.meta().metric
+        {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector navigation codec does not match the index",
+            ));
+        }
+        self.set_navigation_quantization(None)?;
+        self.meta_state.lock().nav_codec_staged = Some(Arc::new(codec));
+        Ok(())
+    }
+
+    /// Append a staged scan code's chain and name it from the meta page.
+    /// No-op without a staged code.
+    pub(crate) fn publish_navigation_codec(&self) -> Result<(), QueryError> {
+        let Some(codec) = self.meta_state.lock().nav_codec_staged.clone() else {
+            return Ok(());
+        };
+        let head = self.append_quantization_blob(&codec.serialize())?;
+        {
+            let mut state = self.meta_state.lock();
+            state.meta.nav_codec_valid = true;
+            state.meta.nav_codec_limit = codec.exact_residual_limit();
+            state.meta.nav_codec_head = head;
+            state.nav_codec = Some((head, codec));
+            state.nav_codec_staged = None;
+        }
+        self.write_meta_page(txn_id_for_ddl())
+    }
+
+    /// Before a bulk image replaces every page, demote a published scan code
+    /// to staged: its chain is about to be overwritten, so the meta page must
+    /// not name it until it is appended again after the image.
+    fn stage_published_navigation_codec(&self) -> Result<(), QueryError> {
+        let Some((codec, _)) = self.navigation_codec()? else {
+            return Ok(());
+        };
+        let mut state = self.meta_state.lock();
+        state.meta.nav_codec_valid = false;
+        state.meta.nav_codec_limit = 0.0;
+        state.meta.nav_codec_head = 0;
+        state.nav_codec = None;
+        state.nav_codec_staged = Some(codec);
+        Ok(())
     }
 
     /// Install the one index-wide SQ8 calibration before a cold build starts.
@@ -1651,24 +1907,37 @@ impl VectorIndexFile {
                     state.meta.nav_dist_mul = 1.0;
                 }
             }
+            // Either outcome retires a scan code; its chain pages stay
+            // allocated and unreferenced, like a replaced quantizer model.
+            state.meta.nav_codec_valid = false;
+            state.meta.nav_codec_limit = 0.0;
+            state.meta.nav_codec_head = 0;
+            state.nav_codec = None;
+            state.nav_codec_staged = None;
         }
         self.write_meta_page(txn_id_for_ddl())
     }
 
-    /// Recalibrate persisted SQ8 in two sequential passes with O(dim) scratch.
-    /// The caller excludes navigation and vector writers for the whole pass.
-    /// Persist an invalid calibration first: interruption then safely selects
-    /// exact navigation instead of mixing old parameters with rewritten codes.
+    /// Recalibrate persisted navigation in two sequential passes with O(dim)
+    /// scratch: global SQ8 when one step resolves every axis, else a
+    /// per-dimension scan code. The caller excludes navigation and vector
+    /// writers for the whole pass. An invalid calibration is persisted first:
+    /// interruption then safely selects exact navigation instead of mixing old
+    /// parameters with rewritten codes.
     pub(crate) fn recalibrate_navigation(&self, extra: &[f32]) -> Result<(), QueryError> {
-        let metric = match self.meta().metric {
-            1 => crate::engine::vector::distance::Metric::Cosine,
-            2 => return Ok(()),
-            _ => crate::engine::vector::distance::Metric::L2,
+        use crate::engine::vector::distance::Metric;
+        if native_geometry(self.dim_fixed).is_some() {
+            return Ok(());
+        }
+        let metric = match Metric::from_u8(self.meta().metric) {
+            Some(metric @ (Metric::L2 | Metric::Cosine | Metric::Dot)) => metric,
+            _ => return Ok(()),
         };
         let mut stats = crate::engine::vector::hnsw::CompactHnswStats::new(metric);
         if !extra.is_empty() {
             stats.observe(extra);
         }
+        let global = self.navigation_quantization().is_some();
         let next = self.meta().node_next_page_id;
         let mut vector = Vec::with_capacity(self.dim_fixed);
         for page_id in 1..next {
@@ -1679,8 +1948,7 @@ impl VectorIndexFile {
                             let offset = node_record_offset(bytes, slot)?;
                             if bytes[offset] & REC_FLAG_INITIALIZED == 0
                                 || bytes[offset] & REC_FLAG_TOMBSTONE != 0
-                                || (self.navigation_quantization().is_some()
-                                    && bytes[offset] & REC_FLAG_EXACT_NAV != 0)
+                                || (global && bytes[offset] & REC_FLAG_EXACT_NAV != 0)
                             {
                                 continue;
                             }
@@ -1694,17 +1962,35 @@ impl VectorIndexFile {
                     Ok(())
                 })?;
         }
-        let Some((mid, inv_scale, dist_mul)) = stats.quantization_params() else {
-            return Ok(());
-        };
         // Headroom reduces repeated fallback for values near the sample edge.
-        let params = (mid, inv_scale / 1.04, dist_mul * 1.04 * 1.04);
+        let params = stats
+            .quantization_params()
+            .map(|(mid, inv_scale, dist_mul)| (mid, inv_scale / 1.04, dist_mul * 1.04 * 1.04));
+        let codec = if params.is_none() {
+            match stats.navigation_codec() {
+                Some(codec) => Some(codec),
+                None => return Ok(()),
+            }
+        } else {
+            None
+        };
         self.set_navigation_quantization(None)?;
+        let codec = match codec {
+            Some(codec) => {
+                let limit = codec.exact_residual_limit();
+                let head = self.append_quantization_blob(&codec.serialize())?;
+                Some((head, limit, Arc::new(codec)))
+            }
+            None => None,
+        };
         let quant = PersistedNavQuant {
-            valid: true,
+            valid: params.is_some(),
             metric: self.meta().metric,
-            mid: params.0,
-            inv_scale: params.1,
+            mid: params.map_or(0.0, |p| p.0),
+            inv_scale: params.map_or(1.0, |p| p.1),
+            codec: codec
+                .as_ref()
+                .map(|(_, limit, codec)| (codec.clone(), *limit)),
         };
         let mut exact = 0u64;
         for page_id in 1..next {
@@ -1722,14 +2008,26 @@ impl VectorIndexFile {
                     for i in 0..self.dim_fixed {
                         vector.push(f32::from_bits(read_u32(bytes, offset + 10 + 4 * i)));
                     }
-                    write_persisted_nav_row(bytes, offset, self.dim_fixed, &vector, quant);
-                    exact += u64::from(bytes[offset] & REC_FLAG_EXACT_NAV != 0);
+                    write_persisted_nav_row(bytes, offset, self.dim_fixed, &vector, &quant);
+                    exact += u64::from(quant.lacks_lane(bytes[offset]));
                 }
                 Ok(((), true))
             })?;
         }
         self.meta_state.lock().meta.nav_exact_nodes = exact;
-        self.set_navigation_quantization(Some(params))
+        match codec {
+            Some((head, limit, codec)) => {
+                {
+                    let mut state = self.meta_state.lock();
+                    state.meta.nav_codec_valid = true;
+                    state.meta.nav_codec_limit = limit;
+                    state.meta.nav_codec_head = head;
+                    state.nav_codec = Some((head, codec));
+                }
+                self.write_meta_page(txn_id_for_ddl())
+            }
+            None => self.set_navigation_quantization(params),
+        }
     }
 
     /// Current entry point `(vid, max_layer)`, or `None` if empty.
@@ -1948,8 +2246,8 @@ impl VectorIndexFile {
             ));
         }
 
-        let nav_quant = self.persisted_nav_quant();
-        let nav_exact = persisted_nav_is_exact(vector, nav_quant);
+        let nav_quant = self.persisted_nav_quant()?;
+        let nav_exact = persisted_nav_is_exact(vector, &nav_quant);
         let rec_size = node_record_size(top_layer, dim, m, m0);
         // A node must fit in an otherwise-empty page (header + directory slot).
         let usable = PAGE_SIZE - NODE_OFF_DIRECTORY;
@@ -1970,7 +2268,7 @@ impl VectorIndexFile {
         if page_id != 0 {
             let _latch = self.page_latch(page_id);
             let slot = self.rmw_node_page(txn_id, page_id, |bytes| {
-                match node_page_append(bytes, row_id, top_layer, vector, dim, m, m0, nav_quant) {
+                match node_page_append(bytes, row_id, top_layer, vector, dim, m, m0, &nav_quant) {
                     Some(slot) => Ok((Some(slot), true)),
                     None => Ok((None, false)),
                 }
@@ -1990,7 +2288,7 @@ impl VectorIndexFile {
         if retry_page != 0 && retry_page != page_id {
             let _latch = self.page_latch(retry_page);
             let slot = self.rmw_node_page(txn_id, retry_page, |bytes| {
-                match node_page_append(bytes, row_id, top_layer, vector, dim, m, m0, nav_quant) {
+                match node_page_append(bytes, row_id, top_layer, vector, dim, m, m0, &nav_quant) {
                     Some(slot) => Ok((Some(slot), true)),
                     None => Ok((None, false)),
                 }
@@ -2008,8 +2306,10 @@ impl VectorIndexFile {
         let new_page = self.alloc_node_page(txn_id)?;
         let mut bytes = vec![0u8; PAGE_SIZE];
         format_empty_node_page(&mut bytes);
-        let slot = node_page_append(&mut bytes, row_id, top_layer, vector, dim, m, m0, nav_quant)
-            .expect("a freshly formatted page must fit one node (checked above)");
+        let slot = node_page_append(
+            &mut bytes, row_id, top_layer, vector, dim, m, m0, &nav_quant,
+        )
+        .expect("a freshly formatted page must fit one node (checked above)");
         self.write_page(txn_id, new_page, bytes)?;
         self.append_hint.store(new_page, Ordering::Release);
         let mut state = self.meta_state.lock();
@@ -2043,6 +2343,99 @@ impl VectorIndexFile {
         hint: &AtomicU64,
     ) -> Result<VecId, QueryError> {
         self.append_native_node_hint(0, row_id, 0, vector, auxiliary, hint)
+    }
+
+    /// Append the scan-code record of native IVF entry `data_vid` to `list`'s
+    /// current code page (`hint`), allocating a fresh code page when it is
+    /// full. Returns the record's stable location.
+    pub(crate) fn append_ivf_code(
+        &self,
+        list: u64,
+        data_vid: VecId,
+        code: &[u8],
+        hint: &AtomicU64,
+    ) -> Result<u64, QueryError> {
+        if ivf_code_capacity(code.len()) == 0 {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector index: IVF scan code exceeds page capacity",
+            ));
+        }
+        let push = |page_id: u64| -> Result<Option<u64>, QueryError> {
+            let _latch = self.page_latch(page_id);
+            let index = self.rmw_node_page(0, page_id, |bytes| {
+                Ok(match ivf_code_page_push(bytes, list, data_vid, code) {
+                    Some(index) => (Some(index), true),
+                    None => (None, false),
+                })
+            })?;
+            Ok(index.map(|index| vid_make(page_id, index)))
+        };
+        let page_id = hint.load(Ordering::Acquire);
+        if page_id != 0 {
+            if let Some(location) = push(page_id)? {
+                return Ok(location);
+            }
+        }
+        let _alloc = self.append_alloc.lock();
+        let retry_page = hint.load(Ordering::Acquire);
+        if retry_page != 0 && retry_page != page_id {
+            if let Some(location) = push(retry_page)? {
+                return Ok(location);
+            }
+        }
+        let new_page = self.alloc_node_page(0)?;
+        let mut bytes = vec![0u8; PAGE_SIZE];
+        format_ivf_code_page(&mut bytes, list);
+        let index = ivf_code_page_push(&mut bytes, list, data_vid, code)
+            .expect("a fresh code page holds at least one record (checked above)");
+        self.write_page(0, new_page, bytes)?;
+        hint.store(new_page, Ordering::Release);
+        Ok(vid_make(new_page, index))
+    }
+
+    /// Visit every IVF scan-code record: `(location, data vid, code)`.
+    pub(crate) fn for_each_ivf_code(
+        &self,
+        code_len: usize,
+        mut f: impl FnMut(u64, VecId, &[u8]),
+    ) -> Result<(), QueryError> {
+        let next = self.meta_state.lock().meta.node_next_page_id;
+        let require_checksum = !self.build_mode.load(Ordering::Acquire);
+        for page_id in 1..next {
+            self.buffer_pool
+                .with_raw_page(self.page_key(page_id), |bytes| {
+                    if read_u32(bytes, 0) != VEC_NODE_MAGIC
+                        || read_u32(bytes, IVF_CODE_OFF_TAG) != IVF_CODE_TAG
+                        || read_u16(bytes, NODE_OFF_SLOT_COUNT) != 0
+                    {
+                        return Ok(());
+                    }
+                    if require_checksum && read_u32(bytes, 16) != page_checksum(bytes, 16) {
+                        return Err(error(
+                            crate::error::catalog::ER_INDEX_CORRUPT,
+                            "corrupt vector index page checksum",
+                        ));
+                    }
+                    let count = ivf_code_page_count(bytes, code_len).ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_INDEX_CORRUPT,
+                            "corrupt IVF scan-code page",
+                        )
+                    })?;
+                    let stride = ivf_code_stride(code_len);
+                    for index in 0..count {
+                        let start = IVF_CODE_OFF_RECORDS + index * stride;
+                        f(
+                            vid_make(page_id, index as u16),
+                            read_u64(bytes, start),
+                            &bytes[start + 8..start + 8 + code_len],
+                        );
+                    }
+                    Ok(())
+                })?;
+        }
+        Ok(())
     }
 
     fn append_native_node_hint(
@@ -2758,11 +3151,11 @@ impl VectorIndexFile {
             ));
         }
 
-        let nav_quant = self.persisted_nav_quant();
+        let nav_quant = self.persisted_nav_quant()?;
         let page_id = vid_page(vid);
         let latch = self.page_latch(page_id);
         let (ok, old_exact, new_exact) = self.rmw_node_page(txn_id, page_id, |bytes| {
-            let result = node_page_write_vector_into(bytes, vid_slot(vid), dim, vector, nav_quant);
+            let result = node_page_write_vector_into(bytes, vid_slot(vid), dim, vector, &nav_quant);
             Ok((result, result.0))
         })?;
         drop(latch);
@@ -3254,9 +3647,7 @@ impl<'a> BulkPagePacker<'a> {
                     m0,
                 )
             } else {
-                self.nav_exact_nodes +=
-                    u64::from(persisted_nav_is_exact(&self.vector, self.nav_quant));
-                node_page_append(
+                let slot = node_page_append(
                     &mut self.image,
                     row_id,
                     layout.levels[id],
@@ -3264,8 +3655,14 @@ impl<'a> BulkPagePacker<'a> {
                     dim,
                     m,
                     m0,
-                    self.nav_quant,
-                )
+                    &self.nav_quant,
+                );
+                if let Some(slot) = slot {
+                    let offset = node_record_offset(&self.image, slot)?;
+                    self.nav_exact_nodes +=
+                        u64::from(self.nav_quant.lacks_lane(self.image[offset]));
+                }
+                slot
             }
             .ok_or_else(|| {
                 error(
@@ -3287,12 +3684,13 @@ impl<'a> BulkPagePacker<'a> {
                 self.mapped.clear();
                 self.mapped.reserve(dense.len());
                 for &neighbor in dense {
-                    let mapped_vid = layout.vids.get(neighbor as usize).copied().ok_or_else(|| {
-                        error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "vector bulk neighbour id out of range",
-                        )
-                    })?;
+                    let mapped_vid =
+                        layout.vids.get(neighbor as usize).copied().ok_or_else(|| {
+                            error(
+                                crate::error::catalog::ER_GET_ERRNO,
+                                "vector bulk neighbour id out of range",
+                            )
+                        })?;
                     self.mapped.push(mapped_vid);
                 }
                 node_page_set_neighbors(
@@ -3334,9 +3732,7 @@ impl<'a> BulkPagePacker<'a> {
     fn write_batch(&mut self) -> Result<(), QueryError> {
         if !self.batch.is_empty() {
             let offset = self.batch_first_page * PAGE_SIZE as u64;
-            self.out
-                .write_all_at(&self.batch, offset)
-                .map_err(io_err)?;
+            self.out.write_all_at(&self.batch, offset).map_err(io_err)?;
             // Overlap device writeback with packing the next batch; the
             // final data sync remains the durability barrier.
             if self.file.durability != DurabilityMode::Memory {
@@ -3417,10 +3813,16 @@ mod vector_page_tests {
         parallel
             .bulk_build_direct_parallel(NODES, Some((5, 2)), level, fetch, 7)
             .unwrap();
-        assert_eq!(serial.meta().node_next_page_id, parallel.meta().node_next_page_id);
+        assert_eq!(
+            serial.meta().node_next_page_id,
+            parallel.meta().node_next_page_id
+        );
         assert!(serial.meta().node_next_page_id > 2 * BULK_WRITE_BATCH_PAGES as u64);
         assert_eq!(serial.meta().entry_vid, parallel.meta().entry_vid);
-        assert_eq!(serial.meta().nav_exact_nodes, parallel.meta().nav_exact_nodes);
+        assert_eq!(
+            serial.meta().nav_exact_nodes,
+            parallel.meta().nav_exact_nodes
+        );
         let left = std::fs::read(a.path().join("bulk.hvec")).unwrap();
         let right = std::fs::read(b.path().join("bulk.hvec")).unwrap();
         assert_eq!(left.len(), right.len());
@@ -3434,6 +3836,7 @@ mod vector_page_tests {
             metric: 0,
             mid: 0.0,
             inv_scale: 1.0,
+            codec: None,
         }
     }
 
@@ -3461,16 +3864,16 @@ mod vector_page_tests {
     #[test]
     fn node_record_size_reserves_per_layer_footprint() {
         let (dim, m, m0) = (8usize, 4usize, 8usize);
-        // layer-0-only node: header(10) + vec(32) + sq8(8) + norm(4)
+        // layer-0-only node: header(10) + vec(32) + navigation lane(dim + 8)
         // + count(2) + m0*4-byte NodeId
         assert_eq!(
             node_record_size(0, dim, m, m0),
-            10 + 32 + dim + 4 + 2 + 8 * 4
+            10 + 32 + dim + 8 + 2 + 8 * 4
         );
         // two-layer node adds count(2) + m*4 for layer 1
         assert_eq!(
             node_record_size(1, dim, m, m0),
-            10 + 32 + dim + 4 + (2 + 8 * 4) + (2 + 4 * 4)
+            10 + 32 + dim + 8 + (2 + 8 * 4) + (2 + 4 * 4)
         );
     }
 
@@ -3484,7 +3887,7 @@ mod vector_page_tests {
             slot_id: 3,
         };
         let vec = vec![1.0f32, 2.0, 3.0, 4.0];
-        let slot = node_page_append(&mut page, row, 1, &vec, dim, m, m0, no_nav_quant()).unwrap();
+        let slot = node_page_append(&mut page, row, 1, &vec, dim, m, m0, &no_nav_quant()).unwrap();
         assert_eq!(slot, 0);
         let view = node_page_read(&page, slot, dim, m, m0).unwrap();
         assert_eq!(view.row_id, row);
@@ -3503,6 +3906,7 @@ mod vector_page_tests {
             metric: 0,
             mid: 0.0,
             inv_scale: 100.0,
+            codec: None,
         };
         let mut page = vec![0u8; PAGE_SIZE];
         format_empty_node_page(&mut page);
@@ -3517,7 +3921,7 @@ mod vector_page_tests {
             dim,
             m,
             m0,
-            quant,
+            &quant,
         )
         .unwrap();
         let qcodes = [50i8, -50i8];
@@ -3537,7 +3941,7 @@ mod vector_page_tests {
             dim,
             m,
             m0,
-            quant,
+            &quant,
         )
         .unwrap();
         assert_eq!(
@@ -3547,7 +3951,7 @@ mod vector_page_tests {
         );
 
         assert_eq!(
-            node_page_write_vector_into(&mut page, out_of_range, dim, &[0.25, -0.25], quant,),
+            node_page_write_vector_into(&mut page, out_of_range, dim, &[0.25, -0.25], &quant,),
             (true, true, false),
             "An in-place UPDATE back within quantization bounds must clear exact_nav"
         );
@@ -3574,7 +3978,7 @@ mod vector_page_tests {
             dim,
             m,
             m0,
-            no_nav_quant(),
+            &no_nav_quant(),
         )
         .unwrap();
         // push up to m0 (cap at layer 0)
@@ -3633,7 +4037,7 @@ mod vector_page_tests {
                 dim,
                 m,
                 m0,
-                no_nav_quant(),
+                &no_nav_quant(),
             );
             if r.is_none() {
                 break;
@@ -3818,7 +4222,7 @@ mod vector_page_tests {
             2,
             4,
             8,
-            no_nav_quant(),
+            &no_nav_quant(),
         )
         .is_some()
         {
@@ -4172,6 +4576,158 @@ mod vector_page_tests {
             assert_eq!(graph.search(&replacement, 97, 128).unwrap(), after_update);
             graph.file().disable_navigation_mapping();
             assert!(!graph.file().prepare_navigation_mapping().unwrap());
+        }
+    }
+
+    /// Mixed-scale rows defeat one global SQ8 step; they must navigate on a
+    /// per-dimension scan code whose chain survives reopen, DML and
+    /// recalibration, while every returned distance stays exact.
+    #[test]
+    fn scan_code_navigation_persists_and_returns_exact_distances() {
+        use crate::engine::vector::distance::{Metric, PreparedF32Distance};
+        for metric in [0u8, 1, 2] {
+            let dir = tempfile::Builder::new()
+                .prefix("scan-code-nav-")
+                .tempdir_in("/tmp/mydb")
+                .unwrap();
+            let dim = 16usize;
+            let mut vectors = gen_vectors(160, dim, 4242 + u64::from(metric));
+            for v in &mut vectors {
+                for x in &mut v[dim / 2..] {
+                    *x *= 0.004;
+                }
+                v[0] += 0.75; // keep COSINE rows away from the origin
+            }
+            let mut stats = crate::engine::vector::hnsw::CompactHnswStats::new(
+                Metric::from_u8(metric).unwrap(),
+            );
+            for v in &vectors {
+                stats.observe(v);
+            }
+            assert!(
+                stats.quantization_params().is_none(),
+                "global SQ8 must fail"
+            );
+            let log = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(dir.path()).unwrap(),
+            ));
+            let pool = BufferPool::new_with_options(
+                DEFAULT_BUFFER_POOL_PAGES,
+                log.clone(),
+                DurabilityMode::Relaxed,
+                std::time::Duration::from_millis(DEFAULT_LOCK_WAIT_MS),
+                1,
+                0,
+            );
+            let path = dir.path().join("vec__1__scan.hvec");
+            let open = || {
+                Arc::new(
+                    VectorIndexFile::open_with_durability(
+                        path.clone(),
+                        log.clone(),
+                        DurabilityMode::Relaxed,
+                        pool.clone(),
+                        dim as u32,
+                        metric,
+                        16,
+                        32,
+                        200,
+                    )
+                    .unwrap(),
+                )
+            };
+            let graph = crate::engine::vector::hnsw_paged::PagedHnsw::new(open());
+            graph.install_build_navigation(&stats).unwrap();
+            graph.begin_bulk_build();
+            let mut vids = Vec::new();
+            for (i, v) in vectors.iter().enumerate() {
+                let row = RowId {
+                    page_id: i as u32,
+                    slot_id: 0,
+                };
+                vids.push(graph.insert(txn_id_for_ddl(), row, v).unwrap());
+            }
+            graph.finalize_bulk_build().unwrap();
+            graph.publish_navigation_codec().unwrap();
+            let meta = graph.file().meta();
+            assert!(meta.nav_codec_valid && !meta.nav_quant_valid, "{metric}");
+            assert!(meta.nav_exact_nodes * 8 <= meta.node_count, "{metric}");
+            assert!(graph.has_navigation_lane());
+            graph.suppress_query_navigation_builds_for_test();
+            let f32_bytes =
+                |v: &[f32]| -> Vec<u8> { v.iter().flat_map(|x| x.to_le_bytes()).collect() };
+            let exact_top = |query: &[f32], k: usize| {
+                let scorer = PreparedF32Distance::new(query, Metric::from_u8(metric).unwrap());
+                let mut all: Vec<(u32, f64)> = vectors
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (i as u32, scorer.score_bytes(&f32_bytes(v))))
+                    .collect();
+                all.sort_by(|a, b| a.1.total_cmp(&b.1).then(a.0.cmp(&b.0)));
+                all.truncate(k);
+                all
+            };
+            let check = |graph: &crate::engine::vector::hnsw_paged::PagedHnsw| {
+                assert!(graph.file().prepare_navigation_mapping().unwrap());
+                assert!(graph
+                    .file()
+                    .with_navigation_mapping(|view| view.codec.is_some())
+                    .unwrap());
+                let mut hits = 0;
+                for q in [3usize, 41, 97, 150] {
+                    let query = &vectors[q];
+                    let got = graph.search(query, 10, 96).unwrap();
+                    let want = exact_top(query, 10);
+                    let scorer = PreparedF32Distance::new(query, Metric::from_u8(metric).unwrap());
+                    for (row, distance) in &got {
+                        // Navigation used codes; returned distances are exact.
+                        let exact = scorer.score_bytes(&f32_bytes(&vectors[row.page_id as usize]));
+                        assert!(
+                            (distance - exact).abs() <= 1e-5 * exact.abs().max(1.0),
+                            "{metric}: {distance} vs {exact}"
+                        );
+                    }
+                    hits += got
+                        .iter()
+                        .filter(|(row, _)| want.iter().any(|(id, _)| *id == row.page_id))
+                        .count();
+                }
+                assert!(hits >= 36, "metric {metric}: recall {hits}/40");
+            };
+            check(&graph);
+            // A reopened file decodes the codec from its overflow chain.
+            graph.file().flush().unwrap();
+            let reopened = crate::engine::vector::hnsw_paged::PagedHnsw::new(open());
+            assert!(reopened.file().navigation_codec().unwrap().is_some());
+            check(&reopened);
+            // Incremental writes keep the lane accounting exact.
+            let before = graph.file().meta().nav_exact_nodes;
+            let outlier: Vec<f32> = (0..dim)
+                .map(|i| if i == dim - 1 { 40.0 } else { 0.5 })
+                .collect();
+            graph
+                .insert(
+                    0,
+                    RowId {
+                        page_id: 5000,
+                        slot_id: 0,
+                    },
+                    &outlier,
+                )
+                .unwrap();
+            assert_eq!(graph.file().meta().nav_exact_nodes, before + 1, "{metric}");
+            graph.file().write_vector(0, vids[3], &vectors[4]).unwrap();
+            let after = graph.file().meta().nav_exact_nodes;
+            assert!((before..=before + 1).contains(&after), "{metric}");
+            graph.file().recalibrate_navigation(&[]).unwrap();
+            let meta = graph.file().meta();
+            assert!(meta.nav_codec_valid && !meta.nav_quant_valid);
+            assert!(meta.nav_exact_nodes <= before + 1);
+            // A chain that does not decode is an error, never exact fallback.
+            graph.file().meta_state.lock().meta.nav_codec_head = vids[0] >> 8;
+            graph.file().meta_state.lock().nav_codec = None;
+            let err = graph.file().navigation_codec().unwrap_err();
+            assert!(err.message().contains("vector"), "{}", err.message());
         }
     }
 
@@ -4697,9 +5253,14 @@ mod vector_page_tests {
         }
         let recall = hits as f64 / total as f64;
         assert!(recall >= 0.90, "paged dot recall too low: {recall}");
+        // DOT never uses global SQ8; it navigates on a scan code or exactly.
+        let meta = g.file().meta();
+        assert!(!meta.nav_quant_valid, "DOT must not use global SQ8");
         let (_, exact_fallback, covered, _) = g.navigation_stats();
-        assert_eq!(covered, 0, "DOT must preserve exact f32 navigation");
-        assert_eq!(exact_fallback, g.node_count());
+        assert_eq!(covered + exact_fallback, g.node_count());
+        if !meta.nav_codec_valid {
+            assert_eq!(covered, 0);
+        }
     }
 
     #[test]

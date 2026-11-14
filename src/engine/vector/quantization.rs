@@ -404,16 +404,32 @@ pub(crate) struct QuantQuery {
     bq_lut: Vec<f64>,
     center_dot: f64,
     sq_weights: Vec<f64>,
+    /// `sq_weights` prepared for the list-scan code kernel, with the record
+    /// length and metric `Quantizer::scan_score` checks on every row.
+    sq_scan: Option<super::scan_codes::CodeWeights>,
+    scan_record_len: usize,
+    scan_metric: Metric,
     _charge: ControlledMemoryCharge,
 }
 impl QuantQuery {
     pub(crate) fn allocated_bytes(&self) -> usize {
         self._charge.bytes()
     }
+
+    /// Whether `Quantizer::scan_score` has code-kernel weights for this query.
+    pub(crate) fn has_scan(&self) -> bool {
+        self.sq_scan.is_some()
+    }
 }
 /// Independent reductions allow LLVM to vectorize byte-to-f64 scoring on
 /// NEON/AVX without reassociating a serial IEEE sum or narrowing native values.
 fn sq8_weighted_dot(code: &[u8], weights: &[f64]) -> f64 {
+    #[cfg(target_arch = "x86_64")]
+    if weights.len() >= 8 && code.len() == weights.len() && std::is_x86_feature_detected!("avx512f")
+    {
+        // SAFETY: dispatch enables AVX-512F and equal lengths bound every load.
+        return unsafe { sq8_weighted_dot_avx512(code, weights) };
+    }
     #[cfg(target_arch = "x86_64")]
     if weights.len() >= 8 && code.len() == weights.len() && std::is_x86_feature_detected!("avx2") {
         // SAFETY: dispatch enables AVX2 and equal lengths bound every load.
@@ -433,12 +449,75 @@ fn sq8_weighted_dot_batch4(code: [&[u8]; 4], weights: &[f64]) -> [f64; 4] {
     #[cfg(target_arch = "x86_64")]
     if weights.len() >= 8
         && code.iter().all(|row| row.len() == weights.len())
+        && std::is_x86_feature_detected!("avx512f")
+    {
+        // SAFETY: dispatch enables AVX-512F and all rows have complete weights.
+        return unsafe { sq8_weighted_dot_batch4_avx512(code, weights) };
+    }
+    #[cfg(target_arch = "x86_64")]
+    if weights.len() >= 8
+        && code.iter().all(|row| row.len() == weights.len())
         && std::is_x86_feature_detected!("avx2")
     {
         // SAFETY: dispatch enables AVX2 and all rows have complete weights.
         return unsafe { sq8_weighted_dot_batch4_avx2(code, weights) };
     }
     code.map(|row| sq8_weighted_dot(row, weights))
+}
+
+/// The AVX2 kernels' eight f64 lanes in one zmm register: lane `j` still sums
+/// elements `≡ j (mod 8)` with separate multiply and add, so the result is
+/// bit-identical to the portable and AVX2 reductions at half the µops.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq8_weighted_dot_batch4_avx512(code: [&[u8]; 4], weights: &[f64]) -> [f64; 4] {
+    use std::arch::x86_64::*;
+    let mut sums = [_mm512_setzero_pd(); 4];
+    let mut i = 0;
+    while i + 8 <= weights.len() {
+        let w = _mm512_loadu_pd(weights.as_ptr().add(i));
+        for (sum, row) in sums.iter_mut().zip(code) {
+            let packed = _mm_cvtsi64_si128(std::ptr::read_unaligned(row.as_ptr().add(i).cast()));
+            let values = _mm512_cvtepi32_pd(_mm256_cvtepu8_epi32(packed));
+            *sum = _mm512_add_pd(*sum, _mm512_mul_pd(values, w));
+        }
+        i += 8;
+    }
+    std::array::from_fn(|j| {
+        let mut lanes = [0.0; 8];
+        _mm512_storeu_pd(lanes.as_mut_ptr(), sums[j]);
+        let tail = code[j][i..]
+            .iter()
+            .zip(&weights[i..])
+            .map(|(&c, &w)| c as f64 * w)
+            .sum::<f64>();
+        lanes.into_iter().sum::<f64>() + tail
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f")]
+unsafe fn sq8_weighted_dot_avx512(code: &[u8], weights: &[f64]) -> f64 {
+    use std::arch::x86_64::*;
+    let mut sum = _mm512_setzero_pd();
+    let mut i = 0;
+    while i + 8 <= weights.len() {
+        let packed = _mm_cvtsi64_si128(std::ptr::read_unaligned(code.as_ptr().add(i).cast()));
+        let values = _mm512_cvtepi32_pd(_mm256_cvtepu8_epi32(packed));
+        sum = _mm512_add_pd(
+            sum,
+            _mm512_mul_pd(values, _mm512_loadu_pd(weights.as_ptr().add(i))),
+        );
+        i += 8;
+    }
+    let mut lanes = [0.0; 8];
+    _mm512_storeu_pd(lanes.as_mut_ptr(), sum);
+    let tail = code[i..]
+        .iter()
+        .zip(&weights[i..])
+        .map(|(&c, &w)| c as f64 * w)
+        .sum::<f64>();
+    lanes.into_iter().sum::<f64>() + tail
 }
 
 #[cfg(target_arch = "x86_64")]
@@ -935,7 +1014,7 @@ impl Quantizer {
         let extra = match self.model.config {
             QuantizationConfig::Pq { bits, .. } => self.model.centers.len() * (1usize << bits) * 16,
             QuantizationConfig::Bq => (self.model.dimension as usize).div_ceil(4) * 16 * 8,
-            QuantizationConfig::Sq8 | QuantizationConfig::Sq4 => self.model.dimension as usize * 8,
+            QuantizationConfig::Sq8 | QuantizationConfig::Sq4 => self.model.dimension as usize * 12,
             _ => 0,
         };
         let charge = ControlledMemoryCharge::try_new_recoverable(
@@ -951,6 +1030,9 @@ impl Quantizer {
             bq_lut: Vec::new(),
             center_dot: 0.0,
             sq_weights: Vec::new(),
+            sq_scan: None,
+            scan_record_len: self.record_len(),
+            scan_metric: Metric::L2,
             _charge: charge,
         };
         if matches!(
@@ -970,6 +1052,10 @@ impl Quantizer {
                 .zip(&self.model.low)
                 .map(|(x, lo)| x * lo)
                 .sum();
+            if matches!(self.model.config, QuantizationConfig::Sq8) {
+                q.sq_scan = super::scan_codes::CodeWeights::new(&q.sq_weights);
+                q.scan_metric = self.metric();
+            }
         }
         if let QuantizationConfig::Pq { bits, .. } = self.model.config {
             q.lut = Vec::with_capacity(self.model.centers.len() * (1usize << bits));
@@ -1479,6 +1565,62 @@ impl Quantizer {
             }
         }))
     }
+    /// List-scan scores of four records: `score_payloads4`'s affine SQ8
+    /// estimate reduced by the code kernel (see `scan_score`). Records that
+    /// need the wide scorer keep it.
+    pub(crate) fn scan_payloads4(
+        &self,
+        rows: [&[u8]; 4],
+        file: Option<&Arc<VectorIndexFile>>,
+        query: &VectorValue,
+        prepared: Option<&QuantQuery>,
+    ) -> Result<[f64; 4], QueryError> {
+        let Some(fast) = prepared.filter(|q| q.has_scan()) else {
+            return self.score_payloads4(rows, file, query, prepared);
+        };
+        let mut scores = [0.0; 4];
+        for (score, row) in scores.iter_mut().zip(rows) {
+            *score = match self.scan_score(row, fast) {
+                Some(score) => score,
+                None => self.score_payload(row, file, query, prepared)?,
+            };
+        }
+        Ok(scores)
+    }
+
+    /// One SQ8 record's list-scan score: `score_payload`'s affine estimate
+    /// with the weighted code sum from the code kernel. A row whose estimate
+    /// lies within the kernel's error of cancellation keeps the wide decoder.
+    /// `None` when the record needs the wide scorer (no scan weights, an
+    /// exception, legacy or malformed record).
+    #[inline]
+    pub(crate) fn scan_score(&self, bytes: &[u8], prepared: &QuantQuery) -> Option<f64> {
+        let scan = prepared.sq_scan.as_ref()?;
+        if bytes.len() != prepared.scan_record_len
+            || bytes.len() != 9 + prepared.sq_weights.len()
+            || bytes[0] != 0
+        {
+            return None;
+        }
+        let norm = f64::from_le_bytes(bytes[1..9].try_into().ok()?);
+        let metric = prepared.scan_metric;
+        if metric != Metric::Dot && !(norm > 0.0 && norm.is_finite()) {
+            return None;
+        }
+        let weighted = scan.dot(&bytes[9..]);
+        let dot = prepared.center_dot + weighted;
+        if dot.abs() <= 64.0 * scan.error() + (prepared.center_dot.abs() + weighted.abs()) * 1e-12 {
+            return Some(self.score(&bytes[9..], prepared));
+        }
+        Some(match metric {
+            Metric::Dot => -dot,
+            Metric::Cosine if prepared.norm2 > 0.0 => {
+                1.0 - (dot / (prepared.norm2 * norm).sqrt()).clamp(-1.0, 1.0)
+            }
+            _ => f64::INFINITY,
+        })
+    }
+
     pub(crate) fn value_payload(
         &self,
         bytes: &[u8],
@@ -1683,6 +1825,62 @@ mod tests {
     }
 
     #[test]
+    fn sq8_scan_scores_track_the_wide_scorer() {
+        for metric in [Metric::Cosine, Metric::Dot, Metric::L2] {
+            let dim = 97usize;
+            let mut trainer = Trainer::new(
+                QuantizationConfig::Sq8,
+                VectorDataType::Float32,
+                dim as u32,
+                metric,
+            )
+            .unwrap();
+            let rows: Vec<VectorValue> = (0..64)
+                .map(|r| {
+                    codec::from_f32(
+                        &(0..dim)
+                            .map(|j| (((r * 31 + j * 17) % 101) as f32 - 50.0) / 25.0)
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .collect();
+            for value in &rows {
+                trainer.observe(value).unwrap();
+            }
+            let quant = trainer.finish().unwrap().unwrap();
+            let stored: Vec<_> = rows.iter().map(|v| quant.store(v, None).unwrap()).collect();
+            for query in rows.iter().step_by(7) {
+                let prepared = quant.prepare(query).unwrap();
+                for chunk in stored.chunks_exact(4) {
+                    let records = [0, 1, 2, 3].map(|i| chunk[i].payload.as_slice());
+                    let wide = quant
+                        .score_payloads4(records, None, query, Some(&prepared))
+                        .unwrap();
+                    let fast = quant
+                        .scan_payloads4(records, None, query, Some(&prepared))
+                        .unwrap();
+                    for (f, w) in fast.iter().zip(wide) {
+                        if metric == Metric::L2 {
+                            assert_eq!(f.to_bits(), w.to_bits(), "L2 keeps the wide scorer");
+                        } else {
+                            // DOT moves by at most the kernel's bound; every
+                            // deviation is far below SQ8's own error.
+                            let bound = prepared.sq_scan.as_ref().unwrap().error();
+                            if metric == Metric::Dot {
+                                assert!((f - w).abs() <= bound * (1.0 + 1e-6) + 1e-9, "{f} {w}");
+                            }
+                            assert!(
+                                (f - w).abs() <= 1e-3 * w.abs().max(1.0),
+                                "{metric:?} {f} {w}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn batched_payload_scores_preserve_types_models_and_legacy_records() {
         for datatype in [
             VectorDataType::Float32,
@@ -1761,6 +1959,50 @@ mod tests {
                     assert_eq!(actual.code(), expected.code());
                 }
             }
+        }
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn sq8_wide_kernels_preserve_portable_bits_for_every_isa() {
+        let have_avx2 = std::is_x86_feature_detected!("avx2");
+        let have_avx512 = std::is_x86_feature_detected!("avx512f");
+        for dimension in [8, 9, 15, 16, 17, 33, 768, 769] {
+            let bytes: Vec<u8> = (0..dimension + 3).map(|i| (i * 37 + 11) as u8).collect();
+            let rows = [
+                &bytes[0..dimension],
+                &bytes[1..dimension + 1],
+                &bytes[2..dimension + 2],
+                &bytes[3..dimension + 3],
+            ];
+            let weights: Vec<f64> = (0..dimension)
+                .map(|i| ((i * 7919 % 997) as f64 - 498.0) / 997.0 * 1e-3)
+                .collect();
+            let want = rows.map(|row| sq8_weighted_dot_portable(row, &weights).to_bits());
+            // SAFETY: each kernel runs only when the CPU supports it.
+            unsafe {
+                if have_avx2 {
+                    assert_eq!(
+                        sq8_weighted_dot_batch4_avx2(rows, &weights).map(f64::to_bits),
+                        want
+                    );
+                    assert_eq!(sq8_weighted_dot_avx2(rows[1], &weights).to_bits(), want[1]);
+                }
+                if have_avx512 {
+                    assert_eq!(
+                        sq8_weighted_dot_batch4_avx512(rows, &weights).map(f64::to_bits),
+                        want
+                    );
+                    assert_eq!(
+                        sq8_weighted_dot_avx512(rows[2], &weights).to_bits(),
+                        want[2]
+                    );
+                }
+            }
+            assert_eq!(
+                sq8_weighted_dot_batch4(rows, &weights).map(f64::to_bits),
+                want
+            );
         }
     }
 

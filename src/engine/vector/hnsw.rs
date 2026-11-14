@@ -67,6 +67,7 @@ use super::distance::{
     dot_i8, dot_i8_batch4_ptrs, l2_ssd_i8, ordering_distance, prefetch_read,
     quantize_centered_into, quantize_into, Metric,
 };
+use super::scan_codes::{ScanCodec, ScanQuery};
 use crate::storage::RowId;
 use crate::types::QueryError;
 
@@ -323,8 +324,31 @@ pub(crate) struct CompactHnswStats {
     vmax: f32,
     means: Vec<f64>,
     deviations: Vec<f64>,
+    /// Per-dimension coded-space extremes, for the per-dimension navigation
+    /// code. Unlike `valid`, `ranged` holds for every metric.
+    lows: Vec<f32>,
+    highs: Vec<f32>,
     valid: bool,
+    ranged: bool,
 }
+
+/// `MYDB_HNSW_BUILD_NAV_CODE=0` keeps frozen cold builds on exact
+/// navigation instead of per-dimension scan codes.
+pub(crate) fn build_navigation_code_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("MYDB_HNSW_BUILD_NAV_CODE").as_deref(),
+            Ok("0" | "off" | "OFF" | "false" | "FALSE")
+        )
+    })
+}
+
+/// Navigation-code ranges are clipped to `mean ± NAV_CODE_CLIP_SIGMA · σ`
+/// per dimension, so a few extreme values cannot coarsen every row's code.
+/// Clamped rows record a larger residual and navigate exactly when it
+/// exceeds [`ScanCodec::exact_residual_limit`].
+const NAV_CODE_CLIP_SIGMA: f64 = 8.0;
 
 impl CompactHnswStats {
     pub(crate) fn new(metric: Metric) -> Self {
@@ -336,7 +360,10 @@ impl CompactHnswStats {
             vmax: f32::NEG_INFINITY,
             means: Vec::new(),
             deviations: Vec::new(),
+            lows: Vec::new(),
+            highs: Vec::new(),
             valid: metric != Metric::Dot,
+            ranged: true,
         }
     }
 
@@ -348,8 +375,11 @@ impl CompactHnswStats {
             self.dim = vector.len();
             self.means.resize(self.dim, 0.0);
             self.deviations.resize(self.dim, 0.0);
+            self.lows.resize(self.dim, f32::INFINITY);
+            self.highs.resize(self.dim, f32::NEG_INFINITY);
         } else if self.dim != vector.len() {
             self.valid = false;
+            self.ranged = false;
             return;
         }
         let norm = if self.metric == Metric::Cosine {
@@ -359,18 +389,23 @@ impl CompactHnswStats {
         };
         let inv_norm = if norm > 0.0 { norm.recip() } else { 1.0 };
         let inv_rows = ((self.rows + 1) as f64).recip();
-        for ((&x, mean), deviation) in vector
+        for ((((&x, mean), deviation), low), high) in vector
             .iter()
             .zip(self.means.iter_mut())
             .zip(self.deviations.iter_mut())
+            .zip(self.lows.iter_mut())
+            .zip(self.highs.iter_mut())
         {
             let x = (x as f64 * inv_norm) as f32;
             if !x.is_finite() {
                 self.valid = false;
+                self.ranged = false;
                 return;
             }
             self.vmin = self.vmin.min(x);
             self.vmax = self.vmax.max(x);
+            *low = low.min(x);
+            *high = high.max(x);
             let delta = x as f64 - *mean;
             *mean += delta * inv_rows;
             *deviation += delta * (x as f64 - *mean);
@@ -383,21 +418,29 @@ impl CompactHnswStats {
     pub(crate) fn merge(&mut self, other: CompactHnswStats) {
         if other.rows == 0 {
             self.valid &= other.valid;
+            self.ranged &= other.ranged;
             return;
         }
         if self.rows == 0 {
-            let valid = self.valid && other.valid;
+            let (valid, ranged) = (self.valid && other.valid, self.ranged && other.ranged);
             *self = other;
             self.valid = valid;
+            self.ranged = ranged;
             return;
         }
         if self.dim != other.dim {
             self.valid = false;
+            self.ranged = false;
             return;
         }
         self.valid &= other.valid;
+        self.ranged &= other.ranged;
         self.vmin = self.vmin.min(other.vmin);
         self.vmax = self.vmax.max(other.vmax);
+        for i in 0..self.dim {
+            self.lows[i] = self.lows[i].min(other.lows[i]);
+            self.highs[i] = self.highs[i].max(other.highs[i]);
+        }
         let (a, b) = (self.rows as f64, other.rows as f64);
         let total = a + b;
         for i in 0..self.dim {
@@ -452,6 +495,27 @@ impl CompactHnswStats {
         };
         (mid.is_finite() && inv_scale.is_normal() && dist_mul.is_normal())
             .then_some((mid, inv_scale, dist_mul))
+    }
+
+    /// Per-dimension navigation code for the observed rows: each range is
+    /// the observed one clipped to `mean ± NAV_CODE_CLIP_SIGMA · σ`. `None`
+    /// for an empty or inconsistent sample and for metrics without a code.
+    pub(crate) fn navigation_codec(&self) -> Option<ScanCodec> {
+        if !self.ranged || self.rows == 0 || self.dim == 0 {
+            return None;
+        }
+        let rows = self.rows as f64;
+        let mut low = Vec::with_capacity(self.dim);
+        let mut high = Vec::with_capacity(self.dim);
+        for i in 0..self.dim {
+            let sigma = (self.deviations[i].max(0.0) / rows).sqrt();
+            let spread = NAV_CODE_CLIP_SIGMA * sigma;
+            let lo = f64::from(self.lows[i]).max(self.means[i] - spread);
+            let hi = f64::from(self.highs[i]).min(self.means[i] + spread);
+            low.push(lo.min(hi));
+            high.push(hi.max(lo));
+        }
+        ScanCodec::from_ranges(self.metric, &low, &high)
     }
 
     /// Conservative capacity envelope. Exact f32 vectors are absent.
@@ -575,10 +639,56 @@ struct Probe<'a> {
     /// When SQ8 navigation is active: the arena, the quantized query codes, and
     /// the query's precomputed `‖q‖²` (so each probe is one `sdot` + two adds).
     quant: Option<(&'a QuantArena, &'a [i8], i32)>,
+    /// Cold-build navigation on per-dimension scan codes ([`BuildCodes`]):
+    /// the probe prepared against the build codec. Edges are still chosen on
+    /// exact distances after the found pool is rescored.
+    code: Option<&'a ScanQuery>,
     /// Cached cosine `‖query‖²` for graph construction, where both endpoints
     /// carry cached norms and edge geometry uses [`cosine_with_norms`] just
     /// like neighbour selection. Query-time probes leave it `None`.
     cosine_norm: Option<f32>,
+}
+
+/// Dense per-dimension scan codes of every cold-build node, valid while the
+/// frozen build view is set. Rows whose code is too coarse (outside the
+/// codec's domain or above its residual limit) navigate exactly.
+struct BuildCodes {
+    codec: ScanCodec,
+    stride: usize,
+    records: Vec<u8>,
+    coded: Vec<bool>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl BuildCodes {
+    #[inline]
+    fn record(&self, id: u32) -> Option<&[u8]> {
+        let id = id as usize;
+        if !*self.coded.get(id)? {
+            return None;
+        }
+        Some(&self.records[id * self.stride..(id + 1) * self.stride])
+    }
+
+    /// Request the first `lines` cache lines of `id`'s record (all of it
+    /// for `usize::MAX`). Requesting whole records for every neighbour at
+    /// once overflows the core's fill buffers, so searches stream them.
+    #[inline]
+    fn prefetch_lines(&self, id: u32, skip: usize, lines: usize) {
+        let start = id as usize * self.stride;
+        if start < self.records.len() {
+            let base = self.records.as_ptr().wrapping_add(start).cast::<i8>();
+            for offset in (64 * skip..self.stride).step_by(64).take(lines) {
+                prefetch_read(base.wrapping_add(offset));
+            }
+        }
+    }
+}
+
+impl std::fmt::Debug for BuildCodes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "BuildCodes({})", self.coded.len())
+    }
 }
 
 impl Probe<'_> {
@@ -1201,6 +1311,10 @@ pub(crate) struct HnswIndex {
     /// `frozen_build_vectors` is set; it removes the node-slab load from each
     /// construction distance.
     frozen_rows: FrozenRows,
+    /// Codec requested for cold-build navigation; [`Self::link_all_frozen`]
+    /// encodes `build_codes` with it when the optional memory is admitted.
+    build_codec: Option<ScanCodec>,
+    build_codes: Option<BuildCodes>,
     // Temporary cold-build graphs own the caller's admitted workspace. Keep
     // this last so all graph allocations are freed before releasing admission.
     build_reservation: Option<BuildReservation>,
@@ -1257,6 +1371,14 @@ impl HnswIndex {
         self.navigation_quant_enabled = false;
         self
     }
+
+    /// Navigate a frozen cold build on per-dimension scan codes of `codec`
+    /// (ignored for other build routes). Candidate pools are rescored
+    /// exactly, so only search coverage, never edge distances, depends on it.
+    pub(crate) fn with_build_navigation_codec(mut self, codec: Option<ScanCodec>) -> Self {
+        self.build_codec = codec.filter(|codec| codec.metric() == self.metric);
+        self
+    }
     pub(crate) fn new(metric: Metric, m: usize, ef_construction: usize) -> Self {
         let m = m.max(2);
         HnswIndex {
@@ -1298,6 +1420,8 @@ impl HnswIndex {
             codes_only: false,
             frozen_build_vectors: AtomicBool::new(false),
             frozen_rows: FrozenRows::default(),
+            build_codec: None,
+            build_codes: None,
             build_reservation: None,
         }
     }
@@ -2196,6 +2320,21 @@ impl HnswIndex {
         ))
     }
 
+    /// Scan-code estimates for one to four coded build rows at once, or
+    /// `None` when any row lacks a code. A short group repeats its first row.
+    #[inline]
+    fn code_batch4(&self, probe: &Probe, group: &[u32]) -> Option<[f64; 4]> {
+        let (code, codes) = (probe.code?, self.build_codes.as_ref()?);
+        let id = |j: usize| group[if j < group.len() { j } else { 0 }];
+        let records = [
+            codes.record(id(0))?,
+            codes.record(id(1))?,
+            codes.record(id(2))?,
+            codes.record(id(3))?,
+        ];
+        Some(code.estimate_batch4(records))
+    }
+
     #[inline]
     fn quant_covers(&self, arena: &QuantArena, id: u32) -> bool {
         (id as usize) < arena.n
@@ -2207,6 +2346,11 @@ impl HnswIndex {
     /// Uses the SQ8 arena when active and `id` is covered, else exact f32.
     #[inline]
     fn probe_dist(&self, probe: &Probe, id: u32) -> f64 {
+        if let (Some(code), Some(codes)) = (probe.code, self.build_codes.as_ref()) {
+            if let Some(record) = codes.record(id) {
+                return code.estimate(record);
+            }
+        }
         if let Some((arena, qcodes, qnorm)) = probe.quant {
             if self.quant_covers(arena, id) {
                 // Norm-decomposed integer SSD (one `sdot`), scaled back to ~real
@@ -2472,8 +2616,16 @@ impl HnswIndex {
             for &nb in nbr_buf.iter() {
                 probe.prefetch(nb);
             }
+            let codes = self.build_codes.as_ref().filter(|_| probe.code.is_some());
+            if let Some(codes) = codes {
+                for &nb in nbr_buf.iter() {
+                    codes.prefetch_lines(nb, 0, usize::MAX);
+                }
+            }
             for group in nbr_buf.chunks(4) {
-                let batch = if probe.quant.is_none() {
+                let batch = if codes.is_some() {
+                    self.code_batch4(probe, group)
+                } else if probe.quant.is_none() {
                     self.frozen_cosine_batch4(probe, group)
                 } else {
                     None
@@ -2577,13 +2729,30 @@ impl HnswIndex {
             for &nb in &nbr_buf {
                 probe.prefetch(nb);
             }
-            if probe.quant.is_none() {
+            let codes = self.build_codes.as_ref().filter(|_| probe.code.is_some());
+            if let Some(codes) = codes {
+                for &nb in &nbr_buf {
+                    codes.prefetch_lines(nb, 0, 1);
+                }
+                for &nb in nbr_buf.iter().take(4) {
+                    codes.prefetch_lines(nb, 1, usize::MAX);
+                }
+            } else if probe.quant.is_none() {
                 for &nb in &nbr_buf {
                     self.prefetch_frozen_vector(nb);
                 }
             }
-            for group in nbr_buf.chunks(4) {
-                let frozen = if BATCH && probe.quant.is_none() {
+            for (index, group) in nbr_buf.chunks(4).enumerate() {
+                if let Some(codes) = codes {
+                    for &nb in nbr_buf.iter().skip(4 * (index + 1)).take(4) {
+                        codes.prefetch_lines(nb, 1, usize::MAX);
+                    }
+                }
+                let frozen = if !BATCH {
+                    None
+                } else if codes.is_some() {
+                    self.code_batch4(probe, group)
+                } else if probe.quant.is_none() {
                     self.frozen_cosine_batch4(probe, group)
                 } else {
                     None
@@ -3199,8 +3368,14 @@ impl HnswIndex {
             .as_ref()
             .filter(|_| !stored_query)
             .and_then(|a| a.prepare_query(self.metric, &node_vec));
+        let code_query = self
+            .build_codes
+            .as_ref()
+            .filter(|_| arena.is_none())
+            .and_then(|codes| ScanQuery::new(&codes.codec, &node_vec));
         let probe = Probe {
             query: &node_vec,
+            code: code_query.as_ref(),
             quant: arena.as_ref().and_then(|a| {
                 if stored_query {
                     Some((a.as_ref(), a.codes_for(id), a.norm(id)))
@@ -3243,7 +3418,7 @@ impl HnswIndex {
                 // Edges are chosen on exact distances (see `selection_arena`);
                 // re-score the SQ8-navigated pool once per layer.
                 let ranked: std::borrow::Cow<'_, [Scored]> =
-                    if probe.quant.is_some() && !self.codes_only {
+                    if (probe.quant.is_some() || probe.code.is_some()) && !self.codes_only {
                         let mut exact: Vec<Scored> = found
                             .iter()
                             .map(|s| Scored {
@@ -3369,12 +3544,83 @@ impl HnswIndex {
             })
             .collect();
         self.frozen_rows = FrozenRows(rows);
+        self.build_codes = self
+            .build_codec
+            .take()
+            .and_then(|codec| Self::encode_build_codes(codec, &self.frozen_rows, threads));
         self.frozen_build_vectors.store(true, Ordering::Release);
         {
             let _reset = Reset(&self.frozen_build_vectors);
             self.link_all(threads);
         }
+        self.build_codes = None;
         self.frozen_rows = FrozenRows::default();
+    }
+
+    /// Encode every frozen row's navigation scan code across `threads`
+    /// workers. `None` when the optional workspace is not admitted; the build
+    /// then navigates on exact rows.
+    fn encode_build_codes(
+        codec: ScanCodec,
+        rows: &FrozenRows,
+        threads: usize,
+    ) -> Option<BuildCodes> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        let started = std::time::Instant::now();
+        let (count, stride) = (rows.0.len(), codec.record_len());
+        let bytes = count.checked_mul(stride)?.checked_add(count)?;
+        let charge = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::StorageScratch,
+            bytes,
+        )?;
+        let mut records = Vec::new();
+        records.try_reserve_exact(count * stride).ok()?;
+        records.resize(count * stride, 0u8);
+        let mut coded = vec![false; count];
+        let limit = codec.exact_residual_limit();
+        const ROWS_PER_TASK: usize = 4096;
+        let tasks: Vec<_> = records
+            .chunks_mut(ROWS_PER_TASK * stride)
+            .zip(coded.chunks_mut(ROWS_PER_TASK))
+            .enumerate()
+            .collect();
+        let tasks = parking_lot::Mutex::new(tasks);
+        crate::util::thread_spawn::scope(|scope| {
+            for _ in 0..threads.max(1) {
+                let (tasks, codec) = (&tasks, &codec);
+                scope.spawn(move || loop {
+                    let Some((task, (records, coded))) = tasks.lock().pop() else {
+                        break;
+                    };
+                    for (j, (record, coded)) in
+                        records.chunks_mut(stride).zip(coded.iter_mut()).enumerate()
+                    {
+                        let row = rows.0[task * ROWS_PER_TASK + j];
+                        // SAFETY: see `FrozenRows`.
+                        let vector =
+                            unsafe { std::slice::from_raw_parts(row.ptr, row.len as usize) };
+                        *coded = codec.encode(vector, record)
+                            && ScanCodec::record_residual(record) <= limit;
+                    }
+                });
+            }
+        });
+        if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
+            let exact = coded.iter().filter(|coded| !**coded).count();
+            eprintln!(
+                "[hnsw] build codes: {:?} (n={count} exact={exact})",
+                started.elapsed()
+            );
+        }
+        Some(BuildCodes {
+            codec,
+            stride,
+            records,
+            coded,
+            _charge: charge,
+        })
     }
 
     pub(crate) fn link_all(&self, threads: usize) {
@@ -3879,6 +4125,7 @@ impl HnswIndex {
             .as_ref()
             .and_then(|a| a.prepare_query(self.metric, query));
         let probe = Probe {
+            code: None,
             query,
             quant: match (arena.as_ref(), qcodes.as_ref()) {
                 (Some(a), Some((qc, qn))) => Some((a.as_ref(), qc.as_slice(), *qn)),
@@ -4524,6 +4771,7 @@ mod tests {
         let mut codes = vec![0; 2];
         old.quantize(&query, &mut codes);
         let probe = Probe {
+            code: None,
             query: &query,
             quant: Some((&old, &codes, super::super::distance::ssq_i8(&codes))),
             cosine_norm: None,
@@ -4894,6 +5142,7 @@ mod tests {
                     });
                     for quantized in [false, true] {
                         let probe = Probe {
+                            code: None,
                             query,
                             quant: if quantized {
                                 arena.as_ref().zip(codes.as_ref()).map(|(a, c)| {

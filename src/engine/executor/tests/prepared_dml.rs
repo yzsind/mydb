@@ -2030,6 +2030,93 @@ fn prepared_insert_select_streams_param_source_across_chunks() {
     assert_eq!(affected(resp), (n - 120) as u64);
 }
 
+/// Function-wrapped parameters take the row-independent path; values that
+/// read earlier columns or DEFAULT keep MySQL's left-to-right semantics.
+#[test]
+fn prepared_function_insert_skips_row_copies_and_keeps_column_references() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute(
+            "CREATE TABLE fn_rows (id INT PRIMARY KEY, a INT DEFAULT 7, b INT, \
+             v VECTOR(4), c VARBINARY(16))",
+        )
+        .unwrap();
+    let mut session = SessionContext::default();
+    let mut state = PreparedDmlState::default();
+    let independent = "INSERT INTO fn_rows (id, a, b, v, c) VALUES \
+        (?, ? + 1, ABS(?), VECTOR_FROM_BINARY(CAST(? AS BINARY), 'FLOAT32', 4), CAST(? AS BINARY))";
+    let prepared = engine.prepare_cached(&mut session, independent, 5).unwrap();
+    let vector: Vec<u8> = [1.0f32, -2.0, 0.5, 4.0]
+        .iter()
+        .flat_map(|v| v.to_le_bytes())
+        .collect();
+    let before = crate::engine::executor::insert::ROW_INDEPENDENT_INSERT_VALUE_ROWS
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let params = vec![
+        Value::Int(1),
+        Value::Int(10),
+        Value::Int(-3),
+        Value::Bytes(vector.clone()),
+        Value::Bytes(vec![0, 255]),
+    ];
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &prepared,
+                independent,
+                &params
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        1
+    );
+    assert!(
+        crate::engine::executor::insert::ROW_INDEPENDENT_INSERT_VALUE_ROWS
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > before
+    );
+    // `b` reads the `a` assigned earlier in the row; `DEFAULT(a)` reads the
+    // column default.
+    let dependent = "INSERT INTO fn_rows (id, a, b) VALUES (?, ? * 2, a + DEFAULT(a))";
+    let prepared = engine.prepare_cached(&mut session, dependent, 2).unwrap();
+    let params = vec![Value::Int(2), Value::Int(5)];
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &prepared,
+                dependent,
+                &params
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        1
+    );
+    assert_eq!(
+        result_rows(
+            engine
+                .execute("SELECT id, a, b, VECTOR_TO_STRING(v), HEX(c) FROM fn_rows ORDER BY id")
+                .unwrap()
+        ),
+        result_rows(
+            engine
+                .execute(
+                    "SELECT 1, 11, 3, VECTOR_TO_STRING(STRING_TO_VECTOR('[1,-2,0.5,4]')), '00FF' \
+                     UNION ALL SELECT 2, 10, 17, NULL, NULL"
+                )
+                .unwrap()
+        )
+    );
+}
+
 #[test]
 fn prepared_parameter_insert_uses_scalar_binding_and_preserves_typed_values() {
     let dir = tempfile::tempdir().unwrap();

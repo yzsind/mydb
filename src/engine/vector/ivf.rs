@@ -1,4 +1,5 @@
 //! Shared native IVF training parameters, sampling and numeric k-means.
+use super::centroids::{assignment_threads, PreparedCentroids, RowRef, EXACT};
 use super::distance::{self, Metric};
 
 /// IVF training parameters. Query effort is resolved from live session, hint
@@ -133,12 +134,31 @@ pub(crate) fn training_sample(n: usize, target: usize) -> Vec<usize> {
 /// vectors; returns `k·dim` row-major centroids. Empty clusters are reseeded to
 /// a strided sample so `nlist` lists always exist. For Cosine, centroids are
 /// re-normalized each iteration (spherical k-means).
+///
+/// The assign step ranks centroids with the blocked kernel of
+/// [`PreparedCentroids`]; rows (or centroid sets) outside its f32 key domain
+/// use the exact [`nearest_centroid`]. Both steps fan out over cores and are
+/// deterministic: the update sums each cluster's members in sample order, the
+/// same order as a serial pass, so `MYDB_IVF_BUILD_THREADS=1` reproduces the
+/// parallel result bit for bit.
 pub(super) fn kmeans<V: AsRef<[f32]> + Sync>(
     samples: &[V],
     k: usize,
     dim: usize,
     iters: usize,
     cosine: bool,
+) -> Vec<f32> {
+    let threads = assignment_threads(samples.len(), k, dim);
+    kmeans_with_threads(samples, k, dim, iters, cosine, threads)
+}
+
+fn kmeans_with_threads<V: AsRef<[f32]> + Sync>(
+    samples: &[V],
+    k: usize,
+    dim: usize,
+    iters: usize,
+    cosine: bool,
+    threads: usize,
 ) -> Vec<f32> {
     let n = samples.len();
     let k = k.clamp(1, n.max(1));
@@ -157,89 +177,56 @@ pub(super) fn kmeans<V: AsRef<[f32]> + Sync>(
     // update when all initial samples happen to prefer cluster 0, even though
     // the empty-cluster reseed has just changed the centroids.
     let mut assign = vec![u32::MAX; n];
-    // The assign step (each sample → nearest of `k` centroids) is the dominant
-    // O(n·k·dim) cost and embarrassingly parallel + deterministic (each sample
-    // independent, centroids read-only). Fan it out over the available cores
-    // for large training sets; tiny sets stay serial to dodge thread overhead.
-    let threads = kmeans_assign_threads(n, k, dim);
+    let mut next = vec![0u32; n];
+    let timing = std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some();
+    let (mut assign_time, mut update_time, mut rounds) =
+        (std::time::Duration::ZERO, std::time::Duration::ZERO, 0usize);
+    let rows: Option<Vec<RowRef<'_>>> = samples
+        .iter()
+        .map(|s| (s.as_ref().len() == dim).then(|| RowRef::from_f32(s.as_ref())))
+        .collect();
     for _ in 0..iters.max(1) {
+        rounds += 1;
+        let started = std::time::Instant::now();
         // Assign.
-        let changed = if threads > 1 {
-            kmeans_assign_parallel(samples, &centroids, k, dim, metric, &mut assign, threads)
+        let prepared = rows.as_ref().and_then(|rows| {
+            PreparedCentroids::new(centroids.clone(), dim, metric).zip(Some(rows))
+        });
+        if let Some((prepared, rows)) = prepared {
+            prepared.assign_parallel(rows, &mut next, threads);
+            for (i, slot) in next.iter_mut().enumerate() {
+                if *slot == EXACT {
+                    *slot =
+                        nearest_centroid(&centroids, k, dim, samples[i].as_ref(), metric) as u32;
+                }
+            }
         } else {
-            let mut changed = false;
-            for (i, s) in samples.iter().enumerate() {
-                let c = nearest_centroid(&centroids, k, dim, s.as_ref(), metric) as u32;
-                if c != assign[i] {
-                    assign[i] = c;
-                    changed = true;
-                }
-            }
-            changed
-        };
+            kmeans_assign_exact(samples, &centroids, k, dim, metric, &mut next, threads);
+        }
+        let changed = next != assign;
+        std::mem::swap(&mut assign, &mut next);
+        let assigned = std::time::Instant::now();
+        assign_time += assigned - started;
         // Update: mean of assigned samples.
-        let mut sums = vec![0f64; k * dim];
-        let mut counts = vec![0u32; k];
-        for (i, s) in samples.iter().enumerate() {
-            let c = assign[i] as usize;
-            counts[c] += 1;
-            let acc = &mut sums[c * dim..c * dim + dim];
-            for (a, &x) in acc.iter_mut().zip(s.as_ref().iter()) {
-                *a += x as f64;
-            }
-        }
-        for c in 0..k {
-            if counts[c] == 0 {
-                // Empty cluster: reseed to a strided sample to keep nlist cells.
-                let si = (c * 2654435761usize) % n;
-                centroids[c * dim..c * dim + dim].copy_from_slice(samples[si].as_ref());
-                continue;
-            }
-            let inv = 1.0 / counts[c] as f64;
-            for d in 0..dim {
-                centroids[c * dim + d] = (sums[c * dim + d] * inv) as f32;
-            }
-            if cosine {
-                let cs = &mut centroids[c * dim..c * dim + dim];
-                let norm: f32 = cs.iter().map(|x| x * x).sum::<f32>().sqrt();
-                if norm > 0.0 {
-                    for x in cs.iter_mut() {
-                        *x /= norm;
-                    }
-                }
-            }
-        }
+        kmeans_update(samples, &assign, &mut centroids, k, dim, cosine, threads);
+        update_time += assigned.elapsed();
         if !changed {
             break;
         }
     }
+    if timing {
+        eprintln!(
+            "[ivf] kmeans n={n} k={k} dim={dim} threads={threads} rounds={rounds} assign_ms={} update_ms={}",
+            assign_time.as_millis(),
+            update_time.as_millis()
+        );
+    }
     centroids
 }
 
-/// Worker count for the k-means assign step: 0/1 (serial) for small sets, else
-/// the core count clamped by the per-thread work. `MYDB_IVF_BUILD_THREADS`
-/// overrides (0/1 forces serial — the differential oracle).
-fn kmeans_assign_threads(n: usize, k: usize, dim: usize) -> usize {
-    if let Ok(v) = std::env::var("MYDB_IVF_BUILD_THREADS") {
-        if let Ok(t) = v.parse::<usize>() {
-            return t.max(1);
-        }
-    }
-    // Only worth parallelising when the per-iteration work is substantial.
-    if n < 4096 || k * dim < 4096 {
-        return 1;
-    }
-    crate::util::thread_spawn::available_parallelism()
-        .map(|c| c.get())
-        .unwrap_or(1)
-        .clamp(1, 16)
-}
-
-/// Parallel k-means assign: split the samples into `threads` disjoint index
-/// ranges, each writing its own slice of `assign`. Returns whether any
-/// assignment changed. Deterministic — identical to the serial loop, only the
-/// iteration is fanned out.
-fn kmeans_assign_parallel<V: AsRef<[f32]> + Sync>(
+/// Exact assign step (the oracle for exceptional domains): each sample to its
+/// nearest centroid by [`nearest_centroid`], over disjoint index ranges.
+fn kmeans_assign_exact<V: AsRef<[f32]> + Sync>(
     samples: &[V],
     centroids: &[f32],
     k: usize,
@@ -247,31 +234,90 @@ fn kmeans_assign_parallel<V: AsRef<[f32]> + Sync>(
     metric: Metric,
     assign: &mut [u32],
     threads: usize,
-) -> bool {
-    let n = samples.len();
-    let chunk = n.div_ceil(threads).max(1);
-    let any_changed = crate::util::thread_spawn::scope(|scope| {
-        let mut handles = Vec::new();
-        let mut base = 0usize;
-        for slice in assign.chunks_mut(chunk) {
-            let start = base;
-            base += slice.len();
-            handles.push(scope.spawn(move || {
-                let mut changed = false;
+) {
+    let chunk = samples.len().div_ceil(threads.max(1)).max(1);
+    crate::util::thread_spawn::scope(|scope| {
+        for (index, slice) in assign.chunks_mut(chunk).enumerate() {
+            let start = index * chunk;
+            scope.spawn(move || {
                 for (j, a) in slice.iter_mut().enumerate() {
-                    let c = nearest_centroid(centroids, k, dim, samples[start + j].as_ref(), metric)
+                    *a = nearest_centroid(centroids, k, dim, samples[start + j].as_ref(), metric)
                         as u32;
-                    if c != *a {
-                        *a = c;
-                        changed = true;
+                }
+            });
+        }
+    });
+}
+
+/// Update step: every centroid becomes the f64 mean of its members, summed in
+/// sample order (identical to one serial pass over the samples). Empty
+/// clusters are reseeded; Cosine centroids are re-normalized.
+fn kmeans_update<V: AsRef<[f32]> + Sync>(
+    samples: &[V],
+    assign: &[u32],
+    centroids: &mut [f32],
+    k: usize,
+    dim: usize,
+    cosine: bool,
+    threads: usize,
+) {
+    let n = samples.len();
+    // Counting sort of sample indices by cluster keeps sample order per cluster.
+    let mut offsets = vec![0usize; k + 1];
+    for &c in assign {
+        offsets[c as usize + 1] += 1;
+    }
+    for c in 0..k {
+        offsets[c + 1] += offsets[c];
+    }
+    let mut cursor = offsets.clone();
+    let mut members = vec![0u32; n];
+    for (i, &c) in assign.iter().enumerate() {
+        members[cursor[c as usize]] = i as u32;
+        cursor[c as usize] += 1;
+    }
+    let (offsets, members) = (&offsets, &members);
+    let update = |first: usize, out: &mut [f32]| {
+        let mut sums = vec![0f64; dim];
+        for (local, center) in out.chunks_exact_mut(dim).enumerate() {
+            let c = first + local;
+            let cluster = &members[offsets[c]..offsets[c + 1]];
+            if cluster.is_empty() {
+                // Empty cluster: reseed to a strided sample to keep nlist cells.
+                let si = (c * 2654435761usize) % n;
+                center.copy_from_slice(samples[si].as_ref());
+                continue;
+            }
+            sums.fill(0.0);
+            for &i in cluster {
+                for (a, &x) in sums.iter_mut().zip(samples[i as usize].as_ref().iter()) {
+                    *a += x as f64;
+                }
+            }
+            let inv = 1.0 / cluster.len() as f64;
+            for (x, &sum) in center.iter_mut().zip(&sums) {
+                *x = (sum * inv) as f32;
+            }
+            if cosine {
+                let norm: f32 = center.iter().map(|x| x * x).sum::<f32>().sqrt();
+                if norm > 0.0 {
+                    for x in center.iter_mut() {
+                        *x /= norm;
                     }
                 }
-                changed
-            }));
+            }
         }
-        handles.into_iter().any(|h| h.join().unwrap_or(false))
+    };
+    let per_thread = k.div_ceil(threads.max(1)).max(1);
+    if threads <= 1 || k < 2 {
+        return update(0, centroids);
+    }
+    crate::util::thread_spawn::scope(|scope| {
+        for (index, out) in centroids.chunks_mut(per_thread * dim).enumerate() {
+            let update = &update;
+            scope.spawn(move || update(index * per_thread, out));
+        }
     });
-    any_changed
 }
 
 #[cfg(test)]
@@ -322,6 +368,51 @@ mod tests {
             let tied = vec![0.0; 5 * dim];
             assert_eq!(nearest_centroid(&tied, 5, dim, &data[0].1, Metric::L2), 0);
         }
+    }
+
+    #[test]
+    fn kmeans_is_thread_count_independent_and_converges() {
+        for (dim, cosine) in [(768, true), (65, false), (3, true)] {
+            let data: Vec<Vec<f32>> = rows(3000, dim, 41)
+                .into_iter()
+                .map(|(_, mut v)| {
+                    if cosine {
+                        distance::normalize_in_place(&mut v);
+                    }
+                    v
+                })
+                .collect();
+            let serial = kmeans_with_threads(&data, 24, dim, 6, cosine, 1);
+            for threads in [2, 5, 16] {
+                let parallel = kmeans_with_threads(&data, 24, dim, 6, cosine, threads);
+                assert_eq!(
+                    serial.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    parallel.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "dim={dim} threads={threads}"
+                );
+            }
+            // Lloyd iterations never increase the inertia.
+            let metric = if cosine { Metric::Cosine } else { Metric::L2 };
+            let inertia = |centers: &[f32]| -> f64 {
+                data.iter()
+                    .map(|v| {
+                        let c = nearest_centroid(centers, 24, dim, v, metric);
+                        distance::ordering_distance(v, &centers[c * dim..(c + 1) * dim], metric)
+                    })
+                    .sum()
+            };
+            let first = kmeans_with_threads(&data, 24, dim, 1, cosine, 4);
+            assert!(
+                inertia(&serial) <= inertia(&first) * (1.0 + 1e-6),
+                "dim={dim}"
+            );
+        }
+        // Exceptional magnitudes take the exact assign path and stay finite.
+        let huge: Vec<Vec<f32>> = (0..64)
+            .map(|i| vec![(i % 4) as f32 * 1e20 + 1e19; 8])
+            .collect();
+        let centers = kmeans_with_threads(&huge, 4, 8, 5, false, 3);
+        assert!(centers.iter().all(|x| x.is_finite()));
     }
 
     #[test]

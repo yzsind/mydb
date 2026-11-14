@@ -1786,6 +1786,11 @@ fn eval_insert_value_rows(
 pub(super) static SIMPLE_INSERT_VALUE_ROWS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Non-simple rows whose values never read the row being built.
+#[cfg(test)]
+pub(super) static ROW_INDEPENDENT_INSERT_VALUE_ROWS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
 fn eval_insert_value_rows_borrowed(
     db: &Arc<Database>,
     table_name: &str,
@@ -1821,13 +1826,57 @@ fn eval_insert_default_bound(
     column: usize,
     current: &[Value],
 ) -> Result<Value, QueryError> {
-    let bound = crate::engine::expr::bind_column_defaults(expr, table, Some(column))?;
+    // Binding rewrites only DEFAULT nodes; skip copying trees without one.
+    let bound = if insert_expr_has_default(expr) {
+        std::borrow::Cow::Owned(crate::engine::expr::bind_column_defaults(
+            expr,
+            table,
+            Some(column),
+        )?)
+    } else {
+        std::borrow::Cow::Borrowed(expr)
+    };
     crate::engine::expr::binary_assignment_value(
         crate::engine::expr::eval_expr(&bound, table, current)?,
         &bound,
         table,
         &table.columns[column].data_type,
     )
+}
+
+fn insert_expr_has_default(expr: &Expr) -> bool {
+    crate::parser::visit::try_for_each_expr(expr, |node| {
+        if matches!(node, Expr::Default(_) | Expr::DefaultQualified(_)) {
+            Err(())
+        } else {
+            Ok(true)
+        }
+    })
+    .is_err()
+}
+
+/// Whether a VALUES expression may read the row being built: MySQL lets a
+/// value refer to columns assigned earlier in the same row, DEFAULT reads
+/// the column defaults, and a subquery may correlate with either.
+fn insert_expr_reads_row(expr: &Expr) -> bool {
+    crate::parser::visit::try_for_each_expr(expr, |node| {
+        if matches!(
+            node,
+            Expr::Identifier(_)
+                | Expr::CompoundIdentifier(_)
+                | Expr::Default(_)
+                | Expr::DefaultQualified(_)
+                | Expr::Subquery(_)
+                | Expr::Exists { .. }
+                | Expr::InSubquery { .. }
+                | Expr::QuantifiedComparison { .. }
+        ) {
+            Err(())
+        } else {
+            Ok(true)
+        }
+    })
+    .is_err()
 }
 
 /// One validation/evaluation order for owned and prepared VALUES. The static
@@ -1890,6 +1939,13 @@ where
             );
             continue;
         }
+        // Later values observe earlier assignments only through `current`;
+        // a row whose values never read it skips copying each value there.
+        let reads_row = !simple && expressions.iter().any(insert_expr_reads_row);
+        #[cfg(test)]
+        if !simple && !reads_row {
+            ROW_INDEPENDENT_INSERT_VALUE_ROWS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         let mut current = if simple {
             Vec::new()
         } else {
@@ -1932,7 +1988,7 @@ where
                     value =
                         crate::engine::expr::encode_binary_assignment_value(value, source_charset)?;
                 }
-                if !simple {
+                if reads_row {
                     current[column] = value.clone();
                 }
                 Ok(value)
