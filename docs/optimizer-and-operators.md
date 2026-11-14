@@ -14,7 +14,7 @@ can change batches, prefetching, and spill behavior within an operator.
 Statistics include row counts, distinct counts, NULL fractions, value
 frequencies, and histograms. Missing statistics use conservative estimates.
 After substantial DML, EXPLAIN can mark statistics as stale. Run
-[`ANALYZE TABLE`](statements/admin/analyze-table.md) and compare estimated with
+[`ANALYZE TABLE`](statement/admin/analyze-table.md) and compare estimated with
 actual rows before changing hints or cost settings.
 
 Estimates describe expected output, while access-row estimates describe the

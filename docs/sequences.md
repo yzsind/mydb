@@ -64,7 +64,7 @@ If remote_apply cannot be satisfied, the operation fails explicitly rather than 
 
 Initial setup can use `sequence_sync_policy` / `MYDB_SEQUENCE_SYNC_POLICY` and `sequence_sync_replicas` / `MYDB_SEQUENCE_SYNC_REPLICAS`; replicas is a comma-separated list of node UUIDs. After initialization, the catalog configuration is authoritative, and conflicting old environment settings cannot overwrite it. The initial configuration epoch is 1.
 
-Use [CHANGE MYDB SEQUENCE SYNC TO](statements/replication/change-mydb-sequence-sync.md) to change an existing primary. Obtain actual node UUIDs from `SHOW MYDB REPLICA STATUS` or `SHOW MYDB REPLICAS`, and increment the known current configuration epoch by one:
+Use [CHANGE MYDB SEQUENCE SYNC TO](statement/replication/change-mydb-sequence-sync.md) to change an existing primary. Obtain actual node UUIDs from `SHOW MYDB REPLICA STATUS` or `SHOW MYDB REPLICAS`, and increment the known current configuration epoch by one:
 
 ```sql
 STOP MASTER WRITES WAIT 30;

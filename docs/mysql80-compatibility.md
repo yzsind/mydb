@@ -56,7 +56,7 @@ production-grade MySQL replacement.
 | MySQL operations ecosystem | ◑/❌ | Common configuration/logging/privilege surfaces work; no Group Replication, Router, Shell/X, or plugin ABI |
 | mydb extensions | ➕ | VECTOR/HNSW/IVF, Zone Map, time travel, sequences, DML RETURNING, physical replication, and more |
 
-**➕ Table sampling:** `TABLESAMPLE` supports row/page sampling by percentage or exact row count, execution-time parameters, `REPEATABLE`, and parallel scans over user base tables and partitions. The default is `SYSTEM` percentage sampling. MySQL 8.0.46 has no equivalent TABLESAMPLE clause; see [SELECT table sampling](statements/query/select.md#table-sampling) for semantics and restrictions.
+**➕ Table sampling:** `TABLESAMPLE` supports row/page sampling by percentage or exact row count, execution-time parameters, `REPEATABLE`, and parallel scans over user base tables and partitions. The default is `SYSTEM` percentage sampling. MySQL 8.0.46 has no equivalent TABLESAMPLE clause; see [SELECT table sampling](statement/query/select.md#table-sampling) for semantics and restrictions.
 
 ---
 
@@ -103,16 +103,16 @@ production-grade MySQL replacement.
 - **Generated columns** (`GENERATED ALWAYS AS`, VIRTUAL / STORED): ✅
 - **Intentional DDL differences**: generated columns and functional indexes may reference an AUTO_INCREMENT column after its value has been assigned. MODIFY without an explicit character set preserves the column's current character set. SHOW CREATE consistently uses backticks, including under ANSI_QUOTES. CHECK accepts numeric truth values; statically string-valued non-boolean expressions are rejected with 3812. Unsupported algorithm/lock combinations use 1846; a duplicate key encountered during cascading updates can use 1062 instead of MySQL's context-specific 1761, with statement rollback preserved.
 - **INSTANT DROP and LOB space**: dropping a column preserves old row layouts and their LOB data without rewriting the heap. OPTIMIZE TABLE or a physical COPY rebuild removes the dropped values and reclaims their LOB space; the instantaneous drop itself does not promise immediate disk reclamation.
-- **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statements/metadata/show-tables.md). UPDATE_TIME is NULL when no reliable modification timestamp is available. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
+- **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statement/metadata/show-tables.md). UPDATE_TIME is NULL when no reliable modification timestamp is available. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
 - **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
 - **CHECK constraints**: ✅ all actions
 - **Foreign keys (FK)**: ✅ all four referential actions, including cascades
 - **Online CHECK / FK ALTER**: ➕ constraint-only ALTERs allow concurrent reads and writes by default, including CHECK add/enable/disable, FK add and DROP+ADD replacement, and atomic publication of multiple constraints. Preparation and publication use short write barriers; `LOCK=SHARED` allows reads and blocks writes, `LOCK=EXCLUSIVE` retains exclusive semantics. Enabling a not-yet-enabled CHECK, disabling, and dropping constraints do not scan existing data; weak lock requests in mixed column/index/partition actions fail explicitly.
-  See [ALTER TABLE](statements/ddl/alter-table.md) for supported syntax and boundaries.
+  See [ALTER TABLE](statement/ddl/alter-table.md) for supported syntax and boundaries.
 - **`ALTER TABLE ALGORITHM={INSTANT|INPLACE|COPY|DEFAULT}`**: ✅
   ➕ Column type changes within the supported range are online by default and also accept `COPY, LOCK=NONE`; strict mode covers LOBs, partitioning, and vector indexes under on-disk storage — see [Online Column Type Change](online-column-type-change.md).
-  Algorithms are validated against the actual work: adding generated columns or columns with enforced CHECKs requires COPY, and dropping a column whose index rebuilds cascade requires INPLACE; encoding-compatible constraint tightening only scans for validation under strict mode. Composite actions that cannot yet be published atomically return 1846 before modification. See [ALTER TABLE](statements/ddl/alter-table.md) for supported combinations.
+  Algorithms are validated against the actual work: adding generated columns or columns with enforced CHECKs requires COPY, and dropping a column whose index rebuilds cascade requires INPLACE; encoding-compatible constraint tightening only scans for validation under strict mode. Composite actions that cannot yet be published atomically return 1846 before modification. See [ALTER TABLE](statement/ddl/alter-table.md) for supported combinations.
 - **Online BTREE `ADD/CREATE INDEX` and `ADD PRIMARY KEY`**: ✅ Ordinary, unique, and primary key indexes allow concurrent DML during the Building phase by default, retaining sorted/bulk-load plus incremental catch-up; preparation and publication use read-compatible write barriers.
   Multi-index ALTERs that only add these indexes are also supported; `LOCK=SHARED` allows reads and blocks writes during the scan phase, and `LOCK=EXCLUSIVE` keeps exclusive access.
   The initiating statement always waits for Public or fails, regardless of `MYDB_DDL_ASYNC`, and never returns OK early.
@@ -126,7 +126,7 @@ production-grade MySQL replacement.
   Single-action column comment/default/visibility, index visibility, and table options/storage attributes/auto-increment options likewise use
   read-compatible barriers. Explicit `LOCK=EXCLUSIVE` still excludes readers.
   Column/generated-column changes that require a physical rewrite, rebuilds, and some partition publications still wait for readers, so not every
-  `ALTER TABLE` can be called read-nonblocking. See [ALTER TABLE](statements/ddl/alter-table.md).
+  `ALTER TABLE` can be called read-nonblocking. See [ALTER TABLE](statement/ddl/alter-table.md).
 - `information_schema.MYDB_DDL_JOBS` keeps the most recent 64 COPY jobs in COMMITTED/FAILED/CANCELLED terminal states, so background errors no longer vanish into logs; online change-log capacity is charged to
   `DdlOnlineLog`, and budget failure aborts the DDL instead of allowing ungoverned memory growth.
 - **Parallel B-tree and FULLTEXT `ADD/CREATE INDEX`**: ➕ supports `CREATE /*+ PARALLEL(n) */ INDEX`
@@ -212,7 +212,7 @@ rebuild. Empty tables still retain the necessary page/index metadata, so space
 does not drop all the way to zero. Optimization needs extra disk space for the
 old and new storage to coexist; concurrent writes may leave a small amount of
 new fragmentation in the new generation. `ALTER TABLE ... OPTIMIZE PARTITION`
-keeps its separate behavior. See [OPTIMIZE TABLE](statements/admin/optimize-table.md)
+keeps its separate behavior. See [OPTIMIZE TABLE](statement/admin/optimize-table.md)
 for syntax and operational limits.
 
 ### Partitioning
@@ -794,7 +794,7 @@ that cannot be used in persistent expressions such as generated columns.
 
 **✅** `CREATE [DEFINER=] {PROCEDURE|FUNCTION} [IF NOT EXISTS]` (IN/OUT/INOUT, RETURNS, DETERMINISTIC, SQL DATA ACCESS, SQL SECURITY, COMMENT), `ALTER`/`DROP`, `CALL`, `SHOW CREATE`, `SHOW {PROCEDURE|FUNCTION} STATUS`, `I_S.ROUTINES` (31 columns)/`PARAMETERS` (16 columns).
 
-As a mydb extension, `CREATE OR REPLACE [DEFINER=] {PROCEDURE|FUNCTION}` replaces the complete definition without a separate DROP. It supports changing parameters, function return types, and bodies, preserves routine grants, and requires CREATE ROUTINE plus ALTER ROUTINE when replacing an existing routine. Invalid definitions leave the old routine available. OR REPLACE and IF NOT EXISTS are mutually exclusive; ALTER continues to update characteristics only. See [CREATE PROCEDURE](statements/programmatic/create-procedure.md) and [CREATE FUNCTION](statements/programmatic/create-function.md).
+As a mydb extension, `CREATE OR REPLACE [DEFINER=] {PROCEDURE|FUNCTION}` replaces the complete definition without a separate DROP. It supports changing parameters, function return types, and bodies, preserves routine grants, and requires CREATE ROUTINE plus ALTER ROUTINE when replacing an existing routine. Invalid definitions leave the old routine available. OR REPLACE and IF NOT EXISTS are mutually exclusive; ALTER continues to update characteristics only. See [CREATE PROCEDURE](statement/programmatic/create-procedure.md) and [CREATE FUNCTION](statement/programmatic/create-function.md).
 
 Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` variables/CONDITION/CURSOR/HANDLER, `SET`, `SELECT…INTO`, `IF`/`CASE`, `LOOP`/`WHILE`/`REPEAT`, `LEAVE`/`ITERATE`, `RETURN`, `OPEN`/`FETCH`/`CLOSE`, `SIGNAL`/`RESIGNAL`, nested `CALL`, in-procedure `PREPARE`/`EXECUTE` dynamic SQL, and `GET [CURRENT|STACKED] DIAGNOSTICS`.
 
@@ -841,7 +841,7 @@ Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` 
 - CREATE/ALTER compound bodies support `BEGIN … END`, locals, branches, loops, and exception handling; one-shot PRESERVE events keep their definition after completion and become DISABLED.
 - Runtime modification after starting with `MYDB_EVENT_SCHEDULER=disabled` reports 1290; ON/OFF can be toggled dynamically.
 - AT/STARTS/ENDS do not accept numeric times (including MySQL's compact numeric date spellings); Unix seconds require explicit `FROM_UNIXTIME()`. EVERY rejects non-positive intervals, and each component is capped at 2147483647.
-- `LAST_EXECUTED` is shown in the event's time zone, and `DATABASE_COLLATION` stores the owning database's default collation. Syntax is in [CREATE EVENT](statements/programmatic/create-event.md).
+- `LAST_EXECUTED` is shown in the event's time zone, and `DATABASE_COLLATION` stores the owning database's default collation. Syntax is in [CREATE EVENT](statement/programmatic/create-event.md).
 
 ---
 
@@ -1287,7 +1287,7 @@ The following expression differences are retained:
 
 - [Product Feature Overview](feature-overview.md) — capability map and product boundaries
 - [Startup Configuration](configuration.md) — configuration files, environment variables, and precedence
-- [ALTER TABLE](statements/ddl/alter-table.md) — supported actions, algorithms, and locking boundaries
+- [ALTER TABLE](statement/ddl/alter-table.md) — supported actions, algorithms, and locking boundaries
 - [docs/hints.md](hints.md) — query hint syntax and behavior
 - [DML RETURNING](dml-returning.md) — PostgreSQL 18-style extension semantics
 - [Data Directory, Persistence, and Recovery](storage-format.md) — file roles, durability, and recovery boundaries

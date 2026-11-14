@@ -552,7 +552,7 @@ scans, and predicate pushdown recognize stable optimizable expressions.
 
 - [Data Types](data-types.md)
 - [SQL Function Index](function/README.md)
-- [SQL Syntax Notation and Common Conventions](statements/syntax-conventions.md)
-- [SELECT](statements/query/select.md)
+- [SQL Syntax Notation and Common Conventions](statement/syntax-conventions.md)
+- [SELECT](statement/query/select.md)
 - [MySQL 8.0 Compatibility Status](mysql80-compatibility.md)
 - [Query Execution](optimizer-and-operators.md#execution-modes-and-resource-limits)

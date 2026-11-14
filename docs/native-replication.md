@@ -87,7 +87,7 @@ This mechanism does not report replica snapshots back to the master and does not
    If sequence synchronization uses `remote_apply`, append the confirmed current
    `SEQUENCE_SYNC_EPOCH=<epoch>` after WAIT. Omitting it or supplying another
    epoch blocks promotion. Record the persisted epoch during preparation; see
-   [sequence synchronization administration](statements/replication/change-mydb-sequence-sync.md).
+   [sequence synchronization administration](statement/replication/change-mydb-sequence-sync.md).
 3. The old master runs `DEMOTE TO REPLICA WITH MASTER='new-primary:3316'`. If the old timeline is a parent of the new master and has not passed the fork LSN, streaming resumes directly; otherwise a divergence/resync is returned and WAL is never stitched together.
 
 Unplanned promotion only permits `PROMOTE TO MASTER FORCE FENCED`, with `SEQUENCE_SYNC_EPOCH=<epoch>` appended when strict sequence synchronization requires it. This command asserts that the operator has isolated the old master through external systems; the promotion point is the last `durable_applied_lsn`, and data after that point may be lost. mydb provides no automatic master election or consensus and cannot prevent split-brain without external fencing.

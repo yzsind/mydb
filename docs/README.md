@@ -20,7 +20,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 
 | Document | Contents |
 | --- | --- |
-| [SQL Statements](statements/README.md) | Statement categories, syntax, examples, and limitations |
+| [SQL Statements](statement/README.md) | Statement categories, syntax, examples, and limitations |
 | [SQL Functions](function/README.md) | Function categories and usage |
 | [Data Types](data-types.md) | Ranges, conversion, comparison, and indexing semantics |
 | [Operators and Expressions](operators-and-expressions.md) | Precedence, NULL handling, and evaluation |
@@ -66,7 +66,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | Document | Contents |
 | --- | --- |
 | [Optimizer and Query Execution](optimizer-and-operators.md) | Access paths, join algorithms, execution modes, EXPLAIN, and tuning |
-| [ANALYZE TABLE](statements/admin/analyze-table.md) | Statistics collection and concurrency boundaries |
+| [ANALYZE TABLE](statement/admin/analyze-table.md) | Statistics collection and concurrency boundaries |
 | [Performance Schema](performance-schema.md) | Runtime tables, collection, memory, and diagnostics |
 | [Metadata Naming](metadata-naming.md) | Canonical result names, native metadata views, and column units |
 | [SHOW STATUS](show-status.md) | Counters, scope, reset behavior, and compatibility |

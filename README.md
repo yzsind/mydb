@@ -260,7 +260,7 @@ MyDB minimizes DDL locking and query waiting by coordinating schema versions, in
 - **Read-compatible column changes**: adding columns without storage rewrites, compatible type modifications, and some metadata-only changes keep ordinary queries running.
 - **Constraints and charset settings**: online foreign keys, CHECK constraints, and default charset/collation metadata changes.
 
-"Lock-free DDL" is a design direction, not a current guarantee: publication still coordinates with write transactions, and replacing primary keys, rewriting column data, or converting charsets still takes locks. See [ALTER TABLE](docs/statements/ddl/alter-table.md) and the [DDL compatibility boundaries](docs/mysql80-compatibility.md#table-ddl).
+"Lock-free DDL" is a design direction, not a current guarantee: publication still coordinates with write transactions, and replacing primary keys, rewriting column data, or converting charsets still takes locks. See [ALTER TABLE](docs/statement/ddl/alter-table.md) and the [DDL compatibility boundaries](docs/mysql80-compatibility.md#table-ddl).
 
 ### Native vectors: from storage to large-scale similarity search
 
@@ -331,9 +331,9 @@ LIMIT 2;
 The INSERT returns IDs `1`, `2`, `3`; the query returns the two rows nearest to
 `[1,0,0]` by L2 distance. HNSW provides approximate nearest-neighbor search —
 recall and performance on larger collections depend on data and parameters. See
-[CREATE INDEX](docs/statements/ddl/create-index.md),
+[CREATE INDEX](docs/statement/ddl/create-index.md),
 [vector functions](docs/function/vector/README.md), and
-[INSERT RETURNING](docs/statements/dml/insert.md).
+[INSERT RETURNING](docs/statement/dml/insert.md).
 
 After configuring and authorizing `test.local_chat` and `test.local_embed`
 with the [Ollama setup](docs/ai.md#configure-ollama), try model calls through the
@@ -390,7 +390,7 @@ The full coverage map, transactional differences, and unsupported features are l
 
 Persistent DROP/TRUNCATE tables are protected by the default-on [recycle bin](docs/recycle-bin.md), including read-only inspection, restore and asynchronous reclamation.
 
-See [sequences](docs/statements/ddl/create-sequence.md), [series generation](docs/generate-series.md), [backup and recovery](docs/backup-and-recovery.md), and [native replication](docs/native-replication.md).
+See [sequences](docs/statement/ddl/create-sequence.md), [series generation](docs/generate-series.md), [backup and recovery](docs/backup-and-recovery.md), and [native replication](docs/native-replication.md).
 
 ## Compatibility boundaries
 
@@ -408,7 +408,7 @@ Unimplemented SQL or protocol capabilities return clear errors rather than faili
 | [Documentation index](docs/README.md) | Product, SQL, operations, and implementation docs |
 | [Feature overview](docs/feature-overview.md) | Capability map and implementation boundaries |
 | [AI model calls](docs/ai.md) / [Hybrid search](docs/hybrid-search.md) | Model setup, embeddings, generation, permissions, and retrieval fusion |
-| [SQL statements](docs/statements/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
+| [SQL statements](docs/statement/README.md) / [Functions](docs/function/README.md) | Syntax, semantics, and usage examples |
 | [Configuration guide](docs/configuration.md) / [Config template](mydb.cnf.example) | Startup options, environment variables, and runtime settings |
 | [Data directory and recovery](docs/storage-format.md) | File roles, format compatibility, durability, and crash recovery |
 

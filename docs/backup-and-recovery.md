@@ -559,7 +559,7 @@ See `mydb-backup --help` for complete arguments. Unknown commands, duplicate opt
 
 Related documentation:
 
-- [Backup SQL Reference](statements/backup/README.md)
+- [Backup SQL Reference](statement/backup/README.md)
 - [Startup Configuration](configuration.md)
 - [Native Physical Replication](native-replication.md)
 - [Storage Format Versions](storage-format-versions.md)
