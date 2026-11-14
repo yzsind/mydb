@@ -41,6 +41,22 @@ cover different development builds and TPC-derived results are unaudited. See
 the [detailed comparison](docs/performance-comparison.md) for all results, test
 conditions, and limitations.
 
+**MyDB vs. PostgreSQL 18.6 + pgvector 0.8.7** · Cohere 1M vectors (768-dim FLOAT32, cosine, top-100):
+
+| Workload | MyDB | pgvector | Advantage |
+| --- | ---: | ---: | ---: |
+| Bulk load · 1M vectors¹ | 34 s | 318 s | **9.4x speedup** |
+| HNSW index build · `m=16, ef_construction=64` | 53 s | 118 s | **2.2x speedup** |
+| HNSW search · recall 94.8% vs 94.4%, 16 clients | 5,200 queries/s · p99 5.6 ms | 1,954 queries/s · p99 14.7 ms | **2.7x throughput** |
+| HNSW search · same settings, 1 client | 670 queries/s | 179 queries/s | **3.7x throughput** |
+| IVF index build · 1,000 lists | 30 s | 99 s | **3.4x speedup** |
+| IVF search · recall 0.96, 16 clients² | 1,066 queries/s | 132 queries/s | **8.1x throughput** |
+
+Same 16-vCPU host, identical index parameters (HNSW `ef_search=200`, no
+quantization), and durable commits. ¹ Multi-row INSERT from the same client:
+binary prepared statements for MyDB, text literals for PostgreSQL.
+² pgvector IVFFlat `probes=64`; MyDB interpolated to the same recall.
+
 ## Quick Start
 
 Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from the
