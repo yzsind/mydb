@@ -9,6 +9,8 @@ pub(crate) struct MappedVectorNavigation {
     address: *mut libc::c_void,
     len: usize,
     meta: VectorMeta,
+    /// Per-dimension navigation scan code named by `meta`, if any.
+    codec: Option<std::sync::Arc<crate::engine::vector::scan_codes::ScanCodec>>,
     source_revision: u64,
     verified: Vec<AtomicU64>,
     records: Option<MappedRecordCache>,
@@ -215,6 +217,15 @@ impl VectorIndexFile {
         if !meta.finalized || meta.node_count == 0 {
             return Ok(false);
         }
+        // Decode the scan code before taking the view lock; a concurrent
+        // recalibration bumps the revision and voids this preparation.
+        let codec = self
+            .navigation_codec()?
+            .filter(|_| meta.nav_codec_valid)
+            .map(|(codec, _)| codec);
+        if meta.nav_codec_valid && codec.is_none() {
+            return Ok(false);
+        }
         let mut view = self.mapped_navigation.write();
         // A role transition may have disabled mapping while we waited here.
         if !self.mapping_allowed.load(Ordering::Acquire) {
@@ -328,6 +339,7 @@ impl VectorIndexFile {
             _mapping: image,
             len,
             meta,
+            codec,
             source_revision: revision,
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
             records,
@@ -807,16 +819,148 @@ impl MappedVectorNavigation {
         Ok(())
     }
 
+    /// The scan-code lane of a coded record (NAV_CODE set).
+    #[inline]
+    fn code_lane<'a>(&self, page: &'a [u8], offset: usize) -> Option<&'a [u8]> {
+        let flags = page[offset];
+        if flags & REC_FLAG_INITIALIZED == 0 || flags & REC_FLAG_NAV_CODE == 0 {
+            return None;
+        }
+        let dim = self.meta.dim as usize;
+        let start = offset + 10 + dim * 4;
+        Some(&page[start..start + dim + crate::engine::vector::scan_codes::RECORD_HEADER])
+    }
+
+    #[inline]
+    fn code_distance(
+        &self,
+        vid: VecId,
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+        code: &crate::engine::vector::scan_codes::ScanQuery,
+    ) -> Result<f64, QueryError> {
+        let (page, offset) = self.record(vid)?;
+        match self.code_lane(page, offset) {
+            Some(lane) => Ok(code.estimate(lane)),
+            None => Ok(query.score_bytes(self.exact_payload(vid, query.dimension())?)),
+        }
+    }
+
+    /// Navigation distances on scan codes: one code lane (`dim + 8` bytes)
+    /// per coded row instead of its `4 · dim`-byte exact row. Rows without a
+    /// code are scored exactly; `out[i]` belongs to `vids[i]`.
+    fn code_distances(
+        &self,
+        vids: &[VecId],
+        query: &crate::engine::vector::distance::PreparedF32Distance<'_>,
+        code: &crate::engine::vector::scan_codes::ScanQuery,
+        out: &mut Vec<f64>,
+    ) -> Result<(), QueryError> {
+        use crate::engine::vector::distance::prefetch_read;
+        // Lanes are 13 cache lines at 768 dimensions. Requesting every
+        // neighbour's lane at once overflows the core's fill buffers, so start
+        // with each record's first line and stream full lanes a few rows
+        // ahead of the scorer.
+        const AHEAD: usize = 4;
+        let dim = self.meta.dim as usize;
+        let lane_len = dim + crate::engine::vector::scan_codes::RECORD_HEADER;
+        let lane_address = |vid: VecId| -> Option<*const i8> {
+            let page = vid_page(vid) as usize;
+            if page >= self.len / PAGE_SIZE {
+                return None;
+            }
+            let offset = self.records.as_ref().and_then(|cache| cache.get(vid))?;
+            // SAFETY: a remembered offset was validated against this
+            // immutable mapping, so the lane lies inside it.
+            Some(unsafe {
+                self.address
+                    .cast::<i8>()
+                    .add(page * PAGE_SIZE + offset + 10 + dim * 4)
+                    .cast_const()
+            })
+        };
+        let prefetch_lane = |vid: VecId| {
+            if let Some(lane) = lane_address(vid) {
+                for position in (64..lane_len).step_by(64) {
+                    prefetch_read(lane.wrapping_add(position));
+                }
+            }
+        };
+        for &vid in vids {
+            let page = vid_page(vid) as usize;
+            if page >= self.len / PAGE_SIZE {
+                continue;
+            }
+            match lane_address(vid) {
+                Some(lane) => {
+                    // SAFETY: inside the mapping (see `lane_address`).
+                    let record = unsafe { lane.sub(10 + dim * 4) };
+                    prefetch_read(record);
+                    prefetch_read(lane);
+                }
+                // SAFETY: the page lies inside the live mapping.
+                None => prefetch_read(unsafe {
+                    self.address.cast::<i8>().add(page * PAGE_SIZE).cast_const()
+                }),
+            }
+        }
+        for &vid in vids.iter().take(AHEAD) {
+            prefetch_lane(vid);
+        }
+        out.clear();
+        out.resize(vids.len(), 0.0);
+        let mut lanes: [&[u8]; 4] = [&[]; 4];
+        let mut slots = [0usize; 4];
+        let mut pending = 0;
+        for (index, &vid) in vids.iter().enumerate() {
+            if let Some(&ahead) = vids.get(index + AHEAD) {
+                prefetch_lane(ahead);
+            }
+            let (page, offset) = self.record(vid)?;
+            match self.code_lane(page, offset) {
+                Some(lane) => {
+                    lanes[pending] = lane;
+                    slots[pending] = index;
+                    pending += 1;
+                    if pending == 4 {
+                        let estimates = code.estimate_batch4(lanes);
+                        for (slot, estimate) in slots.iter().zip(estimates) {
+                            out[*slot] = estimate;
+                        }
+                        pending = 0;
+                    }
+                }
+                None => {
+                    out[index] = query.score_bytes(self.exact_payload(vid, query.dimension())?);
+                }
+            }
+        }
+        for j in 0..pending {
+            out[slots[j]] = code.estimate(lanes[j]);
+        }
+        Ok(())
+    }
+
     pub(crate) fn search(
         &self,
         query: &[f32],
         k: usize,
         ef: usize,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        if let Some(codec) = &self.codec {
+            if self.meta.nav_exact_nodes < self.meta.node_count && query.len() == codec.dimension()
+            {
+                // Zero or non-finite queries have no code estimate.
+                if let Some(code) = crate::engine::vector::scan_codes::ScanQuery::new(codec, query)
+                {
+                    return self.search_impl::<false>(query, k, ef, Some(&code));
+                }
+            }
+            return self.search_impl::<true>(query, k, ef, None);
+        }
         if !self.meta.nav_quant_valid || self.meta.nav_exact_nodes >= self.meta.node_count {
-            self.search_impl::<true>(query, k, ef)
+            self.search_impl::<true>(query, k, ef, None)
         } else {
-            self.search_impl::<false>(query, k, ef)
+            self.search_impl::<false>(query, k, ef, None)
         }
     }
 
@@ -828,6 +972,7 @@ impl MappedVectorNavigation {
         query: &[f32],
         k: usize,
         ef: usize,
+        code: Option<&crate::engine::vector::scan_codes::ScanQuery>,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
         use crate::engine::vector::distance::{dot_i8, quantize_into, Metric};
         use crate::engine::vector::hnsw_core::Scored;
@@ -849,8 +994,10 @@ impl MappedVectorNavigation {
         };
         let explore_ties = metric != Metric::Dot || query.iter().any(|value| *value != 0.0);
         let mut normalized = Vec::new();
-        let quantized_navigation =
-            !EXACT && self.meta.nav_quant_valid && self.meta.nav_exact_nodes < self.meta.node_count;
+        let quantized_navigation = !EXACT
+            && code.is_none()
+            && self.meta.nav_quant_valid
+            && self.meta.nav_exact_nodes < self.meta.node_count;
         let src = if quantized_navigation && metric == Metric::Cosine {
             normalized.extend_from_slice(query);
             crate::engine::vector::distance::normalize_in_place(&mut normalized);
@@ -869,7 +1016,10 @@ impl MappedVectorNavigation {
         }
         let norm = dot_i8(&codes, &codes);
         let prepared = crate::engine::vector::distance::PreparedF32Distance::new(query, metric);
-        let distance = |vid| self.distance(vid, &prepared, &codes, norm);
+        let distance = |vid| match code {
+            Some(code) => self.code_distance(vid, &prepared, code),
+            None => self.distance(vid, &prepared, &codes, norm),
+        };
         let mut current = self.meta.entry_vid;
         if current == VEC_NO_VID || k == 0 {
             return Ok(Vec::new());
@@ -881,7 +1031,12 @@ impl MappedVectorNavigation {
             loop {
                 let previous = current;
                 self.neighbors(current, level, &mut neighbors)?;
-                self.distances(&neighbors, &prepared, &codes, norm, &mut distances)?;
+                match code {
+                    Some(code) => {
+                        self.code_distances(&neighbors, &prepared, code, &mut distances)?
+                    }
+                    None => self.distances(&neighbors, &prepared, &codes, norm, &mut distances)?,
+                }
                 for (&vid, &score) in neighbors.iter().zip(&distances) {
                     if score < best {
                         best = score;
@@ -974,7 +1129,10 @@ impl MappedVectorNavigation {
                     fresh.push(vid);
                 }
             }
-            self.distances(&fresh, &prepared, &codes, norm, &mut distances)?;
+            match code {
+                Some(code) => self.code_distances(&fresh, &prepared, code, &mut distances)?,
+                None => self.distances(&fresh, &prepared, &codes, norm, &mut distances)?,
+            }
             for (&vid, &score) in fresh.iter().zip(&distances) {
                 let furthest = results
                     .peek()
@@ -1010,6 +1168,19 @@ impl MappedVectorNavigation {
                 let (page, offset) = self.record(candidate.id)?;
                 if page[offset] & REC_FLAG_TOMBSTONE == 0 {
                     out.push((vec_unpack_row(read_u64(page, offset + 2)), candidate.dist));
+                }
+            }
+        } else if code.is_some() {
+            // Code estimates only navigated: score the pool exactly with the
+            // cached-norm kernel, then read identity and deletion state.
+            let ids: Vec<VecId> = candidates.iter().map(|candidate| candidate.id).collect();
+            for chunk in ids.chunks(8) {
+                let scores = self.exact_distances8(chunk, &prepared)?;
+                for (&vid, &distance) in chunk.iter().zip(&scores) {
+                    let (page, offset) = self.record(vid)?;
+                    if page[offset] & REC_FLAG_TOMBSTONE == 0 {
+                        out.push((vec_unpack_row(read_u64(page, offset + 2)), distance));
+                    }
                 }
             }
         } else {

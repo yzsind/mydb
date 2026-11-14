@@ -1938,7 +1938,7 @@ impl Database {
         // Persist the SQ8 calibration before any node image is written. Every
         // build route now materialises its navigation row with the exact
         // vector, so the first query never performs an index-wide arena scan.
-        paged.set_navigation_quantization(stats.quantization_params())?;
+        paged.install_build_navigation(&stats)?;
 
         let raw_mode = std::env::var("MYDB_HNSW_BULK_MODE")
             .unwrap_or_else(|_| "auto".to_string())
@@ -2081,6 +2081,11 @@ impl Database {
             HnswColdBuildMode::FullMemory => {
                 let mut graph = HnswIndex::new(metric, m, ef_construction)
                     .without_navigation_quantization()
+                    .with_build_navigation_codec(
+                        crate::engine::vector::hnsw::build_navigation_code_enabled()
+                            .then(|| stats.navigation_codec())
+                            .flatten(),
+                    )
                     .with_build_reservation(
                         lease.as_mut().expect("admitted full build").take_charge(),
                         stats.rows(),
@@ -2169,7 +2174,8 @@ impl Database {
         // it only after releasing the larger construction reservation so
         // CREATE INDEX does not transiently double-charge both workspaces.
         drop(lease.take());
-        if stats.quantization_params().is_none() {
+        paged.publish_navigation_codec()?;
+        if !paged.has_navigation_lane() {
             paged.note_navigation_calibration_infeasible();
         }
         paged.refresh_query_navigation()?;

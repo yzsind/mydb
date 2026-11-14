@@ -138,6 +138,18 @@ fn paged_quant_enabled_uncached() -> bool {
     super::hnsw_core::quant_enabled_uncached()
 }
 
+/// `MYDB_HNSW_NAV_CODE=0` keeps FLOAT32 indexes that fail global SQ8
+/// calibration on exact navigation instead of a per-dimension scan code.
+fn navigation_code_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !matches!(
+            std::env::var("MYDB_HNSW_NAV_CODE").as_deref(),
+            Ok("0" | "off" | "OFF" | "false" | "FALSE")
+        )
+    })
+}
+
 /// Source vector for SQ8 query quantization: a unit-normalized copy for Cosine
 /// (the arena codes are unit-normalized, so the query must match), or the input
 /// borrowed unchanged otherwise. A zero vector has no direction → left as-is.
@@ -2224,6 +2236,7 @@ impl PagedHnsw {
         (self.metric, self.m, self.ef_construction)
     }
 
+    #[cfg(test)]
     pub(crate) fn set_navigation_quantization(
         &self,
         params: Option<(f32, f32, f32)>,
@@ -2237,8 +2250,63 @@ impl PagedHnsw {
         )
     }
 
+    /// Install a cold build's navigation lane before any node is written:
+    /// global SQ8 when one step resolves every axis, else a staged
+    /// per-dimension scan code that the build publishes after its image.
+    pub(crate) fn install_build_navigation(
+        &self,
+        stats: &super::hnsw::CompactHnswStats,
+    ) -> Result<(), QueryError> {
+        self.invalidate_query_navigation();
+        let enabled = self.navigation_quant_enabled && paged_quant_enabled();
+        if enabled && self.metric != Metric::Dot {
+            if let Some(params) = stats.quantization_params() {
+                return self.file.set_navigation_quantization(Some(params));
+            }
+        }
+        match stats
+            .navigation_codec()
+            .filter(|_| enabled && navigation_code_enabled())
+        {
+            Some(codec) => self.file.stage_navigation_codec(codec),
+            None => self.file.set_navigation_quantization(None),
+        }
+    }
+
+    /// Make a staged build scan code durable (no-op when none is staged).
+    pub(crate) fn publish_navigation_codec(&self) -> Result<(), QueryError> {
+        self.invalidate_query_navigation();
+        self.file.publish_navigation_codec()
+    }
+
+    pub(crate) fn has_navigation_lane(&self) -> bool {
+        self.file.has_navigation_lane()
+    }
+
+    /// Whether the persisted lane is stale enough to recalibrate: absent, or
+    /// (scan code) more than one row in eight navigating exactly. Global SQ8
+    /// additionally treats any exact row as stale at refresh time because the
+    /// compact arena requires a fully coded graph.
+    fn navigation_lane_stale(&self, strict_global: bool) -> bool {
+        let meta = self.file.meta();
+        if meta.nav_quant_valid {
+            return if strict_global {
+                meta.nav_exact_nodes != 0
+            } else {
+                meta.nav_exact_nodes > meta.node_count / 8
+            };
+        }
+        !meta.nav_codec_valid || meta.nav_exact_nodes > meta.node_count / 8
+    }
+
+    fn navigation_recalibration_enabled(&self) -> bool {
+        self.navigation_quant_enabled
+            && paged_quant_enabled()
+            && (self.metric != Metric::Dot || navigation_code_enabled())
+    }
+
     fn ensure_navigation_quantization(&self, vector: &[f32]) -> Result<(), QueryError> {
-        if self.metric == Metric::Dot || !(self.navigation_quant_enabled && paged_quant_enabled()) {
+        if !self.navigation_recalibration_enabled() {
             return Ok(());
         }
         let count = self.file.node_count();
@@ -2258,9 +2326,7 @@ impl PagedHnsw {
                     .unwrap_or(u64::MAX),
                 Ordering::Release,
             );
-            if self.file.navigation_quantization().is_none()
-                || self.file.meta().nav_exact_nodes > count / 8
-            {
+            if self.navigation_lane_stale(false) {
                 self.invalidate_query_navigation();
                 self.file.recalibrate_navigation(vector)?;
             }
@@ -2583,15 +2649,13 @@ impl PagedHnsw {
         }) {
             return Ok(());
         }
-        if self.metric != Metric::Dot
-            && (self.navigation_quant_enabled && paged_quant_enabled())
-            && (self.file.navigation_quantization().is_none()
-                || self.file.meta().nav_exact_nodes != 0)
+        if self.navigation_recalibration_enabled()
+            && self.navigation_lane_stale(true)
             && self.calibration_infeasible_at.load(Ordering::Acquire) != self.file.node_count()
         {
             self.invalidate_query_navigation();
             self.file.recalibrate_navigation(&[])?;
-            if self.file.navigation_quantization().is_none() {
+            if !self.file.has_navigation_lane() {
                 self.calibration_infeasible_at
                     .store(self.file.node_count(), Ordering::Release);
             }
@@ -5231,7 +5295,7 @@ impl PagedHnsw {
         (
             meta.node_next_page_id.saturating_sub(1),
             meta.nav_exact_nodes,
-            if self.file.navigation_quantization().is_some() {
+            if self.file.has_navigation_lane() {
                 self.node_count().saturating_sub(meta.nav_exact_nodes)
             } else {
                 0

@@ -465,6 +465,10 @@ construction graph is admitted; only compressed payloads survive publication. Th
   after reopen rather than persisted separately.
 - `MYDB_HNSW_MAPPED_NAVIGATION=0` disables direct mapping for differential
   diagnostics. Memory-only durability also bypasses mapping.
+- `MYDB_HNSW_NAV_CODE=0` keeps unquantized FLOAT32 HNSW indexes whose data
+  cannot use one global SQ8 step on exact navigation instead of a
+  per-dimension 8-bit scan code. It applies when an index is built or
+  recalibrated; final candidates are always rescored exactly.
 - `MYDB_HNSW_QUERY_CACHE_MB` controls optional HNSW navigation caches, not the
   direct file mapping. Compact graph and payload caches default to two thirds
   of the memory target, capped at 1 GiB per index; aggregate admission still

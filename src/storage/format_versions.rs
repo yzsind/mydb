@@ -60,7 +60,9 @@ pub const OVERFLOW_VERSION: u16 = 4;
 /// v4 records the committed heap coverage frontier.
 /// v7 persists native node membership and trained index definitions.
 /// v8 adds native IVF scan-code pages and the scan codec in IVF definitions.
-pub const PAGED_HNSW_INDEX_VERSION: u32 = 8;
+/// v9 widens the FLOAT32 navigation lane to `dim + 8` bytes so it can hold a
+/// per-dimension scan code, named by an overflow chain from the meta page.
+pub const PAGED_HNSW_INDEX_VERSION: u32 = 9;
 pub const PAGED_HNSW_PAGE_VERSION: u16 = 4;
 pub const ZONE_MAP_VERSION: u32 = 6;
 /// Zone Map v6 uses shared-buffer-pool pages and physical redo. Page v2 adds

@@ -127,6 +127,59 @@ impl ScanCodec {
         self.low.len()
     }
 
+    /// A codec over explicit per-dimension coded-space ranges (`low[i]` ≤
+    /// `high[i]`, finite). Values outside a range are clamped when encoded;
+    /// their recorded residual keeps every bound exact. `None` when a range
+    /// is not representable.
+    pub(crate) fn from_ranges(metric: Metric, low: &[f64], high: &[f64]) -> Option<Self> {
+        if low.is_empty()
+            || low.len() != high.len()
+            || !matches!(metric, Metric::L2 | Metric::Cosine | Metric::Dot)
+        {
+            return None;
+        }
+        let mut codec = Self {
+            metric,
+            low: Vec::with_capacity(low.len()),
+            scale: Vec::with_capacity(low.len()),
+        };
+        for (&lo, &hi) in low.iter().zip(high) {
+            if !lo.is_finite() || !hi.is_finite() {
+                return None;
+            }
+            let base = lo as f32;
+            let step = ((hi.max(lo) - f64::from(base)) / LEVELS).max(0.0) as f32;
+            if !base.is_finite() || !step.is_finite() {
+                return None;
+            }
+            codec.low.push(base);
+            codec.scale.push(step);
+        }
+        Some(codec)
+    }
+
+    pub(crate) fn metric(&self) -> Metric {
+        self.metric
+    }
+
+    /// Residual norm above which a row's code is too coarse to navigate on:
+    /// four times the RMS rounding error of a row inside every range, so
+    /// only rows clamped by a clipped range exceed it.
+    pub(crate) fn exact_residual_limit(&self) -> f32 {
+        let rounding: f64 = self
+            .scale
+            .iter()
+            .map(|&step| f64::from(step) * f64::from(step) / 12.0)
+            .sum();
+        (4.0 * rounding.sqrt()) as f32
+    }
+
+    /// Recorded residual norm `‖y − ŷ‖` of an encoded record.
+    #[inline]
+    pub(crate) fn record_residual(record: &[u8]) -> f32 {
+        f32::from_le_bytes([record[0], record[1], record[2], record[3]])
+    }
+
     pub(crate) fn record_len(&self) -> usize {
         RECORD_HEADER + self.dimension()
     }
@@ -268,6 +321,39 @@ impl ScanQuery {
             squared,
             exact_rounding,
         })
+    }
+
+    /// Code estimate of the row's ordering distance, on the scale of the
+    /// exact scorers (`1 − cos`, `−dot`, squared L2). It navigates; only
+    /// [`Self::bounds`] or an exact score may decide a result.
+    #[inline]
+    pub(crate) fn estimate(&self, record: &[u8]) -> f64 {
+        self.estimate_from_dot(record, self.weights.dot(&record[RECORD_HEADER..]))
+    }
+
+    /// [`Self::estimate`] for four records at once; each lane equals the
+    /// single-record value.
+    #[inline]
+    pub(crate) fn estimate_batch4(&self, records: [&[u8]; 4]) -> [f64; 4] {
+        let dots = self
+            .weights
+            .dot_batch4(records.map(|record| &record[RECORD_HEADER..]));
+        std::array::from_fn(|j| self.estimate_from_dot(records[j], dots[j]))
+    }
+
+    #[inline]
+    fn estimate_from_dot(&self, record: &[u8], dot: f64) -> f64 {
+        let estimate = self.bias + dot;
+        match self.metric {
+            Metric::Cosine => 1.0 - estimate,
+            Metric::Dot => -estimate,
+            _ => {
+                let coded_norm = f64::from(f32::from_le_bytes([
+                    record[4], record[5], record[6], record[7],
+                ]));
+                (self.squared + coded_norm * coded_norm - 2.0 * estimate).max(0.0)
+            }
+        }
     }
 
     /// Lower and upper bounds of the exact ordering distance of the row
@@ -463,6 +549,68 @@ impl CodeWeights {
             }
         }
     }
+}
+
+impl CodeWeights {
+    /// [`Self::dot`] of four code rows (each at least as long as the
+    /// weights); every lane is identical to the single-row result.
+    #[inline]
+    pub(crate) fn dot_batch4(&self, codes: [&[u8]; 4]) -> [f64; 4] {
+        match self.kernel {
+            #[cfg(target_arch = "x86_64")]
+            CodeKernel::Vnni => {
+                let len = codes
+                    .iter()
+                    .fold(self.integer.len(), |len, row| len.min(row.len()));
+                // SAFETY: `CodeKernel::detected` confirmed AVX-512F/BW/VNNI;
+                // `len` bounds every load of every row.
+                let sums = unsafe {
+                    integer_codes_vnni_batch4(codes.map(<[u8]>::as_ptr), self.integer.as_ptr(), len)
+                };
+                sums.map(|sum| self.shift + sum as f64 * self.inverse_scale)
+            }
+            CodeKernel::Float(_) => codes.map(|row| self.dot(row)),
+        }
+    }
+}
+
+/// [`integer_codes_vnni`] over four rows sharing each weight load. Every
+/// accumulator sees the same per-block product count as the single-row
+/// kernel (32 per lane per 1024 dimensions), so sums stay exact.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn integer_codes_vnni_batch4(
+    codes: [*const u8; 4],
+    weights: *const i16,
+    len: usize,
+) -> [i64; 4] {
+    use std::arch::x86_64::*;
+    let mut total = [0i64; 4];
+    let mut i = 0;
+    while i + 32 <= len {
+        let block_end = (i + 1024).min(len - (len - i) % 32);
+        let mut acc = [_mm512_setzero_si512(); 4];
+        while i + 32 <= block_end {
+            let w = _mm512_loadu_si512(weights.add(i).cast());
+            for (row, acc) in acc.iter_mut().enumerate() {
+                let c = _mm512_cvtepu8_epi16(_mm256_loadu_si256(codes[row].add(i).cast()));
+                *acc = _mm512_dpwssd_epi32(*acc, c, w);
+            }
+            i += 32;
+        }
+        for (row, acc) in acc.iter().enumerate() {
+            let low = _mm512_cvtepi32_epi64(_mm512_castsi512_si256(*acc));
+            let high = _mm512_cvtepi32_epi64(_mm512_extracti64x4_epi64::<1>(*acc));
+            total[row] += _mm512_reduce_add_epi64(_mm512_add_epi64(low, high));
+        }
+    }
+    while i < len {
+        for (row, total) in total.iter_mut().enumerate() {
+            *total += i64::from(*codes[row].add(i)) * i64::from(*weights.add(i));
+        }
+        i += 1;
+    }
+    total
 }
 
 /// `Σ weights[i] · codes[i]` in f32 with at most `len / 8 + 32` sequential
@@ -768,6 +916,72 @@ mod tests {
         let codec = ScanCodec::train(32, Metric::L2, flat.iter().map(Vec::as_slice)).unwrap();
         assert!(codec.encode(&flat[0], &mut record));
         assert_eq!(f32::from_le_bytes(record[..4].try_into().unwrap()), 0.0);
+    }
+
+    #[test]
+    fn batch_dots_match_single_rows_for_every_kernel() {
+        let mut rng = Rng(0xba7c4);
+        for len in [1usize, 31, 32, 33, 768, 1024, 1056, 2049] {
+            let weights: Vec<f64> = (0..len).map(|_| (rng.next() - 0.5) * 1e-2).collect();
+            let rows: Vec<Vec<u8>> = (0..4)
+                .map(|_| (0..len + 1).map(|_| (rng.next() * 256.0) as u8).collect())
+                .collect();
+            for kernel in CodeKernel::supported() {
+                let prepared = CodeWeights::with_kernel(&weights, kernel).unwrap();
+                // Unaligned starts exercise unaligned loads.
+                let batch = prepared.dot_batch4(std::array::from_fn(|j| &rows[j][1..]));
+                for j in 0..4 {
+                    assert_eq!(
+                        batch[j].to_bits(),
+                        prepared.dot(&rows[j][1..]).to_bits(),
+                        "{kernel:?} len={len} row={j}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Navigation estimates lie inside the strict bounds, so mixing them with
+    /// exact scores in one candidate heap never needs a rescaling.
+    #[test]
+    fn estimates_lie_within_bounds_for_clipped_ranges() {
+        let dim = 64;
+        for metric in [Metric::Cosine, Metric::L2, Metric::Dot] {
+            let mut rng = Rng(0xe57 + metric.as_u8() as u64);
+            let rows: Vec<Vec<f32>> = (0..200).map(|_| rng.vector(dim, 0.1, 2.0)).collect();
+            // Ranges deliberately narrower than the data clamp some values.
+            let (mut low, mut high) = (vec![-0.4f64; dim], vec![0.5f64; dim]);
+            if metric == Metric::Cosine {
+                low.fill(-0.15);
+                high.fill(0.2);
+            }
+            low[3] = 0.0;
+            high[3] = 0.0; // a constant dimension
+            let codec = ScanCodec::from_ranges(metric, &low, &high).unwrap();
+            let limit = codec.exact_residual_limit();
+            assert!(limit.is_finite() && limit > 0.0);
+            let mut records = vec![vec![0u8; codec.record_len()]; rows.len()];
+            for (row, record) in rows.iter().zip(&mut records) {
+                assert!(codec.encode(row, record));
+            }
+            for query in rows.iter().take(8) {
+                for kernel in CodeKernel::supported() {
+                    let prepared = ScanQuery::with_kernel(&codec, query, kernel).unwrap();
+                    for group in records.chunks_exact(4) {
+                        let batch =
+                            prepared.estimate_batch4(std::array::from_fn(|j| group[j].as_slice()));
+                        for (record, estimate) in group.iter().zip(batch) {
+                            assert_eq!(estimate.to_bits(), prepared.estimate(record).to_bits());
+                            let (lo, hi) = prepared.bounds(record);
+                            assert!(lo <= estimate && estimate <= hi, "{metric:?} {kernel:?}");
+                        }
+                    }
+                }
+            }
+        }
+        assert!(ScanCodec::from_ranges(Metric::Cosine, &[0.0], &[f64::NAN]).is_none());
+        assert!(ScanCodec::from_ranges(Metric::Hamming, &[0.0], &[1.0]).is_none());
+        assert!(ScanCodec::from_ranges(Metric::L2, &[], &[]).is_none());
     }
 
     #[test]

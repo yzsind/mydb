@@ -324,11 +324,11 @@ impl Database {
         self.ensure_writable()?;
         let relative = self.relative_path(path);
         let mut last = 0;
+        let started = std::time::Instant::now();
         crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
-            let (sender, receiver) =
-                std::sync::mpsc::sync_channel::<Result<crate::wal::PreEncodedRecord, QueryError>>(
-                    QUEUED,
-                );
+            let (sender, receiver) = std::sync::mpsc::sync_channel::<
+                Result<crate::wal::PreEncodedRecord, QueryError>,
+            >(QUEUED);
             let (file, relative) = (&file, &relative);
             let producer = scope.spawn(move || {
                 let mut offset = 0u64;
@@ -361,28 +361,57 @@ impl Database {
                     offset += count as u64;
                 }
             });
+            // Make already-appended chunks durable while later ones are still
+            // being appended, so the final sync only covers the tail. A sync
+            // request is skipped (never queued) while one is in flight.
+            const SYNC_EVERY: u64 = 256 * 1024 * 1024;
+            let (sync_sender, sync_receiver) = std::sync::mpsc::sync_channel::<u64>(0);
+            let log = &self.log;
+            let syncer = scope.spawn(move || -> Result<(), QueryError> {
+                for lsn in sync_receiver {
+                    crate::wal::LogManager::sync_durable_to(log, lsn)?;
+                }
+                Ok(())
+            });
             let mut appended = Ok(());
+            let mut unsynced = 0u64;
             for record in receiver {
-                match record.and_then(|pre| {
-                    crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
-                }) {
-                    Ok(lsn) => last = lsn,
+                match record
+                    .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre))
+                {
+                    Ok(lsn) => {
+                        last = lsn;
+                        unsynced += CHUNK as u64;
+                        if unsynced >= SYNC_EVERY && sync_sender.try_send(lsn).is_ok() {
+                            unsynced = 0;
+                        }
+                    }
                     Err(err) => {
                         appended = Err(err);
                         break;
                     }
                 }
             }
-            producer.join().map_err(|_| {
+            drop(sync_sender);
+            let panicked = || {
                 error(
                     crate::error::catalog::ER_GET_ERRNO,
                     "vector image logging worker panicked",
                 )
-            })?;
-            appended
+            };
+            producer.join().map_err(|_| panicked())?;
+            let synced = syncer.join().map_err(|_| panicked())?;
+            appended.and(synced)
         })?;
+        let appended = started.elapsed();
         crate::wal::LogManager::sync_durable_to(&self.log, last)?;
         persist_vector_image_receipt(path, last)?;
+        if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
+            eprintln!(
+                "[paged] wal image: bytes={total} append={appended:?} total={:?}",
+                started.elapsed()
+            );
+        }
         Ok(last)
     }
 
