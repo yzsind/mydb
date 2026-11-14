@@ -4059,6 +4059,93 @@ fn ivf_knn_matches_bruteforce_full_probe() {
     );
 }
 
+/// CREATE INDEX over a populated table takes the parallel bulk build, and
+/// queries scan the mapped paged lists in batches. Full-probe COSINE KNN must
+/// still equal brute force, before and after post-build DML, for unquantized
+/// and SQ8 indexes.
+#[test]
+fn paged_ivf_bulk_build_and_mapped_scan_match_bruteforce() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    let cosine = |a: &[f32], b: &[f32]| -> f64 {
+        let dot: f64 = a.iter().zip(b).map(|(&x, &y)| x as f64 * y as f64).sum();
+        let na: f64 = a.iter().map(|&x| x as f64 * x as f64).sum();
+        let nb: f64 = b.iter().map(|&x| x as f64 * x as f64).sum();
+        1.0 - dot / (na.sqrt() * nb.sqrt())
+    };
+    let top = |vectors: &[Vec<f32>], query: &[f32], k: usize| -> Vec<i64> {
+        let mut scored: Vec<(f64, i64)> = vectors
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i as i64 + 1, v))
+            .filter(|(id, v)| !v.is_empty() && *id > 0)
+            .map(|(id, v)| (cosine(v, query), id))
+            .collect();
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        scored.into_iter().take(k).map(|(_, id)| id).collect()
+    };
+    for quantization in ["none", "sq8"] {
+        let dir = tempfile::tempdir().unwrap();
+        let mut engine = open_strict_test_engine(dir.path());
+        let dim = 64;
+        let mut vectors = gen_vectors(2500, dim, 0x5151_7272_9393_A4A4);
+        engine
+            .execute("CREATE TABLE items (id INT PRIMARY KEY, emb VECTOR(64) NOT NULL)")
+            .unwrap();
+        bulk_insert_vectors(&engine, &vectors);
+        engine
+            .execute(&format!(
+                "CREATE INDEX idx_emb ON items(emb) USING IVF \
+                 WITH (metric=COSINE, nlist=16, quantization={quantization})"
+            ))
+            .unwrap();
+        let check = |engine: &StorageQueryEngine, vectors: &[Vec<f32>], seed: u64| {
+            let k = 10;
+            let mut matched = 0;
+            for query in gen_vectors(5, dim, seed) {
+                let sql = format!(
+                    "SELECT /*+ IVF_NPROBE(16) */ id FROM items \
+                     ORDER BY DISTANCE(emb, '{}', 'COSINE') LIMIT {k}",
+                    vec_text(&query)
+                );
+                assert!(explain_mentions_vector_index(engine, &sql), "{sql}");
+                let got = id_list(engine, &sql);
+                let want = top(vectors, &query, k);
+                if quantization == "none" {
+                    assert_eq!(got, want, "full-probe unquantized IVF is exact");
+                }
+                matched += got.iter().filter(|id| want.contains(id)).count();
+            }
+            assert!(matched >= 45, "{quantization}: matched {matched}/50");
+        };
+        check(&engine, &vectors, 0x0101_0202_0303_0404);
+        // Post-build DML: single-row assignment must agree with the bulk lists.
+        let extra = gen_vectors(300, dim, 0x7777_8888_9999_AAAA);
+        bulk_insert_vectors_at(&engine, &extra, vectors.len() + 1);
+        vectors.extend(extra);
+        engine
+            .execute("DELETE FROM items WHERE id % 7 = 0")
+            .unwrap();
+        for (i, v) in vectors.iter_mut().enumerate() {
+            if (i + 1) % 7 == 0 {
+                v.clear(); // deleted: excluded from the brute-force oracle
+            }
+        }
+        check(&engine, &vectors, 0x0505_0606_0707_0808);
+        // Reopen: the paged index reloads its lists and scan-code pages.
+        drop(engine);
+        engine = open_strict_test_engine(dir.path());
+        check(&engine, &vectors, 0x0909_0a0a_0b0b_0c0c);
+        let more = gen_vectors(200, dim, 0x1212_3434_5656_7878);
+        bulk_insert_vectors_at(&engine, &more, vectors.len() + 1);
+        vectors.extend(more);
+        check(&engine, &vectors, 0x0d0d_0e0e_0f0f_1010);
+    }
+}
+
 #[test]
 fn ivf_explain_shows_algo_and_nprobe() {
     let dir = tempfile::tempdir().unwrap();

@@ -59,7 +59,8 @@ pub const UNDO_TABLESPACE_VERSION: u32 = 3;
 pub const OVERFLOW_VERSION: u16 = 4;
 /// v4 records the committed heap coverage frontier.
 /// v7 persists native node membership and trained index definitions.
-pub const PAGED_HNSW_INDEX_VERSION: u32 = 7;
+/// v8 adds native IVF scan-code pages and the scan codec in IVF definitions.
+pub const PAGED_HNSW_INDEX_VERSION: u32 = 8;
 pub const PAGED_HNSW_PAGE_VERSION: u16 = 4;
 pub const ZONE_MAP_VERSION: u32 = 6;
 /// Zone Map v6 uses shared-buffer-pool pages and physical redo. Page v2 adds

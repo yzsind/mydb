@@ -415,6 +415,7 @@ impl MappedVectorNavigation {
         )))
     }
 
+    #[inline]
     fn page(&self, vid: VecId) -> Result<&[u8], QueryError> {
         let page_id = vid_page(vid) as usize;
         if page_id == 0 || page_id >= self.meta.node_next_page_id as usize {
@@ -433,21 +434,30 @@ impl MappedVectorNavigation {
         let word = &self.verified[page_id / 64];
         let mask = 1u64 << (page_id % 64);
         if word.load(Ordering::Relaxed) & mask == 0 {
-            if read_u32(page, 0) != VEC_NODE_MAGIC
-                || read_u16(page, 4) != VEC_PAGE_VERSION
-                || read_u32(page, 16) != page_checksum(page, 16)
-                || NODE_OFF_DIRECTORY + read_u16(page, NODE_OFF_SLOT_COUNT) as usize * 2 > PAGE_SIZE
-            {
-                return Err(error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "corrupt mapped vector navigation page",
-                ));
-            }
-            word.fetch_or(mask, Ordering::Relaxed);
+            Self::verify_page(page, word, mask)?;
         }
         Ok(page)
     }
 
+    /// First touch of a page in this mapping: validate its header and checksum.
+    #[cold]
+    #[inline(never)]
+    fn verify_page(page: &[u8], word: &AtomicU64, mask: u64) -> Result<(), QueryError> {
+        if read_u32(page, 0) != VEC_NODE_MAGIC
+            || read_u16(page, 4) != VEC_PAGE_VERSION
+            || read_u32(page, 16) != page_checksum(page, 16)
+            || NODE_OFF_DIRECTORY + read_u16(page, NODE_OFF_SLOT_COUNT) as usize * 2 > PAGE_SIZE
+        {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt mapped vector navigation page",
+            ));
+        }
+        word.fetch_or(mask, Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[inline]
     fn record(&self, vid: VecId) -> Result<(&[u8], usize), QueryError> {
         if let Some(offset) = self.records.as_ref().and_then(|cache| cache.get(vid)) {
             // SAFETY: this location was published only after page/slot/record
@@ -463,6 +473,13 @@ impl MappedVectorNavigation {
             };
             return Ok((page, offset));
         }
+        self.record_uncached(vid)
+    }
+
+    /// First access to a record in this mapping: validate and remember it.
+    #[cold]
+    #[inline(never)]
+    fn record_uncached(&self, vid: VecId) -> Result<(&[u8], usize), QueryError> {
         let page = self.page(vid)?;
         let offset = node_record_offset(page, vid_slot(vid))?;
         let level = page[offset + 1] as usize;
@@ -488,12 +505,47 @@ impl MappedVectorNavigation {
     }
 
     /// Borrow a native payload while the caller retains the mapping read guard.
+    #[inline]
     pub(crate) fn native_payload(&self, vid: VecId) -> Result<&[u8], QueryError> {
         let (datatype, dimension) = native_geometry(self.meta.dim as usize)
             .ok_or_else(crate::engine::vector::persistence::corrupt)?;
         let (page, offset) = self.record(vid)?;
         let start = offset + 18;
         Ok(&page[start..start + datatype.payload_len(dimension)])
+    }
+
+    /// Borrow the IVF scan-code record at `location` while the caller retains
+    /// the mapping read guard.
+    #[inline]
+    pub(crate) fn ivf_code(&self, location: u64, code_len: usize) -> Result<&[u8], QueryError> {
+        let page = self.page(location)?;
+        ivf_code_page_record(page, usize::from(vid_slot(location)), code_len).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt mapped IVF scan-code record",
+            )
+        })
+    }
+
+    /// Timing hint for a later `ivf_code`; it validates and dereferences
+    /// nothing, and is skipped outside the mapped file.
+    #[inline]
+    pub(crate) fn prefetch_ivf_code(&self, location: u64, code_len: usize) {
+        let page = vid_page(location) as usize;
+        let start = page
+            .saturating_mul(PAGE_SIZE)
+            .saturating_add(IVF_CODE_OFF_RECORDS + 8)
+            .saturating_add(usize::from(vid_slot(location)) * ivf_code_stride(code_len));
+        if page == 0 || start.saturating_add(code_len) > self.len {
+            return;
+        }
+        // SAFETY: `start..start + code_len` lies inside the mapping.
+        unsafe {
+            let address = self.address.cast::<i8>().add(start);
+            for offset in (0..code_len).step_by(64) {
+                crate::engine::vector::distance::prefetch_read(address.add(offset));
+            }
+        }
     }
 
     #[inline]

@@ -43,6 +43,15 @@ metric/type combinations raise an error. `IVF` with `quantization=none` stores
 and scores native payloads. Hamming IVF uses binary majority centers; Jaccard
 IVF uses sampled medoids scored with Jaccard distance.
 
+Unquantized FLOAT32, FLOAT16 and BFLOAT16 IVF indexes with L2, COSINE or DOT
+also keep an 8-bit scan code per row (one byte per dimension plus 8 bytes),
+trained with the coarse centers. A list scan reads the codes, derives a strict
+lower and upper bound of every row's exact distance, and reads the native
+payload only for rows whose lower bound can still enter the result. Results
+equal an exact scan of the probed lists; the codes add about one byte per
+dimension to each row's index storage. Rows inserted before the coarse centers
+are trained, and rows outside the bounded domain, are always scored exactly.
+
 ## Displaying vectors in SQL clients
 
 Native VECTOR results use MySQL's VECTOR wire type with little-endian FLOAT32

@@ -1177,7 +1177,19 @@ impl Database {
             .vector
             .as_ref()
             .is_some_and(|v| v.quantization.enabled());
+        let timing = std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some();
+        let mut phase_start = std::time::Instant::now();
+        let mut phase = |name: &str| {
+            if timing {
+                eprintln!(
+                    "[ivf] build phase={name} elapsed_ms={}",
+                    phase_start.elapsed().as_millis()
+                );
+            }
+            phase_start = std::time::Instant::now();
+        };
         let quantizer = self.train_vector_quantizer(table, index, storage_id, txn, col)?;
+        phase("quantizer");
         let record_bytes = index
             .vector
             .as_ref()
@@ -1232,6 +1244,7 @@ impl Database {
             }
             Ok(false)
         })?;
+        phase("count");
         if count > 0 {
             let params = ivf_params_from_meta(&meta);
             let nlist = if params.nlist == 0 {
@@ -1270,23 +1283,58 @@ impl Database {
                     Ok(ordinals.peek().is_none())
                 },
             )?;
+            phase("sample");
             graph.initialize_from_sample(rows, nlist)?;
             drop(sample_charge);
+            phase("train");
         }
-        let built = self.scan_hnsw_build_rows(
-            table,
-            storage_id,
-            txn,
-            &[col],
-            0,
-            u64::MAX,
-            |row, values| {
-                if let Some(Value::Vector(value)) = values.first() {
-                    graph.insert(row, value.clone())?;
-                }
-                Ok(false)
-            },
-        );
+        // Assign lists in parallel over bounded batches; appends stay in scan
+        // order, so lists and vids match a row-at-a-time build.
+        let batch_bytes = vector::native_ivf::BULK_INSERT_BATCH
+            .saturating_mul(datatype.payload_len(dimension).saturating_add(96));
+        let built = (|| {
+            let _batch_charge =
+                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::StorageScratch,
+                    batch_bytes,
+                )?;
+            let mut batch = Vec::with_capacity(vector::native_ivf::BULK_INSERT_BATCH);
+            let mut inserting = std::time::Duration::ZERO;
+            let mut insert = |batch: Vec<_>| {
+                let start = std::time::Instant::now();
+                let result = graph.insert_batch(batch);
+                inserting += start.elapsed();
+                result
+            };
+            self.scan_hnsw_build_rows(
+                table,
+                storage_id,
+                txn,
+                &[col],
+                0,
+                u64::MAX,
+                |row, values| {
+                    if let Some(Value::Vector(value)) = values.first() {
+                        batch.push((row, value.clone()));
+                        if batch.len() == vector::native_ivf::BULK_INSERT_BATCH {
+                            insert(std::mem::replace(
+                                &mut batch,
+                                Vec::with_capacity(vector::native_ivf::BULK_INSERT_BATCH),
+                            ))?;
+                            crate::engine::cancel::check_cancelled()?;
+                        }
+                    }
+                    Ok(false)
+                },
+            )?;
+            insert(batch)?;
+            if timing {
+                eprintln!("[ivf] build insert_batch_ms={}", inserting.as_millis());
+            }
+            Ok(())
+        })();
+        graph.cluster_entries_by_list();
+        phase("assign");
         if let Err(err) = built {
             graph.invalidate();
             return Err(err);
@@ -1296,6 +1344,7 @@ impl Database {
             file.advance_coverage(txn.snapshot_scn);
             file.finalize_build(0)?;
         }
+        phase("finalize");
         Ok(VectorGraph::NativeIvf(graph))
     }
 

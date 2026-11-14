@@ -665,6 +665,68 @@ fn node_page_append_native(
     Some(slot_count)
 }
 
+// IVF scan-code page: a node page without slots (so node scans skip it, like
+// overflow pages) holding fixed-stride code records of one list:
+//   [32..40] list u64   [40..44] count u32   [44..48] IVF_CODE_TAG
+//   [48..]   count × { data vid u64, code record } at `ivf_code_stride`.
+// Overflow pages keep [44..48] zero. A code record's location is
+// `vid_make(page_id, index)`.
+const IVF_CODE_TAG: u32 = 0x4356_4931; // "1IVC"
+const IVF_CODE_OFF_LIST: usize = 32;
+const IVF_CODE_OFF_COUNT: usize = 40;
+const IVF_CODE_OFF_TAG: usize = 44;
+const IVF_CODE_OFF_RECORDS: usize = 48;
+
+pub(crate) fn ivf_code_stride(code_len: usize) -> usize {
+    (8 + code_len).next_multiple_of(8)
+}
+
+fn ivf_code_capacity(code_len: usize) -> usize {
+    ((PAGE_SIZE - IVF_CODE_OFF_RECORDS) / ivf_code_stride(code_len)).min(u16::MAX as usize)
+}
+
+fn format_ivf_code_page(buf: &mut [u8], list: u64) {
+    format_empty_node_page(buf);
+    write_u16(buf, NODE_OFF_HEAP_TOP, NODE_OFF_DIRECTORY as u16);
+    write_u64(buf, IVF_CODE_OFF_LIST, list);
+    write_u32(buf, IVF_CODE_OFF_COUNT, 0);
+    write_u32(buf, IVF_CODE_OFF_TAG, IVF_CODE_TAG);
+}
+
+/// Record count of a well-formed code page for `code_len`-byte codes.
+fn ivf_code_page_count(buf: &[u8], code_len: usize) -> Option<usize> {
+    if buf.len() != PAGE_SIZE
+        || read_u32(buf, IVF_CODE_OFF_TAG) != IVF_CODE_TAG
+        || read_u16(buf, NODE_OFF_SLOT_COUNT) != 0
+    {
+        return None;
+    }
+    let count = read_u32(buf, IVF_CODE_OFF_COUNT) as usize;
+    (count <= ivf_code_capacity(code_len)).then_some(count)
+}
+
+fn ivf_code_page_push(buf: &mut [u8], list: u64, data_vid: VecId, code: &[u8]) -> Option<u16> {
+    let count = ivf_code_page_count(buf, code.len())?;
+    if read_u64(buf, IVF_CODE_OFF_LIST) != list || count >= ivf_code_capacity(code.len()) {
+        return None;
+    }
+    let start = IVF_CODE_OFF_RECORDS + count * ivf_code_stride(code.len());
+    write_u64(buf, start, data_vid);
+    buf[start + 8..start + 8 + code.len()].copy_from_slice(code);
+    write_u32(buf, IVF_CODE_OFF_COUNT, count as u32 + 1);
+    Some(count as u16)
+}
+
+/// The code record at `index` of a well-formed code page.
+#[inline]
+fn ivf_code_page_record(buf: &[u8], index: usize, code_len: usize) -> Option<&[u8]> {
+    if index >= ivf_code_page_count(buf, code_len)? {
+        return None;
+    }
+    let start = IVF_CODE_OFF_RECORDS + index * ivf_code_stride(code_len) + 8;
+    buf.get(start..start + code_len)
+}
+
 /// Locate a record offset by slot, validating bounds.
 fn node_record_offset(buf: &[u8], slot: u16) -> Result<usize, QueryError> {
     if buf.len() != PAGE_SIZE {
@@ -2043,6 +2105,99 @@ impl VectorIndexFile {
         hint: &AtomicU64,
     ) -> Result<VecId, QueryError> {
         self.append_native_node_hint(0, row_id, 0, vector, auxiliary, hint)
+    }
+
+    /// Append the scan-code record of native IVF entry `data_vid` to `list`'s
+    /// current code page (`hint`), allocating a fresh code page when it is
+    /// full. Returns the record's stable location.
+    pub(crate) fn append_ivf_code(
+        &self,
+        list: u64,
+        data_vid: VecId,
+        code: &[u8],
+        hint: &AtomicU64,
+    ) -> Result<u64, QueryError> {
+        if ivf_code_capacity(code.len()) == 0 {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "vector index: IVF scan code exceeds page capacity",
+            ));
+        }
+        let push = |page_id: u64| -> Result<Option<u64>, QueryError> {
+            let _latch = self.page_latch(page_id);
+            let index = self.rmw_node_page(0, page_id, |bytes| {
+                Ok(match ivf_code_page_push(bytes, list, data_vid, code) {
+                    Some(index) => (Some(index), true),
+                    None => (None, false),
+                })
+            })?;
+            Ok(index.map(|index| vid_make(page_id, index)))
+        };
+        let page_id = hint.load(Ordering::Acquire);
+        if page_id != 0 {
+            if let Some(location) = push(page_id)? {
+                return Ok(location);
+            }
+        }
+        let _alloc = self.append_alloc.lock();
+        let retry_page = hint.load(Ordering::Acquire);
+        if retry_page != 0 && retry_page != page_id {
+            if let Some(location) = push(retry_page)? {
+                return Ok(location);
+            }
+        }
+        let new_page = self.alloc_node_page(0)?;
+        let mut bytes = vec![0u8; PAGE_SIZE];
+        format_ivf_code_page(&mut bytes, list);
+        let index = ivf_code_page_push(&mut bytes, list, data_vid, code)
+            .expect("a fresh code page holds at least one record (checked above)");
+        self.write_page(0, new_page, bytes)?;
+        hint.store(new_page, Ordering::Release);
+        Ok(vid_make(new_page, index))
+    }
+
+    /// Visit every IVF scan-code record: `(location, data vid, code)`.
+    pub(crate) fn for_each_ivf_code(
+        &self,
+        code_len: usize,
+        mut f: impl FnMut(u64, VecId, &[u8]),
+    ) -> Result<(), QueryError> {
+        let next = self.meta_state.lock().meta.node_next_page_id;
+        let require_checksum = !self.build_mode.load(Ordering::Acquire);
+        for page_id in 1..next {
+            self.buffer_pool
+                .with_raw_page(self.page_key(page_id), |bytes| {
+                    if read_u32(bytes, 0) != VEC_NODE_MAGIC
+                        || read_u32(bytes, IVF_CODE_OFF_TAG) != IVF_CODE_TAG
+                        || read_u16(bytes, NODE_OFF_SLOT_COUNT) != 0
+                    {
+                        return Ok(());
+                    }
+                    if require_checksum && read_u32(bytes, 16) != page_checksum(bytes, 16) {
+                        return Err(error(
+                            crate::error::catalog::ER_INDEX_CORRUPT,
+                            "corrupt vector index page checksum",
+                        ));
+                    }
+                    let count = ivf_code_page_count(bytes, code_len).ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_INDEX_CORRUPT,
+                            "corrupt IVF scan-code page",
+                        )
+                    })?;
+                    let stride = ivf_code_stride(code_len);
+                    for index in 0..count {
+                        let start = IVF_CODE_OFF_RECORDS + index * stride;
+                        f(
+                            vid_make(page_id, index as u16),
+                            read_u64(bytes, start),
+                            &bytes[start + 8..start + 8 + code_len],
+                        );
+                    }
+                    Ok(())
+                })?;
+        }
+        Ok(())
     }
 
     fn append_native_node_hint(

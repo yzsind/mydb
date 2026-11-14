@@ -3,6 +3,7 @@
 //! candidates; the executor rechecks MVCC visibility and native heap values.
 
 pub(crate) mod bulk_hnsw;
+pub(crate) mod centroids;
 pub(crate) mod codec;
 pub(crate) mod cursor;
 pub(crate) mod distance;
@@ -14,6 +15,7 @@ pub(crate) mod ivf;
 pub(crate) mod native_hnsw;
 pub(crate) mod native_ivf;
 pub(crate) mod persistence;
+pub(crate) mod scan_codes;
 pub(crate) mod selection;
 pub(crate) mod session;
 pub(crate) mod spill_rows;
