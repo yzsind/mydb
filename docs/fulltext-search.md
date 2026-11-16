@@ -1,0 +1,179 @@
+# Full-Text Search
+
+mydb supports `FULLTEXT` indexes over `CHAR`, `VARCHAR`, and `TEXT` columns,
+natural-language BM25 ranking, boolean search, and the `ngram` parser.
+
+```sql
+CREATE TABLE articles (
+  id BIGINT PRIMARY KEY,
+  title VARCHAR(200),
+  body TEXT,
+  FULLTEXT KEY ft_article (title, body)
+);
+
+INSERT INTO articles VALUES
+  (1, 'Storage guide', 'database systems and query execution'),
+  (2, 'Index guide', 'database index design');
+
+SELECT id, MATCH(title, body) AGAINST('database systems') AS score
+FROM articles
+WHERE MATCH(title, body) AGAINST('database systems')
+ORDER BY score DESC, id;
+```
+
+The `MATCH` column set must exactly match a queryable `FULLTEXT` index.
+Column order does not matter. A missing matching index returns error 1191.
+`CREATE FULLTEXT INDEX` and `ALTER TABLE ... ADD FULLTEXT KEY` can also build
+indexes over existing rows. Prepared statements support `AGAINST(?)`.
+
+Persistent offline builds use the index-build worker budget for projected
+scanning, tokenization, sorting, spill consolidation, and leaf-page writes.
+Use `CREATE /*+ PARALLEL(8) */ FULLTEXT INDEX ft ON articles(body)` to request
+a degree, or `NO_PARALLEL` to force serial execution. The default degree is
+`MYDB_PARALLEL_DEGREE` (2 when unset); `MYDB_PARALLEL_DISABLE` takes precedence.
+Workers share a governed scratch envelope and spill bounded runs when it is
+exhausted. Repeated posting keys can use compact dictionary records, while
+high-cardinality inputs use the external merge path. Query execution, online
+backfills, and memory-only builds keep their existing execution strategies.
+
+## Search modes
+
+Natural-language mode returns the union of indexed query terms. Repeated query
+terms contribute once. The default parser splits Unicode text at
+non-alphanumeric boundaries while retaining underscores, normalizes terms
+using the indexed column's collation, and applies token
+length and stopword filtering. Default minimum/maximum token lengths are
+3/84 characters, and the built-in English stopword list is enabled.
+
+Boolean mode supports these operators:
+
+| Expression | Meaning |
+|---|---|
+| `+database` | Required term |
+| `-design` | Excluded term |
+| `database systems` | Optional terms; their union supplies candidates when no required clause exists |
+| `"database systems"` | Adjacent terms in order within one indexed column |
+| `data*` | Any indexed term starting with `data` |
+
+```sql
+SELECT id FROM articles
+WHERE MATCH(title, body)
+      AGAINST('+database -design' IN BOOLEAN MODE);
+```
+
+An all-negative query matches no documents. An unmatched boolean expression
+returns score `0`, including when its positive terms occur but a required,
+excluded, or phrase condition fails. Projection, comparison, `NOT`, `OR`,
+and multiple `MATCH` expressions use the same membership rules as a bare
+`WHERE MATCH(...)` predicate.
+
+Punctuation inside one boolean operand splits it into required tokens:
+`alpha.beta` requires both `alpha` and `beta`. Whitespace-separated optional
+operands retain union semantics. The built-in stopword table exposes 35 distinct
+words. The identifier `fulltext` requires backticks when used as a column name.
+
+Grouping `()`, weights `> < ~`, and proximity `@` return error 1235.
+Malformed operands, repeated leading signs, and unclosed double quotes return
+error 1064. `WITH QUERY EXPANSION` is not supported and returns a parse error.
+
+## Ngram search
+
+```sql
+CREATE TABLE chinese_articles (
+  id BIGINT PRIMARY KEY,
+  body TEXT,
+  FULLTEXT KEY ft_body (body) WITH PARSER ngram
+);
+INSERT INTO chinese_articles VALUES (1, '数据库全文检索');
+SELECT id FROM chinese_articles WHERE MATCH(body) AGAINST('全文');
+```
+
+The default ngram length is two Unicode characters. Ngrams are generated
+within alphanumeric runs; token length limits from the default parser do not
+apply. In boolean mode, a multi-token ngram operand requires adjacent indexed
+ngrams in order. Phrase adjacency uses the filtered token sequence, rather
+than byte-for-byte source-text equality. Punctuation and discarded tokens
+do not retain their original character offsets.
+
+With `like_ngram_prefilter=on`, a suitable single-column ngram index can also
+prefilter unanchored `LIKE` patterns. The original `LIKE` predicate is always
+rechecked. An ordinary full-text index is not a substring index.
+
+## Ranking and configuration
+
+BM25 uses posting term frequency and document length. Indexed reads estimate
+the document count from table statistics and committed row deltas. They use
+the corpus average length collected by `ANALYZE TABLE` when available, and
+otherwise approximate it from matching documents. Run `ANALYZE TABLE` after
+large corpus changes to refresh these estimates.
+
+Scores do not promise numeric equality with MySQL. Ordinary index statistics
+and posting document frequencies are not fully versioned; concurrent corpus
+changes can affect ranking even when a document's visible text stays the same.
+Term equality uses the indexed column's collation, including case and accent
+sensitivity. Index construction, writes, natural-language searches, boolean
+terms, phrases, and wildcard prefixes share the same normalization rules.
+
+The `MYDB_FT_MIN_TOKEN_SIZE`, `MYDB_FT_MAX_TOKEN_SIZE`, `MYDB_FT_NGRAM_SIZE`,
+`MYDB_FT_STOPWORDS`, `MYDB_FT_POSITIONS`, and `MYDB_FT_POSITION_GAP` process
+defaults are captured in each new index. Later process-default changes do not
+change that index's key encoding or tokenizer. The inter-column position gap
+is at least one. Filtered stopwords and out-of-range words retain their original
+word offsets. Phrases with internal filtered words also verify the original
+words against the visible heap row; filtering never makes separated words adjacent. Indexes without stored positions verify phrases against
+visible row text. `MYDB_FT_BM25_K1` and `MYDB_FT_BM25_B` configure process-wide
+ranking parameters, defaulting to 1.2 and 0.75.
+
+Document lengths and stored token positions use unsigned 32-bit fields.
+Writes and index builds return error 1690 when a document exceeds these
+limits, including through a large inter-column gap. They do not saturate or
+wrap positions into an invalid posting or a cross-column phrase match.
+
+## Execution paths and limits
+
+Ordinary nonpartitioned queries scan B-tree inverted postings. Membership-only
+queries skip scoring state, and phrase clauses share posting and position
+caches across repeated terms. Multi-column indexing prevents phrases from
+crossing column boundaries.
+
+Partitioned and `FOR SYSTEM_TIME AS OF` full-text queries scan MVCC-visible
+text and build query-local postings. This preserves partition identity and
+historical membership and computes their corpus statistics from visible
+documents. These paths cost a corpus scan and can require more memory than
+an ordinary inverted-index lookup. `EXPLAIN` identifies the heap oracle path;
+memory admission failures return an explicit error.
+
+`MATCH` supports UPDATE/DELETE filtering and ordering, including transactional
+rollback, and ordinary JOIN filtering, score projection, and ordering. Aggregated
+MATCH in HAVING remains unsupported and returns an explicit error.
+
+Single-table `FOR UPDATE` and `FOR SHARE` reads support MATCH filtering and
+score projection through the same full-text runtime. MATCH in a locking JOIN
+query remains unsupported and returns error 1235.
+
+Online `OPTIMIZE TABLE` for partitioned tables with `FULLTEXT` indexes remains
+unsupported and returns an explicit error. Immutable backup queries support
+filtering and score projection; see [Backup and Recovery](backup-and-recovery.md#51-fulltext-queries).
+
+## Persistence and failures
+
+FULLTEXT indexes are important persistent objects. Their posting B-trees,
+scoring payloads, tokenizer configuration and positional data participate in
+transactional maintenance, checkpoints, backup and recovery. The ability to
+reconstruct an index does not make a failed write or flush optional.
+
+Malformed posting payloads return an index corruption error; token, prefix,
+phrase and scoring paths never silently skip malformed entries. Detected
+corruption fences the persistent index and preserves its files for explicit
+repair or restore. A normal open does not silently replace a damaged FULLTEXT
+index with a heap reconstruction. A missing derived index file without a
+corruption fence can be rebuilt from the heap during recovery. A deliberately scheduled logical redo rebuild
+is a separately recorded recovery obligation whose failure prevents opening.
+
+## Diagnostic tables
+
+Set `innodb_ft_aux_table='database/table'` to inspect every FULLTEXT index on a
+table through `INNODB_FT_INDEX_TABLE` and `INNODB_FT_CONFIG`. The optional mydb
+extension `database/table/index` selects one index. DOC_ID is a diagnostic
+identity synthesized from storage and row identifiers and can change on row
+migration; POSITION counts tokens rather than InnoDB byte offsets.

@@ -1,0 +1,247 @@
+//! Shared lifecycle for channel-backed native scan workers.
+use super::*;
+
+pub(super) struct ScanWorkers {
+    pub(super) receiver: Option<std::sync::mpsc::Receiver<Result<QueuedScanBatch, QueryError>>>,
+    pub(super) workers: Vec<std::thread::JoinHandle<()>>,
+    pub(super) txn_pressure: Option<crate::util::exec_permit::ParallelReadPressureGuard>,
+    pub(super) worker_context: super::super::execution_context::ExecutionContext,
+    pub(super) finished: bool,
+    panic_message: &'static str,
+}
+
+impl ScanWorkers {
+    pub(super) fn new(
+        worker_context: super::super::execution_context::ExecutionContext,
+        panic_message: &'static str,
+    ) -> Self {
+        Self {
+            receiver: None,
+            workers: Vec::new(),
+            txn_pressure: None,
+            worker_context,
+            finished: false,
+            panic_message,
+        }
+    }
+
+    pub(super) fn with_channel(
+        mut self,
+        receiver: std::sync::mpsc::Receiver<Result<QueuedScanBatch, QueryError>>,
+        workers: Vec<std::thread::JoinHandle<()>>,
+    ) -> Self {
+        self.receiver = Some(receiver);
+        self.workers = workers;
+        self
+    }
+
+    pub(super) fn finish(&mut self) -> Result<(), QueryError> {
+        self.finished = true;
+        // Disconnect before joining: a queued batch owns its memory charge,
+        // and a producer must never wait for a consumer that has exited.
+        self.receiver.take();
+        let panicked = self
+            .workers
+            .drain(..)
+            .fold(false, |panicked, worker| panicked | worker.join().is_err());
+        self.txn_pressure.take();
+        if panicked {
+            Err(crate::storage::error(
+                crate::error::catalog::ER_UNKNOWN_ERROR,
+                self.panic_message,
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// Drain a ready peer without parking the coordinator while it still has
+    /// local work. A closed peer channel is joined by the final blocking pull.
+    pub(super) fn try_next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        if self.finished {
+            return Ok(None);
+        }
+        match self
+            .receiver
+            .as_ref()
+            .expect("scan workers started")
+            .try_recv()
+        {
+            Ok(Ok(batch)) => Ok(Some(batch.batch)),
+            Ok(Err(error)) => {
+                self.worker_context.cancellation().cancel_local();
+                let _ = self.finish();
+                Err(error)
+            }
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub(super) fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        if self.finished {
+            return Ok(None);
+        }
+        match self.receiver.as_ref().expect("scan workers started").recv() {
+            Ok(Ok(batch)) => Ok(Some(batch.batch)),
+            Ok(Err(error)) => {
+                self.worker_context.cancellation().cancel_local();
+                let _ = self.finish();
+                Err(error)
+            }
+            Err(_) => {
+                // A producer may stop while recv is blocked. Channel closure
+                // is EOF only after joining and checking terminal state.
+                let joined = self.finish();
+                if let Some(error) = self.worker_context.budget().terminal_oom() {
+                    return Err(error);
+                }
+                joined?;
+                self.worker_context.cancellation().check()?;
+                Ok(None)
+            }
+        }
+    }
+}
+
+impl Drop for ScanWorkers {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.worker_context.cancellation().cancel_local();
+            let _ = self.finish();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    fn context(
+        budget: Arc<mem_budget::MemBudget>,
+    ) -> super::super::super::execution_context::ExecutionContext {
+        super::super::super::execution_context::ExecutionContext::capture_with_budget(
+            TxnView::read_only(0, crate::storage::IsolationLevel::ReadCommitted),
+            budget,
+        )
+        .fork_worker_cancellation()
+    }
+
+    #[test]
+    fn ready_peer_poll_keeps_eof_and_failure_lifecycle() {
+        let budget = Arc::new(mem_budget::MemBudget::new(4096));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut group = ScanWorkers::new(context(budget), "test panic").with_channel(rx, vec![]);
+        assert!(group.try_next_batch().unwrap().is_none());
+        assert!(!group.finished);
+        drop(tx);
+        assert!(group.try_next_batch().unwrap().is_none());
+        assert!(!group.finished);
+        assert!(group.next_batch().unwrap().is_none());
+        assert!(group.finished);
+        assert!(group.try_next_batch().unwrap().is_none());
+
+        let budget = Arc::new(mem_budget::MemBudget::new(4096));
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let mut group = ScanWorkers::new(context(budget), "test panic").with_channel(rx, vec![]);
+        let error = crate::error::catalog::ER_OUT_OF_RESOURCES.error("peer test failure");
+        tx.send(Err(error.clone())).unwrap();
+        assert_eq!(group.try_next_batch().unwrap_err(), error);
+        assert!(group.finished);
+        assert!(group.next_batch().unwrap().is_none());
+    }
+
+    #[test]
+    fn drop_disconnects_full_queue_joins_worker_and_releases_charges() {
+        let budget = Arc::new(mem_budget::MemBudget::new(4096));
+        let ctx = context(budget.clone());
+        let parent = ctx.clone();
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
+        let schema = Arc::new(BatchSchema::new(Vec::new()));
+        mem_budget::with_query_budget(budget.clone(), || {
+            tx.send(Ok(QueuedScanBatch {
+                batch: Batch::with_row_count(schema, Vec::new(), 0),
+                _charge: mem_budget::force_charge_scoped(128).unwrap(),
+            }))
+            .unwrap_or_else(|_| panic!("queue unexpectedly closed"));
+        });
+        let joined = Arc::new(AtomicBool::new(false));
+        let flag = joined.clone();
+        let worker = crate::util::thread_spawn::spawn(move || {
+            assert!(tx
+                .send(Err(crate::engine::cancel::interrupted_error()))
+                .is_err());
+            flag.store(true, Ordering::Release);
+        });
+        let group = ScanWorkers::new(ctx, "test worker panicked").with_channel(rx, vec![worker]);
+        assert_eq!(budget.used(), 128);
+        drop(group);
+        assert!(joined.load(Ordering::Acquire));
+        assert_eq!(budget.used(), 0);
+        assert!(parent.cancellation().check().is_err());
+    }
+
+    #[test]
+    fn reports_worker_panic_but_preserves_first_query_error() {
+        for query_error in [false, true] {
+            let budget = Arc::new(mem_budget::MemBudget::new(4096));
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = crate::util::thread_spawn::spawn(move || {
+                if query_error {
+                    tx.send(Err(crate::engine::cancel::interrupted_error()))
+                        .unwrap_or_else(|_| panic!("queue unexpectedly closed"));
+                }
+                panic!("injected worker failure");
+            });
+            let mut group = ScanWorkers::new(context(budget), "test worker panicked")
+                .with_channel(rx, vec![worker]);
+            let error = group.next_batch().unwrap_err();
+            assert_eq!(error.code(), if query_error { 1317 } else { 1105 });
+            assert!(group.workers.is_empty());
+            assert!(group.receiver.is_none());
+            assert!(group.next_batch().unwrap().is_none());
+        }
+    }
+    #[test]
+    fn channel_close_preserves_cancellation_and_primary_oom_without_error_message() {
+        for oom in [false, true] {
+            for panicked in [false, true] {
+                if panicked && !oom {
+                    continue;
+                }
+                let budget = Arc::new(mem_budget::MemBudget::new(4096));
+                let ctx = context(budget.clone());
+                let producer = ctx.clone();
+                let expected = if oom {
+                    crate::error::catalog::ER_OUTOFMEMORY.error("source output exhausted")
+                } else {
+                    crate::engine::cancel::interrupted_error()
+                };
+                let error = expected.clone();
+                let (tx, rx) = std::sync::mpsc::sync_channel(1);
+                let worker = crate::util::thread_spawn::spawn(move || {
+                    if oom {
+                        producer.budget().latch_terminal_oom(error);
+                    } else {
+                        producer.cancellation().cancel_local();
+                    }
+                    drop(tx);
+                    if panicked {
+                        panic!("secondary producer failure");
+                    }
+                });
+                let mut group =
+                    ScanWorkers::new(ctx, "test worker panicked").with_channel(rx, vec![worker]);
+                assert_eq!(
+                    group.next_batch().unwrap_err(),
+                    expected,
+                    "oom={oom}, panic={panicked}"
+                );
+                assert!(group.workers.is_empty());
+                assert!(group.receiver.is_none());
+                assert!(group.next_batch().unwrap().is_none());
+                assert_eq!(budget.used(), 0);
+            }
+        }
+    }
+}

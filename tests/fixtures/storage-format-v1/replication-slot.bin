@@ -1,0 +1,1 @@
+{"magic":"MYDBMETA1","kind":2,"version":1,"required_features":0,"payload":{"replica_uuid":"00000000-0000-4000-8000-000000000001","acked_lsn":0,"last_seen_ms":17,"first_registered_ms":17,"status":"active","connected":true},"checksum":3454815831}

@@ -1,0 +1,4152 @@
+{
+  "schema_version": 1,
+  "mysql_version": "8.0.46",
+  "category": "json",
+  "functions": [
+    {
+      "name": "JSON_ARRAY",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY(1, 2, 3)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_ARRAY(1, 2, 3)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_ARRAY(1, 2, 3)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[null]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[null]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[null]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_ARRAY_APPEND",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY_APPEND('[1,2]', '$', 3)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_ARRAY_APPEND('[1,2]', '$', 3)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_ARRAY_APPEND('[1,2]', '$', 3)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY_APPEND(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY_APPEND()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_ARRAY_INSERT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[1, 2, 3]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_ARRAY_INSERT('[1,3]', '$[1]', 2)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY_INSERT(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_ARRAY_INSERT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_CONTAINS",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_CONTAINS('[1,2,3]', '2')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_CONTAINS('[1,2,3]', '2')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_CONTAINS('[1,2,3]', '2')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_CONTAINS(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_CONTAINS()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_CONTAINS_PATH",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_CONTAINS_PATH('{\"a\":1}', 'one', '$.a')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_CONTAINS_PATH(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_CONTAINS_PATH()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_DEPTH",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_DEPTH('{\"a\":[1]}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_DEPTH('{\"a\":[1]}')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_DEPTH('{\"a\":[1]}')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_DEPTH(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_DEPTH()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_EXTRACT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_EXTRACT('{\"a\":1}', '$.a')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_EXTRACT('{\"a\":1}', '$.a')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_EXTRACT('{\"a\":1}', '$.a')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_EXTRACT(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_EXTRACT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_INSERT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_INSERT('{\"a\":1}', '$.b', 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_INSERT('{\"a\":1}', '$.b', 2)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_INSERT('{\"a\":1}', '$.b', 2)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_INSERT(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_INSERT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_KEYS",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_KEYS('{\"a\":1,\"b\":2}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "[\"a\", \"b\"]"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[\"a\", \"b\"]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_KEYS('{\"a\":1,\"b\":2}')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "[\"a\", \"b\"]"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_KEYS('{\"a\":1,\"b\":2}')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_KEYS(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_KEYS()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_LENGTH",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_LENGTH('[1,2,3]')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_LENGTH('[1,2,3]')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "3"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_LENGTH('[1,2,3]')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_LENGTH(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_LENGTH()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_MERGE",
+      "oracle_class": "mysql80_community",
+      "profile": "alias",
+      "canonical": "JSON_MERGE_PRESERVE",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE('{\"a\":1}', '{\"a\":2}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": [1, 2]}"
+              ]
+            ],
+            "warning_codes": [
+              1287
+            ]
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": [1, 2]}"
+              ]
+            ],
+            "warning_codes": [
+              1287
+            ],
+            "columns": [
+              {
+                "name": "JSON_MERGE('{\"a\":1}', '{\"a\":2}')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": [1, 2]}"
+              ]
+            ],
+            "warning_codes": [
+              1287
+            ],
+            "columns": [
+              {
+                "name": "JSON_MERGE('{\"a\":1}', '{\"a\":2}')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_MERGE_PATCH",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE_PATCH('{\"a\":1}', '{\"b\":2}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_MERGE_PATCH('{\"a\":1}', '{\"b\":2}')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_MERGE_PATCH('{\"a\":1}', '{\"b\":2}')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE_PATCH(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE_PATCH()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_MERGE_PRESERVE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE_PRESERVE('{\"a\":1}', '{\"a\":2}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": [1, 2]}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": [1, 2]}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_MERGE_PRESERVE('{\"a\":1}', '{\"a\":2}')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": [1, 2]}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_MERGE_PRESERVE('{\"a\":1}', '{\"a\":2}')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE_PRESERVE(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_MERGE_PRESERVE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_OBJECT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_OBJECT('a', 1)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_OBJECT('a', 1)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_OBJECT('a', 1)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_OBJECT(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_OBJECT()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_OVERLAPS",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_OVERLAPS('[1,2]', '[2,3]')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_OVERLAPS('[1,2]', '[2,3]')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_OVERLAPS('[1,2]', '[2,3]')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_OVERLAPS(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_OVERLAPS()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_PRETTY",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT HEX(JSON_PRETTY('{\"a\":1}'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "7B0A20202261223A20310A7D"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "7B0A20202261223A20310A7D"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "HEX(JSON_PRETTY('{\"a\":1}'))",
+                "type": "LONG_BLOB",
+                "length": 2147483648,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Blob"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "7B0A20202261223A20310A7D"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "HEX(JSON_PRETTY('{\"a\":1}'))",
+                "type": "VAR_STRING",
+                "length": 64,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONG_BLOB', 'length': 2147483648, 'decimals': 31, 'flags': ['NOT_NULL'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 64, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_PRETTY(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_PRETTY()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_QUOTE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_QUOTE('mydb')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "\"mydb\""
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "\"mydb\""
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_QUOTE('mydb')",
+                "type": "VAR_STRING",
+                "length": 104,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "\"mydb\""
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_QUOTE('mydb')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 104, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_QUOTE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_QUOTE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_REMOVE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_REMOVE('{\"a\":1,\"b\":2}', '$.b')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_REMOVE('{\"a\":1,\"b\":2}', '$.b')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_REMOVE('{\"a\":1,\"b\":2}', '$.b')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_REMOVE(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_REMOVE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_REPLACE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_REPLACE('{\"a\":1}', '$.a', 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 2}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_REPLACE('{\"a\":1}', '$.a', 2)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_REPLACE('{\"a\":1}', '$.a', 2)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_REPLACE(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_REPLACE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_SCHEMA_VALID",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SCHEMA_VALID('{\"a\":1}', '{\"a\":1}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SCHEMA_VALID('{\"a\":1}', '{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SCHEMA_VALID('{\"a\":1}', '{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SCHEMA_VALID(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SCHEMA_VALID()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_SCHEMA_VALIDATION_REPORT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SCHEMA_VALIDATION_REPORT('{\"a\":1}', '{\"a\":1}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"valid\": true}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"valid\": true}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SCHEMA_VALIDATION_REPORT('{\"a\":1}', '{\"a\":1}')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"valid\": true}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SCHEMA_VALIDATION_REPORT('{\"a\":1}', '{\"a\":1}')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SCHEMA_VALIDATION_REPORT(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SCHEMA_VALIDATION_REPORT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_SEARCH",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SEARCH('{\"a\":\"mydb\"}', 'one', 'mydb')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "\"$.a\""
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "\"$.a\""
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SEARCH('{\"a\":\"mydb\"}', 'one', 'mydb')",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "\"$.a\""
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SEARCH('{\"a\":\"mydb\"}', 'one', 'mydb')",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SEARCH(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SEARCH()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_SET",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SET('{\"a\":1}', '$.b', 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SET('{\"a\":1}', '$.b', 2)",
+                "type": "JSON",
+                "length": 4294967292,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "{\"a\": 1, \"b\": 2}"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_SET('{\"a\":1}', '$.b', 2)",
+                "type": "JSON",
+                "length": 4294967295,
+                "decimals": 0,
+                "flags": [
+                  "BLOB"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "Json"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'JSON', 'length': 4294967292, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'JSON', 'length': 4294967295, 'decimals': 0, 'flags': ['BLOB'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SET(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_SET()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_STORAGE_FREE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_STORAGE_FREE('{\"a\":1}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_STORAGE_FREE('{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_STORAGE_FREE('{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_STORAGE_FREE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_STORAGE_FREE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_STORAGE_SIZE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_STORAGE_SIZE('{\"a\":1}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "13"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "13"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_STORAGE_SIZE('{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "13"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_STORAGE_SIZE('{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_STORAGE_SIZE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_STORAGE_SIZE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_TYPE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_TYPE('{\"a\":1}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "OBJECT"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "OBJECT"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_TYPE('{\"a\":1}')",
+                "type": "VAR_STRING",
+                "length": 68,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "OBJECT"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_TYPE('{\"a\":1}')",
+                "type": "VAR_STRING",
+                "length": 68,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 68, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 68, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_TYPE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_TYPE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_UNQUOTE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_UNQUOTE('\"mydb\"')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "mydb"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "mydb"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_UNQUOTE('\"mydb\"')",
+                "type": "VAR_STRING",
+                "length": 24,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "mydb"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_UNQUOTE('\"mydb\"')",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 24, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_UNQUOTE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_UNQUOTE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_VALID",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_VALID('{\"a\":1}')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_VALID('{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_VALID('{\"a\":1}')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_VALID(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_VALID()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "JSON_VALUE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_VALUE('{\"a\":1}', '$.a' RETURNING UNSIGNED)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_VALUE('{\"a\":1}', '$.a' RETURNING UNSIGNED)",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM",
+                  "UNSIGNED"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "JSON_VALUE('{\"a\":1}', '$.a', 'UNSIGNED', 'NULL', NULL, 'NULL', NULL)",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM', 'UNSIGNED'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_VALUE(NULL, '$.a')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT JSON_VALUE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    }
+  ]
+}

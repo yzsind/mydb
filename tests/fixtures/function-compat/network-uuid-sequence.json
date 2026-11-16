@@ -1,0 +1,2274 @@
+{
+  "schema_version": 1,
+  "mysql_version": "8.0.46",
+  "category": "network-uuid-sequence",
+  "functions": [
+    {
+      "name": "BIN_TO_UUID",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT BIN_TO_UUID(UNHEX('6CCD780CBABA102695645B8C656024DB'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "6ccd780c-baba-1026-9564-5b8c656024db"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "6ccd780c-baba-1026-9564-5b8c656024db"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "BIN_TO_UUID(UNHEX('6CCD780CBABA102695645B8C656024DB'))",
+                "type": "VAR_STRING",
+                "length": 144,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "6ccd780c-baba-1026-9564-5b8c656024db"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "BIN_TO_UUID(UNHEX('6CCD780CBABA102695645B8C656024DB'))",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 144, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT BIN_TO_UUID(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT BIN_TO_UUID()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "CURRVAL",
+      "oracle_class": "mydb_extension",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [
+            "DROP SEQUENCE IF EXISTS function_doc_seq",
+            "CREATE SEQUENCE function_doc_seq START WITH 1",
+            "SELECT NEXTVAL('function_doc_seq')"
+          ],
+          "sql": "SELECT CURRVAL('function_doc_seq')",
+          "cleanup": [
+            "DROP SEQUENCE function_doc_seq"
+          ],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50015,
+            "sqlstate": "0A000"
+          },
+          "comparison": "offline_contract",
+          "difference_reason": "The MySQL text-protocol compatibility endpoint lacks the internal sequence statement context; the reviewed extension contract is asserted by the Rust engine test and MySQL remains an unsupported probe.",
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT CURRVAL(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50014,
+            "sqlstate": "22023"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50014,
+            "sqlstate": "22023"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code."
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT CURRVAL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "INET6_ATON",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT HEX(INET6_ATON('::1'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "00000000000000000000000000000001"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "00000000000000000000000000000001"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "HEX(INET6_ATON('::1'))",
+                "type": "VAR_STRING",
+                "length": 128,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "00000000000000000000000000000001"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "HEX(INET6_ATON('::1'))",
+                "type": "VAR_STRING",
+                "length": 64,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 128, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 64, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT INET6_ATON(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT INET6_ATON()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "INET6_NTOA",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT INET6_NTOA(UNHEX('00000000000000000000000000000001'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "::1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "::1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INET6_NTOA(UNHEX('00000000000000000000000000000001'))",
+                "type": "VAR_STRING",
+                "length": 156,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "::1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INET6_NTOA(UNHEX('00000000000000000000000000000001'))",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 156, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT INET6_NTOA(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT INET6_NTOA()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "INET_ATON",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT INET_ATON('127.0.0.1')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "2130706433"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2130706433"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INET_ATON('127.0.0.1')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM",
+                  "UNSIGNED"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2130706433"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INET_ATON('127.0.0.1')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM', 'UNSIGNED'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT INET_ATON(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT INET_ATON()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "INET_NTOA",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT INET_NTOA(2130706433)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "127.0.0.1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "127.0.0.1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INET_NTOA(2130706433)",
+                "type": "VAR_STRING",
+                "length": 124,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "127.0.0.1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INET_NTOA(2130706433)",
+                "type": "VAR_STRING",
+                "length": 31,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 124, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 31, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT INET_NTOA(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT INET_NTOA()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_IPV4",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4('127.0.0.1')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV4('127.0.0.1')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV4('127.0.0.1')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_IPV4_COMPAT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4_COMPAT(INET6_ATON('::192.0.2.1'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV4_COMPAT(INET6_ATON('::192.0.2.1'))",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV4_COMPAT(INET6_ATON('::192.0.2.1'))",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4_COMPAT(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4_COMPAT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_IPV4_MAPPED",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4_MAPPED(INET6_ATON('::ffff:192.0.2.1'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV4_MAPPED(INET6_ATON('::ffff:192.0.2.1'))",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV4_MAPPED(INET6_ATON('::ffff:192.0.2.1'))",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4_MAPPED(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV4_MAPPED()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_IPV6",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV6('::1')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV6('::1')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_IPV6('::1')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV6(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_IPV6()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_UUID",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_UUID('6ccd780c-baba-1026-9564-5b8c656024db')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_UUID('6ccd780c-baba-1026-9564-5b8c656024db')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_UUID('6ccd780c-baba-1026-9564-5b8c656024db')",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_UUID(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_UUID()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "LASTVAL",
+      "oracle_class": "mydb_extension",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [
+            "DROP SEQUENCE IF EXISTS function_doc_seq",
+            "CREATE SEQUENCE function_doc_seq START WITH 1",
+            "SELECT NEXTVAL('function_doc_seq')"
+          ],
+          "sql": "SELECT LASTVAL()",
+          "cleanup": [
+            "DROP SEQUENCE function_doc_seq"
+          ],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50015,
+            "sqlstate": "0A000"
+          },
+          "comparison": "offline_contract",
+          "difference_reason": "The MySQL text-protocol compatibility endpoint lacks the internal sequence statement context; the reviewed extension contract is asserted by the Rust engine test and MySQL remains an unsupported probe.",
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT LASTVAL(), LASTVAL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50015,
+            "sqlstate": "0A000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50015,
+            "sqlstate": "0A000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code."
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT LASTVAL(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "NEXTVAL",
+      "oracle_class": "mydb_extension",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [
+            "DROP SEQUENCE IF EXISTS function_doc_seq",
+            "CREATE SEQUENCE function_doc_seq START WITH 1"
+          ],
+          "sql": "SELECT NEXTVAL('function_doc_seq')",
+          "cleanup": [
+            "DROP SEQUENCE function_doc_seq"
+          ],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50015,
+            "sqlstate": "0A000"
+          },
+          "comparison": "offline_contract",
+          "difference_reason": "The MySQL text-protocol compatibility endpoint lacks the internal sequence statement context; the reviewed extension contract is asserted by the Rust engine test and MySQL remains an unsupported probe.",
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT NEXTVAL(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50014,
+            "sqlstate": "22023"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50014,
+            "sqlstate": "22023"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code."
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT NEXTVAL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "SETVAL",
+      "oracle_class": "mydb_extension",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [
+            "DROP SEQUENCE IF EXISTS function_doc_seq",
+            "CREATE SEQUENCE function_doc_seq"
+          ],
+          "sql": "SELECT SETVAL('function_doc_seq', 42)",
+          "cleanup": [
+            "DROP SEQUENCE function_doc_seq"
+          ],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "42"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50015,
+            "sqlstate": "0A000"
+          },
+          "comparison": "offline_contract",
+          "difference_reason": "The MySQL text-protocol compatibility endpoint lacks the internal sequence statement context; the reviewed extension contract is asserted by the Rust engine test and MySQL remains an unsupported probe.",
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[], mydb=[]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT SETVAL(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 50014,
+            "sqlstate": "22023"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 50014,
+            "sqlstate": "22023"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code."
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT SETVAL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1305,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "UUID",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "68c9ebf1-a44c-11f1-810e-ae18bd46242b"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "68c9ebf1-a44c-11f1-810e-ae18bd46242b"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "UUID()",
+                "type": "VAR_STRING",
+                "length": 144,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "68d5ae3e-a44c-11f1-b4ee-8b8c85ce8236"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "UUID()",
+                "type": "VAR_STRING",
+                "length": 108,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 144, 'decimals': 31, 'flags': ['NOT_NULL'], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 108, 'decimals': 31, 'flags': ['NOT_NULL'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID(), UUID()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "68e14f14-a44c-11f1-810e-ae18bd46242b",
+                "68e14f17-a44c-11f1-810e-ae18bd46242b"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "68e14f14-a44c-11f1-810e-ae18bd46242b",
+                "68e14f17-a44c-11f1-810e-ae18bd46242b"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "68e45556-a44c-11f1-b4ee-8b8c85ce8236",
+                "68e45632-a44c-11f1-b4ee-8b8c85ce8236"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "UUID_SHORT",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID_SHORT()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "102056568861753344"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "102056568861753344"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "UUID_SHORT()",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM",
+                  "UNSIGNED"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "102056570757578752"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "UUID_SHORT()",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM",
+                  "UNSIGNED"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM', 'UNSIGNED'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM', 'UNSIGNED'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID_SHORT(), UUID_SHORT()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "102056568861753346",
+                "102056568861753347"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "102056568861753346",
+                "102056568861753347"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "102056570757578754",
+                "102056570757578755"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID_SHORT(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "UUID_TO_BIN",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT HEX(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'))",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "6CCD780CBABA102695645B8C656024DB"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "6CCD780CBABA102695645B8C656024DB"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "HEX(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'))",
+                "type": "VAR_STRING",
+                "length": 128,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "6CCD780CBABA102695645B8C656024DB"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "HEX(UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'))",
+                "type": "VAR_STRING",
+                "length": 64,
+                "decimals": 31,
+                "flags": [
+                  "BINARY"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 128, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 64, 'decimals': 31, 'flags': ['BINARY'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID_TO_BIN(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT UUID_TO_BIN()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    }
+  ]
+}

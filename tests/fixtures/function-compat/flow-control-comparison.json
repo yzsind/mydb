@@ -1,0 +1,1567 @@
+{
+  "schema_version": 1,
+  "mysql_version": "8.0.46",
+  "category": "flow-control-comparison",
+  "functions": [
+    {
+      "name": "COALESCE",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT COALESCE('example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "example"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "example"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "COALESCE('example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "example"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "COALESCE('example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "exact"
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT COALESCE(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT COALESCE()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ELT",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT ELT(2, 'example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "ELT(2, 'example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "ELT(2, 'example')",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'VAR_STRING', 'length': 28, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT ELT(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT ELT()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "FIELD",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT FIELD(2, 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "FIELD(2, 2)",
+                "type": "LONGLONG",
+                "length": 3,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "FIELD(2, 2)",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 3, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT FIELD(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT FIELD()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "GREATEST",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT GREATEST(2, 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "GREATEST(2, 2)",
+                "type": "LONGLONG",
+                "length": 2,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "GREATEST(2, 2)",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 2, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT GREATEST(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT GREATEST()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IF",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IF('example', 2, 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [
+              1292
+            ]
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [
+              1292
+            ],
+            "columns": [
+              {
+                "name": "IF('example', 2, 2)",
+                "type": "LONGLONG",
+                "length": 2,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [
+              1292
+            ],
+            "columns": [
+              {
+                "name": "IF('example', 2, 2)",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 2, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IF(NULL, NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IF()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code.",
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IFNULL",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IFNULL('example', 'example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "example"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "example"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IFNULL('example', 'example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "example"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IFNULL('example', 'example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [
+                  "NOT_NULL"
+                ],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "exact"
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IFNULL(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IFNULL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "INTERVAL",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT INTERVAL(5, 1, 3, 7)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "INTERVAL(5, 1, 3, 7)",
+                "type": "LONGLONG",
+                "length": 2,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "__INTERVAL_LIST(5, 1, 3, 7)",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 2, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT INTERVAL(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "-1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "-1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "-1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT INTERVAL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1064,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "ISNULL",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT ISNULL(2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "ISNULL(2)",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "ISNULL(2)",
+                "type": "LONGLONG",
+                "length": 20,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'LONGLONG', 'length': 20, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT ISNULL(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT ISNULL()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "LEAST",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT LEAST(2, 2)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "LEAST(2, 2)",
+                "type": "LONGLONG",
+                "length": 2,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "2"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "LEAST(2, 2)",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 2, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT LEAST(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT LEAST()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "NAME_CONST",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT NAME_CONST('answer', 42)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "42"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "42"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "answer",
+                "type": "LONGLONG",
+                "length": 3,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "42"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "NAME_CONST('answer', 42)",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 3, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT NAME_CONST(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1382,
+            "sqlstate": "HY000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1382,
+            "sqlstate": "HY000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1210,
+            "sqlstate": "HY000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "Both servers reject this case, but MySQL validates it in a different parser/native/component layer and therefore reports a different catalog code."
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT NAME_CONST()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "comparison": "status_only",
+          "difference_reason": "The SQL parser normalizes the empty reserved NAME_CONST form before internal-engine evaluation, while the protocol path reports the native arity error; both reject the statement."
+        }
+      ]
+    },
+    {
+      "name": "NULLIF",
+      "oracle_class": "mysql80_community",
+      "profile": "scalar",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT NULLIF('example', 'example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "NULLIF('example', 'example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "NULLIF('example', 'example')",
+                "type": "VAR_STRING",
+                "length": 28,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "exact"
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT NULLIF(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT NULLIF()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    }
+  ]
+}

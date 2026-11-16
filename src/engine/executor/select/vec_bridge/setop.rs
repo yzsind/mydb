@@ -1,0 +1,682 @@
+//! setop execution and preparation.
+
+use super::*;
+mod dictionary;
+mod fixed;
+
+thread_local! {
+    // Query-expression domains apply through set nodes and their ordering /
+    // LIMIT wrappers, but never through a leaf SELECT's query boundary.
+    static SET_DOMAINS: std::cell::RefCell<std::collections::HashMap<usize, Arc<BatchSchema>>> = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+fn install_set_domains(plan: &PhysicalPlan, schema: Arc<BatchSchema>) {
+    match plan {
+        PhysicalPlan::SetOp { left, right, .. } => {
+            SET_DOMAINS.with(|domains| {
+                domains
+                    .borrow_mut()
+                    .insert(plan as *const _ as usize, schema.clone());
+            });
+            install_set_domains(left, schema.clone());
+            install_set_domains(right, schema);
+        }
+        PhysicalPlan::Sort { input, .. }
+        | PhysicalPlan::ParallelSort { input, .. }
+        | PhysicalPlan::IncrementalSort { input, .. }
+        | PhysicalPlan::Limit { input, .. }
+        | PhysicalPlan::TopK { input, .. }
+        | PhysicalPlan::ParallelTopK { input, .. }
+        | PhysicalPlan::TopWindow { input, .. }
+        | PhysicalPlan::Exchange { input, .. }
+        | PhysicalPlan::Materialize { input, .. } => install_set_domains(input, schema),
+        _ => {}
+    }
+}
+
+pub(super) struct ChargedMaterializedBatchOperator {
+    pub(super) inner: MaterializedBatchOperator,
+    pub(super) _charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
+impl BatchOperator for ChargedMaterializedBatchOperator {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        self.inner.schema()
+    }
+
+    fn properties(&self) -> BatchProperties {
+        self.inner.properties()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        self.inner.next_batch()
+    }
+}
+
+/// Physical set operator over two lowered batch subgraphs. `UNION ALL`
+/// concatenates lazily; count-based variants use the shared spillable
+/// hash-count kernel without constructing joined/plan rows.
+pub(super) struct SetOpBatchOperator<'a> {
+    pub(super) db: &'a Arc<Database>,
+    pub(super) plan: &'a PhysicalPlan,
+    pub(super) left: Option<Box<dyn BatchOperator + 'a>>,
+    pub(super) right: Option<Box<dyn BatchOperator + 'a>>,
+    pub(super) schema: Arc<BatchSchema>,
+    pub(super) op: crate::parser::SetOp,
+    pub(super) all: bool,
+    pub(super) data_dir: std::path::PathBuf,
+    pub(super) left_done: bool,
+    pub(super) blocking_output: Option<crate::engine::executor::dispatch::IncrementalSetOutput>,
+    compact_output: Option<std::collections::VecDeque<Batch>>,
+    dictionary_output: Option<dictionary::Output>,
+    pub(super) started: Option<std::time::Instant>,
+    pub(super) io_start: Option<(u64, u64)>,
+    pub(super) batches: u64,
+    pub(super) output_rows: u64,
+    pub(super) stats_recorded: bool,
+}
+
+/// Pulls visible rows from a batch stream without draining the whole branch.
+/// A blocking set operator therefore retains at most one input batch in
+/// addition to its bounded hash-count/spill state.
+pub(super) struct SetOpRowPuller<'a> {
+    pub(super) input: Box<dyn BatchOperator + 'a>,
+    pub(super) source_schema: Arc<BatchSchema>,
+    pub(super) schema: Arc<BatchSchema>,
+    pub(super) batch: Option<Batch>,
+    pub(super) visible: Vec<usize>,
+    pub(super) position: usize,
+}
+
+impl SetOpRowPuller<'_> {
+    pub(super) fn next_row_reuse(
+        &mut self,
+        mut row: Vec<Value>,
+    ) -> Result<Option<Vec<Value>>, QueryError> {
+        row.clear();
+        loop {
+            if let Some(batch) = self.batch.as_ref() {
+                if let Some(&row_index) = self.visible.get(self.position) {
+                    self.position += 1;
+                    row.extend(
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| column.value_at(row_index)),
+                    );
+                    for (column_index, (value, field)) in
+                        row.iter_mut().zip(self.schema.fields()).enumerate()
+                    {
+                        let passthrough = self
+                            .source_schema
+                            .fields()
+                            .get(column_index)
+                            .is_some_and(|source| {
+                                SetOpBatchOperator::can_passthrough_field(source, field)
+                            });
+                        if !passthrough {
+                            *value = crate::engine::executor::dispatch::coerce_setop_value_from(
+                                std::mem::replace(value, Value::Null),
+                                self.source_schema
+                                    .fields()
+                                    .get(column_index)
+                                    .map(|field| &field.source),
+                                field.column_type,
+                                &field.source,
+                            )?;
+                        }
+                    }
+                    return Ok(Some(row));
+                }
+            }
+            let Some(batch) = self.input.next_batch()? else {
+                self.batch = None;
+                self.visible.clear();
+                return Ok(None);
+            };
+            crate::engine::cancel::check_cancelled()?;
+            self.visible = batch.visible_indices().collect();
+            self.position = 0;
+            self.batch = Some(batch);
+        }
+    }
+}
+
+impl SetOpBatchOperator<'_> {
+    #[inline]
+    pub(super) fn can_passthrough_field(source: &BatchField, target: &BatchField) -> bool {
+        if source.column_type == ColumnType::Vector && target.column_type == ColumnType::Vector {
+            return source.source.vector_type == target.source.vector_type;
+        }
+        if source.column_type == target.column_type {
+            if matches!(target.column_type, ColumnType::VarString | ColumnType::Blob) {
+                return (source.source.collation_id == Some(63))
+                    == (target.source.collation_id == Some(63));
+            }
+            return true;
+        }
+        matches!(
+            (source.column_type, target.column_type),
+            (
+                ColumnType::Decimal {
+                    precision: source_precision,
+                    scale: source_scale,
+                },
+                ColumnType::Decimal {
+                    precision: target_precision,
+                    scale: target_scale,
+                },
+            ) if source_scale == target_scale && source_precision <= target_precision
+        )
+    }
+
+    pub(super) fn ensure_started(&mut self) {
+        if self.started.is_none() && analyze_stats::is_recording() {
+            self.started = Some(std::time::Instant::now());
+            self.io_start = Some(self.db.buffer_stats_counts());
+        }
+    }
+
+    pub(super) fn record_stats(&mut self) {
+        if self.stats_recorded {
+            return;
+        }
+        self.stats_recorded = true;
+        if self.all && matches!(self.plan, PhysicalPlan::SetOp { all: false, .. }) {
+            analyze_stats::add_expression_runtime(
+                self.plan,
+                "concat_parent_distinct",
+                self.output_rows,
+                0,
+            );
+        }
+        if let (Some(started), Some(io_start)) = (self.started, self.io_start) {
+            analyze_stats::add_vector_runtime(self.plan, self.batches, 0, 1);
+            analyze_stats::record_with_io_snapshot(
+                self.db,
+                self.plan,
+                started.elapsed().as_nanos(),
+                self.output_rows,
+                io_start,
+            );
+        }
+    }
+
+    /// Whether set-operation metadata unification leaves a physical column
+    /// byte-compatible with the output schema. UNION type resolution often
+    /// only widens a DECIMAL's declared precision while retaining its scale;
+    /// the magnitude representation is already identical in that case.
+    #[inline]
+    pub(super) fn can_passthrough_column(
+        column: &ColumnVector,
+        source: &BatchField,
+        target: &BatchField,
+    ) -> bool {
+        if matches!(target.column_type, ColumnType::VarString | ColumnType::Blob) {
+            let binary = target.source.collation_id == Some(63);
+            if matches!(column, ColumnVector::Bytes { .. }) {
+                return binary;
+            }
+            if matches!(column, ColumnVector::Utf8 { .. }) {
+                return !binary;
+            }
+        }
+        if matches!(column, ColumnVector::Null { .. })
+            || Self::can_passthrough_field(source, target)
+        {
+            return true;
+        }
+        false
+    }
+
+    pub(super) fn coerce_schema(&self, mut batch: Batch) -> Result<Batch, QueryError> {
+        let row_count = batch.num_rows();
+        let selection = batch.selection.clone();
+        let mut columns = Vec::with_capacity(batch.columns.len());
+        let (input_columns, owner) = batch.take_columns()?.into_parts();
+        for (column_index, (column, field)) in input_columns
+            .into_iter()
+            .zip(self.schema.fields())
+            .enumerate()
+        {
+            if batch
+                .schema
+                .fields()
+                .get(column_index)
+                .is_some_and(|source| Self::can_passthrough_column(&column, source, field))
+            {
+                columns.push(column);
+                continue;
+            }
+            let mut values = Vec::with_capacity(row_count);
+            for row in 0..row_count {
+                values.push(crate::engine::executor::dispatch::coerce_setop_value_from(
+                    column.value_at(row),
+                    batch
+                        .schema
+                        .fields()
+                        .get(column_index)
+                        .map(|field| &field.source),
+                    field.column_type,
+                    &field.source,
+                )?);
+            }
+            columns.push(ColumnVector::from_values(values));
+        }
+        let mut output = Batch::from_owned_columns(
+            self.schema.clone(),
+            crate::engine::executor::vec::batch::OwnedColumns::from_parts(
+                columns, owner, row_count,
+            ),
+        );
+        if let Some(selection) = selection {
+            output = output.with_selection(selection);
+        }
+        Ok(output)
+    }
+
+    pub(super) fn initialize_blocking(&mut self) -> Result<(), QueryError> {
+        if self.blocking_output.is_some()
+            || self.compact_output.is_some()
+            || self.dictionary_output.is_some()
+        {
+            return Ok(());
+        }
+        if !self.all {
+            let build_right = matches!(self.plan, PhysicalPlan::SetOp { left, right, .. }
+                if crate::planner::estimated_rows(right) < crate::planner::estimated_rows(left));
+            if let Some(output) = dictionary::prepare(
+                &mut self.left,
+                &mut self.right,
+                self.schema.clone(),
+                self.op,
+                build_right,
+                &self.data_dir,
+            )? {
+                let (peak, rows) = output.metrics();
+                analyze_stats::add_peak_memory(self.plan, peak);
+                analyze_stats::add_expression_runtime(self.plan, "dictionary_set", rows, 0);
+                self.dictionary_output = Some(output);
+                return Ok(());
+            }
+            if let Some(output) = fixed::prepare(
+                &mut self.left,
+                &mut self.right,
+                self.schema.clone(),
+                self.op,
+            )? {
+                self.compact_output = Some(output.into());
+                return Ok(());
+            }
+        }
+        let schema = self.schema.clone();
+        let left_input = self
+            .left
+            .take()
+            .expect("set-op left input is present before blocking initialization");
+        let right_input = self
+            .right
+            .take()
+            .expect("set-op right input is present before blocking initialization");
+        let left_source_schema = left_input.schema().clone();
+        let right_source_schema = right_input.schema().clone();
+        let mut left = Some(SetOpRowPuller {
+            input: left_input,
+            source_schema: left_source_schema,
+            schema: schema.clone(),
+            batch: None,
+            visible: Vec::new(),
+            position: 0,
+        });
+        let mut right = Some(SetOpRowPuller {
+            input: right_input,
+            source_schema: right_source_schema,
+            schema,
+            batch: None,
+            visible: Vec::new(),
+            position: 0,
+        });
+        self.blocking_output = Some(
+            crate::engine::executor::dispatch::combine_buffered_unordered_set_sources_spillable(
+                &self
+                    .schema
+                    .fields()
+                    .iter()
+                    .map(|field| field.source.collation_id)
+                    .collect::<Vec<_>>(),
+                self.op,
+                self.all,
+                self.schema.len(),
+                &self.data_dir,
+                crate::planner::estimated_rows(self.plan),
+                |buffer| {
+                    let result = left
+                        .as_mut()
+                        .expect("set-op left input requested after EOF")
+                        .next_row_reuse(buffer)?;
+                    if result.is_none() {
+                        // EOF is a lifetime boundary: completed HashJoin,
+                        // HashAgg and scan work areas must not remain live
+                        // while the right branch and SetOp state grow.
+                        left = None;
+                    }
+                    Ok(result)
+                },
+                |buffer| {
+                    let result = right
+                        .as_mut()
+                        .expect("set-op right input requested after EOF")
+                        .next_row_reuse(buffer)?;
+                    if result.is_none() {
+                        right = None;
+                    }
+                    Ok(result)
+                },
+            )?,
+        );
+        let (
+            spill_bytes,
+            spill_partitions,
+            spill_file_opens,
+            peak_memory,
+            spill_repartitions,
+            spill_max_depth,
+            spill_merge_passes,
+        ) = analyze_stats::take_pending_setop_spill();
+        if spill_bytes > 0 {
+            analyze_stats::add_spill_bytes(self.plan, spill_bytes);
+            analyze_stats::add_spill_shape(self.plan, 0, 1, spill_partitions, "memory_limit");
+            analyze_stats::add_setop_spill_runtime(
+                self.plan,
+                spill_file_opens,
+                spill_repartitions,
+                spill_max_depth,
+                spill_merge_passes,
+            );
+            analyze_stats::add_peak_memory(self.plan, peak_memory);
+        }
+        Ok(())
+    }
+}
+
+impl BatchOperator for SetOpBatchOperator<'_> {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        &self.schema
+    }
+
+    fn properties(&self) -> BatchProperties {
+        BatchProperties::UNORDERED_SINGLE
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        crate::util::stack::with_stack(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+            || self.next_batch_checked(),
+        )?
+    }
+}
+
+impl SetOpBatchOperator<'_> {
+    #[inline(never)]
+    fn next_batch_checked(&mut self) -> Result<Option<Batch>, QueryError> {
+        crate::engine::cancel::check_cancelled()?;
+        self.ensure_started();
+        if self.op == crate::parser::SetOp::Union && self.all {
+            if !self.left_done {
+                let next = self
+                    .left
+                    .as_mut()
+                    .expect("UNION ALL left input is present before EOF")
+                    .next_batch()?;
+                if let Some(batch) = next {
+                    let batch = self.coerce_schema(batch)?;
+                    self.batches = self.batches.saturating_add(1);
+                    self.output_rows = self.output_rows.saturating_add(batch.visible_rows() as u64);
+                    return Ok(Some(batch));
+                }
+                self.left_done = true;
+                self.left = None;
+            }
+            let Some(right) = self.right.as_mut() else {
+                self.record_stats();
+                return Ok(None);
+            };
+            let next = right.next_batch()?;
+            return match next {
+                Some(batch) => {
+                    let batch = self.coerce_schema(batch)?;
+                    self.batches = self.batches.saturating_add(1);
+                    self.output_rows = self.output_rows.saturating_add(batch.visible_rows() as u64);
+                    Ok(Some(batch))
+                }
+                None => {
+                    self.right = None;
+                    self.record_stats();
+                    Ok(None)
+                }
+            };
+        }
+        self.initialize_blocking()?;
+        if let Some(output) = self.dictionary_output.as_mut() {
+            let batch = output.next_batch()?;
+            if let Some(batch) = &batch {
+                self.batches += 1;
+                self.output_rows += batch.visible_rows() as u64;
+            } else {
+                self.record_stats();
+            }
+            return Ok(batch);
+        }
+        if let Some(output) = self.compact_output.as_mut() {
+            let batch = output.pop_front();
+            if let Some(batch) = &batch {
+                self.batches = self.batches.saturating_add(1);
+                self.output_rows = self.output_rows.saturating_add(batch.visible_rows() as u64);
+            } else {
+                self.record_stats();
+            }
+            return Ok(batch);
+        }
+        let output = self
+            .blocking_output
+            .as_mut()
+            .expect("blocking SetOp output initialized");
+        let mut columns: Vec<Vec<Value>> = (0..self.schema.len())
+            .map(|_| Vec::with_capacity(DEFAULT_BATCH_ROWS))
+            .collect();
+        let mut buffer = Vec::new();
+        let mut count = 0;
+        while count < DEFAULT_BATCH_ROWS {
+            let Some(mut row) = output.next_row_reuse(std::mem::take(&mut buffer))? else {
+                break;
+            };
+            if row.len() != columns.len() {
+                return Err(crate::error::catalog::ER_INTERNAL_ERROR
+                    .error("set-operation output width mismatch"));
+            }
+            for (column, value) in columns.iter_mut().zip(row.drain(..)) {
+                column.push(value);
+            }
+            buffer = row;
+            count += 1;
+        }
+        if count == 0 {
+            self.record_stats();
+            Ok(None)
+        } else {
+            let batch = Batch::with_row_count(
+                self.schema.clone(),
+                columns.into_iter().map(ColumnVector::from_values).collect(),
+                count,
+            );
+            self.batches = self.batches.saturating_add(1);
+            self.output_rows = self.output_rows.saturating_add(count as u64);
+            Ok(Some(batch))
+        }
+    }
+}
+
+impl Drop for SetOpBatchOperator<'_> {
+    fn drop(&mut self) {
+        if self.started.is_some() {
+            self.record_stats();
+        }
+    }
+}
+
+pub(super) fn try_build_setop_batch<'a>(
+    db: &'a Arc<Database>,
+    txn: TxnView,
+    plan: &'a PhysicalPlan,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    struct Restore(Option<std::collections::HashMap<usize, Arc<BatchSchema>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            if let Some(old) = self.0.take() {
+                SET_DOMAINS.with(|domains| *domains.borrow_mut() = old);
+            }
+        }
+    }
+    let inherited =
+        SET_DOMAINS.with(|domains| domains.borrow().contains_key(&(plan as *const _ as usize)));
+    let _restore = if inherited {
+        Restore(None)
+    } else {
+        let Some(template) = preflight_query_output_template(plan)? else {
+            return Ok(None);
+        };
+        let old = SET_DOMAINS.with(|domains| std::mem::take(&mut *domains.borrow_mut()));
+        let guard = Restore(Some(old));
+        install_set_domains(plan, template_to_batch_schema(&template));
+        guard
+    };
+    crate::util::stack::with_stack(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+        || try_build_setop_batch_checked(db, txn, plan),
+    )?
+}
+
+fn try_build_setop_batch_checked<'a>(
+    db: &'a Arc<Database>,
+    txn: TxnView,
+    plan: &'a PhysicalPlan,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    build_setop_batch(db, txn, plan, false)
+}
+
+fn build_setop_batch<'a>(
+    db: &'a Arc<Database>,
+    txn: TxnView,
+    plan: &'a PhysicalPlan,
+    deduplicated_by_parent: bool,
+) -> Result<Option<VecBatchInput<'a>>, QueryError> {
+    let PhysicalPlan::SetOp {
+        left,
+        right,
+        op,
+        all,
+        ..
+    } = plan
+    else {
+        return Ok(None);
+    };
+    let domain =
+        SET_DOMAINS.with(|domains| domains.borrow().get(&(plan as *const _ as usize)).cloned());
+    let distinct_domain = if *all && !deduplicated_by_parent {
+        None
+    } else {
+        domain.as_deref()
+    };
+    // DISTINCT UNION is associative in the query expression's common domain.
+    // A direct UNION child need only concatenate; the enclosing DISTINCT
+    // kernel performs the one deduplication. Sort/LIMIT/SELECT boundaries are
+    // deliberately opaque, and INTERSECT/EXCEPT retain their own kernels.
+    let flatten = *op == crate::parser::SetOp::Union && (!*all || deduplicated_by_parent);
+    let build_child = |child: &'a PhysicalPlan| {
+        if flatten
+            && matches!(
+                child,
+                PhysicalPlan::SetOp {
+                    op: crate::parser::SetOp::Union,
+                    ..
+                }
+            )
+        {
+            crate::util::stack::with_stack(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+                || build_setop_batch(db, txn, child, true),
+            )?
+        } else {
+            try_build_query_output_batch_in_set_domain(db, txn, child, distinct_domain)
+        }
+    };
+    let Some(left_input) = build_child(left)? else {
+        return Ok(None);
+    };
+    let Some(right_input) = build_child(right)? else {
+        return Ok(None);
+    };
+    #[cfg(test)]
+    if crate::util::env::var_os("MYDB_DEBUG_SETOP_BATCH").is_some() {
+        eprintln!(
+            "setop runtime left={:?} right={:?}",
+            left_input
+                .template
+                .iter()
+                .map(|field| &field.column)
+                .collect::<Vec<_>>(),
+            right_input
+                .template
+                .iter()
+                .map(|field| &field.column)
+                .collect::<Vec<_>>()
+        );
+    }
+    let mut template = unify_setop_templates(left_input.template, right_input.template)?;
+    if let Some(domain) = domain {
+        for (field, target) in template.iter_mut().zip(domain.fields()) {
+            let mut meta = (*field.meta).clone();
+            meta.column_type = target.column_type;
+            meta.source = target.source.clone();
+            field.meta = super::super::plan::intern_col_meta(meta);
+        }
+    }
+    let schema = template_to_batch_schema(&template);
+    Ok(Some(VecBatchInput {
+        stream: Box::new(SetOpBatchOperator {
+            db,
+            plan,
+            left: Some(left_input.stream),
+            right: Some(right_input.stream),
+            schema,
+            op: *op,
+            all: *all || deduplicated_by_parent,
+            data_dir: db.data_dir().to_path_buf(),
+            left_done: false,
+            blocking_output: None,
+            compact_output: None,
+            dictionary_output: None,
+            started: None,
+            io_start: None,
+            batches: 0,
+            output_rows: 0,
+            stats_recorded: false,
+        }),
+        template,
+    }))
+}
+
+impl BatchOperator for ScalarAggregateKernelBatchOperator<'_> {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        &self.output_schema
+    }
+
+    fn properties(&self) -> BatchProperties {
+        BatchProperties::UNORDERED_SINGLE
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        self.initialize()?;
+        Ok(self.output.as_mut().and_then(Iterator::next))
+    }
+}

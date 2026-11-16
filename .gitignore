@@ -1,0 +1,36 @@
+.DS_Store
+AGENTS.md
+CLAUDE.md
+target/
+output/
+outputs/
+data/
+logs/
+# Local development plans, test procedures, and acceptance records.
+/doc-internal/
+/docs-internal/
+# Machine-local benchmarks, profiling tools, and private experiment drivers.
+/scripts-internal/
+/tests/*
+!/tests/fuzz/
+!/tests/jepsen/
+!/tests/fixtures/
+/tests/fixtures/*
+!/tests/fixtures/storage-format-v1/
+!/tests/fixtures/function-compat/
+!/tests/fixtures/mysql80/
+!/tests/fixtures/xml-functions-mysql80.json
+docs/benchmark-results/
+docs/performance
+docs/validation
+artifacts/
+*.log
+__pycache__/
+.venv-vector-bench/
+*.pyc
+*.pem
+*.key
+*.crt
+.zcodeignore
+# ZCode session-local plans and state.
+.zcode/

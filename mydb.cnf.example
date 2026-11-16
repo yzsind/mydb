@@ -1,0 +1,5 @@
+[mydb]
+port = 8738
+data_dir = ./data
+memory_target = 1G
+parallel_degree = 4

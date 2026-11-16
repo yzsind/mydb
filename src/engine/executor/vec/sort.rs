@@ -1,0 +1,2957 @@
+//! Stable, spillable ORDER BY over the common [`BatchOperator`] protocol.
+//!
+//! Runs contain precomputed sort keys, the input ordinal used as the final
+//! stable tie breaker, and the payload columns.  They use the shared columnar
+//! spill codec, so neither run generation nor merge constructs `PlanRow`.
+
+use std::cmp::Ordering;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::engine::expr_program::ExprProgram;
+use crate::types::{ColumnType, QueryError, Value};
+
+use super::batch::{Batch, ColumnVector, DEFAULT_BATCH_ROWS};
+use super::expr_batch;
+use super::schema::{BatchField, BatchSchema};
+use super::stream::{BatchOperator, BatchProperties};
+
+pub(crate) enum SortKeySource {
+    Column(usize),
+    UnseededRand(Arc<ExprProgram>),
+    Program {
+        program: Arc<ExprProgram>,
+        integer: Option<crate::engine::executor::select::plan::CompiledNumericExpr>,
+    },
+}
+
+struct SortRow {
+    keys: SortKeyValues,
+    payload: Vec<Value>,
+    ordinal: u64,
+}
+
+enum SortKeyValues {
+    One(Value),
+    Many(Vec<Value>),
+}
+
+impl SortKeyValues {
+    /// Keep one-key sorts inline throughout run generation and spill merge.
+    /// Collection remains left-to-right and stops on the first key error.
+    // Fuse collection with its caller to avoid moving the large Result payload per row.
+    #[inline(always)]
+    fn try_collect(
+        mut values: impl ExactSizeIterator<Item = Result<Value, QueryError>>,
+    ) -> Result<Self, QueryError> {
+        if values.len() == 1 {
+            Ok(Self::One(values.next().expect("single sort key present")?))
+        } else {
+            let mut keys = crate::engine::executor::mem_budget::try_vec_with_capacity(
+                values.len(),
+                "batch sort keys",
+            )?;
+            for value in values {
+                keys.push(value?);
+            }
+            Ok(Self::Many(keys))
+        }
+    }
+
+    fn as_slice(&self) -> &[Value] {
+        match self {
+            Self::One(value) => std::slice::from_ref(value),
+            Self::Many(values) => values,
+        }
+    }
+
+    fn as_mut_slice(&mut self) -> &mut [Value] {
+        match self {
+            Self::One(value) => std::slice::from_mut(value),
+            Self::Many(values) => values,
+        }
+    }
+
+    fn take_values(&mut self) -> impl Iterator<Item = Value> + '_ {
+        let values = match self {
+            Self::One(value) => std::slice::from_mut(value),
+            Self::Many(values) => values.as_mut_slice(),
+        };
+        values
+            .iter_mut()
+            .map(|value| std::mem::replace(value, Value::Null))
+    }
+
+    fn iter(&self) -> std::slice::Iter<'_, Value> {
+        self.as_slice().iter()
+    }
+
+    fn get(&self, index: usize) -> Option<&Value> {
+        self.as_slice().get(index)
+    }
+}
+
+fn compare_rows(
+    left: &SortRow,
+    right: &SortRow,
+    fields: &[crate::engine::executor::sort::SortField],
+    payload_ties: bool,
+) -> Ordering {
+    crate::engine::executor::sort::compare_sort_keys(
+        fields,
+        left.keys.as_slice(),
+        right.keys.as_slice(),
+    )
+    .then_with(|| {
+        if payload_ties {
+            crate::engine::executor::sort::compare_payload_rows(&left.payload, &right.payload)
+        } else {
+            Ordering::Equal
+        }
+    })
+    .then_with(|| left.ordinal.cmp(&right.ordinal))
+}
+
+fn sort_rows(
+    rows: &mut Vec<SortRow>,
+    fields: &[crate::engine::executor::sort::SortField],
+    payload_ties: bool,
+) -> Result<(), QueryError> {
+    if payload_ties {
+        rows.sort_unstable_by(|left, right| compare_rows(left, right, fields, true));
+        return Ok(());
+    }
+    let directions = fields
+        .iter()
+        .map(|field| field.ascending)
+        .collect::<Vec<_>>();
+    if crate::engine::executor::sort::try_sort_by_int_keys_multi(
+        rows,
+        &directions,
+        |row, column| match row.keys.get(column) {
+            Some(Value::Int(value)) => Some(*value),
+            _ => None,
+        },
+    ) {
+        return Ok(());
+    }
+    if rows.len() >= 256
+        && crate::engine::executor::sort::key_encode::try_sort_by_borrowed_encoded_keys(
+            rows,
+            fields,
+            |row| row.keys.as_slice(),
+        )?
+    {
+        return Ok(());
+    }
+    rows.sort_unstable_by(|left, right| compare_rows(left, right, fields, false));
+    Ok(())
+}
+
+fn estimate_sort_row(row: &SortRow) -> usize {
+    use crate::engine::executor::memory_footprint::AllocatedBytes;
+    let key_slots = match &row.keys {
+        SortKeyValues::One(_) => 0,
+        SortKeyValues::Many(values) => values.capacity(),
+    };
+    row.keys.iter().chain(&row.payload).fold(
+        std::mem::size_of::<SortRow>().saturating_add(
+            key_slots
+                .saturating_add(row.payload.capacity())
+                .saturating_mul(std::mem::size_of::<Value>()),
+        ),
+        |bytes, value| bytes.saturating_add(value.allocated_bytes()),
+    )
+}
+
+fn copy_payload(columns: &[ColumnVector], row: usize) -> Result<Vec<Value>, QueryError> {
+    let mut payload = crate::engine::executor::mem_budget::try_vec_with_capacity(
+        columns.len(),
+        "batch sort payload",
+    )?;
+    for column in columns {
+        payload.push(column.try_value_at(row)?);
+    }
+    Ok(payload)
+}
+
+/// Retained rows and their capacity have distinct owners. Admission happens
+/// before cloning input values; a soft miss flushes only previously admitted
+/// rows, so computed expressions are never evaluated again.
+struct RunGeneration<'a> {
+    data_dir: &'a Path,
+    fields: &'a [crate::engine::executor::sort::SortField],
+    payload_ties: bool,
+    schema: Arc<BatchSchema>,
+    limit: usize,
+    rows: Vec<SortRow>,
+    bytes: usize,
+    peak_bytes: usize,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+    capacity_charge: crate::engine::executor::mem_budget::ScopedCharge,
+    tmp: Option<crate::engine::executor::select::grace::SpillTmpDir>,
+    /// Parallel run generation writes every worker's runs into one directory
+    /// owned by the operator; run file indexes interleave by worker.
+    shared_tmp: Option<&'a crate::engine::executor::select::grace::SpillTmpDir>,
+    run_offset: usize,
+    run_stride: usize,
+    /// Once any run has been written, admission force-charges instead of
+    /// flushing again on every soft budget miss.
+    flushed: bool,
+    runs: Vec<Run>,
+}
+
+impl<'a> RunGeneration<'a> {
+    fn new(
+        data_dir: &'a Path,
+        fields: &'a [crate::engine::executor::sort::SortField],
+        payload_ties: bool,
+        schema: Arc<BatchSchema>,
+        limit: usize,
+    ) -> Self {
+        Self {
+            data_dir,
+            fields,
+            payload_ties,
+            schema,
+            limit,
+            rows: Vec::new(),
+            bytes: 0,
+            peak_bytes: 0,
+            charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+            capacity_charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+            tmp: None,
+            shared_tmp: None,
+            run_offset: 0,
+            run_stride: 1,
+            flushed: false,
+            runs: Vec::new(),
+        }
+    }
+
+    fn flush(&mut self) -> Result<(), QueryError> {
+        let directory = match (self.shared_tmp, self.tmp.as_ref()) {
+            (Some(directory), _) => directory,
+            (None, Some(directory)) => directory,
+            (None, None) => self.tmp.insert(
+                crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                    self.data_dir,
+                    "sort",
+                )?,
+            ),
+        };
+        if !self.rows.is_empty() {
+            let index = self.run_offset + self.runs.len() * self.run_stride;
+            self.runs.push(flush_run(
+                directory,
+                &mut self.rows,
+                self.fields,
+                self.payload_ties,
+                self.schema.clone(),
+                index,
+            )?);
+        }
+        self.flushed = true;
+        self.bytes = 0;
+        self.charge = self.charge.sibling();
+        Ok(())
+    }
+
+    fn admit(
+        &mut self,
+        bytes: usize,
+    ) -> Result<crate::engine::executor::mem_budget::ScopedCharge, QueryError> {
+        let slot = if self.rows.len() == self.rows.capacity() {
+            std::mem::size_of::<SortRow>()
+        } else {
+            0
+        };
+        if !self.rows.is_empty()
+            && self
+                .bytes
+                .saturating_add(self.capacity_charge.charged())
+                .saturating_add(bytes)
+                .saturating_add(slot)
+                > self.limit
+        {
+            self.flush()?;
+        }
+        let mut charge = self.charge.sibling();
+        if self.flushed {
+            charge.add_force(bytes)?;
+        } else if charge.add(bytes).is_err() {
+            self.flush()?;
+            charge.add_force(bytes)?;
+        }
+        Ok(charge)
+    }
+
+    fn push(
+        &mut self,
+        row: SortRow,
+        charge: crate::engine::executor::mem_budget::ScopedCharge,
+        batch_rows: usize,
+    ) -> Result<(), QueryError> {
+        let mut owned = OwnedSortRow { row, charge };
+        let slot_bytes = std::mem::size_of::<SortRow>();
+        let row_bytes = estimate_sort_row(&owned.row).saturating_sub(slot_bytes);
+        if row_bytes > owned.charge.charged() {
+            let extra = row_bytes - owned.charge.charged();
+            if !self.flushed && owned.charge.add(extra).is_err() {
+                self.flush()?;
+                owned.charge.add_force(extra)?;
+            } else if self.flushed {
+                owned.charge.add_force(extra)?;
+            }
+        } else {
+            owned
+                .charge
+                .release_bytes(owned.charge.charged() - row_bytes);
+        }
+        if !self.rows.is_empty()
+            && self
+                .bytes
+                .saturating_add(self.capacity_charge.charged())
+                .saturating_add(row_bytes)
+                > self.limit
+        {
+            self.flush()?;
+        }
+        if self.rows.len() == self.rows.capacity() {
+            let headroom = self
+                .limit
+                .saturating_sub(self.bytes)
+                .saturating_sub(self.capacity_charge.charged())
+                .saturating_sub(row_bytes)
+                .min(self.capacity_charge.remaining());
+            let additional = (headroom / row_bytes.saturating_add(slot_bytes).max(1))
+                .max(1)
+                .min(batch_rows.max(1))
+                .min(DEFAULT_BATCH_ROWS);
+            crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                &mut self.rows,
+                additional,
+                &mut self.capacity_charge,
+                "batch sort run capacity",
+            )?;
+        }
+        self.bytes = self.bytes.saturating_add(row_bytes);
+        self.peak_bytes = self
+            .peak_bytes
+            .max(self.bytes.saturating_add(self.capacity_charge.charged()));
+        self.charge.absorb(&mut owned.charge);
+        self.rows.push(owned.row);
+        Ok(())
+    }
+}
+
+/// Convert one batch into sort rows for a column-key full sort. Key-sourced
+/// payload lanes stay NULL (the key owns the value), as in the serial path.
+#[inline(never)]
+fn push_column_key_rows(
+    generation: &mut RunGeneration<'_>,
+    batch: &Batch,
+    base_ordinal: u64,
+    key_columns: &[usize],
+    payload_key_sources: &[Option<usize>],
+    output_len: usize,
+) -> Result<(), QueryError> {
+    let value_slot = std::mem::size_of::<Value>();
+    let key_only = |column: usize| payload_key_sources.get(column).is_some_and(Option::is_some);
+    for (offset, row_index) in batch.visible_indices().enumerate() {
+        let mut predicted = batch.columns()[..output_len].iter().enumerate().fold(
+            0usize,
+            |bytes, (index, column)| {
+                bytes.saturating_add(if key_only(index) {
+                    value_slot
+                } else {
+                    column.owned_value_bytes(row_index)
+                })
+            },
+        );
+        if key_columns.len() != 1 {
+            predicted = predicted.saturating_add(key_columns.len().saturating_mul(value_slot));
+        }
+        for &column in key_columns {
+            predicted = predicted.saturating_add(
+                batch.columns()[column]
+                    .owned_value_bytes(row_index)
+                    .saturating_sub(value_slot),
+            );
+        }
+        let charge = generation.admit(predicted)?;
+        let keys = SortKeyValues::try_collect(
+            key_columns
+                .iter()
+                .map(|&column| batch.columns()[column].try_value_at(row_index)),
+        )?;
+        let mut payload = crate::engine::executor::mem_budget::try_vec_with_capacity(
+            output_len,
+            "sort non-key payload",
+        )?;
+        for (column, vector) in batch.columns()[..output_len].iter().enumerate() {
+            payload.push(if key_only(column) {
+                Value::Null
+            } else {
+                vector.try_value_at(row_index)?
+            });
+        }
+        generation.push(
+            SortRow {
+                keys,
+                payload,
+                ordinal: base_ordinal + offset as u64,
+            },
+            charge,
+            batch.num_rows(),
+        )?;
+    }
+    Ok(())
+}
+
+fn run_bytes() -> usize {
+    if let Some(bytes) = crate::engine::executor::tuning::current_or_capture().sort_run_bytes {
+        return bytes;
+    }
+    crate::engine::executor::mem_budget::current_budget()
+        .map(|budget| (budget.limit() / 4).clamp(1024 * 1024, 256 * 1024 * 1024))
+        .unwrap_or(8 * 1024 * 1024)
+}
+
+fn spill_block_bytes() -> usize {
+    crate::engine::executor::mem_budget::current_budget().map_or(256 * 1024, |budget| {
+        (budget.limit() / 16).clamp(16 * 1024, 256 * 1024)
+    })
+}
+
+fn merge_fanin(configured: Option<usize>) -> usize {
+    // A fixed small fan-in adds entire read/write passes even when memory
+    // and file descriptors can hold all remaining runs. Explicit tuning is
+    // still an upper bound; reserve half the live headroom for output and
+    // downstream state, rather than using the query's original limit.
+    let without_budget = configured.unwrap_or(32);
+    let configured = configured.unwrap_or(128);
+    let per_reader = spill_block_bytes()
+        .saturating_mul(4)
+        .saturating_add(32 * 1024);
+    let memory = crate::engine::executor::mem_budget::current_budget()
+        .map_or(without_budget, |budget| {
+            budget.remaining() / 2 / per_reader.max(1)
+        });
+    let descriptors = {
+        #[cfg(unix)]
+        {
+            let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+            // SAFETY: getrlimit writes the complete object on success.
+            if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, limit.as_mut_ptr()) } == 0 {
+                let limit = unsafe { limit.assume_init() }.rlim_cur;
+                (limit.min(usize::MAX as u64) as usize / 2)
+                    .saturating_sub(
+                        crate::engine::executor::spill_quota::active_spill_files()
+                            .min(usize::MAX as u64) as usize,
+                    )
+                    .saturating_sub(16)
+                    .max(2)
+            } else {
+                configured
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            configured
+        }
+    };
+    configured.min(memory.max(2)).min(descriptors).max(2)
+}
+
+/// Evaluate potentially wide keys once, emitting bounded logical chunks.
+/// Hidden computed lanes never become part of the forwarded sort payload.
+struct SortKeyInput<'a> {
+    input: Box<dyn BatchOperator + 'a>,
+    programs: Vec<Arc<ExprProgram>>,
+    computed_columns: Vec<Option<usize>>,
+    schema: Arc<BatchSchema>,
+    pending: Option<super::evaluated_batch::ComputedRowCursor>,
+}
+
+impl SortKeyInput<'_> {
+    fn next(&mut self) -> Result<Option<(Batch, bool)>, QueryError> {
+        loop {
+            if let Some(cursor) = self.pending.as_mut() {
+                if let Some(batch) = cursor.next(&self.programs, &self.schema)? {
+                    return Ok(Some((batch, true)));
+                }
+                self.pending = None;
+            }
+            let Some(batch) = self.input.next_batch()? else {
+                return Ok(None);
+            };
+            if !self.programs.is_empty()
+                && super::evaluated_batch::needs_chunks(&self.programs, batch.num_rows())
+            {
+                self.pending = Some(super::evaluated_batch::ComputedRowCursor::new(batch)?);
+            } else {
+                return Ok(Some((batch, false)));
+            }
+        }
+    }
+}
+
+struct OwnedSortRow {
+    row: SortRow,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
+struct Run {
+    path: PathBuf,
+    bytes: u64,
+}
+
+fn spill_schema(payload: &BatchSchema, key_count: usize) -> Arc<BatchSchema> {
+    let mut fields = Vec::with_capacity(key_count + 1 + payload.len());
+    fields.extend((0..key_count).map(|index| BatchField {
+        table: "__sort".into(),
+        alias: None,
+        name: format!("k{index}"),
+        column_type: ColumnType::Blob,
+        source: Default::default(),
+    }));
+    fields.push(BatchField {
+        table: "__sort".into(),
+        alias: None,
+        name: "ordinal".into(),
+        column_type: ColumnType::LongLong,
+        source: Default::default(),
+    });
+    fields.extend(payload.fields().iter().cloned());
+    Arc::new(BatchSchema::new(fields))
+}
+
+fn batch_from_rows<R: IntoIterator<Item = Value>>(
+    schema: Arc<BatchSchema>,
+    rows: impl ExactSizeIterator<Item = R>,
+) -> Batch {
+    let row_count = rows.len();
+    // Cloning an empty Vec does not preserve its spare capacity. Reserve
+    // each column independently so every lane has room for the whole batch.
+    let mut columns: Vec<Vec<Value>> = (0..schema.len())
+        .map(|_| Vec::with_capacity(row_count))
+        .collect();
+    for row in rows {
+        for (column, value) in row.into_iter().enumerate() {
+            columns[column].push(value);
+        }
+    }
+    Batch::with_row_count(
+        schema,
+        columns
+            .into_iter()
+            .map(|values| {
+                // F64 lanes promote Value::Float, which changes a dynamic
+                // payload's runtime domain depending on spill block boundaries.
+                // Ordinary typed scan FLOAT lanes already arrive as F64; keep
+                // explicitly retained Float values exact in generic payloads.
+                if values.iter().any(|value| matches!(value, Value::Float(_))) {
+                    ColumnVector::Generic { values }
+                } else {
+                    ColumnVector::from_values(values)
+                }
+            })
+            .collect(),
+        row_count,
+    )
+}
+
+/// The caller consumes these rows after writing the batch. Move their values
+/// into columns rather than keeping a second deep copy alive during spill.
+fn rows_to_batch<'a>(
+    schema: Arc<BatchSchema>,
+    rows: impl ExactSizeIterator<Item = &'a mut SortRow>,
+) -> Batch {
+    batch_from_rows(
+        schema,
+        rows.map(|row| {
+            let payload = std::mem::take(&mut row.payload);
+            row.keys
+                .take_values()
+                .chain(std::iter::once(Value::UInt(row.ordinal)))
+                .chain(payload)
+        }),
+    )
+}
+
+fn flush_run(
+    tmp: &crate::engine::executor::select::grace::SpillTmpDir,
+    rows: &mut Vec<SortRow>,
+    fields: &[crate::engine::executor::sort::SortField],
+    payload_ties: bool,
+    schema: Arc<BatchSchema>,
+    index: usize,
+) -> Result<Run, QueryError> {
+    sort_rows(rows, fields, payload_ties)?;
+    let path = tmp.path().join(format!("run-{index}.batch"));
+    let capacity = crate::engine::executor::spill_quota::writer_buffer_capacity(1);
+    let mut writer = crate::engine::executor::spill_quota::TrackedSpillWriter::create_new(
+        &path,
+        tmp.charger(),
+        capacity,
+    )?;
+    let mut start = 0;
+    let target = spill_block_bytes();
+    while start < rows.len() {
+        let mut end = start;
+        let mut bytes = 0usize;
+        while end < rows.len()
+            && end - start < DEFAULT_BATCH_ROWS
+            && (end == start || bytes < target)
+        {
+            bytes = bytes.saturating_add(estimate_sort_row(&rows[end]));
+            end += 1;
+        }
+        let _scratch = crate::engine::executor::mem_budget::force_charge_scoped(bytes)?;
+        super::spill::write_batch(
+            &mut writer,
+            &rows_to_batch(schema.clone(), rows[start..end].iter_mut()),
+        )?;
+        start = end;
+    }
+    let bytes = writer.finish()?;
+    rows.clear();
+    Ok(Run { path, bytes })
+}
+
+struct RunReader {
+    reader: crate::engine::executor::spill_quota::TrackedSpillReader,
+    schema: Arc<BatchSchema>,
+    key_count: usize,
+    batch: Option<Batch>,
+    row: usize,
+}
+
+impl RunReader {
+    fn open(
+        run: &Run,
+        tmp: &crate::engine::executor::select::grace::SpillTmpDir,
+        schema: Arc<BatchSchema>,
+        key_count: usize,
+        reader_count: usize,
+    ) -> Result<Self, QueryError> {
+        Ok(Self {
+            reader: crate::engine::executor::spill_quota::TrackedSpillReader::open(
+                &run.path,
+                tmp.charger(),
+                crate::engine::executor::spill_quota::writer_buffer_capacity(reader_count),
+            )?,
+            schema,
+            key_count,
+            batch: None,
+            row: 0,
+        })
+    }
+
+    fn next_row(&mut self) -> Result<Option<OwnedSortRow>, QueryError> {
+        loop {
+            if self
+                .batch
+                .as_ref()
+                .is_some_and(|batch| self.row < batch.num_rows())
+            {
+                let batch = self.batch.as_ref().expect("batch checked above");
+                let row = self.row;
+                self.row += 1;
+                let mut charge = self.reader.memory_charge();
+                let bytes = batch
+                    .columns()
+                    .iter()
+                    .enumerate()
+                    .filter(|(column, _)| *column != self.key_count)
+                    .fold(std::mem::size_of::<SortRow>(), |bytes, (index, column)| {
+                        bytes
+                            .saturating_add(column.owned_value_bytes(row))
+                            .saturating_sub(if index < self.key_count && self.key_count == 1 {
+                                std::mem::size_of::<Value>()
+                            } else {
+                                0
+                            })
+                    });
+                charge.add_force(bytes)?;
+                let keys = SortKeyValues::try_collect(
+                    (0..self.key_count).map(|column| batch.columns()[column].try_value_at(row)),
+                )?;
+                let ordinal = match batch.columns()[self.key_count].value_at(row) {
+                    Value::UInt(value) => value,
+                    Value::Int(value) if value >= 0 => value as u64,
+                    _ => {
+                        return Err(crate::storage::error(
+                            crate::error::catalog::ER_UNKNOWN_ERROR,
+                            "invalid ordinal in batch sort spill run",
+                        ));
+                    }
+                };
+                let payload = copy_payload(&batch.columns()[self.key_count + 1..], row)?;
+                return Ok(Some(OwnedSortRow {
+                    row: SortRow {
+                        keys,
+                        payload,
+                        ordinal,
+                    },
+                    charge,
+                }));
+            }
+            self.batch = super::spill::read_owned_batch(&mut self.reader, self.schema.clone())?;
+            self.row = 0;
+            if self.batch.is_none() {
+                return Ok(None);
+            }
+        }
+    }
+}
+
+/// Merge comparisons revisit each head O(log fan-in) times. Cache string
+/// weights once per head instead of repeating Unicode collation on every
+/// comparison; numeric and mixed-domain keys retain the shared comparator.
+struct MergeStringKeys {
+    keys: Vec<Option<Vec<u8>>>,
+    encoded: Vec<u8>,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
+impl MergeStringKeys {
+    fn new() -> Self {
+        Self {
+            keys: Vec::new(),
+            encoded: Vec::new(),
+            charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        }
+    }
+
+    fn update(
+        &mut self,
+        row: &SortRow,
+        fields: &[crate::engine::executor::sort::SortField],
+        previous: Option<&SortRow>,
+    ) -> Result<(), QueryError> {
+        self.keys.resize_with(fields.len(), || None);
+        for (index, ((slot, value), field)) in self
+            .keys
+            .iter_mut()
+            .zip(row.keys.iter())
+            .zip(fields)
+            .enumerate()
+        {
+            // Consecutive heads of one sorted run usually share a long raw
+            // prefix. Its collation weights are unchanged; borrow the outgoing
+            // head rather than retaining a second copy of each string.
+            if slot.is_some()
+                && previous
+                    .and_then(|row| row.keys.get(index))
+                    .is_some_and(|old| old.storage_eq(value))
+            {
+                continue;
+            }
+            let text = match value {
+                Value::String(text) => Some(text.as_str()),
+                Value::SmallString(text) => std::str::from_utf8(text.as_ref()).ok(),
+                _ => None,
+            };
+            // Without an explicit collation retain the context-aware comparator.
+            if let (Some(text), Some(id)) = (text, field.collation_id) {
+                crate::charset::collation_key_by_id_into(
+                    id,
+                    text,
+                    slot.get_or_insert_with(Vec::new),
+                );
+            } else {
+                *slot = None;
+            }
+        }
+        let bytes = self.encoded.capacity()
+            + self.keys.capacity() * std::mem::size_of::<Option<Vec<u8>>>()
+            + self.keys.iter().flatten().map(Vec::capacity).sum::<usize>();
+        if bytes > self.charge.charged() {
+            self.charge.add_force(bytes - self.charge.charged())?;
+        }
+        Ok(())
+    }
+
+    fn encode(
+        &mut self,
+        encoder: &mut crate::engine::executor::sort::key_encode::RowEncoder,
+        row: &SortRow,
+    ) -> Result<bool, QueryError> {
+        let Some(bound) = crate::engine::executor::sort::key_encode::RowEncoder::bound(
+            row.keys.as_slice(),
+            &self.keys,
+        ) else {
+            return Ok(false);
+        };
+        let cap = crate::engine::executor::mem_budget::current_budget()
+            .map_or(65536, |b| (b.limit() / 128).min(65536));
+        if bound > cap {
+            return Ok(false);
+        }
+        if bound > self.encoded.capacity() {
+            let extra = bound - self.encoded.capacity();
+            if !self.charge.add_within(extra, usize::MAX) {
+                return Ok(false);
+            }
+            let additional = bound.saturating_sub(self.encoded.len());
+            crate::engine::executor::mem_budget::try_reserve_vec_exact(
+                &mut self.encoded,
+                additional,
+                "merge encoded tuple",
+            )?;
+        }
+        Ok(encoder.encode(row.keys.as_slice(), &self.keys, &mut self.encoded))
+    }
+}
+
+struct HeapRow {
+    row: SortRow,
+    string_keys: MergeStringKeys,
+    charge: crate::engine::executor::mem_budget::ScopedCharge,
+    fields: Arc<[crate::engine::executor::sort::SortField]>,
+    payload_ties: bool,
+    encoded_enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl PartialEq for HeapRow {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other) == Ordering::Equal
+    }
+}
+impl Eq for HeapRow {}
+impl PartialOrd for HeapRow {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+impl Ord for HeapRow {
+    fn cmp(&self, other: &Self) -> Ordering {
+        if self
+            .encoded_enabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            let order = self.string_keys.encoded.cmp(&other.string_keys.encoded);
+            if order != Ordering::Equal {
+                return order;
+            }
+            return (if self.payload_ties {
+                crate::engine::executor::sort::compare_payload_rows(
+                    &self.row.payload,
+                    &other.row.payload,
+                )
+            } else {
+                Ordering::Equal
+            })
+            .then_with(|| self.row.ordinal.cmp(&other.row.ordinal));
+        }
+        for (index, field) in self.fields.iter().enumerate() {
+            let order = match (
+                &self.string_keys.keys[index],
+                &other.string_keys.keys[index],
+            ) {
+                (Some(left), Some(right)) => {
+                    let order = left.cmp(right);
+                    if field.ascending {
+                        order
+                    } else {
+                        order.reverse()
+                    }
+                }
+                _ => crate::engine::executor::sort::compare_value_for_sort(
+                    &self.row.keys.as_slice()[index],
+                    &other.row.keys.as_slice()[index],
+                    *field,
+                ),
+            };
+            if order != Ordering::Equal {
+                return order;
+            }
+        }
+        (if self.payload_ties {
+            crate::engine::executor::sort::compare_payload_rows(
+                &self.row.payload,
+                &other.row.payload,
+            )
+        } else {
+            Ordering::Equal
+        })
+        .then_with(|| self.row.ordinal.cmp(&other.row.ordinal))
+    }
+}
+
+struct RunMerger {
+    readers: Vec<RunReader>,
+    tree: crate::engine::executor::select::loser_tree::LoserTree<HeapRow, ()>,
+    encoder: Option<crate::engine::executor::sort::key_encode::RowEncoder>,
+    encoded_enabled: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl RunMerger {
+    fn open(
+        tmp: &crate::engine::executor::select::grace::SpillTmpDir,
+        runs: &[Run],
+        schema: Arc<BatchSchema>,
+        key_count: usize,
+        fields: Arc<[crate::engine::executor::sort::SortField]>,
+        payload_ties: bool,
+    ) -> Result<Self, QueryError> {
+        let mut readers = Vec::with_capacity(runs.len());
+        let mut heads = Vec::with_capacity(runs.len());
+        let mut encoder = crate::engine::executor::sort::key_encode::sort_key_encode_enabled()
+            .then(|| crate::engine::executor::sort::key_encode::RowEncoder::new(fields.clone()))
+            .flatten();
+        let encoded_enabled = Arc::new(std::sync::atomic::AtomicBool::new(encoder.is_some()));
+        for run in runs {
+            let mut reader = RunReader::open(run, &tmp, schema.clone(), key_count, runs.len())?;
+            let head = if let Some(row) = reader.next_row()? {
+                let mut string_keys = MergeStringKeys::new();
+                string_keys.update(&row.row, &fields, None)?;
+                if let Some(encoding) = encoder.as_mut() {
+                    if !string_keys.encode(encoding, &row.row)? {
+                        encoder = None;
+                        encoded_enabled.store(false, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
+                Some((
+                    HeapRow {
+                        row: row.row,
+                        string_keys,
+                        charge: row.charge,
+                        fields: fields.clone(),
+                        payload_ties,
+                        encoded_enabled: encoded_enabled.clone(),
+                    },
+                    (),
+                ))
+            } else {
+                None
+            };
+            heads.push(head);
+            readers.push(reader);
+        }
+        Ok(Self {
+            readers,
+            encoder,
+            encoded_enabled,
+            tree: crate::engine::executor::select::loser_tree::LoserTree::new(heads),
+        })
+    }
+
+    fn next_sort_row(&mut self) -> Result<Option<OwnedSortRow>, QueryError> {
+        let Some((item, (), run)) = self.tree.pop_winner() else {
+            return Ok(None);
+        };
+        let output = OwnedSortRow {
+            row: item.row,
+            charge: item.charge,
+        };
+        let next = if let Some(row) = self.readers[run].next_row()? {
+            let mut string_keys = item.string_keys;
+            string_keys.update(&row.row, &item.fields, Some(&output.row))?;
+            if let Some(encoding) = self.encoder.as_mut() {
+                if !string_keys.encode(encoding, &row.row)? {
+                    self.encoder = None;
+                    self.encoded_enabled
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            Some((
+                HeapRow {
+                    row: row.row,
+                    string_keys,
+                    charge: row.charge,
+                    fields: item.fields,
+                    payload_ties: item.payload_ties,
+                    encoded_enabled: item.encoded_enabled,
+                },
+                (),
+            ))
+        } else {
+            None
+        };
+        self.tree.refill(run, next);
+        Ok(Some(output))
+    }
+}
+
+struct MergeState {
+    _tmp: crate::engine::executor::select::grace::SpillTmpDir,
+    merger: RunMerger,
+}
+
+impl MergeState {
+    fn open(
+        tmp: crate::engine::executor::select::grace::SpillTmpDir,
+        runs: &[Run],
+        schema: Arc<BatchSchema>,
+        key_count: usize,
+        fields: Arc<[crate::engine::executor::sort::SortField]>,
+        payload_ties: bool,
+    ) -> Result<Self, QueryError> {
+        let merger = RunMerger::open(&tmp, runs, schema, key_count, fields, payload_ties)?;
+        Ok(Self { _tmp: tmp, merger })
+    }
+
+    fn next_row(&mut self) -> Result<Option<OwnedSortRow>, QueryError> {
+        self.merger.next_sort_row()
+    }
+}
+
+type MergeChunk = Result<Vec<OwnedSortRow>, QueryError>;
+
+/// Final spill merge driven by a dedicated thread. Rows arrive in bounded
+/// chunks in exactly the merge order; dropping the consumer closes the
+/// channel, which stops the producer before it is joined.
+struct PipelinedMerge {
+    receiver: Option<std::sync::mpsc::Receiver<MergeChunk>>,
+    buffer: std::vec::IntoIter<OwnedSortRow>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PipelinedMerge {
+    fn spawn(mut merge: MergeState) -> Self {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<MergeChunk>(4);
+        let cancellation = crate::engine::cancel::current_token();
+        let budget = crate::engine::executor::mem_budget::current_budget();
+        let mode = super::config::effective_mode();
+        let handle = crate::util::thread_spawn::spawn(move || {
+            let _cancel = cancellation.map(crate::engine::cancel::enter);
+            let _mode = super::config::enter_mode(mode);
+            let mut produce = move || loop {
+                let mut chunk = Vec::with_capacity(DEFAULT_BATCH_ROWS);
+                let result = (|| -> Result<bool, QueryError> {
+                    while chunk.len() < DEFAULT_BATCH_ROWS {
+                        crate::engine::cancel::check_cancelled()?;
+                        match merge.next_row()? {
+                            Some(row) => chunk.push(row),
+                            None => return Ok(false),
+                        }
+                    }
+                    Ok(true)
+                })();
+                match result {
+                    Ok(more) => {
+                        if !chunk.is_empty() && sender.send(Ok(chunk)).is_err() {
+                            return;
+                        }
+                        if !more {
+                            return;
+                        }
+                    }
+                    Err(error) => {
+                        let _ = sender.send(Err(error));
+                        return;
+                    }
+                }
+            };
+            match budget {
+                Some(budget) => {
+                    crate::engine::executor::mem_budget::with_query_budget(budget, produce)
+                }
+                None => produce(),
+            }
+        });
+        Self {
+            receiver: Some(receiver),
+            buffer: Vec::new().into_iter(),
+            handle: Some(handle),
+        }
+    }
+
+    fn next_row(&mut self) -> Result<Option<OwnedSortRow>, QueryError> {
+        loop {
+            if let Some(row) = self.buffer.next() {
+                return Ok(Some(row));
+            }
+            let Some(receiver) = self.receiver.as_ref() else {
+                return Ok(None);
+            };
+            match receiver.recv() {
+                Ok(Ok(chunk)) => self.buffer = chunk.into_iter(),
+                Ok(Err(error)) => {
+                    self.finish();
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.finish();
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
+    fn finish(&mut self) {
+        self.receiver = None;
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for PipelinedMerge {
+    fn drop(&mut self) {
+        self.finish();
+    }
+}
+
+fn merge_runs_to_run(
+    tmp: &crate::engine::executor::select::grace::SpillTmpDir,
+    runs: &[Run],
+    schema: Arc<BatchSchema>,
+    key_count: usize,
+    fields: Arc<[crate::engine::executor::sort::SortField]>,
+    payload_ties: bool,
+    name: &str,
+) -> Result<Run, QueryError> {
+    let path = tmp.path().join(format!("{name}.batch"));
+    let capacity = crate::engine::executor::spill_quota::writer_buffer_capacity(1);
+    let mut writer = crate::engine::executor::spill_quota::TrackedSpillWriter::create_new(
+        &path,
+        tmp.charger(),
+        capacity,
+    )?;
+    let mut merger = RunMerger::open(tmp, runs, schema.clone(), key_count, fields, payload_ties)?;
+    let mut rows = Vec::new();
+    let mut capacity = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    let mut bytes = 0usize;
+    let flush = |rows: &mut Vec<OwnedSortRow>,
+                 writer: &mut crate::engine::executor::spill_quota::TrackedSpillWriter|
+     -> Result<(), QueryError> {
+        let scratch = rows.iter().map(|row| estimate_sort_row(&row.row)).sum();
+        let _scratch = crate::engine::executor::mem_budget::force_charge_scoped(scratch)?;
+        super::spill::write_batch(
+            writer,
+            &rows_to_batch(schema.clone(), rows.iter_mut().map(|row| &mut row.row)),
+        )?;
+        rows.clear();
+        Ok(())
+    };
+    while let Some(row) = merger.next_sort_row()? {
+        bytes = bytes.saturating_add(estimate_sort_row(&row.row));
+        if rows.len() == rows.capacity() {
+            crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                &mut rows,
+                32,
+                &mut capacity,
+                "sort merge rows",
+            )?;
+        }
+        rows.push(row);
+        if rows.len() == DEFAULT_BATCH_ROWS || bytes >= spill_block_bytes() {
+            flush(&mut rows, &mut writer)?;
+            bytes = 0;
+        }
+    }
+    if !rows.is_empty() {
+        flush(&mut rows, &mut writer)?;
+    }
+    let bytes = writer.finish()?;
+    drop(merger);
+    for run in runs {
+        crate::engine::executor::spill_quota::remove_spill_file(&run.path, &tmp.charger())?;
+    }
+    Ok(Run { path, bytes })
+}
+
+enum OutputState {
+    Memory(std::vec::IntoIter<SortRow>),
+    Spill(MergeState),
+    /// The final merge runs on its own thread, overlapping the consumer.
+    Pipelined(PipelinedMerge),
+    TopK(crate::engine::executor::sort::TopKCandidates<Vec<Value>>),
+    SortedPayloads {
+        rows: std::vec::IntoIter<Vec<Value>>,
+        charge: crate::engine::executor::mem_budget::ScopedCharge,
+    },
+    Empty,
+}
+
+/// Deferred external sort. Capability discovery and child construction happen
+/// before this operator is returned; the first pull is the only point that
+/// consumes upstream input.
+pub(crate) struct ExternalSortBatchOperator<'a> {
+    plan: Option<&'a crate::planner::PhysicalPlan>,
+    upstream: Option<Box<dyn BatchOperator + 'a>>,
+    output_schema: Arc<BatchSchema>,
+    properties: BatchProperties,
+    sources: Vec<SortKeySource>,
+    row_major_keys: bool,
+    fields: Arc<[crate::engine::executor::sort::SortField]>,
+    data_dir: PathBuf,
+    output: Option<OutputState>,
+    memory_charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
+    capacity_charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
+    topn: Option<usize>,
+    output_offset: usize,
+    output_remaining: Option<usize>,
+    record_topn_keys: bool,
+    payload_ties: bool,
+    // Direct sort columns already own their values in the key. Their payload
+    // lanes remain NULL until output, avoiding duplicate strings in every run.
+    payload_key_sources: Vec<Option<usize>>,
+    input_ordinal_column: Option<usize>,
+    /// Worker count for parallel run generation (1 = serial).
+    parallel_runs: usize,
+}
+
+impl<'a> ExternalSortBatchOperator<'a> {
+    /// The producer has already ordered and admitted these rows. Reuse the
+    /// byte-bounded owning output adapter without sorting or evaluating keys.
+    pub(crate) fn from_sorted_rows(
+        schema: Arc<BatchSchema>,
+        properties: BatchProperties,
+        rows: Vec<Vec<Value>>,
+        charge: crate::engine::executor::mem_budget::ScopedCharge,
+        offset: usize,
+    ) -> Self {
+        let mut output = Self::new(
+            None,
+            Box::new(super::stream::MaterializedBatchOperator::new(
+                schema.clone(),
+                Vec::new(),
+            )),
+            schema,
+            properties,
+            Vec::new(),
+            Vec::new(),
+            Path::new("."),
+        );
+        output.upstream = None;
+        output.output = Some(OutputState::SortedPayloads {
+            rows: rows.into_iter(),
+            charge,
+        });
+        output.output_offset = offset;
+        output
+    }
+
+    pub(crate) fn new(
+        plan: Option<&'a crate::planner::PhysicalPlan>,
+        upstream: Box<dyn BatchOperator + 'a>,
+        output_schema: Arc<BatchSchema>,
+        properties: BatchProperties,
+        sources: Vec<SortKeySource>,
+        fields: Vec<crate::engine::executor::sort::SortField>,
+        data_dir: &Path,
+    ) -> Self {
+        let erroring_programs = sources
+            .iter()
+            .filter_map(|source| match source {
+                SortKeySource::Program { program, .. } | SortKeySource::UnseededRand(program) => {
+                    Some(program.capability())
+                }
+                SortKeySource::Column(_) => None,
+            })
+            .filter(|capability| capability.requires_ordered_evaluation())
+            .count();
+        Self {
+            plan,
+            upstream: Some(upstream),
+            output_schema,
+            properties,
+            sources,
+            row_major_keys: erroring_programs > 1,
+            fields: fields.into(),
+            data_dir: data_dir.to_path_buf(),
+            output: None,
+            memory_charge: None,
+            capacity_charge: None,
+            topn: None,
+            output_offset: 0,
+            output_remaining: None,
+            record_topn_keys: false,
+            payload_ties: false,
+            payload_key_sources: Vec::new(),
+            input_ordinal_column: None,
+            parallel_runs: 1,
+        }
+    }
+
+    /// Generate sorted runs on `workers` threads. Applies to full sorts on
+    /// plain column keys; TopN, payload-tie and computed-key sorts keep the
+    /// serial path. The merged output is identical: rows carry a global input
+    /// ordinal that breaks key ties exactly as serial run generation does.
+    pub(crate) fn with_parallel_run_generation(mut self, workers: usize) -> Self {
+        self.parallel_runs = workers.max(1);
+        self
+    }
+
+    /// Retain a heap while its actual footprint fits, then migrate the
+    /// already evaluated candidates and remaining input to ordinary runs.
+    pub(crate) fn with_topn(mut self, k: usize, offset: usize) -> Self {
+        self.topn = Some(k);
+        self.output_offset = offset;
+        self.output_remaining = Some(k.saturating_sub(offset));
+        self.record_topn_keys = true;
+        self
+    }
+
+    /// Workers have already evaluated these candidates. Sort their retained
+    /// payload tie directly and apply K/OFFSET only to the final output.
+    pub(crate) fn with_topn_candidates(mut self, k: usize, offset: usize) -> Self {
+        self = self.with_topn(k, offset);
+        self.topn = None;
+        self.record_topn_keys = false;
+        self
+    }
+
+    pub(crate) fn with_payload_ties(mut self, ordinal_column: usize) -> Self {
+        assert!(
+            self.topn.is_none(),
+            "candidate replay sorts the existing payload tie directly"
+        );
+        self.payload_ties = true;
+        self.input_ordinal_column = Some(ordinal_column);
+        self
+    }
+
+    fn initialize(&mut self) -> Result<(), QueryError> {
+        if self.output.is_some() {
+            return Ok(());
+        }
+        if self.output_remaining == Some(0) {
+            self.upstream = None;
+            self.output = Some(OutputState::Empty);
+            return Ok(());
+        }
+        // Even NULL payloads need one Value slot per column and key. If
+        // those slots alone cannot fit, building and draining a doomed heap
+        // only adds comparisons before the same spillable run generation.
+        // This is a strategy choice, never an input-cardinality assumption.
+        let heap_limit = crate::engine::executor::mem_budget::current_budget()
+            .map_or_else(run_bytes, |budget| (budget.limit() / 4).max(1))
+            .min(run_bytes());
+        let minimum_row = self
+            .output_schema
+            .len()
+            .saturating_add(self.sources.len())
+            .saturating_mul(std::mem::size_of::<Value>());
+        if self
+            .topn
+            .is_some_and(|k| k.saturating_mul(minimum_row) > heap_limit)
+        {
+            self.topn = None;
+        }
+        if self.topn.is_none() && !self.payload_ties && !self.row_major_keys {
+            self.payload_key_sources = vec![None; self.output_schema.len()];
+            for (key, source) in self.sources.iter().enumerate() {
+                if let SortKeySource::Column(column) = source {
+                    if let Some(slot) = self.payload_key_sources.get_mut(*column) {
+                        slot.get_or_insert(key);
+                    }
+                }
+            }
+        }
+        let input = self.upstream.take().expect("batch sort initialized once");
+        if self.parallel_runs > 1
+            && self.topn.is_none()
+            && !self.payload_ties
+            && !self.row_major_keys
+            && self.input_ordinal_column.is_none()
+            && self
+                .sources
+                .iter()
+                .all(|source| matches!(source, SortKeySource::Column(_)))
+        {
+            return self.initialize_parallel(input);
+        }
+        let mut programs = Vec::new();
+        let mut computed_columns = Vec::with_capacity(self.sources.len());
+        let mut computed_fields = self.output_schema.fields().to_vec();
+        for source in &self.sources {
+            if let SortKeySource::Program { program, .. } | SortKeySource::UnseededRand(program) =
+                source
+            {
+                computed_columns.push(Some(self.output_schema.len() + programs.len()));
+                programs.push(program.clone());
+                computed_fields.push(BatchField {
+                    table: "__sort_key".into(),
+                    alias: None,
+                    name: format!("key{}", programs.len()),
+                    column_type: ColumnType::Blob,
+                    source: Default::default(),
+                });
+            } else {
+                computed_columns.push(None);
+            }
+        }
+        let mut upstream = SortKeyInput {
+            input,
+            programs,
+            computed_columns,
+            schema: Arc::new(BatchSchema::new(computed_fields)),
+            pending: None,
+        };
+        let limit = run_bytes();
+        let spill_schema = spill_schema(&self.output_schema, self.sources.len());
+        let mut generation = RunGeneration::new(
+            &self.data_dir,
+            &self.fields,
+            self.payload_ties,
+            spill_schema.clone(),
+            limit,
+        );
+        let mut topk = self
+            .topn
+            .map(|k| crate::engine::executor::sort::BoundedTopK::new(&self.fields, k))
+            .transpose()?;
+        let topk_limit = crate::engine::executor::mem_budget::current_budget()
+            .map_or(limit, |budget| (budget.limit() / 4).max(1))
+            .min(limit);
+        let mut ordinal = 0u64;
+        while let Some((batch, precomputed)) = upstream.next()? {
+            crate::engine::cancel::check_cancelled()?;
+            if self.record_topn_keys {
+                crate::engine::executor::select::eval::record_order_by_key_rows_prepared(
+                    batch.visible_rows(),
+                );
+            }
+            let row_major_keys = self.row_major_keys && !precomputed;
+            let mut evaluated_charge = batch.memory_charge();
+            if !row_major_keys && !precomputed {
+                let bound = upstream
+                    .programs
+                    .iter()
+                    .try_fold(0usize, |sum, program| {
+                        Some(sum.saturating_add(super::evaluated_batch::result_bound(program)?))
+                    })
+                    .expect("unbounded sort keys use byte chunks");
+                evaluated_charge.add_force(
+                    bound
+                        .saturating_mul(batch.num_rows())
+                        .saturating_mul(2)
+                        .saturating_add(
+                            self.sources
+                                .len()
+                                .saturating_mul(std::mem::size_of::<ColumnVector>()),
+                        ),
+                )?;
+            }
+            let evaluated = if row_major_keys || precomputed {
+                Vec::new()
+            } else {
+                self.sources
+                    .iter()
+                    .map(|source| match source {
+                        SortKeySource::Column(_) => Ok(None),
+                        SortKeySource::UnseededRand(_) => {
+                            let mut data =
+                                crate::engine::executor::mem_budget::try_vec_with_capacity(
+                                    batch.num_rows(),
+                                    "TopN RAND keys",
+                                )?;
+                            data.resize(batch.num_rows(), 0.0);
+                            crate::engine::expr::fill_unseeded_mysql_rand_batch(
+                                &mut data,
+                                batch.visible_indices(),
+                            );
+                            Ok(Some(ColumnVector::F64 { data, nulls: None }))
+                        }
+                        SortKeySource::Program { program, integer } => integer
+                            .as_ref()
+                            .and_then(|integer| {
+                                integer.try_eval_batch_integer(batch.columns(), batch.num_rows())
+                            })
+                            .map(Some)
+                            .map(Ok)
+                            .unwrap_or_else(|| {
+                                expr_batch::eval_to_column(program, &batch).map(Some)
+                            }),
+                    })
+                    .collect::<Result<Vec<_>, QueryError>>()?
+            };
+            // A computed fixed-width key has no temporary heap payload.
+            // Reject known losers before reserving their unread row payload;
+            // accepted rows retain the ordinary admission/spill contract.
+            let early_key = if topk.is_some() && !row_major_keys && self.sources.len() == 1 {
+                match &self.sources[0] {
+                    SortKeySource::Column(column) => Some(&batch.columns()[*column]),
+                    SortKeySource::Program { .. } | SortKeySource::UnseededRand(_)
+                        if precomputed =>
+                    {
+                        Some(&batch.columns()[upstream.computed_columns[0].unwrap()])
+                    }
+                    _ => evaluated[0].as_ref(),
+                }
+                .filter(|column| {
+                    matches!(
+                        column,
+                        ColumnVector::Null { .. }
+                            | ColumnVector::Bool { .. }
+                            | ColumnVector::I64 { .. }
+                            | ColumnVector::U64 { .. }
+                            | ColumnVector::F64 { .. }
+                            | ColumnVector::Decimal32 { .. }
+                            | ColumnVector::Decimal64 { .. }
+                            | ColumnVector::Decimal128 { .. }
+                            | ColumnVector::Date32 { .. }
+                            | ColumnVector::Time64 { .. }
+                            | ColumnVector::DateTime64 { .. }
+                            | ColumnVector::Timestamp64 { .. }
+                    )
+                })
+            } else {
+                None
+            };
+            for row_index in batch.visible_indices() {
+                let row_ordinal = match self.input_ordinal_column {
+                    Some(column) => match batch.columns()[column].value_at(row_index) {
+                        Value::UInt(ordinal) => ordinal,
+                        Value::Int(ordinal) if ordinal >= 0 => ordinal as u64,
+                        _ => {
+                            return Err(crate::error::catalog::ER_UNKNOWN_ERROR
+                                .error("invalid parallel TopN input ordinal"))
+                        }
+                    },
+                    None => ordinal,
+                };
+                let inline_key = if let (Some(heap), Some(column)) = (topk.as_ref(), early_key) {
+                    let key = column.try_value_at(row_index)?;
+                    if !heap.would_accept(std::slice::from_ref(&key)) {
+                        crate::engine::executor::mem_budget::check_terminal_oom()?;
+                        ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                            crate::error::catalog::ER_UNKNOWN_ERROR
+                                .error("sort input ordinal overflow")
+                        })?;
+                        continue;
+                    }
+                    Some(SortKeyValues::One(key))
+                } else {
+                    None
+                };
+                let early_accepted = inline_key.is_some();
+                let value_slot = std::mem::size_of::<Value>();
+                let mut predicted = batch.columns()[..self.output_schema.len()]
+                    .iter()
+                    .enumerate()
+                    .fold(0usize, |bytes, (index, column)| {
+                        bytes.saturating_add(
+                            if self
+                                .payload_key_sources
+                                .get(index)
+                                .is_some_and(Option::is_some)
+                            {
+                                value_slot
+                            } else {
+                                column.owned_value_bytes(row_index)
+                            },
+                        )
+                    });
+                if self.sources.len() != 1 {
+                    predicted =
+                        predicted.saturating_add(self.sources.len().saturating_mul(value_slot));
+                }
+                for (index, source) in self.sources.iter().enumerate() {
+                    let column = match source {
+                        SortKeySource::Column(column) => Some(&batch.columns()[*column]),
+                        SortKeySource::Program { .. } | SortKeySource::UnseededRand(_)
+                            if precomputed =>
+                        {
+                            Some(&batch.columns()[upstream.computed_columns[index].unwrap()])
+                        }
+                        SortKeySource::Program { .. } | SortKeySource::UnseededRand(_) => {
+                            evaluated.get(index).and_then(Option::as_ref)
+                        }
+                    };
+                    if column.is_none() && row_major_keys {
+                        if let SortKeySource::Program { program, .. }
+                        | SortKeySource::UnseededRand(program) = source
+                        {
+                            predicted = predicted.saturating_add(
+                                super::evaluated_batch::result_bound(program)
+                                    .unwrap_or(value_slot)
+                                    .saturating_sub(value_slot),
+                            );
+                        }
+                    }
+                    if let Some(column) = column {
+                        predicted = predicted.saturating_add(
+                            column
+                                .owned_value_bytes(row_index)
+                                .saturating_sub(value_slot),
+                        );
+                    }
+                }
+                // A heap stores even a single key in a Vec. Reserve that
+                // additional inline slot before creating the key envelope.
+                let heap_predicted =
+                    predicted.saturating_add(usize::from(self.sources.len() == 1) * value_slot);
+                let mut heap_charge = generation.charge.sibling();
+                if topk.as_ref().is_some_and(|heap| {
+                    heap.resident_bytes().saturating_add(heap_predicted) > topk_limit
+                        || heap_charge.add(heap_predicted).is_err()
+                }) {
+                    drop(heap_charge);
+                    // Drain without cloning and keep each payload's original
+                    // charge and ordinal. Previously rejected rows cannot be
+                    // among the global K winners and need not be replayed.
+                    let candidates = topk.take().expect("active heap").drain_sorted();
+                    for candidate in candidates {
+                        let (keys, payload, ordinal, charge) = candidate.into_parts();
+                        generation.push(
+                            SortRow {
+                                keys: SortKeyValues::Many(keys),
+                                payload,
+                                ordinal,
+                            },
+                            charge,
+                            DEFAULT_BATCH_ROWS,
+                        )?;
+                    }
+                    generation.flush()?;
+                    heap_charge = generation.charge.sibling();
+                }
+                let pending_charge = if topk.is_some() {
+                    heap_charge
+                } else {
+                    generation.admit(predicted)?
+                };
+                let mut prepared_payload = None;
+                let keys = if let Some(key) = inline_key {
+                    key
+                } else if row_major_keys {
+                    let payload =
+                        copy_payload(&batch.columns()[..self.output_schema.len()], row_index)?;
+                    let view = crate::engine::expr_program::RowView::from_values(&payload);
+                    let keys =
+                        SortKeyValues::try_collect(self.sources.iter().map(
+                            |source| match source {
+                                SortKeySource::Column(column) => {
+                                    batch.columns()[*column].try_value_at(row_index)
+                                }
+                                SortKeySource::Program { program, .. }
+                                | SortKeySource::UnseededRand(program) => {
+                                    crate::engine::expr_program::with_eval_scratch(|scratch| {
+                                        program.eval_row(&view, scratch)
+                                    })
+                                }
+                            },
+                        ))?;
+                    prepared_payload = Some(payload);
+                    keys
+                } else {
+                    SortKeyValues::try_collect(self.sources.iter().enumerate().map(
+                        |(index, source)| {
+                            match source {
+                                SortKeySource::Column(column) => {
+                                    batch.columns()[*column].try_value_at(row_index)
+                                }
+                                SortKeySource::Program { .. } | SortKeySource::UnseededRand(_)
+                                    if precomputed =>
+                                {
+                                    batch.columns()[upstream.computed_columns[index].unwrap()]
+                                        .try_value_at(row_index)
+                                }
+                                SortKeySource::Program { .. } | SortKeySource::UnseededRand(_) => {
+                                    evaluated[index].as_ref().unwrap().try_value_at(row_index)
+                                }
+                            }
+                        },
+                    ))?
+                };
+                if let Some(heap) = topk.as_mut() {
+                    if early_accepted || heap.would_accept(keys.as_slice()) {
+                        let payload = match prepared_payload {
+                            Some(payload) => payload,
+                            None => copy_payload(
+                                &batch.columns()[..self.output_schema.len()],
+                                row_index,
+                            )?,
+                        };
+                        let keys = match keys {
+                            SortKeyValues::One(key) => vec![key],
+                            SortKeyValues::Many(keys) => keys,
+                        };
+                        heap.push_reserved(payload, keys, row_ordinal, pending_charge)?;
+                        generation.peak_bytes = generation.peak_bytes.max(heap.resident_bytes());
+                    }
+                } else {
+                    let payload = match prepared_payload {
+                        Some(payload) => payload,
+                        None => {
+                            let mut payload =
+                                crate::engine::executor::mem_budget::try_vec_with_capacity(
+                                    self.output_schema.len(),
+                                    "sort non-key payload",
+                                )?;
+                            for (column, vector) in batch.columns()[..self.output_schema.len()]
+                                .iter()
+                                .enumerate()
+                            {
+                                payload.push(
+                                    if self
+                                        .payload_key_sources
+                                        .get(column)
+                                        .is_some_and(Option::is_some)
+                                    {
+                                        Value::Null
+                                    } else {
+                                        vector.try_value_at(row_index)?
+                                    },
+                                );
+                            }
+                            payload
+                        }
+                    };
+                    generation.push(
+                        SortRow {
+                            keys,
+                            payload,
+                            ordinal: row_ordinal,
+                        },
+                        pending_charge,
+                        batch.num_rows(),
+                    )?;
+                }
+                ordinal = ordinal.checked_add(1).ok_or_else(|| {
+                    crate::error::catalog::ER_UNKNOWN_ERROR.error("sort input ordinal overflow")
+                })?;
+            }
+        }
+        let RunGeneration {
+            mut rows,
+            peak_bytes,
+            charge,
+            capacity_charge,
+            tmp,
+            mut runs,
+            ..
+        } = generation;
+        if let Some(plan) = self.plan {
+            crate::engine::executor::select::analyze_stats::add_peak_memory(
+                plan,
+                peak_bytes as u64,
+            );
+        }
+        if let Some(heap) = topk {
+            self.output = Some(OutputState::TopK(heap.drain_sorted()));
+            return Ok(());
+        }
+        if let Some(directory) = tmp {
+            if !rows.is_empty() {
+                runs.push(flush_run(
+                    &directory,
+                    &mut rows,
+                    &self.fields,
+                    self.payload_ties,
+                    spill_schema.clone(),
+                    runs.len(),
+                )?);
+            }
+            drop(rows);
+            drop(capacity_charge);
+            drop(charge);
+            self.open_spilled_output(directory, runs, spill_schema)?;
+        } else if rows.is_empty() {
+            self.output = Some(OutputState::Empty);
+        } else {
+            sort_rows(&mut rows, &self.fields, self.payload_ties)?;
+            self.memory_charge = Some(charge);
+            self.capacity_charge = Some(capacity_charge);
+            self.output = Some(OutputState::Memory(rows.into_iter()));
+        }
+        Ok(())
+    }
+
+    /// Merge spilled runs down to the configured fan-in, then stream the
+    /// final merge as this operator's output.
+    #[inline(never)]
+    fn open_spilled_output(
+        &mut self,
+        directory: crate::engine::executor::select::grace::SpillTmpDir,
+        mut runs: Vec<Run>,
+        spill_schema: Arc<BatchSchema>,
+    ) -> Result<(), QueryError> {
+        let initial_runs = runs.len();
+        let mut spill_bytes = runs.iter().map(|run| run.bytes).sum::<u64>();
+        let fanin =
+            merge_fanin(crate::engine::executor::tuning::current_or_capture().sort_merge_fanin);
+        let mut pass = 0usize;
+        while runs.len() > fanin {
+            let mut next = Vec::with_capacity(runs.len().div_ceil(fanin));
+            for (group, chunk) in runs.chunks(fanin).enumerate() {
+                let run = merge_runs_to_run(
+                    &directory,
+                    chunk,
+                    spill_schema.clone(),
+                    self.sources.len(),
+                    self.fields.clone(),
+                    self.payload_ties,
+                    &format!("merge-{pass}-{group}"),
+                )?;
+                spill_bytes = spill_bytes.saturating_add(run.bytes);
+                next.push(run);
+            }
+            runs = next;
+            pass += 1;
+        }
+        if let Some(plan) = self.plan {
+            crate::engine::executor::select::analyze_stats::add_spill_bytes(plan, spill_bytes);
+            crate::engine::executor::select::analyze_stats::add_sort_runs(
+                plan,
+                initial_runs as u64,
+                pass as u64,
+            );
+        }
+        let merge = MergeState::open(
+            directory,
+            &runs,
+            spill_schema,
+            self.sources.len(),
+            self.fields.clone(),
+            self.payload_ties,
+        )?;
+        // Parallel run generation already moved conversion and sorting off
+        // the consumer; overlapping the final merge with it as well keeps
+        // the remaining serial stages from running back to back.
+        self.output = Some(if self.parallel_runs > 1 {
+            OutputState::Pipelined(PipelinedMerge::spawn(merge))
+        } else {
+            OutputState::Spill(merge)
+        });
+        Ok(())
+    }
+
+    /// Parallel run generation for column-key full sorts. The calling thread
+    /// pulls upstream batches and hands them round-robin to workers, which
+    /// convert, sort and spill their own runs into one shared directory under
+    /// a 1/workers share of the run budget. All runs are then merged by the
+    /// ordinary spill merge, so the output order equals the serial sort.
+    #[inline(never)]
+    fn initialize_parallel(
+        &mut self,
+        mut input: Box<dyn BatchOperator + 'a>,
+    ) -> Result<(), QueryError> {
+        let workers = self.parallel_runs;
+        let limit = (run_bytes() / workers).max(4 * 1024 * 1024);
+        let spill_schema = spill_schema(&self.output_schema, self.sources.len());
+        let directory = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+            &self.data_dir,
+            "sort",
+        )?;
+        let key_columns = self
+            .sources
+            .iter()
+            .map(|source| match source {
+                SortKeySource::Column(column) => *column,
+                _ => unreachable!("parallel run generation requires column keys"),
+            })
+            .collect::<Vec<_>>();
+        let output_len = self.output_schema.len();
+        let session = crate::engine::expr::current_session_expr_info();
+        let params = crate::engine::params::snapshot_current_context();
+        let cancellation = crate::engine::cancel::current_token();
+        let mode = super::config::effective_mode();
+        let budget = crate::engine::executor::mem_budget::current_budget();
+        let fields: &[crate::engine::executor::sort::SortField] = &self.fields;
+        let payload_key_sources = &self.payload_key_sources;
+        let data_dir = self.data_dir.as_path();
+        let directory_ref = &directory;
+        let key_columns = key_columns.as_slice();
+        let fields_arc = self.fields.clone();
+        let fields_arc = &fields_arc;
+        let spill_schema_ref = &spill_schema;
+        // Workers merge concurrently; share the live merge fan-in among them.
+        let worker_fanin =
+            (merge_fanin(crate::engine::executor::tuning::current_or_capture().sort_merge_fanin)
+                / workers)
+                .max(2);
+
+        type WorkerOutput = Result<(Vec<Run>, usize), QueryError>;
+        let (dispatched, outputs) = crate::util::thread_spawn::scope(|scope| {
+            let mut senders = Vec::with_capacity(workers);
+            let mut handles = Vec::with_capacity(workers);
+            for worker in 0..workers {
+                let (sender, receiver) = std::sync::mpsc::sync_channel::<(Batch, u64)>(2);
+                senders.push(sender);
+                let session = &session;
+                let params = params.clone();
+                let cancellation = cancellation.clone();
+                let budget = budget.clone();
+                let spill_schema = spill_schema.clone();
+                handles.push(scope.spawn(move || -> WorkerOutput {
+                    let _cancel = cancellation.map(crate::engine::cancel::enter);
+                    let _mode = super::config::enter_mode(mode);
+                    let run = || -> WorkerOutput {
+                        let mut generation =
+                            RunGeneration::new(data_dir, fields, false, spill_schema, limit);
+                        generation.shared_tmp = Some(directory_ref);
+                        generation.run_offset = worker;
+                        generation.run_stride = workers;
+                        for (batch, base_ordinal) in receiver {
+                            crate::engine::cancel::check_cancelled()?;
+                            push_column_key_rows(
+                                &mut generation,
+                                &batch,
+                                base_ordinal,
+                                key_columns,
+                                payload_key_sources,
+                                output_len,
+                            )?;
+                        }
+                        generation.flush()?;
+                        let peak_bytes = generation.peak_bytes;
+                        let mut runs = std::mem::take(&mut generation.runs);
+                        drop(generation);
+                        // Merge this worker's runs down to one while the other
+                        // workers do the same, leaving a single final pass
+                        // over at most `workers` runs.
+                        let mut pass = 0usize;
+                        while runs.len() > 1 {
+                            let mut next = Vec::with_capacity(runs.len().div_ceil(worker_fanin));
+                            for (group, chunk) in runs.chunks(worker_fanin).enumerate() {
+                                next.push(merge_runs_to_run(
+                                    directory_ref,
+                                    chunk,
+                                    spill_schema_ref.clone(),
+                                    key_columns.len(),
+                                    fields_arc.clone(),
+                                    false,
+                                    &format!("w{worker}-merge-{pass}-{group}"),
+                                )?);
+                            }
+                            runs = next;
+                            pass += 1;
+                        }
+                        Ok((runs, peak_bytes))
+                    };
+                    let budgeted = || match budget.clone() {
+                        Some(budget) => {
+                            crate::engine::executor::mem_budget::with_query_budget(budget, run)
+                        }
+                        None => run(),
+                    };
+                    crate::engine::expr::with_session_expr_info_option(session, || {
+                        match params.as_ref() {
+                            Some(params) => params.run(budgeted),
+                            None => budgeted(),
+                        }
+                    })
+                }));
+            }
+            let mut dispatch = || -> Result<(), QueryError> {
+                let mut ordinal = 0u64;
+                let mut next = 0usize;
+                while let Some(batch) = input.next_batch()? {
+                    crate::engine::cancel::check_cancelled()?;
+                    let rows = batch.visible_rows() as u64;
+                    if rows == 0 {
+                        continue;
+                    }
+                    // A closed receiver means that worker failed; its error
+                    // is reported when it is joined below.
+                    if senders[next].send((batch, ordinal)).is_err() {
+                        return Ok(());
+                    }
+                    ordinal = ordinal.checked_add(rows).ok_or_else(|| {
+                        crate::error::catalog::ER_UNKNOWN_ERROR.error("sort input ordinal overflow")
+                    })?;
+                    next = (next + 1) % workers;
+                }
+                Ok(())
+            };
+            let dispatched = dispatch();
+            drop(senders);
+            let outputs = handles
+                .into_iter()
+                .map(|handle| {
+                    handle.join().unwrap_or_else(|_| {
+                        Err(crate::error::catalog::ER_UNKNOWN_ERROR
+                            .error("parallel sort run worker panicked"))
+                    })
+                })
+                .collect::<Vec<_>>();
+            (dispatched, outputs)
+        });
+        let mut runs = Vec::new();
+        let mut peak_bytes = 0usize;
+        for output in outputs {
+            let (worker_runs, worker_peak) = output?;
+            runs.extend(worker_runs);
+            peak_bytes = peak_bytes.saturating_add(worker_peak);
+        }
+        dispatched?;
+        if let Some(plan) = self.plan {
+            crate::engine::executor::select::analyze_stats::add_peak_memory(
+                plan,
+                peak_bytes as u64,
+            );
+        }
+        if runs.is_empty() {
+            self.output = Some(OutputState::Empty);
+            return Ok(());
+        }
+        self.open_spilled_output(directory, runs, spill_schema)
+    }
+
+    fn next_owned_row(&mut self) -> Result<Option<OwnedSortRow>, QueryError> {
+        if self.output_remaining == Some(0) {
+            self.output = Some(OutputState::Empty);
+            self.memory_charge = None;
+            self.capacity_charge = None;
+            return Ok(None);
+        }
+        while self.output_offset > 0 {
+            if self.next_owned_row_unlimited()?.is_none() {
+                return Ok(None);
+            }
+            self.output_offset -= 1;
+        }
+        let mut row = self.next_owned_row_unlimited()?;
+        if let Some(owned) = row.as_mut() {
+            for (column, key) in self.payload_key_sources.iter().enumerate() {
+                if let Some(key) = key {
+                    owned.row.payload[column] =
+                        std::mem::replace(&mut owned.row.keys.as_mut_slice()[*key], Value::Null);
+                }
+            }
+        }
+        if row.is_some() {
+            if let Some(remaining) = &mut self.output_remaining {
+                *remaining -= 1;
+            }
+        }
+        Ok(row)
+    }
+
+    fn next_owned_row_unlimited(&mut self) -> Result<Option<OwnedSortRow>, QueryError> {
+        let output = match self.output.as_mut().expect("batch sort output initialized") {
+            OutputState::Memory(rows) => match rows.next() {
+                Some(row) => {
+                    let bytes =
+                        estimate_sort_row(&row).saturating_sub(std::mem::size_of::<SortRow>());
+                    let charge = self
+                        .memory_charge
+                        .as_mut()
+                        .expect("resident sort retains its charge")
+                        .split(bytes);
+                    Ok(Some(OwnedSortRow { row, charge }))
+                }
+                None => Ok(None),
+            },
+            OutputState::Spill(merge) => merge.next_row(),
+            OutputState::Pipelined(merge) => merge.next_row(),
+            OutputState::TopK(candidates) => Ok(candidates.next().map(|candidate| {
+                let (keys, payload, ordinal, charge) = candidate.into_parts();
+                OwnedSortRow {
+                    row: SortRow {
+                        keys: SortKeyValues::Many(keys),
+                        payload,
+                        ordinal,
+                    },
+                    charge,
+                }
+            })),
+            OutputState::SortedPayloads { rows, charge } => {
+                use crate::engine::executor::memory_footprint::AllocatedBytes;
+                Ok(rows.next().map(|payload| {
+                    let row_charge = charge.split(payload.allocated_bytes());
+                    OwnedSortRow {
+                        row: SortRow {
+                            keys: SortKeyValues::Many(Vec::new()),
+                            payload,
+                            ordinal: 0,
+                        },
+                        charge: row_charge,
+                    }
+                }))
+            }
+            OutputState::Empty => Ok(None),
+        }?;
+        if output.is_none() {
+            self.output = Some(OutputState::Empty);
+            self.memory_charge = None;
+            self.capacity_charge = None;
+        }
+        Ok(output)
+    }
+
+    /// Move the final payload directly into a row consumer. Rebuilding a
+    /// columnar batch here would immediately copy every value back out again.
+    pub(crate) fn next_values(&mut self) -> Result<Option<Vec<Value>>, QueryError> {
+        self.initialize()?;
+        Ok(self.next_owned_row()?.map(|owned| owned.row.payload))
+    }
+}
+
+impl BatchOperator for ExternalSortBatchOperator<'_> {
+    fn schema(&self) -> &Arc<BatchSchema> {
+        &self.output_schema
+    }
+
+    fn properties(&self) -> BatchProperties {
+        self.properties.clone()
+    }
+
+    fn next_batch(&mut self) -> Result<Option<Batch>, QueryError> {
+        self.initialize()?;
+        let mut rows = Vec::new();
+        let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+        let mut capacity = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+        let mut bytes = 0usize;
+        while rows.len() < DEFAULT_BATCH_ROWS && (rows.is_empty() || bytes < spill_block_bytes()) {
+            let Some(mut owned) = self.next_owned_row()? else {
+                break;
+            };
+            bytes = bytes.saturating_add(crate::engine::executor::mem_budget::estimate_row_bytes(
+                &owned.row.payload,
+            ));
+            charge.absorb(&mut owned.charge);
+            if rows.len() == rows.capacity() {
+                crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                    &mut rows,
+                    32,
+                    &mut capacity,
+                    "sort output rows",
+                )?;
+            }
+            rows.push(owned.row.payload);
+        }
+        if rows.is_empty() {
+            return Ok(None);
+        }
+        // Cover raw-column conversion while moved row values remain live.
+        let _scratch =
+            crate::engine::executor::mem_budget::force_charge_scoped(bytes.saturating_mul(2))?;
+        let batch = batch_from_rows(self.output_schema.clone(), rows.into_iter());
+        Ok(Some(batch.with_memory_charge(charge)?))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn encoded_merge_tuples_preserve_collation_null_direction_and_late_lane_fallback() {
+        use crate::engine::executor::{mem_budget, sort::key_encode::with_sort_key_encode};
+        let budget = Arc::new(mem_budget::MemBudget::new(32 << 20));
+        mem_budget::with_query_budget(budget.clone(), || {
+            with_sort_key_encode(true, || {
+                for collation in [45, 63, 255, 309] {
+                    for reverse in [false, true] {
+                        let root =
+                            tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+                        let tmp = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                            root.path(),
+                            "sort",
+                        )
+                        .unwrap();
+                        let fields: Arc<[_]> = vec![
+                            crate::engine::executor::sort::SortField {
+                                ascending: !reverse,
+                                nulls_first: true,
+                                collation_id: Some(collation),
+                            },
+                            crate::engine::executor::sort::SortField {
+                                ascending: reverse,
+                                nulls_first: false,
+                                collation_id: None,
+                            },
+                            crate::engine::executor::sort::SortField {
+                                ascending: false,
+                                nulls_first: true,
+                                collation_id: None,
+                            },
+                        ]
+                        .into();
+                        let mut expected = (0..192u64)
+                            .map(|i| {
+                                let text = ["A", "a ", "é", "e", "ß", "ss", "中", "a\0b"]
+                                    [(i % 8) as usize];
+                                (
+                                    vec![
+                                        if i % 17 == 0 {
+                                            Value::Null
+                                        } else {
+                                            Value::String(text.into())
+                                        },
+                                        Value::Int((i % 7) as i64 - 3),
+                                        Value::DecimalCompact((i % 11) as i64 - 5, 2),
+                                    ],
+                                    i,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        let spill_schema = spill_schema(&schema(), 3);
+                        let mut runs = Vec::new();
+                        for (index, chunk) in expected.chunks(24).enumerate() {
+                            let mut rows = chunk
+                                .iter()
+                                .map(|(keys, ordinal)| SortRow {
+                                    keys: SortKeyValues::Many(keys.clone()),
+                                    payload: vec![
+                                        Value::Int(*ordinal as i64),
+                                        Value::String("retained".into()),
+                                    ],
+                                    ordinal: *ordinal,
+                                })
+                                .collect::<Vec<_>>();
+                            runs.push(
+                                flush_run(
+                                    &tmp,
+                                    &mut rows,
+                                    &fields,
+                                    false,
+                                    spill_schema.clone(),
+                                    index,
+                                )
+                                .unwrap(),
+                            );
+                        }
+                        expected.sort_by(|a, b| {
+                            crate::engine::executor::sort::compare_sort_keys(&fields, &a.0, &b.0)
+                                .then(a.1.cmp(&b.1))
+                        });
+                        let mut merge =
+                            RunMerger::open(&tmp, &runs, spill_schema, 3, fields, false).unwrap();
+                        assert!(merge
+                            .encoded_enabled
+                            .load(std::sync::atomic::Ordering::Relaxed));
+                        let mut actual = Vec::new();
+                        while let Some(row) = merge.next_sort_row().unwrap() {
+                            actual.push(row.row.ordinal);
+                        }
+                        assert_eq!(actual, expected.iter().map(|r| r.1).collect::<Vec<_>>());
+                        assert!(merge
+                            .encoded_enabled
+                            .load(std::sync::atomic::Ordering::Relaxed));
+                    }
+                }
+                let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+                let tmp = crate::engine::executor::select::grace::SpillTmpDir::create_kind(
+                    root.path(),
+                    "sort",
+                )
+                .unwrap();
+                let fields: Arc<[_]> = vec![crate::engine::executor::sort::SortField {
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }]
+                .into();
+                let schema = spill_schema(&schema(), 1);
+                let mut runs = Vec::new();
+                for (i, keys) in [
+                    vec![Value::Int(1), Value::UInt(u64::MAX)],
+                    vec![Value::Int(2), Value::Int(3)],
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let mut rows = keys
+                        .into_iter()
+                        .map(|key| SortRow {
+                            keys: SortKeyValues::One(key),
+                            payload: vec![Value::Int(0), Value::String("p".into())],
+                            ordinal: 0,
+                        })
+                        .collect::<Vec<_>>();
+                    runs.push(
+                        flush_run(&tmp, &mut rows, &fields, false, schema.clone(), i).unwrap(),
+                    );
+                }
+                let mut merge = RunMerger::open(&tmp, &runs, schema, 1, fields, false).unwrap();
+                assert!(merge
+                    .encoded_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed));
+                let mut values = Vec::new();
+                while let Some(row) = merge.next_sort_row().unwrap() {
+                    values.push(row.row.keys.as_slice()[0].clone());
+                }
+                assert!(!merge
+                    .encoded_enabled
+                    .load(std::sync::atomic::Ordering::Relaxed));
+                assert_eq!(
+                    values,
+                    vec![
+                        Value::Int(1),
+                        Value::Int(2),
+                        Value::Int(3),
+                        Value::UInt(u64::MAX)
+                    ]
+                );
+            })
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    use super::*;
+    use crate::engine::executor::vec::stream::{BatchOrdering, BatchPartitioning};
+
+    fn schema() -> Arc<BatchSchema> {
+        Arc::new(BatchSchema::new(vec![
+            BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "k".into(),
+                column_type: ColumnType::LongLong,
+                source: Default::default(),
+            },
+            BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "payload".into(),
+                column_type: ColumnType::VarString,
+                source: Default::default(),
+            },
+        ]))
+    }
+
+    #[test]
+    fn merge_string_cache_matches_total_order_and_releases_memory() {
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget, ScopedCharge};
+        let budget = Arc::new(MemBudget::new(1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            let mut values = vec![
+                Value::Null,
+                Value::Int(-2),
+                Value::UInt(3),
+                Value::DecimalCompact(125, 2),
+                Value::Bytes(vec![0, 65]),
+            ];
+            for text in ["", "A", "a", "a ", "é", "e", "ß", "ss", "中", "a\0b"] {
+                values.push(Value::String(text.into()));
+            }
+            for collation_id in [None, Some(63), Some(45), Some(46), Some(255), Some(309)] {
+                for ascending in [false, true] {
+                    for nulls_first in [false, true] {
+                        let fields: Arc<[_]> = vec![crate::engine::executor::sort::SortField {
+                            ascending,
+                            nulls_first,
+                            collation_id,
+                        }]
+                        .into();
+                        let make = |value: &Value| {
+                            let row = SortRow {
+                                keys: SortKeyValues::One(value.clone()),
+                                payload: vec![],
+                                ordinal: 0,
+                            };
+                            let mut string_keys = MergeStringKeys::new();
+                            string_keys.update(&row, &fields, None).unwrap();
+                            HeapRow {
+                                row,
+                                string_keys,
+                                charge: ScopedCharge::new(0),
+                                fields: fields.clone(),
+                                payload_ties: false,
+                                encoded_enabled: Arc::new(std::sync::atomic::AtomicBool::new(
+                                    false,
+                                )),
+                            }
+                        };
+                        let mut reused = MergeStringKeys::new();
+                        let mut previous: Option<HeapRow> = None;
+                        for value in values.iter().chain(values.iter().rev()) {
+                            let fresh = make(value);
+                            reused
+                                .update(&fresh.row, &fields, previous.as_ref().map(|v| &v.row))
+                                .unwrap();
+                            assert_eq!(reused.keys, fresh.string_keys.keys);
+                            // Revisit the identical raw head, then transition to
+                            // another value, including NULL and non-string lanes.
+                            reused
+                                .update(&fresh.row, &fields, Some(&fresh.row))
+                                .unwrap();
+                            assert_eq!(reused.keys, fresh.string_keys.keys);
+                            previous = Some(fresh);
+                        }
+                        for left in &values {
+                            let left = make(left);
+                            for right in &values {
+                                let right = make(right);
+                                assert_eq!(
+                                    left.cmp(&right),
+                                    compare_rows(&left.row, &right.row, &fields, false)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[test]
+    fn selected_sort_releases_reservations_in_memory_and_after_spill() {
+        use super::super::batch::Selection;
+        use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+        for run_limit in [512, 1024 * 1024] {
+            let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
+            with_query_budget(budget.clone(), || {
+                let data_dir = tempfile::tempdir().unwrap();
+                let schema = schema();
+                let batch = Batch::new(
+                    schema.clone(),
+                    vec![
+                        ColumnVector::from_values((0..64).map(|i| Value::Int(i % 5)).collect()),
+                        ColumnVector::from_values(
+                            (0..64)
+                                .map(|i| Value::String(format!("payload-{i}")))
+                                .collect(),
+                        ),
+                    ],
+                )
+                .with_selection(Selection::Indices((0..64).filter(|i| i % 3 == 0).collect()));
+                let input = super::super::stream::MaterializedBatchOperator::new(
+                    schema.clone(),
+                    vec![batch],
+                );
+                let snapshot = crate::engine::executor::tuning::ExecutorTuningSnapshot {
+                    stream_batch_rows: 64,
+                    stream_channel_batches: 2,
+                    sort_run_bytes: Some(run_limit),
+                    sort_merge_fanin: Some(2),
+                    hash_join_bloom_adaptive: true,
+                    scheduler_parallelism: 1,
+                };
+                let _tuning = crate::engine::executor::tuning::enter(snapshot);
+                let mut sort = ExternalSortBatchOperator::new(
+                    None,
+                    Box::new(input),
+                    schema,
+                    BatchProperties {
+                        ordering: BatchOrdering::Ordered(vec![]),
+                        partitioning: BatchPartitioning::Single,
+                    },
+                    vec![SortKeySource::Column(0)],
+                    vec![crate::engine::executor::sort::SortField {
+                        ascending: true,
+                        nulls_first: true,
+                        collation_id: None,
+                    }],
+                    data_dir.path(),
+                );
+                sort.initialize().unwrap();
+                if run_limit > 512 {
+                    // A selection leaves unused slots in the batch reservation.
+                    // They must remain charged for as long as the run is retained.
+                    assert!(
+                        sort.capacity_charge.as_ref().unwrap().charged()
+                            > 22 * std::mem::size_of::<SortRow>()
+                    );
+                }
+                let mut actual = Vec::new();
+                while let Some(row) = sort.next_values().unwrap() {
+                    actual.push(row);
+                }
+                let mut expected: Vec<_> = (0..64)
+                    .filter(|i| i % 3 == 0)
+                    .map(|i| vec![Value::Int(i % 5), Value::String(format!("payload-{i}"))])
+                    .collect();
+                expected.sort_by_key(|row| match row[0] {
+                    Value::Int(v) => v,
+                    _ => unreachable!(),
+                });
+                assert_eq!(actual, expected);
+                drop(sort);
+                assert_eq!(budget.used(), 0, "sort reservation leaked after drop");
+            });
+        }
+    }
+
+    #[test]
+    fn columnar_spill_merge_is_stable_and_cleans_up() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let schema = schema();
+        let rows = (0..200i64)
+            .rev()
+            .map(|value| {
+                vec![
+                    Value::Int(value % 7),
+                    Value::String(format!("row-{value:03}-{}", "x".repeat(32))),
+                ]
+            })
+            .collect::<Vec<_>>();
+        let mut columns = vec![Vec::new(), Vec::new()];
+        for row in &rows {
+            columns[0].push(row[0].clone());
+            columns[1].push(row[1].clone());
+        }
+        let input = super::super::stream::MaterializedBatchOperator::new(
+            schema.clone(),
+            vec![Batch::new(
+                schema.clone(),
+                columns.into_iter().map(ColumnVector::from_values).collect(),
+            )],
+        );
+        let snapshot = crate::engine::executor::tuning::ExecutorTuningSnapshot {
+            stream_batch_rows: 64,
+            stream_channel_batches: 2,
+            sort_run_bytes: Some(1024),
+            sort_merge_fanin: Some(2),
+            hash_join_bloom_adaptive: true,
+            scheduler_parallelism: 1,
+        };
+        let _tuning = crate::engine::executor::tuning::enter(snapshot);
+        let before = crate::engine::executor::spill_quota::sort_spill_count();
+        let properties = BatchProperties {
+            ordering: BatchOrdering::Ordered(vec![]),
+            partitioning: BatchPartitioning::Single,
+        };
+        let mut sort = ExternalSortBatchOperator::new(
+            None,
+            Box::new(input),
+            schema,
+            properties,
+            vec![SortKeySource::Column(0)],
+            vec![crate::engine::executor::sort::SortField {
+                ascending: true,
+                nulls_first: true,
+                collation_id: None,
+            }],
+            data_dir.path(),
+        );
+        let mut actual = Vec::new();
+        while let Some(batch) = sort.next_batch().unwrap() {
+            for row in batch.visible_indices() {
+                actual.push(vec![
+                    batch.columns()[0].value_at(row),
+                    batch.columns()[1].value_at(row),
+                ]);
+            }
+        }
+        let mut expected = rows;
+        expected.sort_by_key(|row| match row[0] {
+            Value::Int(value) => value,
+            _ => unreachable!(),
+        });
+        assert_eq!(actual, expected);
+        assert!(crate::engine::executor::spill_quota::sort_spill_count() > before);
+        drop(sort);
+        let tmp = crate::storage::naming::system_tmp_dir(data_dir.path());
+        assert!(
+            !tmp.exists() || std::fs::read_dir(tmp).unwrap().next().is_none(),
+            "batch sort spill directory leaked"
+        );
+    }
+
+    #[test]
+    fn parallel_run_generation_matches_serial_sort_and_cleans_up() {
+        // Multi-batch input with duplicate keys, NULLs and string keys: the
+        // parallel runs must merge to exactly the serial order (including
+        // the input-order tie-break), and spill files must not leak.
+        let data_dir = tempfile::tempdir().unwrap();
+        let schema = schema();
+        let batches = (0..12i64)
+            .map(|batch| {
+                let rows = (0..97i64).map(|row| batch * 97 + row).collect::<Vec<_>>();
+                let keys = rows
+                    .iter()
+                    .map(|value| {
+                        if value % 23 == 0 {
+                            Value::Null
+                        } else {
+                            Value::Int((value * 7919) % 41)
+                        }
+                    })
+                    .collect();
+                let payloads = rows
+                    .iter()
+                    .map(|value| Value::String(format!("row-{value:05}-{}", "y".repeat(24))))
+                    .collect();
+                Batch::new(
+                    schema.clone(),
+                    vec![
+                        ColumnVector::from_values(keys),
+                        ColumnVector::from_values(payloads),
+                    ],
+                )
+            })
+            .collect::<Vec<_>>();
+        let snapshot = crate::engine::executor::tuning::ExecutorTuningSnapshot {
+            stream_batch_rows: 64,
+            stream_channel_batches: 2,
+            sort_run_bytes: Some(16 * 1024),
+            sort_merge_fanin: Some(3),
+            hash_join_bloom_adaptive: true,
+            scheduler_parallelism: 1,
+        };
+        let _tuning = crate::engine::executor::tuning::enter(snapshot);
+        let run = |workers: usize| {
+            let input = super::super::stream::MaterializedBatchOperator::new(
+                schema.clone(),
+                batches.clone(),
+            );
+            let mut sort = ExternalSortBatchOperator::new(
+                None,
+                Box::new(input),
+                schema.clone(),
+                BatchProperties::UNORDERED_SINGLE,
+                vec![SortKeySource::Column(0), SortKeySource::Column(1)],
+                vec![
+                    crate::engine::executor::sort::SortField {
+                        ascending: false,
+                        nulls_first: true,
+                        collation_id: None,
+                    },
+                    crate::engine::executor::sort::SortField {
+                        ascending: true,
+                        nulls_first: true,
+                        collation_id: Some(crate::charset::collation_id("utf8mb4_0900_ai_ci")),
+                    },
+                ],
+                data_dir.path(),
+            )
+            .with_parallel_run_generation(workers);
+            let mut out = Vec::new();
+            while let Some(batch) = sort.next_batch().unwrap() {
+                for row in batch.visible_indices() {
+                    out.push((
+                        batch.columns()[0].value_at(row),
+                        batch.columns()[1].value_at(row),
+                    ));
+                }
+            }
+            out
+        };
+        let serial = run(1);
+        let parallel = run(4);
+        assert_eq!(serial.len(), 12 * 97);
+        assert_eq!(parallel, serial);
+        // A consumer that stops early (LIMIT) closes the pipelined merge: the
+        // producer stops, is joined, and its spill files are removed.
+        {
+            let input = super::super::stream::MaterializedBatchOperator::new(
+                schema.clone(),
+                batches.clone(),
+            );
+            let mut sort = ExternalSortBatchOperator::new(
+                None,
+                Box::new(input),
+                schema.clone(),
+                BatchProperties::UNORDERED_SINGLE,
+                vec![SortKeySource::Column(0)],
+                vec![crate::engine::executor::sort::SortField {
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }],
+                data_dir.path(),
+            )
+            .with_parallel_run_generation(4);
+            assert!(sort.next_batch().unwrap().is_some());
+        }
+        let tmp = crate::storage::naming::system_tmp_dir(data_dir.path());
+        assert!(
+            !tmp.exists() || std::fs::read_dir(tmp).unwrap().next().is_none(),
+            "parallel sort spill directory leaked"
+        );
+    }
+}
+
+#[cfg(test)]
+#[path = "sort/batch_tests.rs"]
+mod batch_tests;
+
+#[cfg(test)]
+mod spill_contract_regressions {
+    use super::*;
+    use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
+
+    fn file_bytes(path: &Path) -> u64 {
+        std::fs::read_dir(path)
+            .unwrap()
+            .map(|entry| {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    file_bytes(&path)
+                } else {
+                    path.metadata().unwrap().len()
+                }
+            })
+            .sum()
+    }
+
+    #[test]
+    fn scalar_key_topk_matches_full_sort_for_domains_nulls_ties_and_selection() {
+        use super::super::batch::Selection;
+        use crate::engine::expr_program::{ExprCompiler, InputColumn, InputSchema};
+        let root = tempfile::tempdir().unwrap();
+        let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            for family in 0..10 {
+                let kind = match family {
+                    0 | 9 => ColumnType::LongLong,
+                    1 => ColumnType::Bit { bits: 64 },
+                    2 => ColumnType::Double,
+                    3 => ColumnType::Date,
+                    4 => ColumnType::Time,
+                    5 => ColumnType::DateTime,
+                    6 => ColumnType::Timestamp,
+                    7 => ColumnType::Decimal {
+                        precision: 18,
+                        scale: 2,
+                    },
+                    _ => ColumnType::Decimal {
+                        precision: 38,
+                        scale: 2,
+                    },
+                };
+                let schema = Arc::new(BatchSchema::new(vec![
+                    BatchField {
+                        table: "t".into(),
+                        alias: None,
+                        name: "k".into(),
+                        column_type: kind,
+                        source: Default::default(),
+                    },
+                    BatchField {
+                        table: "t".into(),
+                        alias: None,
+                        name: "payload".into(),
+                        column_type: ColumnType::VarString,
+                        source: Default::default(),
+                    },
+                ]));
+                let keys = (0..33)
+                    .map(|row| {
+                        let value = ((row * 17) % 11 - 5) as i64;
+                        if row % 7 == 0 || family == 9 {
+                            return Value::Null;
+                        }
+                        match family {
+                            0 => Value::Int(value),
+                            1 => Value::UInt((1u64 << 63) + (value + 5) as u64),
+                            2 => Value::Double(value as f64 / 3.0),
+                            3 => Value::Date(value as i32),
+                            4 => Value::Time(value * 1_000_000),
+                            5 => Value::DateTime(value * 1_000_000),
+                            6 => Value::Timestamp(value * 1_000_000),
+                            7 => Value::DecimalCompact(value * 100, 2),
+                            _ => Value::Decimal128(value as i128 * (1i128 << 80), 2),
+                        }
+                    })
+                    .collect();
+                let batch = Batch::new(
+                    schema.clone(),
+                    vec![
+                        ColumnVector::from_values(keys),
+                        ColumnVector::from_values(
+                            (0..33)
+                                .map(|row| Value::String(format!("row-{row:02}")))
+                                .collect(),
+                        ),
+                    ],
+                )
+                .with_selection(Selection::Indices(
+                    (0..33).filter(|row| row % 3 != 2).collect(),
+                ));
+                for computed in [false, true] {
+                    for ascending in [false, true] {
+                        for nulls_first in [false, true] {
+                            let run = |topn: Option<(usize, usize)>| {
+                                let source = if computed {
+                                    let input = InputSchema::new(
+                                        schema
+                                            .fields()
+                                            .iter()
+                                            .map(|field| InputColumn {
+                                                table: field.table.clone(),
+                                                alias: None,
+                                                name: field.name.clone(),
+                                                column_type: field.column_type,
+                                                unsigned: matches!(
+                                                    field.column_type,
+                                                    ColumnType::Bit { .. }
+                                                ),
+                                                collation_id: None,
+                                            })
+                                            .collect(),
+                                    );
+                                    SortKeySource::Program {
+                                        program: Arc::new(
+                                            ExprCompiler::compile(
+                                                &crate::parser::Expr::Identifier("k".into()),
+                                                &input,
+                                            )
+                                            .unwrap(),
+                                        ),
+                                        integer: None,
+                                    }
+                                } else {
+                                    SortKeySource::Column(0)
+                                };
+                                let input = super::super::stream::MaterializedBatchOperator::new(
+                                    schema.clone(),
+                                    vec![batch.clone()],
+                                );
+                                let mut sort = ExternalSortBatchOperator::new(
+                                    None,
+                                    Box::new(input),
+                                    schema.clone(),
+                                    BatchProperties::UNORDERED_SINGLE,
+                                    vec![source],
+                                    vec![crate::engine::executor::sort::SortField {
+                                        ascending,
+                                        nulls_first,
+                                        collation_id: None,
+                                    }],
+                                    root.path(),
+                                );
+                                if let Some((k, offset)) = topn {
+                                    sort = sort.with_topn(k, offset);
+                                }
+                                sort.initialize().unwrap();
+                                let mut rows = Vec::new();
+                                while let Some(row) = sort.next_values().unwrap() {
+                                    rows.push(row);
+                                }
+                                rows
+                            };
+                            let expected = run(None);
+                            for (k, offset) in
+                                [(0, 0), (1, 0), (7, 3), (64, 3), (7, 12), (100_000, 3)]
+                            {
+                                let actual = run(Some((k, offset)));
+                                let wanted = expected
+                                    .iter()
+                                    .take(k)
+                                    .skip(offset)
+                                    .cloned()
+                                    .collect::<Vec<_>>();
+                                assert_eq!(actual, wanted, "family={family} computed={computed} asc={ascending} nulls_first={nulls_first} k={k} offset={offset}");
+                            }
+                        }
+                    }
+                }
+            }
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn topk_rejected_wide_payload_does_not_force_a_spill() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            let schema = Arc::new(BatchSchema::new(vec![
+                BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "k".into(),
+                    column_type: ColumnType::LongLong,
+                    source: Default::default(),
+                },
+                BatchField {
+                    table: "t".into(),
+                    alias: None,
+                    name: "payload".into(),
+                    column_type: ColumnType::VarString,
+                    source: Default::default(),
+                },
+            ]));
+            let batch = Batch::new(
+                schema.clone(),
+                vec![
+                    ColumnVector::from_values(vec![Value::Int(0), Value::Int(1)]),
+                    ColumnVector::from_values(vec![
+                        Value::String("winner".into()),
+                        Value::String("x".repeat(65536)),
+                    ]),
+                ],
+            );
+            let input =
+                super::super::stream::MaterializedBatchOperator::new(schema.clone(), vec![batch]);
+            let _tuning = crate::engine::executor::tuning::enter(
+                crate::engine::executor::tuning::ExecutorTuningSnapshot {
+                    stream_batch_rows: 64,
+                    stream_channel_batches: 2,
+                    sort_run_bytes: Some(8192),
+                    sort_merge_fanin: Some(2),
+                    hash_join_bloom_adaptive: true,
+                    scheduler_parallelism: 1,
+                },
+            );
+            let before = crate::engine::executor::spill_quota::sort_spill_count();
+            let mut sort = ExternalSortBatchOperator::new(
+                None,
+                Box::new(input),
+                schema,
+                BatchProperties::UNORDERED_SINGLE,
+                vec![SortKeySource::Column(0)],
+                vec![crate::engine::executor::sort::SortField {
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }],
+                root.path(),
+            )
+            .with_topn(1, 0);
+            sort.initialize().unwrap();
+            assert_eq!(
+                crate::engine::executor::spill_quota::sort_spill_count(),
+                before,
+                "a known losing key must not spill its unread wide payload"
+            );
+            assert_eq!(
+                sort.next_values().unwrap(),
+                Some(vec![Value::Int(0), Value::String("winner".into())])
+            );
+            assert!(sort.next_values().unwrap().is_none());
+            drop(sort);
+            assert_eq!(budget.used(), 0);
+            assert_eq!(budget.spill_bytes(), 0);
+        });
+    }
+
+    #[test]
+    fn multi_pass_sort_live_quota_matches_remaining_files() {
+        let root = tempfile::tempdir().unwrap();
+        let budget = Arc::new(MemBudget::new(8 * 1024 * 1024));
+        with_query_budget(budget.clone(), || {
+            let schema = Arc::new(BatchSchema::new(vec![BatchField {
+                table: "t".into(),
+                alias: None,
+                name: "v".into(),
+                column_type: ColumnType::VarString,
+                source: Default::default(),
+            }]));
+            let batch = Batch::new(
+                schema.clone(),
+                vec![ColumnVector::from_values(
+                    (0..128)
+                        .rev()
+                        .map(|i| Value::String(format!("{i:04}{}", "x".repeat(128))))
+                        .collect(),
+                )],
+            );
+            let input =
+                super::super::stream::MaterializedBatchOperator::new(schema.clone(), vec![batch]);
+            let _tuning = crate::engine::executor::tuning::enter(
+                crate::engine::executor::tuning::ExecutorTuningSnapshot {
+                    stream_batch_rows: 64,
+                    stream_channel_batches: 2,
+                    sort_run_bytes: Some(1024),
+                    sort_merge_fanin: Some(2),
+                    hash_join_bloom_adaptive: true,
+                    scheduler_parallelism: 1,
+                },
+            );
+            let mut sort = ExternalSortBatchOperator::new(
+                None,
+                Box::new(input),
+                schema,
+                BatchProperties::UNORDERED_SINGLE,
+                vec![SortKeySource::Column(0)],
+                vec![crate::engine::executor::sort::SortField {
+                    ascending: true,
+                    nulls_first: true,
+                    collation_id: None,
+                }],
+                root.path(),
+            );
+            sort.initialize().unwrap();
+            assert_eq!(
+                budget.spill_bytes(),
+                file_bytes(&crate::storage::naming::system_tmp_dir(root.path()))
+            );
+            drop(sort);
+            assert_eq!(budget.spill_bytes(), 0);
+            assert_eq!(budget.used(), 0);
+        });
+    }
+}

@@ -1,0 +1,591 @@
+//! Spatial relationship predicates.
+//!
+//! MBR predicates compare bounds directly. Topological touches, crosses and
+//! overlaps use a noded DE-9IM intersection matrix, including multipart inputs.
+
+use super::algo::{point_in_polygon, segments_intersect, Containment};
+use super::types::*;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MbrOp {
+    Contains,
+    Within,
+    Intersects,
+    Disjoint,
+    Equals,
+    Touches,
+    Overlaps,
+    Covers,
+    CoveredBy,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StOp {
+    Intersects,
+    Disjoint,
+    Contains,
+    Within,
+    Equals,
+    Touches,
+    Crosses,
+    Overlaps,
+}
+
+/// Evaluate an MBR predicate. `None` when either geometry is empty (no MBR),
+/// which MySQL surfaces as NULL.
+pub(crate) fn mbr_predicate(op: MbrOp, a: &Geom, b: &Geom) -> Option<bool> {
+    let ma = a.mbr()?;
+    let mb = b.mbr()?;
+    Some(match op {
+        MbrOp::Contains => contains_interior(&ma, &mb),
+        MbrOp::Within => contains_interior(&mb, &ma),
+        MbrOp::Covers => ma.contains(&mb),
+        MbrOp::CoveredBy => mb.contains(&ma),
+        MbrOp::Intersects => ma.intersects(&mb),
+        MbrOp::Disjoint => !ma.intersects(&mb),
+        MbrOp::Equals => ma.equals(&mb),
+        MbrOp::Touches => ma.intersects(&mb) && !interiors_overlap(&ma, &mb),
+        MbrOp::Overlaps => {
+            (ma.minx == ma.maxx) == (mb.minx == mb.maxx)
+                && (ma.miny == ma.maxy) == (mb.miny == mb.maxy)
+                && interiors_overlap(&ma, &mb)
+                && !ma.contains(&mb)
+                && !mb.contains(&ma)
+        }
+    })
+}
+
+#[inline]
+fn contains_interior(a: &Mbr, b: &Mbr) -> bool {
+    a.contains(b)
+        && (if a.minx == a.maxx {
+            b.minx == a.minx && b.maxx == a.maxx
+        } else {
+            b.minx < a.maxx && b.maxx > a.minx
+        })
+        && (if a.miny == a.maxy {
+            b.miny == a.miny && b.maxy == a.maxy
+        } else {
+            b.miny < a.maxy && b.maxy > a.miny
+        })
+}
+
+#[inline]
+fn interiors_overlap(a: &Mbr, b: &Mbr) -> bool {
+    fn axis(amin: f64, amax: f64, bmin: f64, bmax: f64) -> bool {
+        match (amin == amax, bmin == bmax) {
+            (true, true) => amin == bmin,
+            (true, false) => amin > bmin && amin < bmax,
+            (false, true) => bmin > amin && bmin < amax,
+            (false, false) => amin < bmax && amax > bmin,
+        }
+    }
+    axis(a.minx, a.maxx, b.minx, b.maxx) && axis(a.miny, a.maxy, b.miny, b.maxy)
+}
+
+/// Evaluate a topological predicate. `None` when either geometry is empty.
+pub(crate) fn st_predicate(op: StOp, a: &Geom, b: &Geom) -> Option<bool> {
+    if a.is_empty() || b.is_empty() {
+        // ST_Equals is the documented exception to the empty-geometry NULL
+        // rule: two empty geometries represent the same point set.
+        return matches!(op, StOp::Equals).then(|| a.is_empty() && b.is_empty());
+    }
+    Some(match op {
+        StOp::Intersects => intersects(a, b),
+        StOp::Disjoint => !intersects(a, b),
+        StOp::Contains => contains(a, b),
+        StOp::Within => contains(b, a),
+        StOp::Equals => equals(a, b),
+        StOp::Touches => touches(a, b),
+        StOp::Crosses => crosses(a, b),
+        StOp::Overlaps => overlaps(a, b),
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Point-vs-geometry coverage
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cover {
+    Interior,
+    Boundary,
+    Outside,
+}
+
+fn coincides(a: Coord, b: Coord) -> bool {
+    a == b
+}
+
+fn on_seg(p: Coord, a: Coord, b: Coord) -> bool {
+    super::algo::on_segment(p, a, b)
+}
+
+/// Classify `pt` relative to `geom`.
+fn cover_point(geom: &Geom, pt: Coord) -> Cover {
+    match geom {
+        Geom::Point(c) => {
+            if coincides(*c, pt) {
+                Cover::Interior
+            } else {
+                Cover::Outside
+            }
+        }
+        Geom::MultiPoint(ps) => {
+            if ps.iter().any(|c| coincides(*c, pt)) {
+                Cover::Interior
+            } else {
+                Cover::Outside
+            }
+        }
+        Geom::LineString(cs) => cover_point_line(cs, pt),
+        Geom::MultiLineString(ls) => combine(ls.iter().map(|l| cover_point_line(l, pt))),
+        Geom::Polygon(rings) => match point_in_polygon(pt, rings) {
+            Containment::Inside => Cover::Interior,
+            Containment::Boundary => Cover::Boundary,
+            Containment::Outside => Cover::Outside,
+        },
+        Geom::MultiPolygon(ps) => combine(ps.iter().map(|p| match point_in_polygon(pt, p) {
+            Containment::Inside => Cover::Interior,
+            Containment::Boundary => Cover::Boundary,
+            Containment::Outside => Cover::Outside,
+        })),
+        Geom::GeometryCollection(gs) => combine(gs.iter().map(|g| cover_point(g, pt))),
+    }
+}
+
+fn cover_point_line(cs: &[Coord], pt: Coord) -> Cover {
+    if cs.is_empty() {
+        return Cover::Outside;
+    }
+    if cs.len() == 1 {
+        return if coincides(cs[0], pt) {
+            Cover::Interior
+        } else {
+            Cover::Outside
+        };
+    }
+    let closed = coincides(cs[0], cs[cs.len() - 1]);
+    for w in cs.windows(2) {
+        if on_seg(pt, w[0], w[1]) {
+            // Endpoints of an open line are boundary; everything else interior.
+            if !closed && (coincides(pt, cs[0]) || coincides(pt, cs[cs.len() - 1])) {
+                return Cover::Boundary;
+            }
+            return Cover::Interior;
+        }
+    }
+    Cover::Outside
+}
+
+fn combine(it: impl Iterator<Item = Cover>) -> Cover {
+    let mut best = Cover::Outside;
+    for c in it {
+        match c {
+            Cover::Interior => return Cover::Interior,
+            Cover::Boundary => best = Cover::Boundary,
+            Cover::Outside => {}
+        }
+    }
+    best
+}
+
+#[inline]
+fn covered(geom: &Geom, pt: Coord) -> bool {
+    cover_point(geom, pt) != Cover::Outside
+}
+
+// ---------------------------------------------------------------------------
+// Boundary segments
+// ---------------------------------------------------------------------------
+
+fn boundary_segments(geom: &Geom, out: &mut Vec<(Coord, Coord)>) {
+    match geom {
+        Geom::Point(_) | Geom::MultiPoint(_) => {}
+        Geom::LineString(cs) => push_open_segs(cs, out),
+        Geom::MultiLineString(ls) => ls.iter().for_each(|l| push_open_segs(l, out)),
+        Geom::Polygon(rings) => rings.iter().for_each(|r| push_ring_segs(r, out)),
+        Geom::MultiPolygon(ps) => ps
+            .iter()
+            .for_each(|p| p.iter().for_each(|r| push_ring_segs(r, out))),
+        Geom::GeometryCollection(gs) => gs.iter().for_each(|g| boundary_segments(g, out)),
+    }
+}
+
+fn push_open_segs(cs: &[Coord], out: &mut Vec<(Coord, Coord)>) {
+    cs.windows(2).for_each(|w| out.push((w[0], w[1])));
+}
+
+fn push_ring_segs(ring: &[Coord], out: &mut Vec<(Coord, Coord)>) {
+    let n = ring.len();
+    if n < 2 {
+        return;
+    }
+    for i in 0..n {
+        out.push((ring[i], ring[(i + 1) % n]));
+    }
+}
+
+fn boundaries_cross(a: &Geom, b: &Geom) -> bool {
+    let mut sa = Vec::new();
+    let mut sb = Vec::new();
+    boundary_segments(a, &mut sa);
+    boundary_segments(b, &mut sb);
+    sa.iter().any(|&(p1, p2)| {
+        sb.iter()
+            .any(|&(p3, p4)| segments_intersect(p1, p2, p3, p4))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Predicates
+// ---------------------------------------------------------------------------
+
+fn mbr_disjoint(a: &Geom, b: &Geom) -> bool {
+    match (a.mbr(), b.mbr()) {
+        (Some(ma), Some(mb)) => !ma.intersects(&mb),
+        _ => true,
+    }
+}
+
+fn intersects(a: &Geom, b: &Geom) -> bool {
+    if mbr_disjoint(a, b) {
+        return false;
+    }
+    // A point has no boundary segments. Its single coverage test already
+    // determines intersection with every geometry, without coordinate copies.
+    match (a, b) {
+        (Geom::Point(point), other) | (other, Geom::Point(point)) => covered(other, *point),
+        _ => intersects_candidates(a, b),
+    }
+}
+
+#[cfg(test)]
+pub(super) fn intersects_reference(a: &Geom, b: &Geom) -> bool {
+    !mbr_disjoint(a, b) && intersects_candidates(a, b)
+}
+
+fn intersects_candidates(a: &Geom, b: &Geom) -> bool {
+    if a.all_coords().iter().any(|&c| covered(b, c)) {
+        return true;
+    }
+    if b.all_coords().iter().any(|&c| covered(a, c)) {
+        return true;
+    }
+    boundaries_cross(a, b)
+}
+
+/// `a` contains `b`: every point of `b` lies in the closure of `a`, no point
+/// of `b` is in the exterior of `a`, and their interiors meet.
+fn contains(a: &Geom, b: &Geom) -> bool {
+    if let Some(result) = contains_points(a, b) {
+        return result;
+    }
+    contains_topology(a, b)
+}
+
+/// A zero-dimensional target needs coverage of every point and at least one
+/// interior intersection. Borrow the coordinates instead of constructing a
+/// noded relation graph. Ambiguous multipart boundaries and collection unions
+/// retain the general topology implementation.
+fn contains_points(a: &Geom, b: &Geom) -> Option<bool> {
+    // Two point sets retain indexed topology matching instead of repeated
+    // linear membership probes, which would be quadratic for large sets.
+    if matches!((a, b), (Geom::MultiPoint(_), Geom::MultiPoint(_))) {
+        return None;
+    }
+    if !matches!(
+        a,
+        Geom::Point(_)
+            | Geom::MultiPoint(_)
+            | Geom::LineString(_)
+            | Geom::Polygon(_)
+            | Geom::MultiPolygon(_)
+    ) {
+        return None;
+    }
+    let points = match b {
+        Geom::Point(point) => std::slice::from_ref(point),
+        Geom::MultiPoint(points) => points.as_slice(),
+        _ => return None,
+    };
+    let mut interior = false;
+    for &point in points {
+        let position = match a {
+            Geom::Polygon(rings) => polygon_point_position(rings, point),
+            Geom::MultiPolygon(polygons) => {
+                let mut inside = false;
+                for rings in polygons {
+                    match polygon_point_position(rings, point) {
+                        // Global boundary rules cannot be decided by combining
+                        // component labels. Reuse the complete relation graph.
+                        Cover::Boundary => return None,
+                        Cover::Interior => inside = true,
+                        Cover::Outside => {}
+                    }
+                }
+                if inside {
+                    Cover::Interior
+                } else {
+                    Cover::Outside
+                }
+            }
+            _ => cover_point(a, point),
+        };
+        match position {
+            Cover::Outside => return Some(false),
+            Cover::Interior => interior = true,
+            Cover::Boundary => {}
+        }
+    }
+    Some(interior)
+}
+
+fn polygon_point_position(rings: &[Vec<Coord>], point: Coord) -> Cover {
+    let Some(exterior) = rings.first() else {
+        return Cover::Outside;
+    };
+    let position = ring_point_position(exterior, point);
+    if position != Cover::Interior {
+        return position;
+    }
+    for hole in &rings[1..] {
+        match ring_point_position(hole, point) {
+            Cover::Interior => return Cover::Outside,
+            Cover::Boundary => return Cover::Boundary,
+            Cover::Outside => {}
+        }
+    }
+    Cover::Interior
+}
+
+/// Robust winding-number classification without ray-intersection division.
+/// Half-open crossings count shared vertices once; collinear edges retain
+/// exact boundary semantics at every coordinate scale and ring orientation.
+fn ring_point_position(ring: &[Coord], point: Coord) -> Cover {
+    use geo::kernels::{Kernel, Orientation, RobustKernel};
+    let mut winding = 0i64;
+    for (&a, &b) in ring
+        .iter()
+        .zip(ring.iter().cycle().skip(1))
+        .take(ring.len())
+    {
+        if a.y <= point.y {
+            if b.y >= point.y {
+                let orientation = RobustKernel::orient2d(coord(&a), coord(&b), coord(&point));
+                if orientation == Orientation::CounterClockwise && b.y != point.y {
+                    winding += 1;
+                } else if orientation == Orientation::Collinear
+                    && point.x >= a.x.min(b.x)
+                    && point.x <= a.x.max(b.x)
+                {
+                    return Cover::Boundary;
+                }
+            }
+        } else if b.y <= point.y {
+            let orientation = RobustKernel::orient2d(coord(&a), coord(&b), coord(&point));
+            if orientation == Orientation::Clockwise {
+                winding -= 1;
+            } else if orientation == Orientation::Collinear
+                && point.x >= a.x.min(b.x)
+                && point.x <= a.x.max(b.x)
+            {
+                return Cover::Boundary;
+            }
+        }
+    }
+    if winding == 0 {
+        Cover::Outside
+    } else {
+        Cover::Interior
+    }
+}
+
+pub(super) fn contains_topology(a: &Geom, b: &Geom) -> bool {
+    use geo::Relate;
+    if matches!(a, Geom::GeometryCollection(_)) || matches!(b, Geom::GeometryCollection(_)) {
+        use geo::BooleanOps;
+        let left = topology_groups(a);
+        let right = topology_groups(b);
+        let polygons = left.iter().find_map(|g| match g {
+            geo::Geometry::MultiPolygon(polygons) => Some(polygons),
+            _ => None,
+        });
+        let lines = left.iter().find_map(|g| match g {
+            geo::Geometry::MultiLineString(lines) => Some(lines),
+            _ => None,
+        });
+        let covered = right.iter().all(|part| match part {
+            geo::Geometry::MultiPoint(points) => points
+                .0
+                .iter()
+                .all(|point| left.iter().any(|g| g.relate(point).is_covers())),
+            geo::Geometry::MultiLineString(target) => {
+                let outside = polygons.map(|polygons| polygons.clip(target, true));
+                let outside = outside.as_ref().unwrap_or(target);
+                outside.0.is_empty() || lines.is_some_and(|lines| lines.relate(outside).is_covers())
+            }
+            geo::Geometry::MultiPolygon(target) => {
+                polygons.is_some_and(|polygons| polygons.relate(target).is_covers())
+            }
+            _ => unreachable!("normalized dimensional groups"),
+        });
+        return covered
+            && left.iter().any(|a| {
+                right
+                    .iter()
+                    .any(|b| a.relate(b).matches("T********").expect("valid DE-9IM mask"))
+            });
+    }
+    topology_geometry(a)
+        .relate(&topology_geometry(b))
+        .is_contains()
+}
+
+fn equals(a: &Geom, b: &Geom) -> bool {
+    // Mutual containment (cheap exact-equality fast path first).
+    if a == b {
+        return true;
+    }
+    match (a.mbr(), b.mbr()) {
+        (Some(ma), Some(mb)) if ma.equals(&mb) => contains(a, b) && contains(b, a),
+        _ => false,
+    }
+}
+
+fn coord(c: &Coord) -> geo::Coord<f64> {
+    geo::Coord { x: c.x, y: c.y }
+}
+fn line(cs: &[Coord]) -> geo::LineString<f64> {
+    geo::LineString(cs.iter().map(coord).collect())
+}
+fn polygon(rings: &[Vec<Coord>]) -> geo::Polygon<f64> {
+    geo::Polygon::new(
+        rings.first().map_or_else(|| line(&[]), |r| line(r)),
+        rings.iter().skip(1).map(|r| line(r)).collect(),
+    )
+}
+
+pub(super) fn topology_geometry(geom: &Geom) -> geo::Geometry<f64> {
+    match geom {
+        Geom::Point(c) => geo::Point(coord(c)).into(),
+        Geom::LineString(cs) => line(cs).into(),
+        Geom::Polygon(rings) => polygon(rings).into(),
+        Geom::MultiPoint(cs) => {
+            geo::MultiPoint(cs.iter().map(|c| geo::Point(coord(c))).collect()).into()
+        }
+        Geom::MultiLineString(lines) => {
+            geo::MultiLineString(lines.iter().map(|cs| line(cs)).collect()).into()
+        }
+        Geom::MultiPolygon(polygons) => {
+            geo::MultiPolygon(polygons.iter().map(|rings| polygon(rings)).collect()).into()
+        }
+        Geom::GeometryCollection(gs) => geo::Geometry::GeometryCollection(geo::GeometryCollection(
+            gs.iter().map(topology_geometry).collect(),
+        )),
+    }
+}
+
+/// Relate heterogeneous collections by normalized dimensional components.
+/// A single mixed graph can classify an isolated point as line interior.
+fn topology_groups(geom: &Geom) -> Vec<geo::Geometry<f64>> {
+    use geo::{BooleanOps, Intersects};
+    fn collect(
+        geom: &Geom,
+        points: &mut Vec<geo::Point<f64>>,
+        lines: &mut Vec<geo::LineString<f64>>,
+        polygons: &mut Vec<geo::Polygon<f64>>,
+    ) {
+        match geom {
+            Geom::GeometryCollection(parts) => {
+                for part in parts {
+                    collect(part, points, lines, polygons);
+                }
+            }
+            Geom::Point(point) => points.push(geo::Point(coord(point))),
+            Geom::MultiPoint(parts) => {
+                points.extend(parts.iter().map(|point| geo::Point(coord(point))))
+            }
+            Geom::LineString(points) => lines.push(line(points)),
+            Geom::MultiLineString(parts) => lines.extend(parts.iter().map(|points| line(points))),
+            Geom::Polygon(rings) => polygons.push(polygon(rings)),
+            Geom::MultiPolygon(parts) => polygons.extend(parts.iter().map(|rings| polygon(rings))),
+        }
+    }
+    let mut points = Vec::new();
+    let mut lines = Vec::new();
+    let mut polygons = Vec::new();
+    collect(geom, &mut points, &mut lines, &mut polygons);
+    let polygons = if polygons.len() > 1 {
+        geo::unary_union(&polygons)
+    } else {
+        geo::MultiPolygon(polygons)
+    };
+    let lines = geo::MultiLineString(lines);
+    let lines = if polygons.0.is_empty() {
+        lines
+    } else {
+        polygons.clip(&lines, true)
+    };
+    points.retain(|point| !polygons.intersects(point) && !lines.intersects(point));
+    let mut groups = Vec::with_capacity(3);
+    if !points.is_empty() {
+        groups.push(geo::MultiPoint(points).into());
+    }
+    if !lines.0.is_empty() {
+        groups.push(lines.into());
+    }
+    if !polygons.0.is_empty() {
+        groups.push(polygons.into());
+    }
+    groups
+}
+
+fn touches(a: &Geom, b: &Geom) -> bool {
+    use geo::Relate;
+    if matches!(a, Geom::GeometryCollection(_)) || matches!(b, Geom::GeometryCollection(_)) {
+        let left = topology_groups(a);
+        let right = topology_groups(b);
+        let mut touching = false;
+        for a in &left {
+            for b in &right {
+                let matrix = a.relate(b);
+                if matrix.matches("T********").expect("valid DE-9IM mask") {
+                    return false;
+                }
+                touching |= matrix.is_touches();
+            }
+        }
+        return touching;
+    }
+    topology_geometry(a)
+        .relate(&topology_geometry(b))
+        .is_touches()
+}
+
+fn crosses(a: &Geom, b: &Geom) -> bool {
+    use geo::Relate;
+    normalized_topology_geometry(a)
+        .relate(&normalized_topology_geometry(b))
+        .is_crosses()
+}
+
+fn overlaps(a: &Geom, b: &Geom) -> bool {
+    use geo::Relate;
+    normalized_topology_geometry(a)
+        .relate(&normalized_topology_geometry(b))
+        .is_overlaps()
+}
+
+fn normalized_topology_geometry(geom: &Geom) -> geo::Geometry<f64> {
+    if matches!(geom, Geom::GeometryCollection(_)) {
+        let mut groups = topology_groups(geom);
+        if groups.len() == 1 {
+            groups.pop().unwrap()
+        } else {
+            geo::Geometry::GeometryCollection(geo::GeometryCollection(groups))
+        }
+    } else {
+        topology_geometry(geom)
+    }
+}

@@ -1,0 +1,938 @@
+{
+  "RecycleBin": {
+    "references": [
+      "docs/statement/admin/show-recyclebin.md",
+      "docs/statement/admin/restore-table.md",
+      "docs/statement/admin/purge-recyclebin.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ApiKey": {
+    "references": [
+      "docs/statement/account/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Ai": {
+    "references": [
+      "docs/statement/integration/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "RowSecurity": {
+    "references": [
+      "docs/statement/security/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Begin": {
+    "references": [
+      "docs/statement/transaction/start-transaction.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Commit": {
+    "references": [
+      "docs/statement/transaction/commit.md"
+    ],
+    "kind": "statement"
+  },
+  "Rollback": {
+    "references": [
+      "docs/statement/transaction/rollback.md"
+    ],
+    "kind": "statement"
+  },
+  "Savepoint": {
+    "references": [
+      "docs/statement/transaction/savepoint.md"
+    ],
+    "kind": "statement"
+  },
+  "RollbackToSavepoint": {
+    "references": [
+      "docs/statement/transaction/rollback-to-savepoint.md"
+    ],
+    "kind": "statement"
+  },
+  "ReleaseSavepoint": {
+    "references": [
+      "docs/statement/transaction/release-savepoint.md"
+    ],
+    "kind": "statement"
+  },
+  "CancelDdlJob": {
+    "references": [
+      "docs/statement/admin/cancel-ddl-job.md"
+    ],
+    "kind": "statement"
+  },
+  "BackupAdmin": {
+    "references": [
+      "docs/statement/backup/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Prepare": {
+    "references": [
+      "docs/statement/programmatic/prepare.md"
+    ],
+    "kind": "statement"
+  },
+  "ExecutePrepared": {
+    "references": [
+      "docs/statement/programmatic/execute.md"
+    ],
+    "kind": "statement-family"
+  },
+  "DeallocatePrepared": {
+    "references": [
+      "docs/statement/programmatic/deallocate-prepare.md"
+    ],
+    "kind": "statement-family"
+  },
+  "SetAutocommit": {
+    "references": [
+      "docs/statement/transaction/set-autocommit.md"
+    ],
+    "kind": "statement"
+  },
+  "SetTransactionIsolation": {
+    "references": [
+      "docs/statement/transaction/set-transaction.md"
+    ],
+    "kind": "statement-family"
+  },
+  "LockTables": {
+    "references": [
+      "docs/statement/transaction/lock-tables.md"
+    ],
+    "kind": "statement"
+  },
+  "UnlockTables": {
+    "references": [
+      "docs/statement/transaction/unlock-tables.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateTable": {
+    "references": [
+      "docs/statement/ddl/create-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateTableLike": {
+    "references": [
+      "docs/statement/ddl/create-table-like.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterTable": {
+    "references": [
+      "docs/statement/ddl/alter-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateDatabase": {
+    "references": [
+      "docs/statement/ddl/create-database.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterDatabase": {
+    "references": [
+      "docs/statement/ddl/alter-database.md"
+    ],
+    "kind": "statement"
+  },
+  "DropDatabase": {
+    "references": [
+      "docs/statement/ddl/drop-database.md"
+    ],
+    "kind": "statement"
+  },
+  "DropTable": {
+    "references": [
+      "docs/statement/ddl/drop-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateSequence": {
+    "references": [
+      "docs/statement/ddl/create-sequence.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterSequence": {
+    "references": [
+      "docs/statement/ddl/alter-sequence.md"
+    ],
+    "kind": "statement"
+  },
+  "DropSequence": {
+    "references": [
+      "docs/statement/ddl/drop-sequence.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCreateSequence": {
+    "references": [
+      "docs/statement/metadata/show-create-sequence.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowSequences": {
+    "references": [
+      "docs/statement/metadata/show-sequences.md"
+    ],
+    "kind": "statement"
+  },
+  "TruncateTable": {
+    "references": [
+      "docs/statement/ddl/truncate-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateIndex": {
+    "references": [
+      "docs/statement/ddl/create-index.md"
+    ],
+    "kind": "statement"
+  },
+  "DropIndex": {
+    "references": [
+      "docs/statement/ddl/drop-index.md"
+    ],
+    "kind": "statement"
+  },
+  "AnalyzeTable": {
+    "references": [
+      "docs/statement/admin/analyze-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CheckTable": {
+    "references": [
+      "docs/statement/admin/check-table.md"
+    ],
+    "kind": "statement"
+  },
+  "RepairTable": {
+    "references": [
+      "docs/statement/admin/repair-table.md"
+    ],
+    "kind": "statement"
+  },
+  "OptimizeTable": {
+    "references": [
+      "docs/statement/admin/optimize-table.md"
+    ],
+    "kind": "statement"
+  },
+  "ChecksumTable": {
+    "references": [
+      "docs/statement/admin/checksum-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateTablespace": {
+    "references": [
+      "docs/statement/ddl/create-tablespace.md"
+    ],
+    "kind": "statement"
+  },
+  "DropTablespace": {
+    "references": [
+      "docs/statement/ddl/drop-tablespace.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterTablespace": {
+    "references": [
+      "docs/statement/ddl/alter-tablespace.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateView": {
+    "references": [
+      "docs/statement/ddl/create-view.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterView": {
+    "references": [
+      "docs/statement/ddl/alter-view.md"
+    ],
+    "kind": "statement"
+  },
+  "DropView": {
+    "references": [
+      "docs/statement/ddl/drop-view.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateTableAsSelect": {
+    "references": [
+      "docs/statement/ddl/create-table-as-select.md"
+    ],
+    "kind": "statement"
+  },
+  "Insert": {
+    "references": [
+      "docs/statement/dml/insert.md"
+    ],
+    "kind": "statement"
+  },
+  "Select": {
+    "references": [
+      "docs/statement/query/select.md"
+    ],
+    "kind": "statement"
+  },
+  "SetOperation": {
+    "references": [
+      "docs/statement/query/select.md"
+    ],
+    "kind": "statement-family"
+  },
+  "WithCte": {
+    "references": [
+      "docs/statement/query/select.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Explain": {
+    "references": [
+      "docs/statement/query/explain.md"
+    ],
+    "kind": "statement"
+  },
+  "ExplainForConnection": {
+    "references": [
+      "docs/statement/query/explain-for-connection.md"
+    ],
+    "kind": "statement"
+  },
+  "SelectIntoVars": {
+    "references": [
+      "docs/statement/query/select-into-variables.md"
+    ],
+    "kind": "statement-family"
+  },
+  "SelectIntoFile": {
+    "references": [
+      "docs/statement/query/select-into-file.md"
+    ],
+    "kind": "statement"
+  },
+  "RenameTables": {
+    "references": [
+      "docs/statement/ddl/rename-table.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Update": {
+    "references": [
+      "docs/statement/dml/update.md"
+    ],
+    "kind": "statement"
+  },
+  "Delete": {
+    "references": [
+      "docs/statement/dml/delete.md"
+    ],
+    "kind": "statement"
+  },
+  "Describe": {
+    "references": [
+      "docs/statement/query/describe.md"
+    ],
+    "kind": "statement"
+  },
+  "UseDatabase": {
+    "references": [
+      "docs/statement/metadata/use.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ShowDatabases": {
+    "references": [
+      "docs/statement/metadata/show-databases.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowTables": {
+    "references": [
+      "docs/statement/metadata/show-tables.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowTableStatus": {
+    "references": [
+      "docs/statement/metadata/show-table-status.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowColumns": {
+    "references": [
+      "docs/statement/metadata/show-columns.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowIndex": {
+    "references": [
+      "docs/statement/metadata/show-index.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCreateDatabase": {
+    "references": [
+      "docs/statement/metadata/show-create-database.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCreateTable": {
+    "references": [
+      "docs/statement/metadata/show-create-table.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateRoutine": {
+    "references": [
+      "docs/statement/programmatic/create-procedure.md",
+      "docs/statement/programmatic/create-function.md"
+    ],
+    "kind": "statement-family"
+  },
+  "AlterRoutine": {
+    "references": [
+      "docs/statement/programmatic/alter-procedure.md",
+      "docs/statement/programmatic/alter-function.md"
+    ],
+    "kind": "statement-family"
+  },
+  "DropRoutine": {
+    "references": [
+      "docs/statement/programmatic/drop-procedure.md",
+      "docs/statement/programmatic/drop-function.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Call": {
+    "references": [
+      "docs/statement/programmatic/call.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCreateRoutine": {
+    "references": [
+      "docs/statement/metadata/show-create-routine.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowRoutineStatus": {
+    "references": [
+      "docs/statement/metadata/show-routine-status.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateTrigger": {
+    "references": [
+      "docs/statement/programmatic/create-trigger.md"
+    ],
+    "kind": "statement"
+  },
+  "DropTrigger": {
+    "references": [
+      "docs/statement/programmatic/drop-trigger.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCreateTrigger": {
+    "references": [
+      "docs/statement/metadata/show-create-trigger.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowTriggers": {
+    "references": [
+      "docs/statement/metadata/show-triggers.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateEvent": {
+    "references": [
+      "docs/statement/programmatic/create-event.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterEvent": {
+    "references": [
+      "docs/statement/programmatic/alter-event.md"
+    ],
+    "kind": "statement"
+  },
+  "DropEvent": {
+    "references": [
+      "docs/statement/programmatic/drop-event.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCreateEvent": {
+    "references": [
+      "docs/statement/metadata/show-create-event.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowEvents": {
+    "references": [
+      "docs/statement/metadata/show-events.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCharset": {
+    "references": [
+      "docs/statement/metadata/show-character-set.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ShowCollation": {
+    "references": [
+      "docs/statement/metadata/show-collation.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowVariables": {
+    "references": [
+      "docs/statement/metadata/show-variables.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowStatus": {
+    "references": [
+      "docs/statement/metadata/show-status.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowDiagnostics": {
+    "references": [
+      "docs/statement/metadata/show-diagnostics.md"
+    ],
+    "kind": "statement"
+  },
+  "GetDiagnostics": {
+    "references": [
+      "docs/statement/programmatic/get-diagnostics.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowCountDiagnostics": {
+    "references": [
+      "docs/statement/metadata/show-diagnostics.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ShowEngines": {
+    "references": [
+      "docs/statement/metadata/show-engines.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowEngineMydbStatus": {
+    "references": [
+      "docs/statement/metadata/show-engine.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ShowMydbMemory": {
+    "references": [
+      "docs/statement/metadata/show-mydb-memory.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowMydbMemorySessions": {
+    "references": [
+      "docs/statement/metadata/show-mydb-memory-sessions.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowEngine": {
+    "references": [
+      "docs/statement/metadata/show-engine.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowPlugins": {
+    "references": [
+      "docs/statement/metadata/show-plugins.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowOpenTables": {
+    "references": [
+      "docs/statement/metadata/show-open-tables.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowProcesslist": {
+    "references": [
+      "docs/statement/metadata/show-processlist.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowGrants": {
+    "references": [
+      "docs/statement/account/show-grants.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowGrantsFor": {
+    "references": [
+      "docs/statement/account/show-grants.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ShowCreateUser": {
+    "references": [
+      "docs/statement/account/show-create-user.md"
+    ],
+    "kind": "statement"
+  },
+  "Kill": {
+    "references": [
+      "docs/statement/admin/kill.md"
+    ],
+    "kind": "statement"
+  },
+  "Shutdown": {
+    "references": [
+      "docs/statement/admin/shutdown.md"
+    ],
+    "kind": "statement"
+  },
+  "Restart": {
+    "references": [
+      "docs/statement/admin/restart.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterSystemCheckpoint": {
+    "references": [
+      "docs/statement/admin/alter-system-checkpoint.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterSystemFlushDataCache": {
+    "references": [
+      "docs/statement/admin/alter-system-flush-data-cache.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterSystemFlushSqlCache": {
+    "references": [
+      "docs/statement/admin/alter-system-flush-sql-cache.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterSystemReloadHttpConfig": {
+    "references": [
+      "docs/statement/integration/reload-http-config.md"
+    ],
+    "kind": "statement-family"
+  },
+  "ShowHttpStatus": {
+    "references": [
+      "docs/statement/integration/show-http-status.md"
+    ],
+    "kind": "statement"
+  },
+  "ShowPrivileges": {
+    "references": [
+      "docs/statement/account/show-privileges.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateUser": {
+    "references": [
+      "docs/statement/account/create-user.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterUser": {
+    "references": [
+      "docs/statement/account/alter-user.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterUsers": {
+    "references": [
+      "docs/statement/account/alter-user.md"
+    ],
+    "kind": "statement-family"
+  },
+  "DropUser": {
+    "references": [
+      "docs/statement/account/drop-user.md"
+    ],
+    "kind": "statement"
+  },
+  "RenameUser": {
+    "references": [
+      "docs/statement/account/rename-user.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateRole": {
+    "references": [
+      "docs/statement/account/create-role.md"
+    ],
+    "kind": "statement"
+  },
+  "DropRole": {
+    "references": [
+      "docs/statement/account/drop-role.md"
+    ],
+    "kind": "statement"
+  },
+  "Grant": {
+    "references": [
+      "docs/statement/account/grant.md"
+    ],
+    "kind": "statement"
+  },
+  "Revoke": {
+    "references": [
+      "docs/statement/account/revoke.md"
+    ],
+    "kind": "statement"
+  },
+  "SetRole": {
+    "references": [
+      "docs/statement/account/set-role.md"
+    ],
+    "kind": "statement"
+  },
+  "SetDefaultRole": {
+    "references": [
+      "docs/statement/account/set-default-role.md"
+    ],
+    "kind": "statement"
+  },
+  "SetPassword": {
+    "references": [
+      "docs/statement/account/set-password.md"
+    ],
+    "kind": "statement"
+  },
+  "SetNames": {
+    "references": [
+      "docs/statement/transaction/set-names.md"
+    ],
+    "kind": "statement"
+  },
+  "SetCharacterSet": {
+    "references": [
+      "docs/statement/transaction/set-character-set.md"
+    ],
+    "kind": "statement"
+  },
+  "Set": {
+    "references": [
+      "docs/statement/transaction/set.md"
+    ],
+    "kind": "statement"
+  },
+  "ResetPersist": {
+    "references": [
+      "docs/statement/transaction/reset-persist.md"
+    ],
+    "kind": "statement"
+  },
+  "SetResourceGroup": {
+    "references": [
+      "docs/statement/transaction/set-resource-group.md"
+    ],
+    "kind": "statement"
+  },
+  "CreateResourceGroup": {
+    "references": [
+      "docs/statement/admin/create-resource-group.md"
+    ],
+    "kind": "statement"
+  },
+  "DropResourceGroup": {
+    "references": [
+      "docs/statement/admin/drop-resource-group.md"
+    ],
+    "kind": "statement"
+  },
+  "AlterResourceGroup": {
+    "references": [
+      "docs/statement/admin/alter-resource-group.md"
+    ],
+    "kind": "statement"
+  },
+  "SetTransactionCharacteristics": {
+    "references": [
+      "docs/statement/transaction/set-transaction.md"
+    ],
+    "kind": "statement-family"
+  },
+  "FlushPrivileges": {
+    "references": [
+      "docs/statement/admin/flush-privileges.md"
+    ],
+    "kind": "statement"
+  },
+  "FlushUserResources": {
+    "references": [
+      "docs/statement/admin/flush-user-resources.md"
+    ],
+    "kind": "statement"
+  },
+  "FlushHosts": {
+    "references": [
+      "docs/statement/admin/flush-hosts.md"
+    ],
+    "kind": "statement"
+  },
+  "FlushStatus": {
+    "references": [
+      "docs/statement/admin/flush-status.md"
+    ],
+    "kind": "statement"
+  },
+  "FlushTables": {
+    "references": [
+      "docs/statement/admin/flush-tables.md"
+    ],
+    "kind": "statement"
+  },
+  "FlushQueryCache": {
+    "references": [
+      "docs/statement/admin/flush-query-cache.md"
+    ],
+    "kind": "statement"
+  },
+  "FlushLogs": {
+    "references": [
+      "docs/statement/admin/flush-logs.md"
+    ],
+    "kind": "statement"
+  },
+  "InstallComponent": {
+    "references": [
+      "docs/statement/admin/install-component.md"
+    ],
+    "kind": "statement"
+  },
+  "UninstallComponent": {
+    "references": [
+      "docs/statement/admin/uninstall-component.md"
+    ],
+    "kind": "statement"
+  },
+  "ReplicationAdmin": {
+    "references": [
+      "docs/statement/replication/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "MydbReplicationAdmin": {
+    "references": [
+      "docs/native-replication.md",
+      "docs/statement/replication/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "BinlogAdmin": {
+    "references": [
+      "docs/statement/replication/README.md"
+    ],
+    "kind": "statement-family"
+  },
+  "Noop": {
+    "references": [
+      "docs/sql-parser-capabilities.md"
+    ],
+    "kind": "internal-parser-form"
+  },
+  "LoadData": {
+    "references": [
+      "docs/statement/dml/load-data.md"
+    ],
+    "kind": "statement"
+  },
+  "Do": {
+    "references": [
+      "docs/statement/query/do.md"
+    ],
+    "kind": "statement"
+  },
+  "Unsupported": {
+    "references": [
+      "docs/sql-parser-capabilities.md"
+    ],
+    "kind": "explicit-rejection"
+  },
+  "MultiStatement": {
+    "references": [
+      "docs/statement/execution-contracts.md"
+    ],
+    "kind": "statement-family"
+  },
+  "XaStart": {
+    "references": [
+      "docs/statement/transaction/xa-start.md"
+    ],
+    "kind": "statement"
+  },
+  "XaEnd": {
+    "references": [
+      "docs/statement/transaction/xa-end.md"
+    ],
+    "kind": "statement"
+  },
+  "XaPrepare": {
+    "references": [
+      "docs/statement/transaction/xa-prepare.md"
+    ],
+    "kind": "statement"
+  },
+  "XaCommit": {
+    "references": [
+      "docs/statement/transaction/xa-commit.md"
+    ],
+    "kind": "statement"
+  },
+  "XaRollback": {
+    "references": [
+      "docs/statement/transaction/xa-rollback.md"
+    ],
+    "kind": "statement"
+  },
+  "XaRecover": {
+    "references": [
+      "docs/statement/transaction/xa-recover.md"
+    ],
+    "kind": "statement"
+  },
+  "DeclareSqlCursor": {
+    "references": [
+      "docs/statement/programmatic/declare-cursor.md"
+    ],
+    "kind": "statement-family"
+  },
+  "FetchSqlCursor": {
+    "references": [
+      "docs/statement/programmatic/fetch-cursor.md"
+    ],
+    "kind": "statement-family"
+  },
+  "CloseSqlCursor": {
+    "references": [
+      "docs/statement/programmatic/close-cursor.md"
+    ],
+    "kind": "statement-family"
+  }
+}

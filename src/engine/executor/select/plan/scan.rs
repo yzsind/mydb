@@ -1,0 +1,7662 @@
+//! scan execution and preparation.
+
+use super::fulltext_source::{collect_heap_documents, heap_document_id, FtSearchSource};
+use super::*;
+
+/// A runtime integer domain is a conservative page predicate. Keep membership
+/// and join checks in place: gaps within the domain are deliberately admitted.
+pub(crate) fn runtime_filter_zone_ranges(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    runtime_filter: &RuntimeFilter,
+) -> Option<crate::storage::ZoneMapRanges> {
+    if txn.dirty_read
+        || table.system_time.is_some()
+        || table.schema.is_partitioned()
+        || table.zone_map_hint == Some(false)
+        || (table.zone_map_hint != Some(true)
+            && !crate::storage::schema::zone_map_optimizer_enabled())
+    {
+        return None;
+    }
+    let (keys, null_safe, bounds) = match runtime_filter {
+        RuntimeFilter::ExactIntKey {
+            keys,
+            null_safe,
+            filter,
+            ..
+        } => (keys, null_safe, filter.bounds()),
+        RuntimeFilter::KeySet {
+            keys,
+            null_safe,
+            values,
+            ..
+        } => {
+            let mut bounds: Option<(i128, i128)> = None;
+            for row in values.iter() {
+                let [value] = row.as_slice() else {
+                    return None;
+                };
+                let value = match value {
+                    Value::Null => continue,
+                    Value::Int(value) => i128::from(*value),
+                    Value::UInt(value) => i128::from(*value),
+                    _ => return None,
+                };
+                bounds =
+                    Some(bounds.map_or((value, value), |(lo, hi)| (lo.min(value), hi.max(value))));
+            }
+            (keys, null_safe, bounds)
+        }
+        RuntimeFilter::BloomKey { .. } => return None,
+    };
+    if keys.len() != 1 || null_safe.iter().any(|safe| *safe) {
+        return None;
+    }
+    let columns = runtime_filter_schema_indices(runtime_filter, table)?;
+    let [column] = columns.as_slice() else {
+        return None;
+    };
+    let column = &table.schema.columns[*column];
+    if column.unsigned
+        || !matches!(
+            column.data_type,
+            crate::storage::DataTypeKind::TinyInt
+                | crate::storage::DataTypeKind::SmallInt
+                | crate::storage::DataTypeKind::MediumInt
+                | crate::storage::DataTypeKind::Int
+                | crate::storage::DataTypeKind::BigInt
+        )
+    {
+        return None;
+    }
+    let (lo, hi) = bounds?;
+    let predicate = Expr::Between {
+        expr: Box::new(Expr::Identifier(column.name.clone())),
+        low: Box::new(Expr::BoundValue(Value::Int(i64::try_from(lo).ok()?))),
+        high: Box::new(Expr::BoundValue(Value::Int(i64::try_from(hi).ok()?))),
+        negated: false,
+    };
+    let ranges = db.zone_map_candidate_ranges_for_plan(&table.schema, &predicate)?;
+    let pages = db.heap_page_count_for_storage(table.schema.id).ok()?;
+    ranges
+        .iter()
+        .all(|&(lo, hi)| lo <= hi && hi <= pages)
+        .then_some(ranges)
+}
+
+pub(crate) fn prune_runtime_filter_row_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filters: &[RuntimeFilter],
+    row_ids: &mut Vec<RowId>,
+) {
+    for filter in filters {
+        if row_ids.is_empty() {
+            break;
+        }
+        let Some(ranges) = runtime_filter_zone_ranges(db, txn, table, filter) else {
+            continue;
+        };
+        row_ids.retain(|id| {
+            let page = u64::from(id.page_id);
+            let range = ranges.partition_point(|(_, hi)| *hi <= page);
+            ranges
+                .get(range)
+                .is_some_and(|&(lo, hi)| lo <= page && page < hi)
+        });
+    }
+}
+
+/// Wrap a scan call in a partition-pruning context derived from the
+/// optional WHERE filter. When the table is partitioned and the
+/// filter exposes equality / range / IN on the partition column(s),
+/// `partition_router::with_pruned_partitions` installs a thread-local
+/// list of `storage_id`s the storage layer's
+/// `partition_storage_ids_for_scan` consults inside the partition
+/// fan-out; the scan therefore visits only matching partitions.
+///
+/// For unpartitioned tables and unprunable filters this is a
+/// transparent no-op — the closure runs without any extra work.
+pub(in crate::engine::executor::select) fn run_scan_with_partition_pruning<F, T>(
+    table: &crate::storage::TableSchema,
+    filter: &Option<Expr>,
+    body: F,
+) -> Result<T, QueryError>
+where
+    F: FnOnce() -> Result<T, QueryError>,
+{
+    if !table.is_partitioned() {
+        return body();
+    }
+    let pruned = crate::engine::executor::partition_router::pruned_storage_ids_from_filter(
+        table,
+        filter.as_ref(),
+    );
+    let pruned = match (
+        crate::engine::executor::partition_router::current_pruned_partitions(),
+        pruned,
+    ) {
+        (Some(current), Some(planned)) => Some(
+            current
+                .into_iter()
+                .filter(|id| planned.contains(id))
+                .collect(),
+        ),
+        (Some(current), None) => Some(current),
+        (None, planned) => planned,
+    };
+    match pruned {
+        Some(ids) => crate::engine::executor::partition_router::with_pruned_partitions(ids, body),
+        None => body(),
+    }
+}
+
+/// Execute a physical table access with the immutable pruning artifact chosen
+/// by the planner. Static plans never re-interpret the predicate in the
+/// executor; parameterized plans evaluate the pruning program against the
+/// current bound expression values.
+pub(in crate::engine::executor::select) fn run_plan_scan_with_partition_pruning<F, T>(
+    table: &crate::planner::PlanTable,
+    filter: &Option<Expr>,
+    body: F,
+) -> Result<T, QueryError>
+where
+    F: FnOnce() -> Result<T, QueryError>,
+{
+    if !table.schema.is_partitioned() {
+        return body();
+    }
+    match table.resolved_partition_storage_ids(filter.as_ref()) {
+        Some(storage_ids) => {
+            crate::engine::executor::partition_router::with_pruned_partitions(storage_ids, body)
+        }
+        None => body(),
+    }
+}
+
+pub(in crate::engine::executor::select) fn scan_plan_table(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    runtime_filters: &[RuntimeFilter],
+    projected_columns: Option<&[usize]>,
+    use_zone_map: bool,
+) -> Result<Vec<PlanRow>, QueryError> {
+    // When the planner has computed a column-pruning list, use the
+    // streaming-columns API: storage decodes only the projected columns
+    // out of each heap row and we never allocate `StoredRow.values` for
+    // the unreferenced ones. The full-row path remains for single-table
+    // queries and any case where the planner couldn't project.
+    if let Some(projection) = projected_columns {
+        return scan_plan_table_projected(
+            db,
+            txn,
+            table,
+            filter,
+            runtime_filters,
+            projection,
+            use_zone_map,
+        );
+    }
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut out = Vec::new();
+    let bloom_fast_indices: Vec<Option<CompiledRuntimeFilterProbe>> = runtime_filters
+        .iter()
+        .map(|rf| compile_runtime_filter_probe_full(rf, &table.schema))
+        .collect();
+    let all_fast = !runtime_filters.is_empty() && bloom_fast_indices.iter().all(|x| x.is_some());
+    let compiled_filter = filter
+        .as_ref()
+        .and_then(|expr| CompiledPredicate::compile(expr, &table.schema));
+    let qualified = db.storage_key_for_table(&table.schema);
+    let stored_rows = run_plan_scan_with_partition_pruning(table, filter, || {
+        if table.schema.is_partitioned() {
+            let mut rows = Vec::new();
+            scan_partition_ranges(
+                db,
+                &table.schema,
+                filter.as_ref().filter(|_| use_zone_map),
+                |storage_id, lo, hi| {
+                    rows.extend(db.scan_rows_storage_range(
+                        &table.schema,
+                        storage_id,
+                        txn,
+                        lo,
+                        hi,
+                    )?);
+                    Ok(())
+                },
+            )?;
+            return Ok(rows);
+        }
+        if let Some(ranges) = use_zone_map
+            .then(|| filter.as_ref())
+            .flatten()
+            .and_then(|expr| db.zone_map_candidate_ranges_for_plan(&table.schema, expr))
+        {
+            let mut rows = Vec::new();
+            for (lo, hi) in ranges {
+                rows.extend(db.scan_rows_range(&qualified, txn, lo, hi)?);
+            }
+            Ok(rows)
+        } else {
+            db.scan_rows(&qualified, txn)
+        }
+    })?;
+    for stored in stored_rows {
+        crate::engine::cancel::check_cancelled()?;
+        if let Some(compiled) = compiled_filter.as_ref() {
+            if !compiled.eval(&stored.values)? {
+                continue;
+            }
+        }
+        if all_fast && !runtime_filters_admit_values(&bloom_fast_indices, &stored.values) {
+            HASH_JOIN_BLOOM_PROBE_FILTERED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let row = stored_row_to_plan_row(table, stored.values)?;
+        if !all_fast && !runtime_filters_admit(runtime_filters, &row)? {
+            HASH_JOIN_BLOOM_PROBE_FILTERED.fetch_add(1, Ordering::Relaxed);
+            continue;
+        }
+        let keep = match (filter, compiled_filter.as_ref()) {
+            (Some(expr), None) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
+            _ => true,
+        };
+        if keep {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Visit selected partition heaps in storage order. An empty candidate set
+/// skips that heap; only unavailable candidates fall back to its full range.
+/// The owning candidate iterator keeps its scratch reservation through errors.
+fn scan_partition_ranges(
+    db: &Database,
+    schema: &TableSchema,
+    zone_map_filter: Option<&Expr>,
+    mut visit: impl FnMut(u64, u64, u64) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
+    for storage_id in db.scan_storage_ids(schema) {
+        let ranges = zone_map_filter.and_then(|expr| {
+            db.zone_map_candidate_ranges_for_storage_for_plan(schema, storage_id, expr)
+        });
+        if let Some(ranges) = ranges {
+            for (lo, hi) in ranges {
+                visit(storage_id, lo, hi)?;
+            }
+        } else {
+            let pages = db.heap_page_count_for_storage(storage_id)?;
+            visit(storage_id, 0, pages)?;
+        }
+    }
+    Ok(())
+}
+
+/// Physical routing shared by collected and channel-backed projected scans.
+/// Nonpartitioned candidates are supplied by the caller: streaming scans must
+/// retain the ranges and reservation captured before dispatching their worker.
+/// Row filters and partition-pruning scope remain the caller's responsibility.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine::executor::select) fn scan_projected_table<F>(
+    db: &Database,
+    schema: &TableSchema,
+    txn: TxnView,
+    columns: &[usize],
+    zone_map_filter: Option<&Expr>,
+    candidate_ranges: Option<&[(u64, u64)]>,
+    outside_latch: bool,
+    mut visit: F,
+) -> Result<(), QueryError>
+where
+    F: FnMut(&[Value]) -> Result<(), QueryError>,
+{
+    if schema.is_partitioned() {
+        scan_partition_ranges(db, schema, zone_map_filter, |storage_id, lo, hi| {
+            scan_projected_range(
+                db,
+                schema,
+                storage_id,
+                txn,
+                columns,
+                lo,
+                hi,
+                outside_latch,
+                &mut visit,
+            )
+        })
+    } else if let Some(ranges) = candidate_ranges {
+        for &(lo, hi) in ranges {
+            scan_projected_range(
+                db,
+                schema,
+                schema.id,
+                txn,
+                columns,
+                lo,
+                hi,
+                outside_latch,
+                &mut visit,
+            )?;
+        }
+        Ok(())
+    } else if outside_latch {
+        let pages = db.heap_page_count_for_storage(schema.id)?;
+        scan_projected_range(db, schema, schema.id, txn, columns, 0, pages, true, visit)
+    } else {
+        let qualified = db.storage_key_for_table(schema);
+        db.scan_rows_columns_streaming(&qualified, txn, columns, visit)
+    }
+}
+
+/// Visit projected rows outside page/heap latches when the consumer may
+/// evaluate opaque SQL. Buffer one physical page, never a whole scan. The
+/// caller's statement view is kept across pages, including historical rows.
+/// Pure predicate kernels retain the original borrowed-value fast path.
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine::executor::select) fn scan_projected_range<F>(
+    db: &Database,
+    schema: &TableSchema,
+    storage_id: u64,
+    txn: TxnView,
+    columns: &[usize],
+    page_lo: u64,
+    page_hi: u64,
+    outside_latch: bool,
+    mut visit: F,
+) -> Result<(), QueryError>
+where
+    F: FnMut(&[Value]) -> Result<(), QueryError>,
+{
+    if !outside_latch {
+        return db.scan_rows_columns_storage_streaming_range(
+            schema, storage_id, txn, columns, page_lo, page_hi, visit,
+        );
+    }
+    let mut rows = Vec::new();
+    for page in page_lo..page_hi {
+        crate::engine::cancel::check_cancelled()?;
+        db.scan_rows_columns_storage_streaming_range(
+            schema,
+            storage_id,
+            txn,
+            columns,
+            page,
+            page + 1,
+            |values| {
+                rows.push(values.to_vec());
+                Ok(())
+            },
+        )?;
+        for row in rows.drain(..) {
+            visit(&row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Streaming scan that only decodes columns in `projection` (relative to
+/// `table.schema.columns`). Built on top of `scan_rows_columns_streaming`,
+/// which feeds rows page-by-page without ever materialising a full
+/// `StoredRow` Vec — important for the wide TPC-H tables where 90% of the
+/// columns are never read by the query.
+pub(super) fn scan_plan_table_projected(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    runtime_filters: &[RuntimeFilter],
+    projection: &[usize],
+    use_zone_map: bool,
+) -> Result<Vec<PlanRow>, QueryError> {
+    crate::engine::cancel::check_cancelled()?;
+    let bloom_specs: Vec<Option<CompiledRuntimeFilterProbe>> = runtime_filters
+        .iter()
+        .map(|rf| compile_runtime_filter_probe_projected(rf, &table.schema, projection))
+        .collect();
+    let all_fast = !runtime_filters.is_empty() && bloom_specs.iter().all(|x| x.is_some());
+    // Pre-intern each projection slot's ColMeta to an `&'static ColMeta`
+    // once, then build each emitted `PlanRow.fields` in a single
+    // (meta, value) zip. The earlier two-step template-clone pattern
+    // copied `PlanField` rows full of `Value::Null` placeholders before
+    // overwriting their `.value` slots — pure waste on the hot path.
+    let metas: Vec<_> = projection
+        .iter()
+        .map(|&i| {
+            intern_col_meta(ColMeta {
+                invisible: table.schema.columns[i].invisible,
+                table: table.schema.name.clone(),
+                alias: table.alias.clone(),
+                column: table.schema.columns[i].name.clone(),
+                column_type: table.schema.result_type(i),
+                source: Default::default(),
+            })
+        })
+        .collect();
+    let mut out: Vec<PlanRow> = Vec::new();
+    let mut eval_ctx = EvalQueryContext::default();
+    // If the row filter contains a subquery, evaluating it inside
+    // `scan_rows_columns_streaming` deadlocks: the streaming scan holds
+    // the heap's RwLock write lock for the duration of the visit
+    // callback, and any subquery body that scans the same heap would
+    // re-enter `with_heap_mut` on the same thread and block forever
+    // waiting for its own write lock.
+    // Defer subquery-bearing filters to a post-scan pass.
+    let filter_has_subquery = filter
+        .as_ref()
+        .is_some_and(crate::engine::executor::select::simple::expr_has_subquery);
+    let projected_schema = projected_schema_view(&table.schema, projection);
+    let compiled_filter = if filter_has_subquery {
+        None
+    } else {
+        filter
+            .as_ref()
+            .and_then(|expr| compile_scan_predicate(expr, &projected_schema))
+    };
+    let outside_latch = (!filter_has_subquery
+        && filter.is_some()
+        && !compiled_filter
+            .as_ref()
+            .is_some_and(CompiledScanPredicate::page_latch_safe))
+        || (!runtime_filters.is_empty() && !all_fast);
+    run_plan_scan_with_partition_pruning(table, filter, || {
+        let visit = |values: &[Value]| {
+            crate::engine::cancel::check_cancelled()?;
+            if all_fast && !runtime_filters_admit_values_indexed(&bloom_specs, values) {
+                HASH_JOIN_BLOOM_PROBE_FILTERED.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            if let Some(predicate) = compiled_filter.as_ref() {
+                if !predicate.eval(values)? {
+                    return Ok(());
+                }
+            }
+            let fields: Vec<PlanField> = metas
+                .iter()
+                .zip(values.iter())
+                .map(|(meta, value)| PlanField {
+                    meta: meta.clone(),
+                    value: value.clone(),
+                })
+                .collect();
+            let row = PlanRow {
+                fields,
+                group: None,
+                agg_values: None,
+                schema: PlanRow::empty_schema(),
+            };
+            if !all_fast && !runtime_filters_admit(runtime_filters, &row)? {
+                HASH_JOIN_BLOOM_PROBE_FILTERED.fetch_add(1, Ordering::Relaxed);
+                return Ok(());
+            }
+            if filter_has_subquery {
+                // Stage the row for a post-scan pass — see comment above.
+                out.push(row);
+                return Ok(());
+            }
+            let keep = match (filter, compiled_filter.as_ref()) {
+                (Some(expr), None) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
+                _ => true,
+            };
+            if keep {
+                out.push(row);
+            }
+            Ok(())
+        };
+        let zone_map_filter = filter.as_ref().filter(|_| use_zone_map);
+        let candidate_ranges = if table.schema.is_partitioned() {
+            None
+        } else {
+            zone_map_filter
+                .and_then(|expr| db.zone_map_candidate_ranges_for_plan(&table.schema, expr))
+        };
+        scan_projected_table(
+            db,
+            &table.schema,
+            txn,
+            projection,
+            zone_map_filter,
+            candidate_ranges.as_deref(),
+            outside_latch,
+            visit,
+        )
+    })?;
+    if filter_has_subquery {
+        if let Some(expr) = filter {
+            let mut filtered = Vec::with_capacity(out.len());
+            for row in out {
+                if eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)? {
+                    filtered.push(row);
+                }
+            }
+            out = filtered;
+        }
+    }
+    Ok(out)
+}
+
+/// `try_precompute_bloom_columns` flavour for a projected scan: the
+/// runtime values vector contains only the projected columns in the
+/// caller's order, so we resolve each bloom-key column to its position
+/// inside that projected vector (not its schema-wide index).
+pub(in crate::engine::executor::select) fn compile_runtime_filter_probe_projected(
+    rf: &RuntimeFilter,
+    schema: &crate::storage::schema::TableSchema,
+    projection: &[usize],
+) -> Option<CompiledRuntimeFilterProbe> {
+    compile_runtime_filter_probe(rf, schema, Some(projection))
+}
+
+#[derive(Clone)]
+pub(in crate::engine::executor::select) struct CompiledRuntimeFilterProbe {
+    pub(super) membership: CompiledRuntimeFilterMembership,
+    pub(super) key: CompiledRuntimeFilterKey,
+}
+
+#[derive(Clone)]
+pub(super) enum CompiledRuntimeFilterMembership {
+    Bloom {
+        filter: Arc<crate::engine::executor::select::bloom::BloomFilter>,
+        rejected: Option<Arc<std::sync::atomic::AtomicU64>>,
+    },
+    ExactInt {
+        filter: Arc<crate::engine::executor::select::bloom::ExactIntKeySet>,
+        rejected: Arc<std::sync::OnceLock<Arc<std::sync::atomic::AtomicU64>>>,
+    },
+    KeySet {
+        filter: Arc<crate::engine::executor::select::bloom::BloomFilter>,
+    },
+}
+
+#[derive(Clone)]
+pub(super) enum CompiledRuntimeFilterKey {
+    Fixed1 {
+        index: usize,
+        null_safe: bool,
+    },
+    Fixed2 {
+        indices: [usize; 2],
+        null_safe: [bool; 2],
+    },
+    Fixed3 {
+        indices: [usize; 3],
+        null_safe: [bool; 3],
+    },
+    Generic {
+        indices: Vec<usize>,
+        null_safe: Vec<bool>,
+    },
+}
+
+pub(super) fn runtime_filter_fixed_width_type(data_type: &DataTypeKind) -> bool {
+    matches!(
+        data_type,
+        DataTypeKind::TinyInt
+            | DataTypeKind::SmallInt
+            | DataTypeKind::MediumInt
+            | DataTypeKind::Int
+            | DataTypeKind::BigInt
+            | DataTypeKind::Bool
+            | DataTypeKind::Date
+            | DataTypeKind::DateTime { .. }
+            | DataTypeKind::Timestamp { .. }
+    )
+}
+
+pub(super) fn compile_runtime_filter_probe(
+    rf: &RuntimeFilter,
+    schema: &crate::storage::schema::TableSchema,
+    projection: Option<&[usize]>,
+) -> Option<CompiledRuntimeFilterProbe> {
+    let (keys, null_safe, membership) = match rf {
+        RuntimeFilter::BloomKey {
+            keys,
+            null_safe,
+            filter,
+            rejected,
+        } => (
+            keys,
+            null_safe,
+            CompiledRuntimeFilterMembership::Bloom {
+                filter: filter.clone(),
+                rejected: rejected.clone(),
+            },
+        ),
+        RuntimeFilter::ExactIntKey {
+            keys,
+            null_safe,
+            filter,
+            rejected,
+        } => (
+            keys,
+            null_safe,
+            CompiledRuntimeFilterMembership::ExactInt {
+                filter: filter.clone(),
+                rejected: rejected.clone(),
+            },
+        ),
+        RuntimeFilter::KeySet {
+            keys,
+            null_safe,
+            filter,
+            ..
+        } => (
+            keys,
+            null_safe,
+            CompiledRuntimeFilterMembership::KeySet {
+                filter: filter.clone(),
+            },
+        ),
+    };
+    let mut indices = Vec::with_capacity(keys.len());
+    let mut fixed_width = keys.len() <= 3;
+    for expr in keys {
+        let col_name: &str = match expr {
+            Expr::Identifier(n) => n.as_str(),
+            Expr::CompoundIdentifier(parts) => parts.last()?.as_str(),
+            _ => return None,
+        };
+        let schema_idx = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(col_name))?;
+        fixed_width &= runtime_filter_fixed_width_type(&schema.columns[schema_idx].data_type);
+        let value_idx = match projection {
+            Some(projection) => projection.iter().position(|&p| p == schema_idx)?,
+            None => schema_idx,
+        };
+        indices.push(value_idx);
+    }
+    let safe_at = |idx: usize| null_safe.get(idx).copied().unwrap_or(false);
+    let key = if fixed_width {
+        match indices.as_slice() {
+            [index] => CompiledRuntimeFilterKey::Fixed1 {
+                index: *index,
+                null_safe: safe_at(0),
+            },
+            [first, second] => CompiledRuntimeFilterKey::Fixed2 {
+                indices: [*first, *second],
+                null_safe: [safe_at(0), safe_at(1)],
+            },
+            [first, second, third] => CompiledRuntimeFilterKey::Fixed3 {
+                indices: [*first, *second, *third],
+                null_safe: [safe_at(0), safe_at(1), safe_at(2)],
+            },
+            _ => CompiledRuntimeFilterKey::Generic {
+                indices,
+                null_safe: null_safe.clone(),
+            },
+        }
+    } else {
+        CompiledRuntimeFilterKey::Generic {
+            indices,
+            null_safe: null_safe.clone(),
+        }
+    };
+    Some(CompiledRuntimeFilterProbe { membership, key })
+}
+
+/// Schema positions of a runtime filter's keys in `table`, or `None` when any
+/// key belongs to another relation. Keys are qualified by the probe side's
+/// alias/table, so a filter on `a.id` must never be installed on a sibling
+/// relation that merely has a column of the same name.
+pub(crate) fn runtime_filter_schema_indices(
+    rf: &RuntimeFilter,
+    table: &PlanTable,
+) -> Option<Vec<usize>> {
+    let keys = match rf {
+        RuntimeFilter::BloomKey { keys, .. }
+        | RuntimeFilter::ExactIntKey { keys, .. }
+        | RuntimeFilter::KeySet { keys, .. } => keys,
+    };
+    keys.iter()
+        .map(|expr| {
+            let column = super::hash_join::runtime_filter_simple_column_for_table(expr, table)?;
+            table
+                .schema
+                .columns
+                .iter()
+                .position(|candidate| candidate.name.eq_ignore_ascii_case(column))
+        })
+        .collect()
+}
+
+pub(in crate::engine::executor::select) fn runtime_filters_admit_values_indexed(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    values: &[Value],
+) -> bool {
+    runtime_filters_admit_values_indexed_impl(precomputed, values, None)
+}
+
+pub(super) fn runtime_filters_admit_values_indexed_impl(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    values: &[Value],
+    mut rejected: Option<&mut [u64]>,
+) -> bool {
+    for (filter_index, compiled) in precomputed.iter().enumerate() {
+        let Some(compiled) = compiled else {
+            return true;
+        };
+        let contains = match &compiled.key {
+            CompiledRuntimeFilterKey::Fixed1 { index, null_safe } => {
+                let value = values.get(*index).unwrap_or(&Value::Null);
+                if matches!(value, Value::Null) && !*null_safe {
+                    false
+                } else {
+                    let key = [ValueKey::from(value)];
+                    compiled.contains(&key[..])
+                }
+            }
+            CompiledRuntimeFilterKey::Fixed2 { indices, null_safe } => {
+                let first = values.get(indices[0]).unwrap_or(&Value::Null);
+                let second = values.get(indices[1]).unwrap_or(&Value::Null);
+                if (matches!(first, Value::Null) && !null_safe[0])
+                    || (matches!(second, Value::Null) && !null_safe[1])
+                {
+                    false
+                } else {
+                    let key = [ValueKey::from(first), ValueKey::from(second)];
+                    compiled.contains(&key[..])
+                }
+            }
+            CompiledRuntimeFilterKey::Fixed3 { indices, null_safe } => {
+                let first = values.get(indices[0]).unwrap_or(&Value::Null);
+                let second = values.get(indices[1]).unwrap_or(&Value::Null);
+                let third = values.get(indices[2]).unwrap_or(&Value::Null);
+                if (matches!(first, Value::Null) && !null_safe[0])
+                    || (matches!(second, Value::Null) && !null_safe[1])
+                    || (matches!(third, Value::Null) && !null_safe[2])
+                {
+                    false
+                } else {
+                    let key = [
+                        ValueKey::from(first),
+                        ValueKey::from(second),
+                        ValueKey::from(third),
+                    ];
+                    compiled.contains(&key[..])
+                }
+            }
+            CompiledRuntimeFilterKey::Generic { indices, null_safe } => {
+                let mut key = HashJoinKey::with_capacity(indices.len());
+                let mut has_unsafe_null = false;
+                for (position, &index) in indices.iter().enumerate() {
+                    let value = values.get(index).unwrap_or(&Value::Null);
+                    if matches!(value, Value::Null)
+                        && !null_safe.get(position).copied().unwrap_or(false)
+                    {
+                        has_unsafe_null = true;
+                        break;
+                    }
+                    key.push(ValueKey::from(value));
+                }
+                if has_unsafe_null {
+                    false
+                } else {
+                    compiled.contains(key.as_slice())
+                }
+            }
+        };
+        if !contains {
+            if let Some(counts) = rejected.as_deref_mut() {
+                counts[filter_index] = counts[filter_index].saturating_add(1);
+            } else {
+                compiled.record_rejected();
+            }
+            return false;
+        }
+    }
+    true
+}
+
+/// Runtime-filter probe used by predicate-first storage scans. Rejections are
+/// accumulated in morsel-local counters and published when the morsel closes,
+/// avoiding a shared atomic read-modify-write for every discarded fact row.
+pub(in crate::engine::executor::select) fn runtime_filters_admit_values_indexed_deferred(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    values: &[Value],
+    rejected: &mut [u64],
+) -> bool {
+    debug_assert_eq!(precomputed.len(), rejected.len());
+    runtime_filters_admit_values_indexed_impl(precomputed, values, Some(rejected))
+}
+
+/// Allocation-free runtime-filter probe for values decoded directly into the
+/// predicate scratch lanes. Fixed-width scan keys never construct an
+/// intermediate `Value`; generic/variable-width keys retain the same
+/// canonical `ValueKey` semantics as the ordinary evaluator.
+pub(super) fn runtime_filters_admit_predicate_values_indexed_impl(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    values: &[crate::engine::executor::vec::scan_bridge::PredicateValue],
+    mut rejected: Option<&mut [u64]>,
+) -> bool {
+    use crate::engine::executor::vec::scan_bridge::PredicateValue;
+
+    // Fact-table scans overwhelmingly carry one runtime filter over one
+    // integer join key. Keep that shape out of the generic slice loop and
+    // nested key/membership dispatch: Q11-class scans execute this branch for
+    // every input row, including the millions rejected before payload decode.
+    // No allocation or additional resident state is introduced.
+    if let [Some(compiled)] = precomputed {
+        if let CompiledRuntimeFilterKey::Fixed1 { index, null_safe } = &compiled.key {
+            let null = PredicateValue::Null;
+            let value = values.get(*index).unwrap_or(&null);
+            let contains = if matches!(value, PredicateValue::Null) && !*null_safe {
+                false
+            } else if let Some(key) = predicate_value_exact_int_key(value) {
+                match &compiled.membership {
+                    CompiledRuntimeFilterMembership::ExactInt { filter, .. } => {
+                        filter.contains(key)
+                    }
+                    CompiledRuntimeFilterMembership::Bloom { filter, .. }
+                        if filter.uses_int_keys() =>
+                    {
+                        filter.contains_int(key)
+                    }
+                    _ => compiled.contains(&[ValueKey::Int(key)]),
+                }
+            } else {
+                compiled.contains(&[value.to_value_key()])
+            };
+            if !contains {
+                if let Some(counts) = rejected.as_deref_mut() {
+                    if let Some(count) = counts.first_mut() {
+                        *count = count.saturating_add(1);
+                    }
+                } else {
+                    compiled.record_rejected();
+                }
+            }
+            return contains;
+        }
+    }
+
+    for (filter_index, compiled) in precomputed.iter().enumerate() {
+        let Some(compiled) = compiled else {
+            return true;
+        };
+        let is_null = |value: &PredicateValue| matches!(value, PredicateValue::Null);
+        let null = PredicateValue::Null;
+        let contains = match &compiled.key {
+            CompiledRuntimeFilterKey::Fixed1 { index, null_safe } => {
+                let value = values.get(*index).unwrap_or(&null);
+                if is_null(value) && !*null_safe {
+                    false
+                } else if let (
+                    CompiledRuntimeFilterMembership::ExactInt { filter, .. },
+                    Some(key),
+                ) = (&compiled.membership, predicate_value_exact_int_key(value))
+                {
+                    // The overwhelmingly common fact-table runtime filter is
+                    // one native integer key. Probe the exact bitmap/sorted
+                    // set directly instead of constructing ValueKey, hashing
+                    // its enum discriminant and re-matching it in `contains`.
+                    filter.contains(key)
+                } else if let (CompiledRuntimeFilterMembership::Bloom { filter, .. }, Some(key)) =
+                    (&compiled.membership, predicate_value_exact_int_key(value))
+                {
+                    if filter.uses_int_keys() {
+                        filter.contains_int(key)
+                    } else {
+                        // Keep the canonical ValueKey hash representation,
+                        // but construct it directly from the already-decoded
+                        // integer lane.
+                        let key = [ValueKey::Int(key)];
+                        filter.contains(&key[..])
+                    }
+                } else {
+                    compiled.contains(&[value.to_value_key()])
+                }
+            }
+            CompiledRuntimeFilterKey::Fixed2 { indices, null_safe } => {
+                let first = values.get(indices[0]).unwrap_or(&null);
+                let second = values.get(indices[1]).unwrap_or(&null);
+                if (is_null(first) && !null_safe[0]) || (is_null(second) && !null_safe[1]) {
+                    false
+                } else if let (
+                    CompiledRuntimeFilterMembership::Bloom { filter, .. },
+                    Some(first_key),
+                    Some(second_key),
+                ) = (
+                    &compiled.membership,
+                    predicate_value_exact_int_key(first),
+                    predicate_value_exact_int_key(second),
+                ) {
+                    if filter.uses_int_pair_keys() {
+                        filter.contains_int_pair(first_key, second_key)
+                    } else {
+                        compiled.contains(&[ValueKey::Int(first_key), ValueKey::Int(second_key)])
+                    }
+                } else {
+                    compiled.contains(&[first.to_value_key(), second.to_value_key()])
+                }
+            }
+            CompiledRuntimeFilterKey::Fixed3 { indices, null_safe } => {
+                let first = values.get(indices[0]).unwrap_or(&null);
+                let second = values.get(indices[1]).unwrap_or(&null);
+                let third = values.get(indices[2]).unwrap_or(&null);
+                if (is_null(first) && !null_safe[0])
+                    || (is_null(second) && !null_safe[1])
+                    || (is_null(third) && !null_safe[2])
+                {
+                    false
+                } else {
+                    compiled.contains(&[
+                        first.to_value_key(),
+                        second.to_value_key(),
+                        third.to_value_key(),
+                    ])
+                }
+            }
+            CompiledRuntimeFilterKey::Generic { indices, null_safe } => {
+                let mut key = HashJoinKey::with_capacity(indices.len());
+                let mut has_unsafe_null = false;
+                for (position, &index) in indices.iter().enumerate() {
+                    let value = values.get(index).unwrap_or(&null);
+                    if is_null(value) && !null_safe.get(position).copied().unwrap_or(false) {
+                        has_unsafe_null = true;
+                        break;
+                    }
+                    key.push(value.to_value_key());
+                }
+                if has_unsafe_null {
+                    false
+                } else {
+                    compiled.contains(key.as_slice())
+                }
+            }
+        };
+        if !contains {
+            if let Some(counts) = rejected.as_deref_mut() {
+                counts[filter_index] = counts[filter_index].saturating_add(1);
+            } else {
+                compiled.record_rejected();
+            }
+            return false;
+        }
+    }
+    true
+}
+
+#[inline]
+pub(super) fn predicate_value_exact_int_key(
+    value: &crate::engine::executor::vec::scan_bridge::PredicateValue,
+) -> Option<i128> {
+    use crate::engine::executor::vec::scan_bridge::PredicateValue;
+    match value {
+        PredicateValue::I64(value) => Some(i128::from(*value)),
+        PredicateValue::U64(value) => Some(i128::from(*value)),
+        PredicateValue::Date(value) => Some(i128::from(*value)),
+        PredicateValue::Year(value) => Some(if *value == 0 {
+            0
+        } else {
+            1900 + i128::from(*value)
+        }),
+        PredicateValue::Time(value)
+        | PredicateValue::DateTime(value)
+        | PredicateValue::Timestamp(value) => Some(i128::from(*value)),
+        PredicateValue::Null
+        | PredicateValue::F64(_)
+        | PredicateValue::Decimal(_, _)
+        | PredicateValue::Value(_) => None,
+    }
+}
+
+pub(in crate::engine::executor::select) fn runtime_filters_admit_predicate_values_indexed_deferred(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    values: &[crate::engine::executor::vec::scan_bridge::PredicateValue],
+    rejected: &mut [u64],
+) -> bool {
+    debug_assert_eq!(precomputed.len(), rejected.len());
+    runtime_filters_admit_predicate_values_indexed_impl(precomputed, values, Some(rejected))
+}
+
+pub(in crate::engine::executor::select) fn flush_runtime_filter_rejections(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    rejected: &mut [u64],
+) {
+    debug_assert_eq!(precomputed.len(), rejected.len());
+    for (compiled, count) in precomputed.iter().zip(rejected) {
+        let count = std::mem::take(count);
+        if count != 0 {
+            if let Some(compiled) = compiled {
+                compiled.record_rejected_n(count);
+            }
+        }
+    }
+}
+
+impl CompiledRuntimeFilterProbe {
+    #[inline]
+    pub(super) fn contains(&self, key: &[ValueKey]) -> bool {
+        match &self.membership {
+            CompiledRuntimeFilterMembership::Bloom { filter, .. } => {
+                filter.contains_value_keys(key)
+            }
+            CompiledRuntimeFilterMembership::ExactInt { filter, .. } => match key {
+                [ValueKey::Int(value)] => filter.contains(*value),
+                // A schema/value mismatch cannot make a runtime filter reject
+                // a row: the parent join remains the correctness check.
+                _ => true,
+            },
+            CompiledRuntimeFilterMembership::KeySet { filter } => filter.contains(key),
+        }
+    }
+
+    #[inline]
+    pub(super) fn record_rejected(&self) {
+        self.record_rejected_n(1);
+    }
+
+    #[inline]
+    pub(super) fn record_rejected_n(&self, count: u64) {
+        match &self.membership {
+            CompiledRuntimeFilterMembership::Bloom { rejected, .. } => {
+                record_hash_join_bloom_filtered_n(count);
+                if let Some(rejected) = rejected {
+                    rejected.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            CompiledRuntimeFilterMembership::ExactInt { rejected, .. } => {
+                record_hash_join_bloom_filtered_n(count);
+                if let Some(rejected) = rejected.get() {
+                    rejected.fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            CompiledRuntimeFilterMembership::KeySet { .. } => {
+                INLJ_RUNTIME_KEYSET_CANDIDATE_REJECTED
+                    .fetch_add(count, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+    }
+}
+
+/// If a runtime bloom filter's keys are all simple column references that
+/// resolve to schema columns, return the column indices so the scan can
+/// probe the bloom against `StoredRow.values` directly. Returns `None`
+/// for any expression we can't resolve to a single column (e.g. arithmetic
+/// or function calls in the join key) so the caller falls back to the
+/// PlanRow-based path.
+pub(super) fn compile_runtime_filter_probe_full(
+    rf: &RuntimeFilter,
+    schema: &crate::storage::schema::TableSchema,
+) -> Option<CompiledRuntimeFilterProbe> {
+    compile_runtime_filter_probe(rf, schema, None)
+}
+
+pub(super) fn runtime_filters_admit_values(
+    precomputed: &[Option<CompiledRuntimeFilterProbe>],
+    values: &[Value],
+) -> bool {
+    runtime_filters_admit_values_indexed(precomputed, values)
+}
+
+pub(in crate::engine::executor::select) fn runtime_filters_admit(
+    runtime_filters: &[RuntimeFilter],
+    row: &PlanRow,
+) -> Result<bool, QueryError> {
+    for rf in runtime_filters {
+        match rf {
+            RuntimeFilter::BloomKey {
+                keys,
+                null_safe,
+                filter,
+                rejected,
+            } => {
+                let mut value_keys = HashJoinKey::with_capacity(keys.len());
+                let mut has_unsafe_null = false;
+                for (idx, expr) in keys.iter().enumerate() {
+                    let value = eval_plan_expr(expr, row)?;
+                    let is_null = matches!(value, Value::Null);
+                    let safe = null_safe.get(idx).copied().unwrap_or(false);
+                    if is_null && !safe {
+                        has_unsafe_null = true;
+                        break;
+                    }
+                    value_keys.push(ValueKey::from(&value));
+                }
+                if has_unsafe_null {
+                    record_hash_join_bloom_filtered();
+                    if let Some(rejected) = rejected {
+                        rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(false);
+                }
+                if !filter.contains_value_keys(value_keys.as_slice()) {
+                    // Phase E: scan-level bloom rejection bumps the
+                    // same counter as the probe-time bloom so existing
+                    // observability (`SHOW STATUS Hash_join_bloom_*`)
+                    // accounts for both paths.
+                    record_hash_join_bloom_filtered();
+                    if let Some(rejected) = rejected {
+                        rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(false);
+                }
+            }
+            RuntimeFilter::ExactIntKey {
+                keys,
+                null_safe,
+                filter,
+                rejected,
+            } => {
+                let Some(expr) = keys.first() else {
+                    continue;
+                };
+                let value = eval_plan_expr(expr, row)?;
+                if matches!(value, Value::Null) && !null_safe.first().copied().unwrap_or(false) {
+                    record_hash_join_bloom_filtered();
+                    if let Some(rejected) = rejected.get() {
+                        rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(false);
+                }
+                let ValueKey::Int(value) = ValueKey::from(&value) else {
+                    continue;
+                };
+                if !filter.contains(value) {
+                    record_hash_join_bloom_filtered();
+                    if let Some(rejected) = rejected.get() {
+                        rejected.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    return Ok(false);
+                }
+            }
+            RuntimeFilter::KeySet { .. } => {}
+        }
+    }
+    Ok(true)
+}
+
+pub(in crate::engine::executor::select) fn read_plan_table_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    ids: Vec<RowId>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    if table.schema.is_partitioned() {
+        // A RowId is local to one partition and therefore cannot be resolved
+        // by probing every heap for the first matching numeric id. The
+        // dispatcher above fans every partitioned B-tree operator out under
+        // a single-storage-id prune context; preserve that storage identity
+        // through the heap read and use the normal batched materializer.
+        let storage_ids = table.in_scope_storage_ids();
+        let [storage_id] = storage_ids.as_slice() else {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "partition index RowId reached heap read without a unique storage_id",
+            ));
+        };
+        let heap = db.cached_heap_handle(*storage_id)?;
+        return read_plan_table_ids_with_heap(db, txn, table, &heap, ids, filter, None, projection);
+    }
+    let heap = db.cached_heap_handle(table.schema.id)?;
+    read_plan_table_ids_with_heap(db, txn, table, &heap, ids, filter, None, projection)
+}
+
+/// Index condition pushdown (ICP): the subset of a non-covering range
+/// scan's residual filter that can be pre-evaluated on the index entry
+/// itself, before paying the heap lookup. Pushed conjuncts are
+/// evaluated on a row projected from the index key by the same
+/// `IndexEntryProjector` covering scans trust; the full original
+/// filter is still re-checked on the fetched heap row, so ICP is a
+/// pure pre-filter — an MVCC-stale index entry that passes it can
+/// never leak a wrong row into the result.
+pub(in crate::engine::executor::select) struct IndexConditionPushdown {
+    pub(super) projector: IndexEntryProjector,
+    pub(super) condition: Expr,
+}
+
+pub(super) fn icp_enabled() -> bool {
+    use std::sync::OnceLock;
+    static FLAG: OnceLock<bool> = OnceLock::new();
+    *FLAG.get_or_init(|| {
+        crate::util::env::var("MYDB_ICP_DISABLE")
+            .map(|v| !matches!(v.as_str(), "1" | "true" | "TRUE" | "on" | "ON"))
+            .unwrap_or(true)
+    })
+}
+
+/// Conservative whitelist walk: returns false for any expression shape
+/// whose index-domain evaluation is not known to match heap-domain
+/// evaluation (subqueries, functions, CASE, LIKE, user variables, ...).
+/// Column references are collected into `out`.
+pub(super) fn icp_collect_columns(expr: &Expr, out: &mut Vec<String>) -> bool {
+    match expr {
+        Expr::Identifier(name) => {
+            out.push(name.to_ascii_lowercase());
+            true
+        }
+        Expr::CompoundIdentifier(parts) => {
+            if let Some(name) = parts.last() {
+                out.push(name.to_ascii_lowercase());
+            }
+            true
+        }
+        Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_) => true,
+        Expr::Unary { expr, .. } => icp_collect_columns(expr, out),
+        Expr::Binary { left, op, right } => {
+            matches!(
+                op,
+                BinaryOp::Or
+                    | BinaryOp::And
+                    | BinaryOp::Xor
+                    | BinaryOp::Eq
+                    | BinaryOp::NullSafeEq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+                    | BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+            ) && icp_collect_columns(left, out)
+                && icp_collect_columns(right, out)
+        }
+        Expr::IsNull(inner) | Expr::IsNotNull(inner) => icp_collect_columns(inner, out),
+        Expr::Between {
+            expr, low, high, ..
+        } => {
+            icp_collect_columns(expr, out)
+                && icp_collect_columns(low, out)
+                && icp_collect_columns(high, out)
+        }
+        Expr::InList { expr, list, .. } => {
+            icp_collect_columns(expr, out) && list.iter().all(|item| icp_collect_columns(item, out))
+        }
+        _ => false,
+    }
+}
+
+pub(in crate::engine::executor::select) enum CteRowPredicate {
+    And(Box<CteRowPredicate>, Box<CteRowPredicate>),
+    Or(Box<CteRowPredicate>, Box<CteRowPredicate>),
+    Cmp {
+        col: usize,
+        op: BinaryOp,
+        value: Value,
+        flipped: bool,
+        provenance: crate::engine::expr::ComparisonProvenance,
+    },
+    InList {
+        col: usize,
+        values: Vec<Value>,
+        provenance: Vec<crate::engine::expr::ComparisonProvenance>,
+        negated: bool,
+    },
+    Between {
+        col: usize,
+        low: Value,
+        high: Value,
+        provenance: [crate::engine::expr::ComparisonProvenance; 2],
+        negated: bool,
+    },
+    /// Evaluate the inner column predicate under the column's collation:
+    /// a materialized `utf8mb4_bin` column keeps binary comparison against
+    /// a coercible literal, exactly as on the base table.
+    Collated(u16, Box<CteRowPredicate>),
+    Const(bool),
+}
+
+/// Bind a single-column leaf predicate to that column's string collation.
+fn collated_cte_leaf(
+    columns: &[crate::types::Column],
+    col: usize,
+    predicate: CteRowPredicate,
+) -> CteRowPredicate {
+    match columns[col].source.collation_id {
+        Some(id) if id != crate::charset::BINARY_COLLATION_ID => {
+            CteRowPredicate::Collated(id, Box::new(predicate))
+        }
+        _ => predicate,
+    }
+}
+
+pub(in crate::engine::executor::select) fn compile_cte_row_predicate(
+    expr: &Expr,
+    columns: &[crate::types::Column],
+) -> Option<CteRowPredicate> {
+    match expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::And,
+            right,
+        } => Some(CteRowPredicate::And(
+            Box::new(compile_cte_row_predicate(left, columns)?),
+            Box::new(compile_cte_row_predicate(right, columns)?),
+        )),
+        Expr::Binary {
+            left,
+            op: BinaryOp::Or,
+            right,
+        } => Some(CteRowPredicate::Or(
+            Box::new(compile_cte_row_predicate(left, columns)?),
+            Box::new(compile_cte_row_predicate(right, columns)?),
+        )),
+        Expr::Binary { left, op, right }
+            if matches!(
+                op,
+                BinaryOp::Eq
+                    | BinaryOp::NullSafeEq
+                    | BinaryOp::NotEq
+                    | BinaryOp::Lt
+                    | BinaryOp::LtEq
+                    | BinaryOp::Gt
+                    | BinaryOp::GtEq
+            ) =>
+        {
+            if let Some(col) = cte_column_index(left, columns) {
+                if let Some(value) = crate::engine::expr::expr_literal_value(right) {
+                    let cmp = CteRowPredicate::Cmp {
+                        col,
+                        op: *op,
+                        value,
+                        flipped: false,
+                        provenance: crate::engine::expr::ComparisonProvenance::from_exprs(
+                            left, right,
+                        )
+                        .with_temporal_constant_context(left, right),
+                    };
+                    return Some(collated_cte_leaf(columns, col, cmp));
+                }
+            }
+            if let Some(col) = cte_column_index(right, columns) {
+                if let Some(value) = crate::engine::expr::expr_literal_value(left) {
+                    let cmp = CteRowPredicate::Cmp {
+                        col,
+                        op: *op,
+                        value,
+                        flipped: true,
+                        provenance: crate::engine::expr::ComparisonProvenance::from_exprs(
+                            right, left,
+                        )
+                        .with_temporal_constant_context(right, left),
+                    };
+                    return Some(collated_cte_leaf(columns, col, cmp));
+                }
+            }
+            None
+        }
+        Expr::InList {
+            expr,
+            list,
+            negated,
+        } => {
+            let col = cte_column_index(expr, columns)?;
+            let mut values = Vec::with_capacity(list.len());
+            for item in list {
+                values.push(crate::engine::expr::expr_literal_value(item)?);
+            }
+            let in_list = CteRowPredicate::InList {
+                col,
+                values,
+                provenance: list
+                    .iter()
+                    .map(|item| {
+                        crate::engine::expr::ComparisonProvenance::from_exprs(expr, item)
+                            .with_temporal_constant_context(expr, item)
+                    })
+                    .collect(),
+                negated: *negated,
+            };
+            Some(collated_cte_leaf(columns, col, in_list))
+        }
+        Expr::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => {
+            let col = cte_column_index(expr, columns)?;
+            let between = CteRowPredicate::Between {
+                col,
+                low: crate::engine::expr::expr_literal_value(low)?,
+                high: crate::engine::expr::expr_literal_value(high)?,
+                provenance: [
+                    crate::engine::expr::ComparisonProvenance::from_exprs(expr, low)
+                        .with_temporal_constant_context(expr, low),
+                    crate::engine::expr::ComparisonProvenance::from_exprs(expr, high)
+                        .with_temporal_constant_context(expr, high),
+                ],
+                negated: *negated,
+            };
+            Some(collated_cte_leaf(columns, col, between))
+        }
+        Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_) => {
+            let value = crate::engine::expr::expr_literal_value(expr)?;
+            Some(CteRowPredicate::Const(crate::engine::expr::truthy(&value)))
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn cte_column_index(expr: &Expr, columns: &[crate::types::Column]) -> Option<usize> {
+    let name = match expr {
+        Expr::Identifier(name) => name,
+        Expr::CompoundIdentifier(parts) => parts.last()?,
+        _ => return None,
+    };
+    columns
+        .iter()
+        .position(|col| col.name.eq_ignore_ascii_case(name))
+}
+
+pub(in crate::engine::executor::select) fn eval_cte_row_predicate(
+    predicate: &CteRowPredicate,
+    row: &[Value],
+) -> Result<bool, QueryError> {
+    match predicate {
+        CteRowPredicate::And(left, right) => {
+            Ok(eval_cte_row_predicate(left, row)? && eval_cte_row_predicate(right, row)?)
+        }
+        CteRowPredicate::Or(left, right) => {
+            Ok(eval_cte_row_predicate(left, row)? || eval_cte_row_predicate(right, row)?)
+        }
+        CteRowPredicate::Cmp {
+            col,
+            op,
+            value,
+            flipped,
+            provenance,
+        } => {
+            let left = row.get(*col).unwrap_or(&Value::Null);
+            crate::engine::expr::with_numeric_comparison_context_from_provenance(
+                *provenance,
+                left,
+                value,
+                || eval_cte_row_cmp(left, *op, value, *flipped),
+            )
+        }
+        CteRowPredicate::InList {
+            col,
+            values,
+            provenance,
+            negated,
+        } => {
+            let value = row.get(*col).unwrap_or(&Value::Null);
+            let mut found = false;
+            let mut has_null = false;
+            if !matches!(value, Value::Null) {
+                for (item, provenance) in values.iter().zip(provenance) {
+                    let comparison =
+                        crate::engine::expr::with_numeric_comparison_context_from_provenance(
+                            *provenance,
+                            value,
+                            item,
+                            || crate::engine::expr::compare_nullable_values(value, item),
+                        )?;
+                    has_null |= comparison.is_none();
+                    if comparison == Some(std::cmp::Ordering::Equal) {
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            Ok(if *negated {
+                !matches!(value, Value::Null) && !found && !has_null
+            } else {
+                found
+            })
+        }
+        CteRowPredicate::Between {
+            col,
+            low,
+            high,
+            provenance,
+            negated,
+        } => {
+            let value = row.get(*col).unwrap_or(&Value::Null);
+            crate::engine::expr::eval_between_with_provenance(
+                value,
+                low,
+                high,
+                *negated,
+                *provenance,
+            )
+            .map(|value| crate::engine::expr::truthy(&value))
+        }
+        CteRowPredicate::Collated(id, inner) => {
+            crate::engine::expr::with_compare_collation(Some(*id), || {
+                eval_cte_row_predicate(inner, row)
+            })
+        }
+        CteRowPredicate::Const(value) => Ok(*value),
+    }
+}
+
+pub(super) fn eval_cte_row_cmp(
+    left: &Value,
+    op: BinaryOp,
+    right: &Value,
+    flipped: bool,
+) -> Result<bool, QueryError> {
+    if op == BinaryOp::NullSafeEq {
+        if matches!((left, right), (Value::Null, Value::Null)) {
+            return Ok(true);
+        }
+        if matches!(left, Value::Null) || matches!(right, Value::Null) {
+            return Ok(false);
+        }
+    } else if matches!(left, Value::Null) || matches!(right, Value::Null) {
+        return Ok(false);
+    }
+    let Some(ord) = crate::engine::expr::compare_nullable_values(left, right)? else {
+        return Ok(false);
+    };
+    let ord = if flipped { ord.reverse() } else { ord };
+    Ok(match op {
+        BinaryOp::Eq | BinaryOp::NullSafeEq => ord == std::cmp::Ordering::Equal,
+        BinaryOp::NotEq => ord != std::cmp::Ordering::Equal,
+        BinaryOp::Lt => ord == std::cmp::Ordering::Less,
+        BinaryOp::LtEq => ord != std::cmp::Ordering::Greater,
+        BinaryOp::Gt => ord == std::cmp::Ordering::Greater,
+        BinaryOp::GtEq => ord != std::cmp::Ordering::Less,
+        _ => false,
+    })
+}
+
+/// Index-domain evaluation is trusted whenever the key-to-value
+/// round-trip and the eventual expression comparison both round-trip
+/// the heap-domain semantics bit-for-bit.
+///
+/// Numeric / temporal types round-trip cleanly: their KeyPart variants
+/// hold the same canonical i64/u64/days/microseconds magnitudes the
+/// `Value::*` form does, and the operator dispatch never consults
+/// collation, so the index-domain pre-filter agrees with the heap-domain
+/// re-check by construction.
+///
+/// Binary string families (`BINARY` / `VARBINARY` / `TINYBLOB` … `LONGBLOB`)
+/// store and compare as raw bytes both at the IndexKey layer (always
+/// `KeyPart::Bytes`) and at the expression layer (no collation lookup
+/// on `Value::Bytes`), so they're equally safe.
+///
+/// Character string families (`CHAR` / `VARCHAR` / `TINYTEXT` … `LONGTEXT`)
+/// are only safe under a binary collation. With a binary collation,
+/// `charset::compare_strings_for_info` short-circuits to
+/// `left.as_bytes().cmp(right.as_bytes())` (charset.rs:1018-1022) — the
+/// same byte-wise ordering the IndexKey's derived `Ord` uses. For a
+/// case-insensitive / accent-insensitive collation, ICP would have to
+/// re-derive the collation key per entry, which the projector doesn't
+/// do — so we conservatively bail out and let the heap-side re-check
+/// keep the wide-collation correctness story unchanged. The conservatism
+/// here is intentional: ICP is a pure pre-filter, so over-bailing only
+/// costs throughput, never correctness.
+pub(super) fn icp_safe_column(column: &crate::storage::ColumnSchema) -> bool {
+    use DataTypeKind::*;
+    match &column.data_type {
+        TinyInt
+        | SmallInt
+        | MediumInt
+        | Int
+        | BigInt
+        | Bool
+        | Float { .. }
+        | Double { .. }
+        | Decimal { .. }
+        | Date
+        | Time { .. }
+        | DateTime { .. }
+        | Timestamp { .. }
+        | Year => true,
+        Binary { .. } | VarBinary { .. } | Blob { .. } => true,
+        Char { .. } | VarChar { .. } | Text { .. } => column
+            .collation
+            .as_deref()
+            .and_then(|name| crate::charset::resolve_collation(name).ok())
+            .is_some_and(|info| info.binary),
+        _ => false,
+    }
+}
+
+impl IndexConditionPushdown {
+    pub(in crate::engine::executor::select) fn try_new(
+        table: &PlanTable,
+        index: &IndexSchema,
+        low: Option<&IndexBound>,
+        high: Option<&IndexBound>,
+        filter: &Option<Expr>,
+    ) -> Option<Self> {
+        if !icp_enabled() {
+            return None;
+        }
+        let filter = filter.as_ref()?;
+        if index.has_multi_valued_parts() || !index.key_expressions.is_empty() {
+            return None;
+        }
+        // Index columns usable for pushdown: full (non-prefix) columns
+        // of an ICP-safe type. `column_prefix_lengths` aligns with
+        // `columns`; INCLUDE columns are always stored whole.
+        let mut safe: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Columns already constrained by the scan bounds. The residual
+        // filter usually re-states the bound predicates (the heap-side
+        // re-check needs them), but on the *entry* domain they are true
+        // by construction — pushing a conjunct that only touches bound
+        // columns buys zero filtering and pays a projection + eval per
+        // entry. Measured on TPC-H date-range scans (Q4/Q10/Q14) that
+        // pure overhead was a 15-50% per-query regression.
+        let bound_prefix = low
+            .map(|b| b.key.0.len())
+            .max(high.map(|b| b.key.0.len()))
+            .unwrap_or(0);
+        let mut beyond_bounds: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (pos, name) in index.effective_columns().iter().enumerate() {
+            let truncated = pos < index.columns.len()
+                && index
+                    .column_prefix_lengths
+                    .get(pos)
+                    .is_some_and(|len| len.is_some());
+            if truncated {
+                continue;
+            }
+            let lowered = name.to_ascii_lowercase();
+            let Some(column) = table
+                .schema
+                .columns
+                .iter()
+                .find(|c| c.name.eq_ignore_ascii_case(name))
+            else {
+                continue;
+            };
+            if icp_safe_column(column) {
+                if pos >= bound_prefix {
+                    beyond_bounds.insert(lowered.clone());
+                }
+                safe.insert(lowered);
+            }
+        }
+        if beyond_bounds.is_empty() {
+            return None;
+        }
+        let mut conjuncts: Vec<&Expr> = Vec::new();
+        collect_and_conjuncts(filter, &mut conjuncts);
+        let mut pushable: Vec<Expr> = Vec::new();
+        for conjunct in conjuncts {
+            let mut cols = Vec::new();
+            if icp_collect_columns(conjunct, &mut cols)
+                && !cols.is_empty()
+                && cols.iter().all(|col| safe.contains(col))
+                && cols.iter().any(|col| beyond_bounds.contains(col))
+            {
+                pushable.push(conjunct.clone());
+            }
+        }
+        let condition = pushable.into_iter().reduce(|left, right| Expr::Binary {
+            left: Box::new(left),
+            op: BinaryOp::And,
+            right: Box::new(right),
+        })?;
+        Some(Self {
+            projector: IndexEntryProjector::new(table, index, None),
+            condition,
+        })
+    }
+
+    pub(in crate::engine::executor::select) fn matches(
+        &self,
+        db: &Arc<Database>,
+        txn: TxnView,
+        key: &IndexKey,
+        eval_ctx: &mut EvalQueryContext,
+    ) -> Result<bool, QueryError> {
+        let row = self.projector.project(key);
+        eval_plan_bool_with_db(db, txn, &self.condition, &row, eval_ctx)
+    }
+}
+
+pub(super) fn collect_and_conjuncts<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match expr {
+        Expr::Binary { left, op, right } if *op == BinaryOp::And => {
+            collect_and_conjuncts(left, out);
+            collect_and_conjuncts(right, out);
+        }
+        other => out.push(other),
+    }
+}
+
+pub(super) const MRR_BYTES_PER_RID: usize = 32;
+pub(super) const MRR_MIN_WINDOW_ROWS: usize = 4_096;
+pub(super) const MRR_MAX_WINDOW_ROWS: usize = 262_144;
+
+/// Runtime-only work area for non-covering index-to-heap fetches. Its grant
+/// controls I/O batching but is intentionally absent from `PhysicalPlan` and
+/// every plan-cache key.
+pub(crate) struct MrrWorkArea {
+    pub(super) handle: Option<crate::engine::executor::work_area::WorkAreaHandle>,
+    pub(super) window_rows: usize,
+    pub(super) charged_bytes: usize,
+    pub(super) spill_released: AtomicBool,
+}
+
+impl MrrWorkArea {
+    pub(crate) fn new() -> Self {
+        if !mrr_sort_enabled() {
+            return Self {
+                handle: None,
+                window_rows: 4_096,
+                charged_bytes: 0,
+                spill_released: AtomicBool::new(true),
+            };
+        }
+
+        use crate::engine::executor::work_area::{SpillHint, WorkAreaHandle};
+
+        let handle = WorkAreaHandle::register();
+        let fair_bytes = handle.manager().fair_share_bytes();
+        let target_bytes = fair_bytes
+            .min(MRR_MAX_WINDOW_ROWS * MRR_BYTES_PER_RID)
+            .max(MRR_MIN_WINDOW_ROWS * MRR_BYTES_PER_RID);
+        let spill = matches!(handle.try_charge(target_bytes), SpillHint::Spill);
+        let window_rows = if spill {
+            // MRR has no disk-spill representation: the current RID window is
+            // itself the spill unit. Return the denied reservation at once
+            // and continue with the 4K minimum window.
+            handle.release(target_bytes);
+            MRR_MIN_WINDOW_ROWS
+        } else {
+            (target_bytes / MRR_BYTES_PER_RID).clamp(MRR_MIN_WINDOW_ROWS, MRR_MAX_WINDOW_ROWS)
+        };
+        if spill {
+            MRR_WORKAREA_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            crate::engine::executor::select::analyze_stats::add_mrr_work(0, 0, 0, 1, 0);
+        }
+        Self {
+            handle: Some(handle),
+            window_rows,
+            charged_bytes: if spill { 0 } else { target_bytes },
+            spill_released: AtomicBool::new(spill),
+        }
+    }
+
+    pub(crate) fn window_rows(&self) -> usize {
+        let Some(handle) = self.handle.as_ref() else {
+            return self.window_rows;
+        };
+        if self.spill_released.load(Ordering::Relaxed) {
+            return MRR_MIN_WINDOW_ROWS;
+        }
+        if handle.must_spill()
+            && self
+                .spill_released
+                .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            // A new contender or a runtime target shrink can revoke the
+            // earlier fair share between windows. Flush by releasing the
+            // reservation and use minimum windows for the rest of this scan.
+            handle.release(self.charged_bytes);
+            MRR_WORKAREA_FLUSHES.fetch_add(1, Ordering::Relaxed);
+            crate::engine::executor::select::analyze_stats::add_mrr_work(0, 0, 0, 1, 0);
+            return MRR_MIN_WINDOW_ROWS;
+        }
+        self.window_rows
+    }
+
+    /// Cap a RID window by the caller's full resident footprint, not merely
+    /// the 32-byte MRR bookkeeping estimate. Native columnar scans retain
+    /// decoded projected values until the Batch is built, so wide projections
+    /// must consume fewer rows from the same grant.
+    pub(crate) fn window_rows_for_resident_bytes(
+        &self,
+        resident_bytes_per_row: usize,
+        max_rows: usize,
+    ) -> usize {
+        let rows = self.window_rows().min(max_rows).max(1);
+        if self.spill_released.load(Ordering::Relaxed) {
+            return rows.min(MRR_MIN_WINDOW_ROWS);
+        }
+        rows.min((self.charged_bytes / resident_bytes_per_row.max(1)).max(1))
+    }
+}
+
+pub(super) fn read_plan_table_ids_range_chunked(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    mut low: Option<IndexBound>,
+    mut high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    crate::planner::boolean_range::refine_runtime(
+        &table.schema,
+        index,
+        filter.as_ref(),
+        &mut low,
+        &mut high,
+    );
+    if db.has_pending_index_repairs_for(table.schema.id, &index.name) {
+        let ids = range_index_ids_visible_ordered(db, txn, table, index, low, high, reverse)?;
+        return read_plan_table_ids_with_heap(
+            db,
+            txn,
+            table,
+            &index_scan_heap(db, table)?,
+            ids,
+            filter,
+            None,
+            projection,
+        );
+    }
+
+    // ICP: pre-filter index entries before the heap lookup when part
+    // of the residual filter is evaluable on the index key.
+    if let Some(icp) =
+        IndexConditionPushdown::try_new(table, index, low.as_ref(), high.as_ref(), filter)
+    {
+        return read_plan_table_ids_range_icp(
+            db, txn, table, index, low, high, reverse, filter, projection, &icp,
+        );
+    }
+
+    let mrr = MrrWorkArea::new();
+    let mut rows = Vec::new();
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let heap = index_scan_heap(db, table)?;
+
+    if reverse {
+        let mut cursor = db.range_index_snapshot_reverse_cursor(
+            &table.schema,
+            index,
+            low.clone(),
+            high.clone(),
+            txn,
+        )?;
+        loop {
+            // Non-covering: keys are never consulted — pull bare RowIds.
+            let chunk = cursor.next_chunk_row_ids(mrr.window_rows())?;
+            if chunk.is_empty() {
+                break;
+            }
+            read_visible_row_id_chunk_with_heap(
+                db,
+                txn,
+                table,
+                &heap,
+                filter,
+                &mut eval_ctx,
+                &mut rows,
+                &mut seen,
+                chunk,
+                projection,
+            )?;
+        }
+    } else {
+        let mut cursor =
+            db.range_index_snapshot_cursor(&table.schema, index, low.clone(), high.clone(), txn)?;
+        loop {
+            // Non-covering: the index key is never consulted past this
+            // point, so pull bare RowIds and skip the per-entry
+            // IndexKey clone.
+            let chunk = cursor.next_chunk_row_ids(mrr.window_rows())?;
+            if chunk.is_empty() {
+                break;
+            }
+            read_visible_row_id_chunk_with_heap(
+                db,
+                txn,
+                table,
+                &heap,
+                filter,
+                &mut eval_ctx,
+                &mut rows,
+                &mut seen,
+                chunk,
+                projection,
+            )?;
+        }
+    }
+
+    Ok(rows)
+}
+
+/// Non-covering range scan with index condition pushdown: stream
+/// borrowed entries off the cursor, evaluate the pushed conjuncts on
+/// the projected key, and heap-fetch only the survivors (in index
+/// order, preserving the heap-read batching and prefetch window). The
+/// full filter is re-applied to the heap rows.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_plan_table_ids_range_icp(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+    icp: &IndexConditionPushdown,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mrr = MrrWorkArea::new();
+    let heap = index_scan_heap(db, table)?;
+    let mut rows = Vec::new();
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut icp_ctx = EvalQueryContext::default();
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let mut pending: Vec<RowId> = Vec::with_capacity(mrr.window_rows());
+    {
+        let mut consume = |entries: &[(&IndexKey, RowId)]| -> Result<(), QueryError> {
+            for (key, row_id) in entries {
+                if !icp.matches(db, txn, key, &mut icp_ctx)? {
+                    continue;
+                }
+                pending.push(*row_id);
+                if pending.len() >= mrr.window_rows() {
+                    read_visible_row_id_chunk_with_heap(
+                        db,
+                        txn,
+                        table,
+                        &heap,
+                        filter,
+                        &mut eval_ctx,
+                        &mut rows,
+                        &mut seen,
+                        std::mem::take(&mut pending),
+                        projection,
+                    )?;
+                }
+            }
+            Ok(())
+        };
+        if reverse {
+            let mut cursor =
+                db.range_index_snapshot_reverse_cursor(&table.schema, index, low, high, txn)?;
+            cursor.visit_entries(&mut consume)?;
+        } else {
+            let mut cursor =
+                db.range_index_snapshot_cursor(&table.schema, index, low, high, txn)?;
+            cursor.visit_entries(&mut consume)?;
+        }
+    }
+    if !pending.is_empty() {
+        read_visible_row_id_chunk_with_heap(
+            db,
+            txn,
+            table,
+            &heap,
+            filter,
+            &mut eval_ctx,
+            &mut rows,
+            &mut seen,
+            pending,
+            projection,
+        )?;
+    }
+    Ok(rows)
+}
+
+/// LIMIT-aware ICP variant of `read_plan_table_ids_range_icp`. Same
+/// borrowed-entry walk + index-key pre-filter, but stops feeding the
+/// heap-fetch sink once `max_rows` survivors have landed in `rows`.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_plan_table_ids_range_icp_limited(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+    max_rows: usize,
+    icp: &IndexConditionPushdown,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mrr = MrrWorkArea::new();
+    let heap = index_scan_heap(db, table)?;
+    let mut rows = Vec::with_capacity(max_rows.min(64));
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut icp_ctx = EvalQueryContext::default();
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let mut pending: Vec<RowId> = Vec::with_capacity(mrr.window_rows().min(max_rows.max(1)));
+    let mut stop = false;
+    {
+        let mut consume = |entries: &[(&IndexKey, RowId)]| -> Result<(), QueryError> {
+            if stop {
+                return Ok(());
+            }
+            for (key, row_id) in entries {
+                if rows.len() >= max_rows {
+                    stop = true;
+                    return Ok(());
+                }
+                if !icp.matches(db, txn, key, &mut icp_ctx)? {
+                    continue;
+                }
+                pending.push(*row_id);
+                if pending.len() >= mrr.window_rows() {
+                    read_visible_row_id_chunk_limited_with_heap(
+                        db,
+                        txn,
+                        table,
+                        &heap,
+                        filter,
+                        &mut eval_ctx,
+                        &mut rows,
+                        &mut seen,
+                        std::mem::take(&mut pending),
+                        max_rows,
+                        projection,
+                    )?;
+                    if rows.len() >= max_rows {
+                        stop = true;
+                        return Ok(());
+                    }
+                }
+            }
+            Ok(())
+        };
+        if reverse {
+            let mut cursor =
+                db.range_index_snapshot_reverse_cursor(&table.schema, index, low, high, txn)?;
+            cursor.visit_entries(&mut consume)?;
+        } else {
+            let mut cursor =
+                db.range_index_snapshot_cursor(&table.schema, index, low, high, txn)?;
+            cursor.visit_entries(&mut consume)?;
+        }
+    }
+    if !pending.is_empty() && rows.len() < max_rows {
+        read_visible_row_id_chunk_limited_with_heap(
+            db,
+            txn,
+            table,
+            &heap,
+            filter,
+            &mut eval_ctx,
+            &mut rows,
+            &mut seen,
+            pending,
+            max_rows,
+            projection,
+        )?;
+    }
+    Ok(rows)
+}
+
+pub(super) fn read_plan_table_ids_range_chunked_limited(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    mut low: Option<IndexBound>,
+    mut high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    max_rows: usize,
+    projection: Option<&[usize]>,
+    allow_icp: bool,
+) -> Result<Vec<PlanRow>, QueryError> {
+    crate::planner::boolean_range::refine_runtime(
+        &table.schema,
+        index,
+        filter.as_ref(),
+        &mut low,
+        &mut high,
+    );
+    if max_rows == 0 {
+        return Ok(Vec::new());
+    }
+    if db.has_pending_index_repairs_for(table.schema.id, &index.name) {
+        let ids = range_index_ids_visible_ordered(db, txn, table, index, low, high, reverse)?;
+        return read_plan_table_ids_with_heap(
+            db,
+            txn,
+            table,
+            &index_scan_heap(db, table)?,
+            ids,
+            filter,
+            Some(max_rows),
+            projection,
+        );
+    }
+
+    // ICP: pre-filter index entries before the heap lookup when part
+    // of the residual filter is evaluable on the index key. Symmetric
+    // with the unbounded sibling `read_plan_table_ids_range_chunked`
+    // — a LIMIT cap doesn't change the pre-filter's correctness
+    // (every entry the ICP rejects could never satisfy the filter
+    // anyway), and the pruning is strictly cheaper than paying the
+    // heap fetch + full filter on each non-matching row.
+    if let Some(icp) = allow_icp
+        .then(|| IndexConditionPushdown::try_new(table, index, low.as_ref(), high.as_ref(), filter))
+        .flatten()
+    {
+        return read_plan_table_ids_range_icp_limited(
+            db, txn, table, index, low, high, reverse, filter, projection, max_rows, &icp,
+        );
+    }
+
+    let mrr = MrrWorkArea::new();
+    const MIN_CHUNK: usize = 64;
+    let mut rows = Vec::with_capacity(max_rows.min(64));
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let heap = index_scan_heap(db, table)?;
+
+    if reverse {
+        let mut cursor = db.range_index_snapshot_reverse_cursor(
+            &table.schema,
+            index,
+            low.clone(),
+            high.clone(),
+            txn,
+        )?;
+        loop {
+            let remaining = max_rows.saturating_sub(rows.len());
+            if remaining == 0 {
+                break;
+            }
+            let chunk_size = remaining.max(MIN_CHUNK).min(mrr.window_rows());
+            // Non-covering: keys are never consulted — pull bare RowIds.
+            let chunk = cursor.next_chunk_row_ids(chunk_size)?;
+            if chunk.is_empty() {
+                break;
+            }
+            read_visible_row_id_chunk_limited_with_heap(
+                db,
+                txn,
+                table,
+                &heap,
+                filter,
+                &mut eval_ctx,
+                &mut rows,
+                &mut seen,
+                chunk,
+                max_rows,
+                projection,
+            )?;
+        }
+    } else {
+        let mut cursor =
+            db.range_index_snapshot_cursor(&table.schema, index, low.clone(), high.clone(), txn)?;
+        loop {
+            let remaining = max_rows.saturating_sub(rows.len());
+            if remaining == 0 {
+                break;
+            }
+            let chunk_size = remaining.max(MIN_CHUNK).min(mrr.window_rows());
+            // Non-covering: keys are never consulted — pull bare RowIds.
+            let chunk = cursor.next_chunk_row_ids(chunk_size)?;
+            if chunk.is_empty() {
+                break;
+            }
+            read_visible_row_id_chunk_limited_with_heap(
+                db,
+                txn,
+                table,
+                &heap,
+                filter,
+                &mut eval_ctx,
+                &mut rows,
+                &mut seen,
+                chunk,
+                max_rows,
+                projection,
+            )?;
+        }
+    }
+
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_plan_table_ids_range_windowed(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    reverse: bool,
+    projection: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mrr = MrrWorkArea::new();
+    let heap = index_scan_heap(db, table)?;
+    let mut skip = offset;
+    let mut page_ids: Vec<RowId> = Vec::with_capacity(limit.min(64));
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let mut cursor = if reverse {
+        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
+            &table.schema,
+            index,
+            low,
+            high,
+            txn,
+        )?)
+    } else {
+        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
+            &table.schema,
+            index,
+            low,
+            high,
+            txn,
+        )?)
+    };
+    while page_ids.len() < limit {
+        // The MRR grant is an upper bound, not a mandatory fetch size.
+        // Ordered pagination without a residual filter needs only the
+        // remaining visible OFFSET + LIMIT rows. Pulling the whole work-area
+        // window made `LIMIT 20 OFFSET 2` decode and visibility-check up to
+        // 262K index entries. If tombstones/invisible versions leave us
+        // short, the cursor simply refills with the newly remaining demand.
+        let remaining = skip.saturating_add(limit.saturating_sub(page_ids.len()));
+        let chunk_rows = remaining.max(1).min(mrr.window_rows());
+        let (chunk, page_max_trx_id) = cursor.next_leaf_chunk_row_ids(chunk_rows)?;
+        if chunk.is_empty() {
+            break;
+        }
+        let mut row_ids = chunk;
+        if let Some(seen) = seen.as_mut() {
+            row_ids.retain(|row_id| seen.insert(*row_id));
+        }
+        if row_ids.is_empty() {
+            continue;
+        }
+        record_mrr_window(&row_ids);
+        // The cursor deliberately stops at a leaf boundary, so its persisted
+        // PAGE_MAX_TRX_ID applies to every RowId in this batch. Old/static
+        // leaves can therefore skip heap-header visibility probes entirely;
+        // concurrent or recent leaves fall back to the full MVCC oracle.
+        let visible_mask = db
+            .try_index_page_max_trx_shortcut_for(
+                table.schema.id,
+                &index.name,
+                page_max_trx_id,
+                txn,
+                row_ids.len(),
+            )
+            .map(Ok::<_, QueryError>)
+            .unwrap_or_else(|| {
+                db.filter_visible_row_ids_mask_with_handle(&heap, &table.schema, &row_ids, txn)
+            })?;
+        for (row_id, visible) in row_ids.into_iter().zip(visible_mask.into_iter()) {
+            if !visible {
+                continue;
+            }
+            if skip > 0 {
+                skip -= 1;
+                continue;
+            }
+            page_ids.push(row_id);
+            if page_ids.len() >= limit {
+                break;
+            }
+        }
+    }
+    materialize_row_ids_in_order(db, txn, table, &heap, &page_ids, projection)
+}
+
+pub(super) fn materialize_row_ids_in_order(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    heap: &HeapHandle,
+    row_ids: &[RowId],
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    if row_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    if let Some(cols) = projection {
+        let mut by_id = db
+            .read_row_columns_many_with_handle(heap, &table.schema, row_ids, txn, cols)?
+            .into_iter()
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            if let Some(values) = by_id.remove(row_id) {
+                rows.push(projected_values_to_plan_row(table, cols, values)?);
+            }
+        }
+        Ok(rows)
+    } else {
+        let mut by_id = db
+            .read_rows_many_with_handle(heap, &table.schema, row_ids, txn)?
+            .into_iter()
+            .map(|row| (row.row_id, row.values))
+            .collect::<std::collections::HashMap<_, _>>();
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            if let Some(values) = by_id.remove(row_id) {
+                rows.push(stored_row_to_plan_row(table, values)?);
+            }
+        }
+        Ok(rows)
+    }
+}
+
+/// `MYDB_MRR_SORT` is a diagnostic execution-only oracle. MRR is on by
+/// default; explicit `0/off/false` restores the legacy 4K-window path without
+/// changing the cached plan or EXPLAIN output.
+pub(super) fn mrr_sort_enabled() -> bool {
+    !crate::util::env::var("MYDB_MRR_SORT")
+        .map(|v| {
+            matches!(
+                v.trim().to_ascii_lowercase().as_str(),
+                "0" | "off" | "false" | "no" | "disable" | "disabled"
+            )
+        })
+        .unwrap_or(false)
+}
+
+pub(crate) fn record_mrr_window(chunk: &[RowId]) {
+    if !mrr_sort_enabled() || chunk.is_empty() {
+        return;
+    }
+    let mut pages: Vec<u32> = chunk.iter().map(|row_id| row_id.page_id).collect();
+    pages.sort_unstable();
+    pages.dedup();
+    let rids = chunk.len() as u64;
+    let unique_pages = pages.len() as u64;
+    let page_reuses = rids.saturating_sub(unique_pages);
+    let bytes = rids.saturating_mul(MRR_BYTES_PER_RID as u64);
+    MRR_WINDOWS.fetch_add(1, Ordering::Relaxed);
+    MRR_RIDS.fetch_add(rids, Ordering::Relaxed);
+    MRR_UNIQUE_PAGES.fetch_add(unique_pages, Ordering::Relaxed);
+    MRR_PAGE_REUSES.fetch_add(page_reuses, Ordering::Relaxed);
+    MRR_PEAK_BYTES.fetch_max(bytes, Ordering::Relaxed);
+    crate::engine::executor::select::analyze_stats::add_mrr_work(1, rids, unique_pages, 0, bytes);
+}
+
+/// Visible-row heap fetch for RowId chunks pulled via
+/// `IndexRangeCursor::next_chunk_row_ids` — the non-covering path never
+/// looks at the index key, so the chunk arrives without any `IndexKey`
+/// clones having been paid.
+pub(in crate::engine::executor::select) fn read_visible_row_id_chunk_with_heap(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    heap: &HeapHandle,
+    filter: &Option<Expr>,
+    eval_ctx: &mut EvalQueryContext,
+    rows: &mut Vec<PlanRow>,
+    seen: &mut Option<std::collections::HashSet<RowId>>,
+    mut chunk: Vec<RowId>,
+    projection: Option<&[usize]>,
+) -> Result<(), QueryError> {
+    if let Some(seen) = seen.as_mut() {
+        chunk.retain(|row_id| seen.insert(*row_id));
+    }
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    record_mrr_window(&chunk);
+    if crate::engine::executor::select::analyze_stats::is_recording() {
+        let mut pages: Vec<u32> = chunk.iter().map(|row_id| row_id.page_id).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        crate::engine::executor::select::analyze_stats::add_range_scan_work(
+            chunk.len() as u64,
+            chunk.len() as u64,
+            pages.len() as u64,
+        );
+    }
+
+    // Storage sorts the missing-page subset for one pin/decode per page;
+    // materialization maps it back to `chunk` order, preserving index order.
+    for row in materialize_row_ids_in_order(db, txn, table, heap, &chunk, projection)? {
+        if filter
+            .as_ref()
+            .map(|expr| eval_plan_bool_with_db(db, txn, expr, &row, eval_ctx))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            rows.push(row);
+        }
+    }
+    Ok(())
+}
+
+/// Limited (max_rows-capped) variant of `read_visible_row_id_chunk_with_heap`.
+pub(super) fn read_visible_row_id_chunk_limited_with_heap(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    heap: &HeapHandle,
+    filter: &Option<Expr>,
+    eval_ctx: &mut EvalQueryContext,
+    rows: &mut Vec<PlanRow>,
+    seen: &mut Option<std::collections::HashSet<RowId>>,
+    mut chunk: Vec<RowId>,
+    max_rows: usize,
+    projection: Option<&[usize]>,
+) -> Result<(), QueryError> {
+    if let Some(seen) = seen.as_mut() {
+        chunk.retain(|row_id| seen.insert(*row_id));
+    }
+    if chunk.is_empty() {
+        return Ok(());
+    }
+    record_mrr_window(&chunk);
+    if crate::engine::executor::select::analyze_stats::is_recording() {
+        let mut pages: Vec<u32> = chunk.iter().map(|row_id| row_id.page_id).collect();
+        pages.sort_unstable();
+        pages.dedup();
+        crate::engine::executor::select::analyze_stats::add_range_scan_work(
+            chunk.len() as u64,
+            chunk.len() as u64,
+            pages.len() as u64,
+        );
+    }
+    for row in materialize_row_ids_in_order(db, txn, table, heap, &chunk, projection)? {
+        if rows.len() >= max_rows {
+            break;
+        }
+        if filter
+            .as_ref()
+            .map(|expr| eval_plan_bool_with_db(db, txn, expr, &row, eval_ctx))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            rows.push(row);
+        }
+    }
+    Ok(())
+}
+
+/// Heap handle an index scan uses for its MVCC visibility probe / heap
+/// fetch. For a partitioned table the entries come from one partition's
+/// local index (the executor fans the scan out per partition), so the
+/// probe must target that partition's heap — the base `table.id` heap
+/// is empty. Resolves the in-scope partition from the active prune
+/// context; unpartitioned tables read `table.id`.
+pub(crate) fn index_scan_heap(
+    db: &Arc<Database>,
+    table: &PlanTable,
+) -> Result<HeapHandle, QueryError> {
+    let storage_id = table
+        .in_scope_storage_ids()
+        .into_iter()
+        .next()
+        .unwrap_or(table.schema.id);
+    db.cached_heap_handle(storage_id)
+}
+
+/// Append one borrowed covering-index batch to `rows`.
+///
+/// The caller owns the output materialization policy, while this helper keeps
+/// the storage-side index entries borrowed from the pinned leaf page.  In
+/// particular it must never clone a whole worker leaf range into
+/// `Vec<(IndexKey, RowId)>`; the input batch is bounded by the storage visitor.
+pub(in crate::engine::executor::select) fn append_plan_table_entry_refs_chunk(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    heap: &HeapHandle,
+    entries: &[(&IndexKey, RowId)],
+    page_max_trx_id: u64,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+    rows: &mut Vec<PlanRow>,
+    eval_ctx: &mut EvalQueryContext,
+) -> Result<(), QueryError> {
+    let projector = IndexEntryProjector::new(table, index, projection);
+    let mut compiled_filter = None;
+    let visible_mask = db
+        .try_index_page_max_trx_shortcut_for(
+            table.schema.id,
+            &index.name,
+            page_max_trx_id,
+            txn,
+            entries.len(),
+        )
+        .map(Ok::<_, QueryError>)
+        .unwrap_or_else(|| {
+            db.filter_visible_index_entries_refs_mask_with_handle(
+                heap,
+                &table.schema,
+                index,
+                entries,
+                txn,
+            )
+        })?;
+    let float_rows = projector.prepare_float_rows(
+        db,
+        txn,
+        entries
+            .iter()
+            .zip(visible_mask.iter())
+            .filter_map(|((key, id), visible)| (*visible).then_some((*key, *id))),
+        || Ok(heap.clone()),
+    )?;
+    for ((key, row_id), visible) in entries.iter().zip(visible_mask.into_iter()) {
+        if !visible {
+            continue;
+        }
+        let Some(row) = projector.project_visible(db, txn, *row_id, key, float_rows.as_ref())?
+        else {
+            continue;
+        };
+        if eval_covering_filter(db, txn, filter, &row, eval_ctx, &mut compiled_filter)? {
+            rows.push(row);
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::engine::executor::select) fn read_plan_table_entries(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    entries: Vec<(IndexKey, RowId)>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let heap = index_scan_heap(db, table)?;
+    read_plan_table_entries_with_heap(db, txn, table, index, &heap, entries, filter, projection)
+}
+
+pub(super) fn read_plan_table_entries_with_visibility_bound(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    entries: Vec<(IndexKey, RowId)>,
+    page_max_trx_id: Option<u64>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let heap = index_scan_heap(db, table)?;
+    read_plan_table_entries_with_heap_and_bound(
+        db,
+        txn,
+        table,
+        index,
+        &heap,
+        entries,
+        page_max_trx_id,
+        filter,
+        projection,
+    )
+}
+
+pub(super) fn read_plan_table_entries_with_heap(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    heap: &HeapHandle,
+    entries: Vec<(IndexKey, RowId)>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    read_plan_table_entries_with_heap_and_bound(
+        db, txn, table, index, heap, entries, None, filter, projection,
+    )
+}
+
+pub(super) fn read_plan_table_entries_with_heap_and_bound(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    heap: &HeapHandle,
+    entries: Vec<(IndexKey, RowId)>,
+    page_max_trx_id: Option<u64>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mut rows = Vec::with_capacity(entries.len());
+    let mut eval_ctx = EvalQueryContext::default();
+    let projector = IndexEntryProjector::new(table, index, projection);
+    let mut compiled_filter = None;
+    let visible_mask = match page_max_trx_id.and_then(|bound| {
+        db.try_index_page_max_trx_shortcut_for(
+            table.schema.id,
+            &index.name,
+            bound,
+            txn,
+            entries.len(),
+        )
+    }) {
+        Some(mask) => mask,
+        None => db.filter_visible_index_entries_mask_with_handle(
+            heap,
+            &table.schema,
+            index,
+            &entries,
+            txn,
+        )?,
+    };
+    let float_rows = projector.prepare_float_rows(
+        db,
+        txn,
+        entries
+            .iter()
+            .zip(visible_mask.iter())
+            .filter_map(|((key, id), visible)| (*visible).then_some((key, *id))),
+        || Ok(heap.clone()),
+    )?;
+    for ((key, row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
+        if !visible {
+            continue;
+        }
+        let Some(row) = projector.project_visible(db, txn, row_id, &key, float_rows.as_ref())?
+        else {
+            continue;
+        };
+        if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+/// Streaming covering-scan reader: walks the range via the borrowing
+/// cursor visitor, so index keys are projected straight out of the
+/// pinned leaf pages — no per-entry `IndexKey` clone and a single
+/// visibility pass (the old shape filtered visibility once inside
+/// `range_index_entries_visible_ordered` and a second time inside
+/// `read_plan_table_entries`).
+pub(super) fn read_plan_table_entries_streamed(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    mut low: Option<IndexBound>,
+    mut high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    crate::planner::boolean_range::refine_runtime(
+        &table.schema,
+        index,
+        filter.as_ref(),
+        &mut low,
+        &mut high,
+    );
+    if db.has_pending_index_repairs_for(table.schema.id, &index.name) {
+        let entries =
+            range_index_entries_visible_ordered(db, txn, table, index, low, high, reverse)?;
+        return read_plan_table_entries(db, txn, table, index, entries, filter, projection);
+    }
+    let heap = index_scan_heap(db, table)?;
+    let mut rows = Vec::new();
+    let mut eval_ctx = EvalQueryContext::default();
+    let projector = IndexEntryProjector::new(table, index, projection);
+    let mut compiled_filter = None;
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let mut consume = |entries: &[(&IndexKey, RowId)]| -> Result<(), QueryError> {
+        let visible_mask = db.filter_visible_index_entries_refs_mask_with_handle(
+            &heap,
+            &table.schema,
+            index,
+            entries,
+            txn,
+        )?;
+        let float_rows = projector.prepare_float_rows(
+            db,
+            txn,
+            entries
+                .iter()
+                .zip(visible_mask.iter())
+                .filter_map(|((key, id), visible)| (*visible).then_some((*key, *id))),
+            || Ok(heap.clone()),
+        )?;
+        for ((key, row_id), visible) in entries.iter().zip(visible_mask.into_iter()) {
+            if !visible {
+                continue;
+            }
+            if seen.as_mut().is_some_and(|seen| !seen.insert(*row_id)) {
+                continue;
+            }
+            let Some(row) =
+                projector.project_visible(db, txn, *row_id, key, float_rows.as_ref())?
+            else {
+                continue;
+            };
+            if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
+                rows.push(row);
+            }
+        }
+        Ok(())
+    };
+    if reverse {
+        let mut cursor =
+            db.range_index_snapshot_reverse_cursor(&table.schema, index, low, high, txn)?;
+        cursor.visit_entries(&mut consume)?;
+    } else {
+        let mut cursor = db.range_index_snapshot_cursor(&table.schema, index, low, high, txn)?;
+        cursor.visit_entries(&mut consume)?;
+    }
+    Ok(rows)
+}
+
+pub(super) fn read_plan_table_ids_with_heap(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    heap: &HeapHandle,
+    ids: Vec<RowId>,
+    filter: &Option<Expr>,
+    max_rows: Option<usize>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mut rows = Vec::with_capacity(max_rows.map_or(ids.len(), |max| max.min(ids.len())));
+    let mut eval_ctx = EvalQueryContext::default();
+    // Non-covering index scans used to route every residual row through the
+    // DB-aware AST interpreter even when the predicate was a fully compilable
+    // prepared expression (`column = ?`, conjunctions, ranges, ...).
+    // Compile lazily against the first materialized row, exactly as covering
+    // scans do. Unsupported/subquery shapes retain the DB-aware legacy path
+    // through `CompiledPlanPredicate::eval_bool_with_db`.
+    let mut compiled_filter = None;
+    if let Some(cols) = projection {
+        for (_row_id, values) in
+            db.read_row_columns_many_with_handle(heap, &table.schema, &ids, txn, cols)?
+        {
+            if max_rows.is_some_and(|max| rows.len() >= max) {
+                break;
+            }
+            let row = projected_values_to_plan_row(table, cols, values)?;
+            if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
+                rows.push(row);
+            }
+        }
+    } else {
+        for row in db.read_rows_many_with_handle(heap, &table.schema, &ids, txn)? {
+            if max_rows.is_some_and(|max| rows.len() >= max) {
+                break;
+            }
+            let row = stored_row_to_plan_row(table, row.values)?;
+            if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
+                rows.push(row);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+pub(super) fn read_plan_table_entries_limited_with_heap(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    heap: &HeapHandle,
+    entries: Vec<(IndexKey, RowId)>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+    max_rows: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mut rows = Vec::with_capacity(max_rows.min(entries.len()));
+    let mut eval_ctx = EvalQueryContext::default();
+    let projector = IndexEntryProjector::new(table, index, projection);
+    let mut compiled_filter = None;
+    let visible_mask = db.filter_visible_index_entries_mask_with_handle(
+        heap,
+        &table.schema,
+        index,
+        &entries,
+        txn,
+    )?;
+    for ((key, row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
+        if rows.len() >= max_rows {
+            break;
+        }
+        if !visible {
+            continue;
+        }
+        let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? else {
+            continue;
+        };
+        if eval_covering_filter(db, txn, filter, &row, &mut eval_ctx, &mut compiled_filter)? {
+            rows.push(row);
+        }
+    }
+    Ok(rows)
+}
+
+pub(super) fn read_plan_table_entries_chunked(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    const CHUNK: usize = 4096;
+    let mut rows = Vec::new();
+    let heap = index_scan_heap(db, table)?;
+    let mut cursor =
+        db.range_index_snapshot_cursor(&table.schema, index, low.clone(), high.clone(), txn)?;
+    loop {
+        let entries = cursor.next_chunk(CHUNK)?;
+        if entries.is_empty() {
+            break;
+        }
+        rows.extend(read_plan_table_entries_with_heap(
+            db, txn, table, index, &heap, entries, filter, projection,
+        )?);
+    }
+    Ok(rows)
+}
+
+/// Direction-agnostic chunk source for LIMIT-bounded covering scans.
+pub(super) enum AnyRangeCursor {
+    Forward(crate::storage::IndexRangeCursor),
+    Reverse(crate::storage::IndexRangeReverseCursor),
+}
+
+impl AnyRangeCursor {
+    pub(super) fn next_leaf_chunk(
+        &mut self,
+        cap: usize,
+    ) -> Result<(Vec<(IndexKey, RowId)>, u64), QueryError> {
+        match self {
+            Self::Forward(cursor) => cursor.next_leaf_chunk(cap),
+            Self::Reverse(cursor) => cursor.next_leaf_chunk(cap),
+        }
+    }
+    pub(super) fn advance_exclusive_prefix(&mut self, key: IndexKey) -> Result<(), QueryError> {
+        match self {
+            Self::Forward(cursor) => cursor.advance_exclusive_prefix(key),
+            Self::Reverse(cursor) => cursor.advance_exclusive_prefix(key),
+        }
+    }
+    pub(super) fn next_chunk(
+        &mut self,
+        chunk_size: usize,
+    ) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+        match self {
+            AnyRangeCursor::Forward(cursor) => cursor.next_chunk(chunk_size),
+            AnyRangeCursor::Reverse(cursor) => cursor.next_chunk(chunk_size),
+        }
+    }
+
+    pub(super) fn next_leaf_chunk_row_ids(
+        &mut self,
+        soft_cap: usize,
+    ) -> Result<(Vec<RowId>, u64), QueryError> {
+        match self {
+            AnyRangeCursor::Forward(cursor) => cursor.next_leaf_chunk_row_ids(soft_cap),
+            AnyRangeCursor::Reverse(cursor) => cursor.next_leaf_chunk_row_ids(soft_cap),
+        }
+    }
+}
+
+pub(super) fn read_plan_table_entries_chunked_limited(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+    max_rows: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    const MAX_CHUNK: usize = 4096;
+    let mut rows = Vec::with_capacity(max_rows.min(64));
+    // Each pull checks heap visibility for every entry it returns. Start
+    // near the requested window (an ordered LIMIT 1 used to verify 64 rows)
+    // and widen geometrically when invisible or filtered entries fall short.
+    let mut chunk = max_rows.saturating_mul(4).clamp(4, MAX_CHUNK);
+    let heap = index_scan_heap(db, table)?;
+    let mut cursor = if reverse {
+        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
+            &table.schema,
+            index,
+            low.clone(),
+            high.clone(),
+            txn,
+        )?)
+    } else {
+        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
+            &table.schema,
+            index,
+            low.clone(),
+            high.clone(),
+            txn,
+        )?)
+    };
+    while rows.len() < max_rows {
+        let remaining = max_rows - rows.len();
+        let entries = cursor.next_chunk(remaining.max(chunk).min(MAX_CHUNK))?;
+        if entries.is_empty() {
+            break;
+        }
+        chunk = chunk.saturating_mul(4).min(MAX_CHUNK);
+        rows.extend(read_plan_table_entries_limited_with_heap(
+            db,
+            txn,
+            table,
+            index,
+            &heap,
+            entries,
+            filter,
+            projection,
+            max_rows - rows.len(),
+        )?);
+    }
+    Ok(rows)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn read_plan_table_entries_windowed(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    reverse: bool,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+    offset: usize,
+    limit: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    const CHUNK: usize = 4096;
+    let heap = index_scan_heap(db, table)?;
+    let projector = IndexEntryProjector::new(table, index, projection);
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut compiled_filter = None;
+    let mut skip = offset;
+    let mut rows = Vec::with_capacity(limit.min(64));
+    // A covering scan still probes the heap for MVCC. Avoid checking a full
+    // batch when only a small ordered window is needed. Residual predicates
+    // retain the bulk path; visibility/duplicate losses adapt subsequent pulls.
+    let mut chunk_rows = if filter.is_none() {
+        offset.saturating_add(limit).clamp(1, CHUNK)
+    } else {
+        CHUNK
+    };
+    let mut seen = (!index.unique).then(std::collections::HashSet::new);
+    let mut cursor = if reverse {
+        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
+            &table.schema,
+            index,
+            low,
+            high,
+            txn,
+        )?)
+    } else {
+        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
+            &table.schema,
+            index,
+            low,
+            high,
+            txn,
+        )?)
+    };
+    while rows.len() < limit {
+        let mut entries = cursor.next_chunk(chunk_rows)?;
+        if entries.is_empty() {
+            break;
+        }
+        let examined = entries.len();
+        super::super::analyze_stats::add_range_scan_work(examined as u64, 0, 0);
+        let previous_rows = rows.len();
+        let previous_skip = skip;
+        if filter.is_none() {
+            chunk_rows = chunk_rows.saturating_mul(4).min(CHUNK);
+        }
+        if let Some(seen) = seen.as_mut() {
+            entries.retain(|(_, row_id)| seen.insert(*row_id));
+        }
+        if entries.is_empty() {
+            continue;
+        }
+        let visible_mask = db.filter_visible_index_entries_mask_with_handle(
+            &heap,
+            &table.schema,
+            index,
+            &entries,
+            txn,
+        )?;
+        for ((key, row_id), visible) in entries.into_iter().zip(visible_mask.into_iter()) {
+            if !visible {
+                continue;
+            }
+            if filter.is_none() {
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                if let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? {
+                    rows.push(row);
+                }
+            } else {
+                let Some(row) = projector.project_visible(db, txn, row_id, &key, None)? else {
+                    continue;
+                };
+                if !eval_covering_filter(
+                    db,
+                    txn,
+                    filter,
+                    &row,
+                    &mut eval_ctx,
+                    &mut compiled_filter,
+                )? {
+                    continue;
+                }
+                if skip > 0 {
+                    skip -= 1;
+                    continue;
+                }
+                rows.push(row);
+            }
+            if rows.len() >= limit {
+                break;
+            }
+        }
+        if filter.is_none() && rows.len() < limit {
+            let accepted = previous_skip - skip + rows.len() - previous_rows;
+            if accepted > 0 {
+                let remaining = skip.saturating_add(limit - rows.len());
+                chunk_rows = remaining
+                    .saturating_mul(examined)
+                    .div_ceil(accepted)
+                    .clamp(1, CHUNK);
+            }
+        }
+    }
+    Ok(rows)
+}
+
+/// Evaluate a scan residual through the compiled expression engine.
+///
+/// The materialized row shape is stable for the lifetime of one scan, so
+/// compiling against the first visible row is enough for every subsequent
+/// entry. Unsupported expressions retain the exact legacy/subquery behavior
+/// through `CompiledPlanPredicate`'s fallback. The historical function name
+/// remains because covering-index scans were its first caller.
+pub(in crate::engine::executor::select) fn eval_covering_filter(
+    db: &Arc<Database>,
+    txn: TxnView,
+    filter: &Option<Expr>,
+    row: &PlanRow,
+    eval_ctx: &mut EvalQueryContext,
+    compiled: &mut Option<CompiledPlanPredicate>,
+) -> Result<bool, QueryError> {
+    let Some(expr) = filter.as_ref() else {
+        return Ok(true);
+    };
+    let predicate = compiled.get_or_insert_with(|| CompiledPlanPredicate::compile_once(expr, row));
+    predicate.eval_bool_with_db(db, txn, row, eval_ctx)
+}
+
+pub(in crate::engine::executor::select) fn read_plan_table_entries_chunked_for_parallel_fallback(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    filter: Option<&Expr>,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    read_plan_table_entries_chunked(
+        db,
+        txn,
+        table,
+        index,
+        low,
+        high,
+        &filter.cloned(),
+        projection,
+    )
+}
+
+/// Execute an `IndexAggregate` operator. Single-table aggregate
+/// pushed down onto an index scan: yields one row whose `agg_values`
+/// cache holds the computed value keyed by `agg_key` (matching the
+/// `aggregate_key(expr)` the projection layer will look up).
+///
+/// COUNT(*) walks the entire visible-entry stream; MIN/MAX walk the
+/// index in forward/reverse order and return the first non-NULL,
+/// visible entry — early-terminating, so they're typically O(1) reads.
+pub(super) fn execute_index_aggregate(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    filter: Option<&Expr>,
+    op: &IndexAggOp,
+    agg_key: u64,
+    output_alias: &str,
+    output_type: ColumnType,
+) -> Result<Vec<PlanRow>, QueryError> {
+    if table.schema.is_partitioned() {
+        // IndexAggregate bypasses the heap scan adapter, so account for each
+        // partition-local index opened by this operator here. The active outer
+        // pruning scope narrows this list for partition predicates.
+        for _ in table.in_scope_storage_ids() {
+            crate::engine::executor::partition_router::record_partition_visit();
+        }
+    }
+    let value = match op {
+        IndexAggOp::CountStar => {
+            // Single-pass leaf walk + visibility check, no
+            // intermediate Vec of 6M entries and no per-chunk tree
+            // re-descent.
+            let count =
+                db.count_index_entries_visible(&table.schema, index, low, high, txn, None)?;
+            Value::Int(count)
+        }
+        IndexAggOp::CountColumn(col) => {
+            // Locate `col` inside the chosen covering index's key
+            // layout once. The storage helper inspects this slot in
+            // each leaf entry to skip NULLs in the streaming walk.
+            let pos = index
+                .effective_columns()
+                .iter()
+                .position(|c| c.eq_ignore_ascii_case(col))
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                        format!("COUNT({col}) pushdown column not in index {}", index.name),
+                    )
+                })?;
+            let count =
+                db.count_index_entries_visible(&table.schema, index, low, high, txn, Some(pos))?;
+            Value::Int(count)
+        }
+        IndexAggOp::CountDistinctColumn(col) => {
+            debug_assert!(
+                !index.has_prefix_columns()
+                    && index
+                        .columns
+                        .first()
+                        .is_some_and(|first| first.eq_ignore_ascii_case(col)),
+                "planner must prove ordered full-column DISTINCT input"
+            );
+            Value::Int(db.count_distinct_index_prefix_visible(
+                &table.schema,
+                index,
+                low,
+                high,
+                txn,
+            )?)
+        }
+        IndexAggOp::Min(col) => {
+            if let Some(filter) = filter {
+                filtered_index_min_max_value(db, txn, table, index, low, high, filter, col, false)?
+            } else {
+                index_min_max_value(db, txn, table, index, col, false)?
+            }
+        }
+        IndexAggOp::Max(col) => {
+            if let Some(filter) = filter {
+                filtered_index_min_max_value(db, txn, table, index, low, high, filter, col, true)?
+            } else {
+                index_min_max_value(db, txn, table, index, col, true)?
+            }
+        }
+    };
+
+    let mut cache: HashMap<u64, Value> = HashMap::with_capacity(1);
+    cache.insert(agg_key, value.clone());
+
+    let row = PlanRow {
+        fields: vec![PlanField {
+            meta: intern_col_meta(index_aggregate_output_meta(
+                table,
+                op,
+                output_alias,
+                output_type,
+            )),
+            value,
+        }],
+        group: Some(Vec::new()),
+        agg_values: Some(std::sync::Arc::new(cache)),
+        schema: PlanRow::empty_schema(),
+    };
+    Ok(vec![row])
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn filtered_index_min_max_value(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    filter: &Expr,
+    col: &str,
+    reverse: bool,
+) -> Result<Value, QueryError> {
+    let col_idx = table
+        .schema
+        .columns
+        .iter()
+        .position(|column| column.name.eq_ignore_ascii_case(col))
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_BAD_FIELD_ERROR,
+                format!("MIN/MAX pushdown column {col} missing on table"),
+            )
+        })?;
+    // MIN/MAX ignore NULL. Fold that rule into the residual only when the
+    // aggregate column is actually nullable, avoiding a redundant predicate
+    // for the common NOT NULL primary-key case.
+    let filter = if table.schema.columns[col_idx].nullable {
+        Expr::Binary {
+            left: Box::new(filter.clone()),
+            op: crate::parser::BinaryOp::And,
+            right: Box::new(Expr::IsNotNull(Box::new(Expr::Identifier(col.to_string())))),
+        }
+    } else {
+        filter.clone()
+    };
+    // Do not split this residual into ICP + heap predicates. A limited ICP
+    // deliberately batches a large MRR window before evaluating heap-only
+    // conjuncts, while an aggregate edge walk must evaluate each small leading
+    // window so it can stop immediately.
+    let rows = read_plan_table_ids_range_chunked_limited(
+        db,
+        txn,
+        table,
+        index,
+        low,
+        high,
+        reverse,
+        &Some(filter),
+        1,
+        None,
+        false,
+    )?;
+    Ok(rows
+        .first()
+        .and_then(|row| {
+            row.fields
+                .iter()
+                .find(|field| field.column.eq_ignore_ascii_case(col))
+        })
+        .map(|field| field.value.clone())
+        .unwrap_or(Value::Null))
+}
+
+#[derive(Clone)]
+pub(super) enum CoveringAggInput {
+    CountStar,
+    Column {
+        key_pos: usize,
+        data_type: DataTypeKind,
+    },
+    Null,
+}
+
+pub(in crate::engine::executor::select) struct CoveringIndexAggregatePartial {
+    pub(in crate::engine::executor::select) groups:
+        hashbrown::HashMap<Vec<ValueKey>, CoveringIndexAggregateGroup, ahash::RandomState>,
+    pub(in crate::engine::executor::select) native_rows: u64,
+}
+
+pub(in crate::engine::executor::select) struct CoveringIndexAggregateGroup {
+    pub(super) key_values: Vec<Value>,
+    pub(super) accumulators: Vec<Box<dyn crate::engine::executor::select::aggregate::Accumulator>>,
+}
+
+pub(in crate::engine::executor::select) struct CoveringIndexAggregateSpec {
+    pub(super) slots: Vec<crate::engine::executor::select::aggregate::AggregateSlot>,
+    pub(super) slot_inputs: Vec<CoveringAggInput>,
+    pub(super) slot_fixed_scales: Vec<Option<u8>>,
+    pub(super) group_inputs: Vec<CoveringAggInput>,
+    pub(super) group_table_indices: Vec<usize>,
+    float_restorer: IndexFloatValueRestorer,
+}
+
+pub(in crate::engine::executor::select) fn execute_covering_index_aggregate(
+    db: &Arc<Database>,
+    txn: TxnView,
+    runtime_plan: &PhysicalPlan,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    group_by: &[Expr],
+    having: Option<&Expr>,
+    aggregates: &[Expr],
+) -> Result<Vec<PlanRow>, QueryError> {
+    let spec = build_covering_index_aggregate_spec(table, index, group_by, having, aggregates)?;
+    if db.has_pending_index_repairs_for(table.schema.id, &index.name) {
+        let entries =
+            db.range_index_bounds_entries_visible(&table.schema, index, low, high, txn)?;
+        let _exact = crate::storage::ExactIndexVisibility::enter();
+        let rows = read_plan_table_entries(db, txn, table, index, entries, &None, None)?;
+        return aggregate_plan_rows(rows, group_by, having, &spec.slots);
+    }
+    let leaf_ids = db.range_index_leaf_ids(&table.schema, index, low.clone(), high.clone())?;
+    let partial = scan_covering_index_aggregate_leaf_ids(
+        db, txn, table, index, low, high, &leaf_ids, None, &spec,
+    )?;
+    let native_rows = partial.native_rows;
+    let rows = finalize_covering_index_aggregate_partials(table, having, &spec, vec![partial])?;
+    crate::engine::executor::select::analyze_stats::add_aggregate_runtime(
+        runtime_plan,
+        "ordered_index",
+        native_rows,
+        0,
+        0,
+    );
+    Ok(rows)
+}
+
+pub(in crate::engine::executor::select) fn build_covering_index_aggregate_spec(
+    table: &PlanTable,
+    index: &IndexSchema,
+    group_by: &[Expr],
+    having: Option<&Expr>,
+    aggregates: &[Expr],
+) -> Result<CoveringIndexAggregateSpec, QueryError> {
+    let mut slot_exprs: Vec<&Expr> = aggregates.iter().collect();
+    if let Some(h) = having {
+        slot_exprs.push(h);
+    }
+    let mut slots =
+        crate::engine::executor::select::aggregate::collect_aggregate_slots(&slot_exprs);
+    for slot in &mut slots {
+        if matches!(
+            slot.kind(),
+            Some(super::aggregate::AggregateKind::Min | super::aggregate::AggregateKind::Max)
+        ) {
+            slot.comparison_collation = slot
+                .args
+                .first()
+                .and_then(|expr| crate::engine::expr::expr_collation(expr, &table.schema))
+                .map(|info| info.collation_id);
+        }
+    }
+    if slots.iter().any(|s| s.has_order_by()) {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "GROUP_CONCAT/JSON_ARRAYAGG with ORDER BY is not supported by covering index aggregate",
+        ));
+    }
+    let key_map: HashMap<String, usize> = index
+        .effective_columns()
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| (col.to_ascii_lowercase(), idx))
+        .collect();
+    let input_for_expr = |expr: &Expr| -> Result<CoveringAggInput, QueryError> {
+        let source_expr = match expr {
+            Expr::Function {
+                name,
+                args,
+                distinct: false,
+            } if name == "__DISTINCT_COLLATION_KEY" && args.len() == 1 => &args[0],
+            _ => expr,
+        };
+        let Some(col_idx) = simple_column_index_of(source_expr, &table.schema) else {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "covering index aggregate only supports simple column arguments",
+            ));
+        };
+        let col = &table.schema.columns[col_idx];
+        let Some(key_pos) = key_map.get(&col.name.to_ascii_lowercase()).copied() else {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                format!("column {} is not covered by index {}", col.name, index.name),
+            ));
+        };
+        Ok(CoveringAggInput::Column {
+            key_pos,
+            data_type: col.data_type.clone(),
+        })
+    };
+    let mut group_inputs = Vec::with_capacity(group_by.len());
+    let mut group_table_indices = Vec::with_capacity(group_by.len());
+    for expr in group_by {
+        let Some(col_idx) = simple_column_index_of(expr, &table.schema) else {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "covering index aggregate only supports simple GROUP BY columns",
+            ));
+        };
+        group_inputs.push(input_for_expr(expr)?);
+        group_table_indices.push(col_idx);
+    }
+    let mut slot_inputs = Vec::with_capacity(slots.len());
+    let mut slot_fixed_scales = Vec::with_capacity(slots.len());
+    for slot in &slots {
+        if slot.is_count_star {
+            slot_inputs.push(CoveringAggInput::CountStar);
+            slot_fixed_scales.push(None);
+        } else if slot.args.is_empty() {
+            slot_inputs.push(CoveringAggInput::Null);
+            slot_fixed_scales.push(None);
+        } else {
+            let input = input_for_expr(&slot.args[0])?;
+            let scale = if slot.name.eq_ignore_ascii_case("SUM") {
+                let column_index = simple_column_index_of(&slot.args[0], &table.schema);
+                column_index.and_then(|index| match table.schema.columns[index].data_type {
+                    DataTypeKind::Float {
+                        scale: Some(scale), ..
+                    }
+                    | DataTypeKind::Double {
+                        scale: Some(scale), ..
+                    } => Some(scale),
+                    _ => None,
+                })
+            } else {
+                None
+            };
+            slot_inputs.push(input);
+            slot_fixed_scales.push(scale);
+        }
+    }
+    let mut float_restorer = IndexFloatValueRestorer::new(table, index, None);
+    float_restorer.positions.retain(|(position, _)| {
+        group_inputs.iter().any(
+            |input| matches!(input,CoveringAggInput::Column { key_pos,.. } if key_pos==position),
+        ) || slots.iter().zip(&slot_inputs).any(|(slot, input)| {
+            !matches!(
+                slot.kind(),
+                Some(
+                    super::aggregate::AggregateKind::Count
+                        | super::aggregate::AggregateKind::CountDistinct
+                )
+            ) && matches!(input,CoveringAggInput::Column { key_pos,.. } if key_pos==position)
+        })
+    });
+    Ok(CoveringIndexAggregateSpec {
+        float_restorer,
+        slots,
+        slot_inputs,
+        slot_fixed_scales,
+        group_inputs,
+        group_table_indices,
+    })
+}
+
+pub(in crate::engine::executor::select) fn scan_covering_index_aggregate_leaf_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    leaf_ids: &[u64],
+    seed_leaf_id: Option<u64>,
+    spec: &CoveringIndexAggregateSpec,
+) -> Result<CoveringIndexAggregatePartial, QueryError> {
+    let heap = db.cached_heap_handle(table.schema.id)?;
+    let streaming = covering_group_is_index_prefix(index, spec);
+    let mut repairs =
+        db.snapshot_leaf_repairs(&table.schema, index, low.clone(), high.clone(), txn);
+    let epoch = db.index_repair_rollback_epoch(table.schema.id, &index.name);
+    // A writer retiring keys mid-stream restarts the slice in buffered mode.
+    let state = loop {
+        let mut state = CoveringStreamingState::new(spec, streaming);
+        let complete = db.visit_index_leaf_entry_chunks_for_snapshot(
+            &mut repairs,
+            &table.schema,
+            index,
+            leaf_ids,
+            seed_leaf_id,
+            low.clone(),
+            high.clone(),
+            |entries, page_max_trx_id| {
+                // InnoDB-style PAGE_MAX_TRX_ID shortcut: skip the whole
+                // per-entry visibility filter when the leaf's writer
+                // upper bound proves visibility to `txn` and no repairs pend.
+                // Covering aggregates then consume index values directly
+                // without probing heap MVCC headers.
+                let _exact = (db.index_repair_rollback_epoch(table.schema.id, &index.name)
+                    != epoch)
+                    .then(crate::storage::ExactIndexVisibility::enter);
+                let visible = db
+                    .try_index_page_max_trx_shortcut_for(
+                        table.schema.id,
+                        &index.name,
+                        page_max_trx_id,
+                        txn,
+                        entries.len(),
+                    )
+                    .map(Ok::<_, QueryError>)
+                    .unwrap_or_else(|| {
+                        db.filter_visible_index_entries_refs_mask_with_handle(
+                            &heap,
+                            &table.schema,
+                            index,
+                            entries,
+                            txn,
+                        )
+                    })?;
+                state.consume(spec, entries, &visible, db, txn)
+            },
+        )?;
+        if complete {
+            break state;
+        }
+    };
+    Ok(state.finish(spec))
+}
+
+/// True when every GROUP BY column maps to a distinct index key
+/// position 0..k (in order) — i.e. the group keys form a prefix of
+/// the index sort key. In that case the index leaf scan delivers
+/// rows already grouped: same group_key entries arrive contiguously
+/// and group_keys are monotonic. We can keep one active accumulator
+/// at a time and flush on group-key change (O(1) memory + 0 hash
+/// operations on the hot path).
+///
+/// Conservative: only returns `true` when the group columns line up
+/// 1:1 with `key_pos = 0,1,..k-1`. A reordered or non-prefix group
+/// list keeps the hash path.
+pub(super) fn covering_group_is_index_prefix(
+    _index: &IndexSchema,
+    spec: &CoveringIndexAggregateSpec,
+) -> bool {
+    if spec.group_inputs.is_empty() {
+        return false;
+    }
+    for (i, input) in spec.group_inputs.iter().enumerate() {
+        let key_pos = match input {
+            CoveringAggInput::Column { key_pos, .. } => *key_pos,
+            // CountStar / Null are not GROUP BY columns — bail.
+            _ => return false,
+        };
+        if key_pos != i {
+            return false;
+        }
+    }
+    true
+}
+
+pub(super) struct CoveringStreamingState {
+    pub(super) streaming: bool,
+    /// Set when the aggregate is `COUNT(*)` (one or more) with no
+    /// GROUP BY. Per-entry hashbrown probe + per-slot dispatch then
+    /// collapses to a single popcount per chunk; group key extraction
+    /// is skipped entirely (no `Vec<Value>` / `Vec<ValueKey>` per row).
+    pub(super) count_star_only: bool,
+    /// Hash path: keyed by group_key.
+    pub(super) groups:
+        hashbrown::HashMap<Vec<ValueKey>, CoveringIndexAggregateGroup, ahash::RandomState>,
+    /// Streaming path: only the currently-open group. When the next
+    /// entry produces a different group_key, we flush this into
+    /// `groups` (one insert per distinct group, never an upsert).
+    pub(super) active: Option<(Vec<ValueKey>, CoveringIndexAggregateGroup)>,
+    /// Single-group accumulator state for the `count_star_only` fast
+    /// path. Lazily initialised at the first non-empty `consume()`;
+    /// finalised by `finish()` into the synthetic empty group.
+    pub(super) count_star_state: Option<CoveringIndexAggregateGroup>,
+    /// All other ungrouped aggregates also have exactly one logical group.
+    /// Keep it directly instead of allocating two empty key vectors and
+    /// probing the same hash bucket for every visible index entry.
+    pub(super) scalar_state: Option<CoveringIndexAggregateGroup>,
+    pub(super) native_rows: u64,
+}
+
+impl CoveringStreamingState {
+    pub(super) fn new(spec: &CoveringIndexAggregateSpec, streaming: bool) -> Self {
+        let count_star_only = spec.group_inputs.is_empty()
+            && !spec.slot_inputs.is_empty()
+            && spec
+                .slot_inputs
+                .iter()
+                .all(|input| matches!(input, CoveringAggInput::CountStar));
+        Self {
+            streaming,
+            count_star_only,
+            groups: hashbrown::HashMap::with_hasher(ahash::RandomState::new()),
+            active: None,
+            count_star_state: None,
+            scalar_state: None,
+            native_rows: 0,
+        }
+    }
+
+    pub(super) fn consume(
+        &mut self,
+        spec: &CoveringIndexAggregateSpec,
+        entries: &[(&IndexKey, RowId)],
+        visible: &[bool],
+        db: &Database,
+        txn: TxnView,
+    ) -> Result<(), QueryError> {
+        let visible_count = visible.iter().filter(|visible| **visible).count();
+        self.native_rows = self.native_rows.saturating_add(visible_count as u64);
+        // Fast path: `COUNT(*)` with no GROUP BY. The dominant TPC-H
+        // shape `SELECT count(*) FROM lineitem` lands here. Without
+        // this branch the per-entry loop below performed (a) two `Vec`
+        // allocations for an empty group key, (b) a `hashbrown::entry()`
+        // probe per row, and (c) a per-slot match dispatch — all to
+        // produce a single integer increment. Here we instead popcount
+        // the visible mask (the compiler auto-vectorises `iter().filter`
+        // into a SIMD masked count on both AVX2 and NEON) and update
+        // every accumulator by that count in one call.
+        if self.count_star_only {
+            self.consume_count_star_batch(spec, visible_count);
+            // Silence the `entries` warning when this branch fires.
+            let _ = entries;
+            return Ok(());
+        }
+        if spec.group_inputs.is_empty() {
+            let state = self
+                .scalar_state
+                .get_or_insert_with(|| CoveringIndexAggregateGroup {
+                    key_values: Vec::new(),
+                    accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
+                });
+            for ((key, row_id), is_visible) in entries.iter().zip(visible.iter()) {
+                if *is_visible {
+                    if !spec.float_restorer.needs_restore(key) {
+                        update_covering_state(spec, key, state)?;
+                        continue;
+                    }
+                    let Some(key) = spec.float_restorer.key_for_row(db, txn, *row_id, key)? else {
+                        continue;
+                    };
+                    update_covering_state(spec, &key, state)?;
+                }
+            }
+            return Ok(());
+        }
+        for ((key, row_id), is_visible) in entries.iter().zip(visible.iter()) {
+            if !*is_visible {
+                continue;
+            }
+            let restored;
+            let key: &IndexKey = if spec.float_restorer.needs_restore(key) {
+                let Some(value) = spec.float_restorer.key_for_row(db, txn, *row_id, key)? else {
+                    continue;
+                };
+                restored = value;
+                &restored
+            } else {
+                *key
+            };
+            // Hot loop: build the per-row group_key once and reuse it
+            // for both the streaming compare path and the hash insert
+            // path. The Vec allocation here is the same as the legacy
+            // code; the win is avoiding the *second* allocation (the
+            // hash-map probe key) that the old path did per row.
+            let key_values: Vec<Value> = spec
+                .group_inputs
+                .iter()
+                .map(|input| covering_input_value(input, key))
+                .collect();
+            let group_key: Vec<ValueKey> = key_values.iter().map(ValueKey::from).collect();
+
+            if self.streaming {
+                // Streaming path: same key as the active group? Just
+                // update its accumulators in place — no hash, no probe
+                // key clone, no Vec alloc beyond what we already paid
+                // for the column extract.
+                let same_as_active = self
+                    .active
+                    .as_ref()
+                    .is_some_and(|(active_key, _)| active_key == &group_key);
+                if same_as_active {
+                    let (_, state) = self.active.as_mut().unwrap();
+                    update_covering_state(spec, key, state)?;
+                    continue;
+                }
+                // Group changed. Flush the prior active into `groups`
+                // (one .insert() per distinct group) before opening the
+                // new active. The leaf-scan order guarantees this group
+                // can never reappear later in the same scan, so the
+                // insert is always vacant — but we still let the
+                // HashMap handle a duplicate gracefully (a partial
+                // boundary across parallel workers can land the same
+                // key on more than one shard, and finalize_* will
+                // merge).
+                if let Some((prev_key, prev_state)) = self.active.take() {
+                    self.groups.insert(prev_key, prev_state);
+                }
+                let mut new_state = CoveringIndexAggregateGroup {
+                    key_values,
+                    accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
+                };
+                update_covering_state(spec, key, &mut new_state)?;
+                self.active = Some((group_key, new_state));
+            } else {
+                use hashbrown::hash_map::Entry;
+                let state = match self.groups.entry(group_key) {
+                    Entry::Occupied(e) => e.into_mut(),
+                    Entry::Vacant(e) => e.insert(CoveringIndexAggregateGroup {
+                        key_values,
+                        accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
+                    }),
+                };
+                update_covering_state(spec, key, state)?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(super) fn consume_count_star_batch(
+        &mut self,
+        spec: &CoveringIndexAggregateSpec,
+        count: usize,
+    ) {
+        if count == 0 {
+            return;
+        }
+        let state = self
+            .count_star_state
+            .get_or_insert_with(|| CoveringIndexAggregateGroup {
+                key_values: Vec::new(),
+                accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
+            });
+        for acc in state.accumulators.iter_mut() {
+            acc.update_count_star_batch(count);
+        }
+    }
+
+    pub(super) fn finish(
+        mut self,
+        spec: &CoveringIndexAggregateSpec,
+    ) -> CoveringIndexAggregatePartial {
+        crate::engine::perf_events::record_rows_examined(self.native_rows);
+        if let Some((key, state)) = self.active.take() {
+            self.groups.insert(key, state);
+        }
+        // Promote the count(*) fast-path accumulator into the synthetic
+        // empty group so finalize / merge see one canonical shape
+        // regardless of which consume path produced the partial.
+        if let Some(state) = self.count_star_state.take() {
+            self.groups.insert(Vec::new(), state);
+        }
+        if let Some(state) = self.scalar_state.take() {
+            self.groups.insert(Vec::new(), state);
+        }
+        if spec.group_inputs.is_empty() && self.groups.is_empty() {
+            self.groups.insert(
+                Vec::new(),
+                CoveringIndexAggregateGroup {
+                    key_values: Vec::new(),
+                    accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
+                },
+            );
+        }
+        CoveringIndexAggregatePartial {
+            groups: self.groups,
+            native_rows: self.native_rows,
+        }
+    }
+}
+
+pub(super) fn update_covering_state(
+    spec: &CoveringIndexAggregateSpec,
+    key: &IndexKey,
+    state: &mut CoveringIndexAggregateGroup,
+) -> Result<(), QueryError> {
+    for (input, acc) in spec.slot_inputs.iter().zip(state.accumulators.iter_mut()) {
+        match input {
+            CoveringAggInput::CountStar => acc.update_count_star(),
+            CoveringAggInput::Null => acc.update(Value::Null)?,
+            CoveringAggInput::Column { key_pos, .. } => {
+                match key.0.get(*key_pos) {
+                    Some(KeyPart::Null) | None => acc.update_ref(&Value::Null)?,
+                    Some(KeyPart::Int(value)) => acc.update_i64(*value)?,
+                    Some(KeyPart::UInt(value)) => acc.update_u64(*value)?,
+                    Some(KeyPart::Float32(value)) => {
+                        acc.update_f64(f64::from(crate::storage::f32_from_order_u32(*value)))?
+                    }
+                    Some(KeyPart::Float64(value)) => {
+                        acc.update_f64(crate::storage::f64_from_order_u64(*value))?
+                    }
+                    Some(KeyPart::Decimal { value, scale }) => {
+                        acc.update_decimal_parts(*value, *scale)?
+                    }
+                    // Variable-width, temporal and wide-decimal index parts
+                    // retain the established Value oracle.
+                    Some(_) => {
+                        let value = covering_input_value(input, key);
+                        acc.update_ref(&value)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(in crate::engine::executor::select) fn scan_covering_index_aggregate_page_range(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    page_lo: u64,
+    page_hi: u64,
+    low: Option<IndexBound>,
+    high: Option<IndexBound>,
+    spec: &CoveringIndexAggregateSpec,
+) -> Result<CoveringIndexAggregatePartial, QueryError> {
+    let heap = db.cached_heap_handle(table.schema.id)?;
+    let streaming = covering_group_is_index_prefix(index, spec);
+    let mut state = CoveringStreamingState::new(spec, streaming);
+    let mut scan_page_lo = page_lo;
+    if state.count_star_only && low.is_none() && high.is_none() {
+        let (visible_prefix_count, resume_page) = db.count_visible_index_leaf_prefix_page_range(
+            &table.schema,
+            index,
+            page_lo,
+            page_hi,
+            txn,
+        )?;
+        state.native_rows = state.native_rows.saturating_add(visible_prefix_count);
+        state.consume_count_star_batch(spec, visible_prefix_count as usize);
+        if resume_page >= page_hi {
+            return Ok(state.finish(spec));
+        }
+        scan_page_lo = resume_page;
+    }
+    if low.is_none()
+        && high.is_none()
+        && spec.group_inputs.is_empty()
+        && !matches!(
+            crate::engine::executor::vec::config::effective_mode(),
+            crate::engine::executor::vec::config::VecMode::Off
+        )
+    {
+        let input = spec.slot_inputs.iter().find_map(|input| match input {
+            CoveringAggInput::Column { key_pos, data_type } => Some((*key_pos, data_type)),
+            _ => None,
+        });
+        if let Some((position, data_type)) = input.filter(|(position, data_type)| {
+            matches!(
+                data_type,
+                DataTypeKind::TinyInt
+                    | DataTypeKind::SmallInt
+                    | DataTypeKind::MediumInt
+                    | DataTypeKind::Int
+                    | DataTypeKind::BigInt
+                    | DataTypeKind::Date
+                    | DataTypeKind::Time { .. }
+                    | DataTypeKind::DateTime { .. }
+                    | DataTypeKind::Timestamp { .. }
+                    | DataTypeKind::Year
+            ) && spec.slot_inputs.iter().all(|input| match input {
+                CoveringAggInput::Column { key_pos, .. } => key_pos == position,
+                CoveringAggInput::CountStar => true,
+                CoveringAggInput::Null => false,
+            })
+        }) {
+            scan_page_lo = db.visit_visible_index_numeric_prefix_page_range(
+                &table.schema,
+                index,
+                scan_page_lo,
+                page_hi,
+                txn,
+                position,
+                data_type,
+                |values| {
+                    let scalar =
+                        state
+                            .scalar_state
+                            .get_or_insert_with(|| CoveringIndexAggregateGroup {
+                                key_values: Vec::new(),
+                                accumulators: spec
+                                    .slots
+                                    .iter()
+                                    .map(|s| s.make_accumulator())
+                                    .collect(),
+                            });
+                    for (input, accumulator) in
+                        spec.slot_inputs.iter().zip(&mut scalar.accumulators)
+                    {
+                        if matches!(input, CoveringAggInput::CountStar) {
+                            accumulator.update_count_star_batch(values.len());
+                        } else {
+                            accumulator.update_batch(values)?;
+                        }
+                    }
+                    state.native_rows = state.native_rows.saturating_add(values.len() as u64);
+                    Ok(())
+                },
+            )?;
+            if scan_page_lo >= page_hi {
+                return Ok(state.finish(spec));
+            }
+        }
+    }
+    db.visit_index_leaf_page_range_entry_chunks_with_bound(
+        &table.schema,
+        index,
+        scan_page_lo,
+        page_hi,
+        low,
+        high,
+        |entries, page_max_trx_id| {
+            let visible = db
+                .try_index_page_max_trx_shortcut_for(
+                    table.schema.id,
+                    &index.name,
+                    page_max_trx_id,
+                    txn,
+                    entries.len(),
+                )
+                .map(Ok::<_, QueryError>)
+                .unwrap_or_else(|| {
+                    db.filter_visible_index_entries_refs_mask_with_handle(
+                        &heap,
+                        &table.schema,
+                        index,
+                        entries,
+                        txn,
+                    )
+                })?;
+            state.consume(spec, entries, &visible, db, txn)
+        },
+    )?;
+    Ok(state.finish(spec))
+}
+
+pub(super) fn covering_input_value(input: &CoveringAggInput, key: &IndexKey) -> Value {
+    match input {
+        CoveringAggInput::CountStar | CoveringAggInput::Null => Value::Null,
+        CoveringAggInput::Column { key_pos, data_type } => key
+            .0
+            .get(*key_pos)
+            .map(|part| part.to_value(data_type))
+            .unwrap_or(Value::Null),
+    }
+}
+
+pub(in crate::engine::executor::select) fn finalize_covering_index_aggregate_partials(
+    table: &PlanTable,
+    having: Option<&Expr>,
+    spec: &CoveringIndexAggregateSpec,
+    partials: Vec<CoveringIndexAggregatePartial>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    use hashbrown::hash_map::Entry;
+    let mut merged: hashbrown::HashMap<
+        Vec<ValueKey>,
+        CoveringIndexAggregateGroup,
+        ahash::RandomState,
+    > = hashbrown::HashMap::with_hasher(ahash::RandomState::new());
+    let parallel_count = if spec.group_inputs.is_empty()
+        && spec.slots.len() == 1
+        && !matches!(
+            crate::engine::executor::vec::config::effective_mode(),
+            crate::engine::executor::vec::config::VecMode::Off
+        ) {
+        if let Some(budget) = crate::engine::executor::mem_budget::current_budget() {
+            let mut sources = smallvec::SmallVec::<
+                [&hashbrown::HashSet<ValueKey, ahash::RandomState>; 16],
+            >::new();
+            let mut eligible = partials.len() <= 16;
+            if eligible {
+                for partial in &partials {
+                    if partial.groups.len() > 1 {
+                        eligible = false;
+                        break;
+                    }
+                    if let Some((key, group)) = partial.groups.iter().next() {
+                        if !key.is_empty() {
+                            eligible = false;
+                            break;
+                        }
+                        let Some(keys) = group
+                            .accumulators
+                            .first()
+                            .and_then(|acc| acc.count_distinct_keys())
+                        else {
+                            eligible = false;
+                            break;
+                        };
+                        sources.push(keys);
+                    }
+                }
+            }
+            if eligible {
+                crate::engine::executor::hash_aggregate::parallel_distinct::count_union(
+                    &sources, &budget,
+                )?
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    if let Some(count) = parallel_count {
+        merged.insert(
+            Vec::new(),
+            CoveringIndexAggregateGroup {
+                key_values: Vec::new(),
+                accumulators: vec![
+                    crate::engine::executor::select::aggregate::finalized_distinct_count(count),
+                ],
+            },
+        );
+        drop(partials);
+    } else {
+        for partial in partials {
+            for (key, group) in partial.groups {
+                match merged.entry(key) {
+                    Entry::Vacant(e) => {
+                        e.insert(group);
+                    }
+                    Entry::Occupied(mut e) => {
+                        let dst = e.get_mut();
+                        for (dst_acc, src_acc) in dst
+                            .accumulators
+                            .iter_mut()
+                            .zip(group.accumulators.into_iter())
+                        {
+                            dst_acc.merge_from(src_acc.into_any());
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if spec.group_inputs.is_empty() && merged.is_empty() {
+        merged.insert(
+            Vec::new(),
+            CoveringIndexAggregateGroup {
+                key_values: Vec::new(),
+                accumulators: spec.slots.iter().map(|s| s.make_accumulator()).collect(),
+            },
+        );
+    }
+
+    // Hot-loop hoist: previously the row-builder loop below called
+    // `intern_col_meta` once per (group × column), each call running
+    // SipHash over the full `ColMeta` (table+alias+column+type+source)
+    // — for TPC-H Q18 sf=5 that's 7.5M groups × 16 lineitem columns
+    // = 120M hashes, which profile shows as 23% of the *main* thread's
+    // CPU. The `&'static ColMeta` is invariant across all groups for a
+    // given (table, column) pair, so build the vec once and reuse.
+    // Same for `group_table_indices` lookup: O(group_by.len()) per
+    // column per group → precompute `column_idx → Some(group_pos)`.
+    let col_metas: Vec<ColMetaRef> = table
+        .schema
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, _)| intern_col_meta(ColMeta::from_table(table, idx)))
+        .collect();
+    let mut col_to_group_pos: Vec<Option<usize>> = vec![None; table.schema.columns.len()];
+    for (pos, &group_idx) in spec.group_table_indices.iter().enumerate() {
+        if let Some(slot) = col_to_group_pos.get_mut(group_idx) {
+            *slot = Some(pos);
+        }
+    }
+
+    let mut out = Vec::with_capacity(merged.len());
+    for (_, group) in merged {
+        let mut cache: HashMap<u64, Value> = HashMap::with_capacity(spec.slots.len());
+        for ((slot, scale), acc) in spec
+            .slots
+            .iter()
+            .zip(spec.slot_fixed_scales.iter())
+            .zip(group.accumulators.into_iter())
+        {
+            let value = acc.finalize()?;
+            let value = match (scale, value) {
+                (Some(scale), Value::Double(value)) => {
+                    Value::Decimal(format!("{value:.scale$}", scale = usize::from(*scale)))
+                }
+                (_, value) => value,
+            };
+            cache.insert(slot.key, value);
+        }
+        let mut fields = Vec::with_capacity(col_metas.len() + group.key_values.len());
+        for (idx, meta) in col_metas.iter().enumerate() {
+            let value = match col_to_group_pos[idx] {
+                Some(pos) => group.key_values[pos].clone(),
+                None => Value::Null,
+            };
+            fields.push(PlanField {
+                meta: meta.clone(),
+                value,
+            });
+        }
+        for (idx, value) in group.key_values.into_iter().enumerate() {
+            fields.push(crate::engine::executor::select::aggregate::group_marker_field(idx, value));
+        }
+        let row = PlanRow {
+            fields,
+            group: Some(Vec::new()),
+            agg_values: Some(std::sync::Arc::new(cache)),
+            schema: PlanRow::empty_schema(),
+        };
+        if having
+            .map(|expr| eval_aggregate_bool(expr, &[], &row))
+            .transpose()?
+            .unwrap_or(true)
+        {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+pub(super) fn index_min_max_value(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    col: &str,
+    reverse: bool,
+) -> Result<Value, QueryError> {
+    let col_idx = index
+        .columns
+        .iter()
+        .position(|c| c.eq_ignore_ascii_case(col))
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                format!("MIN/MAX pushdown column {col} not in index {}", index.name),
+            )
+        })?;
+    let table_col = table
+        .schema
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(col))
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_BAD_FIELD_ERROR,
+                format!("MIN/MAX pushdown column {col} missing on table"),
+            )
+        })?;
+    let projected_column = table.schema.column_index(col)?;
+    let float_restorer = IndexFloatValueRestorer::new(table, index, Some(&[projected_column]));
+    const CHUNK: usize = 256;
+    let heap = db.cached_heap_handle(table.schema.id)?;
+    if reverse {
+        let mut cursor =
+            db.range_index_snapshot_reverse_cursor(&table.schema, index, None, None, txn)?;
+        loop {
+            let chunk = cursor.next_chunk(CHUNK)?;
+            if chunk.is_empty() {
+                return Ok(Value::Null);
+            }
+            for (key, row_id) in &chunk {
+                if !db.is_index_entry_version_visible(&table.schema, index, key, *row_id, txn)? {
+                    continue;
+                }
+                let restored;
+                let key = if float_restorer.needs_restore(key) {
+                    let Some(value) = float_restorer.key_for_row(db, txn, *row_id, key)? else {
+                        continue;
+                    };
+                    restored = value;
+                    &restored
+                } else {
+                    key
+                };
+                if let Some(part) = key.0.get(col_idx) {
+                    let v = part.to_value(&table_col.data_type);
+                    if !matches!(v, Value::Null) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+    } else {
+        let mut cursor = db.range_index_snapshot_cursor(&table.schema, index, None, None, txn)?;
+        loop {
+            let chunk = cursor.next_chunk(CHUNK)?;
+            if chunk.is_empty() {
+                return Ok(Value::Null);
+            }
+            let visible_mask = db.filter_visible_index_entries_mask_with_handle(
+                &heap,
+                &table.schema,
+                index,
+                &chunk,
+                txn,
+            )?;
+            for ((key, row_id), visible) in chunk.into_iter().zip(visible_mask.into_iter()) {
+                if !visible {
+                    continue;
+                }
+                let restored;
+                let key = if float_restorer.needs_restore(&key) {
+                    let Some(value) = float_restorer.key_for_row(db, txn, row_id, &key)? else {
+                        continue;
+                    };
+                    restored = value;
+                    &restored
+                } else {
+                    &key
+                };
+                if let Some(part) = key.0.get(col_idx) {
+                    let v = part.to_value(&table_col.data_type);
+                    if !matches!(v, Value::Null) {
+                        return Ok(v);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Equality-normalized float keys omit the sign of zero. Recover only those
+/// projected cells from the visible heap version; other keys stay index-only.
+#[derive(Debug)]
+pub(super) struct IndexFloatValueRestorer {
+    schema: Arc<TableSchema>,
+    positions: Vec<(usize, usize)>,
+}
+
+enum FloatRestoreRows {
+    Ordered {
+        rows: Vec<(RowId, Vec<Value>)>,
+        cursor: std::cell::Cell<usize>,
+        reverse: bool,
+    },
+    Scattered(crate::util::fast_hash::AhHashMap<RowId, Vec<Value>>),
+}
+
+impl FloatRestoreRows {
+    fn get(&self, id: RowId) -> Option<&[Value]> {
+        match self {
+            Self::Scattered(rows) => rows.get(&id).map(Vec::as_slice),
+            Self::Ordered {
+                rows,
+                cursor,
+                reverse,
+            } => {
+                let current = cursor.get();
+                let position = if rows.get(current).is_some_and(|(row, _)| *row == id) {
+                    current
+                } else {
+                    rows.binary_search_by_key(&id, |(row, _)| *row).ok()?
+                };
+                cursor.set(if *reverse {
+                    position.saturating_sub(1)
+                } else {
+                    position + 1
+                });
+                Some(rows[position].1.as_slice())
+            }
+        }
+    }
+}
+
+pub(crate) struct IndexFloatRestoreBatch {
+    values: FloatRestoreRows,
+    positions: Vec<usize>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
+
+impl IndexFloatValueRestorer {
+    fn new(table: &PlanTable, index: &IndexSchema, projection: Option<&[usize]>) -> Self {
+        let positions = index
+            .effective_columns()
+            .iter()
+            .enumerate()
+            .filter_map(|(key_pos, name)| {
+                let column = table.schema.column_index(name).ok()?;
+                (matches!(
+                    table.schema.columns[column].data_type,
+                    DataTypeKind::Float { .. } | DataTypeKind::Double { .. }
+                ) && projection.is_none_or(|columns| columns.contains(&column)))
+                .then_some((key_pos, column))
+            })
+            .collect();
+        Self {
+            schema: Arc::clone(&table.schema),
+            positions,
+        }
+    }
+
+    #[inline]
+    fn needs_restore(&self, key: &IndexKey) -> bool {
+        self.positions.iter().any(|(position, _)| {
+            matches!(
+                key.0.get(*position),
+                Some(KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000))
+            )
+        })
+    }
+
+    fn key_for_row<'a>(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        row_id: RowId,
+        key: &'a IndexKey,
+    ) -> Result<Option<std::borrow::Cow<'a, IndexKey>>, QueryError> {
+        let zero_positions: smallvec::SmallVec<[(usize, usize); 4]> = self
+            .positions
+            .iter()
+            .copied()
+            .filter(|(position, _)| {
+                matches!(
+                    key.0.get(*position),
+                    Some(KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000))
+                )
+            })
+            .collect();
+        if zero_positions.is_empty() {
+            return Ok(Some(std::borrow::Cow::Borrowed(key)));
+        }
+        let columns: smallvec::SmallVec<[usize; 4]> =
+            zero_positions.iter().map(|(_, column)| *column).collect();
+        let Some(values) = db.read_row_columns(&self.schema, row_id, txn, &columns)? else {
+            return Ok(None);
+        };
+        crate::engine::executor::select::analyze_stats::add_range_scan_work(0, 1, 1);
+        Ok(Self::restore_values(
+            key,
+            zero_positions
+                .iter()
+                .map(|(position, _)| *position)
+                .zip(values.iter()),
+        ))
+    }
+
+    fn restore_values<'key, 'value>(
+        key: &'key IndexKey,
+        values: impl Iterator<Item = (usize, &'value Value)>,
+    ) -> Option<std::borrow::Cow<'key, IndexKey>> {
+        let mut restored: Option<IndexKey> = None;
+        for (position, value) in values {
+            if !matches!(
+                key.0.get(position),
+                Some(KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000))
+            ) {
+                continue;
+            }
+            let part = match value {
+                Value::Float(value) if *value == 0.0 => {
+                    KeyPart::Float32(crate::util::ordered_float::f32_to_order_u32(*value))
+                }
+                Value::Double(value) if *value == 0.0 => {
+                    KeyPart::Float64(crate::util::ordered_float::f64_to_order_u64(*value))
+                }
+                _ => return None,
+            };
+            if key.0.get(position) != Some(&part) {
+                restored.get_or_insert_with(|| key.clone()).0[position] = part;
+            }
+        }
+        Some(match restored {
+            Some(key) => std::borrow::Cow::Owned(key),
+            None => std::borrow::Cow::Borrowed(key),
+        })
+    }
+
+    fn key_for_batch_row<'a>(
+        &self,
+        row_id: RowId,
+        key: &'a IndexKey,
+        batch: &IndexFloatRestoreBatch,
+    ) -> Option<std::borrow::Cow<'a, IndexKey>> {
+        let values = batch.values.get(row_id)?;
+        Self::restore_values(key, batch.positions.iter().copied().zip(values.iter()))
+    }
+
+    fn prepare_batch<'a>(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        entries: impl Iterator<Item = (&'a IndexKey, RowId)> + Clone,
+        heap: impl FnOnce() -> Result<HeapHandle, QueryError>,
+    ) -> Result<Option<IndexFloatRestoreBatch>, QueryError> {
+        if self.positions.is_empty() {
+            return Ok(None);
+        }
+        let count = entries
+            .clone()
+            .filter(|(key, _)| self.needs_restore(key))
+            .count();
+        if count < 8 {
+            return Ok(None);
+        }
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        // Optional admission must not latch terminal query OOM on refusal.
+        let Some(mut charge) = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::StorageScratch,
+            self.positions.len().saturating_mul(64),
+        ) else {
+            return Ok(None);
+        };
+        let selected: Vec<(usize, usize)> = self
+            .positions
+            .iter()
+            .copied()
+            .filter(|(position, _)| {
+                entries.clone().any(|(key, _)| {
+                    matches!(
+                        key.0.get(*position),
+                        Some(
+                            KeyPart::Float32(0x8000_0000) | KeyPart::Float64(0x8000_0000_0000_0000)
+                        )
+                    )
+                })
+            })
+            .collect();
+        let bytes_per_row = 128usize.saturating_add(
+            selected
+                .len()
+                .saturating_mul(2 * std::mem::size_of::<Value>()),
+        );
+        let Some(mut rows_charge) = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::StorageScratch,
+            count.saturating_mul(bytes_per_row),
+        ) else {
+            return Ok(None);
+        };
+        charge.absorb(&mut rows_charge);
+        let mut ids: Vec<RowId> = entries
+            .filter_map(|(key, id)| self.needs_restore(key).then_some(id))
+            .collect();
+        let ascending = ids.windows(2).all(|pair| pair[0] <= pair[1]);
+        let descending = !ascending && ids.windows(2).all(|pair| pair[0] >= pair[1]);
+        ids.sort_unstable();
+        ids.dedup();
+        let columns: Vec<usize> = selected.iter().map(|(_, column)| *column).collect();
+        let mut values =
+            db.read_row_columns_many_with_handle(&heap()?, &self.schema, &ids, txn, &columns)?;
+        let page_probes = 1 + ids
+            .windows(2)
+            .filter(|pair| pair[0].page_id != pair[1].page_id)
+            .count();
+        crate::engine::executor::select::analyze_stats::add_range_scan_work(
+            0,
+            values.len() as u64,
+            page_probes as u64,
+        );
+        let values = if ascending || descending {
+            // Current-version hits and old-version fallbacks can arrive in
+            // separate runs. Restore RowId order before cursor lookups.
+            if !values.windows(2).all(|pair| pair[0].0 <= pair[1].0) {
+                values.sort_unstable_by_key(|(id, _)| *id);
+            }
+            let cursor = std::cell::Cell::new(if descending {
+                values.len().saturating_sub(1)
+            } else {
+                0
+            });
+            FloatRestoreRows::Ordered {
+                rows: values,
+                cursor,
+                reverse: descending,
+            }
+        } else {
+            FloatRestoreRows::Scattered(values.into_iter().collect())
+        };
+        Ok(Some(IndexFloatRestoreBatch {
+            values,
+            positions: selected.iter().map(|(position, _)| *position).collect(),
+            _charge: charge,
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct IndexEntryProjector {
+    float_restorer: IndexFloatValueRestorer,
+    pub(super) metas: Vec<ColMetaRef>,
+    pub(super) key_positions: Vec<Option<usize>>,
+    pub(super) data_types: Vec<DataTypeKind>,
+}
+
+impl IndexEntryProjector {
+    pub(crate) fn retained_bytes(&self) -> Option<usize> {
+        struct Count(usize);
+        impl std::io::Write for Count {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0 = self.0.saturating_add(bytes.len());
+                Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut bytes = Count(0);
+        serde_json::to_writer(&mut bytes, &self.data_types).ok()?;
+        Some(
+            bytes
+                .0
+                .saturating_mul(8)
+                .saturating_add(
+                    self.data_types
+                        .len()
+                        .saturating_mul(std::mem::size_of::<DataTypeKind>() + 128),
+                )
+                .saturating_add(256),
+        )
+    }
+    pub(crate) fn single_bytes_key_position(&self) -> Option<usize> {
+        let [data_type] = self.data_types.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            data_type,
+            DataTypeKind::VarChar { .. }
+                | DataTypeKind::Text { .. }
+                | DataTypeKind::Binary { .. }
+                | DataTypeKind::VarBinary { .. }
+                | DataTypeKind::Blob { .. }
+        ) {
+            return None;
+        }
+        self.key_positions.first().copied().flatten()
+    }
+
+    pub(crate) fn new(
+        table: &PlanTable,
+        index: &IndexSchema,
+        projection: Option<&[usize]>,
+    ) -> Self {
+        // Both declared key columns and INCLUDE columns are encoded into
+        // the IndexKey (in that order), so a covering scan can read either.
+        let key_map: HashMap<String, usize> = index
+            .effective_columns()
+            .iter()
+            .enumerate()
+            .map(|(i, name)| (name.to_ascii_lowercase(), i))
+            .collect();
+        let columns: Vec<usize> = projection
+            .map(|p| p.to_vec())
+            .unwrap_or_else(|| logical_visible_column_indices(&table.schema));
+        let float_restorer = IndexFloatValueRestorer::new(table, index, Some(&columns));
+        let mut metas = Vec::with_capacity(columns.len());
+        let mut key_positions = Vec::with_capacity(columns.len());
+        let mut data_types = Vec::with_capacity(columns.len());
+        for col_idx in columns {
+            let Some(column) = table.schema.columns.get(col_idx) else {
+                continue;
+            };
+            key_positions.push(key_map.get(&column.name.to_ascii_lowercase()).copied());
+            data_types.push(column.data_type.clone());
+            metas.push(intern_col_meta(ColMeta::from_table(table, col_idx)));
+        }
+        Self {
+            float_restorer,
+            metas,
+            key_positions,
+            data_types,
+        }
+    }
+
+    pub(crate) fn single_lossless_i64_key_position(&self) -> Option<usize> {
+        let [meta] = self.metas.as_slice() else {
+            return None;
+        };
+        if !matches!(
+            meta.column_type,
+            ColumnType::Tiny
+                | ColumnType::Short
+                | ColumnType::MediumInt
+                | ColumnType::Long
+                | ColumnType::LongLong
+        ) {
+            return None;
+        }
+        let unsigned = meta.source.flags & crate::mysql::protocol::UNSIGNED_FLAG != 0;
+        if unsigned && meta.column_type == ColumnType::LongLong {
+            return None;
+        }
+        self.key_positions.first().copied().flatten()
+    }
+
+    pub(crate) fn prepare_float_rows<'a>(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        entries: impl Iterator<Item = (&'a IndexKey, RowId)> + Clone,
+        heap: impl FnOnce() -> Result<HeapHandle, QueryError>,
+    ) -> Result<Option<IndexFloatRestoreBatch>, QueryError> {
+        self.float_restorer.prepare_batch(db, txn, entries, heap)
+    }
+
+    pub(in crate::engine::executor::select) fn project_visible(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        row_id: RowId,
+        key: &IndexKey,
+        batch: Option<&IndexFloatRestoreBatch>,
+    ) -> Result<Option<PlanRow>, QueryError> {
+        if !self.float_restorer.needs_restore(key) {
+            return Ok(Some(self.project(key)));
+        }
+        let key = match batch {
+            Some(batch) => self.float_restorer.key_for_batch_row(row_id, key, batch),
+            None => self.float_restorer.key_for_row(db, txn, row_id, key)?,
+        };
+        Ok(key.map(|key| self.project(&key)))
+    }
+
+    pub(crate) fn append_visible_to_accumulators(
+        &self,
+        db: &Database,
+        txn: TxnView,
+        row_id: RowId,
+        key: &IndexKey,
+        batch: Option<&IndexFloatRestoreBatch>,
+        accumulators: &mut [crate::engine::executor::vec::batch::ColumnAccumulator],
+    ) -> Result<bool, QueryError> {
+        if !self.float_restorer.needs_restore(key) {
+            self.append_to_accumulators(key, accumulators);
+            return Ok(true);
+        }
+        let key = match batch {
+            Some(batch) => self.float_restorer.key_for_batch_row(row_id, key, batch),
+            None => self.float_restorer.key_for_row(db, txn, row_id, key)?,
+        };
+        let Some(key) = key else {
+            return Ok(false);
+        };
+        self.append_to_accumulators(&key, accumulators);
+        Ok(true)
+    }
+
+    pub(in crate::engine::executor::select) fn project(&self, key: &IndexKey) -> PlanRow {
+        let mut fields = Vec::with_capacity(self.metas.len());
+        for ((meta, key_pos), data_type) in self
+            .metas
+            .iter()
+            .zip(self.key_positions.iter())
+            .zip(self.data_types.iter())
+        {
+            let value = key_pos
+                .and_then(|pos| key.0.get(pos))
+                .map(|part| part.to_value(data_type))
+                .unwrap_or(Value::Null);
+            fields.push(PlanField {
+                meta: meta.clone(),
+                value,
+            });
+        }
+        PlanRow {
+            fields,
+            group: None,
+            agg_values: None,
+            schema: PlanRow::empty_schema(),
+        }
+    }
+
+    /// Append one covering-index key straight into native column builders.
+    /// This is the batch equivalent of `project_values`, but it avoids the
+    /// short-lived `Vec<Value>` allocation that a scan would otherwise pay
+    /// once per index entry.
+    pub(crate) fn append_to_accumulators(
+        &self,
+        key: &IndexKey,
+        accumulators: &mut [crate::engine::executor::vec::batch::ColumnAccumulator],
+    ) {
+        use crate::engine::executor::vec::batch::ColumnAccumulator;
+        for ((key_pos, data_type), accumulator) in self
+            .key_positions
+            .iter()
+            .zip(self.data_types.iter())
+            .zip(accumulators.iter_mut())
+        {
+            let part = key_pos.and_then(|pos| key.0.get(pos));
+            // Copy the borrowed leaf value directly into the native lane.
+            // CHAR retains to_value's length/trailing-space normalization;
+            // uncommon lane/type combinations retain their scalar oracle.
+            match (part, &mut *accumulator) {
+                (
+                    Some(KeyPart::String(value) | KeyPart::CollatedString { value, .. }),
+                    ColumnAccumulator::Utf8 { offsets, data, .. },
+                ) if !matches!(data_type, DataTypeKind::Char { .. }) => {
+                    data.extend_from_slice(value.as_bytes());
+                    offsets.push(data.len() as u32);
+                    continue;
+                }
+                (Some(KeyPart::Bytes(value)), ColumnAccumulator::Bytes { offsets, data, .. }) => {
+                    data.extend_from_slice(value);
+                    offsets.push(data.len() as u32);
+                    continue;
+                }
+                _ => {}
+            }
+            if matches!(
+                accumulator,
+                ColumnAccumulator::I64 { .. } | ColumnAccumulator::U64 { .. }
+            ) {
+                let integer = match part {
+                    Some(KeyPart::Int(value)) => Some(
+                        if *value < 0 && matches!(accumulator, ColumnAccumulator::U64 { .. }) {
+                            None
+                        } else {
+                            Some(*value)
+                        },
+                    ),
+                    // The typed unsigned lane restores this bit pattern, so
+                    // BIGINT UNSIGNED and BIT(64) keep their complete range.
+                    Some(KeyPart::UInt(value)) => Some(Some(*value as i64)),
+                    Some(KeyPart::Null) | None => Some(None),
+                    _ => None,
+                };
+                if let Some(integer) = integer {
+                    accumulator.push_lossless_i64(integer);
+                    continue;
+                }
+            }
+            let value = part
+                .map(|part| part.to_value(data_type))
+                .unwrap_or(Value::Null);
+            accumulator.push(&value);
+        }
+    }
+}
+
+pub(in crate::engine::executor::select) fn execute_index_in_lookup_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    index: &IndexSchema,
+    key_prefix: &IndexKey,
+    in_column: &str,
+    subquery: &Select,
+    subquery_plan: &PhysicalPlan,
+) -> Result<
+    (
+        Vec<RowId>,
+        crate::engine::executor::mem_budget::ScopedCharge,
+    ),
+    QueryError,
+> {
+    let rows = match execute_physical_select(db, txn, subquery, subquery_plan)
+        .and_then(QueryResponse::materialize)?
+    {
+        QueryResponse::ResultSet(result) => result.rows,
+        QueryResponse::SharedResultSet(result) => result.rows,
+        _ => {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "IN subquery must return rows",
+            ))
+        }
+    };
+    // The IN key (`key_prefix` ∪ `in_column`) spans the whole index only
+    // when it reaches the last index column. On a composite index where
+    // `in_column` is a non-terminal prefix (e.g. inventory's PRIMARY
+    // `(inv_date_sk, inv_item_sk, inv_warehouse_sk)` driven by
+    // `inv_date_sk IN (...)`), an *exact* seek matches no full key and
+    // silently returns zero rows. Fall back to a prefix scan so every row
+    // whose leading columns equal the key is visited.
+    let exact = key_prefix.0.len() + 1 >= index.columns.len();
+    let mut batched = exact && index.unique && !table.is_partitioned() && !txn.historical;
+    let mut row_ids = Vec::new();
+    let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    // Keep only one bounded probe window. Sorting/deduplicating encoded keys
+    // also collapses values that become equal after index collation/coercion.
+    let mut keys = Vec::new();
+    let mut keys_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    let workspace = keys_charge.remaining() / 4;
+    let batch_size = rows
+        .len()
+        .min(crate::engine::executor::vec::DEFAULT_BATCH_ROWS)
+        .min(workspace / (8 * std::mem::size_of::<IndexKey>()));
+    let key_bytes = batch_size.saturating_mul(std::mem::size_of::<IndexKey>());
+    // Reserve fixed-width keys and storage's temporary copies once per
+    // window; numeric probes must not perform memory-governor atomics per key.
+    let fixed_key_bytes = key_bytes.saturating_mul(5);
+    if batched
+        && (batch_size == 0
+            || !keys_charge.add_within(fixed_key_bytes, workspace)
+            || keys.try_reserve_exact(batch_size).is_err())
+    {
+        batched = false;
+        keys_charge.release_bytes(fixed_key_bytes);
+    }
+    let column = &table.columns[table.column_index(in_column)?];
+    let target = crate::storage::ParamTarget::for_column_with_collation(
+        &column.data_type,
+        column.unsigned,
+        column.collation.as_deref(),
+    );
+    let mut seen_values = HashSet::new();
+    let mut payload_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    let mut payload_bytes = 0usize;
+    for row in rows {
+        let Some(value) = row.first() else {
+            continue;
+        };
+        if matches!(value, Value::Null) || !seen_values.insert(ValueKey::from(value)) {
+            continue;
+        }
+        let mut parts = key_prefix.0.clone();
+        let Some(part) = key_part_for_lookup_target(target, value)? else {
+            continue;
+        };
+        parts.push(part);
+        let key = IndexKey::from(parts);
+        if !batched {
+            let ids = if exact {
+                db.lookup_index_visible(table, index, key, txn)?
+            } else {
+                db.prefix_index_visible(table, index, key, txn)?
+            };
+            append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+            crate::engine::cancel::check_cancelled()?;
+            continue;
+        }
+        // Include the concrete-key and encoded-entry copies used by storage.
+        let retained = key.heap_capacity_bytes().saturating_mul(4);
+        if retained != 0 && !payload_charge.add_within(retained, workspace) {
+            if !keys.is_empty() {
+                let ids = db.lookup_index_candidates_many(table, index, &keys, txn)?;
+                append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+                keys.clear();
+            }
+            payload_charge.release_bytes(payload_bytes);
+            payload_bytes = 0;
+            batched = false;
+            let ids = db.lookup_index_visible(table, index, key, txn)?;
+            append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+            continue;
+        }
+        payload_bytes = payload_bytes.saturating_add(retained);
+        keys.push(key);
+        if keys.len() == batch_size {
+            let ids = db.lookup_index_candidates_many(table, index, &keys, txn)?;
+            append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+            keys.clear();
+            payload_charge.release_bytes(payload_bytes);
+            payload_bytes = 0;
+            crate::engine::cancel::check_cancelled()?;
+        }
+    }
+    if !keys.is_empty() {
+        let ids = db.lookup_index_candidates_many(table, index, &keys, txn)?;
+        append_lookup_row_ids(&mut row_ids, ids, &mut charge)?;
+    }
+    // Different SQL values can encode to the same index key (collation,
+    // coercion), and MVCC repair can revisit an identifier. Deduplicate the
+    // compact candidate array itself instead of retaining a second full-size
+    // hash table. Physical order also gives downstream heap reads locality.
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok((row_ids, charge))
+}
+
+pub(in crate::engine::executor::select) fn execute_index_multi_lookup_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    index: &IndexSchema,
+    keys: &[IndexKey],
+    exact: bool,
+) -> Result<Vec<RowId>, QueryError> {
+    let mut row_ids = Vec::new();
+    let mut seen = HashSet::new();
+    let ordered_keys = runtime_ordered_multi_lookup_keys(keys)?;
+    for key in ordered_keys.as_ref() {
+        let ids = if exact {
+            db.lookup_index_visible(table, index, key.clone(), txn)?
+        } else {
+            db.prefix_index_visible(table, index, key.clone(), txn)?
+        };
+        for row_id in ids {
+            if seen.insert(row_id) {
+                row_ids.push(row_id);
+            }
+        }
+    }
+    Ok(row_ids)
+}
+
+fn append_lookup_row_ids(
+    out: &mut Vec<RowId>,
+    ids: Vec<RowId>,
+    charge: &mut crate::engine::executor::mem_budget::ScopedCharge,
+) -> Result<(), QueryError> {
+    if out.capacity() == 0 {
+        // Transfer the first probe's allocation instead of allocating and
+        // copying it again. Subsequent growth is geometric, so a large keyset
+        // cannot cause one full-array reallocation per probe.
+        charge.add_force(ids.capacity().saturating_mul(std::mem::size_of::<RowId>()))?;
+        *out = ids;
+        return Ok(());
+    }
+    let required = out.len().checked_add(ids.len()).ok_or_else(|| {
+        crate::engine::executor::mem_budget::allocation_error("lookup row identifier overflow")
+    })?;
+    if required > out.capacity() {
+        let capacity = required.max(out.capacity().saturating_mul(2));
+        crate::engine::executor::mem_budget::try_reserve_vec_hard(
+            out,
+            capacity - out.len(),
+            charge,
+            "lookup row identifiers",
+        )?;
+    }
+    out.extend(ids);
+    Ok(())
+}
+
+/// Execute the RowId-only part of an Index Merge. Each recursive result is
+/// sorted and unique, which makes nested union/intersection deterministic and
+/// gives the final heap fetch physical-page locality.
+pub(crate) fn execute_index_merge_row_ids(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    node: &crate::planner::IndexMergeNode,
+) -> Result<Vec<RowId>, QueryError> {
+    let (ids, candidate_rowids, duplicates_removed) =
+        execute_index_merge_row_ids_inner(db, txn, table, node)?;
+    crate::engine::executor::select::analyze_stats::add_index_merge_work(
+        node.leaf_count() as u64,
+        candidate_rowids,
+        duplicates_removed,
+    );
+    Ok(ids)
+}
+
+pub(super) fn execute_index_merge_row_ids_inner(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    node: &crate::planner::IndexMergeNode,
+) -> Result<(Vec<RowId>, u64, u64), QueryError> {
+    use crate::planner::{IndexAccessKind, IndexMergeNode};
+
+    let (mut ids, candidate_rowids, mut duplicates_removed) = match node {
+        IndexMergeNode::Leaf(leaf) => {
+            let ids = match &leaf.access {
+                IndexAccessKind::Lookup { key, exact } => {
+                    if *exact {
+                        db.lookup_index_visible(table, &leaf.index, key.clone(), txn)?
+                    } else {
+                        db.prefix_index_visible(table, &leaf.index, key.clone(), txn)?
+                    }
+                }
+                IndexAccessKind::MultiLookup { keys, exact } => {
+                    execute_index_multi_lookup_ids(db, txn, table, &leaf.index, keys, *exact)?
+                }
+                IndexAccessKind::Range { low, high } => db.range_index_bounds_visible(
+                    table,
+                    &leaf.index,
+                    low.clone(),
+                    high.clone(),
+                    txn,
+                )?,
+            };
+            crate::engine::executor::select::analyze_stats::add_range_scan_work(
+                ids.len() as u64,
+                0,
+                0,
+            );
+            let candidates = ids.len() as u64;
+            (ids, candidates, 0u64)
+        }
+        IndexMergeNode::Union { children, .. } => {
+            let mut merged = Vec::new();
+            let mut candidates = 0u64;
+            let mut duplicates = 0u64;
+            for child in children {
+                crate::engine::cancel::check_cancelled()?;
+                let (child_ids, child_candidates, child_duplicates) =
+                    execute_index_merge_row_ids_inner(db, txn, table, child)?;
+                candidates = candidates.saturating_add(child_candidates);
+                duplicates = duplicates.saturating_add(child_duplicates);
+                merged.extend(child_ids);
+            }
+            let before = merged.len();
+            merged.sort_unstable();
+            merged.dedup();
+            duplicates = duplicates.saturating_add((before - merged.len()) as u64);
+            return Ok((merged, candidates, duplicates));
+        }
+        IndexMergeNode::Intersection { children } => {
+            let mut children = children.iter();
+            let Some(first) = children.next() else {
+                return Ok((Vec::new(), 0, 0));
+            };
+            let (mut intersection, mut candidates, mut duplicates) =
+                execute_index_merge_row_ids_inner(db, txn, table, first)?;
+            for child in children {
+                crate::engine::cancel::check_cancelled()?;
+                let (other, child_candidates, child_duplicates) =
+                    execute_index_merge_row_ids_inner(db, txn, table, child)?;
+                candidates = candidates.saturating_add(child_candidates);
+                duplicates = duplicates.saturating_add(child_duplicates);
+                intersection.retain(|row_id| other.binary_search(row_id).is_ok());
+                if intersection.is_empty() {
+                    break;
+                }
+            }
+            return Ok((intersection, candidates, duplicates));
+        }
+    };
+    let before = ids.len();
+    ids.sort_unstable();
+    ids.dedup();
+    duplicates_removed = duplicates_removed.saturating_add((before - ids.len()) as u64);
+    Ok((ids, candidate_rowids, duplicates_removed))
+}
+
+pub(in crate::engine::executor::select) fn execute_index_multi_lookup_entries(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    index: &IndexSchema,
+    keys: &[IndexKey],
+    exact: bool,
+) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+    let ordered_keys = runtime_ordered_multi_lookup_keys(keys)?;
+    for key in ordered_keys.as_ref() {
+        let key_entries = if exact {
+            db.lookup_index_entries_visible(table, index, key.clone(), txn)?
+        } else {
+            db.prefix_index_entries_visible(table, index, key.clone(), txn)?
+        };
+        for entry in key_entries {
+            if seen.insert(entry.1) {
+                entries.push(entry);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+/// Return multi-lookup probes in index-key order after resolving prepared
+/// parameters. Plans deliberately retain `KeyPart::Param` so they are reusable;
+/// sorting those placeholders at plan time orders by parameter number, not by
+/// the bound key. MySQL's range/multi-range access emits rows in index order,
+/// and a stable runtime ordering also prevents execution-route-dependent row
+/// order. Concrete plans stay allocation-free.
+pub(in crate::engine::executor::select) fn runtime_ordered_multi_lookup_keys(
+    keys: &[IndexKey],
+) -> Result<std::borrow::Cow<'_, [IndexKey]>, QueryError> {
+    if !keys.iter().any(IndexKey::contains_param) {
+        return Ok(std::borrow::Cow::Borrowed(keys));
+    }
+    let mut keyed = keys
+        .iter()
+        .map(|key| Ok((key.resolve_params()?, key.clone())))
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    keyed.sort_unstable_by(|left, right| left.0.cmp(&right.0));
+    keyed.dedup_by(|left, right| left.0 == right.0);
+    Ok(std::borrow::Cow::Owned(
+        keyed.into_iter().map(|(_, original)| original).collect(),
+    ))
+}
+
+pub(in crate::engine::executor::select) fn execute_index_in_lookup_entries(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    index: &IndexSchema,
+    key_prefix: &IndexKey,
+    in_column: &str,
+    subquery: &Select,
+    subquery_plan: &PhysicalPlan,
+) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+    let QueryResponse::ResultSet(result) =
+        execute_physical_select(db, txn, subquery, subquery_plan)
+            .and_then(QueryResponse::materialize)?
+    else {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "IN subquery must return rows",
+        ));
+    };
+    // See `execute_index_in_lookup_ids`: a non-terminal prefix of a
+    // composite index needs a prefix scan, not an exact seek, or the
+    // covering IN-lookup returns zero entries.
+    let exact = key_prefix.0.len() + 1 >= index.columns.len();
+    let mut entries = Vec::new();
+    let mut seen_values = HashSet::new();
+    let mut seen_row_ids = HashSet::new();
+    for row in result.rows {
+        let Some(value) = row.first() else {
+            continue;
+        };
+        if matches!(value, Value::Null) || !seen_values.insert(ValueKey::from(value)) {
+            continue;
+        }
+        let mut parts = key_prefix.0.clone();
+        let column = &table.columns[table.column_index(in_column)?];
+        let target = crate::storage::ParamTarget::for_column_with_collation(
+            &column.data_type,
+            column.unsigned,
+            column.collation.as_deref(),
+        );
+        let Some(part) = key_part_for_lookup_target(target, value)? else {
+            continue;
+        };
+        parts.push(part);
+        let key = IndexKey::from(parts);
+        let key_entries = if exact {
+            db.lookup_index_entries_visible(table, index, key, txn)?
+        } else {
+            db.prefix_index_entries_visible(table, index, key, txn)?
+        };
+        for entry in key_entries {
+            if seen_row_ids.insert(entry.1) {
+                entries.push(entry);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+pub(in crate::engine::executor::select) fn push_table_fields(
+    out: &mut Vec<ColMeta>,
+    table: &PlanTable,
+    projection: Option<&[usize]>,
+) {
+    if let Some(indices) = projection {
+        for &i in indices {
+            if i < table.schema.columns.len() {
+                out.push(ColMeta::from_table(table, i));
+            }
+        }
+    } else {
+        for (idx, _) in table.schema.iter_visible_columns() {
+            out.push(ColMeta::from_table(table, idx));
+        }
+    }
+}
+
+/// Return the cached `&'static ColMeta` slice for `table`, populating it
+/// on first call. Index `i` holds the meta for schema column `i`, so both
+/// full-row and projected materialisers can index directly without
+/// hashing, cloning, or probing the global intern table per cell.
+pub(in crate::engine::executor::select) fn cached_column_metas(table: &PlanTable) -> &[ColMetaRef] {
+    table
+        .column_metas
+        .get_or_init(|| {
+            table
+                .schema
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(idx, _)| intern_col_meta(ColMeta::from_table(table, idx)))
+                .collect()
+        })
+        .as_slice()
+}
+
+/// A positive query term's scoring state: its document frequency `df`
+/// (for IDF) plus a per-candidate-row `(tf, doc_len)` map decoded from
+/// the postings — so scoring is a pure payload read, no heap retable.
+pub(super) struct FtScoringTerm {
+    pub(super) df: usize,
+    pub(super) by_row: AhHashMap<RowId, (u32, u32)>,
+}
+
+/// Fetch (and memoise) a token's postings via the fast payload-decoding
+/// scan API. Boolean evaluation touches the same token from set
+/// membership, phrase verification and scoring; caching keeps the leaf
+/// walk + payload decode to once per distinct token.
+///
+/// `want_positions=true` decodes the position arena (phrase clauses);
+/// `false` decodes only `(doc_len, tf)` (skips the tf-many varints per
+/// posting for pure BM25 / set-membership use).
+pub(super) fn fulltext_cached_postings<'c>(
+    cache: &'c mut AhHashMap<String, crate::storage::fulltext::FtPostingBatch>,
+    want_positions_cache: &mut AhHashSet<String>,
+    source: &FtSearchSource<'_>,
+    token: &str,
+    want_positions: bool,
+) -> Result<&'c crate::storage::fulltext::FtPostingBatch, QueryError> {
+    // If a previous fetch skipped positions but this call needs them, redo
+    // the scan with positions enabled.
+    let needs_rescan =
+        want_positions && cache.contains_key(token) && !want_positions_cache.contains(token);
+    if needs_rescan {
+        cache.remove(token);
+    }
+    if !cache.contains_key(token) {
+        let mut batch = source.scan_token(token, want_positions)?;
+        if want_positions {
+            batch
+                .postings
+                .sort_unstable_by_key(|posting| posting.row_id);
+        }
+        cache.insert(token.to_string(), batch);
+        if want_positions {
+            want_positions_cache.insert(token.to_string());
+        }
+    }
+    Ok(cache.get(token).expect("just inserted"))
+}
+
+/// True when the phrase tokens occur at consecutive positions in some
+/// document — `positions[0]` holds the first token's positions, etc. Each
+/// list is ascending (emitted in token order), so membership is a binary
+/// search. Replaces the heap re-tokenise + `windows()` adjacency check.
+pub(super) fn positions_phrase_match(per_token: &[&[u32]]) -> bool {
+    let Some(first) = per_token.first() else {
+        return true;
+    };
+    'start: for &p0 in first.iter() {
+        for (i, positions) in per_token.iter().enumerate().skip(1) {
+            let Some(want) = u32::try_from(i)
+                .ok()
+                .and_then(|offset| p0.checked_add(offset))
+            else {
+                continue 'start;
+            };
+            if positions.binary_search(&want).is_err() {
+                continue 'start;
+            }
+        }
+        return true;
+    }
+    false
+}
+
+/// Seek monotonically through a row-ordered posting list. Galloping bounds
+/// the search for sparse intersections without re-searching consumed rows;
+/// dense intersections advance in constant time per posting.
+fn seek_fulltext_posting(
+    postings: &[crate::storage::fulltext::FtPosting],
+    cursor: &mut usize,
+    row_id: RowId,
+) -> Option<crate::storage::fulltext::FtPosting> {
+    let remaining = &postings[*cursor..];
+    if remaining.first()?.row_id < row_id {
+        let mut bound = 1usize;
+        while bound < remaining.len() && remaining[bound].row_id < row_id {
+            bound = bound.saturating_mul(2);
+        }
+        *cursor += remaining[..bound.saturating_add(1).min(remaining.len())]
+            .partition_point(|posting| posting.row_id < row_id);
+    }
+    let posting = postings.get(*cursor)?;
+    if posting.row_id != row_id {
+        return None;
+    }
+    *cursor += 1;
+    Some(*posting)
+}
+
+/// Re-tokenize each column separately, preserving the write-side token order
+/// without introducing adjacency between different columns.
+pub(super) fn fulltext_row_contains_phrase(
+    tokenizer: &dyn crate::storage::fulltext::Tokenizer,
+    table: &TableSchema,
+    columns: &[String],
+    values: &[Value],
+    needle: &[String],
+) -> Result<bool, QueryError> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    for column in columns {
+        let idx = table.column_index(column)?;
+        let text = match values.get(idx) {
+            Some(Value::Null) | None => continue,
+            Some(value) => value.to_display_string(),
+        };
+        let tokens = tokenizer.raw_tokens(&text);
+        if tokens.windows(needle.len()).any(|window| window == needle) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Natural-language candidates: union of per-token postings (OR), plus the
+/// per-term scoring state (df + per-row tf/doc_len from payloads) for BM25.
+///
+/// Fast path (2026-07): uses `Database::fulltext_scan_token` which decodes
+/// payloads inline off B-tree leaves. NL never needs positions, so the
+/// scan validates the complete payload without retaining positions and
+/// avoids cloning the `String` token / `Vec<u8>` payload per entry that
+/// the generic `prefix_index_entries` path pays. For `df ≈ 22k` hot queries
+/// this eliminates ~44k allocations per token.
+///
+/// `need_scoring=false` fast-fastest path: when the caller only needs the
+/// candidate set (no BM25 score reference anywhere in the plan) we skip
+/// per-term `by_row` maps entirely and use one shared `AhHashSet<RowId>`.
+pub(super) fn fulltext_natural_language_candidates(
+    source: &FtSearchSource<'_>,
+    tokenizer: &dyn crate::storage::fulltext::Tokenizer,
+    query: &str,
+    need_scoring: bool,
+) -> Result<(Vec<RowId>, Vec<FtScoringTerm>), QueryError> {
+    // Distinct query tokens preserve first-encounter order for
+    // determinism; the actual set operation is a sort/dedup over the
+    // per-token postings, avoiding a `df`-sized `AhHashSet<RowId>` insert
+    // per posting. For 2 tokens × 22k postings a Vec+sort is ~1ms
+    // versus ~2-3ms of hashing.
+    let mut seen_terms = ah_hash_set();
+    let mut row_ids: Vec<RowId> = Vec::new();
+    let mut terms: Vec<FtScoringTerm> = Vec::new();
+    for token in tokenizer.tokenize(query) {
+        if !seen_terms.insert(token.clone()) {
+            continue;
+        }
+        if need_scoring {
+            let batch = source.scan_token(&token, false)?;
+            if batch.postings.is_empty() {
+                continue;
+            }
+            let mut by_row = ah_hash_map_with_capacity(batch.postings.len());
+            row_ids.reserve(batch.postings.len());
+            for p in &batch.postings {
+                row_ids.push(p.row_id);
+                by_row.insert(p.row_id, (p.tf, p.doc_len));
+            }
+            terms.push(FtScoringTerm {
+                df: batch.postings.len(),
+                by_row,
+            });
+        } else {
+            // Row-id-only fast path: NL union with `need_score=false`
+            // needs only the row-id set. Validate payload integrity without
+            // retaining scoring records or a positions arena.
+            let ids = source.scan_ids(&token)?;
+            if ids.is_empty() {
+                continue;
+            }
+            row_ids.reserve(ids.len());
+            row_ids.extend(ids);
+        }
+    }
+    row_ids.sort_unstable();
+    row_ids.dedup();
+    Ok((row_ids, terms))
+}
+
+/// Boolean-mode candidates: evaluate `+ - " " *` clauses into a row set
+/// (intersection of Musts, else union of Shoulds, minus MustNots) and
+/// collect the positive tokens' scoring state for BM25. Phrase adjacency
+/// is verified from persisted positions (no heap retable); only payloads
+/// built with positions disabled fall back to re-tokenising the row.
+///
+/// Fast path (2026-07): uses `Database::fulltext_scan_token` /
+/// `fulltext_scan_prefix` which decode payloads inline off B-tree
+/// leaves — no `IndexKey` clone per posting; positions live in a
+/// per-token arena so phrase intersection can share `&[u32]` slices
+/// instead of cloning `Vec<u32>` for every posting.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn fulltext_boolean_candidates(
+    source: &FtSearchSource<'_>,
+    tokenizer: &dyn crate::storage::fulltext::Tokenizer,
+    columns: &[String],
+    query: &str,
+    need_scoring: bool,
+) -> Result<(Vec<RowId>, Vec<FtScoringTerm>), QueryError> {
+    use crate::storage::fulltext::boolean::{parse_boolean_query, Matcher, Occur};
+    use crate::util::fast_hash::{AhHashMap as HashMap, AhHashSet as HashSet};
+
+    // Unsupported boolean operators (`( )`, `> < ~`, `@`) now surface as
+    // error 1235 instead of being silently dropped.
+    let clauses = parse_boolean_query(query, tokenizer)?;
+    if clauses.is_empty() {
+        return Ok((Vec::new(), Vec::new()));
+    }
+
+    // One prefix scan per distinct token, reused across membership, phrase
+    // verification and scoring.
+    let mut cache: HashMap<String, crate::storage::fulltext::FtPostingBatch> = ah_hash_map();
+    let mut positions_ready: HashSet<String> = ah_hash_set();
+    // Positive (non-MustNot) Term/Phrase tokens, first-seen order, for scoring.
+    let mut positive_tokens: Vec<String> = Vec::new();
+    let mut positive_seen: HashSet<String> = ah_hash_set();
+    let mut must_sets: Vec<HashSet<RowId>> = Vec::new();
+    let mut should_sets: Vec<HashSet<RowId>> = Vec::new();
+    let mut mustnot_sets: Vec<HashSet<RowId>> = Vec::new();
+
+    // Pre-scan clauses to know which tokens need positions (phrase clauses).
+    let mut phrase_tokens: AhHashSet<&str> = ah_hash_set();
+    for clause in &clauses {
+        if let Matcher::Phrase(tokens) | Matcher::FilteredPhrase { terms: tokens, .. } =
+            &clause.matcher
+        {
+            for t in tokens {
+                phrase_tokens.insert(t.as_str());
+            }
+        }
+    }
+
+    for clause in &clauses {
+        let positive = need_scoring && clause.occur != Occur::MustNot;
+        let rowset = match &clause.matcher {
+            Matcher::Term(tokens) => {
+                let mut set: Option<HashSet<RowId>> = None;
+                for tok in tokens {
+                    let want_pos = phrase_tokens.contains(tok.as_str());
+                    let batch = fulltext_cached_postings(
+                        &mut cache,
+                        &mut positions_ready,
+                        source,
+                        tok,
+                        want_pos,
+                    )?;
+                    let s: HashSet<RowId> = batch.postings.iter().map(|p| p.row_id).collect();
+                    set = Some(match set {
+                        None => s,
+                        Some(mut prev) => {
+                            prev.retain(|id| s.contains(id));
+                            prev
+                        }
+                    });
+                    if positive && positive_seen.insert(tok.clone()) {
+                        positive_tokens.push(tok.clone());
+                    }
+                }
+                set.unwrap_or_default()
+            }
+            Matcher::Prefix(prefix) => {
+                // Expand `word*` into the concrete tokens it matches and
+                // feed each into the shared postings cache. Positive
+                // clauses also promote those tokens into `positive_tokens`
+                // so BM25 scores wildcard hits with their real tf/df — MySQL
+                // parity, and the fix for previously-zero prefix scores.
+                let groups = source.scan_prefix(prefix)?;
+                let mut rowset: HashSet<RowId> = ah_hash_set();
+                for (token, batch) in groups {
+                    for p in &batch.postings {
+                        rowset.insert(p.row_id);
+                    }
+                    if positive && positive_seen.insert(token.clone()) {
+                        positive_tokens.push(token.clone());
+                    }
+                    // Prefix scan does not include positions; store the
+                    // batch so scoring can reuse (tf, doc_len) without a
+                    // re-scan.
+                    if !cache.contains_key(&token) {
+                        cache.insert(token.clone(), batch);
+                    }
+                }
+                rowset
+            }
+            Matcher::Phrase(tokens) | Matcher::FilteredPhrase { terms: tokens, .. } => {
+                // Populate one shared, row-ordered batch per distinct token.
+                // Repeated phrase terms borrow the same arena; scoring reuses
+                // these batches without another B-tree scan.
+                for tok in tokens {
+                    fulltext_cached_postings(&mut cache, &mut positions_ready, source, tok, true)?;
+                    if positive && positive_seen.insert(tok.clone()) {
+                        positive_tokens.push(tok.clone());
+                    }
+                }
+                let batches: Vec<_> = tokens.iter().map(|token| &cache[token]).collect();
+                let smallest = batches.iter().min_by_key(|batch| batch.postings.len());
+                let mut verified = ah_hash_set();
+                let mut positions_scratch: Vec<&[u32]> = Vec::with_capacity(tokens.len());
+                let mut cursors = vec![0usize; batches.len()];
+                if let Some(smallest) = smallest {
+                    'candidate: for posting in &smallest.postings {
+                        let row_id = posting.row_id;
+                        positions_scratch.clear();
+                        let mut have_positions = true;
+                        for (batch, cursor) in batches.iter().zip(&mut cursors) {
+                            let Some(p) = seek_fulltext_posting(&batch.postings, cursor, row_id)
+                            else {
+                                continue 'candidate;
+                            };
+                            if p.pos_len == 0 {
+                                have_positions = false;
+                            }
+                            let start = p.pos_start as usize;
+                            positions_scratch
+                                .push(&batch.positions_arena[start..start + p.pos_len as usize]);
+                        }
+                        let matched = if let Matcher::FilteredPhrase { words, .. } = &clause.matcher
+                        {
+                            source.contains_phrase(row_id, tokenizer, columns, words)?
+                        } else if have_positions {
+                            positions_phrase_match(&positions_scratch)
+                        } else {
+                            source.contains_phrase(row_id, tokenizer, columns, tokens)?
+                        };
+                        if matched {
+                            verified.insert(row_id);
+                        }
+                    }
+                }
+                verified
+            }
+        };
+        match clause.occur {
+            Occur::Must => must_sets.push(rowset),
+            Occur::Should => should_sets.push(rowset),
+            Occur::MustNot => mustnot_sets.push(rowset),
+        }
+    }
+
+    // Membership: all Musts intersected; without any Must, the union of
+    // Shoulds. MustNots are then subtracted.
+    let mut base: HashSet<RowId> = if !must_sets.is_empty() {
+        let mut iter = must_sets.into_iter();
+        let mut acc = iter.next().unwrap_or_default();
+        for s in iter {
+            acc.retain(|id| s.contains(id));
+        }
+        acc
+    } else {
+        let mut acc = ah_hash_set();
+        for s in should_sets {
+            acc.extend(s);
+        }
+        acc
+    };
+    for s in &mustnot_sets {
+        for id in s {
+            base.remove(id);
+        }
+    }
+
+    // Build scoring state from the cached postings of positive tokens.
+    // Skip when the caller does not need BM25 — saves per-term
+    // hashmaps for the "score not referenced" query shape.
+    let mut scoring: Vec<FtScoringTerm> = Vec::with_capacity(positive_tokens.len());
+    if need_scoring {
+        for tok in &positive_tokens {
+            let batch =
+                fulltext_cached_postings(&mut cache, &mut positions_ready, source, tok, false)?;
+            let mut by_row = ah_hash_map_with_capacity(batch.postings.len());
+            for p in &batch.postings {
+                by_row.insert(p.row_id, (p.tf, p.doc_len));
+            }
+            scoring.push(FtScoringTerm {
+                df: batch.postings.len(),
+                by_row,
+            });
+        }
+    }
+
+    let mut candidates: Vec<RowId> = base.into_iter().collect();
+    candidates.sort_unstable();
+    Ok((candidates, scoring))
+}
+
+pub(in crate::engine::executor) struct FtMatchRuntime {
+    pub(in crate::engine::executor) fingerprint: u64,
+    pub(super) restrict: bool,
+    pub(super) need_score: bool,
+    pub(super) candidates: Vec<RowId>,
+    pub(super) scoring_terms: Vec<FtScoringTerm>,
+    pub(super) idfs: Vec<f64>,
+    pub(super) doc_len_of: AhHashMap<RowId, u32>,
+    pub(super) avgdl: f64,
+    check_membership: bool,
+    _source_charge: crate::engine::executor::mem_budget::ScopedCharge,
+}
+
+pub(super) fn resolve_fulltext_query(
+    query: &str,
+    query_param: Option<usize>,
+) -> Result<String, QueryError> {
+    let Some(idx) = query_param else {
+        return Ok(query.to_string());
+    };
+    let value = crate::engine::params::current_param(idx).ok_or_else(|| {
+        error(
+            crate::error::catalog::ER_WRONG_ARGUMENTS,
+            "parameter is not bound",
+        )
+    })?;
+    Ok(match value {
+        Value::Null => String::new(),
+        Value::String(s) | Value::Decimal(s) => s,
+        Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        other => other.to_display_string(),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::engine::executor) fn build_fulltext_match_runtime(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    mode: crate::parser::FtMode,
+    query: &str,
+    query_param: Option<usize>,
+    columns: &[String],
+    fingerprint: u64,
+    restrict: bool,
+    need_score: bool,
+    heap_rows: Option<&[Vec<Value>]>,
+) -> Result<FtMatchRuntime, QueryError> {
+    let query = resolve_fulltext_query(query, query_param)?;
+    let default_meta = crate::storage::schema::FulltextMeta::default();
+    let meta = index.fulltext.as_ref().unwrap_or(&default_meta);
+    let tokenizer = crate::storage::fulltext::build_tokenizer_from_meta(meta);
+    let source = FtSearchSource::new(
+        db,
+        txn,
+        table,
+        index,
+        heap_rows,
+        tokenizer.as_ref(),
+        &query,
+        mode,
+    )?;
+    let (candidates, scoring_terms) = match mode {
+        crate::parser::FtMode::NaturalLanguage => {
+            fulltext_natural_language_candidates(&source, tokenizer.as_ref(), &query, need_score)?
+        }
+        crate::parser::FtMode::Boolean => {
+            fulltext_boolean_candidates(&source, tokenizer.as_ref(), columns, &query, need_score)?
+        }
+    };
+    let mut idfs = Vec::new();
+    let mut doc_len_of = ah_hash_map();
+    let mut avgdl = 1.0;
+    if need_score {
+        let frozen = super::super::fulltext_context::statistics(table, index)?;
+        // The unsigned modified-row counter counts INSERT, UPDATE and DELETE
+        // and is only a staleness trigger. BM25's document count must use the
+        // signed committed row delta, otherwise update-heavy tables make IDF
+        // drift upward without gaining a single document.
+        let est = source.corpus.map_or(frozen.base_n, |corpus| corpus.0);
+        let max_df = scoring_terms.iter().map(|term| term.df).max().unwrap_or(0) as f64;
+        let n_docs = est.max(candidates.len() as f64).max(max_df).max(1.0);
+        idfs = scoring_terms
+            .iter()
+            .map(|term| crate::storage::fulltext::bm25::idf(n_docs, term.df as f64))
+            .collect();
+        for term in &scoring_terms {
+            for (row_id, (_, doc_len)) in &term.by_row {
+                doc_len_of.entry(*row_id).or_insert(*doc_len);
+            }
+        }
+        let (sum, count) = candidates
+            .iter()
+            .fold((0u64, 0u64), |(sum, count), row_id| {
+                doc_len_of
+                    .get(row_id)
+                    .map(|len| (sum + *len as u64, count + 1))
+                    .unwrap_or((sum, count))
+            });
+        if count > 0 {
+            avgdl = (sum as f64 / count as f64).max(1.0);
+        }
+        if let Some(corpus_avg) = source.corpus.map(|corpus| corpus.1).or(frozen.corpus_avg) {
+            avgdl = corpus_avg;
+        }
+    }
+    Ok(FtMatchRuntime {
+        fingerprint,
+        restrict,
+        need_score,
+        candidates,
+        scoring_terms,
+        idfs,
+        doc_len_of,
+        avgdl,
+        check_membership: mode == crate::parser::FtMode::Boolean,
+        _source_charge: source.charge,
+    })
+}
+
+pub(in crate::engine::executor) fn fulltext_runtime_score(
+    runtime: &FtMatchRuntime,
+    row_id: RowId,
+) -> f64 {
+    if !runtime.need_score {
+        return 0.0;
+    }
+    // Positive term frequencies alone do not prove Must/MustNot or phrase
+    // membership. Scalar MATCH must agree with the restricting WHERE path.
+    if runtime.check_membership && runtime.candidates.binary_search(&row_id).is_err() {
+        return 0.0;
+    }
+    let params = crate::storage::fulltext::bm25::global_params();
+    let dl = runtime.doc_len_of.get(&row_id).copied().unwrap_or(0) as f64;
+    runtime
+        .scoring_terms
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, term)| {
+            term.by_row.get(&row_id).map(|(tf, _)| {
+                crate::storage::fulltext::bm25::term_score(
+                    runtime.idfs[idx],
+                    *tf as f64,
+                    dl,
+                    runtime.avgdl,
+                    params,
+                )
+            })
+        })
+        .fold(0.0, |score, term| score + term)
+}
+
+pub(super) fn execute_fulltext_like_prefilter(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    plan: &crate::planner::FulltextLikePrefilterPlan,
+    filter: &Option<Expr>,
+    projected_columns: Option<&Arc<Vec<usize>>>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let runtime_tokens = if let Some(param) = plan.pattern_param {
+        let Some(value) = crate::engine::params::current_param(param) else {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_ARGUMENTS,
+                "LIKE parameter is not bound",
+            ));
+        };
+        let pattern = match value {
+            Value::Null => return Ok(Vec::new()),
+            Value::String(text) => text,
+            Value::Bytes(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            other => other.to_display_string(),
+        };
+        let segments = crate::engine::expr::like_literal_segments(&pattern, plan.escape_char)
+            .unwrap_or_default();
+        let default_meta = crate::storage::FulltextMeta::default();
+        let meta = index.fulltext.as_ref().unwrap_or(&default_meta);
+        let tokenizer = crate::storage::fulltext::build_tokenizer_from_meta(meta);
+        let column = table
+            .schema
+            .columns
+            .iter()
+            .find(|column| column.name.eq_ignore_ascii_case(&plan.column))
+            .ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_BAD_FIELD_ERROR,
+                    "LIKE ngram column not found",
+                )
+            })?;
+        let mut seen = AhHashSet::default();
+        let mut tokens = Vec::new();
+        for segment in segments {
+            for token in tokenizer.tokenize(&segment) {
+                if crate::planner::ngram_token_is_like_safe(column, &token)
+                    && seen.insert(token.clone())
+                {
+                    tokens.push(token);
+                    if tokens.len() >= 64 {
+                        break;
+                    }
+                }
+            }
+            if tokens.len() >= 64 {
+                break;
+            }
+        }
+        tokens
+    } else {
+        plan.tokens.clone()
+    };
+    if runtime_tokens.is_empty() || !crate::storage::schema::like_ngram_prefilter_enabled() {
+        crate::engine::status_counters::record_like_ngram_no_safe_token();
+        let ids = db
+            .scan_rows(&table.schema.qualified_name(), txn)?
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect();
+        return read_plan_table_ids(
+            db,
+            txn,
+            table,
+            ids,
+            filter,
+            projected_columns.map(|columns| columns.as_slice()),
+        );
+    }
+    let mut postings = Vec::with_capacity(runtime_tokens.len());
+    for token in &runtime_tokens {
+        let mut ids = db.fulltext_scan_token_ids(&table.schema, index, token, txn)?;
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        postings.push((ids.len(), ids));
+    }
+    let posting_rows = postings.iter().map(|(df, _)| *df as u64).sum::<u64>();
+    postings.sort_unstable_by_key(|(df, _)| *df);
+    let mut selected = postings.into_iter().take(8);
+    let Some((_, mut candidates)) = selected.next() else {
+        return Ok(Vec::new());
+    };
+    for (_, ids) in selected {
+        let keep: AhHashSet<RowId> = ids.into_iter().collect();
+        candidates.retain(|row_id| keep.contains(row_id));
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+    }
+    crate::engine::status_counters::record_like_ngram_rows(posting_rows, candidates.len() as u64);
+    let mut out = Vec::with_capacity(candidates.len());
+    let mut eval_ctx = EvalQueryContext::default();
+    for row_id in candidates {
+        let Some(stored) = db.read_row(&table.schema, row_id, txn)? else {
+            continue;
+        };
+        let row = match projected_columns {
+            Some(columns) => stored_row_to_plan_row_projected(table, stored.values, columns)?,
+            None => stored_row_to_plan_row(table, stored.values)?,
+        };
+        let keep = match filter {
+            Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
+            None => true,
+        };
+        if keep {
+            out.push(row);
+        }
+    }
+    Ok(out)
+}
+
+/// Execute a `MATCH(cols) AGAINST(query [mode])` full-text search. Computes
+/// the matching row set for the mode (natural-language OR vs boolean
+/// `+ - " " *`), scores each candidate with BM25 over the positive query
+/// tokens, and injects the relevance as a hidden `__ft_score_<fingerprint>`
+/// pseudo-column so WHERE / SELECT / ORDER BY occurrences of the same MATCH
+/// read it back by fingerprint. `filter` is the WHERE remainder after the
+/// bare MATCH predicate was stripped at plan time, applied per candidate row.
+///
+/// Score push-down (2026-07): when the enclosing plan never reads back
+/// `__ft_score_<fingerprint>` (SELECT/ORDER BY don't reference the same
+/// MATCH, and `filter` doesn't either), scoring is skipped entirely —
+/// no per-term `by_row` map, no `doc_len_of` hashmap, no BM25 arithmetic.
+/// The FT scan still produces the score pseudo-column set to 0.0 so any
+/// residual expression that stumbles onto it via `resolve_ft_score`
+/// remains well-defined (returns 0 rather than error 1235).
+#[allow(clippy::too_many_arguments)]
+pub(super) fn open_fulltext_scan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    mode: crate::parser::FtMode,
+    query: &str,
+    query_param: Option<usize>,
+    columns: &[String],
+    match_fingerprint: u64,
+    filter: &Option<Expr>,
+    projected_columns: Option<&Arc<Vec<usize>>>,
+    need_score: bool,
+    restrict_to_matches: bool,
+    additional_matches: &[crate::planner::FulltextMatchPlan],
+    like_prefilter: Option<&crate::planner::FulltextLikePrefilterPlan>,
+    base_access: Option<&crate::planner::FulltextBaseAccess>,
+) -> Result<Box<dyn PlanStream>, QueryError> {
+    if let Some(like_prefilter) = like_prefilter {
+        if txn.historical || table.schema.is_partitioned() {
+            return Ok(Box::new(MaterializedStream::new(scan_plan_table(
+                db,
+                txn,
+                table,
+                filter,
+                &[],
+                projected_columns.map(|columns| columns.as_slice()),
+                false,
+            )?)));
+        }
+        return Ok(Box::new(MaterializedStream::new(
+            execute_fulltext_like_prefilter(
+                db,
+                txn,
+                table,
+                index,
+                like_prefilter,
+                filter,
+                projected_columns,
+            )?,
+        )));
+    }
+    // Current postings cannot prove historical membership; bare RowId is
+    // ambiguous across partition heaps. Build a visible-text oracle with
+    // query-local document ids for these paths until specialized indexes can
+    // carry the required version/partition identity.
+    let heap_documents = if txn.historical || table.schema.is_partitioned() {
+        if txn.historical {
+            db.record_temporal_heap_fallback();
+        }
+        Some(collect_heap_documents(db, table, txn)?)
+    } else {
+        None
+    };
+    let heap_rows = heap_documents.as_ref().map(|(rows, _)| rows.as_slice());
+    let primary = build_fulltext_match_runtime(
+        db,
+        txn,
+        table,
+        index,
+        mode,
+        query,
+        query_param,
+        columns,
+        match_fingerprint,
+        restrict_to_matches,
+        need_score,
+        heap_rows,
+    )?;
+    let mut runtimes = Vec::with_capacity(additional_matches.len() + 1);
+    runtimes.push(primary);
+    for spec in additional_matches {
+        runtimes.push(build_fulltext_match_runtime(
+            db,
+            txn,
+            table,
+            &spec.index,
+            spec.mode,
+            &spec.query,
+            spec.query_param,
+            &spec.columns,
+            spec.match_fingerprint,
+            spec.restrict_to_matches,
+            spec.needs_score,
+            heap_rows,
+        )?);
+    }
+
+    let restrict_count = runtimes.iter().filter(|runtime| runtime.restrict).count();
+    if restrict_count > 1 {
+        crate::engine::status_counters::record_fulltext_multi_intersection();
+    } else if restrict_count == 0 {
+        crate::engine::status_counters::record_fulltext_aware_full_scan();
+    }
+    let base_candidates = match base_access.filter(|_| heap_rows.is_none()) {
+        Some(crate::planner::FulltextBaseAccess::Lookup { index, key, exact }) => Some(if *exact {
+            db.lookup_index_visible(&table.schema, index, key.clone(), txn)?
+        } else {
+            db.prefix_index_visible(&table.schema, index, key.clone(), txn)?
+        }),
+        Some(crate::planner::FulltextBaseAccess::MultiLookup { index, keys, exact }) => Some(
+            execute_index_multi_lookup_ids(db, txn, &table.schema, index, keys, *exact)?,
+        ),
+        Some(crate::planner::FulltextBaseAccess::Range { index, low, high }) => Some(
+            db.range_index_bounds_visible(&table.schema, index, low.clone(), high.clone(), txn)?,
+        ),
+        Some(crate::planner::FulltextBaseAccess::ZoneMap { filter }) => {
+            let ids = if let Some(ranges) =
+                db.zone_map_candidate_ranges_for_plan(&table.schema, filter)
+            {
+                let mut ids = Vec::new();
+                for (page_lo, page_hi) in ranges {
+                    ids.extend(
+                        db.scan_rows_storage_range(
+                            &table.schema,
+                            table.schema.id,
+                            txn,
+                            page_lo,
+                            page_hi,
+                        )?
+                        .into_iter()
+                        .map(|row| row.row_id),
+                    );
+                }
+                ids
+            } else {
+                db.scan_rows(&table.schema.qualified_name(), txn)?
+                    .into_iter()
+                    .map(|row| row.row_id)
+                    .collect()
+            };
+            Some(ids)
+        }
+        None => None,
+    };
+    let mut restricting = runtimes.iter().filter(|runtime| runtime.restrict);
+    let mut candidates = if let Some(first) = restricting.next() {
+        let mut base = first.candidates.clone();
+        for runtime in restricting {
+            let keep: AhHashSet<RowId> = runtime.candidates.iter().copied().collect();
+            base.retain(|row_id| keep.contains(row_id));
+        }
+        if let Some(index_candidates) = base_candidates {
+            let keep: AhHashSet<RowId> = index_candidates.into_iter().collect();
+            base.retain(|row_id| keep.contains(row_id));
+        }
+        base
+    } else if let Some(index_candidates) = base_candidates {
+        index_candidates
+    } else if let Some(rows) = heap_rows {
+        (0..rows.len())
+            .map(heap_document_id)
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        db.scan_rows(&table.schema.qualified_name(), txn)?
+            .into_iter()
+            .map(|row| row.row_id)
+            .collect()
+    };
+    candidates.sort_unstable();
+    candidates.dedup();
+    if candidates.is_empty() {
+        return Ok(Box::new(MaterializedStream::new(Vec::new())));
+    }
+
+    Ok(Box::new(super::fulltext_stream::FulltextScanStream::new(
+        db,
+        txn,
+        table,
+        filter,
+        projected_columns,
+        runtimes,
+        candidates,
+        heap_documents,
+    )?))
+}
+
+/// Execute a `SpatialScan`: query persistent R-tree pages for every row
+/// whose stored MBR intersects the search
+/// window, read each candidate with MVCC visibility, then apply the residual
+/// `filter` (the full WHERE, including the exact spatial predicate) so the
+/// R-tree's superset is narrowed to the precise answer.
+pub(super) fn execute_spatial_scan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    query_probe: &planner::SpatialProbe,
+    filter: &Option<Expr>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mut stream = open_spatial_scan(db, txn, table, index, query_probe, filter)?;
+    let mut rows = Vec::new();
+    while let Some(row) = stream.next()? {
+        rows.push(row);
+    }
+    Ok(rows)
+}
+
+pub(super) fn open_spatial_scan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    query_probe: &planner::SpatialProbe,
+    filter: &Option<Expr>,
+) -> Result<Box<dyn PlanStream>, QueryError> {
+    let query_mbr = match query_probe {
+        planner::SpatialProbe::Constant {
+            mbr,
+            srid,
+            function,
+            column_first,
+        } => {
+            let column_srid = index
+                .columns
+                .first()
+                .and_then(|c| table.schema.column_index(c).ok())
+                .and_then(|i| match table.schema.columns[i].data_type {
+                    crate::storage::DataTypeKind::Geometry { srid, .. } => srid,
+                    _ => None,
+                });
+            if column_srid.is_some_and(|expected| expected != *srid) {
+                let expected = column_srid.unwrap();
+                return Err(if *column_first {
+                    crate::engine::geo::srid_mismatch(function, expected, *srid)
+                } else {
+                    crate::engine::geo::srid_mismatch(function, *srid, expected)
+                });
+            }
+            *mbr
+        }
+        planner::SpatialProbe::Parameter {
+            expr,
+            function,
+            column_first,
+        } => {
+            let value = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])?;
+            if matches!(value, Value::Null) {
+                return Ok(Box::new(MaterializedStream::new(Vec::new())));
+            }
+            let (Value::Geometry(bytes) | Value::Bytes(bytes)) = value else {
+                return Err(crate::engine::geo::invalid_gis_data(function));
+            };
+            let geometry = crate::engine::geo::read_geometry(&bytes)?;
+            let column_srid = index
+                .columns
+                .first()
+                .and_then(|column| table.schema.column_index(column).ok())
+                .and_then(|column| match table.schema.columns[column].data_type {
+                    crate::storage::DataTypeKind::Geometry { srid, .. } => srid,
+                    _ => None,
+                });
+            if let Some(column_srid) = column_srid {
+                if geometry.srid != column_srid {
+                    return Err(if *column_first {
+                        crate::engine::geo::srid_mismatch(function, column_srid, geometry.srid)
+                    } else {
+                        crate::engine::geo::srid_mismatch(function, geometry.srid, column_srid)
+                    });
+                }
+            }
+            if geometry
+                .geom
+                .dimension()
+                .is_some_and(|dimension| dimension > 0)
+            {
+                crate::engine::geo::sql::require_planar(function, &geometry)?;
+            }
+            let Some(mbr) = geometry.geom.mbr() else {
+                // Empty geometries have no pruning rectangle. Evaluate the
+                // original predicate just as the constant-probe scan does.
+                return scan_plan_table(db, txn, table, filter, &[], None, false)
+                    .map(|rows| Box::new(MaterializedStream::new(rows)) as Box<dyn PlanStream>);
+            };
+            [mbr.minx, mbr.miny, mbr.maxx, mbr.maxy]
+        }
+    };
+    let window =
+        crate::engine::geo::Mbr::new(query_mbr[0], query_mbr[1], query_mbr[2], query_mbr[3]);
+    let storage_ids = run_plan_scan_with_partition_pruning(table, filter, || {
+        Ok(db.scan_storage_ids(&table.schema))
+    })?;
+    Ok(Box::new(SpatialScanStream {
+        db: db.clone(),
+        txn,
+        table: table.clone(),
+        index: index.clone(),
+        filter: filter.clone(),
+        window,
+        storage_ids: storage_ids.into_iter(),
+        current: None,
+        storage_id: 0,
+        repairs: None,
+        seen: HashSet::new(),
+        seen_charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        repair_charge: crate::engine::executor::mem_budget::ScopedCharge::new(0),
+        eval_ctx: EvalQueryContext::default(),
+    }))
+}
+
+enum SpatialScanSource {
+    Cursor(crate::storage::SpatialCursor),
+    Snapshot(crate::storage::SpatialCandidates, usize),
+}
+impl SpatialScanSource {
+    fn next(&mut self) -> Result<Option<RowId>, QueryError> {
+        match self {
+            Self::Cursor(cursor) => cursor.next(),
+            Self::Snapshot(rows, offset) => {
+                let row = rows.get(*offset).copied();
+                *offset += usize::from(row.is_some());
+                Ok(row)
+            }
+        }
+    }
+}
+
+struct SpatialScanStream {
+    db: Arc<Database>,
+    txn: TxnView,
+    table: PlanTable,
+    index: IndexSchema,
+    filter: Option<Expr>,
+    window: crate::engine::geo::Mbr,
+    storage_ids: std::vec::IntoIter<u64>,
+    storage_id: u64,
+    current: Option<SpatialScanSource>,
+    repairs: Option<std::vec::IntoIter<RowId>>,
+    seen: HashSet<RowId>,
+    seen_charge: crate::engine::executor::mem_budget::ScopedCharge,
+    repair_charge: crate::engine::executor::mem_budget::ScopedCharge,
+    eval_ctx: EvalQueryContext,
+}
+impl PlanStream for SpatialScanStream {
+    fn next(&mut self) -> Result<Option<PlanRow>, QueryError> {
+        loop {
+            crate::engine::cancel::check_cancelled()?;
+            let row_id = if let Some(cursor) = &mut self.current {
+                cursor.next()?
+            } else {
+                self.repairs.as_mut().and_then(Iterator::next)
+            };
+            if let Some(row_id) = row_id {
+                if self.seen.len() == self.seen.capacity() && !self.seen.contains(&row_id) {
+                    self.seen_charge
+                        .add_non_spillable(self.seen.capacity().max(64) * 32)?;
+                    self.seen
+                        .try_reserve(self.seen.capacity().max(64))
+                        .map_err(|_| {
+                            crate::error::catalog::ER_OUTOFMEMORY
+                                .error("spatial cursor visibility set allocation failed")
+                        })?;
+                }
+                if !self.seen.insert(row_id) {
+                    continue;
+                }
+                let Some(stored) =
+                    self.db
+                        .read_row_at(&self.table.schema, self.storage_id, row_id, self.txn)?
+                else {
+                    continue;
+                };
+                let row = stored_row_to_plan_row(&self.table, stored.values)?;
+                if let Some(filter) = &self.filter {
+                    if !eval_plan_bool_with_db(
+                        &self.db,
+                        self.txn,
+                        filter,
+                        &row,
+                        &mut self.eval_ctx,
+                    )? {
+                        continue;
+                    }
+                }
+                return Ok(Some(row));
+            }
+            if matches!(self.current.take(), Some(SpatialScanSource::Cursor(_))) {
+                // Merge repairs after navigation: a concurrent delete may have
+                // removed an unvisited entry after this cursor was opened.
+                let mut physical = (*self.table.schema).clone();
+                physical.id = self.storage_id;
+                let repairs = self.db.spatial_visibility_repairs(
+                    &physical,
+                    &self.index,
+                    self.window,
+                    self.txn,
+                )?;
+                self.repair_charge
+                    .add_non_spillable(repairs.capacity() * std::mem::size_of::<RowId>())?;
+                self.repairs = Some(repairs.into_iter());
+                continue;
+            }
+            self.repairs = None;
+            self.repair_charge
+                .release_bytes(self.repair_charge.charged());
+            let Some(storage_id) = self.storage_ids.next() else {
+                return Ok(None);
+            };
+            self.storage_id = storage_id;
+            self.seen.clear();
+            let mut physical = (*self.table.schema).clone();
+            physical.id = storage_id;
+            self.current = Some(if crate::planner::connection_thread_execution_required() {
+                SpatialScanSource::Snapshot(
+                    self.db.spatial_search_visible(
+                        &physical,
+                        &self.index,
+                        self.window,
+                        self.txn,
+                    )?,
+                    0,
+                )
+            } else {
+                SpatialScanSource::Cursor(self.db.spatial_scan_cursor(
+                    &physical,
+                    &self.index,
+                    self.window,
+                    self.txn,
+                )?)
+            });
+        }
+    }
+}
+
+/// Execute a `VectorIndexScan`: ask the HNSW graph for the nearest candidate
+/// `RowId`s, read each under MVCC visibility, re-rank by the **live heap
+/// vector** (so an UPDATE/DELETE that left a stale graph node only costs recall,
+/// never correctness), apply the residual `filter`, then return the `k` nearest
+/// rows ascending by distance. The graph is a candidate generator, never the
+/// source of truth — matching the spatial R-tree model.
+///
+/// M5.2 — iterative scan. When MVCC visibility / the residual filter drops
+/// candidates below `k`, the search widens `ef` (×2 each iteration) until
+/// either `k` rows survive, the graph is exhausted, or we hit the
+/// session-configured `mydb_hnsw_max_scan_tuples` cap. The widening policy is
+/// chosen by `mydb_hnsw_iterative_scan` (off / relaxed_order / strict_order).
+///
+/// M5.5 — partitioned tables fan out across `table.storage_ids()` and merge
+/// per-partition candidate lists before re-ranking. Each partition keeps its
+/// own per-storage HNSW graph (RowIds are only unique within one partition,
+/// so a single mixed graph would alias rows across partitions).
+/// How many graph candidates to re-rank with an exact heap `read_row`, given
+/// the final `k` and the exploration breadth `want` (= ef_search). Re-ranking
+/// every explored candidate was the dominant fixed cost of a KNN query (one
+/// random heap read each); the true top-k almost always sits within the
+/// approximate top `k·mult`, so we cap reads there. `MYDB_HNSW_RERANK_MULT`
+/// (default 4) tunes the safety margin; floored at 32 and never above `want`.
+/// IVF scans (`nprobe`) and exact-rerank pool size are independent controls.
+/// Reusing the HNSW helper capped the pool by nprobe, yielding only
+/// `max(k,nprobe)` candidates instead of the documented `k * multiplier`.
+pub(super) fn ivf_rerank_fetch(k: usize, mult: u64) -> usize {
+    k.saturating_mul(mult.max(1) as usize).max(k)
+}
+
+pub(in crate::engine::executor::select) fn resolve_knn_query_vector(
+    table: &PlanTable,
+    column_index: usize,
+    baked: &crate::vector::VectorValue,
+    expr: &Option<Expr>,
+) -> Result<crate::vector::VectorValue, QueryError> {
+    let binary = matches!(
+        table.schema.columns[column_index].data_type,
+        crate::storage::DataTypeKind::Vector {
+            datatype: crate::vector::VectorDataType::Binary,
+            ..
+        }
+    );
+    let bytes = if let Some(expr) = expr {
+        let value = crate::engine::expr::eval_expr_legacy(expr, &table.schema, &[])?;
+        (if binary && !matches!(value, Value::Vector(_)) {
+            crate::engine::vector::codec::coerce_value(
+                value,
+                crate::vector::VectorDataType::Binary,
+                None,
+            )
+            .ok()
+        } else {
+            crate::planner::value_to_vector_bytes(&value)
+        })
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
+                "query vector parameter is not a valid VECTOR value",
+            )
+        })?
+    } else {
+        baked.clone()
+    };
+    if let Some(crate::storage::schema::DataTypeKind::Vector { dim: Some(dim), .. }) =
+        table.schema.columns.get(column_index).map(|c| &c.data_type)
+    {
+        let actual = bytes.dimension as usize;
+        if actual != *dim as usize {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
+                format!(
+                    "query vector has {actual} dimensions but column '{}' is VECTOR({dim})",
+                    table.schema.columns[column_index].name
+                ),
+            ));
+        }
+    }
+    Ok(bytes)
+}
+
+pub(in crate::engine::executor::select) fn validate_knn_query_vector(
+    bytes: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+) -> Result<(), QueryError> {
+    let binary = bytes.datatype == crate::vector::VectorDataType::Binary;
+    if binary
+        != matches!(
+            metric,
+            crate::engine::vector::Metric::Hamming | crate::engine::vector::Metric::Jaccard
+        )
+    {
+        return Err(crate::engine::vector::vector_err(
+            "query datatype and distance metric are incompatible",
+        ));
+    }
+    if metric == crate::engine::vector::Metric::Cosine
+        && crate::engine::vector::distance::typed_is_zero(bytes)
+    {
+        return Err(error(
+            crate::error::catalog::MYDB_ER_INVALID_VECTOR_VALUE,
+            "zero query vector is not valid for cosine KNN search",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_vector_index_scan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    index: &IndexSchema,
+    query_vector: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+    k: usize,
+    ef_search: usize,
+    filter: &Option<Expr>,
+    order_by: &[OrderBy],
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    use crate::engine::vector;
+    use crate::engine::vector::session::IterativeScan;
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let query = query_vector;
+    let col_idx = table.schema.column_index(&index.columns[0])?;
+    let output_columns = projection
+        .map(<[usize]>::to_vec)
+        .unwrap_or_else(|| logical_visible_column_indices(&table.schema));
+    let mut read_columns = output_columns.clone();
+    if !read_columns.contains(&col_idx) {
+        read_columns.push(col_idx);
+    }
+    let vector_position = read_columns
+        .iter()
+        .position(|column| *column == col_idx)
+        .unwrap();
+    let row_schema = if read_columns.len() > super::super::row_schema::LOOKUP_THRESHOLD {
+        let metas = cached_column_metas(table);
+        let metas = read_columns
+            .iter()
+            .map(|column| {
+                metas.get(*column).cloned().ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "projected column index out of bounds",
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        RowSchema::from_metas(&metas).into()
+    } else {
+        PlanRow::empty_schema()
+    };
+    let mut retained_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
+    // A recovered/sealed graph contains physical current vectors. Prepared
+    // writers may instead expose older vectors (or deleted rows) through undo;
+    // those rows need not occur in the ANN candidate pool at all.
+    if db.vector_table_has_prepared_writes(&table.schema)
+        || db.vector_snapshot_requires_exact(&table.schema, txn)
+    {
+        if order_by.len() > 1 {
+            return execute_ordered_vector_fallback(
+                db, txn, table, filter, order_by, k, projection,
+            );
+        }
+        return match filter {
+            Some(residual) => execute_vector_brute_scan_filtered(
+                db,
+                txn,
+                table,
+                col_idx,
+                query_vector,
+                metric,
+                k,
+                residual,
+            ),
+            None => execute_vector_brute_scan(db, txn, table, col_idx, query_vector, metric, k),
+        };
+    }
+    let hnsw_cfg = vector::session::current_config();
+    // Algorithm-specific search semantics. For HNSW the `effort` argument is
+    // an `ef` candidate-pool size, which must be at least `k`. For IVF it
+    // is `nprobe` — a *cell count* that is independent of the result size; the
+    // rerank fetch (`vector_rerank_fetch` below) still guarantees ≥ `k`
+    // candidates, so inflating nprobe by `k` (the old `max(k)`) only
+    // over-probes and silently defeats the `NPROBE=` / `mydb_ivf_nprobe`
+    // tuning knob for large-`k` queries.
+    let is_ivf = matches!(index.vector_algo(), crate::storage::schema::VectorAlgo::Ivf);
+    let quantized = index
+        .vector
+        .as_ref()
+        .is_some_and(|v| v.quantization.enabled());
+    let rerank_mult = vector::session::effective_rerank_mult(&hnsw_cfg, index);
+    let rerank_fetch = |want: usize| {
+        want.min(k.saturating_mul(rerank_mult as usize).max(32))
+            .max(k)
+    };
+
+    // Whether the backend's candidate ordering is *exact*. HNSW re-ranks on
+    // full-f32 node vectors, and IVF's Dot lists store f32 — for those, the
+    // first `k` visible candidates (already in exact-distance order) ARE the
+    // answer, so the no-filter early-exit below is sound. IVF L2/Cosine orders
+    // by *approximate* SQ8 distance, so a candidate ranked beyond `k` by SQ8
+    // can be closer in exact f32; we must exact-score the whole rerank pool
+    // before truncating, or recall silently drops to "SQ8 top-k".
+    // The concrete candidate generator reports whether its returned distances
+    // are authoritative. Ordinary IVF L2/Cosine is approximate SQ8, while the
+    // governed IVF graph navigator and both HNSW backends finish on f32 and are
+    // exact within their ANN candidate pool.
+    let mut exact_order = order_by.len() == 1;
+    let base_effort = if is_ivf {
+        ef_search.max(1)
+    } else {
+        ef_search.max(k)
+    };
+    let iterative_scan = if is_ivf {
+        hnsw_cfg.ivf_iterative_scan
+    } else {
+        hnsw_cfg.iterative_scan
+    };
+    let configured_max_scan = if is_ivf {
+        hnsw_cfg.ivf_max_scan_tuples
+    } else {
+        hnsw_cfg.max_scan_tuples
+    };
+    // Iterative-scan upper bound. Zero disables the cap; otherwise we never
+    // grow beyond it (we still cap-clamp on the first iteration so
+    // hint-driven `ef >> max_scan_tuples` stays honest).
+    let max_scan = if configured_max_scan == 0 {
+        usize::MAX
+    } else {
+        (configured_max_scan as usize).max(k)
+    };
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut scored: Vec<(f64, PlanRow)> = Vec::new();
+    let mut effort = if is_ivf {
+        base_effort
+    } else {
+        base_effort.min(max_scan)
+    };
+    let mut candidate_want = if is_ivf {
+        ivf_rerank_fetch(k, rerank_mult).max(if quantized { 32 } else { k })
+    } else {
+        rerank_fetch(effort)
+    }
+    .min(max_scan)
+    .max(k);
+    // For partitioned tables we issue one search per partition storage_id
+    // and union the candidates before MVCC + filter re-rank. The graph map
+    // is keyed by (table_id, storage_id, index_name) — see
+    // `Database::vector_index_search_for_partition`.
+    let storage_ids: Vec<u64> = if table.schema.is_partitioned() {
+        // Honour any active partition prune set (e.g. a partition predicate
+        // on the WHERE clause already routed by the pruning hook).
+        match crate::engine::executor::partition_router::current_pruned_partitions() {
+            Some(ids) if !ids.is_empty() => ids,
+            _ => table.schema.storage_ids(),
+        }
+    } else {
+        vec![table.schema.id]
+    };
+
+    // Separate the HNSW exact re-rank pool from the number of returned rows.
+    // `rerank_limit` below preserves the original scoring work for both the
+    // slab and paged backends before returning the nearest candidates.
+    // For an unfiltered read, returning k per partition is therefore enough
+    // for the global top-k. Keep exploration unchanged, and retain the wider
+    // initial pool when widening is disabled or transaction-local vectors
+    // require reordering by their heap values. Invisible rows are handled by
+    // the existing candidate-limit widening loop below.
+    if !is_ivf
+        && !quantized
+        // Compact FLOAT32 navigation defers its entire exact rerank pool to
+        // the heap. Other exact backends still need only k returned rows.
+        && !(query_vector.datatype == crate::vector::VectorDataType::Float32
+            && metric != vector::Metric::Dot)
+        && order_by.len() == 1
+        && filter.is_none()
+        && !matches!(iterative_scan, IterativeScan::Off)
+        && storage_ids.iter().all(|sid| {
+            db.pending_vector_upsert_row_ids(txn.txn_id, table.schema.id, *sid)
+                .is_empty()
+        })
+    {
+        candidate_want = k;
+    }
+
+    let partition_budget = max_scan / storage_ids.len().max(1);
+    // Score the complete ANN pool in place, then decode output columns only
+    // for winners. Filter/secondary-order/relaxed-order paths retain their
+    // existing row oracle, as do transaction-local vector changes.
+    let mut late_materialize = filter.is_none()
+        && order_by.len() == 1
+        && !matches!(iterative_scan, IterativeScan::RelaxedOrder)
+        && storage_ids.iter().all(|sid| {
+            db.pending_vector_upsert_row_ids(txn.txn_id, table.schema.id, *sid)
+                .is_empty()
+        });
+    let mut late_scores: Vec<(f64, u64, RowId, usize)> = Vec::new();
+    // Retain bounded fixed-width projections during scoring to avoid a
+    // second random read. This also covers vectors needed by internal order
+    // expressions; genuinely wide and LOB projections remain late.
+    let projection_bytes = output_columns.iter().try_fold(0usize, |bytes, &column| {
+        let width = match table.schema.columns[column].data_type {
+            DataTypeKind::Vector {
+                datatype,
+                dim: Some(dim),
+            } => datatype.payload_len(dim).saturating_add(64),
+            DataTypeKind::TinyInt
+            | DataTypeKind::SmallInt
+            | DataTypeKind::MediumInt
+            | DataTypeKind::Int
+            | DataTypeKind::BigInt
+            | DataTypeKind::Bool
+            | DataTypeKind::Float { .. }
+            | DataTypeKind::Double { .. }
+            | DataTypeKind::Decimal { .. }
+            | DataTypeKind::Date
+            | DataTypeKind::Time { .. }
+            | DataTypeKind::DateTime { .. }
+            | DataTypeKind::Timestamp { .. }
+            | DataTypeKind::Year => 256,
+            _ => return None,
+        };
+        bytes.checked_add(width)
+    });
+    let cache_projection =
+        output_columns.len() <= 8 && projection_bytes.is_some_and(|bytes| bytes <= 4096);
+    let cached_projection_bytes = if cache_projection {
+        projection_bytes.unwrap()
+    } else {
+        0
+    };
+    let mut late_values = crate::util::fast_hash::AhHashMap::default();
+
+    // Candidates already heap-read and filtered, keyed by partition-qualified
+    // row identity. Widening re-runs the graph search with a larger pool but
+    // never re-reads or re-evaluates a row an earlier pass already judged, so
+    // `examined` counts distinct heap reads against `max_scan_tuples`.
+    let mut seen: std::collections::HashSet<(u64, RowId)> = std::collections::HashSet::new();
+    let mut examined = 0usize;
+    let exact_fallback = 'candidate_search: loop {
+        if !is_ivf && candidate_want.saturating_mul(storage_ids.len()) > max_scan {
+            break true;
+        }
+        // Exchange candidates from every partition graph. The graph *explores*
+        // `want` (= ef_search) breadth for recall, but we only re-rank the top
+        // `rerank_want` of those by graph distance — each re-rank is a heap
+        // `read_row`, so fetching ef_search of them was the dominant fixed
+        // query cost. Widening below grows the pool when too few survive
+        // MVCC visibility or the residual filter.
+        let mut candidates: Vec<(u64, RowId, f64)> = Vec::new();
+        let mut all_backends_exhausted = true;
+        let mut pool_saturated = false;
+        for sid in &storage_ids {
+            let request = vector::VectorSearchRequest {
+                candidate_limit: candidate_want,
+                rerank_limit: if is_ivf {
+                    candidate_want
+                } else {
+                    rerank_fetch(effort).min(partition_budget).max(k)
+                },
+                effort: if is_ivf {
+                    vector::VectorSearchEffort::Ivf { nprobe: effort }
+                } else {
+                    vector::VectorSearchEffort::Hnsw {
+                        ef: effort.min(partition_budget).max(k),
+                    }
+                },
+            };
+            let part_result = match db.vector_index_search_for_partition(
+                &table.schema,
+                index,
+                *sid,
+                &query,
+                request,
+            ) {
+                Ok(result) => result,
+                Err(index_error)
+                    if index_error.is(crate::error::catalog::ER_INDEX_CORRUPT)
+                        && index_error.diagnostic_id()
+                            == Some("MYDB-DIAG-VECTOR-MAINTENANCE-PENDING") =>
+                {
+                    break 'candidate_search true
+                }
+                Err(index_error) => return Err(index_error),
+            };
+            exact_order &= part_result.exact_order;
+            pool_saturated |= part_result.candidates.len() >= candidate_want;
+            all_backends_exhausted &= part_result.exhausted;
+            candidates.extend(
+                part_result
+                    .candidates
+                    .into_iter()
+                    .map(|(rid, d)| (*sid, rid, d)),
+            );
+            let txn_delta = db.pending_vector_upsert_row_ids(txn.txn_id, table.schema.id, *sid);
+            if !txn_delta.is_empty() {
+                // The graph distance for a transaction-local UPDATE would be
+                // stale, so exact-score the complete merged pool below and
+                // disable the exact-order early exit for this statement.
+                exact_order = false;
+                candidates.extend(
+                    txn_delta
+                        .into_iter()
+                        .map(|rid| (*sid, rid, f64::NEG_INFINITY)),
+                );
+            }
+        }
+        // Sort the merged pool by graph distance so subsequent dedup keeps
+        // the closest copy in stale-graph cases.
+        candidates.sort_by(|a, b| a.2.total_cmp(&b.2));
+        if exact_order {
+            late_materialize = false;
+        }
+        if late_materialize {
+            let mut scoring_charge = retained_charge.sibling();
+            scoring_charge.add_non_spillable(
+                candidates
+                    .len()
+                    .saturating_mul(128 + cached_projection_bytes),
+            )?;
+            let mut pending = crate::util::fast_hash::AhHashMap::default();
+            for &(sid, row, _) in &candidates {
+                if seen.contains(&(sid, row)) {
+                    continue;
+                }
+                if pending.len() >= max_scan.saturating_sub(examined) {
+                    break;
+                }
+                seen.insert((sid, row));
+                pending.insert((sid, row), examined + pending.len());
+            }
+            if candidates
+                .iter()
+                .any(|&(sid, row, _)| !seen.contains(&(sid, row)))
+            {
+                break true;
+            }
+            examined += pending.len();
+            crate::engine::executor::mem_budget::try_reserve_vec_hard(
+                &mut late_scores,
+                pending.len(),
+                &mut retained_charge,
+                "vector candidate scores",
+            )?;
+            for &sid in &storage_ids {
+                let ids: Vec<_> = pending
+                    .keys()
+                    .filter_map(|&(part, row)| (part == sid).then_some(row))
+                    .collect();
+                if ids.is_empty() {
+                    continue;
+                }
+                let heap = db.cached_heap_handle(sid)?;
+                for (row, distance, values) in db.score_vector_rows_many_with_handle(
+                    &heap,
+                    &table.schema,
+                    &ids,
+                    txn,
+                    col_idx,
+                    query_vector,
+                    metric,
+                    cache_projection.then_some(output_columns.as_slice()),
+                )? {
+                    if let Some(&rank) = pending.get(&(sid, row)) {
+                        late_scores.push((distance, sid, row, rank));
+                        if cache_projection {
+                            retained_charge.add_non_spillable(
+                                crate::engine::executor::mem_budget::estimate_row_bytes(&values)
+                                    .saturating_add(128),
+                            )?;
+                            late_values.insert((sid, row), values);
+                        }
+                    }
+                }
+            }
+            let boundary_ties = !is_ivf
+                && metric == vector::Metric::Dot
+                && !quantized
+                && !matches!(iterative_scan, IterativeScan::Off)
+                && vector_pool_boundary_ties(k, late_scores.iter().map(|score| score.0));
+            if (late_scores.len() >= k && !boundary_ties)
+                || matches!(iterative_scan, IterativeScan::Off)
+            {
+                break false;
+            }
+        }
+
+        let mut budget_exhausted = false;
+        let mut candidates = candidates.into_iter().peekable();
+        'candidate_batches: while let Some((sid, row_id, graph_dist)) = candidates.next() {
+            if examined >= max_scan {
+                budget_exhausted = true;
+                break;
+            }
+            if seen.contains(&(sid, row_id)) {
+                continue;
+            }
+            crate::engine::cancel::check_cancelled()?;
+            // Coalesce a bounded, partition-local window without changing the
+            // candidate order, exploration budget or exact rerank policy.
+            let mut cap = 64usize.min(max_scan - examined);
+            if filter.is_none() && exact_order {
+                cap = cap.min(k.saturating_sub(scored.len()).max(1));
+            }
+            let mut window = vec![(row_id, graph_dist)];
+            let mut local_seen = crate::util::fast_hash::ah_hash_set();
+            local_seen.insert(row_id);
+            while window.len() < cap && candidates.peek().is_some_and(|next| next.0 == sid) {
+                let (_, next_row, distance) = candidates.next().unwrap();
+                if !seen.contains(&(sid, next_row)) && local_seen.insert(next_row) {
+                    window.push((next_row, distance));
+                }
+            }
+            let heap = db.cached_heap_handle(sid)?;
+            let ids = window.iter().map(|(row, _)| *row).collect::<Vec<_>>();
+            let values = db.read_row_columns_many_with_handle(
+                &heap,
+                &table.schema,
+                &ids,
+                txn,
+                &read_columns,
+            )?;
+            let mut batch_charge = retained_charge.sibling();
+            // Values move into PlanFields. Admit their additional headers for
+            // this bounded window before allocation, then transfer ownership
+            // once per window instead of releasing/recharging every row.
+            let field_headers = read_columns
+                .len()
+                .saturating_mul(std::mem::size_of::<PlanField>() + 32)
+                .saturating_add(std::mem::size_of::<PlanRow>() + std::mem::size_of::<f64>());
+            batch_charge.add_non_spillable(
+                values
+                    .iter()
+                    .map(|(_, values)| {
+                        crate::engine::executor::mem_budget::estimate_row_bytes(values)
+                            .saturating_add(field_headers)
+                    })
+                    .sum(),
+            )?;
+            let scored_start = scored.len();
+            let mut enough_exact = false;
+            let mut values = values
+                .into_iter()
+                .collect::<crate::util::fast_hash::AhHashMap<_, _>>();
+            for (row_id, graph_dist) in window {
+                // (storage_id, row_id) is the partition-disambiguated identity.
+                // A row judged by an earlier, narrower pass keeps its verdict.
+                if !seen.insert((sid, row_id)) {
+                    continue;
+                }
+                examined += 1;
+                // The batch's explicit heap handle already identifies its
+                // partition; restore graph order after page-coalesced reads.
+                let Some(values) = values.remove(&row_id) else {
+                    continue; // invisible / deleted under this snapshot
+                };
+                // Re-rank by the row's *current* heap vector, not the graph copy.
+                // Score directly over the stored little-endian bytes — no per-
+                // candidate `Vec<f32>` decode.
+                let dist = match values.get(vector_position) {
+                    Some(Value::Vector(bytes)) => {
+                        if bytes.dimension != query_vector.dimension {
+                            continue; // dimension drift — skip defensively
+                        }
+                        vector::distance::typed_ordering_distance(query_vector, bytes, metric)?
+                    }
+                    _ => continue,
+                };
+                // A superseded version kept for older snapshots sits at its old
+                // graph position; the candidate order no longer matches the heap,
+                // so this statement must rank the whole pool exactly.
+                if exact_order
+                    && (dist - graph_dist).abs() > 1e-3 * dist.abs().max(graph_dist.abs()).max(1e-6)
+                {
+                    exact_order = false;
+                }
+                let mut row = projected_values_to_plan_row(table, &read_columns, values)?;
+                row.schema = row_schema.clone();
+                let keep = match filter {
+                    Some(expr) => eval_plan_bool_with_db(db, txn, expr, &row, &mut eval_ctx)?,
+                    None => true,
+                };
+                if keep {
+                    scored.push((dist, row));
+                    // When the candidate ordering is *exact* (`exact_order`:
+                    // HNSW's f32 node vectors, or IVF's f32 Dot lists), candidates
+                    // arrive in exact ascending-distance order, so with no residual
+                    // filter to drop/reorder survivors the first `k` visible rows
+                    // ARE the answer — stop before reading (and MVCC-fetching) the
+                    // rest of the candidate pool. `read_row` dominated the fixed
+                    // cost of a low-ef KNN query; this cuts it from ~`rerank_want`
+                    // heap reads to ~`k`. For IVF L2/Cosine the pool order is only
+                    // SQ8-approximate, so we must exact-score the whole pool (no
+                    // early break) and let the final sort recover the true top-k.
+                    // With a filter we must keep scanning regardless (dropped rows
+                    // need replacements — the iterative widening below handles it).
+                    if filter.is_none() && exact_order && scored.len() >= k {
+                        enough_exact = true;
+                        break;
+                    }
+                }
+            }
+            let retained_bytes = scored[scored_start..]
+                .iter()
+                .map(|(_, row)| {
+                    super::nested_loop::materialized_plan_row_charge(row)
+                        + std::mem::size_of::<f64>()
+                })
+                .sum();
+            let mut moved = batch_charge.split(retained_bytes);
+            retained_charge.absorb(&mut moved);
+            if enough_exact {
+                break 'candidate_batches;
+            }
+        }
+        if budget_exhausted {
+            break true;
+        }
+        let boundary_ties = !is_ivf
+            && metric == vector::Metric::Dot
+            && !quantized
+            && !matches!(iterative_scan, IterativeScan::Off)
+            && vector_pool_boundary_ties(k, scored.iter().map(|score| score.0));
+        if (scored.len() >= k && !boundary_ties) || matches!(iterative_scan, IterativeScan::Off) {
+            break false;
+        }
+        // Every backend proved it holds no further candidates: a short
+        // result is the true answer.
+        if all_backends_exhausted && !pool_saturated {
+            // An ANN frontier can exhaust a disconnected component, or contain
+            // multiple versions of the same row. It cannot prove heap exhaustion.
+            break !is_ivf;
+        }
+        // Rows exist beyond what the ANN budget may inspect. Returning a
+        // short LIMIT would silently drop matching rows, so finish exactly.
+        if examined >= max_scan {
+            break true;
+        }
+        // Once observed filtering would require random heap reads for a
+        // substantial part of the relation, a bounded streaming TopK is cheaper.
+        // A smoothed survival estimate avoids treating one empty pool as proof
+        // that a selective predicate has no matches.
+        if !is_ivf && filter.is_some() && examined >= 64 {
+            let population = crate::planner::table_row_estimate(db, table)?;
+            let survival = (scored.len() as f64 + 2.0) / (examined as f64 + 16.0);
+            if population > 0.0 && k as f64 / survival > population * 0.25 {
+                break true;
+            }
+        }
+        if is_ivf {
+            // First retain more candidates from the already-selected cells;
+            // only after that pool is exhausted widen nprobe.
+            if pool_saturated && candidate_want < max_scan {
+                candidate_want = candidate_want.saturating_mul(2).max(k).min(max_scan);
+                continue;
+            }
+            if all_backends_exhausted {
+                break true;
+            }
+            effort = effort.saturating_mul(2).max(1);
+        } else {
+            // HNSW returns its whole `ef` pool while widening, so pool and
+            // exploration grow together. A pool beyond `max_scan` could only
+            // hold candidates the budget forbids reading: finish exactly.
+            if candidate_want >= max_scan {
+                break true;
+            }
+            let next = effort.max(candidate_want).saturating_mul(2).min(max_scan);
+            effort = next;
+            candidate_want = next.max(k);
+        }
+    };
+    if quantized {
+        if let Some(&sid) = storage_ids.first() {
+            db.record_vector_query_work(
+                &table.schema,
+                index,
+                sid,
+                examined as u64,
+                exact_fallback || db.vector_snapshot_requires_exact(&table.schema, txn),
+            );
+        }
+    }
+    if exact_fallback || db.vector_snapshot_requires_exact(&table.schema, txn) {
+        drop(scored);
+        drop(late_scores);
+        drop(late_values);
+        retained_charge.release_bytes(retained_charge.charged());
+        if order_by.len() > 1 {
+            return execute_ordered_vector_fallback(
+                db, txn, table, filter, order_by, k, projection,
+            );
+        }
+        return match filter {
+            Some(residual) => execute_vector_brute_scan_filtered(
+                db,
+                txn,
+                table,
+                col_idx,
+                query_vector,
+                metric,
+                k,
+                residual,
+            ),
+            None => execute_vector_brute_scan(db, txn, table, col_idx, query_vector, metric, k),
+        };
+    }
+
+    if late_materialize {
+        late_scores.sort_by(|a, b| a.0.total_cmp(&b.0).then_with(|| a.3.cmp(&b.3)));
+        late_scores.truncate(k);
+        let mut values_by_row = late_values;
+        for &sid in storage_ids.iter().filter(|_| !cache_projection) {
+            let ids: Vec<_> = late_scores
+                .iter()
+                .filter_map(|&(_, part, row, _)| (part == sid).then_some(row))
+                .collect();
+            if ids.is_empty() {
+                continue;
+            }
+            let heap = db.cached_heap_handle(sid)?;
+            let values = db.read_row_columns_many_with_handle(
+                &heap,
+                &table.schema,
+                &ids,
+                txn,
+                &output_columns,
+            )?;
+            let headers = output_columns
+                .len()
+                .saturating_mul(std::mem::size_of::<PlanField>() + 32)
+                .saturating_add(std::mem::size_of::<PlanRow>());
+            retained_charge.add_non_spillable(
+                values
+                    .iter()
+                    .map(|(_, row)| {
+                        crate::engine::executor::mem_budget::estimate_row_bytes(row)
+                            .saturating_add(headers)
+                    })
+                    .sum(),
+            )?;
+            values_by_row.extend(values.into_iter().map(|(row, values)| ((sid, row), values)));
+        }
+        let mut out = Vec::with_capacity(late_scores.len());
+        for (_, sid, row, _) in late_scores {
+            let Some(values) = values_by_row.remove(&(sid, row)) else {
+                if quantized {
+                    db.record_vector_query_work(&table.schema, index, sid, 0, true);
+                }
+                return execute_vector_brute_scan(db, txn, table, col_idx, query_vector, metric, k);
+            };
+            let mut row = projected_values_to_plan_row(table, &output_columns, values)?;
+            if output_columns == read_columns {
+                row.schema = row_schema.clone();
+            }
+            out.push(row);
+        }
+        return Ok(out);
+    }
+
+    if order_by.len() > 1 {
+        let rows = scored.into_iter().map(|(_, row)| row).collect();
+        // The external sorter assumes ownership and charges its own rows.
+        retained_charge.release_bytes(retained_charge.charged());
+        let mut rows = super::super::external_sort::sort_plan_rows_for_plan(
+            db.data_dir(),
+            rows,
+            order_by,
+            None,
+        )?;
+        rows.truncate(k);
+        for row in &mut rows {
+            if row.fields.len() > output_columns.len() {
+                row.fields.truncate(output_columns.len());
+                row.schema = PlanRow::empty_schema();
+            }
+        }
+        return Ok(rows);
+    }
+    // strict_order — keep ascending distance order (default). relaxed_order
+    // skips the final sort and just truncates: callers willing to trade
+    // ordering for latency get the raw insertion order.
+    if !matches!(iterative_scan, IterativeScan::RelaxedOrder) {
+        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
+    }
+    scored.truncate(k);
+    Ok(scored
+        .into_iter()
+        .map(|(_, mut row)| {
+            if row.fields.len() > output_columns.len() {
+                row.fields.truncate(output_columns.len());
+                row.schema = PlanRow::empty_schema();
+            }
+            row
+        })
+        .collect())
+}
+
+/// Exact completion can return a full logical heap row. Keep every ANN,
+/// historical and budget-fallback result aligned with the scan's schema.
+pub(super) fn project_vector_scan_output(
+    table: &PlanTable,
+    projection: Option<&[usize]>,
+    mut rows: Vec<PlanRow>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let Some(projection) = projection else {
+        return Ok(rows);
+    };
+    let metas = cached_column_metas(table);
+    let wanted = projection
+        .iter()
+        .map(|index| {
+            metas.get(*index).cloned().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "projected column index out of bounds",
+                )
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    for row in &mut rows {
+        if row.fields.len() == wanted.len()
+            && row
+                .fields
+                .iter()
+                .zip(&wanted)
+                .all(|(field, meta)| field.meta.ptr_eq(meta))
+        {
+            continue;
+        }
+        let mut fields = Vec::with_capacity(wanted.len());
+        for meta in &wanted {
+            let index = row.schema.resolve_index(&row.fields, None, &meta.column)?;
+            fields.push(PlanField {
+                meta: meta.clone(),
+                value: std::mem::replace(&mut row.fields[index].value, Value::Null),
+            });
+        }
+        row.fields = fields;
+        row.schema = PlanRow::empty_schema();
+    }
+    Ok(rows)
+}
+
+/// Exact completion for a distance order with SQL tie-break columns.
+#[allow(clippy::too_many_arguments)]
+fn execute_ordered_vector_fallback(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    order_by: &[OrderBy],
+    k: usize,
+    projection: Option<&[usize]>,
+) -> Result<Vec<PlanRow>, QueryError> {
+    let input = ordered_vector_fallback_input(table, filter, projection);
+    super::execute_topk(db, txn, &input, order_by, k)
+}
+
+pub(super) fn ordered_vector_fallback_input(
+    table: &PlanTable,
+    filter: &Option<Expr>,
+    projection: Option<&[usize]>,
+) -> PhysicalPlan {
+    use crate::engine::cbo::selectivity::Selectivity;
+    let rows = table.schema.stats.row_count as f64;
+    // Keep the same required columns as the ANN leaf. Accurate survivor
+    // estimates let the ordinary scan choose predicate-first decoding instead
+    // of materializing vectors and LOBs for every row before filtering.
+    let estimated_rows = filter.as_ref().map_or(rows, |predicate| {
+        crate::engine::cbo::selectivity::default_selectivity().predicate_rows(
+            &table.schema,
+            predicate,
+            rows,
+        )
+    });
+    PhysicalPlan::SeqScan {
+        table: table.clone(),
+        filter: filter.clone(),
+        estimated_rows,
+        access_rows: rows,
+        cost: crate::engine::cbo::Cost::scalar(rows),
+        possible_keys: Vec::new(),
+        runtime_filters: Vec::new(),
+        hint_note: None,
+        projected_columns: projection.map(|columns| Arc::new(columns.to_vec())),
+    }
+}
+
+/// A mixed-distance pool whose k-th row lies in its final tied plateau may
+/// have been filled by coincident coordinates before reaching other regions.
+/// Widen under the ordinary iterative budget. An entirely tied pool already
+/// supplies interchangeable rows and must not turn a constant-distance query
+/// into an exhaustive scan.
+fn vector_pool_boundary_ties(k: usize, distances: impl Iterator<Item = f64>) -> bool {
+    let mut best = f64::INFINITY;
+    let mut worst = f64::NEG_INFINITY;
+    let mut tied_worst = 0usize;
+    let mut count = 0usize;
+    for distance in distances {
+        if !distance.is_finite() {
+            return false;
+        }
+        best = best.min(distance);
+        if distance > worst {
+            worst = distance;
+            tied_worst = 1;
+        } else if distance == worst {
+            tied_worst += 1;
+        }
+        count += 1;
+    }
+    count >= k && best < worst && tied_worst > 1 && count - tied_worst < k
+}
+
+#[cfg(test)]
+mod vector_pool_boundary_tests {
+    use super::vector_pool_boundary_ties;
+
+    #[test]
+    fn vector_audit_widens_only_mixed_ties_crossing_the_limit() {
+        assert!(vector_pool_boundary_ties(
+            3,
+            [-9.0, -8.0, 0.0, 0.0].into_iter()
+        ));
+        assert!(!vector_pool_boundary_ties(
+            2,
+            [-9.0, -8.0, 0.0, 0.0].into_iter()
+        ));
+        assert!(!vector_pool_boundary_ties(3, [0.0; 32].into_iter()));
+        assert!(!vector_pool_boundary_ties(
+            3,
+            [-9.0, -8.0, -7.0].into_iter()
+        ));
+        assert!(!vector_pool_boundary_ties(4, [-9.0, 0.0, 0.0].into_iter()));
+        assert!(!vector_pool_boundary_ties(
+            3,
+            [-9.0, 0.0, f64::NAN].into_iter()
+        ));
+    }
+}
+
+/// Rare failure-path oracle used when an ANN file cannot be read or fails
+/// structural validation and the plan also carries a residual predicate.
+/// Scanning the heap is deliberately exact: storage/I/O damage must never be
+/// reported as a normal approximate-index miss.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn execute_vector_brute_scan_filtered(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    col_idx: usize,
+    query_vector: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+    k: usize,
+    filter: &Expr,
+) -> Result<Vec<PlanRow>, QueryError> {
+    use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+    use crate::engine::vector::hnsw_core::Scored;
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    let mut eval_ctx = EvalQueryContext::default();
+    let mut admitted =
+        ControlledMemoryCharge::try_new(ControlledMemoryCategory::StorageScratch, 0)?;
+    let mut best: std::collections::BinaryHeap<Scored<usize>> = std::collections::BinaryHeap::new();
+    let mut retained: Vec<Option<PlanRow>> = Vec::new();
+    let mut row_bytes: Vec<usize> = Vec::new();
+    db.scan_rows_ordered_streaming(&table.schema.qualified_name(), txn, |values| {
+        crate::engine::cancel::check_cancelled()?;
+        let Some(Value::Vector(bytes)) = values.get(col_idx) else {
+            return Ok(());
+        };
+        if bytes.dimension != query_vector.dimension {
+            return Ok(());
+        }
+        let row = stored_row_to_plan_row(table, values.to_vec())?;
+        if !eval_plan_bool_with_db(db, txn, filter, &row, &mut eval_ctx)? {
+            return Ok(());
+        }
+        let distance =
+            crate::engine::vector::distance::typed_ordering_distance(query_vector, bytes, metric)?;
+        let distance = if distance.is_nan() {
+            f64::NEG_INFINITY
+        } else {
+            distance
+        };
+        if best.len() < k {
+            let bytes = super::nested_loop::materialized_plan_row_charge(&row);
+            admitted.try_grow(bytes)?;
+            let slot = retained.len();
+            retained.push(Some(row));
+            row_bytes.push(bytes);
+            best.push(Scored {
+                dist: distance,
+                id: slot,
+            });
+        } else if best.peek().is_some_and(|worst| distance < worst.dist) {
+            let mut worst = best.peek_mut().expect("nonempty bounded top-k");
+            let slot = worst.id;
+            let bytes = super::nested_loop::materialized_plan_row_charge(&row);
+            admitted.try_grow(bytes.saturating_sub(row_bytes[slot]))?;
+            admitted.shrink(row_bytes[slot].saturating_sub(bytes));
+            row_bytes[slot] = bytes;
+            retained[slot] = Some(row);
+            worst.dist = distance;
+        }
+        Ok(())
+    })?;
+    Ok(best
+        .into_sorted_vec()
+        .into_iter()
+        .map(|score| retained[score.id].take().expect("retained top-k row"))
+        .collect())
+}
+
+/// Brute-force **exact** KNN over a `VECTOR(n)` column with no HNSW index
+/// (the `PhysicalPlan::VectorBruteScan` node). The heavy lifting —
+/// zero-copy in-place distance scoring off the heap payload, a bounded
+/// top-`k` of `(distance, row_id)`, and the parallel page-range fan-out —
+/// lives in [`Database::vector_brute_knn`]. Here we just re-materialise the
+/// K winners (in ascending-distance order) into `PlanRow`s; the downstream
+/// Projection recomputes the displayed `DISTANCE(...)` value, exactly as for
+/// `VectorIndexScan`, and `provided_order_prefix_len` has already suppressed
+/// the redundant Sort.
+///
+/// The planner only emits this node for unpartitioned tables (RowIds are
+/// unique only within a partition), so a plain `read_row` correctly locates
+/// each winner.
+pub(super) fn execute_vector_brute_scan(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    col_idx: usize,
+    query_vector: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+    k: usize,
+) -> Result<Vec<PlanRow>, QueryError> {
+    if k == 0 {
+        return Ok(Vec::new());
+    }
+    db.validate_vector_table_backend(&table.schema)?;
+    let winners = db.vector_brute_knn(&table.schema, txn, col_idx, query_vector, metric, k)?;
+    let partitioned = table.schema.is_partitioned();
+    let mut rows = Vec::with_capacity(winners.len());
+    for (_dist, sid, row_id) in winners {
+        // Same snapshot as the scan, so a winner is still visible; defensively
+        // skip a row that somehow vanished rather than emitting a stub. For a
+        // partitioned table, route the read to the winner's partition (RowIds
+        // are only unique within one partition).
+        let stored_opt = if partitioned {
+            crate::engine::executor::partition_router::with_pruned_partitions(vec![sid], || {
+                db.read_row(&table.schema, row_id, txn)
+            })?
+        } else {
+            db.read_row(&table.schema, row_id, txn)?
+        };
+        if let Some(stored) = stored_opt {
+            rows.push(stored_row_to_plan_row(table, stored.values)?);
+        }
+    }
+    Ok(rows)
+}
+
+pub(in crate::engine::executor::select) fn stored_row_to_plan_row(
+    table: &PlanTable,
+    values: Vec<Value>,
+) -> Result<PlanRow, QueryError> {
+    let metas = cached_column_metas(table);
+    let fields = logical_visible_column_indices(&table.schema)
+        .into_iter()
+        .map(|idx| {
+            let meta = metas.get(idx).cloned().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "stored row metadata is incomplete",
+                )
+            })?;
+            let value = values.get(idx).cloned().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "stored row has too few values",
+                )
+            })?;
+            Ok(PlanField { meta, value })
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    Ok(PlanRow {
+        fields,
+        group: None,
+        agg_values: None,
+        schema: table
+            .row_schema
+            .get_or_init(|| {
+                let visible_metas = logical_visible_column_indices(&table.schema)
+                    .into_iter()
+                    .filter_map(|index| metas.get(index).cloned())
+                    .collect::<Vec<_>>();
+                RowSchema::from_metas(&visible_metas)
+            })
+            .clone()
+            .into(),
+    })
+}
+
+/// Base-schema indices in SQL-visible logical order. Heap codecs and index
+/// entries continue to address columns by their stable physical/schema slot;
+/// a `PlanRow`, however, is a semantic row and must hide INSTANT-DROP
+/// tombstones and reflect FIRST/AFTER ordering for wildcard projection.
+pub(in crate::engine::executor::select) fn logical_visible_column_indices(
+    schema: &TableSchema,
+) -> Vec<usize> {
+    schema.iter_visible_columns().map(|(idx, _)| idx).collect()
+}
+
+/// Like [`stored_row_to_plan_row`] but keeps only the columns whose base
+/// index appears in `projection`. Consumed `values` are still the full
+/// row (heap reads decode the whole record); this variant just skips the
+/// `PlanField { meta, value }` construction — and, crucially, avoids
+/// cloning large payload columns (TEXT/JSON/BYTES) into a `PlanRow` field
+/// only to be dropped by an upstream projection. Used by the FT executor
+/// when the outer plan doesn't reference the FT indexed columns for
+/// downstream evaluation.
+///
+/// `projection` need not be sorted; column identity is by base index.
+pub(in crate::engine::executor::select) fn stored_row_to_plan_row_projected(
+    table: &PlanTable,
+    values: Vec<Value>,
+    projection: &[usize],
+) -> Result<PlanRow, QueryError> {
+    let metas = cached_column_metas(table);
+    let mut values = values;
+    // Emit fields in the base-column order they were requested. This
+    // preserves the natural ordering used by other scan paths (e.g.
+    // `projected_values_to_plan_row` operates on already-projected
+    // values from covering scans).
+    let mut fields: Vec<PlanField> = Vec::with_capacity(projection.len());
+    for &idx in projection {
+        let meta = metas.get(idx).cloned().ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "projected column index out of bounds",
+            )
+        })?;
+        // `Value` isn't `Default`, so swap in a Null sentinel instead of
+        // `mem::take` to move the value out without cloning.
+        let slot = values.get_mut(idx).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "stored row has too few values",
+            )
+        })?;
+        let value = std::mem::replace(slot, Value::Null);
+        fields.push(PlanField { meta, value });
+    }
+    Ok(PlanRow {
+        fields,
+        group: None,
+        agg_values: None,
+        schema: PlanRow::empty_schema(),
+    })
+}
+
+pub(in crate::engine::executor::select) fn projected_values_to_plan_row(
+    table: &PlanTable,
+    projection: &[usize],
+    values: Vec<Value>,
+) -> Result<PlanRow, QueryError> {
+    let metas = cached_column_metas(table);
+    let mut values = values.into_iter();
+    let fields = projection
+        .iter()
+        .map(|&idx| {
+            let meta = metas.get(idx).cloned().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "projected column index out of bounds",
+                )
+            })?;
+            let value = values.next().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "projected row has too few values",
+                )
+            })?;
+            Ok(PlanField { meta, value })
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
+    Ok(PlanRow {
+        fields,
+        group: None,
+        agg_values: None,
+        schema: PlanRow::empty_schema(),
+    })
+}
+
+pub(super) fn null_extend_right(left: &PlanRow, right_plan: &PhysicalPlan) -> PlanRow {
+    null_extend_plan::<false>(left, right_plan, None)
+}
+
+pub(super) fn null_extend_right_table(
+    left: &PlanRow,
+    right_table: &PlanTable,
+    projection: Option<&[usize]>,
+) -> PlanRow {
+    let right_len = projection
+        .map(|columns| columns.len())
+        .unwrap_or(right_table.schema.columns.len());
+    let mut fields = Vec::with_capacity(left.fields.len() + right_len);
+    fields.extend(left.fields.iter().cloned());
+    if let Some(projection) = projection {
+        for &idx in projection {
+            if let Some(column) = right_table.schema.columns.get(idx) {
+                fields.push(PlanField {
+                    meta: intern_col_meta(ColMeta {
+                        invisible: column.invisible,
+                        table: right_table.schema.name.clone(),
+                        alias: right_table.alias.clone(),
+                        column: column.name.clone(),
+                        column_type: right_table.schema.result_type(idx),
+                        source: Default::default(),
+                    }),
+                    value: Value::Null,
+                });
+            }
+        }
+    } else {
+        for (idx, column) in right_table.schema.columns.iter().enumerate() {
+            fields.push(PlanField {
+                meta: intern_col_meta(ColMeta {
+                    invisible: column.invisible,
+                    table: right_table.schema.name.clone(),
+                    alias: right_table.alias.clone(),
+                    column: column.name.clone(),
+                    column_type: right_table.schema.result_type(idx),
+                    source: Default::default(),
+                }),
+                value: Value::Null,
+            });
+        }
+    }
+    PlanRow {
+        fields,
+        group: None,
+        agg_values: None,
+        schema: PlanRow::empty_schema(),
+    }
+}
+
+pub(super) fn null_extend_left(right: &PlanRow, left_plan: &PhysicalPlan) -> PlanRow {
+    null_extend_plan::<true>(right, left_plan, None)
+}
+
+/// Produce only the requested columns, keeping the plan's NULL-side width.
+pub(super) fn null_extend_right_projected(
+    left: &PlanRow,
+    right_plan: &PhysicalPlan,
+    projection: &[usize],
+) -> PlanRow {
+    null_extend_plan::<false>(left, right_plan, Some(projection))
+}
+
+pub(super) fn null_extend_left_projected(
+    right: &PlanRow,
+    left_plan: &PhysicalPlan,
+    projection: &[usize],
+) -> PlanRow {
+    null_extend_plan::<true>(right, left_plan, Some(projection))
+}
+
+/// The side is a compile-time policy, preserving static row-layout paths.
+#[inline]
+fn null_extend_plan<const NULL_LEFT: bool>(
+    row: &PlanRow,
+    null_plan: &PhysicalPlan,
+    projection: Option<&[usize]>,
+) -> PlanRow {
+    let mut null_cols = Vec::new();
+    collect_plan_fields(null_plan, &mut null_cols);
+    let left_len = if NULL_LEFT {
+        null_cols.len()
+    } else {
+        row.fields.len()
+    };
+    let mut fields =
+        Vec::with_capacity(projection.map_or(row.fields.len() + null_cols.len(), |p| p.len()));
+    let null_field = |meta: ColMeta| PlanField {
+        meta: intern_col_meta(meta),
+        value: Value::Null,
+    };
+    if let Some(projection) = projection {
+        for &i in projection {
+            let null_side = if NULL_LEFT {
+                i < left_len
+            } else {
+                i >= left_len
+            };
+            let position = if i < left_len { i } else { i - left_len };
+            if null_side {
+                if let Some(meta) = null_cols.get(position) {
+                    fields.push(null_field(meta.clone()));
+                }
+            } else if let Some(field) = row.fields.get(position) {
+                fields.push(field.clone());
+            }
+        }
+    } else if NULL_LEFT {
+        fields.extend(null_cols.into_iter().map(null_field));
+        fields.extend(row.fields.iter().cloned());
+    } else {
+        fields.extend(row.fields.iter().cloned());
+        fields.extend(null_cols.into_iter().map(null_field));
+    }
+    PlanRow {
+        fields,
+        group: None,
+        agg_values: None,
+        schema: PlanRow::empty_schema(),
+    }
+}
+
+#[cfg(test)]
+mod fulltext_posting_seek_tests {
+    use super::*;
+    use crate::storage::fulltext::FtPosting;
+
+    #[test]
+    fn monotone_seek_matches_binary_search_for_dense_and_sparse_lists() {
+        for spacing in [1u32, 3, 257] {
+            let postings: Vec<_> = (0..1000)
+                .map(|id| FtPosting {
+                    row_id: RowId::new(id * spacing, (id % 7) as u16),
+                    doc_len: 4,
+                    tf: 1,
+                    pos_start: 0,
+                    pos_len: 1,
+                })
+                .collect();
+            for stride in [1usize, 2, 37, 999, 1001] {
+                let mut cursor = 0;
+                for page in (0..1001 * spacing).step_by(stride) {
+                    for slot in [0u16, 3, 6] {
+                        let row_id = RowId::new(page, slot);
+                        let expected = postings.binary_search_by_key(&row_id, |p| p.row_id).ok();
+                        let actual = seek_fulltext_posting(&postings, &mut cursor, row_id);
+                        assert_eq!(
+                            actual.map(|p| p.row_id),
+                            expected.map(|i| postings[i].row_id)
+                        );
+                    }
+                }
+            }
+        }
+    }
+}

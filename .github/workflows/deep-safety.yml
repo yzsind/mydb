@@ -1,0 +1,64 @@
+name: Deep safety
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      seconds:
+        description: 'Per-target fuzz seconds (keep at or below 400 to fit the job timeout)'
+        type: number
+        default: 60
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  thread-sanitizer:
+    name: ThreadSanitizer concurrency paths
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: tsan
+      - run: scripts/run_tsan_btree.sh
+
+  decoder-fuzz:
+    name: ASan decoder fuzz deep run
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/fuzz -> /tmp/mydb/fuzz/build
+          key: deep-safety-asan
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/mydb/fuzz/corpus
+          key: deep-safety-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: deep-safety-corpus-
+      - run: mkdir -p /tmp/mydb
+      - run: python3 scripts/run_fuzz.py --output /tmp/mydb/fuzz --seconds ${{ inputs.seconds || 60 }}
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deep-fuzz-evidence
+          path: |
+            /tmp/mydb/fuzz/*.log
+            /tmp/mydb/fuzz/results.json
+            /tmp/mydb/fuzz/artifacts
+            /tmp/mydb/fuzz/corpus

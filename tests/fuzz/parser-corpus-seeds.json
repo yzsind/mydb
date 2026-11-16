@@ -1,0 +1,128 @@
+{
+  "cases": [
+    {
+      "sql": "SELECT * FROM t START WITH a=1 CONNECT BY PRIOR a=b",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT 1 FOR JSON AUTO",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT 1 FOR XML AUTO",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT 1 a UNION ALL BY NAME SELECT 2 b",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "INSERT INTO t VALUES (1),(2) LIMIT 1",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "INSERT INTO t VALUES (1),(2) ORDER BY 1 DESC",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "INSERT INTO t VALUES (__MYDB_EMPTY_ROW__)",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "INSERT INTO t VALUES (`__MYDB_EMPTY_ROW__`)",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "INSERT INTO t VALUES (1) RETURNING 5 AS __mydb_returning_old_78, 6 AS keep",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "INSERT INTO t VALUES (DEFAULT(1+2))",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT SUM(x ORDER BY y) FROM t",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT SUM(x LIMIT 1) FROM t",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT GROUP_CONCAT(x LIMIT 1) FROM t",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "FLUSH TABLES `a  b`",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "ANALYZE TABLE `a  b`",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "CREATE VIEW a视图 AS SELECT 1",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SAVEPOINT a点",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "CREATE TABLE t (a INT) PARTITION BY HASH(a) (PARTITION p分区)",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT /*!1 + */ 2",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT /*!1234 + */ 2",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "CREATE TABLE t (id INT, PRIMARY KEY(id) COMMENT 'keep')",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "CREATE TABLE t (count INT, FOREIGN KEY (count) REFERENCES count (id))",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT 'a\\f', 1 +",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT 1 INTO @target FROM",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "/*!99999 中文 */ SELECT 1 +",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT * FROM (SELECT * FROM t) AS d(a,b)",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT * FROM (SELECT 1 UNION SELECT 2) AS d(a)",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SELECT * FROM t FOR UPDATE OF t",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "CREATE TABLE t (a INT) PARTITION BY RANGE(a) (PARTITION p VALUES LESS THAN (+10))",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "CREATE PROCEDURE p() BEGIN `a b`: LOOP LEAVE `a b`; END LOOP `a b`; END",
+      "sql_mode_bits": 0
+    },
+    {
+      "sql": "SET sql_mode='ANSI_QUOTES'; SELECT \"x\" FROM modes",
+      "sql_mode_bits": 0
+    }
+  ]
+}

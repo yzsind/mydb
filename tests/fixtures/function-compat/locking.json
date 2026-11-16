@@ -1,0 +1,662 @@
+{
+  "schema_version": 1,
+  "mysql_version": "8.0.46",
+  "category": "locking",
+  "functions": [
+    {
+      "name": "GET_LOCK",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT GET_LOCK('function-doc-example', 0)",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "GET_LOCK('function-doc-example', 0)",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "GET_LOCK('function-doc-example', 0)",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT GET_LOCK(NULL, NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT GET_LOCK()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_FREE_LOCK",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_FREE_LOCK('function-doc-example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_FREE_LOCK('function-doc-example')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "1"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_FREE_LOCK('function-doc-example')",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_FREE_LOCK(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_FREE_LOCK()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "IS_USED_LOCK",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_USED_LOCK('function-doc-example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_USED_LOCK('function-doc-example')",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM",
+                  "UNSIGNED"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "IS_USED_LOCK('function-doc-example')",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NUM', 'UNSIGNED'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_USED_LOCK(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT IS_USED_LOCK()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "RELEASE_ALL_LOCKS",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT RELEASE_ALL_LOCKS()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "RELEASE_ALL_LOCKS()",
+                "type": "LONGLONG",
+                "length": 21,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NOT_NULL",
+                  "NUM",
+                  "UNSIGNED"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "RELEASE_ALL_LOCKS()",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 21, 'decimals': 0, 'flags': ['BINARY', 'NOT_NULL', 'NUM', 'UNSIGNED'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT RELEASE_ALL_LOCKS(), RELEASE_ALL_LOCKS()",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "0",
+                "0"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0",
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "0",
+                "0"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": []
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT RELEASE_ALL_LOCKS(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    },
+    {
+      "name": "RELEASE_LOCK",
+      "oracle_class": "mysql80_community",
+      "profile": "stateful",
+      "cases": [
+        {
+          "id": "nominal",
+          "tags": [
+            "nominal",
+            "metadata",
+            "constant"
+          ],
+          "setup": [],
+          "sql": "SELECT RELEASE_LOCK('function-doc-example')",
+          "cleanup": [],
+          "expected": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": []
+          },
+          "mysql_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "RELEASE_LOCK('function-doc-example')",
+                "type": "LONGLONG",
+                "length": 1,
+                "decimals": 0,
+                "flags": [
+                  "BINARY",
+                  "NUM"
+                ],
+                "collation": "binary (63)"
+              }
+            ],
+            "column_types": [
+              "LongLong"
+            ]
+          },
+          "mydb_probe": {
+            "status": "ok",
+            "rows": [
+              [
+                "NULL"
+              ]
+            ],
+            "warning_codes": [],
+            "columns": [
+              {
+                "name": "RELEASE_LOCK('function-doc-example')",
+                "type": "VAR_STRING",
+                "length": 65535,
+                "decimals": 31,
+                "flags": [],
+                "collation": "utf8mb4_0900_ai_ci (255)"
+              }
+            ],
+            "column_types": [
+              "VarString"
+            ]
+          },
+          "metadata_comparison": "contract",
+          "metadata_difference_reason": "Captured protocol metadata differs or MySQL Community lacks this function; mysql=[{'type': 'LONGLONG', 'length': 1, 'decimals': 0, 'flags': ['BINARY', 'NUM'], 'collation': 'binary (63)'}], mydb=[{'type': 'VAR_STRING', 'length': 65535, 'decimals': 31, 'flags': [], 'collation': 'utf8mb4_0900_ai_ci (255)'}]."
+        },
+        {
+          "id": "null_or_boundary",
+          "tags": [
+            "null",
+            "boundary",
+            "column"
+          ],
+          "setup": [],
+          "sql": "SELECT RELEASE_LOCK(NULL)",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 3057,
+            "sqlstate": "42000"
+          }
+        },
+        {
+          "id": "invalid_arity",
+          "tags": [
+            "invalid",
+            "wrong_arity"
+          ],
+          "setup": [],
+          "sql": "SELECT RELEASE_LOCK()",
+          "cleanup": [],
+          "expected": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mysql_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          },
+          "mydb_probe": {
+            "status": "error",
+            "errno": 1582,
+            "sqlstate": "42000"
+          }
+        }
+      ]
+    }
+  ]
+}

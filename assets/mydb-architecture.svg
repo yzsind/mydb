@@ -1,0 +1,246 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="1520" viewBox="0 0 1200 1520" role="img" aria-labelledby="title description">
+  <title id="title">MyDB product architecture</title>
+  <desc id="description">MyDB is a public-preview Rust database for HTAP mixed transactional and analytical workloads, AI agents, and MySQL-compatible access. MySQL clients, optional REST SQL, and optional MCP tools share the SQL engine, accounts, row security, and transactions. REST and MCP share an HTTP listener and API-key SQL service. The SQL engine combines parsing, cost-based optimization, parallel and vectorized execution, online DDL, BM25 and vector hybrid retrieval with RRF, and governed external AI model calls. Model inference runs outside the database. Native storage provides heap tables, B-tree, LOB, JSONB, spatial R-tree, full-text, automatic Zone Maps, and memory or paged HNSW and IVF indexes. MVCC, undo, WAL, group commit, and retention-bounded time travel underpin transactions. Shared sessions, security, metadata, and unified memory accounting support the execution path. Online physical backups are directly queryable and support archived-WAL point-in-time recovery. Native WAL replication is separate from MySQL ROW/FULL binlog source and receiver integration. DDL publication still coordinates locks; native role changes require operator control and fencing, with no automatic leader election. Green panels highlight native capabilities.</desc>
+  <defs>
+    <style>
+      svg { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; }
+      text { fill: #172e43; }
+      .canvas { fill: #ffffff; }
+      .panel { fill: #f2f5f8; }
+      .tile { fill: #ffffff; }
+      .feature { fill: #e1f3ef; }
+      .brand { font-size: 34px; font-weight: 700; letter-spacing: -1px; }
+      .subtitle { font-size: 20px; fill: #52697d; }
+      .heading { font-size: 23px; font-weight: 650; }
+      .subhead { font-size: 20px; font-weight: 600; }
+      .detail { font-size: 18px; fill: #52697d; }
+      .small { font-size: 17px; fill: #52697d; }
+      .accent { fill: #006d63; }
+      .eyebrow { font-size: 13px; letter-spacing: 1.2px; font-weight: 650; fill: #52697d; }
+      .rule { stroke: #d5dfe8; stroke-width: 1; }
+      .feature-rule { stroke: #bbdcd3; stroke-width: 1; }
+      .flow { fill: none; stroke: #8197aa; stroke-width: 1.6; marker-end: url(#arrow); }
+      .connector { fill: none; stroke: #8197aa; stroke-width: 1.6; }
+      .support { fill: none; stroke: #a2b2c0; stroke-width: 1.3; stroke-dasharray: 3 4; }
+      .arrowhead { fill: none; stroke: #8197aa; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+      @media (prefers-color-scheme: dark) {
+        text { fill: #eaf2f8; }
+        .canvas { fill: #101b26; }
+        .panel { fill: #1b2b3a; }
+        .tile { fill: #243747; }
+        .feature { fill: #123e3b; }
+        .subtitle, .detail, .small, .eyebrow { fill: #b4c5d4; }
+        .accent { fill: #7addc6; }
+        .rule { stroke: #364d60; }
+        .feature-rule { stroke: #2d6258; }
+        .flow, .connector, .arrowhead { stroke: #90a9bd; }
+        .support { stroke: #647f94; }
+      }
+    </style>
+    <marker id="arrow" viewBox="0 0 8 8" refX="7" refY="4" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path class="arrowhead" d="M1 1 L7 4 L1 7"/>
+    </marker>
+  </defs>
+
+  <rect class="canvas" x="0" y="0" width="1200" height="1520" rx="20"/>
+  <text class="brand" x="36" y="56">MyDB</text>
+  <text class="subtitle" x="156" y="55">Product architecture</text>
+  <rect class="feature" x="958" y="27" width="206" height="36" rx="8"/>
+  <text class="subhead accent" x="1061" y="51" text-anchor="middle">PUBLIC PREVIEW</text>
+  <text class="subtitle" x="36" y="88">HTAP mixed workloads · AI agents · MySQL compatibility</text>
+
+  <!-- All transports enter the same SQL engine; REST and MCP are independently optional. -->
+  <g data-module="client-access">
+    <text class="eyebrow" x="56" y="124">APPLICATIONS &amp; MYSQL CLIENTS</text>
+    <text class="eyebrow" x="440" y="124">OPTIONAL HTTP LISTENER · SHARED API-KEY SQL SERVICE</text>
+    <rect class="panel" x="36" y="140" width="360" height="116" rx="12"/>
+    <text class="heading" x="56" y="176">MySQL classic protocol</text>
+    <text class="detail" x="56" y="207">TLS · Prepared statements</text>
+    <text class="detail" x="56" y="233">Text / binary results · Cursors</text>
+    <rect class="feature" x="416" y="140" width="748" height="116" rx="12"/>
+    <text class="heading accent" x="440" y="176">REST SQL</text>
+    <text class="detail" x="440" y="207">Parameterized SQL · Sessions</text>
+    <text class="detail" x="440" y="233">Transactions · NDJSON streaming</text>
+    <path class="feature-rule" d="M792 158 V238"/>
+    <text class="heading accent" x="816" y="176">MCP server</text>
+    <text class="detail" x="816" y="207">Native SQL tools for AI clients</text>
+    <text class="detail" x="816" y="233">Streamable HTTP · API keys</text>
+  </g>
+  <path class="flow" d="M216 260 V280 H600 V308"/>
+  <path class="connector" d="M792 260 V280 H600"/>
+
+  <!-- Shared lifecycle and statement context. -->
+  <g data-module="sessions">
+    <rect class="panel" x="36" y="316" width="228" height="208" rx="12"/>
+    <text class="heading" x="56" y="352">Sessions</text>
+    <text class="detail" x="56" y="391">Connections &amp; handles</text>
+    <text class="detail" x="56" y="419">Prepared parameters</text>
+    <text class="detail" x="56" y="447">Variables &amp; context</text>
+    <text class="detail" x="56" y="475">Cancel / timeout</text>
+  </g>
+
+  <!-- The same authorization applies across MySQL, REST, and MCP. -->
+  <g data-module="security">
+    <rect class="panel" x="36" y="548" width="228" height="324" rx="12"/>
+    <text class="heading" x="56" y="584">Security</text>
+    <text class="detail" x="56" y="623">Accounts &amp; roles</text>
+    <text class="detail" x="56" y="651">Object / column grants</text>
+    <rect class="feature" x="48" y="658" width="204" height="30" rx="6"/>
+    <text class="detail accent" x="56" y="679" font-weight="600">Row security policies</text>
+    <text class="detail" x="56" y="707">TLS / mTLS · API keys</text>
+    <text class="detail" x="56" y="735">Password policies</text>
+    <text class="detail" x="56" y="763">Audit logging</text>
+    <path class="rule" d="M56 787 H244"/>
+    <text class="small" x="56" y="817">Shared SQL privileges</text>
+    <text class="small" x="56" y="843">across all transports</text>
+  </g>
+
+  <!-- Catalog, plan invalidation, and operational visibility. -->
+  <g data-module="metadata">
+    <rect class="panel" x="36" y="896" width="228" height="292" rx="12"/>
+    <text class="heading" x="56" y="932">Metadata</text>
+    <text class="detail" x="56" y="971">Catalog &amp; schemas</text>
+    <text class="detail" x="56" y="999">Schema versions</text>
+    <text class="detail" x="56" y="1027">Statistics &amp; histograms</text>
+    <text class="detail" x="56" y="1055">System schemas</text>
+    <text class="detail" x="56" y="1083">Object definitions</text>
+    <path class="rule" d="M56 1107 H244"/>
+    <text class="small" x="56" y="1137">EXPLAIN ANALYZE</text>
+    <text class="small" x="56" y="1163">Metrics &amp; diagnostics</text>
+  </g>
+  <path class="support" d="M268 420 H284 M268 710 H284 M268 1042 H284"/>
+
+  <!-- Hybrid retrieval and external calls are SQL capabilities, not mandatory execution stages. -->
+  <g data-module="sql-engine">
+    <rect class="panel" x="288" y="316" width="624" height="406" rx="12"/>
+    <text class="heading" x="312" y="352">SQL engine</text>
+    <rect class="tile" x="308" y="374" width="176" height="90" rx="8"/>
+    <text class="subhead" x="324" y="402">Parse &amp; bind</text>
+    <text class="small" x="324" y="429">AST · Semantics</text>
+    <text class="small" x="324" y="451">Types · Parameters</text>
+    <rect class="feature" x="508" y="374" width="176" height="90" rx="8"/>
+    <text class="subhead accent" x="524" y="402">Optimizer</text>
+    <text class="small" x="524" y="429">CBO · Join ordering</text>
+    <text class="small" x="524" y="451">Rewrites · Caches</text>
+    <rect class="feature" x="708" y="374" width="184" height="90" rx="8"/>
+    <text class="subhead accent" x="724" y="402">Executor</text>
+    <text class="small" x="724" y="429">Row · Vector · SIMD</text>
+    <text class="small" x="724" y="451">Parallel · Hash joins</text>
+    <path class="flow" d="M488 419 H504"/>
+    <path class="flow" d="M688 419 H704"/>
+    <rect class="feature" x="308" y="480" width="584" height="64" rx="8"/>
+    <text class="subhead accent" x="324" y="506">Online DDL*</text>
+    <text class="small" x="324" y="530">Concurrent index builds · Versioned schema changes</text>
+    <rect class="feature" x="308" y="560" width="282" height="142" rx="8"/>
+    <text class="subhead accent" x="324" y="588">Hybrid retrieval</text>
+    <text class="small" x="324" y="615">BM25 + vector search</text>
+    <text class="small" x="324" y="639">RRF / weighted RRF</text>
+    <text class="small" x="324" y="663">Relational filters &amp; joins</text>
+    <text class="eyebrow" x="324" y="687">RRF · TECHNICAL PREVIEW</text>
+    <rect class="feature" x="606" y="560" width="286" height="142" rx="8"/>
+    <text class="subhead accent" x="622" y="588">AI model calls</text>
+    <text class="small" x="622" y="615">AI_GENERATE · AI_EMBED</text>
+    <text class="small" x="622" y="639">Model grants · Encrypted secrets</text>
+    <text class="small" x="622" y="663">External inference · Call budgets</text>
+    <text class="eyebrow" x="622" y="687">LOCAL OR REMOTE SERVICES</text>
+  </g>
+  <path class="flow" d="M600 726 V746"/>
+
+  <!-- One native heap engine with general-purpose access paths. -->
+  <g data-module="storage-engine">
+    <rect class="panel" x="288" y="754" width="624" height="238" rx="12"/>
+    <text class="heading" x="312" y="790">Native storage &amp; indexes</text>
+    <rect class="feature" x="308" y="806" width="584" height="56" rx="8"/>
+    <text class="subhead accent" x="324" y="830">Heap tables</text>
+    <text class="small" x="478" y="830">B-tree · LOB · JSONB · Spatial R-tree</text>
+    <text class="small" x="324" y="851">Full-text BM25 · JSON MVI · Native VECTOR</text>
+    <rect class="feature" x="308" y="874" width="282" height="98" rx="8"/>
+    <text class="subhead accent" x="324" y="900">Automatic Zone Maps</text>
+    <text class="small" x="324" y="925">Automatic block summaries</text>
+    <text class="small" x="324" y="949">Conservative scan pruning</text>
+    <rect class="feature" x="606" y="874" width="286" height="98" rx="8"/>
+    <text class="subhead accent" x="622" y="900">HNSW / IVF vector indexes</text>
+    <text class="small" x="622" y="925">Memory / paged · Quantization</text>
+    <text class="small" x="622" y="949">Visible-heap re-ranking</text>
+  </g>
+  <path class="flow" d="M600 996 V1016"/>
+
+  <!-- Time travel depends on retained history; RC is the default isolation level. -->
+  <g data-module="transactions">
+    <rect class="panel" x="288" y="1024" width="624" height="164" rx="12"/>
+    <text class="heading" x="312" y="1060">Transactions &amp; durability</text>
+    <text class="detail" x="312" y="1095">MVCC · Snapshots · Undo · Row locks · Default RC</text>
+    <text class="detail" x="312" y="1123">WAL · Group commit · Savepoints · XA · Checkpoints</text>
+    <text class="small accent" x="312" y="1161">Time travel: FOR SYSTEM_TIME AS OF · Retained history</text>
+  </g>
+
+  <!-- Shared accounting spans transports, execution, and storage; the target is advisory. -->
+  <g data-module="unified-memory">
+    <rect class="feature" x="936" y="316" width="228" height="872" rx="12"/>
+    <text class="heading accent" x="956" y="352">Unified memory</text>
+    <text class="heading accent" x="956" y="382">management</text>
+    <text class="small" x="956" y="416">Across SQL &amp; storage</text>
+    <path class="feature-rule" d="M956 441 H1144"/>
+    <text class="subhead accent" x="956" y="476">Account &amp; admit</text>
+    <text class="detail" x="956" y="510">Global reservations</text>
+    <text class="detail" x="956" y="538">Query admission</text>
+    <text class="detail" x="956" y="566">Rollback headroom</text>
+    <path class="feature-rule" d="M956 601 H1144"/>
+    <text class="subhead accent" x="956" y="636">Cache</text>
+    <text class="detail" x="956" y="670">Buffer pool</text>
+    <text class="detail" x="956" y="698">Plan &amp; data caches</text>
+    <path class="feature-rule" d="M956 733 H1144"/>
+    <text class="subhead accent" x="956" y="768">Reclaim &amp; spill</text>
+    <text class="detail" x="956" y="802">Coordinated eviction</text>
+    <text class="detail" x="956" y="830">Sort · Join · Aggregate</text>
+    <text class="detail" x="956" y="858">Window · CTE · Distinct</text>
+    <path class="feature-rule" d="M956 893 H1144"/>
+    <text class="subhead accent" x="956" y="928">Bounded delivery</text>
+    <text class="detail" x="956" y="962">HTTP / MCP buffers</text>
+    <text class="detail" x="956" y="990">Streaming backpressure</text>
+    <rect class="tile" x="952" y="1040" width="196" height="124" rx="8"/>
+    <text class="subhead accent" x="968" y="1071">Memory target</text>
+    <text class="small" x="968" y="1101">Working-set guidance</text>
+    <text class="small" x="968" y="1124">Admission is separate</text>
+    <text class="small" x="968" y="1147">Not a hard RSS cap</text>
+  </g>
+  <path class="support" d="M916 519 H932 M916 873 H932 M916 1106 H932"/>
+  <path class="flow" d="M600 1192 V1208 H216 V1216"/>
+  <path class="flow" d="M600 1208 V1216"/>
+  <path class="flow" d="M600 1208 H984 V1216"/>
+
+  <!-- Backup and recovery are independent of replication topology. -->
+  <g data-module="backup-recovery">
+    <rect class="panel" x="36" y="1224" width="360" height="176" rx="12"/>
+    <text class="heading" x="56" y="1260">Backup &amp; recovery</text>
+    <text class="detail" x="56" y="1294">Online physical backup</text>
+    <text class="detail" x="56" y="1320">WAL archiving · PITR</text>
+    <text class="detail" x="56" y="1346">Crash recovery</text>
+    <rect class="feature" x="52" y="1361" width="328" height="27" rx="6"/>
+    <text class="small accent" x="68" y="1381">Query backups directly</text>
+  </g>
+
+  <!-- Native physical replication requires controlled and fenced role changes. -->
+  <g data-module="native-replication">
+    <rect class="feature" x="420" y="1224" width="360" height="176" rx="12"/>
+    <text class="heading accent" x="440" y="1260">Native primary / replica</text>
+    <text class="detail" x="440" y="1294">WAL physical replication</text>
+    <text class="detail" x="440" y="1320">Async / semi-sync · mTLS</text>
+    <text class="detail" x="440" y="1346">Controlled role changes**</text>
+    <text class="small" x="440" y="1381">Slots · Timelines · Base backups</text>
+  </g>
+
+  <!-- MySQL logical replication is separate from native WAL replication. -->
+  <g data-module="mysql-replication">
+    <rect class="panel" x="804" y="1224" width="360" height="176" rx="12"/>
+    <text class="heading" x="824" y="1260">MySQL binlog integration</text>
+    <text class="detail" x="824" y="1294">MyDB as source or replica</text>
+    <text class="detail" x="824" y="1320">ROW / FULL · GTID</text>
+    <text class="detail" x="824" y="1346">Relay log · Ordered apply</text>
+    <text class="small" x="824" y="1381">Independent of native WAL replication</text>
+  </g>
+  <rect class="feature" x="36" y="1424" width="12" height="12" rx="3"/>
+  <text class="small" x="58" y="1436">Highlighted: native capabilities</text>
+  <text class="small" x="36" y="1468">* DDL publication still coordinates locks; lock-free DDL remains a design direction.</text>
+  <text class="small" x="36" y="1496">** Operator-controlled role changes with fencing; no automatic leader election.</text>
+</svg>

@@ -1,0 +1,216 @@
+name: Safety tests
+
+on:
+  pull_request:
+    paths: ['src/**', 'vendor/**', 'tests/fuzz/**', 'tests/jepsen/**', 'tests/fixtures/**', 'scripts/**', 'Cargo.*', '.github/workflows/**', '.gitignore']
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 18 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: safety-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  TMPDIR: /tmp/mydb
+  PYTHONDONTWRITEBYTECODE: 1
+  JAVA_TOOL_OPTIONS: -Djava.io.tmpdir=/tmp/mydb
+
+jobs:
+  fuzz:
+    name: All fuzz targets (ASan)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ github.event_name == 'schedule' && 90 || 15 }}
+    env:
+      # Strip debug info and incremental state from the sanitizer build: the
+      # path-depended mydb crate is recompiled from scratch on every pull
+      # request anyway, and both settings dominate ASan compile/link time.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
+      RUSTFLAGS: -C link-arg=-fuse-ld=lld
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p /tmp/mydb
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends lld
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-fuzz@0.13.2
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: tests/fuzz -> /tmp/mydb/fuzz/build
+          key: safety-asan
+      # Pull requests fuzz the freshly seeded corpora only: replaying the
+      # accumulated corpus spends minutes per target on inputs a 10-second
+      # smoke campaign does not need. Scheduled runs keep corpus evolution.
+      - uses: actions/cache@v4
+        if: github.event_name == 'schedule'
+        with:
+          path: /tmp/mydb/fuzz/corpus
+          key: safety-corpus-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: safety-corpus-
+      - name: Seed and fuzz every declared target
+        # sql_execution_differential spends ~50 s per input under ASan, so even
+        # its seeded corpus replay cannot fit a pull-request budget; its
+        # deterministic all-family regression runs in fuzz-regressions and the
+        # long ASan campaign stays on the daily schedule.
+        run: >-
+          python3 scripts/run_fuzz.py --output /tmp/mydb/fuzz
+          --seconds ${{ github.event_name == 'schedule' && 300 || 10 }}
+          --jobs 3
+          ${{ github.event_name != 'schedule' && '--skip-slow-triage --skip-target sql_execution_differential' || '' }}
+      - if: always() && github.event_name != 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence
+          path: |
+            /tmp/mydb/fuzz/*.log
+            /tmp/mydb/fuzz/results.json
+            /tmp/mydb/fuzz/artifacts
+          retention-days: 14
+      - if: always() && github.event_name == 'schedule'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fuzz-evidence-corpus
+          path: |
+            /tmp/mydb/fuzz/*.log
+            /tmp/mydb/fuzz/results.json
+            /tmp/mydb/fuzz/artifacts
+            /tmp/mydb/fuzz/corpus
+          retention-days: 14
+
+  # The deterministic fuzz-feature regressions compile a second feature set of
+  # the mydb crate; running them in their own job keeps the Jepsen binary lane
+  # free of that rebuild and lets both lanes finish inside the PR budget.
+  fuzz-regressions:
+    name: Deterministic fuzz-feature regressions
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      CARGO_PROFILE_DEV_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p /tmp/mydb
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: safety-fuzz-regressions
+          # This job rebuilds the mydb crate on every pull request; keeping the
+          # incremental state turns that from a full recompile into an
+          # incremental one once a warm cache entry exists.
+          cache-incremental: true
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - run: cargo nextest run --locked --features fuzzing fuzz --no-fail-fast
+
+  jepsen:
+    name: RC, crash and replication histories
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p /tmp/mydb
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: safety-jepsen
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+      - name: Install pinned Leiningen
+        run: |
+          curl --fail --location https://raw.githubusercontent.com/technomancy/leiningen/2.12.0/bin/lein --output /tmp/mydb/lein
+          chmod +x /tmp/mydb/lein
+          echo /tmp/mydb >> "$GITHUB_PATH"
+      - uses: actions/cache@v4
+        with:
+          path: ~/.m2/repository
+          key: safety-lein-${{ hashFiles('tests/jepsen/project.clj') }}
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'pymysql==1.1.2' cryptography mysql-connector-python
+      - run: cargo build --locked --bin mydb
+      - run: lein test
+        working-directory: tests/jepsen
+      - run: python3 -m unittest discover -s scripts -p test_run_fuzz.py
+      - run: python3 -m unittest discover -s tests/jepsen/scripts -p 'test_*.py'
+      - run: python3 tests/jepsen/scripts/run_local.py --binary target/debug/mydb --output /tmp/mydb/safety/rc --time-limit 30
+      - run: python3 tests/jepsen/scripts/run_recovery.py --binary target/debug/mydb --output /tmp/mydb/safety/recovery
+      - run: python3 tests/jepsen/scripts/run_p0.py --binary target/debug/mydb --output /tmp/mydb/safety/p0
+      - name: Concurrent crashes, partitions and fenced promotions
+        shell: bash
+        run: |
+          seeds="20261115"
+          rounds=1
+          operations=16
+          if [[ '${{ github.event_name }}' == schedule ]]; then
+            seeds="20261115 42 99173"
+            rounds=5
+            operations=128
+          fi
+          for seed in $seeds; do
+            python3 tests/jepsen/scripts/run_fault_matrix.py --binary target/debug/mydb --output /tmp/mydb/safety/matrix-$seed --seed "$seed" --rounds "$rounds" --operations "$operations"
+          done
+          if [[ '${{ github.event_name }}' == schedule ]]; then
+            python3 tests/jepsen/scripts/run_fault_matrix.py --binary target/debug/mydb --output /tmp/mydb/safety/semi-sync --case semi-sync --seed 20261115 --rounds 1 --operations 32
+          fi
+      - name: Syscall I/O fault gates
+        run: python3 tests/jepsen/scripts/run_io.py --binary target/debug/mydb --output /tmp/mydb/safety/io
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jepsen-evidence
+          path: /tmp/mydb/safety
+          retention-days: 14
+
+  mysql-receiver:
+    name: MySQL ROW/FULL receiver regressions
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - run: mkdir -p /tmp/mydb
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: safety-mysql-receiver
+      - uses: shogo82148/actions-setup-mysql@v1
+        with:
+          mysql-version: '8.0'
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install 'pymysql==1.1.2' cryptography mysql-connector-python
+      - run: cargo build --locked --bin mydb
+      - name: Receiver regression against an owned local mysqld
+        run: |
+          for checksum_mode in CRC32 NONE; do
+            python3 tests/jepsen/scripts/run_mysql_receiver_local.py \
+              --mysqld "$(command -v mysqld)" \
+              --binary target/debug/mydb \
+              --binlog-checksum "$checksum_mode" \
+              --output "/tmp/mydb/safety/receiver/$checksum_mode"
+          done
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mysql-receiver-evidence
+          path: /tmp/mydb/safety/receiver
+          retention-days: 14

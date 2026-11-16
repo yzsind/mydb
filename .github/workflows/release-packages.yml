@@ -1,0 +1,124 @@
+name: Release packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_linux:
+        description: Build the Linux package as well as Windows
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  PYTHONDONTWRITEBYTECODE: 1
+  PYTHONUTF8: 1
+
+jobs:
+  windows:
+    name: Windows x64 package
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - run: git config --global core.autocrlf false
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: ilammy/msvc-dev-cmd@v1
+      - uses: actions/cache/restore@v4
+        id: windows-cache
+        with:
+          path: |
+            D:/tmp/mydb/release-build
+            C:/Users/runneradmin/.cargo/registry
+          key: release-windows-rust195-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock') }}-${{ github.run_id }}
+          restore-keys: release-windows-rust195-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock') }}-
+      - name: Build portable package
+        run: |
+          python -c "from pathlib import Path; Path('C:/tmp/mydb').mkdir(parents=True, exist_ok=True)"
+          python scripts/package_release.py --output C:/tmp/mydb/release-windows
+      - uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: |
+            D:/tmp/mydb/release-build
+            C:/Users/runneradmin/.cargo/registry
+          key: ${{ steps.windows-cache.outputs.cache-primary-key }}
+      - name: Verify extracted package
+        run: |
+          python scripts/verify_release_package.py --package (Get-ChildItem C:/tmp/mydb/release-windows/mydb-*-windows-x86_64.zip).FullName --output C:/tmp/mydb/release-windows-smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: |
+            C:/tmp/mydb/release-windows/*.zip
+            C:/tmp/mydb/release-windows/*.build-manifest.json
+            C:/tmp/mydb/release-windows/*.Cargo.lock
+            C:/tmp/mydb/release-windows/SHA256SUMS
+            C:/tmp/mydb/release-windows-smoke/result.json
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: release-windows-diagnostics
+          path: C:/tmp/mydb/release-windows-smoke/*.log
+
+  linux:
+    if: inputs.build_linux
+    name: Linux x86_64 glibc 2.17 package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: actions/cache@v4
+        with:
+          path: /tmp/mydb/linux-glibc217
+          key: release-glibc217-rust195-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock', 'scripts/build_linux_glibc217.py') }}
+      - name: Build portable package against glibc 2.17
+        run: |
+          python3 scripts/build_linux_glibc217.py \
+            --toolchain "$(rustc --print sysroot)" --jobs 4
+          mkdir -p /tmp/mydb/release-linux
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+          cp /tmp/mydb/linux-glibc217/mydb-${version}-linux-x86_64.tar.gz \
+            /tmp/mydb/release-linux/mydb-${version}-linux-x86_64.tar.gz
+          cp /tmp/mydb/linux-glibc217/mydb-${version}*.json \
+            /tmp/mydb/linux-glibc217/mydb-${version}*.Cargo.lock /tmp/mydb/release-linux/
+          cd /tmp/mydb/release-linux
+          sha256sum *.tar.gz *.json *.Cargo.lock > SHA256SUMS
+      - name: Verify extracted package
+        run: |
+          python3 scripts/verify_release_package.py \
+            --package /tmp/mydb/release-linux/mydb-*-linux-x86_64.tar.gz \
+            --output /tmp/mydb/release-linux-smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x86_64
+          path: |
+            /tmp/mydb/release-linux/*.tar.gz
+            /tmp/mydb/release-linux/*.json
+            /tmp/mydb/release-linux/*.Cargo.lock
+            /tmp/mydb/release-linux/SHA256SUMS
+            /tmp/mydb/release-linux-smoke/result.json
+            /tmp/mydb/linux-glibc217/abi.json
+            /tmp/mydb/linux-glibc217/build-manifest.json
+          if-no-files-found: error
+          compression-level: 0
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: release-linux-diagnostics
+          path: /tmp/mydb/release-linux-smoke/*.log

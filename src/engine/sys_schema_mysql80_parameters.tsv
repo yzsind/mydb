@@ -1,0 +1,83 @@
+create_synonym_db	1	IN	in_db_name	varchar	varchar(64)
+create_synonym_db	2	IN	in_synonym	varchar	varchar(64)
+diagnostics	1	IN	in_max_runtime	int	int unsigned
+diagnostics	2	IN	in_interval	int	int unsigned
+diagnostics	3	IN	in_auto_config	enum	enum('current','medium','full')
+execute_prepared_stmt	1	IN	in_query	longtext	longtext
+extract_schema_from_file_name	0			varchar	varchar(64)
+extract_schema_from_file_name	1	IN	path	varchar	varchar(512)
+extract_table_from_file_name	0			varchar	varchar(64)
+extract_table_from_file_name	1	IN	path	varchar	varchar(512)
+format_bytes	0			text	text
+format_bytes	1	IN	bytes	text	text
+format_path	0			varchar	varchar(512)
+format_path	1	IN	in_path	varchar	varchar(512)
+format_statement	0			longtext	longtext
+format_statement	1	IN	statement	longtext	longtext
+format_time	0			text	text
+format_time	1	IN	picoseconds	text	text
+list_add	0			text	text
+list_add	1	IN	in_list	text	text
+list_add	2	IN	in_add_value	text	text
+list_drop	0			text	text
+list_drop	1	IN	in_list	text	text
+list_drop	2	IN	in_drop_value	text	text
+ps_is_account_enabled	0			enum	enum('YES','NO')
+ps_is_account_enabled	1	IN	in_host	varchar	varchar(255)
+ps_is_account_enabled	2	IN	in_user	varchar	varchar(32)
+ps_is_consumer_enabled	0			enum	enum('YES','NO')
+ps_is_consumer_enabled	1	IN	in_consumer	varchar	varchar(64)
+ps_is_instrument_default_enabled	0			enum	enum('YES','NO')
+ps_is_instrument_default_enabled	1	IN	in_instrument	varchar	varchar(128)
+ps_is_instrument_default_timed	0			enum	enum('YES','NO')
+ps_is_instrument_default_timed	1	IN	in_instrument	varchar	varchar(128)
+ps_is_thread_instrumented	0			enum	enum('YES','NO','UNKNOWN')
+ps_is_thread_instrumented	1	IN	in_connection_id	bigint	bigint unsigned
+ps_setup_disable_consumer	1	IN	consumer	varchar	varchar(128)
+ps_setup_disable_instrument	1	IN	in_pattern	varchar	varchar(128)
+ps_setup_disable_thread	1	IN	in_connection_id	bigint	bigint
+ps_setup_enable_consumer	1	IN	consumer	varchar	varchar(128)
+ps_setup_enable_instrument	1	IN	in_pattern	varchar	varchar(128)
+ps_setup_enable_thread	1	IN	in_connection_id	bigint	bigint
+ps_setup_reset_to_default	1	IN	in_verbose	tinyint	tinyint(1)
+ps_setup_save	1	IN	in_timeout	int	int
+ps_setup_show_disabled	1	IN	in_show_instruments	tinyint	tinyint(1)
+ps_setup_show_disabled	2	IN	in_show_threads	tinyint	tinyint(1)
+ps_setup_show_enabled	1	IN	in_show_instruments	tinyint	tinyint(1)
+ps_setup_show_enabled	2	IN	in_show_threads	tinyint	tinyint(1)
+ps_thread_account	0			text	text
+ps_thread_account	1	IN	in_thread_id	bigint	bigint unsigned
+ps_thread_id	0			bigint	bigint unsigned
+ps_thread_id	1	IN	in_connection_id	bigint	bigint unsigned
+ps_thread_stack	0			longtext	longtext
+ps_thread_stack	1	IN	thd_id	bigint	bigint unsigned
+ps_thread_stack	2	IN	debug	tinyint	tinyint(1)
+ps_thread_trx_info	0			longtext	longtext
+ps_thread_trx_info	1	IN	in_thread_id	bigint	bigint unsigned
+ps_trace_statement_digest	1	IN	in_digest	varchar	varchar(64)
+ps_trace_statement_digest	2	IN	in_runtime	int	int
+ps_trace_statement_digest	3	IN	in_interval	decimal	decimal(2,2)
+ps_trace_statement_digest	4	IN	in_start_fresh	tinyint	tinyint(1)
+ps_trace_statement_digest	5	IN	in_auto_enable	tinyint	tinyint(1)
+ps_trace_thread	1	IN	in_thread_id	bigint	bigint unsigned
+ps_trace_thread	2	IN	in_outfile	varchar	varchar(255)
+ps_trace_thread	3	IN	in_max_runtime	decimal	decimal(20,2)
+ps_trace_thread	4	IN	in_interval	decimal	decimal(20,2)
+ps_trace_thread	5	IN	in_start_fresh	tinyint	tinyint(1)
+ps_trace_thread	6	IN	in_auto_setup	tinyint	tinyint(1)
+ps_trace_thread	7	IN	in_debug	tinyint	tinyint(1)
+ps_truncate_all_tables	1	IN	in_verbose	tinyint	tinyint(1)
+quote_identifier	0			text	text
+quote_identifier	1	IN	in_identifier	text	text
+statement_performance_analyzer	1	IN	in_action	enum	enum('snapshot','overall','delta','create_table','create_tmp','save','cleanup')
+statement_performance_analyzer	2	IN	in_table	varchar	varchar(129)
+statement_performance_analyzer	3	IN	in_views	set	set('with_runtimes_in_95th_percentile','analysis','with_errors_or_warnings','with_full_table_scans','with_sorting','with_temp_tables','custom')
+sys_get_config	0			varchar	varchar(128)
+sys_get_config	1	IN	in_variable_name	varchar	varchar(128)
+sys_get_config	2	IN	in_default_value	varchar	varchar(128)
+table_exists	1	IN	in_db	varchar	varchar(64)
+table_exists	2	IN	in_table	varchar	varchar(64)
+table_exists	3	OUT	out_exists	enum	enum('','BASE TABLE','VIEW','TEMPORARY')
+version_major	0			tinyint	tinyint unsigned
+version_minor	0			tinyint	tinyint unsigned
+version_patch	0			tinyint	tinyint unsigned

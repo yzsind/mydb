@@ -1,0 +1,42 @@
+# `MAX_INNER_PRODUCT_DISTANCE`
+
+## Description
+
+Returns the negation of the inner product, used for maximum inner product nearest-neighbor ordering.
+
+## Syntax
+
+```sql
+MAX_INNER_PRODUCT_DISTANCE(vector1, vector2)
+```
+
+## Parameters
+
+| Parameter | Required | Accepted Types | Description |
+| --- | --- | --- | --- |
+| `vector1` | Yes | VECTOR or valid vector text | The first vector |
+| `vector2` | Yes | VECTOR or valid vector text | The second vector |
+
+## Return Value
+
+Returns a double-precision value; returns `NULL` when any argument is `NULL`.
+
+## Examples
+
+```sql
+SELECT MAX_INNER_PRODUCT_DISTANCE(STRING_TO_VECTOR('[1,2]'), STRING_TO_VECTOR('[1,2]'));
+```
+
+Result:
+
+```text
+-5
+```
+
+## Notes
+
+- Vectors must be nonempty, floating elements must be finite, and distance operands must have equal dimensions. Numeric datatypes may be mixed without narrowing the query. BINARY cannot be mixed with numeric vectors. Invalid encodings and scalar integer operands raise a vector error. Raw payloads require `VECTOR_FROM_BINARY`; metric names are case-insensitive.
+
+## Related Functions
+
+[`DISTANCE`](distance.md), [`L2_DISTANCE`](l2_distance.md), [`COSINE_DISTANCE`](cosine_distance.md), [`DOT_PRODUCT`](dot_product.md).

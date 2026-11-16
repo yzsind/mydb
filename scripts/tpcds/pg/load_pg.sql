@@ -1,0 +1,25 @@
+-- AUTO-GENERATED: server-side COPY load of the cached SF=1 .dat files (NULL marker \N).
+COPY income_band FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/income_band.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY reason FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/reason.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY ship_mode FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/ship_mode.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY warehouse FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/warehouse.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY store FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/store.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY call_center FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/call_center.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY web_site FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/web_site.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY web_page FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/web_page.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY promotion FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/promotion.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY catalog_page FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/catalog_page.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY household_demographics FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/household_demographics.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY customer_address FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/customer_address.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY customer_demographics FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/customer_demographics.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY customer FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/customer.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY item FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/item.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY date_dim FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/date_dim.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY time_dim FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/time_dim.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY inventory FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/inventory.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY web_returns FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/web_returns.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY catalog_returns FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/catalog_returns.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY store_returns FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/store_returns.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY web_sales FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/web_sales.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY catalog_sales FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/catalog_sales.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');
+COPY store_sales FROM '/tmp/mydb-tpcds-dbgen-cache/sf-1/store_sales.dat' WITH (FORMAT text, DELIMITER '|', NULL '\N');

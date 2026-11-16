@@ -1,0 +1,211 @@
+use std::env::VarError;
+use std::ffi::OsString;
+
+/// Shared spelling rules for configuration booleans. Unknown values remain
+/// distinguishable so each caller can retain its own default/error policy.
+pub(crate) fn parse_bool(raw: &str) -> Option<bool> {
+    let raw = raw.trim();
+    if raw == "1"
+        || ["on", "true", "yes"]
+            .iter()
+            .any(|word| raw.eq_ignore_ascii_case(word))
+    {
+        Some(true)
+    } else if raw == "0"
+        || ["off", "false", "no"]
+            .iter()
+            .any(|word| raw.eq_ignore_ascii_case(word))
+    {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Recognize the base spellings plus explicit single-letter Y/N forms.
+pub(crate) fn parse_bool_with_short(raw: &str) -> Option<bool> {
+    parse_bool(raw).or_else(|| {
+        let raw = raw.trim();
+        if raw.eq_ignore_ascii_case("y") {
+            Some(true)
+        } else if raw.eq_ignore_ascii_case("n") {
+            Some(false)
+        } else {
+            None
+        }
+    })
+}
+
+pub(crate) fn flag(name: &str, default: bool) -> bool {
+    var(name)
+        .map(|raw| parse_bool(&raw).unwrap_or(false))
+        .unwrap_or(default)
+}
+
+#[cfg(test)]
+mod bool_tests {
+    use super::*;
+
+    #[test]
+    fn refactor_boolean_spelling_has_one_shared_contract() {
+        for value in ["1", "on", "ON", "True", " yes "] {
+            assert_eq!(parse_bool(value), Some(true), "{value}");
+        }
+        for value in ["0", "off", "Off", "false", " NO "] {
+            assert_eq!(parse_bool(value), Some(false), "{value}");
+        }
+        assert_eq!(parse_bool("maybe"), None);
+        assert_eq!(parse_bool(""), None);
+    }
+}
+
+pub fn var(key: &str) -> Result<String, VarError> {
+    #[cfg(any(test, feature = "fuzzing"))]
+    {
+        if let Some(value) = test_override(key) {
+            return value.ok_or(VarError::NotPresent);
+        }
+    }
+    crate::startup_config::var(key)
+}
+
+pub fn var_os(key: &str) -> Option<OsString> {
+    #[cfg(any(test, feature = "fuzzing"))]
+    {
+        if let Some(value) = test_override(key) {
+            return value.map(OsString::from);
+        }
+    }
+    crate::startup_config::var_os(key)
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+thread_local! {
+    static OVERRIDES: std::cell::RefCell<Vec<(&'static str, Option<String>)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+fn test_override(key: &str) -> Option<Option<String>> {
+    OVERRIDES.with(|overrides| {
+        overrides
+            .borrow()
+            .iter()
+            .rev()
+            .find_map(|(candidate, value)| (*candidate == key).then(|| value.clone()))
+    })
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) type OverrideSnapshot = Vec<(&'static str, Option<String>)>;
+
+#[cfg(not(any(test, feature = "fuzzing")))]
+#[derive(Clone)]
+pub(crate) struct OverrideSnapshot;
+
+/// Capture the effective test override stack so an execution worker observes
+/// the same immutable configuration as the connection thread that planned
+/// the statement. Production configuration is process-wide, so its snapshot
+/// is intentionally zero-sized.
+pub(crate) fn override_snapshot() -> OverrideSnapshot {
+    #[cfg(any(test, feature = "fuzzing"))]
+    {
+        return OVERRIDES.with(|overrides| overrides.borrow().clone());
+    }
+    #[cfg(not(any(test, feature = "fuzzing")))]
+    OverrideSnapshot
+}
+
+pub(crate) fn with_override_snapshot<R>(snapshot: OverrideSnapshot, f: impl FnOnce() -> R) -> R {
+    #[cfg(any(test, feature = "fuzzing"))]
+    {
+        let previous =
+            OVERRIDES.with(|overrides| std::mem::replace(&mut *overrides.borrow_mut(), snapshot));
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        OVERRIDES.with(|overrides| *overrides.borrow_mut() = previous);
+        return match result {
+            Ok(value) => value,
+            Err(payload) => std::panic::resume_unwind(payload),
+        };
+    }
+    #[cfg(not(any(test, feature = "fuzzing")))]
+    {
+        let _ = snapshot;
+        f()
+    }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) struct ScopedVars {
+    depth: usize,
+    _thread_bound: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+impl Drop for ScopedVars {
+    fn drop(&mut self) {
+        OVERRIDES.with(|overrides| overrides.borrow_mut().truncate(self.depth));
+    }
+}
+
+/// Test fixtures use thread-local configuration and restore it on unwind.
+#[cfg(any(test, feature = "fuzzing"))]
+pub(crate) fn scoped_vars(vars: &[(&'static str, Option<&str>)]) -> ScopedVars {
+    let depth = OVERRIDES.with(|overrides| {
+        let mut overrides = overrides.borrow_mut();
+        let depth = overrides.len();
+        for (key, value) in vars {
+            overrides.push((*key, value.map(str::to_owned)));
+        }
+        depth
+    });
+    ScopedVars {
+        depth,
+        _thread_bound: std::marker::PhantomData,
+    }
+}
+
+#[cfg(any(test, feature = "fuzzing"))]
+pub fn with_vars<R>(vars: &[(&'static str, Option<&str>)], f: impl FnOnce() -> R) -> R {
+    let _scope = scoped_vars(vars);
+    f()
+}
+
+/// Read a process-level boolean with the fulltext configuration's trimmed policy.
+pub(crate) fn process_bool(key: &str, default: bool) -> bool {
+    match std::env::var(key) {
+        Ok(value) => matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "1" | "true" | "on" | "yes"
+        ),
+        Err(_) => default,
+    }
+}
+
+/// Explicit false/off token in the statement's effective environment.
+pub(crate) fn is_disabled(key: &str) -> bool {
+    matches!(
+        var(key).unwrap_or_default().to_ascii_lowercase().as_str(),
+        "off" | "0" | "false" | "no"
+    )
+}
+
+#[cfg(test)]
+mod short_boolean_contract_tests {
+    use super::*;
+    #[test]
+    fn short_boolean_forms_do_not_expand_base_flag_policy() {
+        for (raw, expected) in [
+            ("Y", true),
+            (" y ", true),
+            ("N", false),
+            ("\u{2003}n\u{a0}", false),
+        ] {
+            assert_eq!(parse_bool(raw), None);
+            assert_eq!(parse_bool_with_short(raw), Some(expected));
+        }
+        for raw in ["", "yy", "2", "+1", "ßy", "true!", "ON\0"] {
+            assert_eq!(parse_bool_with_short(raw), None);
+        }
+    }
+}

@@ -1,0 +1,248 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  PYTHONDONTWRITEBYTECODE: 1
+
+jobs:
+  dependency-safety:
+    name: Dependency advisories, licenses and sources
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.20.2
+      - run: cargo deny --locked --all-features check advisories licenses sources
+
+  quality:
+    name: Format, features and high-confidence lints
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --all -- --check
+      - run: scripts/render_storage_format_versions.sh --check
+      - run: python3 scripts/check_docs.py
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - run: python3 -m pip install jsonschema==4.26.0 openapi-spec-validator==0.9.0
+      - run: python3 scripts/check_documentation_contracts.py
+      - run: python3 scripts/check_function_test_coverage.py --check
+      - run: python3 scripts/generate_mysql80_metadata_compat_matrix.py --check
+      - run: python3 scripts/generate_public_references.py --check
+      - run: python3 scripts/generate_mysql80_information_schema_rust.py --check
+      - run: python3 scripts/generate_mysql80_performance_schema_rust.py --check
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_ci_tests.py
+      - run: PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_storage_oracle.py
+      # The repository still has a sizeable style-warning backlog. Keep new
+      # correctness/suspicious defects blocking while that backlog is reduced.
+      - run: cargo clippy --locked --all-targets --all-features -- -A warnings -D clippy::correctness -D clippy::suspicious
+
+  test-build:
+    name: Build tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: default-test
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - run: mkdir -p /tmp/mydb
+      - run: cargo nextest archive --locked --archive-file /tmp/mydb/tests.tar.zst
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tests-default
+          path: /tmp/mydb/tests.tar.zst
+          if-no-files-found: error
+          overwrite: true
+          compression-level: 0
+          retention-days: 1
+
+  test-shard:
+    name: Test (shard ${{ matrix.shard }}/3)
+    needs: test-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-default
+          path: /tmp/mydb/test-archive
+      - run: >-
+          python3 scripts/run_ci_tests.py
+          --archive /tmp/mydb/test-archive/tests.tar.zst
+          --output /tmp/mydb/test-run
+          -- --profile ci --no-fail-fast --partition hash:${{ matrix.shard }}/3
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.shard }}
+          path: /tmp/mydb/test-results
+          retention-days: 7
+
+  # Retain the aggregate status check, including when a build/shard fails.
+  test:
+    name: Test
+    if: always()
+    needs: [test-build, test-shard]
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require all test builds and partitions
+        env:
+          BUILD_RESULT: ${{ needs.test-build.result }}
+          TEST_RESULT: ${{ needs.test-shard.result }}
+        run: test "$BUILD_RESULT" = success && test "$TEST_RESULT" = success
+
+  native-readiness:
+    name: Native recovery and binary protocol gates
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: native-readiness
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # 1.2.3 drops the final OK packet on cold non-TLS RSA authentication.
+      - run: python -m pip install 'pymysql==1.1.2' cryptography mysql-connector-python
+      - run: python scripts/test_linux_compat.py
+      - run: python scripts/test_backup_recovery_wal.py
+      - run: sudo apt-get update && sudo apt-get install --yes --no-install-recommends mysql-client openssl
+      - run: cargo build --locked --features tools --bin mydb --bin mydb-backup
+      - run: cargo build --locked --manifest-path clients/mydb-cli/Cargo.toml
+      - run: python -m pip install jsonschema==4.26.0
+      - run: python scripts/test_documentation_examples.py --binary target/debug/mydb --output /tmp/mydb/documentation-examples-ci
+      - run: python clients/mydb-cli/tests/acceptance.py --cli clients/mydb-cli/target/debug/mydb-cli --server-binary target/debug/mydb --output /tmp/mydb/cli-acceptance-ci
+      - run: python scripts/test_native_readiness.py --binary target/debug/mydb --output /tmp/mydb/native-readiness-ci
+      - run: python scripts/test_backup_recovery.py --profile debug --rows 1000 --pairs 1
+      - run: python scripts/test_backup_recovery.py --profile debug --rows 1000 --pairs 1 --encrypted
+      - run: python scripts/test_release_security.py --binary target/debug/mydb --output /tmp/mydb/release-security-ci
+      - run: python scripts/test_release_storage.py --binary target/debug/mydb --output /tmp/mydb/release-storage-ci
+      - run: python scripts/test_crash_recovery.py --binary target/debug/mydb --output /tmp/mydb/crash-recovery-ci --rows 200 --rounds 1
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: native-readiness
+          path: |
+            /tmp/mydb/cli-acceptance-ci
+            /tmp/mydb/native-readiness-ci
+            /tmp/mydb/documentation-examples-ci
+            /tmp/mydb/native-acceptance-*
+            /tmp/mydb/backup-recovery-*
+            /tmp/mydb/release-security-ci
+            /tmp/mydb/release-storage-ci
+            /tmp/mydb/crash-recovery-ci
+
+  feature-matrix:
+    name: Compile feature surface (${{ matrix.name }})
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: no-default-features
+            args: --no-default-features
+          - name: tools
+            args: --features tools
+          - name: all-features
+            args: --all-features
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: feature-${{ matrix.name }}
+      - run: cargo check --locked --all-targets ${{ matrix.args }}
+
+  msrv:
+    name: Minimum supported Rust 1.95
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: msrv-1.95
+      - run: cargo check --locked --all-targets
+
+  mtr-non-regression:
+    name: MySQL MTR semantic non-regression
+    needs: test-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest@0.9.151
+      - uses: actions/download-artifact@v4
+        with:
+          name: tests-default
+          path: /tmp/mydb/test-archive
+      # GPL upstream inputs remain uncommitted; fetch the pinned oracle used by
+      # scripts/mtr_import.sh and hold this high-signal cluster to its audited
+      # statement-level blocker budget. The budget may only move downward.
+      - run: scripts/mtr_import.sh type_float type_enum type_set type_year
+      - run: test -s tests/mydb-test/triage/t/main/type_float.test && test -s tests/mydb-test/triage/t/main/type_enum.test && test -s tests/mydb-test/triage/t/main/type_set.test && test -s tests/mydb-test/triage/t/main/type_year.test
+      - name: Run statement-level compatibility budget
+        env:
+          MYDB_MTR_TRIAGE_FILTER: main/type_
+          MYDB_MTR_TRIAGE_EXPECT_FILES: 4
+          MYDB_MTR_TRIAGE_MAX_BLOCKERS: 0
+          MYDB_MTR_TRIAGE_ALLOWLIST: scripts/mtr_ci_diff_allowlist.json
+          MYDB_MTR_TRIAGE_REPORT_DIR: /tmp/mydb/mtr-report
+        run: >-
+          python3 scripts/run_ci_tests.py
+          --archive /tmp/mydb/test-archive/tests.tar.zst
+          --output /tmp/mydb/mtr-run
+          -- --profile ci --run-ignored only --no-capture mtr_triage
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtr-triage-report
+          path: /tmp/mydb/mtr-report
