@@ -6,7 +6,7 @@
 
 | Item | Configuration |
 | --- | --- |
-| Database | MyDB `8.0.46-mydb-1.3.0-20261116` |
+| Database | MyDB development snapshot measured on November 16, 2026 |
 | Client | sysbench `1.0.17`, unmodified standard OLTP scripts |
 | Database server | Alibaba Cloud instance: 16 vCPUs, 64 GB RAM, PL1 cloud disk |
 | Load generator | Alibaba Cloud instance: 16 vCPUs, 64 GB RAM, PL1 cloud disk |
@@ -21,9 +21,8 @@ Server settings: `READ-COMMITTED`, `strict` durability with `fdatasync`,
 binary logging OFF, memory target 31,565 MiB, and query parallel degree 4.
 Performance Schema, automatic zone maps, and automatic ANALYZE were enabled.
 
-Version note: the product version was unified to `1.0.0` later on the same day,
-after this run; the binary above carries the earlier `1.3.0` development label.
-The numbers here are single-engine measurements and are not directly comparable
+These results describe the November 16, 2026 MyDB development snapshot.
+They are single-engine measurements and are not directly comparable
 to the October sysbench comparison in
 [performance comparison](performance-comparison.md), which used 20 clients on
 the same host with a warmup, and zone maps and Performance Schema disabled.

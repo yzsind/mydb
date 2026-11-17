@@ -5,8 +5,8 @@
 Engineering reports dated **October 22–24, 2026** show MyDB's strongest measured
 advantages over **MySQL Community 8.0.46** in analytical queries, read-heavy OLTP,
 and bulk loading. The results below come from those reports' completed runs.
-They cover different MyDB development builds, including 0.5.0 and 0.6.0, and
-are not a benchmark of one final release or a guarantee for every workload.
+They cover different MyDB development snapshots tested on October 22–24, 2026,
+and are not a benchmark of one final release or a guarantee for every workload.
 A later single-engine measurement on the November 16 release-candidate build,
 including a 1.32M queries/s point-select run at 300 clients, is reported
 separately in [Sysbench OLTP: 100 million rows, 300 clients](sysbench-100m-300clients-2026-11-16.md).

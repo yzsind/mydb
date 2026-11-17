@@ -8,6 +8,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | Document | Contents |
 | --- | --- |
 | [Project README](../README.md) | Downloads, quick start, building, and client examples |
+| [MyDB 1.0.0 Release Notes](release-notes-1.0.0.md) | Public-preview scope, packages, validation, and historical performance evidence |
 | [Why MyDB](why-mydb.md) | HTAP mixed workloads, AI capabilities, application benefits, and performance evidence |
 | [Feature Overview](feature-overview.md) | Capabilities, limitations, and release maturity |
 | [MySQL 8.0 Compatibility](mysql80-compatibility.md) | Supported behavior, intentional differences, and migration boundaries |

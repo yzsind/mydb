@@ -46,8 +46,8 @@ the linked references describe each capability's supported scope.
 | --- | ---: | ---: |
 | `oltp_point_select` | **1,327,407.37** | **0.55 ms** |
 
-MyDB 1.0.0 on a 16-core CPU VM, with 100M rows across 10 tables,
-300 client threads on a separate host over the private network, and one
+The November 16, 2026 MyDB snapshot ran on a 16-core CPU VM, with 100M rows
+across 10 tables, 300 client threads on a separate host over the private network, and one
 300-second run using sysbench's `special` access distribution. No errors or
 reconnects were recorded. See the [full benchmark report](docs/sysbench-100m-300clients-2026-11-16.md)
 for configuration, methodology, and complete results.

@@ -4,9 +4,8 @@
 published in README commit
 [`d967fb16`](https://github.com/yzsind/mydb-archive/commit/d967fb16625d4f21c949077dfd13154f4d4c1539).
 It is a historical result record reconstructed from Git, not a new benchmark run.
-The measured implementation belongs to the `8.0.46-mydb-1.2.1` development
-series; the product version was later unified to 1.0.0 (a version-metadata
-change only).
+The measurements describe the MyDB development snapshot tested on
+November 14, 2026.
 
 ## Reported results
 
