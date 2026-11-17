@@ -36,6 +36,7 @@ Modifies table structure, constraints, indexes, partitions, and table options.
 - An unqualified `RENAME TO` destination inherits the source table's schema, including for temporary tables. Permissions and metadata locks use that same destination.
 - CREATE, LIKE, ALTER and RENAME enforce the same 64-character identifier and 1017-live-column limits; dropped column tombstones do not count toward the live-column limit.
 - Multiple actions form the atomic intent of a single DDL statement; on failure, no half-completed new schema is exposed.
+- Column `COMMENT` clauses on `ADD`, `MODIFY`, and `CHANGE` participate in the same COPY candidate as the column definition, including supported `FIRST`/`AFTER` moves. Comment length is validated before publication; conversion or validation failure preserves the original definition, comment, and rows. Online COPY retains its existing eligibility and lock restrictions.
 - Explicit ALGORITHM and LOCK requests are validated against the actual execution capability; unsupported combinations fail before mutation.
 
 ## Actions and Requested Algorithms

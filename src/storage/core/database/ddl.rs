@@ -6748,6 +6748,7 @@ impl Database {
                     | A::DropPrimaryKey
                     | A::ConvertToCharset { .. }
                     | A::MoveColumn { .. }
+                    | A::SetColumnComment { .. }
             )
         }) {
             return Ok(None);
@@ -6887,6 +6888,17 @@ impl Database {
                         rename_column_expression_references(&mut candidate, old_name, &new_name)?;
                         rename_partition_column_references(&mut candidate, old_name, &new_name)?;
                     }
+                }
+                A::SetColumnComment { column, comment } => {
+                    // Keep comments in the private COPY candidate so conversion,
+                    // validation, or publication failure cannot expose half an ALTER.
+                    let position = candidate.column_index(column)?;
+                    crate::storage::schema::check_comment_len(
+                        crate::storage::schema::CommentTarget::Field,
+                        column,
+                        comment,
+                    )?;
+                    candidate.columns[position].comment = comment.clone();
                 }
                 A::MoveColumn { column, position } => {
                     move_column_in_candidate(&mut candidate, column, position)?;
