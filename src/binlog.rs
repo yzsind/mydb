@@ -21,8 +21,8 @@ use tokio::sync::Notify;
 use crate::engine::api::{QueryResponse, ResultSet, SessionContext};
 use crate::mysql::protocol::write_lenenc_int;
 use crate::parser::Statement;
-use crate::storage::error;
 use crate::storage::schema::{DataTypeKind, TableSchema};
+use crate::storage::{error, Database};
 use crate::types::{Column, ColumnType, QueryError, Value};
 
 mod stream;
@@ -1781,9 +1781,119 @@ pub fn binary_logs() -> Result<Vec<BinaryLogInfo>, QueryError> {
     require_manager()?.binary_logs()
 }
 
+/// Restore imported history before replication or client connections can allocate GTIDs.
+pub fn restore_imported_gtids(db: &Database) -> Result<(), QueryError> {
+    let imported = db.imported_gtid_set()?;
+    if let Some(manager) = manager() {
+        let _gate = commit_gate();
+        let mut state = manager.state.lock();
+        state.gtid_executed = crate::gtid::union(&state.gtid_executed, &imported);
+        state.gtid_purged = crate::gtid::union(&state.gtid_purged, &imported);
+        state.next_gno = state
+            .next_gno
+            .max(next_gno_for_uuid(&imported, &manager.config.server_uuid));
+    }
+    Ok(())
+}
+
+pub(crate) fn gtid_snapshot(db: &Database) -> Result<(String, String), QueryError> {
+    let replicated = crate::replication::global_manager()
+        .map(|r| r.executed_gtid_set())
+        .transpose()?
+        .unwrap_or_default();
+    gtid_snapshot_with_replication(db, &replicated)
+}
+
+fn gtid_snapshot_with_replication(
+    db: &Database,
+    replicated: &str,
+) -> Result<(String, String), QueryError> {
+    let imported = db.imported_gtid_set()?;
+    let (executed, purged) = manager()
+        .map(|m| {
+            let state = m.state.lock();
+            (state.gtid_executed.clone(), state.gtid_purged.clone())
+        })
+        .unwrap_or_default();
+    let purged = crate::gtid::union(
+        &crate::gtid::union(&purged, &imported),
+        &crate::gtid::subtract(replicated, &executed),
+    );
+    Ok((
+        crate::gtid::union(&crate::gtid::union(&executed, replicated), &imported),
+        purged,
+    ))
+}
+
+fn import_apply_lease(
+    db: &Database,
+) -> Result<parking_lot::ArcRwLockWriteGuard<parking_lot::RawRwLock, ()>, QueryError> {
+    // Never queue a writer behind deferred replica commits: the applier may
+    // need another read lease before flushing its current commit batch.
+    crate::storage::capture::logical_apply_gate(db)?.try_write_arc().ok_or_else(|| error(
+        crate::error::catalog::ER_CANT_SET_GTID_PURGED_WHEN_OWNED_GTIDS_IS_NOT_EMPTY,
+        "Cannot change GTID history while replica transactions are applying; stop replica SQL threads and retry",
+    ))
+}
+
+pub(crate) fn set_gtid_purged(db: &Database, text: &str) -> Result<(), QueryError> {
+    let text = text.trim();
+    let (append, text) = text.strip_prefix('+').map_or((false, text), |s| (true, s));
+    let requested = crate::gtid::validate_set(text)
+        .map_err(|_| crate::engine::sysvar::errors::wrong_value_for_var("gtid_purged", text))?;
+    let _mutation = db.imported_gtids.mutation.lock();
+    // Prevent replica apply from introducing an external GTID between validation
+    // and publication. Source commits may continue after their local range is reserved.
+    let _apply = import_apply_lease(db)?;
+    if !db.list_prepared_xa().is_empty() {
+        return Err(error(
+            crate::error::catalog::ER_CANT_SET_GTID_PURGED_WHEN_OWNED_GTIDS_IS_NOT_EMPTY,
+            "Cannot change GTID history while XA transactions are prepared",
+        ));
+    }
+    let replicated = crate::replication::global_manager()
+        .map(|r| r.executed_gtid_set())
+        .transpose()?
+        .unwrap_or_default();
+    let gate = commit_gate();
+    if manager().is_some() {
+        drain_commits_for_snapshot()?;
+    }
+    let (executed, purged) = gtid_snapshot_with_replication(db, &replicated)?;
+    let constraint = |message| {
+        error(
+            crate::error::catalog::ER_CANT_SET_GTID_PURGED_DUE_SETS_CONSTRAINTS,
+            message,
+        )
+    };
+    if append {
+        if crate::gtid::intersects(&requested, &executed) {
+            return Err(constraint("@@GLOBAL.GTID_PURGED cannot be changed: the added GTID set must not overlap @@GLOBAL.GTID_EXECUTED"));
+        }
+    } else {
+        if !gtid_subset(&purged, &requested) {
+            return Err(constraint("@@GLOBAL.GTID_PURGED cannot be changed: the new value must be a superset of the old value"));
+        }
+        if crate::gtid::intersects(&requested, &crate::gtid::subtract(&executed, &purged)) {
+            return Err(constraint("@@GLOBAL.GTID_PURGED cannot overlap GTIDs still present in binary logs or owned by replication"));
+        }
+    }
+
+    if let Some(manager) = manager() {
+        let mut state = manager.state.lock();
+        state.next_gno = state
+            .next_gno
+            .max(next_gno_for_uuid(&requested, &manager.config.server_uuid));
+    }
+    drop(gate);
+    let imported = crate::gtid::union(&db.imported_gtid_set()?, &requested);
+    db.persist_imported_gtids(&imported)?;
+    restore_imported_gtids(db)
+}
+
 pub fn variables_snapshot() -> Vec<(&'static str, String)> {
     let config = config_snapshot();
-    let (mut gtid_executed, gtid_purged) = manager()
+    let (mut gtid_executed, mut gtid_purged) = manager()
         .map(|manager| {
             let state = manager.state.lock();
             (state.gtid_executed.clone(), state.gtid_purged.clone())
@@ -1792,6 +1902,10 @@ pub fn variables_snapshot() -> Vec<(&'static str, String)> {
     if let Some(replication) = crate::replication::global_manager() {
         match replication.executed_gtid_set() {
             Ok(executed) => {
+                gtid_purged = crate::gtid::union(
+                    &gtid_purged,
+                    &crate::gtid::subtract(&executed, &gtid_executed),
+                );
                 gtid_executed = crate::gtid::format_gtid_interval_map(
                     &crate::gtid::parse_gtid_interval_map(&format!("{gtid_executed},{executed}")),
                 );
@@ -1992,6 +2106,38 @@ pub fn handle_admin_sql(sql: &str, session: &SessionContext) -> Result<QueryResp
     handle_admin_sql_scoped(sql, session, 0, || {
         test_reset_wal_boundary(require_manager()?.as_ref())
     })
+}
+
+pub(crate) fn handle_admin_sql_for_database(
+    db: &Database,
+    sql: &str,
+    session: &SessionContext,
+) -> Result<QueryResponse, QueryError> {
+    if !matches!(AdminCommand::parse(sql)?, AdminCommand::ResetMaster) {
+        return handle_admin_sql_scoped(sql, session, db.global_read_lock_scope(), || {
+            db.reset_binlog_wal_cutoff()
+        });
+    }
+    require_manager()?;
+    let _mutation = db.imported_gtids.mutation.lock();
+    let _apply = import_apply_lease(db)?;
+    let previous = db.imported_gtid_set()?;
+    // Clear the durable baseline before resetting the source manifest. Until
+    // reset succeeds, the source still owns the complete prior executed set.
+    db.persist_imported_gtids("")?;
+    let result = handle_admin_sql_scoped(sql, session, db.global_read_lock_scope(), || {
+        db.reset_binlog_wal_cutoff()
+    });
+    if result.is_err() {
+        if let Err(err) = db.persist_imported_gtids(&previous) {
+            db.quarantine_mvcc(format!(
+                "failed to restore GTID history after RESET MASTER failure: {}",
+                err.message()
+            ));
+            return Err(err);
+        }
+    }
+    result
 }
 
 pub fn handle_admin_sql_scoped(

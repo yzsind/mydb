@@ -1265,6 +1265,9 @@ impl Database {
             crate::binlog::prepared::cleanup(&self.data_dir, txn_id);
         }
         if let Some(delta) = delta.filter(|delta| delta.dd_touched) {
+            // Imported history lives in DD properties and may have changed
+            // without any SQL setter running on this physical replica.
+            self.invalidate_imported_gtids();
             if !delta.object_ids.is_empty() {
                 let object_ids = delta.object_ids.into_iter().collect::<Vec<_>>();
                 let mut loaded = Vec::with_capacity(object_ids.len());
@@ -1448,6 +1451,7 @@ impl Database {
                     return Ok(());
                 }
             }
+            let _auth_mdl = self.lock_auth_catalog_write_mdl()?;
             match self.load_non_table_families_from_store() {
                 Ok(loaded) => {
                     {

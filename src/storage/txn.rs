@@ -1619,6 +1619,9 @@ impl UniquePointTables {
 /// caller (`Database::slot_status_cache`).
 #[derive(Debug, Default)]
 pub(crate) struct LockManager {
+    // Default false keeps detection enabled. This setting shares the graph's
+    // latch, so runtime changes are ordered with every conflict check.
+    pub(crate) deadlock_detection_disabled: bool,
     // Row-lock + waiter maps are keyed by `(table_id, RowId)` because
     // the new 8-byte `RowId` no longer carries `table_id`. Two
     // concurrent INSERTs into different tables can otherwise land on
@@ -5071,7 +5074,9 @@ impl LockManager {
                 },
             );
         }
-        if self.detect_deadlock(txn_id, &owners) {
+        // Keep wait edges while disabled for diagnostics and for cycles that
+        // must be detected on retry after the detector is enabled again.
+        if !self.deadlock_detection_disabled && self.detect_deadlock(txn_id, &owners) {
             self.deadlock_count = self.deadlock_count.saturating_add(1);
             self.waits_for.remove(&txn_id);
             self.remove_waiter_for_resource(txn_id, &resource);

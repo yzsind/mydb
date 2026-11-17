@@ -42,6 +42,122 @@ fn rows(e: &StorageQueryEngine, s: &mut SessionContext, q: &str) -> Vec<Vec<Valu
     r.rows
 }
 
+fn wait_for_data_lock_waits(e: &StorageQueryEngine, count: usize) {
+    let started = Instant::now();
+    while e.db.storage_status().active_lock_waits < count {
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "expected {count} data-lock waits"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+}
+
+#[test]
+fn deadlock_detect_off_times_out_without_aborting_transaction() {
+    let (_dir, e) = fixture();
+    let mut admin = session();
+    let mut a = session();
+    let mut b = session();
+    sql(&e, &mut a, "SET innodb_lock_wait_timeout=5");
+    sql(&e, &mut b, "SET innodb_lock_wait_timeout=1");
+    sql(&e, &mut a, "BEGIN");
+    sql(&e, &mut b, "BEGIN");
+    sql(&e, &mut a, "UPDATE t SET v=10 WHERE id=1");
+    sql(&e, &mut b, "UPDATE t SET v=20 WHERE id=2");
+    sql(&e, &mut admin, "SET GLOBAL innodb_deadlock_detect=OFF");
+    assert_eq!(
+        e.execute_with_session(&mut b, "SELECT * FROM t WHERE id=1 FOR UPDATE NOWAIT")
+            .unwrap_err()
+            .code(),
+        3572
+    );
+    assert_eq!(
+        rows(
+            &e,
+            &mut b,
+            "SELECT id FROM t ORDER BY id FOR UPDATE SKIP LOCKED"
+        ),
+        vec![vec![Value::Int(2)]]
+    );
+    let worker_engine = Arc::clone(&e);
+    let worker = std::thread::spawn(move || {
+        let result = worker_engine.execute_with_session(&mut a, "UPDATE t SET v=21 WHERE id=2");
+        (a, result)
+    });
+    wait_for_data_lock_waits(&e, 1);
+    assert!(!rows(
+        &e,
+        &mut admin,
+        "SELECT * FROM performance_schema.data_lock_waits"
+    )
+    .is_empty());
+    let transaction = b.current_txn;
+    let error = e
+        .execute_with_session(&mut b, "UPDATE t SET v=11 WHERE id=1")
+        .unwrap_err();
+    assert_eq!(error.code(), 1205);
+    assert_eq!(b.current_txn, transaction);
+    assert_eq!(
+        rows(&e, &mut b, "SELECT v FROM t WHERE id=2"),
+        vec![vec![Value::Int(20)]]
+    );
+    assert_eq!(e.db.storage_status().deadlocks, 0);
+    sql(&e, &mut b, "ROLLBACK");
+    let (mut a, result) = worker.join().unwrap();
+    result.unwrap();
+    sql(&e, &mut a, "ROLLBACK");
+    assert_eq!(e.db.storage_status().active_lock_waits, 0);
+    assert_eq!(
+        rows(&e, &mut admin, "SELECT v FROM t ORDER BY id"),
+        vec![vec![Value::Int(1)], vec![Value::Int(2)]]
+    );
+}
+
+#[test]
+fn deadlock_detect_reenable_breaks_existing_wait_cycle() {
+    let (_dir, e) = fixture();
+    let mut admin = session();
+    let mut a = session();
+    let mut b = session();
+    for s in [&mut a, &mut b] {
+        sql(&e, s, "SET innodb_lock_wait_timeout=10");
+        sql(&e, s, "BEGIN");
+    }
+    sql(&e, &mut a, "UPDATE t SET v=10 WHERE id=1");
+    sql(&e, &mut b, "UPDATE t SET v=20 WHERE id=2");
+    sql(&e, &mut admin, "SET GLOBAL mydb_deadlock_detect=OFF");
+    let start = |mut s: SessionContext, query: &'static str| {
+        let engine = Arc::clone(&e);
+        std::thread::spawn(move || {
+            let result = engine.execute_with_session(&mut s, query);
+            (s, result)
+        })
+    };
+    let first = start(a, "UPDATE t SET v=21 WHERE id=2");
+    wait_for_data_lock_waits(&e, 1);
+    let second = start(b, "UPDATE t SET v=11 WHERE id=1");
+    wait_for_data_lock_waits(&e, 2);
+    assert_eq!(e.db.storage_status().deadlocks, 0);
+    sql(&e, &mut admin, "SET GLOBAL innodb_deadlock_detect=ON");
+    let (mut a, first) = first.join().unwrap();
+    let (mut b, second) = second.join().unwrap();
+    let mut victims = 0;
+    for (s, result) in [(&a, first), (&b, second)] {
+        if let Err(error) = result {
+            assert_eq!(error.code(), 1213);
+            assert_eq!(error.sql_state(), "40001");
+            assert!(s.current_txn.is_none());
+            victims += 1;
+        }
+    }
+    assert_eq!(victims, 1);
+    assert_eq!(e.db.storage_status().deadlocks, 1);
+    sql(&e, &mut a, "ROLLBACK");
+    sql(&e, &mut b, "ROLLBACK");
+    assert_eq!(e.db.storage_status().active_lock_waits, 0);
+}
+
 #[test]
 fn rc_timeout_preserves_prior_writes_and_rolls_back_partial_statement() {
     let (_dir, e) = fixture();
@@ -219,9 +335,23 @@ fn wait_pending(e: &StorageQueryEngine, owner: u32) {
 
 #[test]
 fn rc_mdl_deadlock_releases_lazy_read_transaction() {
+    check_mdl_deadlock_releases_lazy_read_transaction(true);
+}
+
+#[test]
+fn deadlock_detect_off_preserves_mdl_detection() {
+    check_mdl_deadlock_releases_lazy_read_transaction(false);
+}
+
+fn check_mdl_deadlock_releases_lazy_read_transaction(detect: bool) {
     let (_dir, e) = fixture();
     let mut a = session();
     let mut b = session();
+    sql(
+        &e,
+        &mut a,
+        &format!("SET GLOBAL mydb_deadlock_detect={}", u8::from(detect)),
+    );
     sql(&e, &mut a, "SET SESSION lock_wait_timeout=2");
     sql(&e, &mut b, "SET SESSION lock_wait_timeout=2");
     sql(&e, &mut a, "BEGIN");

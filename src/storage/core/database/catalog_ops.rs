@@ -1021,6 +1021,9 @@ impl Database {
         creator: Option<&crate::engine::auth::AccountKey>,
         automatic_privileges: bool,
     ) -> Result<bool, QueryError> {
+        let _auth_mdl = if automatic_privileges && creator.is_some() {
+            Some(self.lock_auth_catalog_write_mdl()?)
+        } else { None };
         let (database, name) = split_table_name(current_database, &routine.name);
         let key = routine_key(&database, routine.kind.lower(), &name);
         let routine_kind = routine.kind.lower().to_string();
@@ -1164,6 +1167,7 @@ impl Database {
         name: &str,
         if_exists: bool,
     ) -> Result<bool, QueryError> {
+        let _auth_mdl = self.lock_auth_catalog_write_mdl()?;
         let (database, routine_name) = split_table_name(current_database, name);
         let key = routine_key(&database, kind.lower(), &routine_name);
         let mut invalidated_views = Vec::new();
@@ -1836,6 +1840,25 @@ impl Database {
         Ok(f(&snapshot))
     }
 
+    fn lock_auth_catalog_write_mdl(&self) -> Result<impl Drop + '_, QueryError> {
+        // Virtual mysql privilege tables and their backing catalog share MDL.
+        // Acquire before the publication mutex so a dump never pins that mutex.
+        struct AuthMdl<'a>(&'a Database, u64);
+        impl Drop for AuthMdl<'_> {
+            fn drop(&mut self) { self.0.release_mdl_owner(self.1); }
+        }
+        let owner = crate::storage::mdl::allocate_internal_owner()?;
+        let mdl = AuthMdl(self, owner);
+        self.acquire_mdl(
+            owner, None, crate::storage::mdl::MdlDuration::Statement,
+            crate::engine::mysql_schema::AUTH_TABLES.iter().map(|name| crate::storage::mdl::MdlRequest {
+                key: crate::storage::mdl::MdlObjectKey::table("mysql", name),
+                lock_type: crate::storage::mdl::MdlLockType::SharedWrite,
+            }).collect(), "sql/auth_catalog",
+        )?;
+        Ok(mdl)
+    }
+
     pub(crate) fn publish_auth_snapshot(&self) -> Result<(), QueryError> {
         let auth = {
             let mut catalog = self.catalog_write()?;
@@ -1873,6 +1896,7 @@ impl Database {
     where
         F: FnOnce(&mut crate::engine::auth::AuthCatalog) -> Result<(), QueryError>,
     {
+        let _mdl = self.lock_auth_catalog_write_mdl()?;
         let _auth_mutation = crate::engine::auth::catalog_mutation_lock()
             .lock()
             .map_err(|_| {

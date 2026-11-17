@@ -30,8 +30,6 @@ pub(crate) fn register(reg: &mut Registry) {
         "server_uuid",
         "gtid_mode",
         "enforce_gtid_consistency",
-        "gtid_executed",
-        "gtid_purged",
         "expire_logs_days",
         "max_binlog_cache_size",
         "max_binlog_stmt_cache_size",
@@ -45,6 +43,49 @@ pub(crate) fn register(reg: &mut Registry) {
             move |_ctx| snapshot_value(canon),
             move |_ctx: &mut WriteCtx<'_>, _v: SysVarValue| -> Result<(), QueryError> {
                 Err(crate::engine::sysvar::errors::read_only_variable(canon))
+            },
+        ));
+    }
+
+    for name in ["gtid_executed", "gtid_purged"] {
+        reg.register(SysVar::settable(
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::StrictString {
+                    max_len: None,
+                    null_as_empty: false,
+                },
+            )
+            .with_access(if name == "gtid_purged" {
+                Access::SuperReadWrite
+            } else {
+                Access::ReadOnly
+            })
+            .without_persistence()
+            .with_doc("Durable executed or purged GTID history."),
+            move |ctx| {
+                if let Some(db) = ctx.db {
+                    match crate::binlog::gtid_snapshot(db) {
+                        Ok((executed, purged)) => SysVarValue::String(if name == "gtid_executed" {
+                            executed
+                        } else {
+                            purged
+                        }),
+                        Err(err) => {
+                            db.quarantine_mvcc(err.message());
+                            snapshot_value(name)
+                        }
+                    }
+                } else {
+                    snapshot_value(name)
+                }
+            },
+            move |ctx, value| {
+                let db = ctx
+                    .db
+                    .ok_or_else(crate::engine::sysvar::errors::persist_requires_database)?;
+                crate::binlog::set_gtid_purged(db, &value.to_display_string())
             },
         ));
     }

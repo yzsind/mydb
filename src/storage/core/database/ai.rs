@@ -50,6 +50,9 @@ impl Database {
             .filter(|old| !candidate.models.values().any(|new| new.id == old.id))
             .map(|m| m.id)
             .collect();
+        let _auth_mdl = if deleted.is_empty() {
+            None
+        } else { Some(self.lock_auth_catalog_write_mdl()?) };
         let _auth_lock = if deleted.is_empty() {
             None
         } else {

@@ -2,7 +2,10 @@
 fn xa_row_operation(op: &RelayOp) -> bool {
     match op {
         RelayOp::RowsWithForeignKeyChecks { op, .. } => xa_row_operation(op),
-        RelayOp::Noop | RelayOp::WriteRows { .. } | RelayOp::UpdateRows { .. } | RelayOp::DeleteRows { .. } => true,
+        RelayOp::Noop
+        | RelayOp::WriteRows { .. }
+        | RelayOp::UpdateRows { .. }
+        | RelayOp::DeleteRows { .. } => true,
         _ => false,
     }
 }
@@ -250,7 +253,8 @@ impl ChannelRunner {
             serde_json::to_string(&receipt).map_err(|err| xa_relay_error(err.to_string()))?;
         let db = self.engine.database_for_replication();
         let gate = crate::storage::capture::logical_apply_gate(db)?;
-        let _apply = gate.read_arc();
+        // Relay dispatch holds a read lease across GTID duplicate checking.
+        let _apply = gate.read_arc_recursive();
         if let Some(previous) = db.replication_property(&pending_key)? {
             let previous: ReplicaXaReceipt = serde_json::from_str(&previous)
                 .map_err(|err| xa_relay_error(format!("invalid prepared receipt: {err}")))?;
@@ -297,7 +301,8 @@ impl ChannelRunner {
         let (pending_key, commit_key) = self.xa_property_keys(xid)?;
         let db = self.engine.database_for_replication();
         let gate = crate::storage::capture::logical_apply_gate(db)?;
-        let _apply = gate.read_arc();
+        // Relay dispatch holds a read lease across GTID duplicate checking.
+        let _apply = gate.read_arc_recursive();
         let encoded = db.replication_property(&pending_key)?.ok_or_else(|| xa_relay_error("XA completion has no replicated PREPARE; start from a source position containing the entire XA branch"))?;
         let receipt: ReplicaXaReceipt = serde_json::from_str(&encoded)
             .map_err(|err| xa_relay_error(format!("invalid prepared receipt: {err}")))?;

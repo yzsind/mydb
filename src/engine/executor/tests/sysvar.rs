@@ -7,6 +7,144 @@ use crate::engine::api::SessionContext;
 use crate::types::Value;
 
 #[test]
+fn deadlock_detect_global_alias_scope_and_validation() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut admin = SessionContext::default();
+    let mut existing = SessionContext::default();
+    let query = "SELECT @@global.innodb_deadlock_detect, @@mydb_deadlock_detect";
+    let enabled = vec![Value::String("1".into()), Value::String("1".into())];
+    let disabled = vec![Value::String("0".into()), Value::String("0".into())];
+    assert_eq!(one_row(&engine, &mut existing, query), enabled);
+    engine
+        .execute_with_session(&mut admin, "SET GLOBAL mydb_deadlock_detect=OFF")
+        .unwrap();
+    assert_eq!(one_row(&engine, &mut existing, query), disabled);
+    assert_eq!(
+        one_row(
+            &engine,
+            &mut admin,
+            "SHOW GLOBAL VARIABLES LIKE 'innodb_deadlock_detect'"
+        ),
+        vec![
+            Value::String("innodb_deadlock_detect".into()),
+            Value::String("OFF".into())
+        ]
+    );
+    for name in ["innodb_deadlock_detect", "mydb_deadlock_detect"] {
+        for prefix in ["SET", "SET SESSION"] {
+            assert_eq!(
+                engine
+                    .execute_with_session(&mut admin, &format!("{prefix} {name}=ON"))
+                    .unwrap_err()
+                    .code(),
+                1229
+            );
+        }
+        assert_eq!(
+            engine
+                .execute_with_session(&mut admin, &format!("SELECT @@session.{name}"))
+                .unwrap_err()
+                .code(),
+            1238
+        );
+        for value in ["2", "-1", "NULL", "'invalid'"] {
+            assert_eq!(
+                engine
+                    .execute_with_session(&mut admin, &format!("SET GLOBAL {name}={value}"))
+                    .unwrap_err()
+                    .code(),
+                1231
+            );
+            assert_eq!(one_row(&engine, &mut existing, query), disabled);
+        }
+        for (value, expected) in [
+            ("ON", &enabled),
+            ("0", &disabled),
+            ("TRUE", &enabled),
+            ("FALSE", &disabled),
+            ("DEFAULT", &enabled),
+        ] {
+            engine
+                .execute_with_session(&mut admin, &format!("SET GLOBAL {name}={value}"))
+                .unwrap();
+            assert_eq!(&one_row(&engine, &mut existing, query), expected);
+        }
+        engine
+            .execute_with_session(&mut admin, &format!("SET GLOBAL {name}=OFF"))
+            .unwrap();
+    }
+    engine
+        .execute_with_session(&mut admin, "SET GLOBAL innodb_deadlock_detect=DEFAULT")
+        .unwrap();
+}
+
+#[test]
+fn deadlock_detect_alias_privileges_and_persistence() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    engine
+        .execute_with_session(
+            &mut root,
+            "CREATE USER 'deadlock_admin'@'%' IDENTIFIED BY ''",
+        )
+        .unwrap();
+    let mut user = SessionContext::default();
+    user.user = "deadlock_admin".into();
+    user.login_user = "deadlock_admin".into();
+    user.authenticated_as = crate::engine::auth::AccountKey::new("deadlock_admin", "%");
+    user.current_user_is_system = false;
+    for name in ["innodb_deadlock_detect", "mydb_deadlock_detect"] {
+        assert_eq!(
+            engine
+                .execute_with_session(&mut user, &format!("SET GLOBAL {name}=OFF"))
+                .unwrap_err()
+                .code(),
+            1227
+        );
+    }
+    assert!(engine.database().deadlock_detection_enabled());
+    engine
+        .execute_with_session(
+            &mut root,
+            "GRANT SYSTEM_VARIABLES_ADMIN ON *.* TO 'deadlock_admin'@'%'",
+        )
+        .unwrap();
+    engine
+        .execute_with_session(&mut user, "SET GLOBAL mydb_deadlock_detect=OFF")
+        .unwrap();
+    assert!(!engine.database().deadlock_detection_enabled());
+    engine
+        .execute_with_session(&mut root, "SET PERSIST_ONLY mydb_deadlock_detect=ON")
+        .unwrap();
+    assert!(!engine.database().deadlock_detection_enabled());
+    let persisted = engine.database().persisted_variables().snapshot();
+    assert_eq!(persisted.len(), 1);
+    assert_eq!(persisted[0].name, "innodb_deadlock_detect");
+    assert_eq!(persisted[0].value, "ON");
+    crate::engine::sysvar::registry::apply_persisted_on_startup(engine.database());
+    assert!(engine.database().deadlock_detection_enabled());
+    engine
+        .execute_with_session(&mut root, "SET PERSIST innodb_deadlock_detect=OFF")
+        .unwrap();
+    assert!(!engine.database().deadlock_detection_enabled());
+    engine
+        .execute_with_session(&mut root, "SET PERSIST mydb_deadlock_detect=ON")
+        .unwrap();
+    assert!(engine.database().deadlock_detection_enabled());
+    assert_eq!(engine.database().persisted_variables().snapshot().len(), 1);
+    engine
+        .execute_with_session(&mut root, "RESET PERSIST mydb_deadlock_detect")
+        .unwrap();
+    assert!(engine
+        .database()
+        .persisted_variables()
+        .snapshot()
+        .is_empty());
+}
+
+#[test]
 fn vector_result_format_is_validated_and_session_local() {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();

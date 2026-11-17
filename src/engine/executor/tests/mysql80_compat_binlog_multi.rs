@@ -649,3 +649,50 @@ fn ddl_metadata_rollback_does_not_binlog_the_rejected_statement() {
         "rollback must restore the parent's inbound FK backing name"
     );
 }
+
+#[test]
+fn dump_gtid_import_reserves_local_sequence_and_reset_clears_durable_baseline() {
+    let fixture = BinlogFixture::open_strict();
+    let engine = &fixture.engine;
+    let mut root = SessionContext::default();
+    let uuid = binlog::config_snapshot().server_uuid;
+    engine
+        .execute_with_session(&mut root, &format!("SET GLOBAL gtid_purged='{uuid}:1-100'"))
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "CREATE TABLE imported_t(id INT PRIMARY KEY)")
+        .unwrap();
+    let (executed, purged) = binlog::gtid_snapshot(&engine.db).unwrap();
+    assert!(binlog::gtid_subset(&format!("{uuid}:1-101"), &executed));
+    assert_eq!(purged, format!("{uuid}:1-100"));
+    assert_eq!(
+        engine
+            .execute_with_session(&mut root, &format!("SET GLOBAL gtid_purged='{uuid}:1-101'"))
+            .unwrap_err()
+            .code(),
+        3546
+    );
+    engine
+        .execute_with_session(&mut root, "FLUSH BINARY LOGS")
+        .unwrap();
+    binlog::init_global(fixture.binlog_dir.clone(), binlog::config_snapshot()).unwrap();
+    binlog::restore_imported_gtids(&engine.db).unwrap();
+    assert!(binlog::gtid_subset(
+        &format!("{uuid}:1-101"),
+        &binlog::gtid_snapshot(&engine.db).unwrap().0
+    ));
+    engine
+        .execute_with_session(&mut root, "RESET MASTER")
+        .unwrap();
+    assert_eq!(
+        binlog::gtid_snapshot(&engine.db).unwrap(),
+        (String::new(), String::new())
+    );
+    assert_eq!(
+        engine
+            .db
+            .replication_property("mysql-imported-gtids")
+            .unwrap(),
+        Some(String::new())
+    );
+}

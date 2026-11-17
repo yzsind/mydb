@@ -139,7 +139,7 @@ def run_snapshot(args, source, log_file, log_pos):
         f"-u{source['user']}",
         "--single-transaction", "--skip-lock-tables", "--skip-triggers",
         "--hex-blob", "--default-character-set=utf8mb4", "--skip-add-locks", "--skip-disable-keys",
-        "--set-gtid-purged=OFF", "--no-tablespaces", "--column-statistics=0",
+        f"--set-gtid-purged={'ON' if args.auto_position else 'OFF'}", "--no-tablespaces", "--column-statistics=0",
         "--databases", *args.databases.split(","),
     ]
     # 8.0 spells it --master-data; 8.4+ --source-data. Both embed the
@@ -366,12 +366,6 @@ def main():
     ap.add_argument("--no-smoke", action="store_true", help="skip the end-to-end smoke insert")
     ap.add_argument("--work-dir", type=Path, default=Path("/tmp/mydb/mysql-replica-setup"))
     args = ap.parse_args()
-
-    # gtid_purged is read-only in mydb. A dump cannot seed the source GTID
-    # history, so auto-position would replay transactions already in the dump.
-    if args.snapshot and args.auto_position:
-        ap.error('--snapshot cannot use --auto-position: snapshot GTID import is unsupported; '
-                 'omit --auto-position to resume at the dump-consistent file position')
 
     if not args.work_dir.resolve().is_relative_to(Path("/tmp/mydb").resolve()):
         ap.error("--work-dir must live under /tmp/mydb")

@@ -561,3 +561,5 @@ mod audit_fixes_1106;
 mod table_ddl_audit_1108;
 
 mod exec_optimizer_audit_1108;
+
+mod dump_compatibility;

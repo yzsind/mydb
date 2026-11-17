@@ -3766,6 +3766,7 @@ const MIN_ENCODED_INDEX_SORTER_BYTES: usize = 4 * 1024 * 1024;
 struct OfflineIndexScratchAdmission {
     gate: Mutex<()>,
     available: Condvar,
+    progress_headroom: AtomicUsize,
 }
 
 fn offline_index_scratch_admission() -> &'static OfflineIndexScratchAdmission {
@@ -3773,6 +3774,7 @@ fn offline_index_scratch_admission() -> &'static OfflineIndexScratchAdmission {
     ADMISSION.get_or_init(|| OfflineIndexScratchAdmission {
         gate: Mutex::new(()),
         available: Condvar::new(),
+        progress_headroom: AtomicUsize::new(0),
     })
 }
 
@@ -3809,13 +3811,37 @@ fn index_build_ancillary_headroom_for_limit(operational_limit: usize) -> usize {
         .min(operational_limit / 4)
 }
 
-fn clamp_index_build_scratch_to_headroom(requested: usize, minimum: usize) -> usize {
+/// Each admitted build needs its own progress window in addition to the
+/// process-wide parser/protocol allowance. A shared 64 MiB window is too small
+/// when many large sorters retain their runs while constructing private trees.
+/// This is admission policy, not a live-byte charge: writers still charge their
+/// actual buffers, and later sorters must not consume these windows.
+fn index_build_progress_headroom(requested: usize, operational_limit: usize) -> usize {
+    (requested / 20)
+        .max(8 * 1024 * 1024)
+        .min(operational_limit / 4)
+}
+
+fn clamp_index_build_scratch_to_headroom(
+    requested: usize,
+    minimum: usize,
+    progress_headroom: usize,
+) -> Option<usize> {
     let operational_limit = crate::engine::executor::mem_budget::operational_memory_limit_bytes();
     let controlled = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+    let headroom = index_build_ancillary_headroom_for_limit(operational_limit)
+        .saturating_add(progress_headroom);
     let available = operational_limit
         .saturating_sub(controlled)
-        .saturating_sub(index_build_ancillary_headroom_for_limit(operational_limit));
-    requested.min(available).max(minimum)
+        .saturating_sub(headroom);
+    // Logical ownership can be below the ceiling while allocator/runtime
+    // residency already consumes the progress window. Honor both ceilings.
+    let physical_deficit = crate::engine::memory_reclaimer::process_headroom_reclaim_bytes(
+        available.saturating_add(headroom),
+        operational_limit,
+    );
+    let granted = requested.min(available.saturating_sub(physical_deficit));
+    (granted >= minimum).then_some(granted)
 }
 
 /// Capacity state shared by every offline index build in one database.
@@ -3905,10 +3931,15 @@ fn set_configured_buffer_pool_capacity(
 struct OfflineIndexBuildBufferLease<'a> {
     db: &'a Database,
     lease_id: u64,
+    progress_headroom: usize,
 }
 
 impl Drop for OfflineIndexBuildBufferLease<'_> {
     fn drop(&mut self) {
+        offline_index_scratch_admission()
+            .progress_headroom
+            .fetch_sub(self.progress_headroom, Ordering::AcqRel);
+        offline_index_scratch_admission().available.notify_all();
         let Ok(mut state) = self.db.offline_index_buffer_leases.lock() else {
             log_message("offline index build: buffer lease state poisoned while releasing");
             return;
@@ -3925,7 +3956,6 @@ impl Drop for OfflineIndexBuildBufferLease<'_> {
                 "offline index build: failed to restore shared buffer-pool capacity: {err:?}"
             ));
         }
-        offline_index_scratch_admission().available.notify_all();
     }
 }
 
@@ -4011,7 +4041,11 @@ fn reclaim_index_build_headroom<'a>(
     if reclaim_bytes != 0 {
         let _ = crate::engine::memory_reclaimer::release_allocator_cached_memory();
     }
-    Ok(OfflineIndexBuildBufferLease { db, lease_id })
+    Ok(OfflineIndexBuildBufferLease {
+        db,
+        lease_id,
+        progress_headroom: 0,
+    })
 }
 
 fn reserve_offline_index_build_scratch<'a>(
@@ -4029,53 +4063,57 @@ fn reserve_offline_index_build_scratch<'a>(
     use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
 
     loop {
+        crate::engine::cancel::check_cancelled()?;
         let admission_guard = lock_offline_index_scratch_admission()?;
-        let (controlled, _, categories, _) =
-            crate::engine::executor::mem_budget::controlled_memory_snapshot();
         let operational_limit =
             crate::engine::executor::mem_budget::operational_memory_limit_bytes();
-        let ancillary_headroom = index_build_ancillary_headroom_for_limit(operational_limit);
+        let own_headroom = index_build_progress_headroom(requested, operational_limit);
+        let peer_headroom = offline_index_scratch_admission()
+            .progress_headroom
+            .load(Ordering::Acquire);
+        let progress_headroom = peer_headroom.saturating_add(own_headroom);
+        let (controlled, _, categories, _) =
+            crate::engine::executor::mem_budget::controlled_memory_snapshot();
         let min_buffer_bytes = (16 * 1024 * 1024)
             .min(crate::engine::executor::mem_budget::memory_target_bytes() / 4)
             .max(PAGE_SIZE);
-        let peers_active = db
-            .offline_index_buffer_leases
-            .lock()
-            .map_err(|_| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "offline index build buffer lease lock poisoned",
-                )
-            })?
-            .active_limits
-            .len();
-        if peers_active != 0
+        if peer_headroom != 0
             && categories[0] <= min_buffer_bytes
             && controlled
                 .saturating_add(minimum)
-                .saturating_add(ancillary_headroom)
+                .saturating_add(progress_headroom)
+                .saturating_add(index_build_ancillary_headroom_for_limit(operational_limit))
                 > operational_limit
         {
             wait_for_offline_index_scratch(admission_guard)?;
             continue;
         }
-        let buffer_lease = reclaim_index_build_headroom(db, requested)?;
-        let mut granted = clamp_index_build_scratch_to_headroom(requested, minimum);
+        let mut buffer_lease = reclaim_index_build_headroom(
+            db,
+            requested.saturating_add(progress_headroom),
+        )?;
+        let mut granted =
+            clamp_index_build_scratch_to_headroom(requested, minimum, progress_headroom);
         let charge = loop {
+            let Some(bytes) = granted else { break None };
             if let Some(charge) = ControlledMemoryCharge::try_new_optional(
                 ControlledMemoryCategory::StorageScratch,
-                granted,
+                bytes,
             ) {
                 break Some(charge);
             }
-            if granted <= minimum {
+            if bytes <= minimum {
                 break None;
             }
-            granted = (granted / 2).max(minimum);
+            granted = Some((bytes / 2).max(minimum));
         };
         if let Some(charge) = charge {
+            buffer_lease.progress_headroom = own_headroom;
+            offline_index_scratch_admission()
+                .progress_headroom
+                .fetch_add(own_headroom, Ordering::AcqRel);
             drop(admission_guard);
-            return Ok((buffer_lease, charge, granted));
+            return Ok((buffer_lease, charge, granted.unwrap()));
         }
 
         // Spillable offline builds queue behind peers when even their minimum
@@ -4084,24 +4122,28 @@ fn reserve_offline_index_build_scratch<'a>(
         // DDL correctness. Release our capacity dependency and retry when a
         // peer returns its sorter charge.
         drop(buffer_lease);
-        let peers_active = db
-            .offline_index_buffer_leases
-            .lock()
-            .map_err(|_| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "offline index build buffer lease lock poisoned",
-                )
-            })?
-            .active_limits
-            .len();
-        if peers_active == 0 {
-            drop(admission_guard);
-            return Err(ControlledMemoryCharge::try_new(
+        if offline_index_scratch_admission()
+            .progress_headroom
+            .load(Ordering::Acquire) == 0
+        {
+            // Mandatory admission may reclaim more than the optional probe.
+            // Do not assume it must fail: a peer or the reclaimer can release
+            // memory between the two attempts. Keep the gate until this
+            // decision so a new sorter cannot consume the reclaimed window.
+            let charge = ControlledMemoryCharge::try_new(
                 ControlledMemoryCategory::StorageScratch,
                 minimum,
-            )
-            .expect_err("minimum offline index scratch optional reservation just failed"));
+            )?;
+            drop(charge);
+            if clamp_index_build_scratch_to_headroom(requested, minimum, own_headroom).is_some() {
+                continue;
+            }
+            return Err(error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                format!(
+                    "insufficient memory for index build progress: minimum scratch={minimum}, progress headroom={own_headroom}"
+                ),
+            ));
         }
         wait_for_offline_index_scratch(admission_guard)?;
     }
@@ -6708,6 +6750,111 @@ mod encoded_index_program_tests {
             index_build_ancillary_headroom_for_limit(16 * 1024 * 1024),
             4 * 1024 * 1024
         );
+    }
+
+    #[test]
+    fn concurrent_index_envelopes_leave_each_builder_room_to_finish() {
+        use crate::engine::executor::mem_budget::{
+            with_test_effective_memory_limit, ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = Database::open_with_durability(root.path(), DurabilityMode::Strict).unwrap();
+        with_test_effective_memory_limit(16 * 1024 * 1024 * 1024, || {
+            let mut builds = Vec::new();
+            for _ in 0..8 {
+                builds.push(
+                    reserve_offline_index_build_scratch(&db, 128 * 1024 * 1024, 4 * 1024 * 1024)
+                        .unwrap(),
+                );
+            }
+            // The last sorter consumes the remaining run capacity. These are
+            // reservations, so reproducing admission does not need huge heaps.
+            builds.push(
+                reserve_offline_index_build_scratch(
+                    &db,
+                    16 * 1024 * 1024 * 1024,
+                    4 * 1024 * 1024,
+                )
+                .unwrap(),
+            );
+            let mut writers = Vec::new();
+            for _ in &builds {
+                // Mandatory page images and bounded merge/protocol staging
+                // coexist with every sorter's reservation during publication.
+                writers.push(
+                    ControlledMemoryCharge::try_new(
+                        ControlledMemoryCategory::StorageScratch,
+                        8 * 1024 * 1024,
+                    )
+                    .expect("an admitted index build must retain progress headroom"),
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn index_admission_waits_for_progress_headroom_across_databases() {
+        use crate::engine::executor::mem_budget::with_test_effective_memory_limit;
+
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let first = Database::open_with_durability(
+            &root.path().join("first"),
+            DurabilityMode::Strict,
+        )
+        .unwrap();
+        let second = Database::open_with_durability(
+            &root.path().join("second"),
+            DurabilityMode::Strict,
+        )
+        .unwrap();
+        let first_capacity = first.buffer_pool.capacity_pages();
+        let second_capacity = second.buffer_pool.capacity_pages();
+        with_test_effective_memory_limit(16 * 1024 * 1024 * 1024, || {
+            let build = reserve_offline_index_build_scratch(
+                &first,
+                16 * 1024 * 1024 * 1024,
+                4 * 1024 * 1024,
+            )
+            .unwrap();
+            std::thread::scope(|scope| {
+                let (started_tx, started_rx) = std::sync::mpsc::channel();
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let second = &second;
+                scope.spawn(move || {
+                    started_tx.send(()).unwrap();
+                    let result = reserve_offline_index_build_scratch(
+                        &second,
+                        4 * 1024 * 1024,
+                        4 * 1024 * 1024,
+                    );
+                    let result = result.map(|(lease, charge, bytes)| {
+                        drop(charge);
+                        drop(lease);
+                        bytes
+                    });
+                    done_tx.send(result).unwrap();
+                });
+                started_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                let early = done_rx.recv_timeout(Duration::from_millis(100));
+                // Release the blocker before asserting, so a failed test can
+                // still join its worker rather than leaving admission parked.
+                let (lease, charge, _) = build;
+                drop(charge);
+                drop(lease);
+                assert!(matches!(early, Err(std::sync::mpsc::RecvTimeoutError::Timeout)));
+                assert_eq!(
+                    done_rx.recv_timeout(Duration::from_secs(5)).unwrap().unwrap(),
+                    4 * 1024 * 1024,
+                );
+            });
+            assert_eq!(
+                offline_index_scratch_admission().progress_headroom.load(Ordering::Acquire),
+                0,
+            );
+        });
+        assert_eq!(first.buffer_pool.capacity_pages(), first_capacity);
+        assert_eq!(second.buffer_pool.capacity_pages(), second_capacity);
     }
 
     #[test]

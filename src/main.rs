@@ -258,6 +258,7 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
             "mydb startup: binlog_init={}ms",
             binlog_started.elapsed().as_millis()
         ));
+        mydb::binlog::restore_imported_gtids(engine.db_handle()).map_err(startup_error)?;
         let repl = mydb::replication::init_global(data_dir.clone(), Arc::clone(&engine));
         mydb::replication::maybe_start_from_env(&repl).map_err(startup_error)?;
         let _mydb_repl =

@@ -720,6 +720,14 @@ impl Drop for ScnFrontierGuard<'_> {
 }
 
 impl Database {
+    pub fn deadlock_detection_enabled(&self) -> bool {
+        !self.lock_manager_read().deadlock_detection_disabled
+    }
+
+    pub fn set_deadlock_detection_enabled(&self, enabled: bool) {
+        self.lock_manager().deadlock_detection_disabled = !enabled;
+    }
+
     #[cfg(test)]
     pub(crate) fn buffered_txn_wal_records_for_test(&self, txn_id: u64) -> usize {
         txn_wal_buffer_len(&self.log, txn_id)
@@ -930,7 +938,7 @@ impl Database {
         ))
     }
 
-    fn quarantine_mvcc(&self, reason: impl Into<String>) {
+    pub(crate) fn quarantine_mvcc(&self, reason: impl Into<String>) {
         let reason = reason.into();
         if self
             .mvcc_quarantined

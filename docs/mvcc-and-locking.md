@@ -113,6 +113,25 @@ Deadlock detection covers transactional row, table, and unique-key locks.
 A detected deadlock returns 1213/40001; retry the transaction. MDL has separate
 wait handling.
 
+`innodb_deadlock_detect` (alias `mydb_deadlock_detect`) is a dynamic GLOBAL
+boolean, default `ON`. Both names control the same detector for all sessions,
+including transactions and lock waits that already exist:
+
+```sql
+SELECT @@global.innodb_deadlock_detect, @@global.mydb_deadlock_detect;
+SET GLOBAL innodb_deadlock_detect = OFF;
+SET GLOBAL mydb_deadlock_detect = ON;
+```
+
+With detection `OFF`, transactional locks still enforce their normal conflict
+and FIFO rules, but wait-for cycles are not checked and do not produce 1213.
+Such waits end through lock-wait timeout, cancellation, or a lock release.
+Wait diagnostics remain available in `performance_schema.data_lock_waits`.
+Re-enabling detection preserves existing wait dependencies and checks them on
+the next lock-acquisition retry; setting the variable itself does not choose or
+roll back a victim. MDL deadlock detection is independent and remains enabled.
+`NOWAIT`, `SKIP LOCKED`, and lock-wait timeout settings retain their behavior.
+
 Data-lock waits of ordinary SQL sessions are governed by `innodb_lock_wait_timeout`, default 50 seconds; the direct storage API falls back to `MYDB_LOCK_WAIT_MS`, default 30000 ms, when no session override is installed. MDL uses `lock_wait_timeout`, default 31536000 seconds. Cancellation/KILL is checked between short wait slices, so it never has to wait for the full timeout.
 
 A 1213 deadlock rolls back and ends the current transaction. A 1205 lock timeout or 1317 query interruption rolls back the current statement in an explicit transaction; earlier successful statements remain pending. An autocommit statement failure ends its implicit transaction. A 3572 NOWAIT failure only rolls back the current statement and is not one of the transaction-terminating errors above.

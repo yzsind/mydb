@@ -1158,6 +1158,21 @@ pub(crate) fn inaccessible_table_error(table: &str) -> QueryError {
     )
 }
 
+/// All these compatibility tables project the same immutable authorization catalog.
+pub(crate) const AUTH_TABLES: &[&str] = &[
+    "user",
+    "db",
+    "tables_priv",
+    "columns_priv",
+    "procs_priv",
+    "proxies_priv",
+    "global_grants",
+    "role_edges",
+    "default_roles",
+    "password_history",
+    "component",
+];
+
 pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryError> {
     match table {
         "user" => Ok(mysql_user_rows(db)),
@@ -1185,7 +1200,7 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
         "innodb_index_stats" => innodb_index_stats_rows(db),
         "server_cost" => Ok(server_cost_rows()),
         "engine_cost" => Ok(engine_cost_rows()),
-        "gtid_executed" => Ok(gtid_executed_rows()),
+        "gtid_executed" => gtid_executed_rows(db),
         "time_zone" => Ok(time_zone_rows()),
         "time_zone_name" => Ok(time_zone_name_rows()),
         "time_zone_transition" => Ok(time_zone_transition_rows()),
@@ -1202,13 +1217,10 @@ pub(crate) fn rows(db: &Database, table: &str) -> Result<Vec<Vec<Value>>, QueryE
 /// `@@global.gtid_executed` string the binlog/replication layer maintains, so
 /// the table and the variable never disagree. Empty when GTID mode is off /
 /// nothing has been executed (honest empty).
-fn gtid_executed_rows() -> Vec<Vec<Value>> {
-    let set = crate::binlog::variables_snapshot()
-        .into_iter()
-        .find(|(name, _)| name.eq_ignore_ascii_case("gtid_executed"))
-        .map(|(_, value)| value)
-        .unwrap_or_default();
-    parse_gtid_set_intervals(&set)
+fn gtid_executed_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
+    Ok(parse_gtid_set_intervals(
+        &crate::binlog::gtid_snapshot(db)?.0,
+    ))
 }
 
 /// Parse a GTID set (`uuid:1-5:9,uuid2:1-3`) into `mysql.gtid_executed` rows
