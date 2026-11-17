@@ -61,22 +61,17 @@ See [hardware and OS requirements](hardware-and-os-requirements.md),
 [version changes](changing-versions.md),
 and [storage formats](storage-format.md).
 
-## Validation of the release baseline
+## Release validation
 
-All four GitHub Actions runs below completed successfully for package source
-commit [`7be88e78`](https://github.com/yzsind/mydb/commit/7be88e782cfec30180672a2a4b6e728d1b276d93). The main CI's three test partitions passed 12,077 tests in total.
+The release is built from the `v1.0.0` tag with Rust 1.95.0, locked dependencies,
+default features, and the repository's release profile. Package validation on
+each platform checks extracted file hashes, binary versions and help, required
+TLS connections, typed SQL, transaction rollback, crash recovery, and secondary
+index reads. Linux binaries also pass the glibc 2.17 ABI check.
 
-| Validation | Result |
-| --- | --- |
-| [Main CI](https://github.com/yzsind/mydb/actions/runs/43974623981) | Passed: test partitions, formatting, documentation contracts, Clippy, feature builds, and recovery checks |
-| [MyDB CLI](https://github.com/yzsind/mydb/actions/runs/43974623984) | Passed: all four jobs |
-| [Push Safety](https://github.com/yzsind/mydb/actions/runs/43974623975) | Passed; receiver job is excluded by the push condition |
-| [Full Safety](https://github.com/yzsind/mydb/actions/runs/43975534104) | Passed: ASan fuzz targets, deterministic fuzz regressions, RC/crash/replication histories, and MySQL ROW/FULL receiver |
+The published GitHub Release records the source commit and validation runs.
 
-The full receiver run used MySQL 8.0.46 and passed both `CRC32` and `NONE`
-binlog-checksum modes.
-
-## Release-candidate packages
+## Release packages
 
 Assets contain these three archives and `SHA256SUMS`.
 

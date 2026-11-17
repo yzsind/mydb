@@ -79,24 +79,30 @@ class GateTests(unittest.TestCase):
             self.assertEqual(json.loads((self.root / str(regression) / 'results.json').read_text())['gate_passed'],
                              not regression)
 
-    def test_snapshot_auto_position_is_rejected_before_source_mutation(self):
+    def test_snapshot_auto_position_uses_imported_gtid_history(self):
         import setup_mysql_to_mydb_replica as setup
-        with patch.object(sys, 'argv', ['setup', '--snapshot', '--auto-position']), \
-             patch.object(setup.pymysql, 'connect') as connect, contextlib.redirect_stderr(io.StringIO()):
-            with self.assertRaises(SystemExit) as error:
-                setup.main()
-            self.assertEqual(error.exception.code, 2)
-            connect.assert_not_called()
+        args = SimpleNamespace(source_host='127.0.0.1', source_port=3306, replica_server_id=123,
+                               auto_position=True, databases=None)
+        with patch.object(setup, 'connect_mydb'), patch.object(setup, 'query') as query, \
+             contextlib.redirect_stdout(io.StringIO()):
+            setup.configure_replication(args, 'repl', 'secret', 'bin.000012', 345, 'ON')
+            sql = query.call_args.args[1]
+            self.assertIn('SOURCE_AUTO_POSITION=1', sql)
+            self.assertNotIn('SOURCE_LOG_FILE', sql)
+            self.assertNotIn('SOURCE_LOG_POS', sql)
 
     def test_snapshot_streams_hex_blob_dump_and_accepts_both_coordinate_spellings(self):
         import setup_mysql_to_mydb_replica as setup
         args = SimpleNamespace(work_dir=self.root, databases='db', source_host='127.0.0.1',
                                source_port=3306, mysqldump=Path('compatible-mysqldump'))
-        for prefix, command in [('SOURCE', 'CHANGE REPLICATION SOURCE TO'), ('MASTER', 'CHANGE MASTER TO')]:
+        for prefix, command, auto_position in [('SOURCE', 'CHANGE REPLICATION SOURCE TO', False),
+                                               ('MASTER', 'CHANGE MASTER TO', True)]:
+            args.auto_position = auto_position
             dump = f"-- {command} {prefix}_LOG_FILE='bin.000012', {prefix}_LOG_POS=345;\nINSERT INTO t VALUES(0xFF);\n"
             def execute(argv, **kwargs):
                 self.assertIn('--hex-blob', argv)
                 self.assertIn('--skip-add-locks', argv)
+                self.assertIn('--set-gtid-purged=' + ('ON' if auto_position else 'OFF'), argv)
                 self.assertFalse(any('--password' in value for value in argv))
                 self.assertEqual(kwargs['env']['MYSQL_PWD'], 'secret')
                 kwargs['stdout'].write(dump.encode())
