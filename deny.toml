@@ -2,8 +2,11 @@
 all-features = true
 
 [advisories]
-# Keep unresolved advisories visible and blocking; record dispositions in docs.
-ignore = []
+# Keep other advisories blocking; document each accepted exception.
+# Review the chrono migration by 2027-02-17; see docs-internal/ci-chrono-advisory-2026-11-17.md.
+ignore = [
+    { id = "RUSTSEC-2026-0543", reason = "Maintenance-only notice with no patched release; temporarily retain chrono in temporal code and rmcp/schemars pending migration." },
+]
 
 [licenses]
 confidence-threshold = 0.8

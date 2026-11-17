@@ -1543,7 +1543,12 @@ pub(super) fn parse_statement_via_sqlparser_legacy(sql: &str) -> Result<Statemen
         return parse_statement_via_sqlparser_normalized(sql);
     }
     let (normalized, source_map) = normalize_explain(sql)?;
-    parse_statement_via_sqlparser_normalized(&normalized).map_err(|err| source_map.error(sql, err))
+    parse_statement_via_sqlparser_normalized(&normalized).or_else(|err| {
+        match parse_describe_columns(sql)? {
+            Some(statement) => Ok(statement),
+            None => Err(source_map.error(sql, err)),
+        }
+    })
 }
 
 fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, ParseError> {

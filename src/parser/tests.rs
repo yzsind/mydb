@@ -2181,6 +2181,90 @@ fn parses_lateral_derived_join() {
 }
 
 #[test]
+fn parses_describe_column_filter() {
+    for (sql, table, pattern) in [
+        ("DESC users id", "users", "id"),
+        (
+            "DESCRIBE test.users `display name`",
+            "test.users",
+            "display name",
+        ),
+        ("EXPLAIN users 'name%'", "users", "name%"),
+        ("DESC `users` \"name_%\"", "users", "name_%"),
+        (
+            "DESC /* table */ `test`.`users` /* column */ 'name%';",
+            "test.users",
+            "name%",
+        ),
+        ("DESC users `a``b`", "users", "a`b"),
+        ("DESC users /*!80000 'id' */", "users", "id"),
+    ] {
+        assert_single_entry_parity(sql);
+        let stmt = parse_statement(sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
+        let Statement::ShowColumns {
+            table: actual,
+            full,
+            filter,
+        } = stmt
+        else {
+            panic!("{sql}: expected column metadata, got {stmt:?}");
+        };
+        assert_eq!(actual, table, "{sql}");
+        assert!(!full, "{sql}");
+        assert!(
+            matches!(filter, Some(ShowFilter::Like(value)) if value == pattern),
+            "{sql}"
+        );
+    }
+    for sql in [
+        "DESC users id extra",
+        "DESC users 'id' extra",
+        "DESC users 'na' 'me%'",
+        "DESC users id, name",
+        "DESC users 'id' WHERE Field = 'id'",
+        "DESC users ?",
+        "DESC SELECT FROM",
+        "EXPLAIN WITH cte",
+    ] {
+        assert!(parse_statement(sql).is_err(), "{sql}");
+    }
+    for alias in ["DESC", "DESCRIBE", "EXPLAIN"] {
+        assert!(matches!(
+            parse_statement(&format!("{alias} users")).unwrap(),
+            Statement::Describe { .. }
+        ));
+        assert!(matches!(
+            parse_statement(&format!("{alias} SELECT id FROM users")).unwrap(),
+            Statement::Explain { .. }
+        ));
+    }
+}
+
+#[test]
+fn describe_column_filter_respects_sql_mode() {
+    for (mode, sql, expected) in [
+        (0, r"DESC users 'a\\b'", r"a\b"),
+        (
+            crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES,
+            r"DESC users 'a\\b'",
+            r"a\\b",
+        ),
+        (
+            crate::engine::api::SQL_MODE_ANSI_QUOTES,
+            r#"DESC "test"."users" "field""#,
+            "field",
+        ),
+    ] {
+        let _guard = ParserSqlModeGuard::activate(mode);
+        let stmt = parse_statement(sql).unwrap_or_else(|err| panic!("{sql}: {err}"));
+        assert!(
+            matches!(stmt, Statement::ShowColumns { filter: Some(ShowFilter::Like(value)), .. } if value == expected),
+            "{sql}"
+        );
+    }
+}
+
+#[test]
 fn parses_explain_select() {
     let stmt = parse_statement("EXPLAIN SELECT * FROM users WHERE id = 1").unwrap();
 

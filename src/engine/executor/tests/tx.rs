@@ -1706,6 +1706,69 @@ fn committed_rolled_back_and_incomplete_transactions_recover_atomically() {
 }
 
 #[test]
+fn transaction_isolation_spaces_and_hyphens_preserve_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for (level, isolation) in [
+        ("READ COMMITTED", IsolationLevel::ReadCommitted),
+        ("READ-COMMITTED", IsolationLevel::ReadCommitted),
+        ("READ UNCOMMITTED", IsolationLevel::ReadUncommitted),
+        ("READ-UNCOMMITTED", IsolationLevel::ReadUncommitted),
+        ("REPEATABLE READ", IsolationLevel::RepeatableRead),
+        ("REPEATABLE-READ", IsolationLevel::RepeatableRead),
+    ] {
+        engine
+            .execute_with_session(
+                &mut session,
+                "SET SESSION TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+            )
+            .unwrap();
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("SET TRANSACTION ISOLATION LEVEL {level}, READ ONLY"),
+            )
+            .unwrap();
+        assert_eq!(session.isolation, IsolationLevel::Serializable);
+        assert_eq!(session.next_txn_isolation, Some(isolation));
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        assert_eq!(session.active_txn_isolation, Some(isolation));
+        assert!(session.read_only_txn);
+        assert_eq!(session.next_txn_isolation, None);
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        assert_eq!(
+            session.active_txn_isolation,
+            Some(IsolationLevel::Serializable)
+        );
+        assert!(!session.read_only_txn);
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("SET SESSION TRANSACTION ISOLATION LEVEL {level}"),
+            )
+            .unwrap();
+        assert_eq!(session.isolation, isolation);
+        let QueryResponse::ResultSet(result) = engine
+            .execute_with_session(&mut session, "SELECT @@session.transaction_isolation")
+            .unwrap()
+        else {
+            panic!("expected result set");
+        };
+        assert_eq!(
+            result.rows,
+            vec![vec![Value::String(level.replace(' ', "-"))]]
+        );
+        engine.execute_with_session(&mut session, "BEGIN").unwrap();
+        assert_eq!(session.active_txn_isolation, Some(isolation));
+        engine.execute_with_session(&mut session, "COMMIT").unwrap();
+    }
+}
+
+#[test]
 fn mysql80_isolation_levels_and_next_transaction_scope_are_supported() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

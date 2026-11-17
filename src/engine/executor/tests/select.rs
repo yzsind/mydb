@@ -1,5 +1,88 @@
 use super::*;
 
+#[test]
+fn describe_column_filter_matches_show_columns() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for sql in [
+        "CREATE TABLE desc_columns (id INT PRIMARY KEY, name VARCHAR(30), name_extra JSON, `a%b` INT, `a_b` INT, `display name` TEXT, `列名` INT)",
+        "CREATE VIEW desc_view AS SELECT id, name FROM desc_columns",
+        "CREATE TABLE desc_shadow (persistent_col INT)",
+        "CREATE TEMPORARY TABLE desc_shadow (temporary_col INT)",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    for (table, filter, pattern, expected) in [
+        ("desc_columns", "id", "id", vec!["id"]),
+        ("test.desc_columns", "ID", "ID", vec!["id"]),
+        (
+            "`test`.`desc_columns`",
+            "'name%'",
+            "name%",
+            vec!["name", "name_extra"],
+        ),
+        ("desc_columns", r"'a\\%b'", r"a\%b", vec!["a%b"]),
+        ("desc_columns", r"'a\\_b'", r"a\_b", vec!["a_b"]),
+        (
+            "desc_columns",
+            "`display name`",
+            "display name",
+            vec!["display name"],
+        ),
+        ("desc_columns", "`列名`", "列名", vec!["列名"]),
+        ("desc_columns", "missing", "missing", vec![]),
+        ("desc_columns", "''", "", vec![]),
+        ("desc_view", "name", "name", vec!["name"]),
+        ("desc_shadow", "'%col'", "%col", vec!["temporary_col"]),
+        (
+            "information_schema.tables",
+            "TABLE_NAME",
+            "TABLE_NAME",
+            vec!["TABLE_NAME"],
+        ),
+    ] {
+        let show = format!(
+            "SHOW COLUMNS FROM {table} LIKE '{}'",
+            pattern.replace('\\', "\\\\")
+        );
+        let QueryResponse::ResultSet(show) =
+            engine.execute_with_session(&mut session, &show).unwrap()
+        else {
+            panic!("expected SHOW COLUMNS result");
+        };
+        assert_eq!(
+            show.rows
+                .iter()
+                .map(|row| row[0].to_display_string())
+                .collect::<Vec<_>>(),
+            expected
+        );
+        for alias in ["DESC", "DESCRIBE", "EXPLAIN"] {
+            let sql = format!("{alias} {table} {filter}");
+            let columns = engine
+                .describe_prepared_statement(&mut session, &sql)
+                .unwrap();
+            let QueryResponse::ResultSet(result) =
+                engine.execute_with_session(&mut session, &sql).unwrap()
+            else {
+                panic!("{sql}: expected metadata result");
+            };
+            assert_eq!(result.columns.len(), 6, "{sql}");
+            assert_eq!(columns, result.columns, "{sql}");
+            assert_eq!(result.columns, show.columns, "{sql}");
+            assert_eq!(result.rows, show.rows, "{sql}");
+        }
+    }
+    assert_eq!(
+        engine
+            .execute("DESC missing_desc_table id")
+            .unwrap_err()
+            .code(),
+        1146
+    );
+}
+
 fn collect_select_response_rows(response: QueryResponse) -> Vec<Vec<Value>> {
     match response {
         QueryResponse::ResultSet(result) => result.rows,

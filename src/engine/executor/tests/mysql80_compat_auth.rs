@@ -4841,6 +4841,8 @@ fn phase2_column_metadata_and_system_catalogs_respect_grants() {
         "SHOW COLUMNS FROM p2_columns",
         "SHOW FULL COLUMNS FROM p2_columns",
         "DESCRIBE p2_columns",
+        "DESC p2_columns id",
+        "DESCRIBE p2_columns 'i%'",
     ] {
         let QueryResponse::ResultSet(rs) = engine.execute_with_session(&mut alice, sql).unwrap()
         else {
@@ -4848,6 +4850,17 @@ fn phase2_column_metadata_and_system_catalogs_respect_grants() {
         };
         assert_eq!(rs.rows.len(), 1);
         assert_eq!(rs.rows[0][0], Value::String("id".into()));
+    }
+    for sql in [
+        "DESC p2_columns secret",
+        "DESCRIBE p2_columns 's%'",
+        "DESC p2_columns missing",
+    ] {
+        let QueryResponse::ResultSet(rs) = engine.execute_with_session(&mut alice, sql).unwrap()
+        else {
+            panic!("{sql}: expected column metadata");
+        };
+        assert!(rs.rows.is_empty(), "{sql}");
     }
     assert!(engine
         .execute_with_session(&mut alice, "SHOW CREATE TABLE p2_columns")

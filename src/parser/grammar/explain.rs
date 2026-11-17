@@ -2,12 +2,61 @@
 use std::borrow::Cow;
 
 use super::super::{
-    current_parser_sql_mode_bits, parse_lex_error, parse_statement,
-    try_parse_plain_query_or_delete, ExplainFormat, ParseError, SourceMap, Statement, TextEdit,
-    MYSQL_VERSION_ID,
+    adapter, current_parser_sql_mode_bits, parse_lex_error, parse_statement,
+    try_parse_plain_query_or_delete, ExplainFormat, MydbDialect, ParseError, ShowFilter, SourceMap,
+    SqlStatement, Statement, TextEdit, MYSQL_VERSION_ID,
 };
 use super::cursor::Cursor;
 use crate::sql_lex::{segments, SqlLexMode, SqlSegmentKind, SqlTokenKind};
+
+/// sqlparser accepts the table-only form but not its optional column filter.
+/// Called only after the complete canonical statement fails to parse; validate
+/// its table prefix before lowering the filter to SHOW COLUMNS.
+pub(in crate::parser) fn parse_describe_columns(
+    sql: &str,
+) -> Result<Option<Statement>, ParseError> {
+    let mut cursor = Cursor::new(sql);
+    if !cursor.keyword(b"DESC")? && !cursor.keyword(b"DESCRIBE")? && !cursor.keyword(b"EXPLAIN")? {
+        return Ok(None);
+    }
+    if cursor.peek()?.is_some_and(|token| {
+        token.kind == SqlTokenKind::Word
+            && [
+                "SELECT", "WITH", "TABLE", "INSERT", "REPLACE", "UPDATE", "DELETE", "FOR",
+            ]
+            .iter()
+            .any(|word| cursor.text(&token).eq_ignore_ascii_case(word))
+    }) {
+        return Ok(None);
+    }
+    let Ok(table) = cursor.qualified_name() else {
+        return Ok(None);
+    };
+    let table_end = cursor.position();
+    let Some(token) = cursor.peek()? else {
+        return Ok(None);
+    };
+    let pattern = match token.kind {
+        SqlTokenKind::Word => cursor.text(&token).to_owned(),
+        SqlTokenKind::QuotedIdentifier | SqlTokenKind::String => cursor.quoted_text(&token)?,
+        _ => return Ok(None),
+    };
+    let Ok(statements) = adapter::parse_sql(&MydbDialect::default(), &sql[..table_end]) else {
+        return Ok(None);
+    };
+    if !matches!(statements.as_slice(), [SqlStatement::ExplainTable { .. }]) {
+        return Ok(None);
+    }
+    cursor.next()?;
+    if cursor.finish().is_err() {
+        return Ok(None);
+    }
+    Ok(Some(Statement::ShowColumns {
+        table: table.to_string(),
+        full: false,
+        filter: Some(ShowFilter::Like(pattern)),
+    }))
+}
 
 /// Locate the body once for both header comment masking and TABLE lowering.
 fn normalize(sql: &str, lower_table: bool) -> Result<(Cow<'_, str>, SourceMap), ParseError> {

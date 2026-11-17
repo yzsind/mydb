@@ -444,6 +444,13 @@ for mydb-specific behavior, see [Window Functions](function/aggregate-window/REA
 
 ### Isolation Levels and Transactions
 
+`SET [GLOBAL | SESSION | LOCAL] TRANSACTION ISOLATION LEVEL` accepts both
+space-separated and hyphenated level names: `READ UNCOMMITTED` / `READ-UNCOMMITTED`,
+`READ COMMITTED` / `READ-COMMITTED`, and `REPEATABLE READ` / `REPEATABLE-READ`.
+Names are case-insensitive; `SERIALIZABLE` is also supported. Hyphenated names in
+this statement are a mydb extension. `transaction_isolation` assignments also
+accept both formats, while variable reads return the canonical hyphenated name.
+
 | Level | Status |
 |---|---|
 | READ COMMITTED (default) | ◑: statement-level consistent reads; native heap/MVCC and row locks, with no promise of InnoDB's lock layout |

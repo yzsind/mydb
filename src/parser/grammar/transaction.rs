@@ -111,6 +111,7 @@ fn characteristic(cursor: &mut Cursor<'_>) -> Result<TransactionCharacteristic, 
     cursor.expect_keyword(b"ISOLATION")?;
     cursor.expect_keyword(b"LEVEL")?;
     let isolation = if cursor.keyword(b"READ")? {
+        cursor.symbol(b'-')?;
         if cursor.keyword(b"UNCOMMITTED")? {
             TransactionIsolation::ReadUncommitted
         } else {
@@ -118,6 +119,7 @@ fn characteristic(cursor: &mut Cursor<'_>) -> Result<TransactionCharacteristic, 
             TransactionIsolation::ReadCommitted
         }
     } else if cursor.keyword(b"REPEATABLE")? {
+        cursor.symbol(b'-')?;
         cursor.expect_keyword(b"READ")?;
         TransactionIsolation::RepeatableRead
     } else {

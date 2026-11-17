@@ -1261,6 +1261,73 @@ fn quality_explain_normalization_preserves_body_and_positions() {
 }
 
 #[test]
+fn quality_transaction_isolation_accepts_spaces_and_hyphens() {
+    for (prefix, scope) in [
+        ("SET TRANSACTION", None),
+        ("SET SESSION TRANSACTION", Some(SetScope::Session)),
+        ("SET LOCAL TRANSACTION", Some(SetScope::Session)),
+        ("SET GLOBAL TRANSACTION", Some(SetScope::Global)),
+    ] {
+        for (level, isolation) in [
+            ("READ UNCOMMITTED", TransactionIsolation::ReadUncommitted),
+            ("READ-UNCOMMITTED", TransactionIsolation::ReadUncommitted),
+            ("READ COMMITTED", TransactionIsolation::ReadCommitted),
+            ("read-committed", TransactionIsolation::ReadCommitted),
+            ("REPEATABLE READ", TransactionIsolation::RepeatableRead),
+            ("repeatable-read", TransactionIsolation::RepeatableRead),
+            ("SERIALIZABLE", TransactionIsolation::Serializable),
+            (
+                "READ /* c */ - /* c */ COMMITTED",
+                TransactionIsolation::ReadCommitted,
+            ),
+        ] {
+            let sql = format!("{prefix} ISOLATION LEVEL {level};");
+            assert_eq!(
+                parse_statement(&sql).unwrap(),
+                Statement::SetTransactionIsolation { scope, isolation },
+                "{sql}"
+            );
+            for characteristics in [
+                format!("ISOLATION LEVEL {level}, READ ONLY"),
+                format!("READ ONLY, ISOLATION LEVEL {level}"),
+            ] {
+                let sql = format!("{prefix} {characteristics}");
+                let mut expected = vec![
+                    TransactionCharacteristic::Isolation(isolation),
+                    TransactionCharacteristic::ReadOnly(true),
+                ];
+                if characteristics.starts_with("READ ONLY") {
+                    expected.reverse();
+                }
+                assert_eq!(
+                    parse_statement(&sql).unwrap(),
+                    Statement::SetTransactionCharacteristics {
+                        scope,
+                        characteristics: expected,
+                    },
+                    "{sql}"
+                );
+            }
+        }
+    }
+    for level in [
+        "READ-",
+        "READ--COMMITTED",
+        "READ-COMMITTED-extra",
+        "REPEATABLE-",
+        "REPEATABLE--READ",
+        "REPEATABLE-UNCOMMITTED",
+        "SERIALIZABLE-READ",
+        "'READ-COMMITTED'",
+        "READ-COMMITTED, ISOLATION LEVEL REPEATABLE-READ",
+    ] {
+        let sql = format!("SET TRANSACTION ISOLATION LEVEL {level}");
+        assert!(parse_statement(&sql).is_err(), "{sql}");
+    }
+    assert!(parse_statement("SET TRANSACTION READ-ONLY").is_err());
+}
+
+#[test]
 fn quality_transaction_tokens_preserve_comments_names_and_boundaries() {
     for sql in [
         "START TRANSACTION READ /* c */ ONLY",

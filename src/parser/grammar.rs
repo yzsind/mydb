@@ -7,7 +7,9 @@ mod transaction;
 mod view;
 
 pub(crate) use explain::strip_comments_in_explain_header;
-pub(super) use explain::{normalize_explain, parse_explain_connection, parse_explain_extension};
+pub(super) use explain::{
+    normalize_explain, parse_describe_columns, parse_explain_connection, parse_explain_extension,
+};
 pub(super) use roles::parse_role_statement;
 pub(super) use transaction::{parse_set_session_statement, parse_transaction_statement};
 
