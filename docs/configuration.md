@@ -307,6 +307,24 @@ explicitly; persistence operations always reject unknown variables.
 `require_secure_transport=ON` rejects new plaintext TCP connections during the
 handshake (3159); TLS connections remain usable.
 
+`innodb_deadlock_detect` (alias `mydb_deadlock_detect`) is a dynamic GLOBAL
+boolean with default `ON`. `SET GLOBAL` takes effect for existing sessions and
+transactions as well as new ones; `SET SESSION` and bare `SET` are rejected.
+Writes require the usual global system-variable administration privilege.
+`SET GLOBAL ... = DEFAULT` restores `ON`. Both names accept `ON`/`OFF`,
+`TRUE`/`FALSE`, or `1`/`0` and share one persisted setting through `SET PERSIST`
+and `SET PERSIST_ONLY`. `SHOW VARIABLES` and persisted-variable views use the
+canonical name `innodb_deadlock_detect`.
+
+For example, disable transaction deadlock detection at runtime and across
+restarts with `SET PERSIST mydb_deadlock_detect = OFF`. The option file also
+accepts `innodb_deadlock_detect=OFF` or `mydb_deadlock_detect=OFF` in `[mysqld]`
+or `[mydb]`. Disabling detection leaves lock enforcement, wait diagnostics,
+timeouts, and MDL detection active. Existing wait cycles are checked on the
+next lock-acquisition retry after detection is re-enabled. See
+[MVCC and locking](mvcc-and-locking.md#locking-reads-wait-strategies-and-deadlocks)
+for timeout and transaction rollback semantics.
+
 SHA-2 authentication accepts plaintext passwords only over TLS. Without TLS,
 `sha256_password` and the full-authentication path of `caching_sha2_password`
 require RSA-encrypted credentials; the same contract applies to COM_CHANGE_USER.

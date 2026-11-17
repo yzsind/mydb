@@ -149,3 +149,160 @@ mod tests {
         assert_eq!(intervals, [(max - 1, max)]);
     }
 }
+
+/// Imported history is WAL-backed even when the binlog source is disabled.
+#[derive(Debug, Default)]
+pub(crate) struct ImportedGtidState {
+    pub(crate) mutation: parking_lot::Mutex<()>,
+    value: parking_lot::RwLock<Option<(String, GtidSet)>>,
+}
+
+pub(crate) fn union(left: &str, right: &str) -> String {
+    format_gtid_interval_map(&parse_gtid_interval_map(&format!("{left},{right}")))
+}
+
+pub(crate) fn intersects(left: &str, right: &str) -> bool {
+    let right = parse_gtid_interval_map(right);
+    parse_gtid_interval_map(left)
+        .iter()
+        .any(|(sid, intervals)| {
+            right.get(sid).is_some_and(|other| {
+                intervals
+                    .iter()
+                    .any(|(lo, hi)| other.iter().any(|(a, b)| lo <= b && a <= hi))
+            })
+        })
+}
+
+pub(crate) fn subtract(left: &str, right: &str) -> String {
+    let right = parse_gtid_interval_map(right);
+    let mut result = parse_gtid_interval_map(left);
+    for (sid, intervals) in &mut result {
+        if let Some(remove) = right.get(sid) {
+            for &(a, b) in remove {
+                *intervals = intervals
+                    .iter()
+                    .flat_map(|&(lo, hi)| {
+                        let mut keep = Vec::with_capacity(2);
+                        if b < lo || a > hi {
+                            keep.push((lo, hi));
+                        } else {
+                            if lo < a {
+                                keep.push((lo, a - 1));
+                            }
+                            if hi > b {
+                                keep.push((b + 1, hi));
+                            }
+                        }
+                        keep
+                    })
+                    .collect();
+            }
+        }
+    }
+    format_gtid_interval_map(&result)
+}
+
+/// Validate the external GTID-set boundary; internal interval readers are lenient.
+pub(crate) fn validate_set(text: &str) -> Result<String, crate::types::QueryError> {
+    let malformed = || {
+        crate::storage::error(
+            crate::error::catalog::ER_MALFORMED_GTID_SET_SPECIFICATION,
+            format!("Malformed GTID set specification '{text}'"),
+        )
+    };
+    let mut set = BTreeMap::<String, Vec<(u64, u64)>>::new();
+    for group in text.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let mut parts = group.split(':');
+        let sid = parts.next().unwrap_or("").trim();
+        if sid.len() != 36
+            || !sid.bytes().enumerate().all(|(i, b)| {
+                if matches!(i, 8 | 13 | 18 | 23) {
+                    b == b'-'
+                } else {
+                    b.is_ascii_hexdigit()
+                }
+            })
+        {
+            return Err(malformed());
+        }
+        for interval in parts {
+            let (lo, hi) = interval.split_once('-').unwrap_or((interval, interval));
+            let parse = |n: &str| -> Result<u64, crate::types::QueryError> {
+                let n = n.trim();
+                let digits = n.strip_prefix('+').unwrap_or(n);
+                if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(malformed());
+                }
+                digits
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0 && *n <= i64::MAX as u64)
+                    .ok_or_else(malformed)
+            };
+            let (lo, hi) = (parse(lo)?, parse(hi)?);
+            // MySQL accepts a bare SID, empty comma groups and reversed
+            // intervals; these contribute no transactions to the set.
+            if lo <= hi {
+                set.entry(sid.to_ascii_lowercase())
+                    .or_default()
+                    .push((lo, hi));
+            }
+        }
+    }
+    for intervals in set.values_mut() {
+        merge_intervals(intervals);
+    }
+    Ok(format_gtid_interval_map(&set))
+}
+
+impl crate::storage::Database {
+    pub(crate) fn imported_gtid_set(&self) -> Result<String, crate::types::QueryError> {
+        if let Some(value) = self.imported_gtids.value.read().as_ref() {
+            return Ok(value.0.clone());
+        }
+        let mut cached = self.imported_gtids.value.write();
+        if cached.is_none() {
+            let value = validate_set(
+                &self
+                    .replication_property("mysql-imported-gtids")?
+                    .unwrap_or_default(),
+            )?;
+            *cached = Some((value.clone(), GtidSet::parse(&value)));
+        }
+        Ok(cached.as_ref().unwrap().0.clone())
+    }
+
+    pub(crate) fn imported_gtid_contains(
+        &self,
+        gtid: &str,
+    ) -> Result<bool, crate::types::QueryError> {
+        let cached = self.imported_gtids.value.read();
+        if let Some((_, set)) = cached.as_ref() {
+            return Ok(set.contains(gtid));
+        }
+        drop(cached);
+        self.imported_gtid_set()?;
+        Ok(self
+            .imported_gtids
+            .value
+            .read()
+            .as_ref()
+            .unwrap()
+            .1
+            .contains(gtid))
+    }
+
+    pub(crate) fn invalidate_imported_gtids(&self) {
+        *self.imported_gtids.value.write() = None;
+    }
+
+    pub(crate) fn persist_imported_gtids(
+        &self,
+        value: &str,
+    ) -> Result<(), crate::types::QueryError> {
+        self.set_replication_property("mysql-imported-gtids", Some(value))?;
+        *self.imported_gtids.value.write() = Some((value.to_owned(), GtidSet::parse(value)));
+        Ok(())
+    }
+}

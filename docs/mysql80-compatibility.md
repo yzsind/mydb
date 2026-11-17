@@ -451,6 +451,13 @@ for mydb-specific behavior, see [Window Functions](function/aggregate-window/REA
 | REPEATABLE READ | ◑: consistent reads use a fixed snapshot, without InnoDB gap/next-key locks |
 | SERIALIZABLE | ◑: uses table-level shared locks to restrict concurrent writes; granularity differs from InnoDB range locks |
 
+- `innodb_deadlock_detect` is a dynamic GLOBAL boolean (default `ON`), with
+  `mydb_deadlock_detect` as an alias. Both names control transaction row,
+  table, and unique-key deadlock detection and support persistence. Turning
+  detection off leaves lock waits subject to timeout/cancellation; MDL
+  deadlock detection remains independent. See
+  [MVCC and locking](mvcc-and-locking.md#locking-reads-wait-strategies-and-deadlocks).
+
 > **Important design decision**: mydb's RR consistent reads use snapshot
 > isolation. Omitting InnoDB-style gap/next-key locks is intentional: range locks
 > can block concurrent inserts, increase contention, and introduce deadlock
@@ -1013,10 +1020,18 @@ Ordinary DDL uses standalone GTID/QUERY events; atomic CTAS, including an empty
 result, uses BEGIN/CREATE … START TRANSACTION/rows/XID and the appropriate GTID
 statement flag. Statement-based data changes in QUERY_EVENT are rejected even
 when a source session overrides the previously checked global ROW setting.
-Consistent snapshots pin file position and GTID set together. When restoring logical dumps from a binlog-enabled source, use
-`mysqldump --set-gtid-purged=OFF`: importing `gtid_purged` is currently rejected
-as read-only (1238). Default `mysqldump` table locking supports views and locks
-their underlying tables.
+Consistent snapshots pin file position and GTID set together. `SET GLOBAL gtid_purged`
+supports MySQL 8.0 replacement and `+` append semantics, including the version-comment
+syntax emitted by mysqldump. Imported history is WAL-durable with binary logging
+on or off, is included in `gtid_executed` and replica auto-position, and prevents
+reapplying imported transactions. Invalid sets and overlapping additions fail
+without publishing the import. Stop replica SQL threads before changing GTID
+history if transactions are applying; prepared XA transactions must be resolved first.
+Default `mysqldump` table locking supports views and their underlying tables as
+well as exposed virtual `mysql` tables. Privilege-table read locks block authorization
+catalog mutations until unlock. Full-database export does not imply support for
+restoring raw system privilege-table DDL/DML: use account/role DDL and GRANT/REVOKE
+for those catalogs; unsupported direct catalog writes remain explicit errors.
 
 - **Multiple statements per packet**: a single `COM_QUERY` under `CLIENT_MULTI_STATEMENTS` can mix session state, DDL, and DML; autocommit DML each forms its own GTID/XID, explicit transactions are aggregated and published once, and DDL writes an independent QUERY_EVENT at implicit-commit boundaries; the first error stops processing and subsequent statements are not logged.
 - **Semisynchronous source side**: `rpl_semi_sync_source_*` (+ the legacy `master_*` aliases) are real sysvars, `Rpl_semi_sync_source_*` SHOW STATUS is real, and the synchronous-ack release-commit loop works end to end. **OFF by default**.

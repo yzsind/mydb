@@ -1131,6 +1131,51 @@ async fn async_row_lock_deadlock_fallback_preserves_detection() {
     db.rollback_txn(first).unwrap();
 }
 
+#[tokio::test(flavor = "current_thread")]
+async fn async_row_lock_deadlock_detect_toggle_preserves_wait_edges() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_async_row_lock_test_engine(dir.path());
+    let db = engine.db_for_tests();
+    let first = db.begin_txn().unwrap().txn_id;
+    let second = db.begin_txn().unwrap().txn_id;
+    let row1 = crate::storage::RowId::new(3, 1);
+    let row2 = crate::storage::RowId::new(3, 2);
+    let mode = crate::storage::LockMode::Exclusive;
+    db.acquire_row_lock_blocking(first, 7, row1, mode).unwrap();
+    db.acquire_row_lock_blocking(second, 7, row2, mode).unwrap();
+    db.set_deadlock_detection_enabled(false);
+    let target = crate::storage::NonblockingRowWaitTarget {
+        txn_id: first,
+        table_id: 7,
+        row_id: row2,
+        mode,
+    };
+    let mut first_signal = db.subscribe_row_lock_async_signal(target).unwrap();
+    let second_signal = db
+        .subscribe_row_lock_async_signal(crate::storage::NonblockingRowWaitTarget {
+            txn_id: second,
+            row_id: row1,
+            ..target
+        })
+        .unwrap();
+    assert_eq!(db.storage_status().active_lock_waits, 2);
+    assert_eq!(db.storage_status().deadlocks, 0);
+    db.set_deadlock_detection_enabled(true);
+    let error = db
+        .acquire_row_lock_blocking(second, 7, row1, mode)
+        .unwrap_err();
+    assert_eq!(error.code(), 1213);
+    db.rollback_txn(second).unwrap();
+    tokio::time::timeout(Duration::from_secs(1), first_signal.changed())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(db.async_row_lock_ready(target));
+    drop(second_signal);
+    db.rollback_txn(first).unwrap();
+    assert_eq!(db.storage_status().active_lock_waits, 0);
+}
+
 #[test]
 fn statement_lock_wait_rollback_releases_new_row_locks() {
     let dir = tempfile::tempdir().unwrap();

@@ -155,6 +155,22 @@ pub(crate) fn register(reg: &mut Registry) {
         },
     ));
 
+    reg.register(SysVar::settable(
+        SysVarDef::new("innodb_deadlock_detect", Scope::Global, DataType::Bool)
+            .with_aliases(&["mydb_deadlock_detect"])
+            .with_access(Access::SuperReadWrite)
+            .with_doc("Detect transaction row, table, and unique-key lock deadlocks."),
+        |ctx| SysVarValue::Bool(ctx.db.is_none_or(|db| db.deadlock_detection_enabled())),
+        |ctx: &mut WriteCtx<'_>, value: SysVarValue| {
+            let db = ctx.db.ok_or_else(|| {
+                crate::error::catalog::ER_WRONG_VALUE_FOR_VAR
+                    .error("deadlock detection requires a database context")
+            })?;
+            db.set_deadlock_detection_enabled(value.as_bool().unwrap_or(true));
+            Ok(())
+        },
+    ));
+
     // innodb_lock_wait_timeout — Both. Per-session row-lock wait timeout in
     // seconds; drives the storage-layer wait loop (M3). GLOBAL writes set the
     // default new sessions inherit. MySQL range 1..=1073741824, default 50.

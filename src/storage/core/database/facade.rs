@@ -732,6 +732,7 @@ impl Database {
             auth_snapshot: arc_swap::ArcSwap::from_pointee(
                 crate::engine::auth::AuthCatalog::empty(),
             ),
+            imported_gtids: Default::default(),
             temp_tables: RwLock::new(Default::default()),
             txns: parking_lot::RwLock::new(txns),
             unique_reservations: lock_manager.unique_reservation_filter(),
@@ -1074,6 +1075,8 @@ impl Database {
             &mut recovery,
             clean_checkpoint_startup && !recovered_incomplete,
         )?;
+        // DD property lookups require the dictionary indexes repaired above.
+        db.imported_gtid_set()?;
         db.initialize_auto_increment_counters()?;
         db.initialize_sequence_runtimes()?;
         if physical_replica {

@@ -7427,6 +7427,16 @@ fn collect_lock_table_dependencies(
             "cyclic or excessively nested view in LOCK TABLES",
         ));
     }
+    if let Some(err) = crate::engine::information_schema::hidden_system_table_error(&qualified) {
+        return Err(err);
+    }
+    if schema.eq_ignore_ascii_case("mysql")
+        && crate::engine::information_schema::find_system_table_name(&qualified).is_some()
+    {
+        trail.remove(&qualified);
+        out.push(qualified);
+        return Ok(());
+    }
     if let Some(view) = db.view_definition(&schema, &table) {
         if view.invalid {
             return Err(error(
@@ -7868,6 +7878,32 @@ fn prepared_int_div_error_context<'q>(
     })
 }
 
+fn auth_catalog_statement(statement: &Statement) -> bool {
+    if let Statement::ApiKey(command) = statement {
+        return !command.is_read();
+    }
+    if let Statement::Ai(command) = statement {
+        return command.kind == "model" && command.action == "drop";
+    }
+    matches!(
+        statement,
+        Statement::CreateUser(_)
+            | Statement::AlterUser(_)
+            | Statement::AlterUsers(_)
+            | Statement::DropUser { .. }
+            | Statement::RenameUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::Grant(_)
+            | Statement::Revoke(_)
+            | Statement::SetPassword { .. }
+            | Statement::SetDefaultRole(_)
+            | Statement::InstallComponent { .. }
+            | Statement::UninstallComponent { .. }
+            | Statement::FlushPrivileges
+    )
+}
+
 pub(super) fn execute_qualified_statement(
     db: &Arc<Database>,
     session: &mut SessionContext,
@@ -7904,6 +7940,12 @@ pub(super) fn execute_qualified_statement(
                 "drop schema AI models explicitly before DROP DATABASE",
             ));
         }
+    }
+    if session.has_explicit_table_locks() && auth_catalog_statement(&statement) {
+        return Err(error(
+            crate::error::catalog::ER_LOCK_OR_ACTIVE_TRANSACTION,
+            "Cannot modify authorization catalogs while holding LOCK TABLES",
+        ));
     }
     crate::planner::rewrite_enum_set_dml(db, &mut statement);
     if matches!(
@@ -8158,12 +8200,7 @@ pub(super) fn execute_qualified_statement(
                     "sql/flush_tables_with_read_lock",
                 )?;
             }
-            crate::binlog::handle_admin_sql_scoped(
-                &sql,
-                session,
-                db.global_read_lock_scope(),
-                || db.reset_binlog_wal_cutoff(),
-            )
+            crate::binlog::handle_admin_sql_for_database(db, &sql, session)
         }
         Statement::CreateDatabase {
             name,

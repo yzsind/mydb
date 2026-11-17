@@ -3,6 +3,86 @@ use super::*;
 include!("storage_handle_memo_tests.rs");
 
 #[test]
+fn deadlock_detect_toggle_covers_row_table_unique_and_mixed_cycles() {
+    for kind in ["row", "table", "unique", "range", "mixed", "upgrade"] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = open_memory_test_db(dir.path());
+        let first = db.begin_txn().unwrap().txn_id;
+        let second = db.begin_txn().unwrap().txn_id;
+        let acquire_row = |txn, row, mode| {
+            if row_lock_sharding_enabled() {
+                db.row_lock_acquire_sharded(txn, 7, row, mode, true)
+            } else {
+                db.lock_manager()
+                    .acquire_row_lock_with_mode(txn, 7, row, mode, true)
+            }
+        };
+        let acquire = |txn, resource| {
+            let row = RowId::new(1, resource);
+            match kind {
+                "table" => {
+                    db.acquire_table_lock_sharded(txn, resource as u64, TableLockMode::Exclusive)
+                }
+                "unique" | "range" => db.lock_manager().acquire_unique_key_lock(
+                    txn,
+                    7,
+                    "uk",
+                    &IndexKey::from(vec![KeyPart::Int(resource as i64)]),
+                    true,
+                    &|_| Some(TxnStatus::Active),
+                ),
+                "mixed" if resource == 2 => db.lock_manager().acquire_unique_key_lock(
+                    txn,
+                    7,
+                    "uk",
+                    &IndexKey::from(vec![KeyPart::String("value".into())]),
+                    true,
+                    &|_| Some(TxnStatus::Active),
+                ),
+                "upgrade" => acquire_row(txn, row, LockMode::Exclusive),
+                _ => db.lock_row_nonblocking(txn, 7, row),
+            }
+        };
+        assert!(db.deadlock_detection_enabled());
+        if kind == "range" {
+            assert!(db
+                .lock_manager()
+                .try_lock_integer_range(first, 7, "uk", false, 1, 1)
+                .unwrap());
+            assert!(db
+                .lock_manager()
+                .try_lock_integer_range(second, 7, "uk", false, 2, 2)
+                .unwrap());
+        } else if kind == "upgrade" {
+            acquire_row(first, RowId::new(1, 1), LockMode::Shared).unwrap();
+            acquire_row(second, RowId::new(1, 1), LockMode::Shared).unwrap();
+        } else {
+            acquire(first, 1).unwrap();
+            acquire(second, 2).unwrap();
+        }
+        db.set_deadlock_detection_enabled(false);
+        let first_target = if kind == "upgrade" { 1 } else { 2 };
+        for (txn, target) in [(first, first_target), (second, 1)] {
+            assert!(
+                is_lock_wait_pending_error(&acquire(txn, target).unwrap_err()),
+                "{kind}"
+            );
+        }
+        assert_eq!(db.lock_manager_read().waits_for.len(), 2, "{kind}");
+        assert_eq!(db.lock_manager_read().deadlock_count, 0, "{kind}");
+        db.set_deadlock_detection_enabled(true);
+        let error = acquire(second, 1).unwrap_err();
+        assert_eq!(error.code(), 1213, "{kind}");
+        assert_eq!(error.sql_state(), "40001", "{kind}");
+        assert_eq!(db.lock_manager_read().deadlock_count, 1, "{kind}");
+        db.rollback_txn(second).unwrap();
+        acquire(first, first_target).unwrap();
+        db.rollback_txn(first).unwrap();
+        assert!(db.lock_manager_read().waits_for.is_empty(), "{kind}");
+    }
+}
+
+#[test]
 fn engine_monitor_retained_slots_preserve_old_and_prepared_transactions() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let db = open_memory_test_db(dir.path());

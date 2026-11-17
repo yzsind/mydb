@@ -1427,7 +1427,7 @@ fn persistent_table_parts_for_database(
         return None;
     }
     let (schema, table) = crate::storage::split_table_name(current_database, name);
-    if crate::storage::is_system_database(&schema) {
+    if crate::storage::is_system_database(&schema) && !schema.eq_ignore_ascii_case("mysql") {
         return None;
     }
     let key = crate::storage::table_key(&schema, &table);

@@ -784,7 +784,10 @@ impl ReplicationManager {
 
     pub(crate) fn executed_gtid_set(&self) -> Result<String, QueryError> {
         let channels = self.channels.lock().map_err(|_| relay_lock_error())?;
-        let mut sets = self.retired_gtid_set()?;
+        let mut sets = crate::gtid::union(
+            &self.retired_gtid_set()?,
+            &self.engine.database_for_replication().imported_gtid_set()?,
+        );
         for runtime in channels.values() {
             sets.push(',');
             sets.push_str(
@@ -2199,9 +2202,19 @@ impl ChannelRunner {
                 if !self.enforce_source_delay(*source_ts) {
                     return Ok(());
                 }
-                let duplicate = gtid.as_ref().is_some_and(|g| {
+                let gate = crate::storage::capture::logical_apply_gate(
+                    self.engine.database_for_replication(),
+                )?;
+                let _apply = gate.read_arc();
+                let duplicate = if let Some(g) = gtid.as_ref() {
                     gtid_set_contains(&self.status_snapshot().executed_gtid_set, g)
-                });
+                        || self
+                            .engine
+                            .database_for_replication()
+                            .imported_gtid_contains(g)?
+                } else {
+                    false
+                };
                 let event_count = txn_records.len() as u64 + 1;
                 if !duplicate {
                     match &record.op {
@@ -2401,20 +2414,24 @@ impl ChannelRunner {
         gtid: Option<&str>,
     ) -> Result<Option<DeferredCommit>, QueryError> {
         self.update_status(|status| status.sql_state = "applying relay transaction".to_string());
-        if gtid.is_some_and(|value| {
-            gtid_set_contains(&self.status_snapshot().executed_gtid_set, value)
-        }) {
-            self.update_status(|status| status.sql_state = "skipped duplicate GTID".to_string());
-            return Ok(None);
+        let db = self.engine.database_for_replication();
+        let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
+        let logical_apply_lease = logical_gate.read_arc();
+        if let Some(value) = gtid {
+            if gtid_set_contains(&self.status_snapshot().executed_gtid_set, value)
+                || db.imported_gtid_contains(value)?
+            {
+                self.update_status(|status| {
+                    status.sql_state = "skipped duplicate GTID".to_string()
+                });
+                return Ok(None);
+            }
         }
         debug_assert!(!ops.iter().any(|op| matches!(op, RelayOp::Ddl { .. })));
         let ops = ops
             .into_iter()
             .map(|op| self.decode_relay_rows(op))
             .collect::<Result<Vec<_>, _>>()?;
-        let db = self.engine.database_for_replication();
-        let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
-        let logical_apply_lease = logical_gate.read_arc();
         let txn = db.begin_txn()?;
         let result = with_replication_applier(|| {
             apply_ops_to_storage(&self.engine, db, txn, &ops)?;
@@ -3706,7 +3723,12 @@ impl ChannelRunner {
         // `set_sql_error` and stops the SQL thread while IO keeps buffering.
         self.update_status(|status| status.sql_state = "applying relay transaction".to_string());
         if let Some(gtid) = &gtid {
-            if gtid_set_contains(&self.status_snapshot().executed_gtid_set, gtid) {
+            if gtid_set_contains(&self.status_snapshot().executed_gtid_set, gtid)
+                || self
+                    .engine
+                    .database_for_replication()
+                    .imported_gtid_contains(gtid)?
+            {
                 self.update_status(|status| {
                     status.sql_state = "skipped duplicate GTID".to_string()
                 });
@@ -9434,6 +9456,53 @@ mod tests {
             panic!("expected result set");
         };
         assert_eq!(result.rows[0][0], Value::String("io".to_string()));
+    }
+
+    #[test]
+    fn dump_imported_gtids_seed_auto_position_and_skip_existing_channel_rows() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE t(id INT PRIMARY KEY)")
+            .unwrap();
+        let (runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+        engine
+            .execute(&format!("SET GLOBAL gtid_purged='{uuid}:1-10'"))
+            .unwrap();
+        let cfg = ReplicationChannelConfig {
+            auto_position: true,
+            ..Default::default()
+        };
+        let request = runner.build_binlog_request(&cfg, "", 4).unwrap();
+        assert_eq!(
+            request.sids(),
+            parse_gtid_set(&format!("{uuid}:1-10")).unwrap()
+        );
+        let ops = || {
+            vec![RelayOp::WriteRows {
+                database: "test".into(),
+                table: "t".into(),
+                rows: vec![vec![Value::Int(1)]],
+            }]
+        };
+        assert!(runner
+            .prepare_row_records(ops(), Some(&format!("{uuid}:5")))
+            .unwrap()
+            .is_none());
+        runner
+            .apply_records(ops(), Some(format!("{uuid}:6")))
+            .unwrap();
+        let QueryResponse::ResultSet(result) = engine.execute("SELECT COUNT(*) FROM t").unwrap()
+        else {
+            panic!("rows");
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(0)]]);
+        assert_eq!(
+            runtime.status.lock().unwrap().sql_state,
+            "skipped duplicate GTID"
+        );
     }
 
     #[test]

@@ -2374,6 +2374,45 @@ mod tests {
     }
 
     #[test]
+    fn deadlock_detect_option_file_aliases_share_one_setting() {
+        for name in [
+            "innodb_deadlock_detect",
+            "mydb_deadlock_detect",
+            "deadlock-detect",
+        ] {
+            let entries = parse(format!("[mydb]\n{name}=OFF\n").as_bytes()).unwrap();
+            let (assignments, warnings) = resolve_sysvar_entries(
+                &entries,
+                &BTreeMap::new(),
+                &BTreeMap::new(),
+                Some(Path::new("test.cnf")),
+            )
+            .unwrap();
+            assert!(warnings.is_empty());
+            assert_eq!(assignments.len(), 1);
+            assert_eq!(assignments[0].name, "innodb_deadlock_detect");
+            assert_eq!(assignments[0].value.to_display_string(), "OFF");
+        }
+        let entries =
+            parse(b"[mydb]\nmydb_deadlock_detect=ON\n[mysqld]\ninnodb_deadlock_detect=OFF\n")
+                .unwrap();
+        let (assignments, warnings) = resolve_sysvar_entries(
+            &entries,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(Path::new("test.cnf")),
+        )
+        .unwrap();
+        assert!(warnings.is_empty());
+        assert_eq!(assignments.len(), 1);
+        assert_eq!(assignments[0].value.to_display_string(), "ON");
+        let entries = parse(b"[mydb]\nmydb_deadlock_detect=invalid\n").unwrap();
+        assert!(
+            resolve_sysvar_entries(&entries, &BTreeMap::new(), &BTreeMap::new(), None).is_err()
+        );
+    }
+
+    #[test]
     fn accepts_registered_global_sysvar() {
         let entries = parse(b"[mydb]\nread_only=ON\n").unwrap();
         let (assignments, warnings) = resolve_sysvar_entries(

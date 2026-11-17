@@ -1027,6 +1027,7 @@ pub struct Database {
     /// Lock-free immutable authorization snapshot. Catalog and snapshot share
     /// the same Arc; DCL publishes a replacement only after DD/WAL commit.
     auth_snapshot: arc_swap::ArcSwap<crate::engine::auth::AuthCatalog>,
+    pub(crate) imported_gtids: crate::gtid::ImportedGtidState,
     temp_tables: RwLock<BTreeMap<String, Arc<TableSchema>>>,
     // parking_lot::RwLock: the transaction manager guards every row-lock
     // acquire/release, unique-key check, MVCC visibility lookup and commit.
