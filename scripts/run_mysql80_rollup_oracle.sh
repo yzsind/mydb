@@ -1,31 +1,29 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/_docker_test.sh"
+cd "$ROOT_DIR"
 
-IMAGE="${MYSQL80_IMAGE:-mysql:8.0}"
-CONTAINER="${MYSQL80_CONTAINER:-mydb-mysql80-rollup}"
+
+IMAGE="${MYSQL80_IMAGE:-mysql:8.0.46}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-mydb}"
+mydb_container_init "mydb-rollup" "${MYSQL80_CONTAINER:-}"
 PORT="${MYSQL80_PORT:-33818}"
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  mydb_container_cleanup
 }
 trap cleanup EXIT
 
-cleanup
-docker run --name "$CONTAINER" \
+mydb_container_run \
   -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
   -e MYSQL_DATABASE=test \
   -p "127.0.0.1:${PORT}:3306" \
   -d "$IMAGE" >/dev/null
 
-for _ in $(seq 1 60); do
-  if docker exec "$CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}"
 
-docker exec "$CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASSWORD" \
+docker exec -i "$CONTAINER" mysql --default-character-set=utf8mb4 -uroot -p"$MYSQL_ROOT_PASSWORD" \
   --batch --raw --skip-column-names test <<'SQL'
 CREATE TABLE sales(region varchar(20), product varchar(20), amount int);
 INSERT INTO sales VALUES
@@ -42,7 +40,8 @@ FROM sales
 GROUP BY region, product WITH ROLLUP;
 
 SELECT 'alias and ordinal';
-SELECT region AS r, product AS p, SUM(amount), GROUPING(r), GROUPING(2)
+# GROUPING arguments must name grouping expressions, not aliases/ordinals.
+SELECT region AS r, product AS p, SUM(amount), GROUPING(region), GROUPING(product)
 FROM sales
 GROUP BY r, 2 WITH ROLLUP;
 

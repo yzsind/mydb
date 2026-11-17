@@ -12,7 +12,7 @@
 #            server-side "Time: N ms" captured into pg_query_times.csv.
 #
 # Env: PGHOST/PGPORT/PGUSER/PGDB override the connection; SF overrides scale tag.
-set -uo pipefail
+set -euo pipefail
 
 mkdir -p /tmp/mydb
 export TMPDIR=/tmp/mydb
@@ -24,14 +24,25 @@ SF="${SF:-1}"
 
 SUITE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # scripts/tpcds
 QDIR="${SUITE_DIR}/pg/queries"
-OUT_DIR="${SUITE_DIR}/expected/sf-${SF}"
+OUT_DIR="${TPCDS_PG_EXPECTED_DIR:-${SUITE_DIR}/expected/sf-${SF}}"
 RESULT_DIR="${TPCDS_PG_RESULT_DIR:-/tmp/mydb/tpcds-pg-results/sf-${SF}}"
 mkdir -p "$OUT_DIR" "$RESULT_DIR"
 
 PSQL=("$PGBIN/psql" -h "$PGHOST" -p "$PGPORT" -U "$PGUSER" -d "$PGDB" -X)
-QUERIES="${TPCDS_QUERIES:-$(seq 1 99)}"
+QUERIES="${TPCDS_QUERIES-$(seq 1 99)}"
 PASS="${TPCDS_PG_PASS:-both}"          # both | golden | perf
 PERF_SKIP=" ${TPCDS_PERF_SKIP:-} "     # query nums to skip in the perf pass (e.g. pathological q04/q11)
+
+case "$PASS" in both|golden|perf) ;; *) echo "invalid TPCDS_PG_PASS: $PASS" >&2; exit 2;; esac
+[[ -n "${QUERIES//[[:space:]]/}" ]] || { echo "empty query selection" >&2; exit 2; }
+seen=" "
+for q in $QUERIES; do
+  [[ "$q" =~ ^[1-9][0-9]?$ && "$seen" != *" $q "* ]] || {
+    echo "invalid or duplicate query: $q" >&2; exit 2;
+  }
+  seen+="$q "
+done
+failures=0
 
 # LC_ALL=C forces psql's \timing line to the English "Time: N ms" the perf
 # parser greps for (a localized client prints e.g. "时间：N ms" and the parse
@@ -47,12 +58,18 @@ GOLDEN_OPTS="-c work_mem=256MB -c max_parallel_workers_per_gather=0 -c statement
 for q in $QUERIES; do
   qn="$(printf '%02d' "$q")"
   qfile="${QDIR}/q${qn}.sql"
-  [[ -f "$qfile" ]] || { echo "  Q${qn}  SKIP (no file)"; continue; }
+  if [[ ! -f "$qfile" ]]; then
+    echo "${q},fail,0,0" >> "${RESULT_DIR}/golden_status.csv"
+    echo "Q${qn}: missing query file" >&2
+    fail=$((fail + 1)); failures=$((failures + 1)); continue
+  fi
   out="${OUT_DIR}/q${qn}.tsv"
   err="${RESULT_DIR}/q${qn}_golden_err.txt"
+  partial="${RESULT_DIR}/q${qn}.tsv.part"
   s="$(now_ms)"
   if LC_ALL=C PGOPTIONS="$GOLDEN_OPTS" "${PSQL[@]}" -v ON_ERROR_STOP=1 -At -F $'\t' -P null=NULL \
-        -f "$qfile" > "$out" 2> "$err"; then
+        -f "$qfile" > "$partial" 2> "$err"; then
+    mv "$partial" "$out"
     e="$(now_ms)"; rows="$(wc -l < "$out" | tr -d ' ')"
     printf '  Q%-2s  OK    rows=%-6s %6d ms\n' "$qn" "$rows" "$((e - s))"
     echo "${q},ok,${rows},$((e - s))" >> "${RESULT_DIR}/golden_status.csv"
@@ -61,7 +78,7 @@ for q in $QUERIES; do
     e="$(now_ms)"
     printf '  Q%-2s  FAIL  %s\n' "$qn" "$(head -1 "$err")"
     echo "${q},fail,0,$((e - s))" >> "${RESULT_DIR}/golden_status.csv"
-    rm -f "$out"; fail=$((fail + 1))
+    rm -f "$partial"; fail=$((fail + 1)); failures=$((failures + 1))
   fi
 done
 echo "[golden] ok=${ok} fail=${fail}"
@@ -71,20 +88,26 @@ fi   # end golden pass
 if [[ "$PASS" == both || "$PASS" == perf ]]; then
 # One persistent session per iteration with \timing; parse "Time: N ms".
 PERF_OPTS="-c work_mem=64MB -c max_parallel_workers_per_gather=2 -c effective_cache_size=2GB -c statement_timeout=600000 -c jit=off"
-run_perf_iter() {   # $1 = output csv
-  local csv="$1"; echo "query_num,elapsed_ms" > "$csv"
+run_perf_iter() {
+  local csv="$1"
+  echo "query_num,status,elapsed_ms" > "$csv"
   for q in $QUERIES; do
-    local qn qfile t
+    local qn qfile t timing err
     qn="$(printf '%02d' "$q")"; qfile="${QDIR}/q${qn}.sql"
-    [[ -f "$qfile" ]] || continue
-    if [[ "$PERF_SKIP" == *" $q "* ]]; then echo "${q},-1" >> "$csv"; continue; fi
-    # \timing prints "Time: N.NNN ms" for the statement; sum all such lines
-    # (a query file is one statement here) and discard the result rows.
-    t="$(LC_ALL=C PGOPTIONS="$PERF_OPTS" "${PSQL[@]}" -q -A -t -o /dev/null \
-           -c '\timing on' -f "$qfile" 2>/dev/null | grep -i '^Time:' \
-           | awk '{s+=$2} END{printf "%.0f", s}')"
-    [[ -z "$t" ]] && t=-1   # query errored
-    echo "${q},${t}" >> "$csv"
+    if [[ ! -f "$qfile" ]]; then
+      echo "${q},fail,-1" >> "$csv"; failures=$((failures + 1)); continue
+    fi
+    if [[ "$PERF_SKIP" == *" $q "* ]]; then echo "${q},skipped,-1" >> "$csv"; continue; fi
+    timing="${RESULT_DIR}/q${qn}_perf_stdout.txt"
+    err="${RESULT_DIR}/q${qn}_perf_err.txt"
+    if LC_ALL=C PGOPTIONS="$PERF_OPTS" "${PSQL[@]}" -v ON_ERROR_STOP=1 -q -A -t -o /dev/null \
+         -c '\timing on' -f "$qfile" > "$timing" 2> "$err" &&
+       t="$(awk '/^Time: [0-9]+([.][0-9]+)? ms/ {s+=$2; n++} END {if (!n) exit 1; printf "%.3f", s}' "$timing")"; then
+      echo "${q},ok,${t}" >> "$csv"
+    else
+      echo "Q${qn}: performance query failed or timing is missing; inspect $err" >&2
+      echo "${q},fail,-1" >> "$csv"; failures=$((failures + 1))
+    fi
   done
 }
 # The golden pass already touched every table, so the cache is warm; skip the
@@ -97,4 +120,5 @@ echo "[perf] measured iteration (parallel=2, work_mem=64MB, warm)..."
 run_perf_iter "${RESULT_DIR}/pg_query_times.csv"
 echo "[perf] times -> ${RESULT_DIR}/pg_query_times.csv"
 fi   # end perf pass
-echo "done."
+echo "done: failures=$failures"
+(( failures == 0 ))

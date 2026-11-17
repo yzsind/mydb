@@ -1,29 +1,27 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/_docker_test.sh"
+cd "$ROOT_DIR"
 
-IMAGE="${MYSQL80_IMAGE:-mysql:8.0}"
-CONTAINER="${MYSQL80_CONTAINER:-mydb-mysql80-functions}"
+
+IMAGE="${MYSQL80_IMAGE:-mysql:8.0.46}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-mydb}"
+mydb_container_init "mydb-functions" "${MYSQL80_CONTAINER:-}"
 PORT="${MYSQL80_PORT:-33808}"
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  mydb_container_cleanup
 }
 trap cleanup EXIT
 
-cleanup
-docker run --name "$CONTAINER" \
+mydb_container_run \
   -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
   -e MYSQL_DATABASE=test \
   -p "127.0.0.1:${PORT}:3306" \
   -d "$IMAGE" >/dev/null
 
-for _ in $(seq 1 60); do
-  if docker exec "$CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}"
 
 queries=(
   "SELECT TO_BASE64('hello'), EXPORT_SET(5,'Y','N','/',4), BIT_COUNT(15), 7 DIV 3"
@@ -34,5 +32,5 @@ queries=(
 
 for sql in "${queries[@]}"; do
   echo "mysql80> $sql"
-  docker exec "$CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --raw --skip-column-names test -e "$sql"
+  docker exec "$CONTAINER" mysql --default-character-set=utf8mb4 -uroot -p"$MYSQL_ROOT_PASSWORD" --batch --raw --skip-column-names test -e "$sql"
 done

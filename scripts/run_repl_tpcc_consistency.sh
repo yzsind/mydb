@@ -15,6 +15,7 @@ export TMPDIR=/tmp/mydb
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 : "${BSQL_RUN:?Set BSQL_RUN to the BenchmarkSQL run directory}"
+source "$ROOT_DIR/scripts/_docker_test.sh"
 
 HOST="127.0.0.1"
 MASTER_PORT="${MASTER_PORT:-3406}"
@@ -29,8 +30,10 @@ RUN_MINS="${RUN_MINS:-1}"
 PASSWORD="${MYDB_PASSWORD:-root}"
 BUILD_PROFILE="${MYDB_BUILD_PROFILE:-release}"
 export MYSQL_PWD="$PASSWORD"
-BIN="$ROOT_DIR/target/${BUILD_PROFILE}/mydb"
+export MYDB_REPL_AUTH_TOKEN="${MYDB_REPL_AUTH_TOKEN:-$(python3 -c 'import secrets; print(secrets.token_hex(24))')}"
+BIN="${MYDB_BINARY:-$ROOT_DIR/target/${BUILD_PROFILE}/mydb}"
 
+mydb_assert_ports_free "$MASTER_PORT" "$REPLICA_PORT" "$REPL_PORT"
 mkdir -p "$MASTER_DIR" "$REPLICA_DIR"
 if [[ -n "$(find "$MASTER_DIR" -mindepth 1 -maxdepth 1 -print -quit)" || \
       -n "$(find "$REPLICA_DIR" -mindepth 1 -maxdepth 1 -print -quit)" ]]; then
@@ -46,7 +49,7 @@ cleanup() {
   done
   wait 2>/dev/null || true
 }
-if [[ "${KEEP_ON_FAIL:-0}" != "1" ]]; then trap cleanup EXIT; fi
+trap cleanup EXIT
 
 wait_for_port() {
   local port="$1" pid="$2" log="$3"
@@ -116,59 +119,7 @@ cd "$BSQL_RUN"
 ./runSQL.sh "$PROPS" buildFinish || true
 ./runBenchmark.sh "$PROPS"
 
-echo "=== waiting for the replica to catch up ==="
-master_lsn() {
-  mysql -h"$HOST" -P"$MASTER_PORT" -uroot -N -e "SHOW MYDB MASTER STATUS" 2>/dev/null | awk '{print $6}'
-}
-replica_lsn() {
-  mysql -h"$HOST" -P"$REPLICA_PORT" -uroot -N -e "SHOW MYDB REPLICA STATUS" 2>/dev/null | awk '{print $10}'
-}
-deadline=$((SECONDS + ${CATCHUP_TIMEOUT_S:-300}))
-while true; do
-  m="$(master_lsn)"; sleep 1; m2="$(master_lsn)"; r="$(replica_lsn)"
-  echo "master_lsn=$m2 replica_applied=$r"
-  if [[ -n "$m" && "$m" == "$m2" && -n "$r" && "$r" -ge "$m2" ]]; then
-    echo "replica caught up at LSN $r"
-    break
-  fi
-  if (( SECONDS > deadline )); then
-    echo "FAIL: replica did not catch up within ${CATCHUP_TIMEOUT_S:-300}s" >&2
-    exit 1
-  fi
-  sleep 1
-done
-
-echo "=== comparing per-table checksums ==="
-declare -a CHECKS=(
-  "warehouse|SELECT COUNT(*), SUM(w_ytd) FROM bmsql_warehouse"
-  "district|SELECT COUNT(*), SUM(d_ytd), SUM(d_next_o_id) FROM bmsql_district"
-  "customer|SELECT COUNT(*), SUM(c_balance), SUM(c_ytd_payment), SUM(c_payment_cnt), SUM(c_delivery_cnt) FROM bmsql_customer"
-  "history|SELECT COUNT(*), SUM(h_amount) FROM bmsql_history"
-  "oorder|SELECT COUNT(*), SUM(o_id), SUM(o_carrier_id), SUM(o_ol_cnt) FROM bmsql_oorder"
-  "new_order|SELECT COUNT(*), SUM(no_o_id) FROM bmsql_new_order"
-  "order_line|SELECT COUNT(*), SUM(ol_amount), SUM(ol_quantity), SUM(ol_delivery_d IS NOT NULL) FROM bmsql_order_line"
-  "stock|SELECT COUNT(*), SUM(s_quantity), SUM(s_ytd), SUM(s_order_cnt), SUM(s_remote_cnt) FROM bmsql_stock"
-  "item|SELECT COUNT(*), SUM(i_price) FROM bmsql_item"
-)
-fail=0
-for entry in "${CHECKS[@]}"; do
-  table="${entry%%|*}"
-  query="${entry#*|}"
-  mrow="$(mysql -h"$HOST" -P"$MASTER_PORT" -uroot -N tpcc -e "$query")"
-  rrow="$(mysql -h"$HOST" -P"$REPLICA_PORT" -uroot -N tpcc -e "$query")"
-  if [[ "$mrow" == "$rrow" ]]; then
-    echo "OK   $table: $mrow"
-  else
-    echo "FAIL $table:"
-    echo "  master : $mrow"
-    echo "  replica: $rrow"
-    fail=1
-  fi
-done
-
-if [[ "$fail" == "0" ]]; then
-  echo "=== RESULT: master and replica are CONSISTENT across all TPC-C tables ==="
-else
-  echo "=== RESULT: INCONSISTENCY DETECTED ===" >&2
-  exit 1
-fi
+echo "=== verifying durable applied progress and complete typed rows ==="
+python3 "$ROOT_DIR/scripts/replication_check.py" --physical \
+  --source-port "$MASTER_PORT" --replica-port "$REPLICA_PORT" \
+  --database tpcc --timeout "${CATCHUP_TIMEOUT_S:-300}"

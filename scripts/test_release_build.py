@@ -250,7 +250,7 @@ class PackageLayoutTests(unittest.TestCase):
                     write_archive(archive, prefix, contents)
                     with patch.object(sys, 'argv', ['verify_release_package.py', '--files-only',
                                       '--package', str(archive), '--output', str(root / (prefix + '-bad'))]):
-                        with self.assertRaisesRegex(AssertionError, 'runtime files'):
+                        with self.assertRaisesRegex(ValueError, 'runtime files'):
                             verify_release_package.main()
 
     def test_platform_archives_extract_into_the_named_directory(self):

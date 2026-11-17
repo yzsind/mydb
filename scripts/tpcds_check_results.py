@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """Compare TPC-DS query output against externally-generated expected result sets.
 
-Tab-separated cells are trimmed and numbers are normalized to integer form or
-4 decimals (half-up). Rows are compared as a multiset: SQL does not define the
-relative order of rows tied on every ORDER BY key. See
-scripts/tpcds/expected/README.md for how to populate an expected set.
+TSV values and row order are exact by default. Explicit per-query comparison
+contracts may normalize declared numeric columns and reorder only ORDER BY ties.
 """
 
 from __future__ import annotations
@@ -16,29 +14,35 @@ from pathlib import Path
 
 
 try:
-    from ._tabular_results import CanonicalResult, normalize_cell, query_numbers, write_csv
+    from ._tabular_results import CanonicalResult, comparison_contracts, query_numbers, write_csv
     from ._tabular_results import canonicalize as _canonicalize
 except ImportError:
-    from _tabular_results import CanonicalResult, normalize_cell, query_numbers, write_csv
+    from _tabular_results import CanonicalResult, comparison_contracts, query_numbers, write_csv
     from _tabular_results import canonicalize as _canonicalize
 
 
-def canonicalize(path: Path) -> CanonicalResult:
-    return _canonicalize(path, sort_rows=True)
+def canonicalize(path: Path, *, contract: dict | None = None) -> CanonicalResult:
+    return _canonicalize(path, contract=contract)
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--expected-dir", required=True, type=Path)
     parser.add_argument("--actual-dir", required=True, type=Path)
-    parser.add_argument("--queries", default="1-99")
+    parser.add_argument("--queries", type=lambda value: query_numbers(value, maximum=99), default="1-99")
     parser.add_argument("--actual-pattern", default="q{query:02d}_result.txt")
     parser.add_argument("--output-csv", required=True, type=Path)
     parser.add_argument(
         "--query-status-csv", type=Path,
         help="Execution status CSV from the benchmark runner; only ok may pass",
     )
+    parser.add_argument("--comparison-manifest", type=Path,
+                        help="JSON query contracts: explicit types and ORDER BY tie keys; default exact ordered TSV")
     args = parser.parse_args()
+    try:
+        contracts = comparison_contracts(args.comparison_manifest)
+    except (OSError, ValueError) as error:
+        parser.error(str(error))
 
     execution_status = None
     if args.query_status_csv is not None:
@@ -50,8 +54,10 @@ def main() -> int:
     rows: list[dict[str, object]] = []
     failed = False
 
-    for query in query_numbers(args.queries):
-        expected_path = args.expected_dir / f"q{query:02d}.tsv"
+    for query in args.queries:
+        contract = contracts.get(str(query), {})
+        extension = 'json' if contract.get('format') == 'typed-json' else 'tsv'
+        expected_path = args.expected_dir / f"q{query:02d}.{extension}"
         actual_path = args.actual_dir / args.actual_pattern.format(query=query)
         status = "ok"
         message = ""
@@ -68,9 +74,9 @@ def main() -> int:
             status = "missing_actual"
             message = f"{actual_path} not found"
         else:
-            expected = canonicalize(expected_path)
-            actual = canonicalize(actual_path)
-            if expected.rows != actual.rows:
+            expected = canonicalize(expected_path, contract=contracts.get(str(query)))
+            actual = canonicalize(actual_path, contract=contracts.get(str(query)))
+            if expected.rows != actual.rows or expected.metadata != actual.metadata:
                 status = "mismatch"
                 message = "canonical rows differ"
 

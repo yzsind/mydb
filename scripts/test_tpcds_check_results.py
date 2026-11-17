@@ -11,15 +11,15 @@ from tpcds_check_results import canonicalize
 
 class CanonicalizeTest(unittest.TestCase):
     def test_order_by_ties_compare_as_multisets_and_keep_duplicates(self):
-        with tempfile.TemporaryDirectory() as directory:
+        with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
             root = Path(directory)
             expected = root / "expected.tsv"
             actual = root / "actual.tsv"
             expected.write_text("a\t2.00000\na\t1\na\t1\n")
             actual.write_text("a\t1.0000\na\t1\na\t2\n")
 
-            expected_result = canonicalize(expected)
-            actual_result = canonicalize(actual)
+            expected_result = canonicalize(expected, contract={"columns": ["text", "decimal"], "order_keys": [0]})
+            actual_result = canonicalize(actual, contract={"columns": ["text", "decimal"], "order_keys": [0]})
 
             self.assertEqual(expected_result.rows, actual_result.rows)
             self.assertEqual(expected_result.digest, actual_result.digest)

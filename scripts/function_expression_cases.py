@@ -732,6 +732,13 @@ def build_cases():
             workload_note="Checks unique values 1..N; unordered scan order does not prescribe the ID-to-sequence-value mapping.",
         )
     )
+    # XML functions have a dedicated fixture rather than per-function JSON.
+    for name in ('EXTRACTVALUE', 'UPDATEXML'):
+        if not any(case['name'] == name for case in cases):
+            cases.append(make_case(name, 'xml', EXPRESSIONS[name], oracle_class='mysql80_community'))
+    cases.append(make_case('RLS_CONTEXT', 'information-system',
+                           "RLS_CONTEXT(CONCAT('bench-',CAST(id%8 AS CHAR)))",
+                           oracle_class='mydb_extension', mysql_unavailable='mydb_extension'))
     seen = set()
     for case in cases:
         if case["id"] in seen:

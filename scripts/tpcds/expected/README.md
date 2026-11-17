@@ -7,11 +7,13 @@ checkouts.
 
 This directory holds canonical query results, one tab-separated file per query
 (`sf-<SF>/qNN.tsv`, no header), used by `scripts/tpcds_check_results.py` to
-validate mydb output. The driver (`scripts-internal/run_tpcds.sh`) applies the same
-canonicalization to both sides: cells trimmed; numbers normalized to integer
-form or 4 decimals (half-up); `NULL` printed as the literal token; rows sorted
-lexicographically after cell normalization. Sorting preserves duplicates while
-avoiding false failures when two engines emit ORDER BY ties in different order.
+validate mydb output. The public checker preserves exact text and row order by
+default. Numeric type normalization and permutations within ORDER BY ties need
+an explicit per-query `--comparison-manifest`; see `scripts/README.md`.
+The optional private driver must pass that same contract rather than applying
+its own lossy trimming, rounding or whole-result sorting. Legacy TSV uses the
+literal `NULL` token; it cannot distinguish SQL NULL from a string with exactly
+that spelling.
 
 TPC-DS results depend on the substitution parameters baked into the query files
 (here: `dsqgen -rngseed 1 -scale 1`), so an expected set is only meaningful when
@@ -61,8 +63,8 @@ with only semantics-preserving rewrites, so the answers are unchanged:
 
 ## Known cross-engine divergences (read before trusting a mismatch)
 
-The checker compares canonical row **multisets**. These PG-vs-mydb semantic
-differences can still matter before canonicalization:
+The checker compares exact ordered rows unless a comparison contract explicitly
+permits tie permutations. These PG-vs-mydb semantic differences still matter:
 
 - **NULL ordering** *(neutralized in the harness — see below).* PG sorts `NULL`
   **last** under `ORDER BY … ASC`; MySQL/mydb sorts it **first**. This reorders

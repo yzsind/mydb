@@ -1,30 +1,28 @@
 #!/usr/bin/env bash
 set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/_docker_test.sh"
+cd "$ROOT_DIR"
 
-IMAGE="${MYSQL80_IMAGE:-mysql:8.0}"
-CONTAINER="${MYSQL80_CONTAINER:-mydb-mysql80-charset}"
+
+IMAGE="${MYSQL80_IMAGE:-mysql:8.0.46}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-mydb}"
+mydb_container_init "mydb-charset" "${MYSQL80_CONTAINER:-}"
 
 cleanup() {
-  docker rm -f "$CONTAINER" >/dev/null 2>&1 || true
+  mydb_container_cleanup
 }
 trap cleanup EXIT
 
-cleanup
-docker run --name "$CONTAINER" \
+mydb_container_run \
   -e MYSQL_ROOT_PASSWORD="$MYSQL_ROOT_PASSWORD" \
   -e MYSQL_DATABASE=test \
   -d "$IMAGE" >/dev/null
 
-for _ in $(seq 1 60); do
-  if docker exec "$CONTAINER" mysqladmin ping -uroot -p"$MYSQL_ROOT_PASSWORD" --silent >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}"
 
 mysql80() {
-  docker exec "$CONTAINER" mysql -uroot -p"$MYSQL_ROOT_PASSWORD" \
+  docker exec "$CONTAINER" mysql --default-character-set=utf8mb4 -uroot -p"$MYSQL_ROOT_PASSWORD" \
     --batch --raw --skip-column-names test -e "$1"
 }
 

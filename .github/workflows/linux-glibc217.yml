@@ -32,7 +32,7 @@ jobs:
       - name: Install protocol test dependencies
         run: |
           python3 -m venv /tmp/mydb/protocol-venv
-          /tmp/mydb/protocol-venv/bin/pip install 'PyMySQL==1.1.2' 'cryptography==50.0.2'
+          /tmp/mydb/protocol-venv/bin/pip install -r scripts/requirements.txt
           /tmp/mydb/protocol-venv/bin/python scripts/test_linux_compat.py
       - name: Verify CentOS 7, 8, and 9 runtime contracts
         run: |

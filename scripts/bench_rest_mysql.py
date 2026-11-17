@@ -170,9 +170,17 @@ def main():
               "comparison_method": "median of same-round ratios", "paired_samples": paired_samples,
               "unpaired_comparisons": unpaired_comparisons,
               "gate_passed": bool(comparisons) and all(v["qps_change_pct"] >= -3 and v["p99_change_pct"] <= 5 for group in comparisons.values() for v in group.values())}
+    mixed_passed = (bool(mixed_results) and all(r['requests'] > 0 and not r['errors'] for r in mixed_results)
+                    if args.mixed or args.mixed_only else True)
+    if args.mixed_only:
+        report['gate_passed'] = None
+    overall_passed = mixed_passed and (args.mixed_only or report['gate_passed'])
+    report.update(mixed_passed=mixed_passed, status='passed' if overall_passed else 'failed')
     (out / "results.json").write_text(json.dumps(report, indent=2) + "\n")
-    print(json.dumps({"comparisons": comparisons, "gate_passed": report["gate_passed"]}, indent=2))
+    print(json.dumps({"comparisons": comparisons, "gate_passed": report["gate_passed"],
+                      "status": report['status']}, indent=2))
+    return 0 if overall_passed else 1
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())

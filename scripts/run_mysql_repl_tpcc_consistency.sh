@@ -18,20 +18,21 @@
 #   BSQL_RUN_MIN       — minutes per leg (1)
 #   BSQL_RUN           — path to BenchmarkSQL 5.1 run dir
 #
-# Exit code: 0 iff every table SUM(col IS NOT NULL) row-count agrees between
-# master and replica. Non-zero on any mismatch.
+# Exit code: 0 only after applied progress and complete typed rows match.
 
 set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/_docker_test.sh"
+cd "$ROOT_DIR"
 
 mkdir -p /tmp/mydb
 export TMPDIR=/tmp/mydb
 
-MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0}"
-CONTAINER="${CONTAINER:-mydb-repl-master}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0.46}"
 MYSQL_PORT="${MYSQL_PORT:-33307}"
 MYDB_PORT="${MYDB_PORT:-33308}"
-MYDB_DATA_DIR="${MYDB_DATA_DIR:-/tmp/mydb/repl-mysql-data-$$}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-mydb}"
+mydb_container_init "mydb-repl-master" "${CONTAINER:-}"
 BSQL_WAREHOUSES="${BSQL_WAREHOUSES:-2}"
 BSQL_TERMINALS="${BSQL_TERMINALS:-4}"
 BSQL_RUN_MIN="${BSQL_RUN_MIN:-1}"
@@ -42,19 +43,17 @@ MYDB_PID=""
 cleanup() {
   set +e
   if [[ -n "${MYDB_PID}" ]]; then
-    kill "${MYDB_PID}" 2>/dev/null || true
-    wait "${MYDB_PID}" 2>/dev/null || true
+    mydb_stop_native "$MYDB_PID"
   fi
-  docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-  if [[ "${MYDB_DATA_DIR}" == /tmp/mydb/repl-mysql-data-* ]]; then
-    rm -rf "${MYDB_DATA_DIR}"
-  fi
+  mydb_container_cleanup
+  mydb_test_data_cleanup
 }
 trap cleanup EXIT
+mydb_test_data_init
+mydb_assert_ports_free "$MYDB_PORT" "$MYSQL_PORT"
 
 echo ">>> launching MySQL 8.0 master on ${MYSQL_PORT}"
-docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-docker run --name "${CONTAINER}" \
+mydb_container_run \
   -e MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}" \
   -e MYSQL_DATABASE=tpcc \
   -p "127.0.0.1:${MYSQL_PORT}:3306" \
@@ -69,12 +68,7 @@ docker run --name "${CONTAINER}" \
   >/dev/null
 
 echo ">>> waiting for MySQL to accept connections"
-for _ in $(seq 1 90); do
-  if docker exec "${CONTAINER}" mysqladmin ping -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}"
 
 echo ">>> bootstrapping tpcc user + permissions"
 docker exec -i "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" <<SQL
@@ -85,8 +79,8 @@ GRANT REPLICATION SLAVE ON *.* TO 'repl'@'%';
 FLUSH PRIVILEGES;
 SQL
 
-echo ">>> building mydb (release)"
-cargo build --release
+MYDB_BINARY="${MYDB_BINARY:-$ROOT_DIR/target/release/mydb}"
+[[ -x "$MYDB_BINARY" ]] || { echo "Build mydb or set MYDB_BINARY to a built executable" >&2; exit 2; }
 
 echo ">>> launching mydb replica on ${MYDB_PORT} (data=${MYDB_DATA_DIR})"
 mkdir -p "${MYDB_DATA_DIR}"
@@ -98,16 +92,11 @@ MYDB_REPL_PASSWORD=repl \
 MYDB_REPL_AUTO_POSITION=1 \
 MYDB_REPL_START=0 \
 MYDB_LOG_BIN=0 \
-./target/release/mydb --host 127.0.0.1 --port "${MYDB_PORT}" --data-dir "${MYDB_DATA_DIR}" &
+MYDB_ROOT_PASSWORD="${MYDB_ROOT_PASSWORD:-root}" "$MYDB_BINARY" --host 127.0.0.1 --port "${MYDB_PORT}" --data-dir "${MYDB_DATA_DIR}" &
 MYDB_PID=$!
 
 echo ">>> waiting for mydb to accept connections"
-for _ in $(seq 1 60); do
-  if mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -e "SELECT 1" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_wait_native "$MYDB_PORT" "$MYDB_PID"
 
 echo ">>> setting up tpcc schema on master + replica"
 # BenchmarkSQL needs the schema present before runBenchmark; have BenchmarkSQL
@@ -119,7 +108,7 @@ if [[ ! -d "${BSQL_RUN}" ]]; then
 fi
 
 pushd "${BSQL_RUN}" >/dev/null
-PROP="props.mydb-repl-master"
+PROP="${MYDB_DATA_DIR}/benchmarksql.properties"
 cat > "${PROP}" <<PROPS
 db=mysql
 driver=com.mysql.cj.jdbc.Driver
@@ -137,7 +126,7 @@ echo ">>> loading TPC-C onto master"
 popd >/dev/null
 
 echo ">>> CHANGE REPLICATION SOURCE TO + START REPLICA on mydb"
-mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot <<SQL
+mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -p"${MYDB_ROOT_PASSWORD:-root}" <<SQL
 CHANGE REPLICATION SOURCE TO
   SOURCE_HOST='127.0.0.1',
   SOURCE_PORT=${MYSQL_PORT},
@@ -151,7 +140,7 @@ echo ">>> waiting for initial catchup"
 sleep 5
 
 pushd "${BSQL_RUN}" >/dev/null
-PROP="props.mydb-repl-master"
+PROP="${MYDB_DATA_DIR}/benchmarksql.properties"
 cat > "${PROP}" <<PROPS
 db=mysql
 driver=com.mysql.cj.jdbc.Driver
@@ -169,44 +158,9 @@ echo ">>> running TPC-C for ${BSQL_RUN_MIN} min"
 ./runBenchmark.sh "${PROP}" >/tmp/mydb/repl-master-run.log 2>&1
 popd >/dev/null
 
-echo ">>> waiting for replica to drain"
-for _ in $(seq 1 60); do
-  REPL_FILE=$(docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -e "SHOW MASTER STATUS\G" 2>/dev/null | awk -F': ' '/File:/{print $2}')
-  REPL_POS=$(docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -e "SHOW MASTER STATUS\G" 2>/dev/null | awk -F': ' '/Position:/{print $2}')
-  REPL_STATE=$(mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -N -e "SHOW REPLICA STATUS\G" | awk -F': ' '/Read_Source_Log_Pos:/{print $2}')
-  if [[ -n "${REPL_STATE}" && "${REPL_STATE}" -ge "${REPL_POS}" ]]; then
-    echo "    replica reached source pos ${REPL_POS}"
-    break
-  fi
-  sleep 1
-done
-
-echo ">>> stopping replication and comparing tables"
-mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -e "STOP REPLICA;"
-
-# Use SUM(col IS NOT NULL) (per repl-wal-overhaul memory) so the parallel
-# COUNT() bug in the executor doesn't pollute the verifier.
-TABLES=(warehouse district customer history new_order oorder order_line item stock)
-FAIL=0
-for tbl in "${TABLES[@]}"; do
-  MASTER=$(docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -tpcc -N \
-    -e "SELECT SUM(${tbl}_w_id IS NOT NULL) FROM tpcc.${tbl}" 2>/dev/null \
-    || docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -tpcc -N \
-    -e "SELECT SUM(1) FROM tpcc.${tbl}" 2>/dev/null)
-  REPLICA=$(mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -N \
-    -e "SELECT SUM(${tbl}_w_id IS NOT NULL) FROM tpcc.${tbl}" 2>/dev/null \
-    || mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -N \
-    -e "SELECT SUM(1) FROM tpcc.${tbl}" 2>/dev/null)
-  if [[ "${MASTER}" != "${REPLICA}" ]]; then
-    echo "MISMATCH on ${tbl}: master=${MASTER} replica=${REPLICA}"
-    FAIL=1
-  else
-    echo "OK ${tbl} = ${MASTER}"
-  fi
-done
-
-if [[ "${FAIL}" -ne 0 ]]; then
-  echo "FAIL: row counts differ"
-  exit 1
-fi
-echo "PASS: all tables match"
+echo ">>> verifying applied progress and complete typed rows"
+export MYSQL_ROOT_PASSWORD MYDB_ROOT_PASSWORD="${MYDB_ROOT_PASSWORD:-root}"
+python3 "$ROOT_DIR/scripts/replication_check.py" \
+  --source-port "${MYSQL_PORT}" --source-password-env MYSQL_ROOT_PASSWORD \
+  --replica-port "${MYDB_PORT}" --replica-password-env MYDB_ROOT_PASSWORD \
+  --database tpcc --timeout "${CATCHUP_TIMEOUT_S:-300}"

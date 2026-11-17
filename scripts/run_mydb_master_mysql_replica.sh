@@ -14,20 +14,21 @@
 #   MYDB_DATA_DIR      — fresh data dir (auto: /tmp/mydb/as-master-data-$$)
 #   ROWS_PER_TABLE     — rows inserted into each test table (1000)
 #
-# Exit code: 0 iff every replicated table SUM(col) matches between mydb master
-# and MySQL replica. Non-zero on any mismatch.
+# Exit code: 0 only after applied progress and complete typed rows match.
 
 set -euo pipefail
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/_docker_test.sh"
+cd "$ROOT_DIR"
 
 mkdir -p /tmp/mydb
 export TMPDIR=/tmp/mydb
 
-MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0}"
-CONTAINER="${CONTAINER:-mydb-as-master-replica}"
+MYSQL_IMAGE="${MYSQL_IMAGE:-mysql:8.0.46}"
 MYDB_PORT="${MYDB_PORT:-33309}"
 MYSQL_PORT="${MYSQL_PORT:-33310}"
-MYDB_DATA_DIR="${MYDB_DATA_DIR:-/tmp/mydb/as-master-data-$$}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-mydb}"
+mydb_container_init "mydb-as-master-replica" "${CONTAINER:-}"
 ROWS_PER_TABLE="${ROWS_PER_TABLE:-1000}"
 
 MYDB_PID=""
@@ -35,18 +36,17 @@ MYDB_PID=""
 cleanup() {
   set +e
   if [[ -n "${MYDB_PID}" ]]; then
-    kill "${MYDB_PID}" 2>/dev/null || true
-    wait "${MYDB_PID}" 2>/dev/null || true
+    mydb_stop_native "$MYDB_PID"
   fi
-  docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-  if [[ "${MYDB_DATA_DIR}" == /tmp/mydb/as-master-data-* ]]; then
-    rm -rf "${MYDB_DATA_DIR}"
-  fi
+  mydb_container_cleanup
+  mydb_test_data_cleanup
 }
 trap cleanup EXIT
+mydb_test_data_init
+mydb_assert_ports_free "$MYDB_PORT" "$MYSQL_PORT"
 
-echo ">>> building mydb (release)"
-cargo build --release
+MYDB_BINARY="${MYDB_BINARY:-$ROOT_DIR/target/release/mydb}"
+[[ -x "$MYDB_BINARY" ]] || { echo "Build mydb or set MYDB_BINARY to a built executable" >&2; exit 2; }
 
 echo ">>> launching mydb master on ${MYDB_PORT} (data=${MYDB_DATA_DIR}, binlog ON)"
 mkdir -p "${MYDB_DATA_DIR}"
@@ -54,19 +54,16 @@ MYDB_DATA_DIR="${MYDB_DATA_DIR}" \
 MYDB_LOG_BIN=1 \
 MYDB_SERVER_ID=1 \
 MYDB_BINLOG_CHECKSUM=CRC32 \
-./target/release/mydb --host 0.0.0.0 --port "${MYDB_PORT}" --data-dir "${MYDB_DATA_DIR}" &
+MYDB_ROOT_PASSWORD="${MYDB_ROOT_PASSWORD:-root}" "$MYDB_BINARY" --host 0.0.0.0 --port "${MYDB_PORT}" --data-dir "${MYDB_DATA_DIR}" &
 MYDB_PID=$!
 
 echo ">>> waiting for mydb to accept connections"
-for _ in $(seq 1 60); do
-  if mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -e "SELECT 1" >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_wait_native "$MYDB_PORT" "$MYDB_PID"
 
 echo ">>> bootstrapping test schema + repl user"
-mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot <<SQL
+mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -p"${MYDB_ROOT_PASSWORD:-root}" <<SQL
+CREATE USER 'replication_check'@'%' IDENTIFIED WITH mysql_native_password BY 'local-replication-check';
+GRANT REPLICATION SLAVE, REPLICATION CLIENT ON *.* TO 'replication_check'@'%';
 CREATE DATABASE IF NOT EXISTS appdb;
 USE appdb;
 CREATE TABLE users (
@@ -84,14 +81,11 @@ CREATE TABLE orders (
 );
 SQL
 
-# We can't reliably create a non-root account that the mysql replica will
-# accept from inside the container, so the replica uses root.
-
 echo ">>> launching MySQL replica on ${MYSQL_PORT}"
-docker rm -f "${CONTAINER}" >/dev/null 2>&1 || true
-docker run --name "${CONTAINER}" \
+mydb_container_run \
   -e MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}" \
   -p "127.0.0.1:${MYSQL_PORT}:3306" \
+  --add-host=host.docker.internal:host-gateway \
   -d "${MYSQL_IMAGE}" \
   --server-id=2 \
   --log-bin=mysql-bin \
@@ -102,24 +96,19 @@ docker run --name "${CONTAINER}" \
   >/dev/null
 
 echo ">>> waiting for MySQL replica to come up"
-for _ in $(seq 1 90); do
-  if docker exec "${CONTAINER}" mysqladmin ping -uroot -p"${MYSQL_ROOT_PASSWORD}" --silent >/dev/null 2>&1; then
-    break
-  fi
-  sleep 1
-done
+mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}"
 
 # host.docker.internal resolves to the host running mydb when the replica is
 # inside Docker Desktop; on Linux you may need to substitute another bridge IP.
 MYDB_HOST_FROM_DOCKER="${MYDB_HOST_FROM_DOCKER:-host.docker.internal}"
 
 echo ">>> pointing MySQL replica at mydb master"
-docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" <<SQL
+docker exec -i "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" <<SQL
 CHANGE REPLICATION SOURCE TO
   SOURCE_HOST='${MYDB_HOST_FROM_DOCKER}',
   SOURCE_PORT=${MYDB_PORT},
-  SOURCE_USER='root',
-  SOURCE_PASSWORD='root',
+  SOURCE_USER='replication_check',
+  SOURCE_PASSWORD='local-replication-check',
   SOURCE_AUTO_POSITION=1;
 START REPLICA;
 SQL
@@ -130,39 +119,15 @@ for i in $(seq 1 "${ROWS_PER_TABLE}"); do
   SQL_BLOCK+="INSERT INTO appdb.users VALUES (${i}, 'user${i}', 'user${i}@example.com', NOW(3), ${i}.50);"
   SQL_BLOCK+="INSERT INTO appdb.orders VALUES (${i}, ${i}, ${i}.25, NOW(3));"
   if (( i % 100 == 0 )); then
-    echo "${SQL_BLOCK}" | mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot
+    echo "${SQL_BLOCK}" | mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -p"${MYDB_ROOT_PASSWORD:-root}"
     SQL_BLOCK=""
   fi
 done
-[[ -n "${SQL_BLOCK}" ]] && echo "${SQL_BLOCK}" | mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot
+[[ -n "${SQL_BLOCK}" ]] && echo "${SQL_BLOCK}" | mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -p"${MYDB_ROOT_PASSWORD:-root}"
 
-echo ">>> waiting for replica to drain"
-for _ in $(seq 1 120); do
-  POS_MASTER=$(mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -N -e "SHOW MASTER STATUS\G" | awk -F': ' '/Position:/{print $2}')
-  POS_REPL=$(docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -e "SHOW REPLICA STATUS\G" | awk -F': ' '/Read_Source_Log_Pos:/{print $2}')
-  if [[ -n "${POS_MASTER}" && -n "${POS_REPL}" && "${POS_REPL}" -ge "${POS_MASTER}" ]]; then
-    break
-  fi
-  sleep 1
-done
-
-echo ">>> stopping replication"
-docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -e "STOP REPLICA;"
-
-FAIL=0
-for tbl in users orders; do
-  M_COUNT=$(mysql -h127.0.0.1 -P"${MYDB_PORT}" -uroot -proot -N -e "SELECT SUM(id IS NOT NULL) FROM appdb.${tbl}")
-  R_COUNT=$(docker exec "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" -N -e "SELECT SUM(id IS NOT NULL) FROM appdb.${tbl}")
-  if [[ "${M_COUNT}" != "${R_COUNT}" ]]; then
-    echo "MISMATCH on ${tbl}: master=${M_COUNT} replica=${R_COUNT}"
-    FAIL=1
-  else
-    echo "OK ${tbl} = ${M_COUNT}"
-  fi
-done
-
-if [[ "${FAIL}" -ne 0 ]]; then
-  echo "FAIL: counts differ"
-  exit 1
-fi
-echo "PASS: master and replica agree"
+echo ">>> verifying applied progress and complete typed rows"
+export MYSQL_ROOT_PASSWORD MYDB_ROOT_PASSWORD="${MYDB_ROOT_PASSWORD:-root}"
+python3 "$ROOT_DIR/scripts/replication_check.py" \
+  --source-port "${MYDB_PORT}" --source-password-env MYDB_ROOT_PASSWORD \
+  --replica-port "${MYSQL_PORT}" --replica-password-env MYSQL_ROOT_PASSWORD \
+  --database appdb --timeout "${CATCHUP_TIMEOUT_S:-300}"

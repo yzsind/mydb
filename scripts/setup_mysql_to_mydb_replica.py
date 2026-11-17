@@ -135,10 +135,10 @@ def run_snapshot(args, source, log_file, log_pos):
         die("--snapshot requires --databases (comma list of databases to copy)")
     dump_path = args.work_dir / "snapshot.sql"
     dump_cmd = [
-        "mysqldump", f"-h{args.source_host}", f"-P{args.source_port}",
+        str(args.mysqldump), f"-h{args.source_host}", f"-P{args.source_port}",
         f"-u{source['user']}",
-        f"--password={source['password'] or ''}",
         "--single-transaction", "--skip-lock-tables", "--skip-triggers",
+        "--hex-blob", "--default-character-set=utf8mb4", "--skip-add-locks", "--skip-disable-keys",
         "--set-gtid-purged=OFF", "--no-tablespaces", "--column-statistics=0",
         "--databases", *args.databases.split(","),
     ]
@@ -147,11 +147,15 @@ def run_snapshot(args, source, log_file, log_pos):
     for coord_flag in ("--source-data=2", "--master-data=2"):
         cmd = dump_cmd + [coord_flag]
         try:
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=3600)
+            partial = dump_path.with_suffix('.sql.part')
+            with partial.open('wb') as output:
+                result = subprocess.run(cmd, stdout=output, stderr=subprocess.PIPE,
+                    text=True, encoding='utf-8', timeout=3600,
+                    env=os.environ | {'MYSQL_PWD': source['password'] or ''})
         except FileNotFoundError:
             die("mysqldump not found on PATH; install it or use incremental-only mode")
         if result.returncode == 0:
-            dump_path.write_text(result.stdout)
+            partial.replace(dump_path)
             break
         if "unknown option" not in result.stderr and "unknown variable" not in result.stderr:
             sys.stderr.write(result.stderr)
@@ -159,15 +163,16 @@ def run_snapshot(args, source, log_file, log_pos):
     else:
         die("mysqldump rejected both --source-data and --master-data")
     # Coordinates embedded as a comment by --source-data=2.
-    text = dump_path.read_text()
     marker = None
-    for line in text.splitlines():
-        if line.startswith("--") and "CHANGE REPLICATION SOURCE TO" in line:
-            marker = line
+    with dump_path.open(encoding='utf-8') as dump:
+        for line in dump:
+            if line.startswith('--') and ('CHANGE REPLICATION SOURCE TO' in line or 'CHANGE MASTER TO' in line):
+                marker = line.strip()
+                break
     if marker is None:
         die("could not find snapshot coordinates in mysqldump output")
     import re
-    m = re.search(r"SOURCE_LOG_FILE='([^']+)',\s*SOURCE_LOG_POS=(\d+)", marker)
+    m = re.search(r"(?:SOURCE|MASTER)_LOG_FILE='([^']+)',\s*(?:SOURCE|MASTER)_LOG_POS=(\d+)", marker)
     if not m:
         die(f"unrecognized coordinate comment: {marker}")
     log_file, log_pos = m.group(1), int(m.group(2))
@@ -176,33 +181,16 @@ def run_snapshot(args, source, log_file, log_pos):
 
 
 def restore_filtered_dump(args, dump_path):
-    """Stream the dump into mydb, dropping session/bootstrap statements mydb rejects.
-
-    mysqldump emits `/*!80000 SET SESSION information_schema_stats_expiry=0 */`
-    and friends; mydb lacks several of those sysvars (docs/sysvar-config-bugs
-    audit V-01) and 1193-aborts mid-restore, so header/footer SET blocks,
-    LOCK/UNLOCK TABLES guards and version comments are stripped. DDL and
-    INSERT payloads are kept verbatim, one statement per execution.
-    """
-    stmts = []
-    buf = []
-    for line in dump_path.read_text(errors="replace").splitlines(keepends=True):
-        stripped = line.strip()
-        if stripped.startswith("/*!") or stripped.upper().startswith(("SET ", "LOCK TABLES", "UNLOCK TABLES")):
-            continue
-        if stripped.startswith("--") or not stripped:
-            if not buf:
-                continue
-        buf.append(line)
-        if stripped.endswith(";"):
-            stmts.append("".join(buf))
-            buf = []
+    """Restore one complete statement at a time, including dump session semantics."""
+    from _sql_dump import statements
     mydb = connect_mydb(args)
     try:
-        total = len(stmts)
-        for i, stmt in enumerate(stmts, 1):
-            with mydb.cursor() as cur:
-                cur.execute(stmt)
+        total = 0
+        with dump_path.open(encoding='utf-8') as source:
+            for statement in statements(source):
+                with mydb.cursor() as cursor:
+                    cursor.execute(statement)
+                total += 1
         mydb.commit()
         print(f"[3/6] snapshot restored: {total} statements into mydb")
     finally:
@@ -275,7 +263,7 @@ def configure_replication(args, repl_user, repl_password, log_file, log_pos, gti
     try:
         query(conn, sql)
     except pymysql.err.Error as exc:
-        die(f"CHANGE REPLICATION SOURCE TO failed: {exc}\n  {sql}")
+        die(f"CHANGE REPLICATION SOURCE TO failed: {exc}")
     finally:
         conn.close()
     print(f"[5/6] channel configured ({'GTID auto-position' if args.auto_position else f'{log_file}:{log_pos}'})")
@@ -371,11 +359,19 @@ def main():
                     help="use GTID auto-position (source must have gtid_mode=ON)")
     ap.add_argument("--databases", default=None,
                     help="comma list replicated via REPLICATE_DO_DB filter (also scopes --snapshot)")
+    ap.add_argument("--mysqldump", type=Path, default=Path("mysqldump"),
+                    help="mysqldump executable compatible with the source server version")
     ap.add_argument("--snapshot", action="store_true",
                     help="copy existing data with mysqldump before attaching (needs --databases)")
     ap.add_argument("--no-smoke", action="store_true", help="skip the end-to-end smoke insert")
     ap.add_argument("--work-dir", type=Path, default=Path("/tmp/mydb/mysql-replica-setup"))
     args = ap.parse_args()
+
+    # gtid_purged is read-only in mydb. A dump cannot seed the source GTID
+    # history, so auto-position would replay transactions already in the dump.
+    if args.snapshot and args.auto_position:
+        ap.error('--snapshot cannot use --auto-position: snapshot GTID import is unsupported; '
+                 'omit --auto-position to resume at the dump-consistent file position')
 
     if not args.work_dir.resolve().is_relative_to(Path("/tmp/mydb").resolve()):
         ap.error("--work-dir must live under /tmp/mydb")

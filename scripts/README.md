@@ -10,8 +10,10 @@ are optional and are not included in a public checkout.
 Scripts run locally by default. Temporary databases, caches, logs, and samples
 belong under `/tmp/mydb`. Protocol tests may create or rebuild dedicated databases;
 read each entry point's docstring and `--help`, and use disposable instances.
-Tool binaries require `--features tools`; Python drivers document their own
-optional dependencies.
+Root tool binaries require `--features tools`; development binaries use
+`cargo run -p mydb-dev-tools --release --bin NAME -- ARGS`. Shared Python
+runtime and offline test dependencies are pinned in `scripts/requirements.txt`.
+Use Python 3.12 or later.
 
 Release archives use `mydb-VERSION-macos-arm64.tar.gz`,
 `mydb-VERSION-linux-x86_64.tar.gz`, and `mydb-VERSION-windows-x86_64.zip`.
@@ -87,17 +89,84 @@ TPC-audited performance results.
 
 ```bash
 mkdir -p /tmp/mydb
-PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp/mydb python3 scripts/test_script_maintenance.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_release_build.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_linux_compat.py
-PYTHONDONTWRITEBYTECODE=1 python3 scripts/test_elf_abi.py
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts -p test_function_expression_bench.py
+python3 -m venv /tmp/mydb/scripts-venv
+TMPDIR=/tmp/mydb PIP_CACHE_DIR=/tmp/mydb/pip-cache \
+  /tmp/mydb/scripts-venv/bin/python -m pip install -r scripts/requirements.txt
+PYTHONDONTWRITEBYTECODE=1 TMPDIR=/tmp/mydb \
+  /tmp/mydb/scripts-venv/bin/python scripts/run_script_tests.py
+/tmp/mydb/scripts-venv/bin/python scripts/check_documentation_contracts.py
 python3 scripts/check_function_test_coverage.py --check
 python3 scripts/check_docs.py
 python3 scripts/generate_mysql80_information_schema_rust.py --check
 python3 scripts/generate_mysql80_performance_schema_rust.py --check
 scripts/render_storage_format_versions.sh --check
 ```
+
+`run_script_tests.py` automatically loads `test_*.py` modules declaring unittest
+cases, while keeping standalone integration drivers out of import discovery.
+Import errors and failing cases fail the command. Its JSON evidence records
+Python/platform, dependency versions, source hashes and per-run test counts.
+CI uses the same entry point and dependency pins.
+
+### Result comparison contracts
+
+TPC-H and TPC-DS checkers compare exact UTF-8 TSV cells and row order by default.
+They preserve empty cells/rows, whitespace, duplicates, numeric-looking strings,
+and case-sensitive text. Invalid UTF-8, inconsistent widths, and empty,
+duplicated, reversed or out-of-range query selections fail explicitly.
+
+Use `--comparison-manifest FILE` for explicit per-query JSON contracts, for example:
+
+```json
+{"1": {"columns": ["text", "decimal"], "order_keys": [0], "null_marker": "\\N"}}
+```
+
+Column indices are zero-based. `text` is exact; `integer`, `decimal` and `float`
+normalize numeric spelling without rounding or a global precision tolerance.
+`order_keys` permits permutations only within consecutive equal-key groups;
+the group sequence must match. `unordered: true` is reserved for queries with
+no ordering contract and cannot be combined with `order_keys`. Without an
+explicit contract the checker never guesses column types or discards order.
+TSV capture must use an unambiguous NULL marker/escaping convention: legacy
+files rendering both SQL NULL and the literal string `NULL` as `NULL` cannot
+recover that distinction. The default treats that token as exact text.
+For full type fidelity, use `capture_tabular_result.py --port PORT --database DB
+--sql QUERY.sql --output q01.json` on each endpoint. Then select
+`{"1": {"format": "typed-json"}}` in the comparison manifest and pass
+`--actual-pattern 'q{query:02d}.json'`. Captures preserve column wire types,
+SQL NULL, numeric-looking strings, exact decimals, binary bytes and temporal
+values, and bind the evidence to the query's SHA-256. The checker rejects
+changed metadata or query identities as well as changed values.
+
+### Replication and oracle gates
+
+`replication_check.py` waits for applied file/position (or durable applied LSN),
+rejects replication errors and catchup timeouts, and compares every complete
+typed row including duplicates. SQLite spills exact row multisets under
+`/tmp/mydb` with bounded batch memory. The source must be quiescent during
+verification; a changed source position fails the run. Shell drivers discover
+tables from both endpoints instead of assuming workload-specific table names.
+Use `MYDB_BINARY` to select an already-built server executable.
+
+Snapshot initialization uses the dump-consistent file position. Combining
+`setup_mysql_to_mydb_replica.py --snapshot` with `--auto-position` is rejected
+before connecting or changing accounts: mydb's read-only GTID history cannot
+be seeded from the dump. Incremental-only GTID setup remains available. Use `--mysqldump PATH` to
+select a dump executable compatible with the source server (for example an
+8.0 client for an 8.0 source). Dumps use hexadecimal binary values and stream
+to disk; restore preserves executable SET/DDL comments, quoted/multiline data,
+UTC timestamps and `NO_AUTO_VALUE_ON_ZERO` rather than dropping session state.
+Unsupported DELIMITER/routine dumps and truncated statements fail explicitly.
+
+Docker oracles create unique container names and owner labels. An explicitly
+requested existing name is a collision, never a deletion target; cleanup checks
+the captured container ID and owner label. TCP container readiness and SQL failures
+fail the run. Custom data directories must be empty and below `/tmp/mydb`, and
+are never removed by cleanup. PostgreSQL generation preserves an existing
+golden file on query failure, reports failed/missing timing as `fail,-1`, and
+returns nonzero if any selected query fails. Test-only paths can be redirected
+with `TPCDS_PG_EXPECTED_DIR` and `TPCDS_PG_RESULT_DIR`.
+
 
 Do not commit `__pycache__`, `.pyc`, `.DS_Store`, temporary data, logs, or local
 performance reports. Internal tools may reuse public fixtures, but public builds

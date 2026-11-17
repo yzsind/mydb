@@ -19,6 +19,11 @@ def sha256(path):
         return hashlib.file_digest(source, 'sha256').hexdigest()
 
 
+def require(condition, message):
+    if not condition:
+        raise ValueError(message)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--package', type=Path, required=True)
@@ -43,22 +48,22 @@ def main():
     payload = extracted / prefix
     manifest_path = args.manifest or args.package.with_name(prefix + '.build-manifest.json')
     manifest = json.loads(manifest_path.read_text())
-    assert manifest['schema_version'] == 2
+    require(manifest['schema_version'] == 2, 'unsupported build manifest schema')
     version = manifest['version']
-    assert package_prefix(version, manifest['host']) == prefix
+    require(package_prefix(version, manifest['host']) == prefix, 'archive name does not match manifest version and target')
     windows = 'windows' in manifest['host']
     files = manifest['files']
-    assert files
+    require(files, 'manifest has no runtime files')
     actual = {p.relative_to(payload).as_posix() for p in payload.rglob('*') if p.is_file()}
-    assert actual == set(files) == set(runtime_files(payload, windows=windows)), 'unexpected or missing runtime files'
+    require(actual == set(files) == set(runtime_files(payload, windows=windows)), 'unexpected or missing runtime files')
     for name, expected in files.items():
-        assert sha256(payload / name) == expected, name
+        require(sha256(payload / name) == expected, f'runtime SHA-256 mismatch: {name}')
     for name, package, hash_key in [(f'mydb-{version}.Cargo.lock', 'mydb', 'cargo_lock_sha256'),
                                     (f'mydb-{version}-cli.Cargo.lock', 'mydb-cli', 'client_cargo_lock_sha256')]:
         path = args.package.parent / name
-        assert sha256(path) == manifest[hash_key], name
+        require(sha256(path) == manifest[hash_key], f'lockfile SHA-256 mismatch: {name}')
         lock = tomllib.loads(path.read_text())
-        assert next(p['version'] for p in lock['package'] if p['name'] == package) == version
+        require(next(p['version'] for p in lock['package'] if p['name'] == package) == version, f'lockfile version mismatch: {name}')
     result = {'version': version, 'package': args.package.name, 'sha256': sha256(args.package),
               'source_sha256': manifest['source_sha256'], 'head': manifest.get('head'),
               'manifest': manifest_path.name, 'manifest_sha256': sha256(manifest_path),
@@ -81,8 +86,8 @@ def main():
                                        encoding='utf-8', stderr=subprocess.STDOUT, timeout=90).strip()
 
     versions = {name: run([binaries[name], '--version']) for name in ['mydb', 'mydb-cli']}
-    assert f'mydb-{version}-' in versions['mydb'], versions
-    assert versions['mydb-cli'] == f'mydb-cli {version}', versions
+    require(f'mydb-{version}-' in versions['mydb'], versions)
+    require(versions['mydb-cli'] == f'mydb-cli {version}', versions)
     for binary in binaries.values():
         run([binary, '--help'])
     with socket.socket() as listener:
@@ -102,7 +107,7 @@ def main():
                                        cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
         deadline = time.monotonic() + 90
         while time.monotonic() < deadline:
-            assert process.poll() is None, f'server exited; inspect server-{index}.log'
+            require(process.poll() is None, f'server exited; inspect server-{index}.log')
             try:
                 with socket.create_connection(('127.0.0.1', port), timeout=1):
                     return
@@ -113,18 +118,19 @@ def main():
     try:
         start(1)
         server_version = sql('SELECT VERSION()')
-        assert f'mydb-{version}-' in server_version, server_version
+        require(f'mydb-{version}-' in server_version, server_version)
         sql('CREATE TABLE release_smoke(id INT PRIMARY KEY, amount DECIMAL(20,4), label VARCHAR(64), doc JSON, KEY amount_idx(amount));'
             'INSERT INTO release_smoke VALUES(1,12.3456,\'release\',\'{"ok":true}\');'
             'BEGIN; UPDATE release_smoke SET amount=99 WHERE id=1; ROLLBACK;')
         expected = '1\t12.3456\trelease\ttrue'
         query = "SELECT id,amount,label,JSON_EXTRACT(doc,'$.ok') FROM release_smoke ORDER BY id"
-        assert sql(query) == expected
+        require(sql(query) == expected, 'typed SQL or transaction rollback result mismatch')
         process.kill()
         process.wait(timeout=30)
         start(2)
-        assert sql(query) == expected, 'committed data or rollback changed after crash recovery'
-        assert sql('SELECT id FROM release_smoke FORCE INDEX(amount_idx) WHERE amount=12.3456') == '1'
+        require(sql(query) == expected, 'committed data or rollback changed after crash recovery')
+        require(sql('SELECT id FROM release_smoke FORCE INDEX(amount_idx) WHERE amount=12.3456') == '1',
+                'secondary index lookup failed after recovery')
         result.update(versions=versions, server_version=server_version, execution='native')
         result['checks'] += ['binary-versions', 'binary-help', 'tls-required', 'sql-types',
                              'transaction-rollback', 'crash-recovery', 'secondary-index']
