@@ -29,7 +29,7 @@
 #   MTR_REF   git ref/branch on mysql/mysql-server
 #             (default: pinned commit below for reproducible imports)
 
-set -uo pipefail
+set -euo pipefail
 
 DEFAULT_REF="d229bb760c49b65e19ec28342236961ad961d7fe"
 REF="${MTR_REF:-${DEFAULT_REF}}"
@@ -44,13 +44,49 @@ if [ "$#" -eq 0 ]; then
   exit 2
 fi
 
+# Validate the entire plan before writing anything, including both destinations
+# of a test/result pair and existing symlinks beneath the corpus root.
+if ! python3 - "$TRIAGE_DIR" "$@" <<'PY_VALIDATE'
+from pathlib import Path
+import re
+import sys
+root = Path(sys.argv[1]).resolve()
+for descriptor in sys.argv[2:]:
+    kind, separator, path = descriptor.partition(':')
+    if not separator:
+        kind, path = 'test', descriptor
+    parts = path.split('/')
+    if (kind not in ('test', 'inc', 'data') or not path
+            or any(part in ('', '.', '..') or not re.fullmatch(r'[A-Za-z0-9_.+-]+', part) for part in parts)
+            or (kind == 'test' and len(parts) > 2)):
+        sys.exit('invalid import descriptor: ' + repr(descriptor))
+    if kind == 'test':
+        relative = path if len(parts) == 2 else 'main/' + path
+        destinations = ['t/' + relative + '.test', 'upstream/' + relative + '.result']
+    else:
+        destinations = [path]
+    for destination in destinations:
+        if not (root / destination).resolve().is_relative_to(root):
+            sys.exit('import destination escapes corpus through a symlink: ' + descriptor)
+PY_VALIDATE
+then
+  exit 2
+fi
+
+mkdir -p /tmp/mydb
+partial=""
+trap 'if [[ -n "$partial" ]]; then rm -f -- "$partial"; fi' EXIT
+
 fetch() {
-  # $1 = url, $2 = dest
   local url="$1" dest="$2"
-  mkdir -p "$(dirname "$dest")"
-  if curl -sf --max-time 30 "$url" -o "$dest"; then
+  mkdir -p "$(dirname "$dest")" || return 1
+  partial="$(mktemp /tmp/mydb/mtr-import.XXXXXX)" || return 1
+  if curl -sf --max-time 30 "$url" -o "$partial" && mv -f -- "$partial" "$dest"; then
+    partial=""
     return 0
   fi
+  rm -f -- "$partial"
+  partial=""
   return 1
 }
 
@@ -98,9 +134,13 @@ for spec in "$@"; do
   fi
 
   if fetch "$test_url" "${T_DIR}/${rel}.test"; then
-    fetch "$res_url" "${U_DIR}/${rel}.result" || true
-    echo "  fetched ${rel}"
-    ok=$((ok+1))
+    if fetch "$res_url" "${U_DIR}/${rel}.result"; then
+      echo "  fetched ${rel}"
+      ok=$((ok+1))
+    else
+      echo "  MISSING result ${rel} (${res_url})" >&2
+      miss=$((miss+1))
+    fi
   else
     echo "  MISSING ${rel} (${test_url})" >&2
     miss=$((miss+1))
@@ -109,3 +149,5 @@ done
 
 echo "mtr_import: ${ok} fetched, ${miss} missing → ${T_DIR}"
 echo "next: cargo nextest run --run-ignored only --no-capture mtr_triage"
+
+(( miss == 0 ))

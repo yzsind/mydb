@@ -209,6 +209,21 @@ elif args[0] == 'exec':
                 self.assertTrue(all('--protocol=TCP' in args and '--host=127.0.0.1' in args
                                     and '--port=3306' in args for args in probes))
 
+    def test_replication_network_preserves_loopback_on_linux_and_desktop(self):
+        script = ('set -euo pipefail\nsource "$1"\n'
+                  'uname() { echo "$TEST_PLATFORM"; }\n'
+                  'mydb_source_network\n'
+                  'printf "%s\\n" "$MYSQL_CONTAINER_PORT" "$MYSQL_CONTAINER_BIND" '
+                  '"$MYDB_HOST_FROM_DOCKER" "${MYSQL_NETWORK[@]}"\n')
+        for platform, expected in [('Linux', ['44310', '127.0.0.1', '127.0.0.1', '--network', 'host']),
+                                   ('Darwin', ['3306', '0.0.0.0', 'host.docker.internal', '-p', '127.0.0.1:44310:3306'])]:
+            result = subprocess.run(['bash', '-c', script, 'test', str(ROOT / '_docker_test.sh')],
+                env=os.environ | dict(TEST_PLATFORM=platform, MYSQL_PORT='44310',
+                                      MYDB_DOCKER_NETWORK='auto', MYDB_HOST_FROM_DOCKER=''),
+                capture_output=True, text=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), expected)
+
     def test_custom_data_directories_are_never_deleted(self):
         folder = self.root / 'custom'; folder.mkdir()
         script = 'set -euo pipefail\nsource "$1"\nmydb_test_data_init\nmydb_test_data_cleanup\n'

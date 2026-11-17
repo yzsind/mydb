@@ -28,6 +28,7 @@ import signal
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import uuid
 
@@ -618,18 +619,31 @@ def equivalent(left, right, comparison):
 
 
 def sort_capture(path):
-    target = path.with_suffix(".sorted")
-    if target.exists() and target.stat().st_mtime_ns >= path.stat().st_mtime_ns:
+    target = path.with_suffix('.sorted')
+    metadata = target.with_suffix('.sorted.json')
+    source_hash = digest_file(path)
+    try:
+        record = json.loads(metadata.read_text(encoding='utf-8'))
+        if (record.get('version') == 1 and record.get('source_sha256') == source_hash
+                and record.get('sorted_sha256') == digest_file(target)):
+            return target
+    except (OSError, ValueError, AttributeError):
+        pass
+    env = dict(os.environ, LC_ALL='C', TMPDIR=str(path.parent))
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix='.sort-part', delete=False) as output:
+            temporary = Path(output.name)
+            subprocess.run(['sort', '-t', '\t', '-k1,1n', str(path)], stdout=output, env=env, check=True)
+        if digest_file(path) != source_hash:
+            raise ValueError(f'capture changed during sorting: {path}')
+        sorted_hash = digest_file(temporary)
+        temporary.replace(target)
+        dump(metadata, dict(version=1, source_sha256=source_hash, sorted_sha256=sorted_hash))
         return target
-    env = dict(os.environ, LC_ALL="C", TMPDIR=str(path.parent))
-    with target.open("wb") as output:
-        subprocess.run(
-            ["sort", "-t", "\t", "-k1,1n", str(path)],
-            stdout=output,
-            env=env,
-            check=True,
-        )
-    return target
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
 
 
 def compare_captures(left, right, comparison, numeric_columns=False):
@@ -1199,6 +1213,7 @@ def run(args, validate_only=False):
                 capture.unlink()
             for ordered in case_dir.glob("*.sorted"):
                 ordered.unlink()
+                ordered.with_suffix(".sorted.json").unlink(missing_ok=True)
             print(
                 f"[{index+1}/{len(cases)}] {case['id']}: "
                 + ", ".join(f"{k}={v['status']}" for k, v in result["engines"].items())

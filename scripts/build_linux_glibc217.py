@@ -16,12 +16,16 @@ import subprocess
 import tarfile
 import tomllib
 import urllib.request
+from urllib.parse import urlsplit
 from release_archive import package_prefix, runtime_files, write_archive, write_runtime_readme
 
 IMAGE = 'quay.io/pypa/manylinux2014_x86_64@sha256:f6a6f153c9cf45470507ebbc27013e5db14ce21331b62fd2c540561f25e5f0a5'
 RUST = '1.95.0'
-NEXT = '0.9.151'
-NEXT_SHA256 = '6b284d6fde9670dfb6ee10ea9d9abbc85f95643d3f592472d420d82e257b3a6c'
+NEXT_RELEASE = dict(line.split('=', 1) for line in
+    Path(__file__).with_name('nextest-release.env').read_text(encoding='utf-8').splitlines()
+    if line and not line.startswith('#'))
+NEXT = NEXT_RELEASE['NEXT_VERSION']
+NEXT_SHA256 = NEXT_RELEASE['NEXT_X86_64_SHA256']
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -120,7 +124,29 @@ def verify_test_artifacts(build, manifest, nextest):
         raise SystemExit('nextest runner differs from the successful build manifest')
 
 
-def ensure_openssl_build_tools():
+def centos_vault_mirror(value):
+    url = urlsplit(value)
+    if (url.scheme != 'https' or not url.netloc or url.username or url.password
+            or url.query or url.fragment or any(char.isspace() for char in value)):
+        raise ValueError('CentOS vault mirror must be an HTTPS URL without credentials, query or fragment')
+    return value.rstrip('/')
+
+
+def configure_centos_vault_mirror(mirror, directory=Path('/etc/yum.repos.d')):
+    mirror = centos_vault_mirror(mirror)
+    pattern = re.compile(r'(?m)^([ \t]*baseurl[ \t]*=[ \t]*)https://vault\.centos\.org/(?:centos/)?(?:7(?:\.9\.2009)?|\$releasever)(?=/)')
+    changed = 0
+    for path in directory.glob('*.repo'):
+        source = path.read_text(encoding='utf-8')
+        updated, count = pattern.subn(lambda match: match[1] + mirror, source)
+        if count:
+            path.write_text(updated, encoding='utf-8')
+            changed += count
+    if not changed:
+        raise RuntimeError('no compatible CentOS vault baseurl found for the requested mirror')
+
+
+def ensure_openssl_build_tools(mirror=None, cache=None):
     """The minimal manylinux Perl omits modules required by vendored OpenSSL."""
     probe = ['perl', '-MIPC::Cmd', '-MTime::Piece', '-MDigest::SHA', '-e',
              'print "$^V IPC::Cmd=$IPC::Cmd::VERSION Time::Piece=$Time::Piece::VERSION\\n"']
@@ -128,7 +154,15 @@ def ensure_openssl_build_tools():
     if result.returncode:
         if not shutil.which('yum'):
             raise SystemExit('vendored OpenSSL requires Perl IPC::Cmd in the pinned builder')
-        call(['yum', '--setopt=timeout=20', '--setopt=retries=1', 'install', '-y', 'perl-core'])
+        if mirror:
+            configure_centos_vault_mirror(mirror)
+        cache_options = []
+        if cache is not None:
+            cache.mkdir(parents=True, exist_ok=True)
+            cache_options = [f'--setopt=cachedir={cache}', '--setopt=keepcache=1']
+        call(['yum', '--setopt=timeout=20', '--setopt=retries=1', '--setopt=gpgcheck=1',
+              '--disablerepo=*', '--enablerepo=base', '--enablerepo=updates', '--enablerepo=extras',
+              *cache_options, 'install', '-y', 'perl-core'])
         result = subprocess.run(probe, capture_output=True, text=True, check=True)
     print('OpenSSL Perl prerequisite: ' + result.stdout.strip(), flush=True)
     return result.stdout.strip()
@@ -156,7 +190,7 @@ def inside(args):
                                  'CPATH', 'LIBRARY_PATH') if os.environ.get(name)]
     if polluted:
         raise SystemExit('unexpected compiler overrides: ' + ', '.join(polluted))
-    perl = ensure_openssl_build_tools()
+    perl = ensure_openssl_build_tools(getattr(args, 'centos_vault_mirror', None), args.output / 'yum-cache')
     if not shutil.which('cargo'):
         # rustup verifies official toolchain downloads. Keep the installer and
         # all caches under the caller's output directory.
@@ -222,6 +256,7 @@ def inside(args):
                 'test_artifacts': test_artifacts,
                 'test_build': test_build,
                 'builder_sha256': file_sha256(Path(__file__)),
+                'centos_vault_mirror': getattr(args, 'centos_vault_mirror', None),
                 'archive_writer_sha256': file_sha256(Path(__file__).with_name('release_archive.py')),
                 'license_collector_sha256': file_sha256(Path(__file__).with_name('release_licenses.py')),
                 'files': {name: file_sha256(path) for name, path in sorted(contents.items())},
@@ -246,6 +281,8 @@ def main():
     parser.add_argument('--output', type=Path, default=Path('/tmp/mydb/linux-glibc217'))
     parser.add_argument('--source', type=Path, default=ROOT)
     parser.add_argument('--image', default=IMAGE)
+    parser.add_argument('--centos-vault-mirror', type=centos_vault_mirror,
+                        help='optional HTTPS CentOS 7 archive mirror for builder prerequisites; RPM signatures remain required')
     parser.add_argument('--toolchain', type=Path, help='existing Linux Rust 1.95.0 sysroot')
     parser.add_argument('--nextest', type=Path, help='static Linux cargo-nextest for --test-archive')
     parser.add_argument('--cargo-home', type=Path, help='isolated dependency cache, optionally with registry mirror configuration')
@@ -270,6 +307,8 @@ def main():
         raise SystemExit('--jobs must be positive')
     if args.output == args.source or args.source in args.output.parents:
         raise SystemExit('output must be outside the source checkout')
+    # Reject invalid public inputs before downloads or container setup.
+    source_hash(args.source)
     cargo_home = (args.cargo_home or args.output / 'cargo-home').resolve()
     cargo_home.mkdir(parents=True, exist_ok=True)
     command = ['docker', 'run', '--rm', '--platform', 'linux/amd64',
@@ -290,6 +329,8 @@ def main():
     command.extend(['-e', f'PATH={path}', args.image, 'python3',
                     args.source / 'scripts/build_linux_glibc217.py', '--inside',
                     '--source', args.source, '--output', args.output, '--image', args.image])
+    if args.centos_vault_mirror:
+        command.extend(['--centos-vault-mirror', args.centos_vault_mirror])
     if args.offline:
         command.append('--offline')
     if args.test_archive:

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
 import json
 import math
 import re
@@ -282,43 +283,79 @@ def normalize_wkt(value: str) -> str:
     return value.replace("MULTIPOINT((", "MULTIPOINT(").replace("),(", ",").replace("))", ")").replace(" ", "")
 
 
-def semantic_cell_equal(function: str, left: object, right: object) -> bool:
-    if left == right:
-        return True
-    if not isinstance(left, str) or not isinstance(right, str):
+NUMERIC_TYPES = {'TINY', 'SHORT', 'INT24', 'LONG', 'LONGLONG', 'FLOAT', 'DOUBLE', 'DECIMAL', 'NEWDECIMAL', 'YEAR'}
+NUMBER = re.compile(r'[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?')
+
+
+def json_equal(left, right):
+    if type(left) is not type(right):
         return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(json_equal(value, right[key]) for key, value in left.items())
+    if isinstance(left, list):
+        return len(left) == len(right) and all(json_equal(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def column_kind(outcome, index):
+    columns = outcome.get('columns', [])
+    if index >= len(columns):
+        return None
+    kind = str(columns[index].get('type', '')).upper().removeprefix('MYSQL_TYPE_')
+    if kind in NUMERIC_TYPES:
+        return 'numeric'
+    if kind == 'JSON':
+        return 'json'
+    if kind in {'DATE', 'NEWDATE', 'DATETIME', 'TIMESTAMP'}:
+        return 'temporal'
+    return 'text'
+
+
+def semantic_cell_equal(function: str, left: object, right: object, *, kind='text') -> bool:
+    if not isinstance(left, str) or not isinstance(right, str):
+        return (type(left) is type(right) and left == right
+                and (not isinstance(left, float) or math.isfinite(left)))
     if function in DYNAMIC_FUNCTIONS and dynamic_cell(function, left) and dynamic_cell(function, right):
         return True
-    if left.rstrip("0").rstrip(".") == right.rstrip("0").rstrip(".") and ("." in left or "." in right):
+    if kind == 'numeric':
+        if left == right == 'NULL':
+            return True
+        if not NUMBER.fullmatch(left) or not NUMBER.fullmatch(right):
+            return False
+        try:
+            a, b = Decimal(left), Decimal(right)
+        except InvalidOperation:
+            return False
+        if not a.is_finite() or not b.is_finite():
+            return False
+        if function in APPROXIMATE_FUNCTIONS:
+            a, b = float(a), float(b)
+            return math.isfinite(a) and math.isfinite(b) and math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-9)
+        return a == b
+    if kind == 'temporal' and (f'{left} 00:00:00' == right or f'{right} 00:00:00' == left):
         return True
-    if f"{left} 00:00:00" == right or f"{right} 00:00:00" == left:
+    if kind == 'json':
+        if left == right == 'NULL':
+            return True
+        try:
+            def reject(value):
+                raise ValueError(f'nonfinite JSON number: {value}')
+            a = json.loads(left, parse_float=Decimal, parse_int=Decimal, parse_constant=reject)
+            b = json.loads(right, parse_float=Decimal, parse_int=Decimal, parse_constant=reject)
+            return json_equal(a, b)
+        except (ValueError, InvalidOperation):
+            return False
+    if left == right:
         return True
-    if re.sub(r"\.0+$", "", left) == re.sub(r"\.0+$", "", right):
-        return True
-    if left.startswith(("POINT(", "LINESTRING(", "POLYGON(", "MULTI", "GEOMETRYCOLLECTION(")) and right.startswith(("POINT(", "LINESTRING(", "POLYGON(", "MULTI", "GEOMETRYCOLLECTION(")):
+    if function.startswith('ST_') and left.startswith(('POINT(', 'LINESTRING(', 'POLYGON(', 'MULTI', 'GEOMETRYCOLLECTION(')) and right.startswith(('POINT(', 'LINESTRING(', 'POLYGON(', 'MULTI', 'GEOMETRYCOLLECTION(')):
         if normalize_wkt(left) == normalize_wkt(right):
             return True
-        number = re.compile(r"-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?")
-        if number.sub("#", left) == number.sub("#", right):
-            left_values = [float(value) for value in number.findall(left)]
-            right_values = [float(value) for value in number.findall(right)]
-            return len(left_values) == len(right_values) and all(
-                math.isclose(a, b, rel_tol=1e-5, abs_tol=1e-9)
-                for a, b in zip(left_values, right_values)
-            )
-    try:
-        left_json = json.loads(left)
-        right_json = json.loads(right)
-    except (json.JSONDecodeError, TypeError):
-        pass
-    else:
-        if left_json == right_json:
-            return True
-    if function in APPROXIMATE_FUNCTIONS:
-        try:
-            return math.isclose(float(left), float(right), rel_tol=1e-5, abs_tol=1e-9)
-        except ValueError:
-            return False
+        number = re.compile(r'-?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?')
+        if number.sub('#', left) == number.sub('#', right):
+            a = [float(value) for value in number.findall(left)]
+            b = [float(value) for value in number.findall(right)]
+            return len(a) == len(b) and all(math.isfinite(x) and math.isfinite(y)
+                and math.isclose(x, y, rel_tol=1e-5, abs_tol=1e-9) for x, y in zip(a, b))
     return False
 
 
@@ -336,8 +373,14 @@ def outcomes_equal(function: str, case: dict[str, object], left: dict[str, objec
     for left_row, right_row in zip(left_rows, right_rows):
         if len(left_row) != len(right_row):
             return False
-        if not all(semantic_cell_equal(function, a, b) for a, b in zip(left_row, right_row)):
-            return False
+        for index, (a, b) in enumerate(zip(left_row, right_row)):
+            kinds = [kind for item in (left, right) if (kind := column_kind(item, index)) is not None]
+            if not kinds:
+                kinds = [kind for item in (case.get('mysql_probe', {}), case.get('mydb_probe', {}))
+                         if (kind := column_kind(item, index)) is not None]
+            kind = kinds[0] if kinds and len(set(kinds)) == 1 else 'text'
+            if not semantic_cell_equal(function, a, b, kind=kind):
+                return False
     if left.get("warning_codes", []) != right.get("warning_codes", []):
         return False
     if (

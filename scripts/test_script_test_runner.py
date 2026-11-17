@@ -28,6 +28,14 @@ class ScriptRunnerTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             runner.unit_modules(self.root / 'missing')
 
+    def test_source_archive_does_not_require_git_or_inherit_parent_repository_identity(self):
+        with patch.object(runner.subprocess, 'check_output', side_effect=FileNotFoundError):
+            self.assertIsNone(runner.git_commit(self.root))
+        with patch.object(runner.subprocess, 'check_output', return_value=str(self.root.parent)):
+            self.assertIsNone(runner.git_commit(self.root))
+        with patch.object(runner.subprocess, 'check_output', side_effect=[str(self.root), 'a' * 40]):
+            self.assertEqual(runner.git_commit(self.root), 'a' * 40)
+
     def test_zero_or_all_skipped_tests_cannot_pass(self):
         empty = unittest.TestResult()
         self.assertFalse(runner.passed(empty))

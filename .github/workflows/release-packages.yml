@@ -86,7 +86,7 @@ jobs:
       - uses: actions/cache@v4
         with:
           path: /tmp/mydb/linux-glibc217
-          key: release-glibc217-rust195-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock', 'scripts/build_linux_glibc217.py') }}
+          key: release-glibc217-rust195-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'clients/mydb-cli/Cargo.lock', 'scripts/build_linux_glibc217.py', 'scripts/nextest-release.env') }}
       - name: Build portable package against glibc 2.17
         run: |
           python3 scripts/build_linux_glibc217.py \

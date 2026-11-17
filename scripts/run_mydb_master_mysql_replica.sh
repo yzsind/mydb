@@ -30,6 +30,7 @@ MYSQL_PORT="${MYSQL_PORT:-33310}"
 MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD:-mydb}"
 mydb_container_init "mydb-as-master-replica" "${CONTAINER:-}"
 ROWS_PER_TABLE="${ROWS_PER_TABLE:-1000}"
+mydb_source_network
 
 MYDB_PID=""
 
@@ -54,7 +55,7 @@ MYDB_DATA_DIR="${MYDB_DATA_DIR}" \
 MYDB_LOG_BIN=1 \
 MYDB_SERVER_ID=1 \
 MYDB_BINLOG_CHECKSUM=CRC32 \
-MYDB_ROOT_PASSWORD="${MYDB_ROOT_PASSWORD:-root}" "$MYDB_BINARY" --host 0.0.0.0 --port "${MYDB_PORT}" --data-dir "${MYDB_DATA_DIR}" &
+MYDB_ROOT_PASSWORD="${MYDB_ROOT_PASSWORD:-root}" "$MYDB_BINARY" --host "${MYDB_BIND_HOST:-127.0.0.1}" --port "${MYDB_PORT}" --data-dir "${MYDB_DATA_DIR}" &
 MYDB_PID=$!
 
 echo ">>> waiting for mydb to accept connections"
@@ -84,10 +85,11 @@ SQL
 echo ">>> launching MySQL replica on ${MYSQL_PORT}"
 mydb_container_run \
   -e MYSQL_ROOT_PASSWORD="${MYSQL_ROOT_PASSWORD}" \
-  -p "127.0.0.1:${MYSQL_PORT}:3306" \
-  --add-host=host.docker.internal:host-gateway \
+  "${MYSQL_NETWORK[@]}" \
   -d "${MYSQL_IMAGE}" \
   --server-id=2 \
+  --port="$MYSQL_CONTAINER_PORT" \
+  --bind-address="$MYSQL_CONTAINER_BIND" \
   --log-bin=mysql-bin \
   --binlog-format=ROW \
   --gtid-mode=ON \
@@ -96,11 +98,9 @@ mydb_container_run \
   >/dev/null
 
 echo ">>> waiting for MySQL replica to come up"
-mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}"
+mydb_container_wait "${MYSQL_READY_ATTEMPTS:-90}" "$MYSQL_CONTAINER_PORT"
 
-# host.docker.internal resolves to the host running mydb when the replica is
-# inside Docker Desktop; on Linux you may need to substitute another bridge IP.
-MYDB_HOST_FROM_DOCKER="${MYDB_HOST_FROM_DOCKER:-host.docker.internal}"
+# Docker Desktop routes to host loopback; Linux uses isolated loopback host networking.
 
 echo ">>> pointing MySQL replica at mydb master"
 docker exec -i "${CONTAINER}" mysql -uroot -p"${MYSQL_ROOT_PASSWORD}" <<SQL

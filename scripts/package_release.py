@@ -27,13 +27,7 @@ def command(*args, env=None):
     return subprocess.check_output(args, cwd=ROOT, text=True, env=env).strip()
 
 
-def build_provenance(source):
-    snapshot = ROOT / ".release-source.json"
-    if snapshot.is_file():
-        record = json.loads(snapshot.read_text())
-        if record["source_sha256"] != source:
-            raise SystemExit("snapshot provenance does not match candidate source")
-        return record["head"], record["worktree_status"]
+def build_provenance():
     return command("git", "rev-parse", "HEAD"), command("git", "status", "--short")
 
 
@@ -46,7 +40,7 @@ def main():
         parser.error("--output must not already exist")
     destination.parent.mkdir(parents=True, exist_ok=True)
     before = source_hash(ROOT)
-    head, status = build_provenance(before)
+    head, status = build_provenance()
     # A source-addressed build directory prevents unrelated workspace builds
     # from replacing release executables between cargo and artifact capture.
     build_dir = Path("/tmp/mydb/release-build") / before

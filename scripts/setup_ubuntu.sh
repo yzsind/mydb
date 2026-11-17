@@ -20,6 +20,7 @@ export TMPDIR=/tmp/mydb
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+source "$SCRIPT_DIR/_nextest_release.sh"
 
 WITH_BENCH=0
 SKIP_BUILD=0
@@ -39,9 +40,9 @@ Options:
 
 Optional nextest environment variables:
   MYDB_NEXTEST_ARCHIVE=/path/to/archive.tar.gz
-      Install a pre-downloaded official nextest archive.
+      Install a pre-downloaded pinned official nextest archive (SHA-256 checked).
   MYDB_NEXTEST_URL=https://mirror.example/archive.tar.gz
-      Download nextest from a trusted private or proxy mirror.
+      Mirror of the pinned official release; the same SHA-256 check applies.
   MYDB_DOWNLOAD_TIMEOUT=90
       Per-attempt download timeout in seconds (default: 90).
 
@@ -197,31 +198,16 @@ elif ((SKIP_NEXTEST)); then
 else
   echo "==> Installing cargo-nextest"
   mkdir -p "${CARGO_BIN_DIR}"
+  CUSTOM_NEXTEST_URL="${MYDB_NEXTEST_URL:-}"
+  mydb_nextest_asset "$(uname -m)" || true
+  NEXTEST_URL="${CUSTOM_NEXTEST_URL:-$NEXTEST_URL}"
   NEXTEST_ARCHIVE="${MYDB_NEXTEST_ARCHIVE:-}"
-  if [[ -n "${NEXTEST_ARCHIVE}" ]]; then
-    if [[ ! -r "${NEXTEST_ARCHIVE}" ]]; then
-      echo "Cannot read MYDB_NEXTEST_ARCHIVE: ${NEXTEST_ARCHIVE}" >&2
+  if [[ -n "$NEXTEST_ARCHIVE" ]]; then
+    if [[ ! -r "$NEXTEST_ARCHIVE" || -z "$NEXTEST_SHA256" ]]; then
+      echo "Cannot verify MYDB_NEXTEST_ARCHIVE for $(uname -m): $NEXTEST_ARCHIVE" >&2
       exit 1
     fi
   else
-    NEXTEST_URL="${MYDB_NEXTEST_URL:-}"
-    if [[ -z "${NEXTEST_URL}" ]]; then
-      case "$(uname -m)" in
-        x86_64)
-          NEXTEST_URL="https://get.nexte.st/0.9/linux"
-          ;;
-        aarch64|arm64)
-          NEXTEST_URL="https://get.nexte.st/0.9/linux-arm"
-          ;;
-        riscv64)
-          NEXTEST_URL="https://get.nexte.st/0.9/linux-riscv64"
-          ;;
-        *)
-          NEXTEST_URL=""
-          ;;
-      esac
-    fi
-
     if [[ -n "${NEXTEST_URL}" ]]; then
       NEXTEST_ARCHIVE="${TEMP_DIR}/cargo-nextest.tar.gz"
       DOWNLOAD_TIMEOUT="${MYDB_DOWNLOAD_TIMEOUT:-90}"
@@ -241,6 +227,7 @@ else
   fi
 
   if [[ -n "${NEXTEST_ARCHIVE}" ]]; then
+    mydb_verify_nextest_archive "$NEXTEST_ARCHIVE" "$NEXTEST_SHA256"
     tar -xzf "${NEXTEST_ARCHIVE}" -C "${CARGO_BIN_DIR}"
     if cargo nextest --version >/dev/null 2>&1; then
       NEXTEST_AVAILABLE=1

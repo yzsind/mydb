@@ -40,12 +40,26 @@ def passed(result):
     return result.wasSuccessful() and result.testsRun > len(result.skipped)
 
 
+def git_commit(directory):
+    try:
+        top = subprocess.check_output(['git', 'rev-parse', '--show-toplevel'], cwd=directory,
+                                      text=True, stderr=subprocess.DEVNULL).strip()
+        if Path(top).resolve() != directory.resolve():
+            return None
+        return subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=directory,
+                                       text=True, stderr=subprocess.DEVNULL).strip()
+    except (OSError, subprocess.CalledProcessError):
+        # Exported public sources have no Git metadata; per-file hashes still
+        # bind the results to the exact scripts that executed.
+        return None
+
+
 def evidence(modules, result):
     sources = [path for path in ROOT.rglob('*') if path.is_file()
-               and path.suffix in ('.py', '.sh', '.ps1', '.txt', '.json')
+               and path.suffix in ('.py', '.sh', '.ps1', '.txt', '.json', '.env')
                and '__pycache__' not in path.parts]
     return dict(python=sys.version, platform=platform.platform(),
-        commit=subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip(),
+        commit=git_commit(ROOT.parent),
         dependencies={entry.metadata['Name']: entry.version for entry in importlib.metadata.distributions()},
         sources={str(path.relative_to(ROOT)): hashlib.sha256(path.read_bytes()).hexdigest() for path in sources},
         modules=[path.name for path in modules], tests=result.testsRun,

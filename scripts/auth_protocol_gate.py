@@ -3,6 +3,8 @@
 Run against a disposable mydb server. Requires mysql CLI and openssl; stdlib only.
 MYDB_GATE_ROOT_PASSWORD supplies the admin password (default: root).
 """
+
+from _checks import require
 import argparse
 import json
 import os
@@ -40,12 +42,12 @@ def finish_authentication(sock, user, password, plugin, mode, seed, initial,
             return True
         if payload[0] == 255:
             code = int.from_bytes(payload[1:3], "little")
-            assert code == expected_error, (mode, plugin, code, payload)
+            require(code == expected_error, (mode, plugin, code, payload))
             return False
-        assert not reject_before_full, "policy rejection incorrectly requested additional credentials"
+        require(not reject_before_full, "policy rejection incorrectly requested additional credentials")
         if payload[0] == 254:
             switched, switched_seed = payload[1:].split(b"\0", 1)
-            assert switched.decode() == plugin
+            require(switched.decode() == plugin, 'acceptance check failed: switched.decode() == plugin')
             seed = switched_seed[:20]
             packet_write(sock, seq + 1, initial)
         elif payload == b"\1\4":
@@ -113,9 +115,9 @@ def main():
         env = environment if user == "root" else dict(os.environ, MYSQL_PWD="gate-correct")
         result = subprocess.run(cli + ["-u" + user] + (["-D" + database] if database else []), input=statement, text=True, env=env, capture_output=True)
         if expected_error is not None:
-            assert result.returncode != 0 and str(expected_error) in result.stderr, result.stderr
+            require(result.returncode != 0 and str(expected_error) in result.stderr, result.stderr)
         else:
-            assert result.returncode == 0, result.stderr
+            require(result.returncode == 0, result.stderr)
         return result.stdout.strip()
     results = []
     for plugin in ["caching_sha2_password", "sha256_password"]:
@@ -126,29 +128,29 @@ def main():
                 for valid in [True, False]:
                     sql(f"ALTER USER '{user}'@'%' ACCOUNT UNLOCK; FLUSH PRIVILEGES;")
                     accepted = authenticate(args.port, user, "gate-correct" if valid else "gate-wrong", plugin, mode, expected_error=3955)
-                    assert accepted == valid, (plugin, mode, valid, accepted)
+                    require(accepted == valid, (plugin, mode, valid, accepted))
                     results.append(dict(plugin=plugin, mode=mode, correct_password=valid, passed=True))
                     print(json.dumps(results[-1]), flush=True)
                     if not valid:
-                        assert not authenticate(args.port, user, "gate-correct", plugin, mode, expected_error=3955)
+                        require(not authenticate(args.port, user, "gate-correct", plugin, mode, expected_error=3955), 'acceptance check failed: not authenticate(args.port, user, "gate-correct", plugin, mode, expected_error=3955)')
                         results.append(dict(plugin=plugin, mode=mode, check="one_failed_password_locks_account", passed=True))
                         print(json.dumps(results[-1]), flush=True)
             # Keep transport denial independent from temporary-lock policy:
             # the TLS/RSA matrix above already requires one-failure lockout.
             sql(f"ALTER USER '{user}'@'%' FAILED_LOGIN_ATTEMPTS 0 PASSWORD_LOCK_TIME 0 ACCOUNT UNLOCK; FLUSH PRIVILEGES;")
-            assert authenticate(args.port, user, "gate-correct", plugin, "tls")
+            require(authenticate(args.port, user, "gate-correct", plugin, "tls"), 'acceptance check failed: authenticate(args.port, user, "gate-correct", plugin, "tls")')
             for password in ["gate-correct", "gate-wrong"]:
                 sql(f"ALTER USER '{user}'@'%' ACCOUNT UNLOCK; FLUSH PRIVILEGES;")
-                assert not authenticate(args.port, user, password, plugin, "plaintext-compat")
+                require(not authenticate(args.port, user, password, plugin, "plaintext-compat"), 'acceptance check failed: not authenticate(args.port, user, password, plugin, "plaintext-compat")')
                 results.append(dict(plugin=plugin, check="plaintext_full_auth_rejected_without_tls", passed=True))
                 print(json.dumps(results[-1]), flush=True)
         finally:
             sql(f"DROP USER '{user}'@'%';")
     sql("CREATE USER auth_gate_ssl IDENTIFIED WITH caching_sha2_password BY 'gate-correct' REQUIRE SSL")
     try:
-        assert not authenticate(args.port, "auth_gate_ssl", "gate-correct", "caching_sha2_password", "plaintext-compat", expected_error=3159, reject_before_full=True)
+        require(not authenticate(args.port, "auth_gate_ssl", "gate-correct", "caching_sha2_password", "plaintext-compat", expected_error=3159, reject_before_full=True), 'acceptance check failed: not authenticate(args.port, "auth_gate_ssl", "gate-correct", "caching_sha2_password", "plaintext-compat", expected_error=3159, reject_before_full=True)')
         results.append(dict(check="require_ssl_rejects_before_full_auth", passed=True))
-        assert authenticate(args.port, "auth_gate_ssl", "gate-correct", "caching_sha2_password", "tls")
+        require(authenticate(args.port, "auth_gate_ssl", "gate-correct", "caching_sha2_password", "tls"), 'acceptance check failed: authenticate(args.port, "auth_gate_ssl", "gate-correct", "caching_sha2_password", "tls")')
         results.append(dict(check="require_ssl_accepts_tls", passed=True))
         for result in results[-2:]:
             print(json.dumps(result), flush=True)
@@ -158,10 +160,10 @@ def main():
     # Oversized SHA-2 passwords are rejected before expensive hashing.
     sql("CREATE USER auth_gate_bound IDENTIFIED WITH caching_sha2_password BY '" + "x" * 256 + "'")
     try:
-        assert authenticate(args.port, "auth_gate_bound", "x" * 256, "caching_sha2_password", "tls")
+        require(authenticate(args.port, "auth_gate_bound", "x" * 256, "caching_sha2_password", "tls"), 'acceptance check failed: authenticate(args.port, "auth_gate_bound", "x" * 256, "caching_sha2_password", "tls")')
         results.append(dict(check="sha2_256_byte_password", passed=True))
         sql("ALTER USER auth_gate_bound IDENTIFIED BY '" + "x" * 257 + "'", expected_error=1396)
-        assert not authenticate(args.port, "auth_gate_bound", "x" * 4096, "caching_sha2_password", "tls")
+        require(not authenticate(args.port, "auth_gate_bound", "x" * 4096, "caching_sha2_password", "tls"), 'acceptance check failed: not authenticate(args.port, "auth_gate_bound", "x" * 4096, "caching_sha2_password", "tls")')
         results.append(dict(check="sha2_oversized_password_rejected", passed=True))
         for result in results[-2:]:
             print(json.dumps(result), flush=True)
@@ -171,7 +173,7 @@ def main():
     for plugin in ["mysql_native_password", "caching_sha2_password", "sha256_password"]:
         sql(f"CREATE USER auth_gate_empty IDENTIFIED WITH {plugin} AS ''")
         try:
-            assert authenticate(args.port, "auth_gate_empty", "", plugin, "tls")
+            require(authenticate(args.port, "auth_gate_empty", "", plugin, "tls"), 'acceptance check failed: authenticate(args.port, "auth_gate_empty", "", plugin, "tls")')
             results.append(dict(plugin=plugin, check="empty_encoded_credential", passed=True))
             print(json.dumps(results[-1]), flush=True)
         finally:
@@ -182,15 +184,15 @@ def main():
     upper = None
     try:
         for view in ["TABLES", "COLUMNS", "STATISTICS"]:
-            assert sql(f"SELECT COUNT(*) FROM information_schema.{view} WHERE TABLE_SCHEMA='mysql' AND TABLE_NAME='user'", "auth_gate_case") == "0", view
+            require(sql(f"SELECT COUNT(*) FROM information_schema.{view} WHERE TABLE_SCHEMA='mysql' AND TABLE_NAME='user'", "auth_gate_case") == "0", view)
             results.append(dict(check="private_" + view.lower(), passed=True))
-        assert sql("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='performance_schema'", "auth_gate_case") == "8"
+        require(sql("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='performance_schema'", "auth_gate_case") == "8", 'acceptance check failed: sql("SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA=\'performance_schema\'", "auth_gate_case") == "8"')
         results.append(dict(check="public_performance_tables", passed=True))
         sql("SELECT 1", "auth_gate_case", database="mysql", expected_error=1044)
         results.append(dict(check="handshake_database_access", passed=True))
         upper = subprocess.Popen(cli + ["-uauth_gate_Case", "-e", "SELECT CONNECTION_ID(); SELECT SLEEP(2)"], env=dict(os.environ, MYSQL_PWD="gate-correct"), stdout=subprocess.PIPE, text=True)
         connection_id = int(upper.stdout.readline().strip())
-        assert sql(f"SELECT COUNT(*) FROM performance_schema.session_account_connect_attrs WHERE PROCESSLIST_ID={connection_id}", "auth_gate_case") == "0"
+        require(sql(f"SELECT COUNT(*) FROM performance_schema.session_account_connect_attrs WHERE PROCESSLIST_ID={connection_id}", "auth_gate_case") == "0", 'acceptance check failed: sql(f"SELECT COUNT(*) FROM performance_schema.session_account_connect_attrs WHERE PROCESSLIST_ID={connection_id}", "auth_gate_case") == "0"')
         upper.wait(timeout=10)
         results.append(dict(check="case_distinct_account_attributes", passed=True))
         for result in results[-6:]:

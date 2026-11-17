@@ -342,6 +342,26 @@ class BenchmarkTests(unittest.TestCase):
                 compare_captures(left, right, "exact")["status"], "mismatch"
             )
 
+    def test_sort_cache_cannot_hide_same_size_rewrites_with_preserved_mtime(self):
+        with tempfile.TemporaryDirectory(dir='/tmp/mydb') as directory:
+            left, right = Path(directory)/'left', Path(directory)/'right'
+            left.write_text('1\t["1","a"]\n2\t["2","b"]\n')
+            right.write_text('2\t["2","b"]\n1\t["1","a"]\n')
+            self.assertEqual(compare_captures(left, right, 'exact')['status'], 'match')
+            timestamp = right.stat()
+            right.write_text('2\t["2","c"]\n1\t["1","a"]\n')
+            os.utime(right, ns=(timestamp.st_atime_ns, timestamp.st_mtime_ns))
+            self.assertEqual(compare_captures(left, right, 'exact')['status'], 'mismatch')
+
+    def test_corrupt_sorted_cache_is_regenerated_from_the_capture(self):
+        with tempfile.TemporaryDirectory(dir='/tmp/mydb') as directory:
+            left, right = Path(directory)/'left', Path(directory)/'right'
+            left.write_text('1\t["1","a"]\n2\t["2","b"]\n')
+            right.write_text('2\t["2","b"]\n1\t["1","a"]\n')
+            self.assertEqual(compare_captures(left, right, 'exact')['status'], 'match')
+            right.with_suffix('.sorted').write_text('1\t["1","corrupt"]\n')
+            self.assertEqual(compare_captures(left, right, 'exact')['status'], 'match')
+
     def test_identifier_contract_checks_uniqueness_and_sequence_order(self):
         with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:
             path = Path(directory) / "capture"

@@ -4,6 +4,8 @@
 Requires Linux Docker and PyMySQL with cryptography. Every failed check fails the
 matrix. Output directories must be new; databases are retained as evidence.
 """
+
+from _checks import require
 import argparse
 from decimal import Decimal
 import hashlib
@@ -26,8 +28,8 @@ IMAGES = {
     'centos7': 'quay.io/centos/centos@sha256:e4ca2ed0202e76be184e75fb26d14bf974193579039d5573fb2348664deef76e',
     'centos8': 'quay.io/centos/centos@sha256:96a58892e20a62e264ccf432da7007871a427103804d82cb5029df5499f1d82f',
     'stream8': 'quay.io/centos/centos@sha256:20da069d4f8126c4517ee563e6e723d4cbe79ff62f6c4597f753478af91a09a3',
-    'centos9': 'quay.io/centos/centos@sha256:33346f5fe280763eb78e85f968ad52bc2b2013369de85403f67e802db98ed243',
-    'stream10': 'quay.io/centos/centos@sha256:e664412637fcadb7d9eef7da6cc48c29cd69fb977d27c871ec3c54d95c91ace9',
+    'centos9': 'quay.io/centos/centos@sha256:b21ca3f04d21894422b5c3e2ce580b0e64f80cd104697438d73f0cb27e3900f8',
+    'stream10': 'quay.io/centos/centos@sha256:763d8c404e02cd772b43be5447a12c5370d9b788850393c4e5523a9e0e59ac18',
 }
 
 
@@ -40,6 +42,33 @@ def checked(args, timeout=60):
     if result.returncode:
         raise RuntimeError(f'{args}: exit {result.returncode}\n{result.stdout}{result.stderr}')
     return result.stdout.strip()
+
+
+PROTOCOL_GATES = ('verify_expression_protocol.py', 'verify_json_protocol.py')
+
+
+def check_public_protocol_gates(root):
+    for name in (*PROTOCOL_GATES, 'protocol_helpers.py', '_checks.py'):
+        path = root / 'scripts' / name
+        if not path.is_file() or not path.resolve().is_relative_to(root.resolve()):
+            raise FileNotFoundError(f'public protocol gate is missing: {path}')
+
+
+def ensure_runtime_image(image, *, pull=False, require_amd64=True):
+    local = image.startswith('sha256:')
+    if pull and not local:
+        checked(['docker', 'pull', '--platform', 'linux/amd64', image], 600)
+    try:
+        output = checked(['docker', 'image', 'inspect', image])
+    except RuntimeError:
+        if local or pull:
+            raise
+        checked(['docker', 'pull', '--platform', 'linux/amd64', image], 600)
+        output = checked(['docker', 'image', 'inspect', image])
+    info = json.loads(output)[0]
+    if info['Os'] != 'linux' or (require_amd64 and info['Architecture'] != 'amd64'):
+        raise RuntimeError(f'runtime image must be linux/amd64: {image}')
+    return info
 
 
 def free_port():
@@ -163,7 +192,7 @@ class Case:
             sql="CREATE USER 'release_matrix'@'%' IDENTIFIED BY 'matrix-password'; GRANT ALL PRIVILEGES ON *.* TO 'release_matrix'@'%' WITH GRANT OPTION; GRANT BACKUP_ADMIN,SYSTEM_VARIABLES_ADMIN ON *.* TO 'release_matrix'@'%';"
             created=subprocess.run(cli,input=sql,capture_output=True,text=True,timeout=30)
             if created.returncode:raise RuntimeError(created.stderr)
-        else:assert result.stdout.strip()=='1',result.stdout
+        else:require(result.stdout.strip()=='1', result.stdout)
         self.result['checks']['local_root_and_explicit_remote_account']=True
 
     def ready(self, name, port):
@@ -255,7 +284,7 @@ class Case:
                 raise AssertionError('TLS was not negotiated')
         self.result['tls_cipher'] = cipher
         self.result['checks']['tls_and_authentication'] = True
-        for script in ('verify_expression_protocol.py', 'verify_json_protocol.py'):
+        for script in PROTOCOL_GATES:
             command = [self.args.python, ROOT / 'scripts' / script, '--port', self.port]
             if script == 'verify_expression_protocol.py':
                 command += ['--output', self.folder / 'expression-protocol.json']
@@ -317,7 +346,9 @@ class Case:
         # Compare full values and index queries against the captured source,
         # rather than treating equal row counts as proof of a valid restore.
         statements = ['SELECT * FROM compat ORDER BY id',
-                      'SELECT * FROM vectors ORDER BY id',
+                      # PyMySQL cannot decode the native VECTOR wire type.
+                      # Compare every component through its lossless SQL text form.
+                      'SELECT id,VECTOR_TO_STRING(v) FROM vectors ORDER BY id',
                       'SELECT * FROM documents ORDER BY id',
                       'SELECT id FROM compat FORCE INDEX(idx_n) WHERE n>0 ORDER BY id',
                       "SELECT id FROM vectors ORDER BY DISTANCE(v,'[0,0,0]') LIMIT 3",
@@ -372,7 +403,8 @@ class Case:
         threads = getattr(self.args, 'test_threads', 8)
         memory = getattr(self.args, 'test_memory', '32g')
         self.result['archived_test_config'] = {'threads': threads, 'memory': memory}
-        command = ['docker', 'run', '--rm', '--name', name, '--platform', 'linux/amd64', '--user', '10001:10001',
+        # Retain the named runner until close(), which owns logs and removal.
+        command = ['docker', 'run', '--name', name, '--platform', 'linux/amd64', '--user', '10001:10001',
                    '--cpus', str(min(threads, os.cpu_count() or 2)), '--memory', memory, *test_mount,
                    '-v', f'{self.args.build}:{self.args.build}:ro', '-v', f'{ROOT}:{ROOT}:ro',
                    '-v', f'{self.args.nextest}:/opt/cargo-nextest:ro', '-w', ROOT,
@@ -429,8 +461,8 @@ class Case:
 def main():
     global ROOT
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('--build', type=Path, required=True, help='build_linux_glibc217.py output')
-    parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--build', type=Path, help='build_linux_glibc217.py output')
+    parser.add_argument('--output', type=Path)
     parser.add_argument('--source', type=Path, default=ROOT, help='immutable build input; its fingerprint must match the manifest')
     parser.add_argument('--timezone', help='explicit TZ for server and archived tests; defaults to the image environment')
     parser.add_argument('--network-mode', choices=['auto', 'host', 'publish'], default='auto',
@@ -441,6 +473,8 @@ def main():
                         help='explicit local test reserve (0..90); product default is unchanged')
     parser.add_argument('--bootstrap-client-image',
                         help='immutable local MySQL client image for loopback account initialization under published ports')
+    parser.add_argument('--prepare-images-only', action='store_true',
+                        help='preflight public protocol gates and pull the selected pinned runtime images')
     parser.add_argument('--images', help='comma-separated matrix labels; defaults to all entries')
     parser.add_argument('--matrix', type=Path, help='JSON object mapping safe labels to digest-pinned references or immutable local image IDs')
     parser.add_argument('--python', default=os.sys.executable)
@@ -478,6 +512,16 @@ def main():
     labels = args.images.split(',') if args.images else list(images)
     if len(labels) != len(set(labels)) or any(label not in images for label in labels):
         raise SystemExit('matrix labels must be unique and present in the matrix')
+    check_public_protocol_gates(ROOT)
+    if not args.prepare_images_only and (args.build is None or args.output is None):
+        parser.error('--build and --output are required for runtime verification')
+    for label in labels:
+        info = ensure_runtime_image(images[label], pull=args.prepare_images_only)
+        print(f"{label}: runtime image ready: {info['Id']}", flush=True)
+    if args.bootstrap_client_image:
+        ensure_runtime_image(args.bootstrap_client_image, require_amd64=False)
+    if args.prepare_images_only:
+        return 0
     args.build = args.build.resolve()
     args.output = args.output.resolve()
     args.binary = args.build / 'bin/mydb'

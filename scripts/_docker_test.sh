@@ -25,11 +25,11 @@ mydb_container_cleanup() {
 }
 
 mydb_container_wait() {
-  local attempts="${1:-90}"
+  local attempts="${1:-90}" port="${2:-3306}"
   for (( attempt=0; attempt<attempts; attempt++ )); do
     # The image bootstraps a temporary socket-only server before its final
     # instance. TCP readiness must not accept that temporary instance.
-    if docker exec "$CONTAINER" mysql --protocol=TCP --host=127.0.0.1 --port=3306 -uroot -p"$MYSQL_ROOT_PASSWORD" \
+    if docker exec "$CONTAINER" mysql --protocol=TCP --host=127.0.0.1 --port="$port" -uroot -p"$MYSQL_ROOT_PASSWORD" \
       --batch --skip-column-names -e 'SELECT 1' >/dev/null 2>&1; then
       return 0
     fi
@@ -104,4 +104,30 @@ mydb_stop_native() {
     kill -KILL "$pid" 2>/dev/null || true
   fi
   wait "$pid" 2>/dev/null || true
+}
+
+# Keep the native source loopback-only while making it reachable by the replica.
+mydb_source_network() {
+  local mode="${MYDB_DOCKER_NETWORK:-auto}"
+  if [[ "$mode" == auto ]]; then
+    if [[ "$(uname -s)" == Linux ]]; then mode=host; else mode=publish; fi
+  fi
+  case "$mode" in
+    host)
+      MYSQL_CONTAINER_PORT="$MYSQL_PORT"
+      MYSQL_CONTAINER_BIND=127.0.0.1
+      MYSQL_NETWORK=(--network host)
+      MYDB_HOST_FROM_DOCKER="${MYDB_HOST_FROM_DOCKER:-127.0.0.1}"
+      ;;
+    publish)
+      MYSQL_CONTAINER_PORT=3306
+      MYSQL_CONTAINER_BIND=0.0.0.0
+      MYSQL_NETWORK=(-p "127.0.0.1:${MYSQL_PORT}:3306")
+      MYDB_HOST_FROM_DOCKER="${MYDB_HOST_FROM_DOCKER:-host.docker.internal}"
+      if [[ "$(uname -s)" == Linux ]]; then
+        MYSQL_NETWORK+=(--add-host=host.docker.internal:host-gateway)
+      fi
+      ;;
+    *) echo "MYDB_DOCKER_NETWORK must be auto, host or publish" >&2; return 2;;
+  esac
 }

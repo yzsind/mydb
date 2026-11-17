@@ -2,10 +2,10 @@
 
 This directory contains versioned build and release tools, code generators,
 compatibility oracles, benchmark inputs, and the regressions wired into CI.
-CI and Docker builds require only public files. Machine-local benchmarks,
-profiling tools, comparison-server helpers, historical audit regressions, and
-their harness tests live in the ignored `scripts-internal/` directory. They
-are optional and are not included in a public checkout.
+CI and Docker builds require only public files. Private machine-local experiments,
+profiling prototypes, and historical audit drivers normally live in the ignored
+`scripts-internal/` directory. Maintained public tools and integration-driver
+exceptions are listed below; private tools are optional in a public checkout.
 
 Scripts run locally by default. Temporary databases, caches, logs, and samples
 belong under `/tmp/mydb`. Protocol tests may create or rebuild dedicated databases;
@@ -34,6 +34,11 @@ archive; native execution checks remain enabled by default.
 | Portable Linux build and ABI contract | `build_linux_glibc217.py`, `check_elf_abi.py`, `verify_linux_compat.py` |
 | Host-native release packaging and licenses | `package_release.py`, `release_licenses.py` |
 | Extracted release package, version, TLS and crash recovery checks | `verify_release_package.py --package ARCHIVE --output /tmp/mydb/package-check` |
+| Expression, JSON and authentication protocol release gates | `verify_expression_protocol.py`, `verify_json_protocol.py`, `auth_protocol_gate.py` |
+| MySQL 8.0 function, character set and ROLLUP oracles | `run_mysql80_function_oracle.sh`, `run_mysql80_charset_oracle.sh`, `run_mysql80_rollup_oracle.sh` |
+| Manual XML correctness and performance comparison | `xml_functions_compare.py` |
+| Manual macOS nextest capture diagnostic | `check_nextest_capture.py` |
+| Windows development SSH setup | `setup_windows_ssh.ps1` |
 | Windows checks and native isolated tests | `check_windows.py`, `test_windows_native.ps1` |
 | Ubuntu development environment | `setup_ubuntu.sh` |
 | Build and runtime-matrix command regressions | `test_release_build.py`, `test_linux_compat.py`, `test_elf_abi.py` |
@@ -60,8 +65,14 @@ exercises over `crash_test_index_defer.sh`. Shared protocol and process fixtures
 (`protocol_helpers.py`, `fixtures/`) also remain here so public regressions do
 not depend on private tools. Historical audit drivers and one-off verification
 regressions (`verify_*_audit.py`, `test_*_audit*.py`, `*_audit_verify.py`, and
-similar) live in `scripts-internal/` and are not needed by public builds or
-default correctness runs.
+similar) normally live in `scripts-internal/` and are not needed by public builds
+or default correctness runs. `test_lifecycle_audit_1031.py` is a retained standalone
+Unix process/protocol integration driver: run it explicitly with `--binary` on a
+disposable local instance. It declares no unittest classes and is excluded from
+`run_script_tests.py`. It remains public to retain those process-boundary checks.
+`test_native_backup.py` is an alias of `test_backup_recovery.py`;
+`pitr_restore.sh` is a fail-fast retired-entry guard directing callers to native
+`mydb-backup restore`. Neither is loaded by the offline unittest runner.
 
 Pinned MySQL 8.0.46 catalog and status baselines live in
 `tests/fixtures/mysql80/`. They are tracked regression inputs used by Rust tests
@@ -106,7 +117,9 @@ scripts/render_storage_format_versions.sh --check
 cases, while keeping standalone integration drivers out of import discovery.
 Import errors and failing cases fail the command. Its JSON evidence records
 Python/platform, dependency versions, source hashes and per-run test counts.
-CI uses the same entry point and dependency pins.
+CI uses the same entry point and dependency pins. Exported source trees without
+Git metadata record `commit: null` and retain per-file SHA-256 evidence; an
+unrelated parent repository is never used as their provenance.
 
 ### Result comparison contracts
 
@@ -158,6 +171,12 @@ to disk; restore preserves executable SET/DDL comments, quoted/multiline data,
 UTC timestamps and `NO_AUTO_VALUE_ON_ZERO` rather than dropping session state.
 Unsupported DELIMITER/routine dumps and truncated statements fail explicitly.
 
+The logical-source replication driver binds mydb to `127.0.0.1` by default.
+Linux uses host networking with a loopback-only MySQL listener; Docker Desktop
+uses its host-loopback gateway and publishes the replica port only on loopback.
+`MYDB_DOCKER_NETWORK=host|publish` selects an explicit transport;
+`MYDB_BIND_HOST` is an explicit override for a custom local test topology.
+
 Docker oracles create unique container names and owner labels. An explicitly
 requested existing name is a collision, never a deletion target; cleanup checks
 the captured container ID and owner label. TCP container readiness and SQL failures
@@ -171,3 +190,34 @@ with `TPCDS_PG_EXPECTED_DIR` and `TPCDS_PG_RESULT_DIR`.
 Do not commit `__pycache__`, `.pyc`, `.DS_Store`, temporary data, logs, or local
 performance reports. Internal tools may reuse public fixtures, but public builds
 and default correctness regressions must work without `scripts-internal/`.
+
+## Release prerequisites and integrity checks
+
+The glibc workflow runs `verify_linux_compat.py --prepare-images-only --images
+centos7,centos8,centos9` before building. It checks public protocol dependencies
+and prefetches immutable linux/amd64 runtime images; normal verification also
+pulls missing remote images. Missing immutable local image IDs and registry
+errors are fatal. Protocol gates remain in the public checkout with their
+shared helpers and keep all checks and packet reads active under `python -O`.
+
+Function-oracle comparisons normalize finite numbers only for columns with
+numeric metadata; strings remain exact. Exact decimal comparison preserves
+integer trailing zeros and arbitrary precision, while approximate functions
+retain their documented floating-point tolerance. MTR imports validate every
+requested path, including test/result paths and symlink escapes, before fetching.
+Missing tests, result files, includes or data fail the command. Failed downloads
+do not replace existing fixtures.
+
+`nextest-release.env` pins setup/build nextest versions and archive SHA-256
+values. Ubuntu setup validates downloaded or supplied mirror archives before
+extracting them. Host-native release provenance comes from the Git checkout;
+there is no undocumented `.release-source.json` input.
+
+For restricted build networks, `build_linux_glibc217.py --centos-vault-mirror
+https://mirrors.example/centos-vault/7.9.2009` selects an HTTPS archive mirror
+inside the disposable builder. Perl prerequisites use only CentOS base,
+updates and extras, with RPM signature checks enabled; repository/package
+caches remain under `BUILD/yum-cache`. No host repository settings are changed.
+The source tree is fingerprinted before container setup. When exporting a
+checkout from macOS, omit AppleDouble `._*` sidecars (for example with Python's
+`tarfile`); the builder deliberately rejects those files.
