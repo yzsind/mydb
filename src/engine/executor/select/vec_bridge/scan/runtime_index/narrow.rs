@@ -467,7 +467,11 @@ mod tests {
                     PlanTable::new(1, db.table("narrow_rows").unwrap(), Some("r".into()));
                 let stats = &mut Arc::make_mut(&mut table.schema).stats;
                 stats.row_count = 1_000_000;
-                stats.heap_page_count = 1 << 24;
+                // Model a nonresident heap without allocating its pages, on any host.
+                stats.heap_page_count = (mem_budget::effective_memory_limit_bytes() as u64
+                    / crate::storage::PAGE_SIZE as u64)
+                    .saturating_add(1)
+                    .max(1 << 24);
                 stats.columns.get_mut("k").unwrap().distinct_count = 1_000_000;
                 let schema = super::super::build_scan_batch_schema(&table, &[1, 2]);
                 let selected = if mode == "pages" {

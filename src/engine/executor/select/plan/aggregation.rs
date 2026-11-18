@@ -367,6 +367,7 @@ pub(super) fn merge_row_hash_agg_spill_partitions(
     occupied_partitions: &[usize],
     schema_template: &Arc<Vec<PlanField>>,
     group_field_positions: &[Option<usize>],
+    group_collations: &[Option<u16>],
     slots: &[crate::engine::executor::select::aggregate::AggregateSlot],
     having: Option<&Expr>,
 ) -> Result<Vec<PlanRow>, QueryError> {
@@ -392,7 +393,11 @@ pub(super) fn merge_row_hash_agg_spill_partitions(
         while let Some((key_values, slot_inputs, order_keys, sample_values)) =
             read_row_hash_agg_spill_record(&mut reader)?
         {
-            let key: Vec<ValueKey> = key_values.iter().map(ValueKey::from).collect();
+            let key: Vec<ValueKey> = key_values
+                .iter()
+                .zip(group_collations)
+                .map(|(value, collation)| ValueKey::from_with_collation(value, *collation))
+                .collect();
             let charge =
                 key.iter().map(|vk| 24 + vk.payload_size()).sum::<usize>() + 64 + slots.len() * 32;
             match groups.entry(key) {
@@ -465,6 +470,12 @@ pub(in crate::engine::executor::select) fn aggregate_plan_rows_spilled(
             .collect(),
     );
     let group_field_positions = simple_group_field_positions(group_by, schema_template.as_slice());
+    let group_collations = group_by
+        .iter()
+        .map(|expr| {
+            super::super::eval::plan_expr_collation(expr, &input_rows[0]).map(|info| info.id)
+        })
+        .collect::<Vec<_>>();
     let preserve_sample_values = aggregate_slots_need_sample_fields(slots);
 
     for row in &input_rows {
@@ -473,7 +484,11 @@ pub(in crate::engine::executor::select) fn aggregate_plan_rows_spilled(
             .iter()
             .map(|expr| eval_plan_expr(expr, row))
             .collect::<Result<Vec<_>, _>>()?;
-        let key: Vec<ValueKey> = key_values.iter().map(ValueKey::from).collect();
+        let key: Vec<ValueKey> = key_values
+            .iter()
+            .zip(&group_collations)
+            .map(|(value, collation)| ValueKey::from_with_collation(value, *collation))
+            .collect();
         let mut hasher = hasher_state.build_hasher();
         key.hash(&mut hasher);
         let pidx = (hasher.finish() as usize) & partition_mask;
@@ -499,6 +514,7 @@ pub(in crate::engine::executor::select) fn aggregate_plan_rows_spilled(
         &occupied_partitions,
         &schema_template,
         &group_field_positions,
+        &group_collations,
         slots,
         having,
     )
@@ -525,10 +541,15 @@ pub(in crate::engine::executor::select) fn aggregate_plan_stream_spilled(
 
     let mut stream = execute_plan_stream(db, txn, input)?;
     let mut schema_template: Option<Arc<Vec<PlanField>>> = None;
+    let mut group_collations = Vec::new();
     let preserve_sample_values = aggregate_slots_need_sample_fields(slots);
     while let Some(row) = stream.next()? {
         crate::engine::cancel::check_cancelled()?;
         if schema_template.is_none() {
+            group_collations = group_by
+                .iter()
+                .map(|expr| super::super::eval::plan_expr_collation(expr, &row).map(|info| info.id))
+                .collect();
             schema_template = Some(Arc::new(
                 row.fields
                     .iter()
@@ -543,7 +564,11 @@ pub(in crate::engine::executor::select) fn aggregate_plan_stream_spilled(
             .iter()
             .map(|expr| eval_plan_expr(expr, &row))
             .collect::<Result<Vec<_>, _>>()?;
-        let key: Vec<ValueKey> = key_values.iter().map(ValueKey::from).collect();
+        let key: Vec<ValueKey> = key_values
+            .iter()
+            .zip(&group_collations)
+            .map(|(value, collation)| ValueKey::from_with_collation(value, *collation))
+            .collect();
         let mut hasher = hasher_state.build_hasher();
         key.hash(&mut hasher);
         let pidx = (hasher.finish() as usize) & partition_mask;
@@ -573,6 +598,7 @@ pub(in crate::engine::executor::select) fn aggregate_plan_stream_spilled(
         &occupied_partitions,
         &schema_template,
         &group_field_positions,
+        &group_collations,
         slots,
         having,
     )

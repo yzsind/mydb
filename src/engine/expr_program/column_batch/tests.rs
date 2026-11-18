@@ -75,7 +75,7 @@ fn collate_text_payloads_and_composed_like_keep_native_columns_and_legacy_semant
         "utf8mb4_bin",
         "utf8mb4_general_ci",
         "utf8mb4_unicode_ci",
-        "utf8mb4_0900_as_ci",
+        "utf8mb4_unicode_ci",
     ] {
         for sql in [
             format!("x COLLATE {name}"),
@@ -2444,6 +2444,24 @@ fn decimal_character_columns_keep_scale_full_coefficients_nulls_and_selection() 
             );
         }
     }
+    // A projected division column may retain guard digits at runtime while
+    // its bound SQL type has already declared the result scale.
+    let (_, scratch_schema) = compile(
+        "CAST(x AS CHAR)",
+        ColumnType::Decimal {
+            precision: 20,
+            scale: 4,
+        },
+    );
+    checked_legacy_column(
+        "CAST(x AS CHAR)",
+        scratch_schema,
+        vec![ColumnVector::Decimal128 {
+            data: vec![333333333, -333333333],
+            scale: 9,
+            nulls: None,
+        }],
+    );
     // Width-limited casts retain their truncation diagnostics in the oracle.
     let (program, schema) = compile(
         "CAST(x AS CHAR(2))",
@@ -2835,7 +2853,7 @@ fn strcmp_columns_keep_collation_padding_expansions_and_nulls() {
         "utf8mb4_general_ci",
         "utf8mb4_bin",
         "utf8mb4_unicode_ci",
-        "utf8mb4_0900_as_cs",
+        "utf8mb4_0900_bin",
         "utf8mb4_turkish_ci",
     ] {
         let mut field = schema.fields()[0].clone();
@@ -3445,7 +3463,7 @@ fn regexp_columns_keep_collation_flags_unicode_offsets_occurrences_and_nulls() {
     for collation in [
         "utf8mb4_0900_ai_ci",
         "utf8mb4_general_ci",
-        "utf8mb4_0900_as_cs",
+        "utf8mb4_0900_bin",
         "utf8mb4_bin",
         "utf8mb4_turkish_ci",
     ] {
@@ -3577,7 +3595,7 @@ fn string_search_columns_preserve_collations_expansions_character_boundaries_and
         "utf8mb4_general_ci",
         "utf8mb4_unicode_ci",
         "utf8mb4_bin",
-        "utf8mb4_0900_as_cs",
+        "utf8mb4_0900_bin",
         "utf8mb4_german2_ci",
         "utf8mb4_turkish_ci",
     ] {

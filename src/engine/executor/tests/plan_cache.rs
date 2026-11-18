@@ -649,6 +649,46 @@ fn type_affecting_session_variables_are_part_of_plan_semantics() {
 }
 
 #[test]
+fn prepared_plan_settings_guard_validates_both_identity_and_optimizer_options() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let db = engine.db_handle();
+    let base = SessionContext::default();
+    let settings = crate::engine::cache::PreparedPlanSemantics::capture(&db, &base);
+    assert!(settings.matches_session(&db, &base));
+
+    let changes: [(&str, fn(&mut SessionContext)); 10] = [
+        ("sql_mode", |s| s.sql_mode.push_str(",ANSI_QUOTES")),
+        ("character_set_client", |s| {
+            s.character_set_client = "latin1".into()
+        }),
+        ("character_set_connection", |s| {
+            s.character_set_connection = "latin1".into()
+        }),
+        ("collation_connection", |s| {
+            s.collation_connection = "utf8mb4_bin".into()
+        }),
+        ("time_zone", |s| s.sysvars.time_zone = "+01:00".into()),
+        ("div_precision_increment", |s| {
+            s.sysvars.div_precision_increment = 9
+        }),
+        ("optimizer_switch", |s| {
+            s.sysvars.optimizer_switch.push_str(",index_merge=off")
+        }),
+        ("sql_select_limit", |s| s.sysvars.sql_select_limit = 1),
+        ("use_invisible_indexes", |s| {
+            s.sysvars.use_invisible_indexes = true
+        }),
+        ("group_concat_max_len", |s| s.group_concat_max_len = 512),
+    ];
+    for (name, change) in changes {
+        let mut session = base.clone();
+        change(&mut session);
+        assert!(!settings.matches_session(&db, &session), "{name}");
+    }
+}
+
+#[test]
 fn b2_plan_cache_partitions_by_exact_sql_select_limit() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

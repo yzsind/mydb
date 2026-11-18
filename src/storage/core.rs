@@ -3474,10 +3474,9 @@ struct BufferPoolShard {
     hand: AtomicUsize,
     /// Independent bounded sampling cursor for pressure writeback.
     cleaner_hand: AtomicUsize,
-    // Hit statistics are aggregated at observation time. Keep the hot shard
-    // counter separate from its colder clock/eviction metadata, and avoid a
-    // second process-wide atomic write on every resident-page access.
-    hits: CachePadded<AtomicU64>,
+    // A hot page sends every hit to the same shard. Stripe the counter by
+    // worker so concurrent readers do not write the same cache line.
+    hits: crate::util::striped_counter::StripedCounter,
     misses: AtomicU64,
     evictions: AtomicU64,
     /// D-1 - dirty-page registry. Every clean→dirty transition inserts

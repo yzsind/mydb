@@ -365,13 +365,25 @@ impl OnlineConstraintValidation {
             if table_id == self.child.id {
                 let key = values
                     .map(|values| {
-                        db.fk_child_reference_key(&state.fk, &state.parent, &state.index, values)
+                        db.fk_child_reference_key(
+                            &state.fk,
+                            &state.parent,
+                            &state.index,
+                            &state.parent_columns,
+                            values,
+                        )
                     })
                     .transpose()?
                     .flatten();
                 let old_key = previous_values
                     .map(|values| {
-                        db.fk_child_reference_key(&state.fk, &state.parent, &state.index, values)
+                        db.fk_child_reference_key(
+                            &state.fk,
+                            &state.parent,
+                            &state.index,
+                            &state.parent_columns,
+                            values,
+                        )
                     })
                     .transpose()?
                     .flatten();

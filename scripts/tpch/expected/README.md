@@ -26,9 +26,19 @@ different random text fields, so its result fixtures must use a separate
 
 Files are tab-separated rows without column headers. Cells are trimmed, and
 numeric values are canonicalized to integer form or 4 decimal places with
-half-up rounding. `scripts-internal/run_tpch.sh` uses `scripts/tpch_check_results.py` to
-apply the same canonicalization to mydb output before comparing it with these
-fixtures.
+half-up rounding. Each scale directory's `comparison.json` explicitly declares
+the result column types, `trim_text: true`, `decimal_places: 4`, and the legacy
+`NULL` marker. `scripts/tpch_check_results.py` automatically loads this adjacent
+contract unless `--comparison-manifest` selects another file, so both standalone
+checks and `scripts-internal/run_tpch.sh` apply the fixture's declared policy.
+Row order, duplicate counts, integer values, and text spelling remain checked;
+numeric-looking text columns are never converted to numbers. Fixtures without
+an adjacent contract retain exact ordered TSV comparison.
+
+These historical fixtures cannot prove numeric agreement beyond four decimal
+places or preservation of leading/trailing text whitespace: that information
+was discarded when they were generated. New references needing those checks
+should preserve the original values and use an exact typed contract instead.
 
 Use `TPCH_CHECK_CORRECTNESS=0` or `scripts-internal/run_tpch.sh --no-check` to disable
 the check. Use `TPCH_CHECK_CORRECTNESS=1` to require a checked-in expected set

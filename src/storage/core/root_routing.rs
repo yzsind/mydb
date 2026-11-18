@@ -99,7 +99,7 @@ impl IndexFile {
         record_query_buffer_hit();
         self.buffer_pool.shards[self.buffer_pool.shard_index_ref(self.page_key_ref(page_id))]
             .hits
-            .fetch_add(1, Ordering::Relaxed);
+            .add(1);
         route(&image.bytes).map(Some)
     }
 

@@ -4350,6 +4350,9 @@ fn derived_column_reference_name(
     derived_qualifier: &str,
 ) -> Option<String> {
     match expr {
+        Expr::GroupKeyRef { expr, .. } => {
+            derived_column_reference_name(expr, alias_map, derived_qualifier)
+        }
         Expr::Identifier(name) if alias_map.contains_key(&name.to_ascii_lowercase()) => {
             Some(name.clone())
         }

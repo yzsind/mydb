@@ -195,6 +195,22 @@ pub(super) fn candidate_row_ids_for_write(
     table: &TableSchema,
     selection: Option<&Expr>,
 ) -> Result<Option<Vec<RowId>>, QueryError> {
+    candidate_row_ids_with_wait(
+        db,
+        txn,
+        table,
+        selection,
+        crate::parser::LockWaitMode::Default,
+    )
+}
+
+fn candidate_row_ids_with_wait(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    selection: Option<&Expr>,
+    wait: crate::parser::LockWaitMode,
+) -> Result<Option<Vec<RowId>>, QueryError> {
     if let Some(candidates) = selection
         .map(|expr| super::rowid::candidates(table, expr))
         .transpose()?
@@ -219,17 +235,17 @@ pub(super) fn candidate_row_ids_for_write(
         WriteCandidateAccess::Single(index, access) => match access {
             EngineIndexAccess::Lookup { key, exact } => {
                 if exact && (index.unique || index.primary) && !key.contains_null() {
-                    db.lookup_unique_index_for_write_one(txn, table, index, key)?
+                    db.lookup_unique_index_for_locking_read(txn, table, index, key, wait)?
                         .into_iter()
                         .collect()
                 } else if exact {
-                    db.lookup_index_for_write(txn, table, index, key)?
+                    db.lookup_index_visible(table, index, key, txn)?
                 } else {
-                    db.prefix_index(table, index, key)?
+                    db.prefix_index_visible(table, index, key, txn)?
                 }
             }
             EngineIndexAccess::Range { low, high } => {
-                db.range_index_bounds(table, index, low, high)?
+                db.range_index_bounds_visible(table, index, low, high, txn)?
             }
         },
         WriteCandidateAccess::Multi(access) => {
@@ -237,7 +253,11 @@ pub(super) fn candidate_row_ids_for_write(
                 unreachable!("write IN access is a finite set of probes")
             };
             let index = &access.index;
-            let mut ids = if exact && index.unique && !table.is_partitioned() {
+            let mut ids = if exact
+                && index.unique
+                && !table.is_partitioned()
+                && wait == crate::parser::LockWaitMode::Default
+            {
                 db.lookup_unique_index_for_write_many(txn, table, index, &keys)?
                     .into_iter()
                     .map(|(_, id)| id)
@@ -246,15 +266,27 @@ pub(super) fn candidate_row_ids_for_write(
                 let mut ids = Vec::new();
                 for key in keys {
                     crate::engine::cancel::check_cancelled()?;
-                    let local = if exact {
-                        db.lookup_index_for_write(txn, table, index, key)?
-                    } else {
-                        let bound = IndexBound {
-                            key,
-                            inclusive: true,
+                    let local =
+                        if exact && index.unique && !key.contains_null() && !table.is_partitioned()
+                        {
+                            db.lookup_unique_index_for_locking_read(txn, table, index, key, wait)?
+                                .into_iter()
+                                .collect()
+                        } else if exact {
+                            db.lookup_index_visible(table, index, key, txn)?
+                        } else {
+                            let bound = IndexBound {
+                                key,
+                                inclusive: true,
+                            };
+                            db.range_index_bounds_visible(
+                                table,
+                                index,
+                                Some(bound.clone()),
+                                Some(bound),
+                                txn,
+                            )?
                         };
-                        db.range_index_bounds(table, index, Some(bound.clone()), Some(bound))?
-                    };
                     ids.extend(local);
                 }
                 ids
@@ -387,6 +419,22 @@ pub(super) fn candidate_row_refs_for_write(
     table: &TableSchema,
     selection: Option<&Expr>,
 ) -> Result<Option<Vec<crate::storage::DmlRowRef>>, QueryError> {
+    candidate_row_refs_with_wait(
+        db,
+        txn,
+        table,
+        selection,
+        crate::parser::LockWaitMode::Default,
+    )
+}
+
+pub(super) fn candidate_row_refs_with_wait(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &TableSchema,
+    selection: Option<&Expr>,
+    wait: crate::parser::LockWaitMode,
+) -> Result<Option<Vec<crate::storage::DmlRowRef>>, QueryError> {
     if let Some(candidates) = selection
         .map(|expr| super::rowid::candidates(table, expr))
         .transpose()?
@@ -406,7 +454,7 @@ pub(super) fn candidate_row_refs_for_write(
     }
     let _partition_scope = super::partition_router::push_filter_partition_scope(table, selection);
     if !table.is_partitioned() {
-        return candidate_row_ids_for_write(db, txn, table, selection).map(|candidates| {
+        return candidate_row_ids_with_wait(db, txn, table, selection, wait).map(|candidates| {
             candidates.map(|rows| {
                 rows.into_iter()
                     .map(|row_id| crate::storage::DmlRowRef {
@@ -421,7 +469,7 @@ pub(super) fn candidate_row_refs_for_write(
     let mut out = Vec::new();
     for storage_id in super::partition_router::in_scope_storage_ids(table) {
         let _scope = super::partition_router::push_pruned_partitions(vec![storage_id]);
-        let Some(rows) = candidate_row_ids_for_write(db, txn, table, selection)? else {
+        let Some(rows) = candidate_row_ids_with_wait(db, txn, table, selection, wait)? else {
             return Ok(None);
         };
         out.extend(

@@ -2314,7 +2314,7 @@ impl BufferPool {
         record_query_buffer_hit();
         self.shards[self.shard_index(key)]
             .hits
-            .fetch_add(1, Ordering::Relaxed);
+            .add(1);
         if prefetch_hit {
             self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
             self.record_prefetch_lead(&frame);
@@ -2521,7 +2521,7 @@ impl BufferPool {
                     }
                     if intent != AccessIntent::Prefetch {
                         record_query_buffer_hit();
-                        self.shards[shard_idx].hits.fetch_add(1, Ordering::Relaxed);
+                        self.shards[shard_idx].hits.add(1);
                         if prefetch_hit {
                             self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
                             self.record_prefetch_lead(&frame);
@@ -2581,7 +2581,7 @@ impl BufferPool {
                     }
                     if intent != AccessIntent::Prefetch {
                         record_query_buffer_hit();
-                        self.shards[shard_idx].hits.fetch_add(1, Ordering::Relaxed);
+                        self.shards[shard_idx].hits.add(1);
                         if prefetch_hit {
                             self.prefetch_hits.fetch_add(1, Ordering::Relaxed);
                             self.record_prefetch_lead(&existing);
@@ -4273,7 +4273,7 @@ impl BufferPool {
         let mut shard_max_hits = 0u64;
         let mut shard_min_hits = u64::MAX;
         for shard in &self.shards {
-            let h = shard.hits.load(Ordering::Relaxed);
+            let h = shard.hits.sum();
             shard_max_hits = shard_max_hits.max(h);
             shard_min_hits = shard_min_hits.min(h);
         }
@@ -7059,7 +7059,7 @@ impl BufferPool {
     fn buffer_stats(&self) -> BufferStats {
         BufferStats {
             hits: self.shards.iter().fold(0u64, |total, shard| {
-                total.wrapping_add(shard.hits.load(Ordering::Relaxed))
+                total.wrapping_add(shard.hits.sum())
             }),
             misses: self.misses.load(Ordering::Relaxed),
         }

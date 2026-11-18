@@ -140,6 +140,28 @@ normalize numeric spelling without rounding or a global precision tolerance.
 the group sequence must match. `unordered: true` is reserved for queries with
 no ordering contract and cannot be combined with `order_keys`. Without an
 explicit contract the checker never guesses column types or discards order.
+For existing references that already discarded precision or whitespace, a TSV
+contract can explicitly set `decimal_places: 4` (half-up rounding of decimal/float
+columns only) and `trim_text: true`. Integer columns stay exact. Neither option
+is enabled by default or allowed for typed JSON. Both checkers automatically read
+`EXPECTED_DIR/comparison.json` when present; an explicit `--comparison-manifest`
+overrides it. The checked-in TPC-H contracts describe the historical fixture
+generation policy; they do not establish accuracy beyond that policy.
+For headerless TSV containing multiple result sets, declare each set's exact
+`row_count` and `columns` in order. Each set can use its own numeric and ordering
+options; reordering never crosses a set boundary. Missing/extra rows and invalid
+widths fail. For example:
+
+```json
+{"14": {"result_sets": [
+  {"row_count": 2, "columns": ["text"]},
+  {"row_count": 1, "columns": ["text", "decimal"]}
+]}}
+```
+
+These counts describe the reference data and must be updated when regenerating
+fixtures. TPC-DS reports malformed expected/actual files as `invalid_expected` /
+`invalid_actual` in its CSV, continues checking later queries, and exits nonzero.
 TSV capture must use an unambiguous NULL marker/escaping convention: legacy
 files rendering both SQL NULL and the literal string `NULL` as `NULL` cannot
 recover that distinction. The default treats that token as exact text.

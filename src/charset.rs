@@ -529,7 +529,7 @@ fn build_collations() -> Vec<CollationInfo> {
             charset: "utf8mb4",
             id: *id,
             is_default: name == DEFAULT_COLLATION,
-            is_compiled: true,
+            is_compiled: *id == UTF8MB4_0900_AI_CI_ID || binary,
             sort_len: 0,
             pad_attribute: "NO PAD",
             case_sensitive,
@@ -953,6 +953,20 @@ pub fn resolve_collation(name: &str) -> Result<&'static CollationInfo, QueryErro
         .get(normalized.as_str())
         .map(|idx| &collations()[*idx])
         .ok_or_else(|| unknown_collation(name))
+        .and_then(require_compiled_collation)
+}
+
+fn require_compiled_collation(
+    info: &'static CollationInfo,
+) -> Result<&'static CollationInfo, QueryError> {
+    if info.is_compiled {
+        Ok(info)
+    } else {
+        Err(crate::error::catalog::ER_NOT_SUPPORTED_YET.error(format!(
+            "Collation '{}' is not implemented; use utf8mb4_0900_ai_ci or utf8mb4_0900_bin",
+            info.name
+        )))
+    }
 }
 
 pub fn default_collation_for_charset(charset: &str) -> Result<&'static str, QueryError> {
@@ -1009,12 +1023,14 @@ pub fn resolve_collation_id(id: u16) -> Option<&'static CollationInfo> {
 }
 
 pub fn resolve_collation_id_checked(id: u16) -> Result<&'static CollationInfo, QueryError> {
-    resolve_collation_id(id).ok_or_else(|| {
-        mysql_errors::error(
-            mysql_errors::ER_UNKNOWN_COLLATION,
-            format!("unknown collation id: {id}"),
-        )
-    })
+    resolve_collation_id(id)
+        .ok_or_else(|| {
+            mysql_errors::error(
+                mysql_errors::ER_UNKNOWN_COLLATION,
+                format!("unknown collation id: {id}"),
+            )
+        })
+        .and_then(require_compiled_collation)
 }
 
 pub fn collation_name_for_id(id: u16) -> &'static str {
@@ -2867,9 +2883,7 @@ mod tests {
             "utf8mb3_general_ci",
             "latin1_general_ci",
             "ascii_general_ci",
-            "utf8mb4_0900_as_cs", // accent-sensitive + case-sensitive
-            "utf8mb4_0900_as_ci", // accent-sensitive + case-insensitive
-            "utf8mb4_bin",        // case-sensitive binary
+            "utf8mb4_bin", // case-sensitive binary
         ]
         .iter()
         .map(|name| resolve_collation(name).unwrap_or_else(|_| panic!("missing collation {name}")))
@@ -2972,9 +2986,6 @@ mod tests {
         // combining marks, including expansions larger than the inline buffer.
         for name in [
             "utf8mb4_0900_ai_ci",
-            "utf8mb4_0900_as_ci",
-            "utf8mb4_0900_as_cs",
-            "utf8mb4_de_pb_0900_as_cs",
             "latin1_german2_ci",
             "latin1_general_ci",
         ] {
@@ -3001,8 +3012,6 @@ mod tests {
         let collations = [
             "utf8mb4_0900_ai_ci",
             "utf8mb4_general_ci",
-            "utf8mb4_0900_as_ci",
-            "utf8mb4_0900_as_cs",
             "latin1_german2_ci",
             "utf8mb4_bin",
         ];

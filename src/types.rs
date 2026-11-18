@@ -1252,21 +1252,20 @@ pub(crate) fn write_time_canonical_with_fsp(
 
 /// Allocation-free MySQL canonical decimal text writer used by the
 /// protocol hot path. Writes the same byte sequence
-/// `format_decimal_compact` returns into a 48-byte caller-owned stack
-/// buffer. 48 bytes covers the worst case of `i64::MIN` (20 chars)
-/// with MySQL's maximum `DECIMAL(P, 30)` scale — `(sign 1) + (int 1)
-/// + (dot 1) + (scale 30)` = 33 plus headroom.
+/// `format_decimal_compact` returns into a caller-owned stack buffer.
+/// The buffer covers every u8 scale, including internal division scales:
+/// one sign, one integer digit, a decimal point, and 255 fractional digits.
 pub(crate) fn write_decimal_compact_canonical(
     magnitude: i64,
     scale: u8,
-    buf: &mut [u8; 48],
+    buf: &mut [u8; 258],
 ) -> &[u8] {
     let negative = magnitude < 0;
     let mut mag = magnitude.unsigned_abs() as u128;
     let scale_usize = scale as usize;
     // Build the digit sequence right-to-left in a scratch buffer so
     // we know the integer/fraction split before laying it into `buf`.
-    let mut tmp = [0u8; 48];
+    let mut tmp = [0u8; 258];
     let mut pos = tmp.len();
     let mut digits = 0usize;
     loop {

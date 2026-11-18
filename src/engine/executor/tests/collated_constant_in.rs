@@ -8,7 +8,7 @@ fn collated_constant_in_matches_comparison_disjunction_and_native_analysis() {
         "utf8mb4_bin",
         "utf8mb4_0900_bin",
         "utf8mb4_0900_ai_ci",
-        "utf8mb4_0900_as_cs",
+        "utf8mb4_0900_bin",
     ] {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let engine = open_test_engine(dir.path());

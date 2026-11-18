@@ -28,6 +28,10 @@ pub struct BinlogStream {
 }
 
 impl BinlogStream {
+    /// Let a governed consumer own table maps without retaining a second copy.
+    pub fn set_table_map_cache_enabled(&mut self, enabled: bool) {
+        self.esr.set_table_map_cache_enabled(enabled);
+    }
     /// `conn` is a `Conn` with `request_binlog` executed on it.
     pub(super) fn new(conn: Conn, checksum_alg: Option<BinlogChecksumAlg>) -> Self {
         let mut esr = EventStreamReader::new(Version4);

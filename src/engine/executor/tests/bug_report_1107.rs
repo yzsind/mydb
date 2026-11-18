@@ -274,7 +274,7 @@ fn report1107_fulltext_uses_column_collation_in_every_mode() {
         for (name, collation) in [
             ("ci", "utf8mb4_0900_ai_ci"),
             ("bin", "utf8mb4_bin"),
-            ("cs", "utf8mb4_0900_as_cs"),
+            ("cs", "utf8mb4_0900_bin"),
         ] {
             exec(&engine,&mut s,&format!("CREATE TABLE {name}(id INT PRIMARY KEY,s TEXT COLLATE {collation},FULLTEXT(s))")).unwrap();
             exec(

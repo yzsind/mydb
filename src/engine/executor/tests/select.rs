@@ -23979,7 +23979,7 @@ fn broad_parameterized_text_filters_keep_borrowed_decode_and_rebind() {
     use crate::engine::params::with_params;
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());
-    for collation in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_0900_as_cs"] {
+    for collation in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_0900_bin"] {
         for text_type in ["VARCHAR(16)", "CHAR(16)"] {
             engine
                 .execute("DROP TABLE IF EXISTS borrowed_text")

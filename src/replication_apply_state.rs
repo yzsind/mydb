@@ -342,16 +342,29 @@ impl ChannelRunner {
 }
 
 // A row receipt commits in the same storage transaction as its row events.
-thread_local! {
-    static ROW_RECEIPT: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
-    static RECOVERED_ROW_RECEIPT: std::cell::RefCell<Option<(String, u64)>> = const { std::cell::RefCell::new(None) };
+#[derive(Clone, Serialize, Deserialize)]
+struct RowReceipt {
+    source_uuid: String,
+    file: String,
+    pos: u64,
 }
 
-fn source_boundary_covers(applied: &(String, u64), file: &str, pos: u64) -> bool {
-    if applied.0 == file {
-        return applied.1 >= pos;
+thread_local! {
+    static ROW_RECEIPT: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+    static RECOVERED_ROW_RECEIPT: std::cell::RefCell<Option<RowReceipt>> = const { std::cell::RefCell::new(None) };
+}
+
+fn source_boundary_covers(applied: &RowReceipt, record: &RelayRecord) -> bool {
+    if applied.source_uuid.is_empty() || applied.source_uuid != record.source_uuid {
+        return false;
     }
-    match (applied.0.rsplit_once('.'), file.rsplit_once('.')) {
+    if applied.file == record.source_file {
+        return applied.pos >= record.source_pos;
+    }
+    match (
+        applied.file.rsplit_once('.'),
+        record.source_file.rsplit_once('.'),
+    ) {
         (Some((a, x)), Some((b, y))) if a == b => {
             matches!((x.parse::<u64>(), y.parse::<u64>()), (Ok(x), Ok(y)) if x > y)
         }
@@ -370,9 +383,9 @@ impl Drop for RowReceiptGuard {
 
 fn recovered_row_boundary_covers(record: &RelayRecord) -> bool {
     RECOVERED_ROW_RECEIPT.with(|slot| {
-        slot.borrow().as_ref().is_some_and(|applied| {
-            source_boundary_covers(applied, &record.source_file, record.source_pos)
-        })
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|applied| source_boundary_covers(applied, record))
     })
 }
 
@@ -391,8 +404,12 @@ fn write_current_row_receipt(
 impl ChannelRunner {
     fn row_receipt_guard(&self, record: &RelayRecord) -> Result<RowReceiptGuard, QueryError> {
         let key = replication_property_key("rows", &self.status_snapshot().channel, b"");
-        let value = serde_json::to_string(&(&record.source_file, record.source_pos))
-            .map_err(|err| io_error("serialize row apply receipt", std::io::Error::other(err)))?;
+        let value = serde_json::to_string(&RowReceipt {
+            source_uuid: record.source_uuid.clone(),
+            file: record.source_file.clone(),
+            pos: record.source_pos,
+        })
+        .map_err(|err| io_error("serialize row apply receipt", std::io::Error::other(err)))?;
         Ok(RowReceiptGuard(
             ROW_RECEIPT.with(|slot| slot.replace(Some((key, value)))),
         ))

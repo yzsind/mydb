@@ -685,14 +685,25 @@ impl<E: QueryEngine> Handler<E> {
                     .with_outcome("unknown")
                     .with_request_id(id)
             })?;
-        let sql::Payload::Structured(value, memory) = chunk.payload else {
+        let sql::Payload::Structured(mut value, memory) = chunk.payload else {
             unreachable!()
         };
-        lease.memory.lock().push(
-            self.state
-                .sql
-                .memory(codec::encoded_len(&value)?.saturating_mul(3))?,
-        );
+        match codec::encoded_len(&value)
+            .and_then(|bytes| self.state.sql.memory(bytes.saturating_mul(3)))
+        {
+            Ok(memory) => lease.memory.lock().push(memory),
+            Err(failure) => {
+                // Execution is terminal. Omit rows while retaining the commit
+                // outcome, transaction state and request handle for retries.
+                value["results"] = json!([]);
+                value["results_omitted"] = json!(true);
+                if value.get("error").is_none_or(Value::is_null) {
+                    value["error"] = failure.value();
+                } else {
+                    value["delivery_error"] = failure.value();
+                }
+            }
+        }
         lease.memory.lock().push(memory);
         *lease.execution.lock() = Some(execution);
         Ok(value)

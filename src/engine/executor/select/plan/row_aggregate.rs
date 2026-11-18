@@ -69,6 +69,7 @@ impl RowAggregateGroup {
 pub(super) struct RowAggregateProgram {
     slots: Vec<AggregateSlot>,
     group_by: Vec<CompiledPlanExpr>,
+    group_collations: Vec<Option<u16>>,
     inputs: Vec<Option<CompiledPlanExpr>>,
     pub(super) template: Vec<PlanField>,
     retain_sample: bool,
@@ -99,6 +100,17 @@ impl RowAggregateProgram {
             }
         }
         Self {
+            group_collations: schema
+                .as_ref()
+                .map(|schema| {
+                    group_by
+                        .iter()
+                        .map(|expr| {
+                            crate::engine::expr_program::input_expr_type(expr, schema).collation_id
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
             group_by: schema
                 .as_ref()
                 .map(|schema| {
@@ -246,7 +258,7 @@ impl RowAggregateGroups {
         let per_group_bytes = 64 + program.slots.len() * 32;
         if program.group_by.len() == 1 {
             let value = program.group_by[0].eval(row)?;
-            let key = ValueKey::from(&value);
+            let key = ValueKey::from_with_collation(&value, program.group_collations[0]);
             let bytes = 24 + key.payload_size() + per_group_bytes;
             match self.single.entry(key) {
                 Entry::Occupied(mut entry) => program.update(entry.get_mut(), row),
@@ -264,7 +276,11 @@ impl RowAggregateGroups {
                 .iter()
                 .map(|expr| expr.eval(row))
                 .collect::<Result<Vec<_>, _>>()?;
-            let key: Vec<ValueKey> = values.iter().map(ValueKey::from).collect();
+            let key: Vec<ValueKey> = values
+                .iter()
+                .zip(&program.group_collations)
+                .map(|(value, collation)| ValueKey::from_with_collation(value, *collation))
+                .collect();
             let bytes =
                 key.iter().map(|key| 24 + key.payload_size()).sum::<usize>() + per_group_bytes;
             match self.multi.entry(key) {

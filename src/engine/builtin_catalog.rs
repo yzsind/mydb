@@ -146,6 +146,7 @@ macro_rules! scalar_catalog {
         enum FunctionKernel {
             JsonScalar(crate::engine::json::SqlScalarSource),
             TemporalString(u8),
+            DecimalString(u8),
             BitString(u8),
             Field(crate::engine::expr::FieldComparisonDomain),
             Math(crate::engine::expr::math::MathFunction),
@@ -161,13 +162,13 @@ macro_rules! scalar_catalog {
             fn may_error(self, arity: usize) -> bool {
                 match self {
                     $(Self::$variant => ($diagnostic)(arity),)*
-                    Self::JsonScalar(_) | Self::TemporalString(_) | Self::BitString(_) | Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
+                    Self::JsonScalar(_) | Self::TemporalString(_) | Self::DecimalString(_) | Self::BitString(_) | Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) | Self::LegacySession(_) => true,
                 }
             }
             fn is_deterministic(self) -> bool {
                 match self {
                     $(Self::$variant => $deterministic,)*
-                    Self::JsonScalar(_) | Self::TemporalString(_) | Self::BitString(_) | Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) => true,
+                    Self::JsonScalar(_) | Self::TemporalString(_) | Self::DecimalString(_) | Self::BitString(_) | Self::Field(_) | Self::Math(_) | Self::Network(_) | Self::GeometryConstructor(..) | Self::Spatial(_) | Self::LegacyDeterministic(_) => true,
                     Self::LegacySession(_) => false,
                 }
             }

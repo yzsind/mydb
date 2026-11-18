@@ -875,6 +875,7 @@ fn key_plan_from_lookup(
     }
     Some(HashJoinKeyPlan {
         field_indices,
+        source_collation_ids: collation_ids.clone(),
         collation_ids,
     })
 }

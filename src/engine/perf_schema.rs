@@ -1672,6 +1672,10 @@ pub(crate) fn global_status_pairs(
         crate::engine::perf_digest::lost(),
     );
     push(
+        "Performance_schema_session_connect_attrs_lost",
+        crate::mysql::protocol::connection_attributes_lost(),
+    );
+    push(
         "Created_tmp_tables",
         crate::engine::status_counters::created_tmp_tables(),
     );

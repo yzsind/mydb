@@ -13,8 +13,6 @@ const COLLATIONS: &[&str] = &[
     "utf8mb4_0900_ai_ci",
     "utf8mb4_general_ci",
     "utf8mb4_unicode_ci",
-    "utf8mb4_0900_as_ci",
-    "utf8mb4_0900_as_cs",
     "utf8mb4_bin",
     "latin1_german2_ci",
 ];

@@ -417,7 +417,7 @@ impl HashJoinBatchOperator<'_> {
                 &self.key_collations,
             );
             for probe_row in batch.visible_indices() {
-                let hits = lookup.lookup(probe_row, &mut key).1;
+                let hits = lookup.lookup(probe_row, &mut key)?.1;
                 let Some(hits) = hits else {
                     if self.join_type == JoinType::Inner {
                         analyze_stats::add_pending_runtime_filter_rejected(1);

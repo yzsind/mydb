@@ -107,13 +107,10 @@ impl SetOpRowPuller<'_> {
                     for (column_index, (value, field)) in
                         row.iter_mut().zip(self.schema.fields()).enumerate()
                     {
-                        let passthrough = self
-                            .source_schema
-                            .fields()
-                            .get(column_index)
-                            .is_some_and(|source| {
-                                SetOpBatchOperator::can_passthrough_field(source, field)
-                            });
+                        let passthrough = !matches!(field.column_type, ColumnType::Decimal { .. })
+                            && self.source_schema.fields().get(column_index).is_some_and(
+                                |source| SetOpBatchOperator::can_passthrough_field(source, field),
+                            );
                         if !passthrough {
                             *value = crate::engine::executor::dispatch::coerce_setop_value_from(
                                 std::mem::replace(value, Value::Null),
@@ -145,6 +142,11 @@ impl SetOpRowPuller<'_> {
 impl SetOpBatchOperator<'_> {
     #[inline]
     pub(super) fn can_passthrough_field(source: &BatchField, target: &BatchField) -> bool {
+        if matches!(target.column_type, ColumnType::Decimal { .. })
+            && source.source.round_decimal_result
+        {
+            return false;
+        }
         if source.column_type == ColumnType::Vector && target.column_type == ColumnType::Vector {
             return source.source.vector_type == target.source.vector_type;
         }
@@ -212,6 +214,23 @@ impl SetOpBatchOperator<'_> {
         source: &BatchField,
         target: &BatchField,
     ) -> bool {
+        // Expression batches may carry division guard digits even when
+        // their declared metadata already equals the UNION result type.
+        if let ColumnType::Decimal { precision, scale } = target.column_type {
+            if !matches!(source.column_type,
+                ColumnType::Decimal { precision: source_precision, scale: source_scale }
+                    if source_precision <= precision && source_scale == scale)
+            {
+                return false;
+            }
+            return match column {
+                ColumnVector::Null { .. } => true,
+                ColumnVector::Decimal32 { scale: actual, .. }
+                | ColumnVector::Decimal64 { scale: actual, .. }
+                | ColumnVector::Decimal128 { scale: actual, .. } => *actual == scale,
+                _ => false,
+            };
+        }
         if matches!(target.column_type, ColumnType::VarString | ColumnType::Blob) {
             let binary = target.source.collation_id == Some(63);
             if matches!(column, ColumnVector::Bytes { .. }) {

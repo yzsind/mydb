@@ -43,6 +43,26 @@ class TabularTests(unittest.TestCase):
         self.assertNotEqual(self.result('1\ta\n2\tb\n').rows,
                             self.result('2\tb\n1\ta\n').rows)
 
+    def test_multiple_tsv_result_sets_have_explicit_boundaries_and_widths(self):
+        contract = {'result_sets': [
+            {'row_count': 2, 'columns': ['text'], 'unordered': True},
+            {'row_count': 0, 'columns': ['text', 'integer']},
+            {'row_count': 1, 'columns': ['text', 'decimal']},
+        ]}
+        expected = self.result('b\na\nx\t1.00\n', contract=contract)
+        self.assertEqual(expected.rows, [('a',), ('b',), ('x', '1')])
+        self.assertEqual(expected, self.result('a\nb\nx\t1\n', contract=contract))
+        for text in ['a\nb\nx\n', 'a\nb\n', 'a\nb\nx\t1\nextra\n']:
+            with self.subTest(text=text), self.assertRaises(ValueError):
+                self.result(text, contract=contract)
+        # Ordering permissions apply within each set, never across boundaries.
+        same_width = {'result_sets': [
+            {'row_count': 1, 'columns': ['text'], 'unordered': True},
+            {'row_count': 1, 'columns': ['text'], 'unordered': True},
+        ]}
+        self.assertNotEqual(self.result('a\nb\n', contract=same_width),
+                            self.result('b\na\n', contract=same_width))
+
     def test_only_explicit_ties_can_be_reordered(self):
         contract = {'columns': ['text', 'decimal'], 'order_keys': [0]}
         left = self.result('a\t2.00000\na\t1\na\t1\nb\t3\n', contract=contract)
@@ -61,6 +81,21 @@ class TabularTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.result(value + '\n', contract=contract)
 
+    def test_lossy_fixture_precision_and_text_trimming_require_explicit_options(self):
+        contract = {'columns': ['text', 'decimal', 'integer'],
+                    'trim_text': True, 'decimal_places': 4}
+        self.assertEqual(self.result(' 001 \t-1.23445\t12\n', contract=contract),
+                         self.result('001\t-1.2345\t12\n', contract=contract))
+        self.assertNotEqual(self.result('001\t1.0001\t12\n', contract=contract),
+                            self.result('001\t1.0002\t12\n', contract=contract))
+        contract = {'columns': ['decimal'], 'decimal_places': 4}
+        self.assertEqual(self.result('123456789012345678901234567890.99995\n', contract=contract).rows,
+                         [('123456789012345678901234567891',)])
+        self.assertEqual(self.result('-0.00001\n', contract=contract).rows, [('0',)])
+        with self.assertRaises(ValueError):
+            self.result('001\t1\t12.00001\n', contract={
+                'columns': ['text', 'decimal', 'integer'], 'decimal_places': 4})
+
     def test_null_requires_an_explicit_marker_and_does_not_equal_text(self):
         contract = {'columns': ['text'], 'null_marker': '\\N'}
         self.assertNotEqual(self.result('\\N\n', contract=contract), self.result('NULL\n', contract=contract))
@@ -74,7 +109,23 @@ class TabularTests(unittest.TestCase):
     def test_invalid_contracts_fail(self):
         for contract in [{'columns': ['unknown']}, {'order_keys': [5]},
                          {'columns': ['text', 'decimal']}, {'unordered': True, 'order_keys': [0]},
-                         {'order_keys': [-1]}, {'unordered': 'yes'}, {'typo': True}]:
+                         {'order_keys': [-1]}, {'unordered': 'yes'}, {'typo': True},
+                         {'trim_text': 'yes'}, {'decimal_places': 4},
+                         {'columns': ['decimal'], 'decimal_places': True},
+                         {'columns': ['decimal'], 'decimal_places': -1},
+                         {'columns': ['decimal'], 'decimal_places': 1.5},
+                         {'format': 'typed-json', 'trim_text': True},
+                         {'format': 'typed-json', 'decimal_places': 4},
+                         {'result_sets': []}, {'result_sets': 'invalid'},
+                         {'result_sets': [None]},
+                         {'result_sets': [{'columns': ['text']}]},
+                         {'result_sets': [{'row_count': 1}]},
+                         {'result_sets': [{'row_count': 0, 'columns': None}]},
+                         {'result_sets': [{'row_count': -1, 'columns': ['text']}]},
+                         {'result_sets': [{'row_count': True, 'columns': ['text']}]},
+                         {'result_sets': [{'row_count': 1, 'format': 'typed-json'}]},
+                         {'result_sets': [{'row_count': 0, 'result_sets': []}]},
+                         {'result_sets': [{'row_count': 0, 'columns': ['text']}], 'unordered': True}]:
             with self.subTest(contract=contract), self.assertRaises(ValueError):
                 self.result('1\n', contract=contract)
 
@@ -125,7 +176,7 @@ class TabularTests(unittest.TestCase):
     def test_cli_uses_per_query_contract(self):
         (self.root / 'q01.tsv').write_text('a\t2\na\t1\n')
         (self.root / 'q01_result.txt').write_text('a\t1.0\na\t2.0\n')
-        manifest = self.root / 'comparison.json'
+        manifest = self.root / 'contract.json'
         manifest.write_text(json.dumps({'1': {'columns': ['text', 'decimal'], 'order_keys': [0]}}))
         command = [sys.executable, str(Path(__file__).with_name('tpcds_check_results.py')),
             '--expected-dir', str(self.root), '--actual-dir', str(self.root), '--queries', '1',

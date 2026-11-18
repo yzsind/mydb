@@ -141,8 +141,7 @@ impl Iterator for SqlSegments<'_> {
                 && start > 0
                 && matches!(self.bytes[start - 1], b'x' | b'X')
                 && (start < 2
-                    || !(self.bytes[start - 2].is_ascii_alphanumeric()
-                        || self.bytes[start - 2] == b'_'));
+                    || (!is_word_continue(self.bytes[start - 2]) && self.bytes[start - 2] != b'@'));
             if hex_literal {
                 let end = memchr::memchr(b'\'', &self.bytes[start + 1..])
                     .map(|offset| start + 1 + offset);

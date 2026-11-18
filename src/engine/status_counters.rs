@@ -573,6 +573,7 @@ pub(crate) fn status_var_defs() -> &'static [StatusVarDef] {
                 "Connection_errors_max_connections",
                 "Prepared_stmt_count",
                 "Performance_schema_digest_lost",
+                "Performance_schema_session_connect_attrs_lost",
                 "Uptime",
             ],
             StatusScope::Global,

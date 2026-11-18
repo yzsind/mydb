@@ -1312,14 +1312,18 @@ impl SessionHandle {
 
     pub(crate) fn set_base_state(&self, state: ProcessState) {
         let mut entry = self.entry.lock();
+        Self::update_base_state(&mut entry, state);
+    }
+
+    fn update_base_state(entry: &mut SessionEntry, state: ProcessState) {
         entry.base_state = Some(state);
         if entry.killed {
             return;
         }
         if entry.active_stage_total == 0 {
-            Self::set_effective_state(&mut entry, Some(state));
+            Self::set_effective_state(entry, Some(state));
         } else {
-            Self::recompute_effective_state(&mut entry);
+            Self::recompute_effective_state(entry);
         }
     }
 
@@ -1343,13 +1347,15 @@ impl SessionHandle {
     /// handle memoizes in its [`SensitivityMemo`].
     ///
     /// [`SensitivityMemo`]: crate::engine::http::SensitivityMemo
-    pub(crate) fn set_process_info_prechecked(&self, info: Arc<str>, sensitive: bool) {
+    pub(crate) fn set_prepared_execution(&self, info: Arc<str>, sensitive: bool) {
         let info = if sensitive {
             Arc::from(crate::engine::http::redaction_marker(&info, false))
         } else {
             info
         };
-        self.entry.lock().info = Some(ProcessSqlText::Shared(info));
+        let mut entry = self.entry.lock();
+        entry.info = Some(ProcessSqlText::Shared(info));
+        Self::update_base_state(&mut entry, ProcessState::Executing);
     }
 
     pub(crate) fn set_time_reference_unix_secs(&self, reference: Option<u64>) {

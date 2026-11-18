@@ -60,7 +60,9 @@ impl BuildDomain {
                     collations,
                     row,
                     &mut encoded,
-                ) && !keys.contains(encoded.as_slice())
+                )
+                .ok()?
+                    && !keys.contains(encoded.as_slice())
                 {
                     if !charge.add_within(encoded.len(), cap) {
                         return None;
@@ -180,7 +182,7 @@ impl BatchOperator for BuildDomainStream<'_> {
                             &self.collations,
                             row,
                             &mut encoded,
-                        ) && keys.contains(encoded.as_slice())
+                        )? && keys.contains(encoded.as_slice())
                     }
                 };
                 if contains {

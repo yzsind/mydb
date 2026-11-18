@@ -2171,6 +2171,84 @@ fn prepared_parameter_insert_uses_scalar_binding_and_preserves_typed_values() {
 }
 
 #[test]
+fn prepared_full_width_parameters_rebind_after_column_reorder() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE bind_order (id INT PRIMARY KEY, a VARCHAR(20), b VARCHAR(20))")
+        .unwrap();
+    let mut session = SessionContext::default();
+    let sql = "INSERT INTO bind_order (id, a, b) VALUES (?, ?, ?), (?, ?, ?)";
+    let prepared = engine.prepare_cached(&mut session, sql, 6).unwrap();
+    let mut state = PreparedDmlState::default();
+    let params = |id| {
+        [
+            Value::Int(id),
+            Value::String("a1".into()),
+            Value::String("b1".into()),
+            Value::Int(id + 1),
+            Value::String("a2".into()),
+            Value::Null,
+        ]
+    };
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &prepared,
+                sql,
+                &params(1)
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        2
+    );
+    let PreparedDmlState::Ready(plan) = &state else {
+        panic!("missing prepared plan")
+    };
+    assert!(plan.parameter_insert.is_some());
+    engine
+        .execute("ALTER TABLE bind_order DROP COLUMN a")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE bind_order ADD COLUMN a VARCHAR(20) AFTER id")
+        .unwrap();
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &prepared,
+                sql,
+                &params(3)
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        2
+    );
+    let PreparedDmlState::Ready(plan) = &state else {
+        panic!("missing rebound prepared plan")
+    };
+    assert!(plan.parameter_insert.is_none());
+    assert_eq!(
+        result_rows(
+            engine
+                .execute("SELECT a, b FROM bind_order WHERE id >= 3 ORDER BY id")
+                .unwrap()
+        ),
+        vec![
+            vec![Value::String("a1".into()), Value::String("b1".into())],
+            vec![Value::String("a2".into()), Value::Null],
+        ]
+    );
+}
+
+#[test]
 fn prepared_point_decode_recipe_is_shared_and_rebinds_after_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

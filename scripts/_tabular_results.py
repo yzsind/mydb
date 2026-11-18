@@ -19,11 +19,12 @@ class CanonicalResult:
     metadata: tuple = ()
 
 
-def normalize_cell(value: str, kind: str = 'text', null_marker: str | None = None) -> str | None:
+def normalize_cell(value: str, kind: str = 'text', null_marker: str | None = None,
+                   *, trim_text: bool = False, decimal_places: int | None = None) -> str | None:
     if null_marker is not None and value == null_marker:
         return None
     if kind == 'text':
-        return value
+        return value.strip() if trim_text else value
     if value != value.strip():
         raise ValueError(f'whitespace in numeric cell: {value!r}')
     try:
@@ -32,6 +33,14 @@ def normalize_cell(value: str, kind: str = 'text', null_marker: str | None = Non
         raise ValueError(f'invalid {kind} cell: {value!r}') from error
     if not number.is_finite() or (kind == 'integer' and number != number.to_integral_value()):
         raise ValueError(f'invalid {kind} cell: {value!r}')
+    if decimal_places is not None and kind != 'integer':
+        # Lossy reference fixtures must explicitly declare their precision.
+        # Size the local context for both the integer and fractional digits,
+        # including a possible carry; never inherit the process-wide precision.
+        with decimal.localcontext() as context:
+            context.prec = max(1, len(number.as_tuple().digits), number.adjusted() + 1) + decimal_places + 1
+            number = number.quantize(decimal.Decimal((0, (1,), -decimal_places)),
+                                     rounding=decimal.ROUND_HALF_UP)
     # Formatting does not round to the process-wide Decimal context precision.
     if not number:
         return '0'
@@ -40,16 +49,36 @@ def normalize_cell(value: str, kind: str = 'text', null_marker: str | None = Non
 
 
 def validate_contract(contract: dict) -> None:
-    if not isinstance(contract, dict) or set(contract) - {'columns', 'order_keys', 'unordered', 'null_marker', 'format'}:
+    if isinstance(contract, dict) and 'result_sets' in contract:
+        if set(contract) != {'result_sets'}:
+            raise ValueError('result_sets cannot be combined with top-level comparison options')
+        sets = contract['result_sets']
+        if not isinstance(sets, list) or not sets:
+            raise ValueError('result_sets must be a nonempty list')
+        for spec in sets:
+            if (not isinstance(spec, dict) or type(spec.get('row_count')) is not int
+                    or spec['row_count'] < 0 or not isinstance(spec.get('columns'), list)
+                    or spec.get('format', 'tsv') != 'tsv' or 'result_sets' in spec):
+                raise ValueError('each TSV result set requires a nonnegative row_count and explicit columns')
+            validate_contract({key: value for key, value in spec.items() if key != 'row_count'})
+        return
+    if not isinstance(contract, dict) or set(contract) - {
+            'columns', 'order_keys', 'unordered', 'null_marker', 'format', 'trim_text', 'decimal_places'}:
         raise ValueError('unknown comparison contract fields')
     if contract.get('format', 'tsv') not in ('tsv', 'typed-json'):
         raise ValueError('format must be tsv or typed-json')
-    if contract.get('format') == 'typed-json' and ('columns' in contract or 'null_marker' in contract):
+    if contract.get('format') == 'typed-json' and any(
+            field in contract for field in ('columns', 'null_marker', 'trim_text', 'decimal_places')):
         raise ValueError('typed-json already carries types and NULL values')
     columns = contract.get('columns')
     if columns is not None and (not isinstance(columns, list) or not columns or
             any(kind not in ('text', 'integer', 'decimal', 'float') for kind in columns)):
         raise ValueError('columns must be a nonempty list of explicit scalar types')
+    if type(contract.get('trim_text', False)) is not bool:
+        raise ValueError('trim_text must be a boolean')
+    if 'decimal_places' in contract and (type(contract['decimal_places']) is not int or
+                                       contract['decimal_places'] < 0 or columns is None):
+        raise ValueError('decimal_places requires explicit columns and a nonnegative integer')
     keys = contract.get('order_keys')
     if keys is not None and (not isinstance(keys, list) or not keys or
             any(type(key) is not int or key < 0 for key in keys) or len(keys) != len(set(keys))):
@@ -97,10 +126,47 @@ def typed_cell(value):
     raise ValueError(f'unsupported typed-json cell: {value!r}')
 
 
+def _ordered_rows(rows: list[tuple], contract: dict) -> list[tuple]:
+    def serialized(row):
+        return json.dumps(row, ensure_ascii=False, separators=(',', ':'))
+    if contract.get('unordered'):
+        rows.sort(key=serialized)
+        return rows
+    keys = contract.get('order_keys')
+    if keys:
+        # Keep the reference's group sequence. Reordering distinct ORDER BY
+        # keys, including separating a tie group, must still fail comparison.
+        return [row for _, group in itertools.groupby(rows, lambda row: serialized(tuple(row[i] for i in keys)))
+                for row in sorted(group, key=serialized)]
+    return rows
+
+
+def _tsv_rows(source, path: Path, contract: dict) -> list[tuple]:
+    columns = contract.get('columns')
+    keys = contract.get('order_keys')
+    width = len(columns) if columns else None
+    rows = []
+    # Only newline terminators are removed: blank records are real empty rows.
+    for line in source:
+        record = line[:-2] if line.endswith('\r\n') else line.removesuffix('\n')
+        cells = record.split('\t')
+        if width is None:
+            width = len(cells)
+        if len(cells) != width:
+            raise ValueError(f'{path}: inconsistent result width: {len(cells)} != {width}')
+        rows.append(tuple(normalize_cell(cell, columns[i] if columns else 'text',
+                                        contract.get('null_marker'),
+                                        trim_text=contract.get('trim_text', False),
+                                        decimal_places=contract.get('decimal_places'))
+                          for i, cell in enumerate(cells)))
+    if keys and width is not None and max(keys) >= width:
+        raise ValueError('order key is outside the result columns')
+    return _ordered_rows(rows, contract)
+
+
 def canonicalize(path: Path, *, contract: dict | None = None) -> CanonicalResult:
     contract = {} if contract is None else contract
     validate_contract(contract)
-    columns = contract.get('columns')
     keys = contract.get('order_keys')
     rows = []
     metadata = ()
@@ -123,30 +189,25 @@ def canonicalize(path: Path, *, contract: dict | None = None) -> CanonicalResult
             if not isinstance(row, list) or len(row) != width:
                 raise ValueError('typed-json row width does not match metadata')
             rows.append(tuple(typed_cell(cell) for cell in row))
-    else:
-        width = len(columns) if columns else None
-        # Only newline terminators are removed: blank records are real empty rows.
+        if keys and max(keys) >= width:
+            raise ValueError('order key is outside the result columns')
+        rows = _ordered_rows(rows, contract)
+    elif 'result_sets' in contract:
+        # Headerless batch TSV has no set delimiters. The reference contract
+        # must provide the boundaries, including empty and equal-width sets.
         with path.open(encoding='utf-8', newline='') as source:
-            for line in source:
-                record = line[:-2] if line.endswith('\r\n') else line.removesuffix('\n')
-                cells = record.split('\t')
-                if width is None:
-                    width = len(cells)
-                if len(cells) != width:
-                    raise ValueError(f'{path}: inconsistent result width: {len(cells)} != {width}')
-                rows.append(tuple(normalize_cell(cell, columns[i] if columns else 'text',
-                                                contract.get('null_marker')) for i, cell in enumerate(cells)))
-    if keys and width is not None and max(keys) >= width:
-        raise ValueError('order key is outside the result columns')
-    def serialized(row):
-        return json.dumps(row, ensure_ascii=False, separators=(',', ':'))
-    if contract.get('unordered'):
-        rows.sort(key=serialized)
-    elif keys:
-        # Keep the reference's group sequence. Reordering distinct ORDER BY
-        # keys, including separating a tie group, must still fail comparison.
-        rows = [row for _, group in itertools.groupby(rows, lambda row: serialized(tuple(row[i] for i in keys)))
-                for row in sorted(group, key=serialized)]
+            for index, spec in enumerate(contract['result_sets'], 1):
+                batch = _tsv_rows(itertools.islice(source, spec['row_count']), path, spec)
+                if len(batch) != spec['row_count']:
+                    raise ValueError(f'{path}: result set {index}: row count {len(batch)} != {spec["row_count"]}')
+                rows.extend(batch)
+            if next(source, None) is not None:
+                raise ValueError(f'{path}: extra rows after declared result sets')
+        metadata = ('result_sets', tuple((spec['row_count'], len(spec['columns']))
+                                         for spec in contract['result_sets']))
+    else:
+        with path.open(encoding='utf-8', newline='') as source:
+            rows = _tsv_rows(source, path, contract)
     payload = json.dumps([metadata, rows], ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode()
     return CanonicalResult(rows, hashlib.sha256(payload).hexdigest(), metadata)
 

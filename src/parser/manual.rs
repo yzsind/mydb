@@ -1551,7 +1551,11 @@ impl<'a> LoadDataParser<'a> {
         if end > self.bytes.len() {
             return false;
         }
-        if !self.sql[self.pos..end].eq_ignore_ascii_case(keyword) {
+        if !self
+            .sql
+            .get(self.pos..end)
+            .is_some_and(|text| text.eq_ignore_ascii_case(keyword))
+        {
             return false;
         }
         if end < self.bytes.len()

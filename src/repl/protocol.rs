@@ -22,7 +22,7 @@ use std::io::{Error, ErrorKind, Result as IoResult};
 use crc32fast::Hasher as Crc32;
 
 pub const MAGIC: [u8; 4] = *b"REPL";
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 pub const MAX_PAYLOAD_BYTES: usize = 64 * 1024 * 1024;
 pub const FRAME_HEADER_LEN: usize = 4 + 1 + 4;
 pub const FRAME_TRAILER_LEN: usize = 4;
@@ -45,6 +45,7 @@ pub enum MsgType {
     BaseBackupStart = 8,
     BaseBackupChunk = 9,
     BaseBackupEnd = 10,
+    BaseBackupManifest = 11,
 }
 
 impl MsgType {
@@ -60,6 +61,7 @@ impl MsgType {
             8 => MsgType::BaseBackupStart,
             9 => MsgType::BaseBackupChunk,
             10 => MsgType::BaseBackupEnd,
+            11 => MsgType::BaseBackupManifest,
             _ => {
                 return Err(Error::new(
                     ErrorKind::InvalidData,
@@ -82,6 +84,7 @@ pub enum Message {
     BaseBackupStart(BaseBackupStart),
     BaseBackupChunk(BaseBackupChunk),
     BaseBackupEnd(BaseBackupEnd),
+    BaseBackupManifest(BaseBackupStart),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -218,6 +221,7 @@ impl Message {
             Message::Resync(_) => MsgType::Resync,
             Message::Close(_) => MsgType::Close,
             Message::BaseBackupStart(_) => MsgType::BaseBackupStart,
+            Message::BaseBackupManifest(_) => MsgType::BaseBackupManifest,
             Message::BaseBackupChunk(_) => MsgType::BaseBackupChunk,
             Message::BaseBackupEnd(_) => MsgType::BaseBackupEnd,
         }
@@ -232,7 +236,9 @@ impl Message {
             Message::ReplicaAck(m) => encode_replica_ack(m, out),
             Message::Resync(m) => encode_resync(m, out),
             Message::Close(m) => encode_close(m, out),
-            Message::BaseBackupStart(m) => encode_base_backup_start(m, out),
+            Message::BaseBackupStart(m) | Message::BaseBackupManifest(m) => {
+                encode_base_backup_start(m, out)
+            }
             Message::BaseBackupChunk(m) => encode_base_backup_chunk(m, out),
             Message::BaseBackupEnd(m) => encode_base_backup_end(m, out),
         }
@@ -249,6 +255,9 @@ impl Message {
             MsgType::Resync => Message::Resync(decode_resync(&mut r)?),
             MsgType::Close => Message::Close(decode_close(&mut r)?),
             MsgType::BaseBackupStart => Message::BaseBackupStart(decode_base_backup_start(&mut r)?),
+            MsgType::BaseBackupManifest => {
+                Message::BaseBackupManifest(decode_base_backup_start(&mut r)?)
+            }
             MsgType::BaseBackupChunk => Message::BaseBackupChunk(decode_base_backup_chunk(&mut r)?),
             MsgType::BaseBackupEnd => Message::BaseBackupEnd(decode_base_backup_end(&mut r)?),
         };
@@ -470,7 +479,10 @@ where
     if precharged
         && matches!(
             msg_type,
-            MsgType::BaseBackupStart | MsgType::BaseBackupChunk | MsgType::BaseBackupEnd
+            MsgType::BaseBackupStart
+                | MsgType::BaseBackupManifest
+                | MsgType::BaseBackupChunk
+                | MsgType::BaseBackupEnd
         )
     {
         return Err(Error::new(
@@ -481,7 +493,7 @@ where
     let limit = match msg_type {
         MsgType::WalChunk if hard_limit => max_wal_bytes.saturating_add(24),
         MsgType::WalChunk => MAX_PAYLOAD_BYTES,
-        MsgType::BaseBackupStart => MAX_PAYLOAD_BYTES,
+        MsgType::BaseBackupStart | MsgType::BaseBackupManifest => MAX_PAYLOAD_BYTES,
         MsgType::BaseBackupChunk => 1024 * 1024 + 8192,
         _ => 8192,
     };

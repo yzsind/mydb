@@ -431,57 +431,28 @@ pub(super) fn execute_insert(
 /// `eval_insert_value_rows`); a prepared insert's rows are placeholders
 /// that are re-evaluated per execute anyway, so borrowing costs nothing
 /// there and the occasional literal falls back to a per-value clone —
-/// still far cheaper than cloning the whole `Insert`. Returns
-/// `Ok(None)` for `INSERT … SELECT`, which keeps the owned streaming
-/// path (the caller clones and delegates).
+/// still far cheaper than cloning the whole `Insert`. Prepared DML
+/// compilation already excludes view checks, explicit partitions and VALUES
+/// subqueries. INSERT … SELECT borrows the target and clones its plan input.
 pub(super) fn execute_insert_borrowed(
     db: &Arc<Database>,
     session: &mut SessionContext,
     txn: TxnView,
     stmt: &Insert,
+    parameter_insert: Option<&crate::engine::api::PreparedParameterInsert>,
     registry: &SessionRegistry,
-) -> Result<Option<QueryResponse>, QueryError> {
+) -> Result<QueryResponse, QueryError> {
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
-    if stmt
-        .view_check_predicate
-        .as_ref()
-        .is_some_and(super::prepared_dml::expr_contains_subquery)
+    // The compiled target and its trigger eligibility have been revalidated
+    // under statement MDL. Multi-row non-strict NULL repair still needs the
+    // ordinary column-aware evaluator.
+    if let Some(binding) =
+        parameter_insert.filter(|binding| binding.row_count == 1 || insert_strict_mode())
     {
-        return execute_insert(db, session, txn, stmt.clone(), registry).map(Some);
+        return execute_parameter_insert(db, txn, stmt, binding);
     }
-
-    let partition_filter = if stmt.partitions.is_empty() {
-        None
-    } else {
-        super::partition_clause::resolve_partition_clause(db, &stmt.table, &stmt.partitions)?
-    };
-    let _partition_write = partition_filter
-        .as_ref()
-        .map(|allowed| {
-            db.table(&stmt.table).map(|table| {
-                super::partition_clause::PartitionWriteGuard::enter(table.id, allowed.clone())
-            })
-        })
-        .transpose()?;
     match &stmt.source {
         InsertSource::Values(expr_rows) => {
-            if expr_rows
-                .iter()
-                .flatten()
-                .any(super::prepared_dml::expr_contains_subquery)
-            {
-                let mut resolved_rows = expr_rows.clone();
-                for row in &mut resolved_rows {
-                    for expr in row {
-                        if super::prepared_dml::expr_contains_subquery(expr) {
-                            super::dml::materialize_subqueries(db, txn, expr)?;
-                        }
-                    }
-                }
-                let mut owned = stmt.clone();
-                owned.source = InsertSource::Values(resolved_rows);
-                return execute_insert(db, session, txn, owned, registry).map(Some);
-            }
             let mut rows = eval_insert_value_rows_borrowed(
                 db,
                 &stmt.table,
@@ -502,7 +473,7 @@ pub(super) fn execute_insert_borrowed(
             let ctx = InsertChunkCtx::compute(db, session, stmt);
             let resp = dispatch_insert_chunk(db, session, txn, stmt, &ctx, rows, registry)?;
             finalize_insert_info(records, false);
-            Ok(Some(resp))
+            Ok(resp)
         }
         // P4 — prepared INSERT…SELECT streams through the borrowed cached
         // `Insert`, cloning only the source query (which the executor
@@ -513,18 +484,95 @@ pub(super) fn execute_insert_borrowed(
             if insert_targets_generated(&table, stmt.columns.as_deref())? {
                 return Err(generated_column_assignment_error());
             }
-            let resp = execute_insert_from_select_stream(
+            execute_insert_from_select_stream(
                 db,
                 session,
                 txn,
                 stmt,
                 select.clone(),
                 registry,
-                partition_filter,
-            )?;
-            Ok(Some(resp))
+                None,
+            )
         }
     }
+}
+
+/// Pin the positional mapping of direct parameters to a complete heap row.
+/// Special column conversions and partial/defaulted rows use the canonical
+/// VALUES evaluator. Storage still performs coercion, locking and constraints.
+pub(super) fn compile_parameter_insert(
+    table: &TableSchema,
+    stmt: &Insert,
+) -> Option<crate::engine::api::PreparedParameterInsert> {
+    let InsertSource::Values(rows) = &stmt.source else {
+        return None;
+    };
+    if rows.is_empty() || stmt.returning.is_some() || table.columns.is_empty() {
+        return None;
+    }
+    let width = table.columns.len();
+    let indexes = insert_column_indexes(table, stmt.columns.as_deref()).ok()?;
+    if indexes.len() != width || !indexes.iter().copied().eq(0..width) {
+        return None;
+    }
+    if table.columns.iter().any(|column| {
+        column.state == crate::storage::ColumnState::Dropped
+            || column.generated_expr.is_some()
+            || column.auto_increment
+            || (!column.nullable && matches!(column.data_type, DataTypeKind::Timestamp { .. }))
+            || matches!(
+                column.data_type,
+                DataTypeKind::Binary { .. }
+                    | DataTypeKind::VarBinary { .. }
+                    | DataTypeKind::Blob { .. }
+            )
+    }) {
+        return None;
+    }
+    if rows.iter().any(|row| row.len() != width)
+        || !rows
+            .iter()
+            .flatten()
+            .enumerate()
+            .all(|(pos, expr)| matches!(expr, Expr::Placeholder(index) if *index == pos))
+    {
+        return None;
+    }
+    Some(crate::engine::api::PreparedParameterInsert {
+        row_width: width,
+        row_count: rows.len(),
+    })
+}
+
+fn execute_parameter_insert(
+    db: &Database,
+    txn: TxnView,
+    stmt: &Insert,
+    binding: &crate::engine::api::PreparedParameterInsert,
+) -> Result<QueryResponse, QueryError> {
+    let rows = crate::engine::params::with_current_params(|params, _| {
+        let params = params.unwrap_or_default();
+        let mut rows = Vec::with_capacity(binding.row_count);
+        for row in 0..binding.row_count {
+            crate::engine::cancel::check_cancelled()?;
+            let from = row * binding.row_width;
+            let values = params.get(from..from + binding.row_width).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_WRONG_ARGUMENTS,
+                    "parameter is not bound",
+                )
+            })?;
+            rows.push(values.to_vec());
+        }
+        Ok::<_, QueryError>(rows)
+    })?;
+    let _ignore_coercion = crate::storage::DmlIgnoreCoercionGuard::new(false);
+    let inserted = db.insert_rows_detailed(txn, &stmt.table, rows)?;
+    crate::engine::api::set_statement_insert_id(inserted.first_insert_id);
+    finalize_insert_info(binding.row_count as u64, false);
+    Ok(QueryResponse::OkAffected {
+        affected_rows: inserted.row_ids.len() as u64,
+    })
 }
 
 /// Apply a single (possibly partial) batch of rows through the same
@@ -3481,11 +3529,21 @@ pub(super) fn insert_column_indexes(
             return Ok(table.iter_select_columns().map(|(idx, _)| idx).collect());
         }
     };
-    let mut column_indexes = Vec::new();
-    let mut seen = HashSet::new();
+    let mut column_indexes = Vec::with_capacity(insert_columns.len());
+    let mut seen = 0u128;
+    let mut wide = (table.columns.len() > u128::BITS as usize)
+        .then(|| HashSet::with_capacity(insert_columns.len()));
     for column in insert_columns {
         let idx = table.column_index(column)?;
-        if !seen.insert(idx) {
+        let new = if let Some(wide) = &mut wide {
+            wide.insert(idx)
+        } else {
+            let bit = 1u128 << idx;
+            let new = seen & bit == 0;
+            seen |= bit;
+            new
+        };
+        if !new {
             return Err(error(
                 crate::error::catalog::ER_FIELD_SPECIFIED_TWICE,
                 format!("column '{}' specified twice", column),

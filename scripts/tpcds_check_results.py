@@ -37,10 +37,13 @@ def main() -> int:
         help="Execution status CSV from the benchmark runner; only ok may pass",
     )
     parser.add_argument("--comparison-manifest", type=Path,
-                        help="JSON query contracts: explicit types and ORDER BY tie keys; default exact ordered TSV")
+                        help="JSON query contracts; defaults to expected-dir/comparison.json if present, otherwise exact ordered TSV")
     args = parser.parse_args()
+    manifest = args.comparison_manifest
+    if manifest is None and (args.expected_dir / 'comparison.json').is_file():
+        manifest = args.expected_dir / 'comparison.json'
     try:
-        contracts = comparison_contracts(args.comparison_manifest)
+        contracts = comparison_contracts(manifest)
     except (OSError, ValueError) as error:
         parser.error(str(error))
 
@@ -74,11 +77,21 @@ def main() -> int:
             status = "missing_actual"
             message = f"{actual_path} not found"
         else:
-            expected = canonicalize(expected_path, contract=contracts.get(str(query)))
-            actual = canonicalize(actual_path, contract=contracts.get(str(query)))
-            if expected.rows != actual.rows or expected.metadata != actual.metadata:
-                status = "mismatch"
-                message = "canonical rows differ"
+            try:
+                expected = canonicalize(expected_path, contract=contract)
+            except (OSError, ValueError) as error:
+                status = "invalid_expected"
+                message = str(error)
+            if status == "ok":
+                try:
+                    actual = canonicalize(actual_path, contract=contract)
+                except (OSError, ValueError) as error:
+                    status = "invalid_actual"
+                    message = str(error)
+            if status == "ok":
+                if expected.rows != actual.rows or expected.metadata != actual.metadata:
+                    status = "mismatch"
+                    message = "canonical rows differ"
 
         if status != "ok":
             failed = True

@@ -33,6 +33,7 @@ mod table_ddl_audit_1027;
 mod tablesample;
 mod temporal_comparison_consistency;
 mod txn_acid_audit_1108;
+mod vaderyang_issues;
 
 use super::*;
 use crate::parser::Assignment;

@@ -13,7 +13,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex as PlMutex;
-use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
 
 use crate::repl::config::ReplConfig;
 use crate::repl::master::slot::SlotHandle;
@@ -372,16 +372,19 @@ pub async fn run_sender(
             .data_dir
             .as_ref()
             .expect("needs_base_backup gated by data_dir Some");
-        match crate::repl::base_backup::stream_base_backup_with_chunk_bytes(
+        let capture = crate::repl::base_backup::stream_base_backup_with_chunk_bytes(
             &mut writer,
             db,
             data_dir,
             env.config
                 .chunk_bytes
                 .min(req.max_chunk_bytes.max(1) as usize),
-        )
-        .await
-        {
+        );
+        let result = tokio::select! {
+            result = capture => result,
+            _ = reader.read_u8() => Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED.error("peer disconnected or sent unexpected data during base backup")),
+        };
+        match result {
             Ok(snapshot) => {
                 effective_start_lsn = snapshot.backup_lsn.saturating_add(1);
             }

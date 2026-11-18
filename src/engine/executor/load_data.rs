@@ -357,6 +357,8 @@ pub(super) fn execute_load_data_with_reader(
     // every element type and both persistent backends. Heap-only import cannot
     // publish a complete graph or a replayable vector completion boundary.
     let needs_general = table.indexes.iter().any(|index| index.is_vector())
+        || crate::engine::rls::binding(db, &table, crate::parser::rls::Command::Insert, true)?
+            .is_some()
         || stmt.is_xml
         || !stmt.set_clauses.is_empty()
         || stmt.has_user_var_targets()
@@ -620,6 +622,8 @@ fn load_data_exclusive_insert_shape_eligible(
     table: &TableSchema,
 ) -> Result<bool, QueryError> {
     if !session.autocommit
+        || crate::engine::rls::binding(db, table, crate::parser::rls::Command::Insert, true)?
+            .is_some()
         || session.explicit_txn
         || session.current_txn.is_some()
         || session.xa_branch.is_some()

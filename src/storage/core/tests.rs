@@ -3,6 +3,40 @@ use super::*;
 include!("storage_handle_memo_tests.rs");
 
 #[test]
+fn issue_18_auth_catalog_delta_survives_commit_mdl_retry() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let txn = db.begin_txn().unwrap();
+    db.applier_dd_dirty_txns.lock().insert(
+        txn.txn_id,
+        CatalogApplyDelta {
+            dd_touched: true,
+            invalidate_all: true,
+            ..Default::default()
+        },
+    );
+    let owner = crate::storage::mdl::allocate_internal_owner().unwrap();
+    db.acquire_mdl(
+        owner,
+        None,
+        crate::storage::mdl::MdlDuration::Statement,
+        vec![MdlRequest {
+            key: MdlObjectKey::table("mysql", "user"),
+            lock_type: MdlLockType::SharedNoWrite,
+        }],
+        "issue18",
+    )
+    .unwrap();
+    let failed = db.apply_commit_txn(txn.txn_id, db.visible_scn() + 1);
+    db.release_mdl_owner(owner);
+    assert!(failed.is_err());
+    assert!(db.applier_dd_dirty_txns.lock().contains_key(&txn.txn_id));
+    db.apply_commit_txn(txn.txn_id, db.visible_scn() + 1)
+        .unwrap();
+    assert!(!db.applier_dd_dirty_txns.lock().contains_key(&txn.txn_id));
+}
+
+#[test]
 fn deadlock_detect_toggle_covers_row_table_unique_and_mixed_cycles() {
     for kind in ["row", "table", "unique", "range", "mixed", "upgrade"] {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
@@ -27615,7 +27649,7 @@ fn buffer_pool_sharded_hits_count_concurrent_resident_reads_exactly() {
         pool.buffer_stats().hits,
         pool.shards
             .iter()
-            .map(|shard| shard.hits.load(Ordering::Relaxed))
+            .map(|shard| shard.hits.sum())
             .sum::<u64>()
     );
 }

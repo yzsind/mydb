@@ -741,17 +741,30 @@ fn fk_build_key<'a>(
     ref_cols: &[String],
     vals: impl IntoIterator<Item = &'a Value>,
 ) -> Result<IndexKey, QueryError> {
+    fk_build_key_from_positions(
+        table,
+        index,
+        ref_cols.iter().map(|column| table.column_index(column)),
+        vals,
+    )
+}
+
+fn fk_build_key_from_positions<'a>(
+    table: &TableSchema,
+    index: &IndexSchema,
+    columns: impl ExactSizeIterator<Item = Result<usize, QueryError>>,
+    vals: impl IntoIterator<Item = &'a Value>,
+) -> Result<IndexKey, QueryError> {
     let mut vals = vals.into_iter();
-    let mut parts = smallvec::SmallVec::<[KeyPart; 4]>::with_capacity(ref_cols.len());
-    for (k, col) in ref_cols.iter().enumerate() {
+    let mut parts = smallvec::SmallVec::<[KeyPart; 4]>::with_capacity(columns.len());
+    for (k, column) in columns.enumerate() {
         let value = vals.next().ok_or_else(|| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
                 "foreign key value count mismatch",
             )
         })?;
-        let idx = table.column_index(col)?;
-        let column = &table.columns[idx];
+        let column = &table.columns[column?];
         let part = KeyPart::from_column_value_with_collation(
             value,
             &column.data_type,
@@ -1061,6 +1074,9 @@ impl Database {
         if table.foreign_keys.is_empty() || !fk_checks_enabled() || rows.is_empty() {
             return Ok(());
         }
+        if let [row] = rows {
+            return self.fk_check_child_references(table, txn, row, None);
+        }
         // Resolve (parent, index) once per FK; skip unresolved (deferred) FKs.
         let mut resolved: Vec<(
             &ForeignKeySchema,
@@ -1108,7 +1124,9 @@ impl Database {
         for values in rows {
             for (position, (fk, parent, index, referenced_columns)) in resolved.iter().enumerate() {
                 let index = &parent.indexes[*index];
-                let Some(key) = self.fk_child_reference_key(fk, parent, index, values)? else {
+                let Some(key) =
+                    self.fk_child_reference_key(fk, parent, index, referenced_columns, values)?
+                else {
                     continue;
                 };
                 if last_satisfied[position].as_ref() == Some(&key)
@@ -1186,14 +1204,16 @@ impl Database {
         txn: TxnView,
         values: &[Value],
     ) -> Result<(), QueryError> {
-        let Some(key) = self.fk_child_reference_key(fk, parent, index, values)? else {
-            return Ok(());
-        };
         let referenced_columns = fk
             .referenced_columns
             .iter()
             .map(|column| parent.column_index(column))
             .collect::<Result<smallvec::SmallVec<[usize; 4]>, _>>()?;
+        let Some(key) =
+            self.fk_child_reference_key(fk, parent, index, &referenced_columns, values)?
+        else {
+            return Ok(());
+        };
         self.fk_enforce_child_key(table, fk, parent, index, &referenced_columns, txn, &key)
     }
 
@@ -1204,6 +1224,7 @@ impl Database {
         fk: &ForeignKeySchema,
         parent: &TableSchema,
         index: &IndexSchema,
+        referenced_columns: &[usize],
         values: &[Value],
     ) -> Result<Option<IndexKey>, QueryError> {
         // MATCH SIMPLE: any NULL key column → constraint satisfied.
@@ -1217,10 +1238,10 @@ impl Database {
         // Borrow the child values directly. KeyPart performs the one required
         // conversion/copy; a temporary Value vector would clone strings and
         // allocate again before the inline composite-key storage is built.
-        fk_build_key(
+        fk_build_key_from_positions(
             parent,
             index,
-            &fk.referenced_columns,
+            referenced_columns.iter().copied().map(Ok),
             fk.child_col_idx.iter().map(|&ci| &values[ci]),
         )
         .map(Some)
@@ -1257,7 +1278,6 @@ impl Database {
             if !self.fk_parent_row_key_matches_projected(
                 parent,
                 index,
-                &fk.referenced_columns,
                 referenced_columns,
                 rid,
                 key,
@@ -1279,7 +1299,6 @@ impl Database {
             if self.fk_parent_row_key_matches_projected(
                 parent,
                 index,
-                &fk.referenced_columns,
                 referenced_columns,
                 rid,
                 key,
@@ -1304,7 +1323,6 @@ impl Database {
         &self,
         parent: &TableSchema,
         index: &IndexSchema,
-        referenced_column_names: &[String],
         referenced_columns: &[usize],
         row_id: RowId,
         key: &IndexKey,
@@ -1347,7 +1365,12 @@ impl Database {
             stored_count,
             parent,
         );
-        let current = fk_build_key(parent, index, referenced_column_names, &values)?;
+        let current = fk_build_key_from_positions(
+            parent,
+            index,
+            referenced_columns.iter().copied().map(Ok),
+            &values,
+        )?;
         Ok(current.0.len() >= key.0.len() && current.0[..key.0.len()] == key.0[..])
     }
 

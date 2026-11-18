@@ -3858,11 +3858,36 @@ impl ValueKey {
     /// use that fallback for a column declared with (for example)
     /// `utf8mb4_bin`, otherwise the row and vector engines disagree about
     /// whether `A = a`.
+    /// Binary comparisons consume the original character-set octets, rather
+    /// than the UTF-8 representation used internally for character values.
+    #[inline]
+    pub(crate) fn from_with_source_collation(
+        value: &Value,
+        collation_id: Option<u16>,
+        source_collation_id: Option<u16>,
+    ) -> Result<Self, QueryError> {
+        if let Some(charset) = binary_key_source_charset(collation_id, source_collation_id) {
+            let encoded = value_in_charset_octets(value.clone(), charset)?;
+            return Ok(Self::from_with_collation(&encoded, collation_id));
+        }
+        Ok(Self::from_with_collation(value, collation_id))
+    }
+
     #[inline]
     pub(crate) fn from_with_collation(value: &Value, collation_id: Option<u16>) -> Self {
         let Some(collation_id) = collation_id else {
             return ValueKey::from(value);
         };
+        if collation_id == 63 {
+            match value {
+                Value::String(text) => {
+                    return ValueKey::Bytes(KeyBytes::from_slice(text.as_bytes()))
+                }
+                Value::SmallString(bytes) => return ValueKey::Bytes(KeyBytes::from_slice(bytes)),
+                Value::Bytes(bytes) => return ValueKey::Bytes(KeyBytes::from_slice(bytes)),
+                _ => {}
+            }
+        }
         match value {
             Value::String(value) => {
                 let mut buf = KeyBytes::new();
@@ -5666,13 +5691,23 @@ where
     eval_function_inner(name, args, eval_arg)
 }
 
+pub(crate) fn function_uses_numeric_hex_literals(name: &str) -> bool {
+    ["ROUND", "TRUNCATE", "BIN", "OCT", "MAKEDATE", "MAKETIME"]
+        .iter()
+        .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 fn eval_function_inner<F>(name: &str, args: &[Expr], mut eval_arg: F) -> Result<Value, QueryError>
 where
     F: FnMut(&Expr) -> Result<Value, QueryError>,
 {
     let binary_geometry = uses_binary_geometry_arguments(name);
+    let numeric_hex_literals = function_uses_numeric_hex_literals(name);
     let mut eval_arg = |arg: &Expr| {
         eval_arg(arg).map(|value| match value {
+            value if numeric_hex_literals && expr_is_numeric_hexbit_literal(arg) => {
+                coerce_hex_bytes_to_uint(value)
+            }
             Value::Geometry(bytes) if binary_geometry => Value::Bytes(bytes),
             other => other,
         })
@@ -6628,6 +6663,13 @@ where
                         _ => int_value(&value)?,
                     };
                     let expanded = match year {
+                        0 if matches!(
+                            &value,
+                            Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                        ) =>
+                        {
+                            2000
+                        }
                         0 => 0,
                         1..=69 => 2000 + year,
                         70..=99 => 1900 + year,
@@ -10476,12 +10518,6 @@ pub(crate) fn round_or_truncate_value(
                     "incorrect DECIMAL value",
                 )
             }),
-        Value::Bytes(bytes) if bytes.len() <= 8 => {
-            let value = bytes
-                .iter()
-                .fold(0u64, |acc, byte| (acc << 8) | u64::from(*byte));
-            round_or_truncate_value(&Value::UInt(value), d, round)
-        }
         other => round_or_truncate_f64(numeric(other)?, d, round),
     }
 }
@@ -27336,11 +27372,22 @@ pub(crate) fn decimal_result_needs_shaping(expr: &Expr) -> bool {
 }
 
 /// Shape exact decimals at an API/protocol result boundary, never mid-expression.
+#[inline]
 pub(crate) fn decimal_result_value<'a>(
     value: &'a Value,
     column_type: ColumnType,
 ) -> std::borrow::Cow<'a, Value> {
     if let ColumnType::Decimal { scale, .. } = column_type {
+        // Stored coefficients already at the bound scale require neither a
+        // BigInt clone nor parsing a second owned decimal representation.
+        let runtime_scale = match value {
+            Value::DecimalCompact(_, scale) | Value::Decimal128(_, scale) => Some(*scale),
+            Value::DecimalWide(value) => Some(value.scale),
+            _ => None,
+        };
+        if runtime_scale == Some(scale) {
+            return std::borrow::Cow::Borrowed(value);
+        }
         if let Some(exact) = value.exact_decimal() {
             if exact.scale() != scale {
                 return std::borrow::Cow::Owned(Value::from_exact_decimal(
@@ -27350,6 +27397,15 @@ pub(crate) fn decimal_result_value<'a>(
         }
     }
     std::borrow::Cow::Borrowed(value)
+}
+
+/// Consume an expression value without cloning an already-shaped coefficient.
+#[inline]
+pub(crate) fn decimal_result_value_owned(value: Value, column_type: ColumnType) -> Value {
+    match decimal_result_value(&value, column_type) {
+        std::borrow::Cow::Borrowed(_) => value,
+        std::borrow::Cow::Owned(shaped) => shaped,
+    }
 }
 
 /// Coerce a selected CASE/IF branch to its already-bound semantic domain.
@@ -30900,7 +30956,7 @@ mod hash_join_key_semantics_tests {
                 "utf8mb4_0900_ai_ci",
                 &[("A", "a"), ("e", "é"), ("Straße", "strasse")],
             ),
-            ("utf8mb4_0900_as_ci", &[("A", "a")]),
+            ("utf8mb4_unicode_ci", &[("A", "a")]),
             ("utf8mb4_bin", &[("A", "A"), ("é", "é")]),
         ];
         for (collation, pairs) in cases {
@@ -31300,14 +31356,27 @@ pub(crate) fn string_context_value(
 ) -> Result<Value, QueryError> {
     if !matches!(
         value,
-        Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_)
+        Value::Time(_)
+            | Value::DateTime(_)
+            | Value::Timestamp(_)
+            | Value::DecimalCompact(..)
+            | Value::Decimal128(..)
+            | Value::DecimalWide(_)
+            | Value::Decimal(_)
     ) {
         return Ok(value);
     }
-    if let crate::engine::expr_type::ExprTypeKind::Temporal { fsp, .. } = infer().kind {
-        temporal_string_value(value, fsp)
-    } else {
-        Ok(value)
+    match infer().kind {
+        crate::engine::expr_type::ExprTypeKind::Temporal { fsp, .. } => {
+            temporal_string_value(value, fsp)
+        }
+        crate::engine::expr_type::ExprTypeKind::Decimal {
+            precision, scale, ..
+        } => Ok(decimal_result_value_owned(
+            value,
+            ColumnType::Decimal { precision, scale },
+        )),
+        _ => Ok(value),
     }
 }
 
@@ -31322,7 +31391,15 @@ pub(crate) fn function_argument_with_temporal_string(
 ) -> Result<Value, QueryError> {
     if !matches!(
         value,
-        Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::UInt(_) | Value::Int(_)
+        Value::Time(_)
+            | Value::DateTime(_)
+            | Value::Timestamp(_)
+            | Value::UInt(_)
+            | Value::Int(_)
+            | Value::DecimalCompact(..)
+            | Value::Decimal128(..)
+            | Value::DecimalWide(_)
+            | Value::Decimal(_)
     ) {
         return Ok(value);
     }
@@ -31371,6 +31448,17 @@ pub(crate) fn is_charset_octet_function(name: &str) -> bool {
     ]
     .iter()
     .any(|n| name.eq_ignore_ascii_case(n))
+}
+
+pub(crate) fn binary_key_source_charset(
+    comparison: Option<u16>,
+    source: Option<u16>,
+) -> Option<&'static str> {
+    if comparison != Some(63) {
+        return None;
+    }
+    let charset = crate::charset::resolve_collation_id(source?)?.charset;
+    (!matches!(charset, "binary" | "utf8mb4" | "utf8mb3" | "utf8")).then_some(charset)
 }
 
 pub(crate) fn value_in_charset_octets(value: Value, charset: &str) -> Result<Value, QueryError> {

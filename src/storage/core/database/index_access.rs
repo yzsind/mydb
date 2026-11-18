@@ -332,24 +332,58 @@ impl Database {
     /// R-tree. Keep repairs out of the shared cache: their visibility depends
     /// on the reader's snapshot. A repair version change during the probe
     /// requires a fresh physical probe while the repair directory is pinned.
-    pub(crate) fn spatial_estimate_fraction(&self, storage_id: u64, index: &str, query: crate::engine::geo::Mbr) -> Option<f64> {
-        self.with_index_read(storage_id, index, |file| file.spatial.as_ref()
-            .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "not a spatial index"))?
-            .estimate_fraction(query)).ok()
+    pub(crate) fn spatial_estimate_fraction(
+        &self,
+        storage_id: u64,
+        index: &str,
+        query: crate::engine::geo::Mbr,
+    ) -> Option<f64> {
+        self.with_index_read(storage_id, index, |file| {
+            file.spatial
+                .as_ref()
+                .ok_or_else(|| error(crate::error::catalog::ER_GET_ERRNO, "not a spatial index"))?
+                .estimate_fraction(query)
+        })
+        .ok()
     }
 
-    pub(crate) fn spatial_scan_cursor(&self, table: &TableSchema, index: &IndexSchema, query: crate::engine::geo::Mbr, txn: TxnView) -> Result<spatial_index::SpatialCursor, QueryError> {
+    pub(crate) fn spatial_scan_cursor(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        query: crate::engine::geo::Mbr,
+        txn: TxnView,
+    ) -> Result<spatial_index::SpatialCursor, QueryError> {
         self.check_index_read_view(table, index, txn)?;
         spatial_index::SpatialCursor::new(self.index_handle(table.id, &index.name)?, query)
     }
-    pub(crate) fn spatial_visibility_repairs(&self, table: &TableSchema, index: &IndexSchema, query: crate::engine::geo::Mbr, txn: TxnView) -> Result<Vec<RowId>, QueryError> {
-        let key_matches = |key: &IndexKey| decode_mbr_key(key).is_some_and(|mbr| mbr.intersects(&query));
+    pub(crate) fn spatial_visibility_repairs(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        query: crate::engine::geo::Mbr,
+        txn: TxnView,
+    ) -> Result<Vec<RowId>, QueryError> {
+        let key_matches =
+            |key: &IndexKey| decode_mbr_key(key).is_some_and(|mbr| mbr.intersects(&query));
         let mut rows = self.txns_read()?.index_visibility_repair_row_ids(
-            txn, table.id, &index.name, key_matches,
-            |txn_id| self.temporal_history.txn_commit(txn_id).map(|entry| entry.commit_scn),
+            txn,
+            table.id,
+            &index.name,
+            key_matches,
+            |txn_id| {
+                self.temporal_history
+                    .txn_commit(txn_id)
+                    .map(|entry| entry.commit_scn)
+            },
         );
         if txn.historical {
-            rows.extend(self.temporal_history.history_index_entries(txn, table.id, &index.name, key_matches).into_iter().map(|(_, row)| row));
+            rows.extend(
+                self.temporal_history
+                    .history_index_entries(txn, table.id, &index.name, key_matches)
+                    .into_iter()
+                    .map(|(_, row)| row),
+            );
         }
         Ok(rows)
     }
@@ -702,6 +736,15 @@ impl Database {
         if unsatisfiable {
             return Ok(Vec::new());
         }
+        self.lookup_index_resolved(table, index, &key)
+    }
+
+    fn lookup_index_resolved(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        key: &IndexKey,
+    ) -> Result<Vec<RowId>, QueryError> {
         if table.is_partitioned() {
             // RowId is per-partition; if the active partition prune
             // set narrows the search to one partition, the returned
@@ -720,14 +763,14 @@ impl Database {
             let mut out: Vec<RowId> = Vec::new();
             for sid in candidate_sids {
                 let ids = self.with_index_read(sid, &index.name, |index_file| {
-                    index_file.get(&key, !index.unique)
+                    index_file.get(key, !index.unique)
                 })?;
                 out.extend(ids);
             }
             return Ok(out);
         }
         self.with_index_read(table.id, &index.name, |index_file| {
-            index_file.get(&key, !index.unique)
+            index_file.get(key, !index.unique)
         })
     }
 
@@ -743,7 +786,7 @@ impl Database {
         if unsatisfiable {
             return Ok(Vec::new());
         }
-        let mut ids = self.lookup_index(table, index, key.clone())?;
+        let mut ids = self.lookup_index_resolved(table, index, &key)?;
         let before = ids.len();
         self.add_exact_index_visibility_repair_ids(table, index, txn, &key, &mut ids)?;
         if ids.len() != before {
@@ -1001,9 +1044,47 @@ impl Database {
         index: &IndexSchema,
         key: IndexKey,
     ) -> Result<Option<RowId>, QueryError> {
+        self.lookup_unique_index_for_locking_read(
+            txn,
+            table,
+            index,
+            key,
+            crate::parser::LockWaitMode::Default,
+        )
+    }
+
+    pub(crate) fn lookup_unique_index_for_locking_read(
+        &self,
+        txn: TxnView,
+        table: &TableSchema,
+        index: &IndexSchema,
+        key: IndexKey,
+        wait: crate::parser::LockWaitMode,
+    ) -> Result<Option<RowId>, QueryError> {
         self.check_primary_read_view(table, txn)?;
         debug_assert!(index.unique || index.primary);
         if table.is_partitioned() {
+            if wait != crate::parser::LockWaitMode::Default {
+                let (key, _) = resolve_index_key(index, key)?;
+                for storage_id in
+                    crate::engine::executor::partition_router::in_scope_storage_ids(table)
+                {
+                    if let Err(err) =
+                        self.check_unique_key_reservation(txn.txn_id, storage_id, &index.name, &key)
+                    {
+                        if !is_lock_wait_pending_error(&err) {
+                            return Err(err);
+                        }
+                        if wait == crate::parser::LockWaitMode::SkipLocked {
+                            return Ok(None);
+                        }
+                        return Err(crate::error::catalog::ER_LOCK_NOWAIT.error("Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set"));
+                    }
+                }
+                return self
+                    .lookup_index_visible(table, index, key, txn)
+                    .map(|mut ids| ids.pop());
+            }
             let mut ids = self.lookup_index_for_write(txn, table, index, key)?;
             return Ok(ids.pop());
         }
@@ -1018,7 +1099,24 @@ impl Database {
             // dozens of such wakeups before their key becomes available.
             // The blocking helper preserves deadlock detection, cancellation
             // and innodb_lock_wait_timeout while redoing only the key probe.
-            self.check_unique_key_lock_blocking(txn.txn_id, table.id, &index.name, &key)?;
+            match wait {
+                crate::parser::LockWaitMode::Default => {
+                    self.check_unique_key_lock_blocking(txn.txn_id, table.id, &index.name, &key)?;
+                }
+                mode => {
+                    if let Err(err) =
+                        self.check_unique_key_reservation(txn.txn_id, table.id, &index.name, &key)
+                    {
+                        if !is_lock_wait_pending_error(&err) {
+                            return Err(err);
+                        }
+                        if mode == crate::parser::LockWaitMode::SkipLocked {
+                            return Ok(None);
+                        }
+                        return Err(crate::error::catalog::ER_LOCK_NOWAIT.error("Statement aborted because lock(s) could not be acquired immediately and NOWAIT is set"));
+                    }
+                }
+            }
         }
         let candidate = self.with_index_read(table.id, &index.name, |index_file| {
             index_file.get_unique_one(&key)
@@ -1788,22 +1886,32 @@ impl Database {
         // different key. Validate ownership for old/own-write views and when
         // repair publication overlaps the raw lookup.
         let validate = || {
-            let mut entries=self.lookup_index_entries_many_visible_with_handle(
-                index_handle,table,index,&resolved,txn)?;
-            let mask=self.filter_visible_index_entries_mask_exact(table,index,&entries,txn)?;
-            let mut visible=mask.into_iter();
-            entries.retain(|_|visible.next().unwrap_or(false));
-            Ok(map_index_entries_to_key_indices(&resolved,&entries))
+            let mut entries = self.lookup_index_entries_many_visible_with_handle(
+                index_handle,
+                table,
+                index,
+                &resolved,
+                txn,
+            )?;
+            let mask = self.filter_visible_index_entries_mask_exact(table, index, &entries, txn)?;
+            let mut visible = mask.into_iter();
+            entries.retain(|_| visible.next().unwrap_or(false));
+            Ok(map_index_entries_to_key_indices(&resolved, &entries))
         };
-        let repair_version=self.index_repair_version();
-        if self.has_pending_index_repairs() || txn.txn_id!=0 || txn.dirty_read
-            || txn.historical || txn.snapshot_scn<self.visible_scn() {
+        let repair_version = self.index_repair_version();
+        if self.has_pending_index_repairs()
+            || txn.txn_id != 0
+            || txn.dirty_read
+            || txn.historical
+            || txn.snapshot_scn < self.visible_scn()
+        {
             return validate();
         }
-        let index_file=index_handle.read();
-        let entries=index_file.lookup_entries_many_sorted_keyed(&resolved,exact,!index.unique)?;
+        let index_file = index_handle.read();
+        let entries =
+            index_file.lookup_entries_many_sorted_keyed(&resolved, exact, !index.unique)?;
         drop(index_file);
-        if self.index_repair_version()!=repair_version || txn.snapshot_scn<self.visible_scn() {
+        if self.index_repair_version() != repair_version || txn.snapshot_scn < self.visible_scn() {
             return validate();
         }
         Ok(entries)
@@ -1875,24 +1983,36 @@ impl Database {
             return Ok(None);
         }
         let version = self.index_repair_version();
-        if version & 1 != 0 { return Ok(None); }
+        if version & 1 != 0 {
+            return Ok(None);
+        }
         let mut examined = 0usize;
         for key in keys {
             crate::engine::cancel::check_cancelled()?;
-            let bound = IndexBound { key: key.clone(), inclusive: true };
-            let mut cursor = self.range_index_entries_cursor(
-                table, index, Some(bound.clone()), Some(bound),
-            )?;
+            let bound = IndexBound {
+                key: key.clone(),
+                inclusive: true,
+            };
+            let mut cursor =
+                self.range_index_entries_cursor(table, index, Some(bound.clone()), Some(bound))?;
             loop {
                 crate::engine::cancel::check_cancelled()?;
                 let chunk = cursor.next_chunk_row_ids(4096)?;
-                if chunk.is_empty() { break; }
-                examined = examined.saturating_add(chunk.len());
-                if examined > max_entries { return Ok(None); }
-                for id in chunk {
-                    if !visit(id) { return Ok(None); }
+                if chunk.is_empty() {
+                    break;
                 }
-                if self.index_repair_version() != version { return Ok(None); }
+                examined = examined.saturating_add(chunk.len());
+                if examined > max_entries {
+                    return Ok(None);
+                }
+                for id in chunk {
+                    if !visit(id) {
+                        return Ok(None);
+                    }
+                }
+                if self.index_repair_version() != version {
+                    return Ok(None);
+                }
             }
         }
         Ok((self.index_repair_version() == version).then_some(examined))
@@ -4091,21 +4211,37 @@ mod keyed_snapshot_tests {
     use super::*;
     #[test]
     fn keyed_index_candidates_recheck_snapshot_key_ownership() {
-        let dir=tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
-        let engine=crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
-        engine.execute("CREATE TABLE f(k INT,v INT,INDEX by_k(k))").unwrap();
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE f(k INT,v INT,INDEX by_k(k))")
+            .unwrap();
         engine.execute("INSERT INTO f VALUES(1,10)").unwrap();
-        let db=engine.db_for_tests();
-        let table=db.table("f").unwrap();
-        let index=table.indexes.iter().find(|i|i.name=="by_k").unwrap();
-        let handle=db.cached_index_handle(table.id,"by_k").unwrap();
-        let keys=vec![IndexKey(vec![KeyPart::Int(1)].into()),IndexKey(vec![KeyPart::Int(2)].into())];
-        let (old,_snapshot)=db.read_only_statement_view_with_guard(IsolationLevel::RepeatableRead,None);
+        let db = engine.db_for_tests();
+        let table = db.table("f").unwrap();
+        let index = table.indexes.iter().find(|i| i.name == "by_k").unwrap();
+        let handle = db.cached_index_handle(table.id, "by_k").unwrap();
+        let keys = vec![
+            IndexKey(vec![KeyPart::Int(1)].into()),
+            IndexKey(vec![KeyPart::Int(2)].into()),
+        ];
+        let (old, _snapshot) =
+            db.read_only_statement_view_with_guard(IsolationLevel::RepeatableRead, None);
         engine.execute("UPDATE f SET k=2").unwrap();
-        let old_entries=db.lookup_index_entries_many_keyed_with_handle(&handle,&table,index,&keys,old).unwrap();
-        assert_eq!(old_entries.iter().map(|&(i,_)|i).collect::<Vec<_>>(),vec![0]);
-        let current=TxnView::read_only(u64::MAX,IsolationLevel::ReadCommitted);
-        let current_entries=db.lookup_index_entries_many_keyed_with_handle(&handle,&table,index,&keys,current).unwrap();
-        assert_eq!(current_entries.iter().map(|&(i,_)|i).collect::<Vec<_>>(),vec![1]);
+        let old_entries = db
+            .lookup_index_entries_many_keyed_with_handle(&handle, &table, index, &keys, old)
+            .unwrap();
+        assert_eq!(
+            old_entries.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            vec![0]
+        );
+        let current = TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted);
+        let current_entries = db
+            .lookup_index_entries_many_keyed_with_handle(&handle, &table, index, &keys, current)
+            .unwrap();
+        assert_eq!(
+            current_entries.iter().map(|&(i, _)| i).collect::<Vec<_>>(),
+            vec![1]
+        );
     }
 }

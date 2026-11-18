@@ -280,17 +280,16 @@ impl HeapPatchSource {
         {
             return Ok(None);
         }
-        let (header, mut offset, external) = read_mvcc_header(payload)?;
+        let (header, offset, external) = read_mvcc_header(payload)?;
         if offset != 18 || external || header.flags & MVCC_FLAG_ROW_PIECE != 0 {
             return Ok(None);
         }
-        let layout_id = read_varint(payload, &mut offset)? as u32;
-        let layout = codec.layout_for_id(layout_id)?;
+        let Some(layout) = RowPatchLayout::parse(payload, codec, offset, external)? else {
+            return Ok(None);
+        };
         let mut columns = smallvec::SmallVec::new();
         for &column_index in changed_columns {
-            let Some((range, null_offset, null_mask)) =
-                column_patch_range(payload, codec, column_index)?
-            else {
+            let Some(range) = layout.column(column_index)? else {
                 return Ok(None);
             };
             if fixed_width_for_kind(range.kind) != Some(range.width) || range.width > 16 {
@@ -308,26 +307,19 @@ impl HeapPatchSource {
             let Some(before) = payload.get(range.offset_in_payload..end) else {
                 return Ok(None);
             };
-            let Some(stored_ordinal) = layout
-                .columns
-                .iter()
-                .position(|column| column.column_index == column_index)
-            else {
-                return Ok(None);
-            };
             columns.push(HeapPatchSourceColumn {
                 column_index,
-                stored_ordinal,
+                stored_ordinal: range.stored_ordinal,
                 offset: range.offset_in_payload,
-                null_offset,
-                null_mask,
-                old_null_byte: payload[null_offset],
+                null_offset: range.null_offset,
+                null_mask: range.null_mask,
+                old_null_byte: payload[range.null_offset],
                 before: HeapPatchBytes::from_slice(before),
             });
         }
         Ok(Some(Self {
             row_id,
-            layout_id,
+            layout_id: layout.layout_id,
             old_last_txn_id_bytes: payload[2..10].try_into().expect("validated MVCC header"),
             old_undo_ptr_bytes: payload[10..18].try_into().expect("validated MVCC header"),
             columns,
@@ -3095,7 +3087,7 @@ impl HeapFile {
                     return Ok(None);
                 }
 
-                let (header, header_len, _) = read_mvcc_header(slot_bytes)?;
+                let (header, header_len, has_external) = read_mvcc_header(slot_bytes)?;
                 if header_len != 18 || header.flags & MVCC_FLAG_ROW_PIECE != 0 {
                     UPDATE_DELTA_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     return Ok(None);
@@ -3116,14 +3108,18 @@ impl HeapFile {
                     .try_into()
                     .expect("eight-byte slice");
 
+                let Some(layout) =
+                    RowPatchLayout::parse(slot_bytes, &self.codec, header_len, has_external)?
+                else {
+                    return Ok(None);
+                };
                 let mut col_patches = HeapColumnPatches::with_capacity(changed_cols.len());
                 for &col_idx in changed_cols {
                     let new_is_null = matches!(new_values.get(col_idx), Some(Value::Null));
-                    let Some((range, null_offset, null_mask)) =
-                        column_patch_range(slot_bytes, &self.codec, col_idx)?
-                    else {
+                    let Some(range) = layout.column(col_idx)? else {
                         return Ok(None);
                     };
+                    let (null_offset, null_mask) = (range.null_offset, range.null_mask);
                     // A variable NULL has zero encoded width. Preserve the
                     // canonical shrinking rewrite instead of retaining its
                     // former payload as unused bytes in a sparse patch.

@@ -1889,6 +1889,7 @@ struct DurabilityWaiter {
 #[derive(Debug, Default)]
 struct DurabilityState {
     pending: SmallVec<[DurabilityWaiter; 32]>,
+    syncing: bool,
     stopping: bool,
     failure: Option<QueryError>,
     window: Duration,
@@ -1907,11 +1908,61 @@ struct DurabilityShared {
     batch_max: AtomicU64,
 }
 
-/// Persistent durability owner. Each executor reuses its private park token;
-/// requests arriving during fsync join the next barrier without handing
-/// leadership back to a client thread or allocating a completion object.
+impl DurabilityShared {
+    fn sync_batch(
+        &self,
+        log: &Arc<crate::wal::LogMutex>,
+        target_lsn: u64,
+        mut batch: SmallVec<[DurabilityWaiter; 32]>,
+        foreground: bool,
+    ) -> Result<(), QueryError> {
+        let result = crate::wal::LogManager::sync_durable_high_water_to(log, target_lsn);
+        let mut state = self.state.lock();
+        match &result {
+            Ok((high_water, _)) => {
+                let high_water = *high_water;
+                self.durable_lsn.fetch_max(high_water, Ordering::Release);
+                // The flush may also cover requests queued after it started.
+                let mut i = 0;
+                while i < state.pending.len() {
+                    if state.pending[i].lsn <= high_water {
+                        batch.push(state.pending.swap_remove(i));
+                    } else {
+                        i += 1;
+                    }
+                }
+            }
+            Err(err) => {
+                state.failure = Some(err.clone());
+                state.stopping = true;
+                batch.extend(state.pending.drain(..));
+            }
+        }
+        let count = batch.len() as u64 + u64::from(foreground);
+        self.queue_depth.fetch_sub(count, Ordering::AcqRel);
+        if matches!(&result, Ok((_, true))) {
+            self.batches.fetch_add(1, Ordering::Relaxed);
+            self.batch_max.fetch_max(count, Ordering::Relaxed);
+        }
+        state.syncing = false;
+        let wake_worker = foreground && (state.stopping || !state.pending.is_empty());
+        drop(state);
+        for waiter in batch {
+            waiter.signal.notify();
+        }
+        if wake_worker {
+            self.ready.notify_one();
+        }
+        result.map(|_| ())
+    }
+}
+
+/// The worker owns timed batches. With a zero window the first committer
+/// can take an idle barrier directly, saving a park and a thread handoff.
+/// Followers in both cases use the same queue and durable high-water mark.
 #[derive(Debug)]
 pub(crate) struct DurabilityWorker {
+    log: Option<Arc<crate::wal::LogMutex>>,
     log_state: Option<Arc<crate::wal::LogStateAtomics>>,
     writer: Option<crate::wal::WalWriter>,
     shared: Arc<DurabilityShared>,
@@ -1932,6 +1983,7 @@ impl DurabilityWorker {
         let shared = Arc::new(DurabilityShared::default());
         shared.state.lock().stopping = true;
         Self {
+            log: None,
             log_state: None,
             writer: None,
             shared,
@@ -1948,12 +2000,13 @@ impl DurabilityWorker {
             .is_ok_and(|v| matches!(v.as_str(), "1" | "on" | "true"))
             .then(|| crate::wal::WalWriter::start(Arc::clone(&log)));
         let worker = Arc::clone(&shared);
+        let worker_log = Arc::clone(&log);
         let log_state = log.lock().state_atomics();
         let handle = thread::Builder::new()
             .name("mydb-wal-durable".to_string())
             .spawn(move || loop {
                 let mut state = worker.state.lock();
-                while state.pending.is_empty() && !state.stopping {
+                while state.syncing || (state.pending.is_empty() && !state.stopping) {
                     worker.ready.wait(&mut state);
                 }
                 if state.pending.is_empty() {
@@ -1969,50 +2022,20 @@ impl DurabilityWorker {
                         break;
                     }
                 }
-                let mut batch = std::mem::take(&mut state.pending);
+                let batch = std::mem::take(&mut state.pending);
                 let target_lsn = batch.iter().map(|waiter| waiter.lsn).max().unwrap();
+                state.syncing = true;
                 drop(state);
-                let result = crate::wal::LogManager::sync_durable_high_water_to(&log, target_lsn);
-                let mut state = worker.state.lock();
-                let (failed, performed_io) = match result {
-                    Ok((high_water, performed_io)) => {
-                        worker.durable_lsn.fetch_max(high_water, Ordering::Release);
-                        // A request can enqueue after the batch snapshot even
-                        // though its bytes were included in the same fsync.
-                        // Release it now rather than scheduling a no-op batch.
-                        let mut i = 0;
-                        while i < state.pending.len() {
-                            if state.pending[i].lsn <= high_water {
-                                batch.push(state.pending.swap_remove(i));
-                            } else {
-                                i += 1;
-                            }
-                        }
-                        (false, performed_io)
-                    }
-                    Err(err) => {
-                        state.failure = Some(err);
-                        state.stopping = true;
-                        batch.extend(state.pending.drain(..));
-                        (true, false)
-                    }
-                };
-                let count = batch.len() as u64;
-                worker.queue_depth.fetch_sub(count, Ordering::AcqRel);
-                if performed_io {
-                    worker.batches.fetch_add(1, Ordering::Relaxed);
-                    worker.batch_max.fetch_max(count, Ordering::Relaxed);
-                }
-                drop(state);
-                for waiter in batch {
-                    waiter.signal.notify();
-                }
-                if failed {
+                if worker
+                    .sync_batch(&worker_log, target_lsn, batch, false)
+                    .is_err()
+                {
                     break;
                 }
             })
             .expect("failed to start WAL durability worker");
         Self {
+            log: Some(log),
             log_state: Some(log_state),
             writer,
             shared,
@@ -2037,7 +2060,6 @@ impl DurabilityWorker {
         if lsn <= durable() {
             return Ok(());
         }
-        let signal = COMMIT_WAIT_SIGNAL.with(Arc::clone);
         let mut state = self.shared.state.lock();
         if let Some(err) = &state.failure {
             return Err(err.clone());
@@ -2052,21 +2074,32 @@ impl DurabilityWorker {
             return Ok(());
         }
         self.shared.requests.fetch_add(1, Ordering::Relaxed);
+        let depth = self.shared.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
+        self.shared
+            .queue_depth_peak
+            .fetch_max(depth, Ordering::Relaxed);
+        if !state.syncing && state.pending.is_empty() && window.is_zero() {
+            if let Some(log) = &self.log {
+                state.syncing = true;
+                drop(state);
+                return self.shared.sync_batch(log, lsn, SmallVec::new(), true);
+            }
+        }
         if state.pending.is_empty() {
             state.window = window;
             state.target = target.max(1);
         }
+        let signal = COMMIT_WAIT_SIGNAL.with(Arc::clone);
         signal.ready.store(false, Ordering::Release);
         state.pending.push(DurabilityWaiter {
             lsn,
             signal: Arc::clone(&signal),
         });
-        let depth = self.shared.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        self.shared
-            .queue_depth_peak
-            .fetch_max(depth, Ordering::Relaxed);
+        let wake_worker = !state.syncing;
         drop(state);
-        self.shared.ready.notify_one();
+        if wake_worker {
+            self.shared.ready.notify_one();
+        }
         signal.wait();
         if lsn <= self.shared.durable_lsn.load(Ordering::Acquire) {
             return Ok(());
@@ -7490,6 +7523,50 @@ mod group_commit_tests {
             "single writer waited out the group-commit window"
         );
         assert!(log.lock().durable_lsn() >= lsn);
+    }
+
+    #[test]
+    fn durability_worker_foreground_barrier_covers_a_queued_follower() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut log = crate::wal::LogManager::open(dir.path()).unwrap();
+        let first = log.append(0, WalPayload::EndTxn).unwrap();
+        let second = log.append(0, WalPayload::EndTxn).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(log));
+        let worker = Arc::new(DurabilityWorker::start(Arc::clone(&log)));
+
+        // Keep the WAL locked until both requests have entered the
+        // coordinator. The foreground caller owns the barrier meanwhile.
+        let wal_guard = log.lock();
+        let leader = {
+            let worker = Arc::clone(&worker);
+            thread::spawn(move || worker.sync_lsn(first, Duration::ZERO, 2))
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !worker.shared.state.lock().syncing {
+            assert!(
+                Instant::now() < deadline,
+                "foreground barrier did not start"
+            );
+            thread::yield_now();
+        }
+        let follower = {
+            let worker = Arc::clone(&worker);
+            thread::spawn(move || worker.sync_lsn(second, Duration::ZERO, 2))
+        };
+        while worker.stats().queue_depth < 2 {
+            assert!(Instant::now() < deadline, "follower did not queue");
+            thread::yield_now();
+        }
+        assert_eq!(worker.stats().batches, 0);
+        drop(wal_guard);
+
+        leader.join().unwrap().unwrap();
+        follower.join().unwrap().unwrap();
+        assert!(log.lock().durable_lsn() >= second);
+        let stats = worker.stats();
+        assert_eq!(stats.batches, 1, "{stats:?}");
+        assert_eq!(stats.batch_max, 2, "{stats:?}");
+        assert_eq!(stats.queue_depth, 0, "{stats:?}");
     }
 }
 

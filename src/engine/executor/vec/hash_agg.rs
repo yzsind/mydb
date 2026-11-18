@@ -12545,7 +12545,7 @@ mod tests {
             None,
             Some(crate::charset::UTF8MB4_0900_AI_CI_ID),
             Some(
-                crate::charset::resolve_collation("utf8mb4_0900_as_cs")
+                crate::charset::resolve_collation("utf8mb4_0900_bin")
                     .unwrap()
                     .id,
             ),

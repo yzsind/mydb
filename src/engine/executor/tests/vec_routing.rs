@@ -1657,7 +1657,7 @@ fn parallel_count_topk_pushdown_matches_legacy() {
 fn count_topk_raw_probe_preserves_case_sensitive_groups() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
-    engine.execute("CREATE TABLE cs_topk (id INT PRIMARY KEY, category VARCHAR(64) COLLATE utf8mb4_0900_as_cs NOT NULL)").unwrap();
+    engine.execute("CREATE TABLE cs_topk (id INT PRIMARY KEY, category VARCHAR(64) COLLATE utf8mb4_0900_bin NOT NULL)").unwrap();
     let mut insert = String::from("INSERT INTO cs_topk VALUES ");
     for id in 0..2000 {
         if id > 0 {

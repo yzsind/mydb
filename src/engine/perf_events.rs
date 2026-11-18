@@ -518,13 +518,28 @@ thread_local! {
     /// a `&mut SessionContext` plumbed through every scan signature.
     static THREAD_ROWS_EXAMINED: Cell<u64> = const { Cell::new(0) };
     static THREAD_SCAN_ROWS_EXAMINED: Cell<u64> = const { Cell::new(0) };
-    static SHARED_ROWS_EXAMINED: RefCell<Option<Arc<RowsExaminedCounters>>> = const { RefCell::new(None) };
+    static ROWS_EXAMINED_STATE: RefCell<RowsExaminedState> = const { RefCell::new(RowsExaminedState::Inactive) };
 }
 
 #[derive(Default)]
 pub(crate) struct RowsExaminedCounters {
     total: AtomicU64,
     sequential: AtomicU64,
+}
+
+enum RowsExaminedState {
+    Inactive,
+    Local,
+    Shared(Arc<RowsExaminedCounters>),
+}
+
+impl RowsExaminedState {
+    fn shared(&self) -> Option<&RowsExaminedCounters> {
+        match self {
+            Self::Shared(counter) => Some(counter),
+            Self::Inactive | Self::Local => None,
+        }
+    }
 }
 
 impl RowsExaminedCounters {
@@ -537,7 +552,7 @@ impl RowsExaminedCounters {
 }
 
 pub(crate) struct RowsExaminedScope {
-    previous: Option<Arc<RowsExaminedCounters>>,
+    previous: RowsExaminedState,
     previous_local: u64,
     previous_scan_local: u64,
 }
@@ -547,12 +562,12 @@ impl Drop for RowsExaminedScope {
         let local = THREAD_ROWS_EXAMINED.with(|cell| cell.replace(self.previous_local));
         let scan_local =
             THREAD_SCAN_ROWS_EXAMINED.with(|cell| cell.replace(self.previous_scan_local));
-        SHARED_ROWS_EXAMINED.with(|slot| {
-            if let Some(counter) = slot.borrow().as_ref() {
+        ROWS_EXAMINED_STATE.with(|slot| {
+            let previous = std::mem::replace(&mut self.previous, RowsExaminedState::Inactive);
+            if let RowsExaminedState::Shared(counter) = slot.replace(previous) {
                 counter.total.fetch_add(local, Ordering::Relaxed);
                 counter.sequential.fetch_add(scan_local, Ordering::Relaxed);
             }
-            *slot.borrow_mut() = self.previous.take();
         });
     }
 }
@@ -560,7 +575,9 @@ impl Drop for RowsExaminedScope {
 pub(crate) fn enter_rows_examined_counter(
     counter: Option<Arc<RowsExaminedCounters>>,
 ) -> RowsExaminedScope {
-    let previous = SHARED_ROWS_EXAMINED.with(|slot| slot.replace(counter));
+    let previous = ROWS_EXAMINED_STATE.with(|slot| {
+        slot.replace(counter.map_or(RowsExaminedState::Inactive, RowsExaminedState::Shared))
+    });
     let previous_local = THREAD_ROWS_EXAMINED.with(|cell| cell.replace(0));
     let previous_scan_local = THREAD_SCAN_ROWS_EXAMINED.with(|cell| cell.replace(0));
     RowsExaminedScope {
@@ -571,23 +588,38 @@ pub(crate) fn enter_rows_examined_counter(
 }
 
 pub(crate) fn current_rows_examined_counter() -> Option<Arc<RowsExaminedCounters>> {
-    SHARED_ROWS_EXAMINED.with(|slot| slot.borrow().clone())
+    ROWS_EXAMINED_STATE.with(|slot| {
+        let mut state = slot.borrow_mut();
+        match &mut *state {
+            RowsExaminedState::Inactive => None,
+            RowsExaminedState::Local => {
+                let counter = Arc::new(RowsExaminedCounters::default());
+                *state = RowsExaminedState::Shared(Arc::clone(&counter));
+                Some(counter)
+            }
+            RowsExaminedState::Shared(counter) => Some(Arc::clone(counter)),
+        }
+    })
 }
 
 pub(crate) fn start_statement_rows_examined() {
-    SHARED_ROWS_EXAMINED
-        .with(|slot| *slot.borrow_mut() = Some(Arc::new(RowsExaminedCounters::default())));
+    // Serial statements only need the two thread-local counters. Allocate a
+    // shared counter when an execution context or cursor actually captures it.
+    ROWS_EXAMINED_STATE.with(|slot| *slot.borrow_mut() = RowsExaminedState::Local);
 }
 
 pub(crate) fn clear_statement_rows_examined() {
     let local = THREAD_ROWS_EXAMINED.with(|cell| cell.replace(0));
     let scan_local = THREAD_SCAN_ROWS_EXAMINED.with(|cell| cell.replace(0));
-    SHARED_ROWS_EXAMINED.with(|slot| {
-        if let Some(counter) = slot.borrow().as_ref() {
-            counter.total.fetch_add(local, Ordering::Relaxed);
-            counter.sequential.fetch_add(scan_local, Ordering::Relaxed);
+    ROWS_EXAMINED_STATE.with(|slot| {
+        if let RowsExaminedState::Shared(counter) = slot.replace(RowsExaminedState::Inactive) {
+            if local != 0 {
+                counter.total.fetch_add(local, Ordering::Relaxed);
+            }
+            if scan_local != 0 {
+                counter.sequential.fetch_add(scan_local, Ordering::Relaxed);
+            }
         }
-        *slot.borrow_mut() = None;
     });
 }
 
@@ -673,8 +705,8 @@ pub(crate) fn record_scan_rows_examined(n: u64) {
 /// statement's slow-log row.
 pub(crate) fn take_rows_examined() -> u64 {
     let local = THREAD_ROWS_EXAMINED.with(|cell| cell.replace(0));
-    SHARED_ROWS_EXAMINED.with(|slot| {
-        slot.borrow().as_ref().map_or(local, |counter| {
+    ROWS_EXAMINED_STATE.with(|slot| {
+        slot.borrow().shared().map_or(local, |counter| {
             counter
                 .total
                 .swap(0, Ordering::Relaxed)
@@ -685,8 +717,8 @@ pub(crate) fn take_rows_examined() -> u64 {
 
 pub(crate) fn take_scan_rows_examined() -> u64 {
     let local = THREAD_SCAN_ROWS_EXAMINED.with(|cell| cell.replace(0));
-    SHARED_ROWS_EXAMINED.with(|slot| {
-        slot.borrow().as_ref().map_or(local, |counter| {
+    ROWS_EXAMINED_STATE.with(|slot| {
+        slot.borrow().shared().map_or(local, |counter| {
             counter
                 .sequential
                 .swap(0, Ordering::Relaxed)
@@ -697,8 +729,8 @@ pub(crate) fn take_scan_rows_examined() -> u64 {
 
 pub(crate) fn rows_examined() -> u64 {
     let local = THREAD_ROWS_EXAMINED.with(Cell::get);
-    SHARED_ROWS_EXAMINED.with(|slot| {
-        slot.borrow().as_ref().map_or(local, |counter| {
+    ROWS_EXAMINED_STATE.with(|slot| {
+        slot.borrow().shared().map_or(local, |counter| {
             counter.total.load(Ordering::Relaxed).saturating_add(local)
         })
     })
@@ -2320,6 +2352,32 @@ fn fnv1a_64(text: &str) -> u64 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn rows_examined_keeps_local_and_worker_counts_across_lazy_capture() {
+        super::clear_statement_rows_examined();
+        assert!(super::current_rows_examined_counter().is_none());
+        super::start_statement_rows_examined();
+        super::record_scan_rows_examined(2);
+        let counter = super::current_rows_examined_counter().unwrap();
+        std::thread::spawn({
+            let counter = counter.clone();
+            move || {
+                let _scope = super::enter_rows_examined_counter(Some(counter));
+                super::record_rows_examined(3);
+                super::record_scan_rows_examined(4);
+            }
+        })
+        .join()
+        .unwrap();
+        assert_eq!(super::rows_examined(), 9);
+        assert_eq!(super::take_rows_examined(), 9);
+        assert_eq!(super::take_scan_rows_examined(), 6);
+        super::record_scan_rows_examined(1);
+        super::clear_statement_rows_examined();
+        assert_eq!(counter.take(), (1, 1));
+        assert!(super::current_rows_examined_counter().is_none());
+    }
+
     use super::*;
 
     #[test]

@@ -299,7 +299,7 @@ fn audit1027_distinct_topk_collation_matrix() {
     use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
     for collation in [
         "utf8mb4_bin",
-        "utf8mb4_0900_as_cs",
+        "utf8mb4_0900_bin",
         "utf8mb4_general_ci",
         "utf8mb4_0900_ai_ci",
     ] {

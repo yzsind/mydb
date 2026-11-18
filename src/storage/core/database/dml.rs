@@ -64,6 +64,33 @@ mod audit_1029_tests {
 #[cfg(test)]
 mod write_key_reuse_tests {
     #[test]
+    fn routed_small_insert_keeps_source_order_for_unique_conflicts() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE key_batch(a INT, b INT, PRIMARY KEY(a, b))")
+            .unwrap();
+        engine
+            .execute("INSERT INTO key_batch VALUES (1, 2), (1, 5), (2, 0)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO key_batch VALUES (1, 1), (1, 3), (1, 4), (1, 6)")
+            .unwrap();
+        let err = engine
+            .execute("INSERT INTO key_batch VALUES (1, 7), (1, 5), (1, 2), (1, 8)")
+            .unwrap_err();
+        assert!(err.is(crate::error::catalog::ER_DUP_ENTRY));
+        assert!(err.message().contains("'1-5'"), "{err:?}");
+        let result = engine
+            .execute("SELECT a, b FROM key_batch")
+            .unwrap()
+            .materialize()
+            .unwrap();
+        assert_eq!(result.found_rows(), 7);
+        engine.shutdown().unwrap();
+    }
+
+    #[test]
     fn scalar_insert_reuses_keys_and_preserves_duplicate_rollback() {
         let dir = tempfile::tempdir().unwrap();
         let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
@@ -2294,7 +2321,6 @@ impl Database {
                                 ) {
                                     self.try_in_place_update_delta(
                                         txn,
-                                        table_ref,
                                         table_ref.id,
                                         update.row_id,
                                         update.header,
@@ -2356,7 +2382,6 @@ impl Database {
                             let cols = effective_changed_columns.unwrap();
                             if self.try_in_place_update_delta(
                                 txn,
-                                &table,
                                 table.id,
                                 update.row_id,
                                 update.header,
@@ -3231,8 +3256,10 @@ impl Database {
     /// so mutate it directly and retain only the changed columns' before-image
     /// for sparse undo. `Ok(None)` means the conservative preconditions or the
     /// raw heap patch did not hold; the caller must execute the ordinary path.
+    ///
+    /// The caller already acquired the exact row's exclusive lock.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn try_update_prepared_row_by_id_in_place_delta_noop<F>(
+    pub(crate) fn try_update_locked_prepared_row_by_id_in_place_delta_noop<F>(
         &self,
         txn: TxnView,
         table: &TableSchema,
@@ -3256,6 +3283,7 @@ impl Database {
             affected_index_positions,
             required_columns,
             decode_plan,
+            true,
             None,
             apply_updates,
         )
@@ -3275,17 +3303,15 @@ impl Database {
         affected_index_positions: &[usize],
         required_columns: &[usize],
         decode_plan: Option<&RowDecodePlan>,
+        row_locked: bool,
         mut predicate: Option<&mut dyn FnMut(&[Value]) -> Result<bool, QueryError>>,
         mut apply_updates: F,
     ) -> Result<Option<bool>, QueryError>
     where
         F: FnMut(&mut [Value]) -> Result<(), QueryError>,
     {
-        let generated_changed_columns =
-            expand_changed_columns_for_generated(table, changed_columns);
-        let effective_changed_columns = generated_changed_columns.as_deref().or(changed_columns);
         let Some(effective_changed_columns) =
-            effective_changed_columns.filter(|cols| !cols.is_empty())
+            changed_columns.filter(|cols| !cols.is_empty())
         else {
             return Ok(None);
         };
@@ -3373,23 +3399,24 @@ impl Database {
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.acquire_table_write_binding(txn.txn_id, &table)?;
-        let storage_id = self.locate_row_storage_id(table, row_id)?;
-        let held_before =
-            txn.txn_id == 0 || self.txn_holds_row_lock(txn.txn_id, storage_id, row_id);
-        if txn.txn_id != 0 {
+        let storage_id = table.id;
+        debug_assert!(
+            !row_locked || txn.txn_id == 0 || self.txn_holds_row_lock(txn.txn_id, storage_id, row_id)
+        );
+        let held_before = row_locked
+            || txn.txn_id == 0
+            || self.txn_holds_row_lock(txn.txn_id, storage_id, row_id);
+        if txn.txn_id != 0 && !row_locked {
             self.acquire_row_lock_blocking(txn.txn_id, storage_id, row_id, LockMode::Exclusive)?;
         }
-        let Some((header, projected_values, stored_count, patch_source)) = self
-            .read_mvcc_row_columns_for_update(
-                storage_id,
+        let heap = self.heap_handle(storage_id)?;
+        let Some((header, projected_values, stored_count, patch_source)) =
+            Self::read_mvcc_row_columns_for_update(
+                &heap,
                 row_id,
                 required_columns,
                 decode_plan,
-                if txn.txn_id != 0 {
-                    effective_changed_columns
-                } else {
-                    &[]
-                },
+                if txn.txn_id == 0 { &[] } else { effective_changed_columns },
             )?
         else {
             if !held_before {
@@ -3407,7 +3434,7 @@ impl Database {
         // the encoded shape rather than rejecting every first UPDATE.
         if patch_source.is_none()
             && header.undo_ptr.is_none()
-            && !self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?
+            && !heap.read().has_reserved_undo_slot(row_id)?
         {
             return Ok(None);
         }
@@ -3467,7 +3494,6 @@ impl Database {
             (!affected_index_positions.is_empty()).then(|| current_values.clone());
         apply_updates(&mut current_values)?;
         coerce_updated_row(table, &mut current_values, changed_columns)?;
-        materialize_generated_columns(table, &mut current_values, Some(effective_changed_columns))?;
         crate::engine::rls::check_row(
             self,
             txn,
@@ -3491,21 +3517,17 @@ impl Database {
             }
         }
 
-        // With no affected unique index, check_update_constraints never needs an old
-        // unique key. Passing the new row for both slices preserves the shared
-        // NOT NULL / CHECK / child-FK gates without materialising a full old
-        // row solely for an argument that will not be read.
-        self.check_update_constraints(
+        // The prepared index footprint and the guards above exclude
+        // affected UNIQUE/vector keys, CHECKs, generated columns, child
+        // FK changes and partition routing. Only NOT NULL remains.
+        self.check_updated_not_null_constraints(
             table,
-            txn,
-            row_id,
-            &current_values,
             &current_values,
             Some(effective_changed_columns),
         )?;
         let patched = self.try_in_place_update_delta_with_before(
             txn,
-            table,
+            &heap,
             storage_id,
             row_id,
             header,
@@ -3811,7 +3833,6 @@ impl Database {
                 let cols = effective_changed_columns.unwrap();
                 self.try_in_place_update_delta(
                     txn,
-                    table,
                     storage_id,
                     row_id,
                     current.header,
@@ -4305,7 +4326,6 @@ impl Database {
             if !has_lob {
                 let patched = self.try_in_place_update_delta(
                     txn,
-                    table,
                     storage_id,
                     row_id,
                     old_header,
@@ -4493,7 +4513,6 @@ impl Database {
     fn try_in_place_update_delta(
         &self,
         txn: TxnView,
-        table: &TableSchema,
         storage_id: u64,
         row_id: RowId,
         old_header: RowHeader,
@@ -4512,7 +4531,7 @@ impl Database {
             .collect();
         self.try_in_place_update_delta_with_before(
             txn,
-            table,
+            &self.heap_handle(storage_id)?,
             storage_id,
             row_id,
             old_header,
@@ -4531,7 +4550,7 @@ impl Database {
     fn try_in_place_update_delta_with_before(
         &self,
         txn: TxnView,
-        _table: &TableSchema,
+        heap: &HeapHandle,
         storage_id: u64,
         row_id: RowId,
         old_header: RowHeader,
@@ -4543,7 +4562,6 @@ impl Database {
         debug_assert_eq!(changed_cols.len(), before_values_sparse.len());
         // Release the heap handle/page guards before reserving or appending
         // undo: preparation must not introduce a heap -> undo lock order.
-        let heap = self.heap_handle(storage_id)?;
         let prepared = {
             let heap = heap.read();
             match patch_source {

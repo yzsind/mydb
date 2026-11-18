@@ -2215,28 +2215,7 @@ pub(in crate::engine::executor::select) fn value_to_f64_fast(value: &Value) -> O
         Value::Float(v) => Some(*v as f64),
         Value::Double(v) => Some(*v),
         Value::DecimalCompact(mag, scale) => {
-            const POW10: [f64; 19] = [
-                1.0,
-                10.0,
-                100.0,
-                1_000.0,
-                10_000.0,
-                100_000.0,
-                1_000_000.0,
-                10_000_000.0,
-                100_000_000.0,
-                1_000_000_000.0,
-                10_000_000_000.0,
-                100_000_000_000.0,
-                1_000_000_000_000.0,
-                10_000_000_000_000.0,
-                100_000_000_000_000.0,
-                1_000_000_000_000_000.0,
-                10_000_000_000_000_000.0,
-                100_000_000_000_000_000.0,
-                1_000_000_000_000_000_000.0,
-            ];
-            POW10.get(*scale as usize).map(|denom| *mag as f64 / *denom)
+            Some(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
         }
         Value::Decimal128(mag, scale) => {
             Some(crate::util::decimal::parts_to_f64(*mag as i128, *scale))
@@ -2341,12 +2320,7 @@ mod ascii_short_tests {
 
     #[test]
     fn short_ascii_membership_exhaustively_matches_collation_oracle() {
-        for name in [
-            "utf8mb4_0900_ai_ci",
-            "utf8mb4_bin",
-            "utf8mb4_0900_as_cs",
-            "utf8mb4_0900_bin",
-        ] {
+        for name in ["utf8mb4_0900_ai_ci", "utf8mb4_bin", "utf8mb4_0900_bin"] {
             let id = crate::charset::resolve_collation(name).unwrap().id;
             for literals in [
                 vec![],

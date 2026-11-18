@@ -84,15 +84,35 @@ pub(super) fn lock_select_rows_for_update(
         && stmt.group_by.is_empty()
         && stmt.having.is_none()
     {
-        if let Some(row_id) =
-            unique_row_id_for_exact_write(db, txn, &table, stmt.selection.as_ref(), false)?
+        if let Some((index, EngineIndexAccess::Lookup { key, exact: true })) = stmt
+            .selection
+            .as_ref()
+            .and_then(|selection| best_index_access(&table, selection))
         {
-            let row_ref = crate::storage::DmlRowRef {
-                storage_id: table.id,
-                row_id,
-            };
-            let locked = apply_lock_clause(db, txn, &table, &[row_ref], lock_clause)?;
-            return Ok(Some(locked));
+            if index.unique
+                && !table.is_partitioned()
+                && !key.contains_null()
+                && stmt.selection.as_ref().is_some_and(|selection| {
+                    index_access_covers_all_conjuncts(&table, index, selection, &key)
+                })
+            {
+                let Some(row_id) = db.lookup_unique_index_for_locking_read(
+                    txn,
+                    &table,
+                    index,
+                    key,
+                    lock_clause.wait,
+                )?
+                else {
+                    return Ok(Some(Vec::new()));
+                };
+                let row_ref = crate::storage::DmlRowRef {
+                    storage_id: table.id,
+                    row_id,
+                };
+                let locked = apply_lock_clause(db, txn, &table, &[row_ref], lock_clause)?;
+                return Ok(Some(locked));
+            }
         }
     }
     if fulltext.is_empty() && stmt.from[0].sample.is_none() {
@@ -108,7 +128,7 @@ pub(super) fn lock_select_rows_for_update(
     let candidates = if let Some((rows, _charge)) = &mut sampled {
         Some(std::mem::take(rows))
     } else {
-        candidate_row_refs_for_write(
+        super::indexes::candidate_row_refs_with_wait(
             db,
             txn,
             &table,
@@ -117,6 +137,7 @@ pub(super) fn lock_select_rows_for_update(
             } else {
                 None
             },
+            lock_clause.wait,
         )?
     };
     let rows = db.dml_candidate_rows_with_origin_for_write(&table, txn, candidates)?;
@@ -1261,6 +1282,7 @@ pub(super) fn execute_prepared_range_update(
                     &update.affected_indexes,
                     &update.required_columns,
                     update.decode_recipe.as_deref().map(|(plan, _)| plan),
+                    false,
                     Some(&mut predicate),
                     &apply,
                 )?;
@@ -1326,7 +1348,7 @@ pub(super) fn execute_prepared_point_update(
         crate::engine::api::set_statement_matched_rows(0);
         return Ok(QueryResponse::OkAffected { affected_rows: 0 });
     };
-    let update_result = match db.try_update_prepared_row_by_id_in_place_delta_noop(
+    let update_result = match db.try_update_locked_prepared_row_by_id_in_place_delta_noop(
         txn,
         &point.table,
         row_id,

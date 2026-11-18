@@ -6340,12 +6340,9 @@ impl IndexFile {
     }
 
     fn first_entry_follows_right_edge(&self, entry: &IndexEntry) -> Result<bool, QueryError> {
-        let leaf_id = self.rightmost_leaf()?;
-        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
-        let can_append =
-            pinned.with_index_raw_bytes(|bytes| raw_last_leaf_entry_less_than(bytes, entry))?;
-        drop(pinned);
-        Ok(can_append)
+        let pinned = self.pin_rightmost_leaf_from(self.root_page.load(Ordering::Acquire))?;
+        pinned.frame.touch(AccessIntent::Normal);
+        pinned.with_index_raw_bytes(|bytes| raw_last_leaf_entry_less_than(bytes, entry))
     }
 
     fn append_sorted_entries(
@@ -8973,8 +8970,8 @@ impl IndexFile {
     fn last_key_is_before(&self, candidate: &IndexKey) -> Result<bool, QueryError> {
         let _structure = self.structure_lock.read_recursive();
         self.ensure_healthy()?;
-        let leaf_id = self.rightmost_leaf()?;
-        let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(leaf_id))?;
+        let pinned = self.pin_rightmost_leaf_from(self.root_page.load(Ordering::Acquire))?;
+        pinned.frame.touch(AccessIntent::Normal);
         pinned.with_index_raw_bytes(|bytes| {
             let header = parse_leaf_payload_header(bytes)?;
             if header.count == 0 {
@@ -10530,19 +10527,36 @@ impl IndexFile {
         }
     }
 
-    fn rightmost_leaf_from(&self, mut page_id: u64) -> Result<u64, QueryError> {
+    fn rightmost_leaf_from(&self, page_id: u64) -> Result<u64, QueryError> {
+        Ok(self.pin_rightmost_leaf_from(page_id)?.frame.key.page_id)
+    }
+
+    fn pin_rightmost_leaf_from(
+        &self,
+        mut page_id: u64,
+    ) -> Result<PinnedFrame<&BufferPool>, QueryError> {
         let mut progress = IndexPageProgress::new(page_id);
         loop {
-            let pinned = self.buffer_pool.pin_page_ref(self.page_key_ref(page_id))?;
+            if let Some(Some(child)) =
+                self.with_cached_root(page_id, |bytes| edge_child_index_page_bytes(bytes, true))?
+            {
+                progress.advance(child)?;
+                page_id = child;
+                continue;
+            }
+            let pinned = self.pin_tree_page_borrowed(page_id)?;
+            if pinned.frame.has_packed_leaf() {
+                return Ok(pinned);
+            }
             let child =
                 pinned.with_index_raw_bytes(|bytes| edge_child_index_page_bytes(bytes, true))?;
-            drop(pinned);
             match child {
                 Some(child) => {
+                    self.remember_root_routing(&pinned)?;
                     progress.advance(child)?;
                     page_id = child;
                 }
-                None => return Ok(page_id),
+                None => return Ok(pinned),
             }
         }
     }
