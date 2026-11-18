@@ -24,7 +24,7 @@ The current development format is incompatible with earlier versions. If version
 | commit ledger / history index | 2 / 2 |
 | binlog manifest | 2 |
 | replica progress / replication slot | 1 / 1 |
-| MySQL channel / relay record | 1 / 1 |
+| MySQL channel / relay record | 1 / 2 |
 | WAL retention / persisted variables / AI keyring | 1 / 1 / 1 |
 | native replication metadata | 3 |
 | commit clock watermark | 2 |

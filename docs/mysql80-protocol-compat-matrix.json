@@ -50,9 +50,9 @@
   "evidence": {
     "review_scope": "Source and documentation contract review; focused regression and local protocol rehearsal. This fingerprint is a review trigger, not proof all combinations are supported.",
     "source_sha256": {
-      "src/mysql/protocol.rs": "7d56b1c0915b1cda9ec91015f9d03c14e68a24942e2db54289530f685608c503",
+      "src/mysql/protocol.rs": "5a948ad3535e087348a483e2d11d482bbb76488e5013aca6272b4fa9b873ab16",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "f18c77aff8561e1c69670ee95cfc6b1416a0c619e6a86d091e6bedd5b78e1066",
+      "src/mysql/session.rs": "babdaf1bef90847da869d8816351a27a3769dd2a84b2cb49b70fcf9a2e23d732",
       "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023",
       "src/mysql/peer_monitor.rs": "0ea7dc6481c8bdd31dbafcaa86dfe81aa0212cc638cd0e4324843205d80187fc"
     },
