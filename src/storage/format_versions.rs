@@ -45,7 +45,8 @@ pub const CATALOG_VERSION: u32 = 72;
 /// v36: persistent spatial R-tree page batches.
 /// v37: transaction-linked spatial undo and compensation cursors.
 /// v40: bounded lossless LZ4 transaction-batch frames.
-pub const WAL_VERSION: u32 = 40;
+/// v41: durable commit-visibility proofs for voided SCNs and source restart.
+pub const WAL_VERSION: u32 = 41;
 /// v14: reduced-redo pages require an FPI before later physiological writes.
 pub const HEAP_PAGE_VERSION: u16 = 15;
 pub const MVCC_ROW_VERSION: u8 = 9;

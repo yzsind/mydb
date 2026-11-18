@@ -1935,24 +1935,25 @@ mod lifecycle_tests {
         let baseline = db.wal_log().lock().last_lsn();
         db.set_physical_replica_mode(true).unwrap();
         std::fs::create_dir(dir.path().join("unwritable-redo-target")).unwrap();
-        {
+        let fault_lsn = {
             let log = source.database_for_replication().wal_log();
             let mut log = log.lock();
-            log.append_reserved(
-                baseline + 1,
-                0,
-                crate::wal::WalPayload::SlotReclaim {
-                    path: "unwritable-redo-target".into(),
-                    page_id: 0,
-                    slot_id: 0,
-                },
-            )
-            .unwrap();
+            let lsn = log
+                .append(
+                    0,
+                    crate::wal::WalPayload::SlotReclaim {
+                        path: "unwritable-redo-target".into(),
+                        page_id: 0,
+                        slot_id: 0,
+                    },
+                )
+                .unwrap();
             log.flush().unwrap();
-        }
+            lsn
+        };
         crate::wal::LogManager::sync_durable_to(
             &source.database_for_replication().wal_log(),
-            baseline + 1,
+            fault_lsn,
         )
         .unwrap();
         let progress = ReplicaProgress {

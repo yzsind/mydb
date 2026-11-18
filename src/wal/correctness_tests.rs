@@ -269,3 +269,49 @@ fn synchronization_cannot_publish_a_future_allocation() {
     LogManager::sync_durable_to(&log, appended).unwrap();
     assert_eq!(log.lock().durable_lsn(), appended);
 }
+
+#[test]
+fn commit_visibility_proofs_round_trip_and_reject_invalid_scope() {
+    for (resolved_scn, visible_scn) in [(172, 169), (172, 173), (173, 173)] {
+        let mut record = WalRecord {
+            source_time_us: 0,
+            lsn: 1,
+            prev_txn_lsn: 0,
+            txn_id: 0,
+            payload: WalPayload::CommitVisibility {
+                resolved_scn,
+                visible_scn,
+            },
+        };
+        let bytes = encode_record(&record).unwrap();
+        let decoded = decode_frame_for_replication(&bytes).unwrap();
+        assert!(matches!(decoded.payload, WalPayload::CommitVisibility {
+            resolved_scn: actual_resolved, visible_scn: actual_visible,
+        } if actual_resolved == resolved_scn && actual_visible == visible_scn));
+        let mut corrupt = bytes.clone();
+        corrupt[WAL_FRAME_HEADER_LEN] ^= 1;
+        assert!(decode_frame_for_replication(&corrupt).is_err());
+        let mut wrong_scope = bytes;
+        wrong_scope[24..32].copy_from_slice(&9u64.to_le_bytes());
+        let crc = wal_frame_checksum(&wrong_scope, &wrong_scope[WAL_FRAME_HEADER_LEN..]);
+        wrong_scope[44..48].copy_from_slice(&crc.to_le_bytes());
+        assert!(decode_frame_for_replication(&wrong_scope).is_err());
+        record.txn_id = 9;
+        assert!(encode_record(&record).is_err());
+        assert!(LogManager::pre_encode_record(9, record.payload.clone()).is_err());
+        assert!(LogManager::pre_encode_record(
+            9,
+            WalPayload::TxnBatch {
+                records: vec![
+                    record.payload,
+                    WalPayload::CommitTxn {
+                        commit_scn: 174,
+                        commit_unix_us: 174,
+                        binlog: None,
+                    }
+                ],
+            }
+        )
+        .is_err());
+    }
+}
