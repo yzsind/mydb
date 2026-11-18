@@ -806,14 +806,20 @@ mod tests {
                         .chunks_exact(dim)
                         .map(|r| prepared.row_f32(r).unwrap())
                         .collect();
+                    // The scalar oracle is independent of the dispatched ISA.
+                    let exact: Vec<Vec<f64>> = rows
+                        .chunks_exact(dim)
+                        .map(|row| {
+                            centers
+                                .chunks_exact(dim)
+                                .map(|c| ordering_distance(row, c, metric))
+                                .collect()
+                        })
+                        .collect();
                     for isa in Isa::supported() {
                         let mut out = vec![0; refs.len()];
                         prepared.assign_with(isa, &refs, &mut out);
-                        for (i, row) in rows.chunks_exact(dim).enumerate() {
-                            let exact: Vec<f64> = centers
-                                .chunks_exact(dim)
-                                .map(|c| ordering_distance(row, c, metric))
-                                .collect();
+                        for (i, exact) in exact.iter().enumerate() {
                             let best = exact.iter().cloned().fold(f64::INFINITY, f64::min);
                             let got = out[i] as usize;
                             assert!(got < count, "{isa:?} {metric:?} returned EXACT");

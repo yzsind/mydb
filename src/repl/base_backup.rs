@@ -788,6 +788,7 @@ pub(crate) async fn perform_base_backup_into_with_config(
         }
     }
     fs::create_dir_all(&staging).map_err(io_err)?;
+    let staging_sync = crate::platform::fs::PrivateTreeSyncBatch::new(&staging).map_err(io_err)?;
     let mut expected = std::collections::BTreeMap::<String, (u64, u64, bool)>::new();
     let mut checksums = std::collections::HashMap::<String, Sha256>::new();
     for file in &start.files {
@@ -920,7 +921,10 @@ pub(crate) async fn perform_base_backup_into_with_config(
                     )
                 })?;
                 if chunk.eof {
-                    entry.sync_all().map_err(|err| {
+                    // Drain the original writer to catch its writeback
+                    // errors. The private tree shares its final device
+                    // barrier before any install journal or live rename.
+                    crate::platform::fs::sync_standard_file_at(entry, &abs).map_err(|err| {
                         error(
                             crate::error::catalog::ER_NOT_SUPPORTED_YET,
                             format!("flush chunk: {err}"),
@@ -1023,6 +1027,7 @@ pub(crate) async fn perform_base_backup_into_with_config(
         })?;
     }
     sync_tree(&staging)?;
+    staging_sync.finish().map_err(io_err)?;
     install_staged_backup(data_dir, &staging)?;
     if staging.exists() {
         remove_path(&staging).map_err(io_err)?;

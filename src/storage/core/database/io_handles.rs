@@ -1219,8 +1219,15 @@ impl Database {
                     self.config.heap_update_reserve_bytes,
                 )
             };
+            let heap_path = self.table_path(table_id);
+            #[cfg(test)]
+            if crate::storage::data_dictionary::is_dd_table_id(table_id) {
+                if let Some(seed) = &self.lazy_fixture_heaps {
+                    seed.prepare(&heap_path).map_err(io_err)?;
+                }
+            }
             let mut heap_file = HeapFile::open_with_buffer_pool(
-                self.table_path(table_id),
+                heap_path,
                 table_id,
                 self.log.clone(),
                 if is_temp_table_id(table_id) {

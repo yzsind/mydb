@@ -4449,77 +4449,60 @@ impl BufferPool {
     }
 
     fn ensure_capacity_for_insert(&self, timeout: Duration) -> Result<(), QueryError> {
-        let started = Instant::now();
-        while self.used_pages.load(Ordering::Relaxed)
-            >= self.capacity_pages.load(Ordering::Relaxed).max(1)
-        {
-            // D-2 - inside the grace window only clean victims are
-            // taken; the IO workers flush on our behalf. Past the
-            // window — or when the caller has no wait budget at all
-            // (lock_wait of zero means "must make progress inline") —
-            // the old synchronous dirty-victim path guarantees
-            // progress regardless of worker liveness.
-            let allow_dirty_victim = timeout <= BUFFER_POOL_EVICT_SYNC_GRACE
-                || started.elapsed() >= BUFFER_POOL_EVICT_SYNC_GRACE;
-            match self.evict_one_with_policy(allow_dirty_victim)? {
-                true => continue,
-                false if started.elapsed() < timeout => {
-                    let wait_started = Instant::now();
-                    self.waits.fetch_add(1, Ordering::Relaxed);
-                    let remaining = timeout.saturating_sub(started.elapsed());
-                    // N-3 - cap each individual wait at 50ms (was 2ms)
-                    // and rely on `notify_frame_waiters` after every
-                    // eviction / flush / pin release for prompt wake.
-                    // The cap protects us from a missed notify (e.g.
-                    // workers having parked between wake_workers and
-                    // their next loop iteration), but should rarely
-                    // be reached in practice. Removes 500 wakeups/s
-                    // of pure busy waiting on contended OLTP.
-                    self.wait_for_frame_release(remaining.min(BUFFER_POOL_WAIT_CEILING));
-                    let waited = wait_started.elapsed();
-                    self.wait_ms.fetch_add(
-                        waited.as_millis().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
-                    // P0-1 - microsecond resolution so sub-ms waits
-                    // (the P99 tail) stay visible.
-                    self.ensure_capacity_busy_us.fetch_add(
-                        waited.as_micros().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
-                }
-                false => return Err(self.capacity_exhausted_error()),
-            }
-        }
-        Ok(())
+        self.ensure_capacity_with_reserve(timeout, 1)
     }
 
     fn ensure_capacity(&self, timeout: Duration) -> Result<(), QueryError> {
-        let started = Instant::now();
+        self.ensure_capacity_with_reserve(timeout, 0)
+    }
+
+    fn ensure_capacity_with_reserve(
+        &self,
+        timeout: Duration,
+        reserve_pages: u64,
+    ) -> Result<(), QueryError> {
+        let mut started = None;
         while self.used_pages.load(Ordering::Relaxed)
-            > self.capacity_pages.load(Ordering::Relaxed).max(1)
+            > self
+                .capacity_pages
+                .load(Ordering::Relaxed)
+                .max(1)
+                .saturating_sub(reserve_pages)
         {
-            let allow_dirty_victim = timeout <= BUFFER_POOL_EVICT_SYNC_GRACE
-                || started.elapsed() >= BUFFER_POOL_EVICT_SYNC_GRACE;
-            match self.evict_one_with_policy(allow_dirty_victim)? {
-                true => continue,
-                false if started.elapsed() < timeout => {
-                    let wait_started = Instant::now();
-                    self.waits.fetch_add(1, Ordering::Relaxed);
-                    let remaining = timeout.saturating_sub(started.elapsed());
-                    self.wait_for_frame_release(remaining.min(BUFFER_POOL_WAIT_CEILING));
-                    let waited = wait_started.elapsed();
-                    self.wait_ms.fetch_add(
-                        waited.as_millis().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
-                    self.ensure_capacity_busy_us.fetch_add(
-                        waited.as_micros().min(u128::from(u64::MAX)) as u64,
-                        Ordering::Relaxed,
-                    );
-                }
-                false => return Err(self.capacity_exhausted_error()),
+            let start = *started.get_or_insert_with(Instant::now);
+            let elapsed = start.elapsed();
+            // Only wait for asynchronous writeback while it can make progress.
+            // Foreground eviction is the fallback as soon as the grace expires.
+            let allow_dirty_victim = self.durability == DurabilityMode::Memory
+                || self.shutdown.load(Ordering::Acquire)
+                || timeout <= BUFFER_POOL_EVICT_SYNC_GRACE
+                || elapsed >= BUFFER_POOL_EVICT_SYNC_GRACE;
+            if self.evict_one_with_policy(allow_dirty_victim)? {
+                continue;
             }
+            let wait_started = Instant::now();
+            let elapsed = wait_started.duration_since(start);
+            if elapsed >= timeout {
+                return Err(self.capacity_exhausted_error());
+            }
+            let mut wait = (timeout - elapsed).min(BUFFER_POOL_WAIT_CEILING);
+            if !allow_dirty_victim {
+                wait = wait.min(BUFFER_POOL_EVICT_SYNC_GRACE.saturating_sub(elapsed));
+                if wait.is_zero() {
+                    continue;
+                }
+            }
+            self.waits.fetch_add(1, Ordering::Relaxed);
+            self.wait_for_frame_release(wait);
+            let waited = wait_started.elapsed();
+            self.wait_ms.fetch_add(
+                waited.as_millis().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
+            self.ensure_capacity_busy_us.fetch_add(
+                waited.as_micros().min(u128::from(u64::MAX)) as u64,
+                Ordering::Relaxed,
+            );
         }
         Ok(())
     }
@@ -9234,6 +9217,44 @@ mod oldest_dirty_tests {
         let frame = pool.lookup_frame(&key(1)).unwrap().unwrap();
         assert!(frame.is_ready());
         assert_eq!(frame.pin_count.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn memory_pool_evicts_dirty_pages_without_waiting_for_io_workers() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("memory-eviction.heap");
+        let bytes: Vec<_> = (0..3).flat_map(|_| Page::new().encode()).collect();
+        fs::write(&path, bytes).unwrap();
+        bind_test_file_pages(&path);
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool = BufferPool::new_with_options(
+            2,
+            log,
+            DurabilityMode::Memory,
+            Duration::from_secs(1),
+            1,
+            0,
+        );
+        let file = Arc::new(BufferPool::heap_file_key(path, 1));
+        let key = |page_id| PageKey {
+            file: file.clone(),
+            page_id,
+        };
+        for id in 0..2 {
+            pool.with_raw_page_mut(key(id), 0, |page| {
+                page[128] = 42;
+                Ok(())
+            })
+            .unwrap();
+        }
+        pool.read_raw_page(key(2)).unwrap();
+        for id in 0..2 {
+            assert_eq!(pool.read_raw_page(key(id)).unwrap()[128], 42);
+        }
+        assert_eq!(pool.waits.load(Ordering::Relaxed), 0);
+        assert!(pool.evict_sync_dirty_flushes.load(Ordering::Relaxed) > 0);
     }
 
     #[test]

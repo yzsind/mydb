@@ -75,9 +75,9 @@ where
     let _ = fs::remove_dir_all(seed_dir.join("system/logs"));
     let _ = fs::remove_file(seed_dir.join("system/mydb.lock"));
 
-    // Keep all heap allocation metadata and populated dictionary indexes.
-    // Empty indexes are initialized on first use in private memory. The
-    // ordinary index-handle cache serializes root creation and publication.
+    // Keep populated dictionary files in the cloned seed. Empty indexes are
+    // initialized on first use; empty heap allocation metadata is copied
+    // privately on first open, preserving its original bytes and ownership.
     let memory_seed_dir = seed_dir.parent().unwrap().join("memory-seed");
     copy_seed_tree(&seed_dir, &memory_seed_dir)?;
     if !empty_indexes.is_empty() {
@@ -177,6 +177,12 @@ pub(crate) fn compact_memory_seed(
     empty_indexes: &[(u64, Vec<PathBuf>)],
 ) -> io::Result<()> {
     let catalog = root.join("system/catalog");
+    let empty_heaps = empty_heap_templates_dir(root);
+    fs::create_dir_all(&empty_heaps)?;
+    for (table_id, _) in empty_indexes {
+        let name = format!("{table_id}.heap");
+        fs::rename(catalog.join(&name), empty_heaps.join(name))?;
+    }
     for relative in empty_indexes.iter().flat_map(|(_, paths)| paths) {
         let path = root.join(relative);
         fs::remove_file(&path)?;
@@ -197,6 +203,12 @@ pub(crate) fn compact_memory_seed(
         }
     }
     Ok(())
+}
+
+pub(crate) fn empty_heap_templates_dir(root: &Path) -> PathBuf {
+    let mut path = root.as_os_str().to_os_string();
+    path.push(".empty-heaps");
+    PathBuf::from(path)
 }
 
 fn query_error(error: mydb::types::QueryError) -> io::Error {

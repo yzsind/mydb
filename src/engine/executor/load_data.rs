@@ -8399,8 +8399,13 @@ mod tests {
             }
         }
         let _restore = Restore(prior_limit);
-        let body = (1..=12000)
-            .map(|id| format!("{id}|a{id}{}|b{id}{}\n", "x".repeat(96), "y".repeat(96)))
+        // Cross both the parallel probe and two replay-copy buffers without
+        // importing thousands of additional narrow rows in every matrix case.
+        let rows = 2 * PARALLEL_MIN_ROWS + 1;
+        let padding = "x".repeat(264);
+        let other_padding = "y".repeat(264);
+        let body = (1..=rows)
+            .map(|id| format!("{id}|a{id}{padding}|b{id}{other_padding}\n"))
             .collect::<String>();
         assert!(body.len() > 2 * LOAD_REPLAY_COPY_BYTES);
         for case in ["success", "duplicate", "conversion", "quota"] {
@@ -8421,10 +8426,18 @@ mod tests {
                     0
                 });
                 let table = format!("stream_{case}");
-                engine.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, a VARCHAR(160) UNIQUE, b VARCHAR(160) UNIQUE)")).unwrap();
+                engine.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, a VARCHAR(320) UNIQUE, b VARCHAR(320) UNIQUE)")).unwrap();
                 let before = super::super::spill_quota::global_spilled_bytes();
+                let shadow_hits = engine.db.load_shadow_perf_snapshot()[0];
                 let diagnostics = import_local_for_test(&engine, &table, degree, &input);
                 assert_eq!(super::super::spill_quota::global_spilled_bytes(), before);
+                if case == "success" {
+                    assert_eq!(
+                        engine.db.load_shadow_perf_snapshot()[0] - shadow_hits,
+                        u64::from(degree > 1),
+                        "the smaller fixture must retain parallel publication"
+                    );
+                }
                 let QueryResponse::ResultSet(rows) = engine
                     .execute(&format!("SELECT * FROM {table} ORDER BY id"))
                     .unwrap()

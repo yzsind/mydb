@@ -535,9 +535,13 @@ mod tests {
     use super::*;
 
     fn file(dir: &Path) -> PageFile {
+        file_with_pages(dir, 8)
+    }
+
+    fn file_with_pages(dir: &Path, pages: u64) -> PageFile {
         let log = Arc::new(parking_lot::Mutex::new(LogManager::open(dir).unwrap()));
         let pool = BufferPool::new(
-            8,
+            pages,
             Arc::clone(&log),
             DurabilityMode::Relaxed,
             Duration::from_secs(5),
@@ -558,7 +562,9 @@ mod tests {
     fn zone_map_page_directory_streams_multilevel_and_selects_columns() {
         std::fs::create_dir_all("/tmp/mydb").unwrap();
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-        let file = file(dir.path());
+        // Construction need not repeatedly evict its own input. The explicit
+        // flush/eviction below still makes every directory lookup cold.
+        let file = file_with_pages(dir.path(), 1_024);
         let mut builder = Builder::new(&file, 77, 64).unwrap();
         assert!(Root::open(&file, 77, 64).is_err());
         for column in 1..=3 {

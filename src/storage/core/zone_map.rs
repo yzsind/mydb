@@ -3520,8 +3520,11 @@ mod zone_map_worker_budget_tests {
 
     #[test]
     fn zone_map_worker_large_values_are_borrowed_and_clone_has_independent_charge() {
-        let (_dir, _engine, table) =
+        let (_dir, engine, table) =
             fixture("txt VARCHAR(4096), bytes VARBINARY(4096), amount DECIMAL(38,0)");
+        // Scratch accounting is process-wide. Join unrelated pool I/O before
+        // asserting exact deltas for the worker and its independent clone.
+        engine.db_for_tests().stop_buffer_pool_io_for_test();
         let values = vec![
             Value::String("A".repeat(8 * 1024 * 1024)),
             Value::Bytes(vec![7; 8 * 1024 * 1024]),

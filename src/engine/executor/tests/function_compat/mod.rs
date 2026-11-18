@@ -8,23 +8,33 @@
 use super::*;
 use regex::Regex;
 use serde::Deserialize;
+use serde_json::value::RawValue;
 
 #[derive(Debug, Deserialize)]
-struct FixtureFile {
+struct FixtureFile<'a> {
     schema_version: u32,
     mysql_version: String,
     category: String,
-    functions: Vec<FunctionFixture>,
+    #[serde(borrow)]
+    functions: Vec<FunctionFixture<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-struct FunctionFixture {
+struct FunctionFixture<'a> {
     name: String,
     oracle_class: String,
     profile: String,
     #[serde(default)]
     canonical: Option<String>,
-    cases: Vec<FunctionCase>,
+    #[serde(borrow)]
+    cases: &'a RawValue,
+}
+
+impl FunctionFixture<'_> {
+    fn parse_cases(&self) -> Vec<FunctionCase> {
+        serde_json::from_str(self.cases.get())
+            .unwrap_or_else(|error| panic!("invalid cases for {}: {error}", self.name))
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -470,7 +480,7 @@ fn assert_case(function: &str, case: &FunctionCase, actual: ActualOutcome) {
 }
 
 fn run_function_fixture(json: &str, function: &str) {
-    let fixture: FixtureFile = serde_json::from_str(json)
+    let fixture: FixtureFile<'_> = serde_json::from_str(json)
         .unwrap_or_else(|error| panic!("invalid fixture for {function}: {error}"));
     assert_eq!(fixture.schema_version, 1);
     assert_eq!(fixture.mysql_version, "8.0.46");
@@ -488,12 +498,12 @@ fn run_function_fixture(json: &str, function: &str) {
             "alias {function} lacks canonical name"
         );
     }
-    assert!(
-        !function_fixture.cases.is_empty(),
-        "{function} has no cases"
-    );
+    // Nextest starts one process per function. Parse only the selected
+    // function's SQL, rows and diagnostics, all of which are checked below.
+    let cases = function_fixture.parse_cases();
+    assert!(!cases.is_empty(), "{function} has no cases");
     let mut scalar_fixture = None;
-    for case in &function_fixture.cases {
+    for case in &cases {
         assert!(
             !case.tags.is_empty(),
             "{function}/{} has no coverage tags",

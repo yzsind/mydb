@@ -277,6 +277,114 @@ pub(crate) fn copy_fixture_file(source: &Path, destination: &Path) -> io::Result
     fs::copy(source, destination).map(|_| ())
 }
 
+/// Deferred copies belong to one newly seeded memory database. An attempted
+/// path is never restored again: later deletion/corruption must reach the
+/// ordinary heap opener rather than being hidden by fixture reconstruction.
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct LazyFixtureHeaps {
+    source: std::path::PathBuf,
+    opened: parking_lot::Mutex<std::collections::HashSet<std::ffi::OsString>>,
+}
+
+#[cfg(test)]
+impl LazyFixtureHeaps {
+    pub(crate) fn new(source: std::path::PathBuf) -> io::Result<Option<Self>> {
+        match fs::metadata(&source) {
+            Ok(metadata) if metadata.is_dir() => Ok(Some(Self {
+                source,
+                opened: Default::default(),
+            })),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+            Ok(_) => Err(io::Error::other(
+                "fixture heap templates are not a directory",
+            )),
+        }
+    }
+
+    pub(crate) fn prepare(&self, destination: &Path) -> io::Result<bool> {
+        let name = destination
+            .file_name()
+            .ok_or_else(|| io::Error::other("fixture heap path has no file name"))?;
+        let mut opened = self.opened.lock();
+        if opened.contains(name) {
+            return Ok(false);
+        }
+        let source = self.source.join(name);
+        let copied = if !destination.try_exists()? && source.try_exists()? {
+            copy_new_fixture_file(&source, destination)?
+        } else {
+            false
+        };
+        opened.insert(name.to_owned());
+        Ok(copied)
+    }
+}
+
+#[cfg(test)]
+fn copy_new_fixture_file(source: &Path, destination: &Path) -> io::Result<bool> {
+    #[cfg(target_os = "macos")]
+    match clone_fixture_path(source, destination) {
+        Ok(()) => return Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => return Ok(false),
+        Err(_) => {}
+    }
+    // Publish the complete byte copy without replacing a concurrently
+    // created file. Keep the fallback independent of APFS clone support.
+    let staged = tempfile::NamedTempFile::new_in(destination.parent().unwrap())?;
+    fs::copy(source, staged.path())?;
+    match staged.persist_noclobber(destination) {
+        Ok(_) => Ok(true),
+        Err(error) if error.error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(error) => Err(error.error),
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn lazy_fixture_heaps_are_private_and_do_not_repair_later_damage() {
+    let root = tempfile::tempdir_in(test_temp_dir()).unwrap();
+    let source = root.path().join("templates");
+    let private = root.path().join("private");
+    fs::create_dir_all(&source).unwrap();
+    fs::create_dir_all(&private).unwrap();
+    for name in ["first.heap", "existing.heap"] {
+        fs::write(source.join(name), b"original allocation metadata").unwrap();
+    }
+    let seed = LazyFixtureHeaps::new(source.clone()).unwrap().unwrap();
+    let path = private.join("first.heap");
+    let copies = std::thread::scope(|scope| {
+        let workers = (0..8)
+            .map(|_| scope.spawn(|| seed.prepare(&path).unwrap()))
+            .collect::<Vec<_>>();
+        workers
+            .into_iter()
+            .map(|worker| usize::from(worker.join().unwrap()))
+            .sum::<usize>()
+    });
+    assert_eq!(copies, 1);
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        fs::read(source.join("first.heap")).unwrap()
+    );
+    fs::write(&path, b"private mutation").unwrap();
+    assert_eq!(
+        fs::read(source.join("first.heap")).unwrap(),
+        b"original allocation metadata"
+    );
+    fs::remove_file(&path).unwrap();
+    assert!(!seed.prepare(&path).unwrap());
+    assert!(!path.exists());
+    let existing = private.join("existing.heap");
+    fs::write(&existing, b"injected corruption").unwrap();
+    assert!(!seed.prepare(&existing).unwrap());
+    assert_eq!(fs::read(existing).unwrap(), b"injected corruption");
+    let missing = private.join("not-a-template.heap");
+    assert!(!seed.prepare(&missing).unwrap());
+    assert!(!missing.exists());
+}
+
 #[cfg(all(test, target_os = "macos"))]
 fn clone_fixture_path(source: &Path, destination: &Path) -> io::Result<()> {
     use std::ffi::CString;

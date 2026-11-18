@@ -2,11 +2,15 @@ use super::support::query_rows;
 use super::*;
 
 fn fixture() -> (tempfile::TempDir, StorageQueryEngine) {
+    fixture_with_rows(2048)
+}
+
+fn fixture_with_rows(rows: usize) -> (tempfile::TempDir, StorageQueryEngine) {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
     engine.execute("CREATE TABLE sampled (id INT PRIMARY KEY, k INT, s VARCHAR(256), d DECIMAL(18,3), j JSON)").unwrap();
-    engine.execute("INSERT INTO sampled SELECT value, value%7, REPEAT('a', 100), value/1000, JSON_OBJECT('id',value) FROM generate_series(1,2048) AS g(value)").unwrap();
+    engine.execute(&format!("INSERT INTO sampled SELECT value, value%7, REPEAT('a', 100), value/1000, JSON_OBJECT('id',value) FROM generate_series(1,{rows}) AS g(value)")).unwrap();
     (dir, engine)
 }
 
@@ -161,7 +165,10 @@ fn tablesample_prepared_parameters_and_invalid_arguments() {
 
 #[test]
 fn tablesample_cached_nested_bindings_do_not_capture_amounts_or_leak_into_plain_reads() {
-    let (_dir, engine) = fixture();
+    // Each requested sample fits and leaves unselected rows. The nested
+    // expression can probe once per outer row, so keep this binding fixture
+    // small. The larger serial and parallel scan fixtures retain 2,048 rows.
+    let (_dir, engine) = fixture_with_rows(128);
     let mut session = SessionContext::default();
     engine.execute_with_session(&mut session,
         "PREPARE nested_sample FROM 'SELECT id FROM sampled WHERE id IN (SELECT id FROM sampled TABLESAMPLE BERNOULLI (? ROWS) REPEATABLE (?)) ORDER BY id'").unwrap();
@@ -196,7 +203,7 @@ fn tablesample_cached_nested_bindings_do_not_capture_amounts_or_leak_into_plain_
         let plain = support::result_rows(
             support::execute_materialized(&engine, &mut session, "EXECUTE plain_read").unwrap(),
         );
-        assert_eq!(plain[0][0].to_display_string(), "2048");
+        assert_eq!(plain[0][0], Value::Int(128));
     }
     engine
         .execute_with_session(&mut session, "SET @amount=-1, @seed=7")
@@ -211,7 +218,7 @@ fn tablesample_cached_nested_bindings_do_not_capture_amounts_or_leak_into_plain_
     let plain = support::result_rows(
         support::execute_materialized(&engine, &mut session, "EXECUTE plain_read").unwrap(),
     );
-    assert_eq!(plain[0][0].to_display_string(), "2048");
+    assert_eq!(plain[0][0], Value::Int(128));
 }
 
 #[test]

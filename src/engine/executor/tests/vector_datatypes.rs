@@ -649,6 +649,33 @@ fn vector_quantization_bq_physical_replication() {
 }
 fn physical_vector_replication_matrix(quantization: Option<&str>) {
     use std::io::{Read, Seek, SeekFrom};
+
+    struct IndexCase {
+        index: String,
+        query: String,
+        exact: String,
+    }
+
+    let assert_index = |engine: &StorageQueryEngine, case: &IndexCase| {
+        let QueryResponse::ResultSet(plan) =
+            engine.execute(&format!("EXPLAIN {}", case.query)).unwrap()
+        else {
+            panic!("expected EXPLAIN rows");
+        };
+        let key = plan
+            .columns
+            .iter()
+            .position(|col| col.name.eq_ignore_ascii_case("key"))
+            .unwrap();
+        assert!(
+            plan.rows
+                .iter()
+                .any(|row| row[key].to_display_string() == case.index),
+            "{}: {:?}",
+            case.query,
+            plan.rows
+        );
+    };
     let vector = |binary: bool, value: usize| {
         if binary {
             format!(
@@ -670,28 +697,35 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
         ]);
         let source = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let target = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let mut tables = Vec::new();
         let mut cases = Vec::new();
         let preparation = crate::platform::fs::FixtureSyncBatch::new(source.path()).unwrap();
-        // Distinct tables retain the full type/algorithm matrix while sharing
-        // one physical bootstrap, replica, promotion and promoted restart.
+        // Both algorithms keep independent indexes on the same typed heap.
+        // Each phase writes the heap once and exercises both indexes.
         {
             let engine = open_strict_test_engine(source.path());
             for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
                 if datatype == "BINARY" && quantization.is_some() {
                     continue;
                 }
-                for algo in ["HNSW", "IVF"] {
-                    let table = format!("items_{datatype}_{algo}");
-                    let binary = datatype == "BINARY";
-                    let dimension = if binary { 128 } else { 3 };
-                    engine.execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR({dimension},{datatype}) NOT NULL)")).unwrap();
-                    let rows = (1..=127)
-                        .map(|id| format!("({id},'{}')", vector(binary, id)))
-                        .collect::<Vec<_>>()
-                        .join(",");
-                    engine
-                        .execute(&format!("INSERT INTO {table} VALUES {rows}"))
-                        .unwrap();
+                let table = format!("items_{datatype}");
+                let binary = datatype == "BINARY";
+                let dimension = if binary { 128 } else { 3 };
+                engine.execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY,v VECTOR({dimension},{datatype}) NOT NULL)")).unwrap();
+                let rows = (1..=127)
+                    .map(|id| format!("({id},'{}')", vector(binary, id)))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                engine
+                    .execute(&format!("INSERT INTO {table} VALUES {rows}"))
+                    .unwrap();
+                let query_type = if binary { "BINARY" } else { "FLOAT32" };
+                let order = format!(
+                    "ORDER BY DISTANCE(v,TO_VECTOR('{}','{query_type}')) LIMIT 1",
+                    vector(binary, 0)
+                );
+                let exact = format!("SELECT /*+ NO_VECTOR_INDEX */ id FROM {table} {order}");
+                for (algo, index) in [("HNSW", "vx_hnsw"), ("IVF", "vx_ivf")] {
                     let options = if algo == "HNSW" {
                         "m=4, ef_construction=64"
                     } else {
@@ -709,16 +743,22 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
                             )
                         })
                         .unwrap_or_default();
-                    engine.execute(&format!("CREATE INDEX vx ON {table}(v) USING {algo} WITH ({options}{quant_options})")).unwrap();
+                    engine.execute(&format!("CREATE INDEX {index} ON {table}(v) USING {algo} WITH ({options}{quant_options})")).unwrap();
                     let hint = if algo == "HNSW" {
                         "HNSW_EF(64)"
                     } else {
                         "IVF_NPROBE(2)"
                     };
-                    let query_type = if binary { "BINARY" } else { "FLOAT32" };
-                    let sql = format!("SELECT /*+ {hint} */ id FROM {table} ORDER BY DISTANCE(v,TO_VECTOR('{}','{query_type}')) LIMIT 1", vector(binary, 0));
-                    cases.push((table, datatype, binary, hint, sql));
+                    let query = format!(
+                        "SELECT /*+ {hint} */ id FROM {table} FORCE INDEX({index}) {order}"
+                    );
+                    cases.push(IndexCase {
+                        index: index.into(),
+                        query,
+                        exact: exact.clone(),
+                    });
                 }
+                tables.push((table, datatype, binary));
             }
         }
         preparation.finish().unwrap();
@@ -730,15 +770,21 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
         let replica = open_strict_test_engine(target.path());
         replica.database().set_physical_replica_mode(true).unwrap();
         let mut next_lsn = replica.database().wal_log().lock().last_lsn() + 1;
-        for (table, _, _, _, sql) in &cases {
-            assert_eq!(scalar(&replica, sql), "1", "{backend}/{table}");
+        for case in &cases {
+            assert_index(&replica, case);
+            assert_eq!(
+                scalar(&replica, &case.query),
+                "1",
+                "{backend}/{}",
+                case.query
+            );
         }
         // One durable decision per DML phase covers every independent codec;
         // the replica must expose each table's result after the whole apply.
         for (phase, expected) in [(0, "128"), (1, "1"), (2, "127"), (3, "127")] {
             let mut writer = SessionContext::default();
             master.execute_with_session(&mut writer, "BEGIN").unwrap();
-            for (table, _, binary, _, _) in &cases {
+            for (table, _, binary) in &tables {
                 let zero = vector(*binary, 0);
                 let far = vector(*binary, 127);
                 let dml = match phase {
@@ -785,19 +831,26 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
                 }
             }
             replica.database().wal_log().lock().flush().unwrap();
+            let mut apply = crate::storage::OnlineWalApplyContext::default();
             for record in scan.records.iter().filter(|r| r.lsn >= next_lsn) {
-                replica.database().apply_wal_record(record).unwrap();
+                replica
+                    .database()
+                    .apply_wal_record_with_context(record, &mut apply)
+                    .unwrap();
             }
             next_lsn = scan.next_lsn;
-            for (table, _, _, hint, sql) in &cases {
+            let mut oracles = std::collections::HashMap::new();
+            for case in &cases {
+                let actual = scalar(&replica, &case.query);
+                assert_eq!(actual, expected, "{backend}/{}: phase={phase}", case.query);
+                let exact = oracles
+                    .entry(case.exact.as_str())
+                    .or_insert_with(|| scalar(&replica, &case.exact));
                 assert_eq!(
-                    scalar(&replica, sql),
-                    expected,
-                    "{backend}/{table}: phase={phase}"
-                );
-                assert_eq!(
-                    scalar(&replica, sql),
-                    scalar(&replica, &sql.replace(hint, "NO_VECTOR_INDEX"))
+                    actual.as_str(),
+                    exact.as_str(),
+                    "{backend}/{}: phase={phase}",
+                    case.query
                 );
             }
         }
@@ -824,12 +877,17 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
             &crate::repl::role::RoleState::new_standalone(),
         )
         .unwrap();
-        for (table, _, _, _, sql) in &cases {
-            assert_eq!(scalar(&replica, sql), "127", "{backend}/{table}");
+        for case in &cases {
+            assert_eq!(
+                scalar(&replica, &case.query),
+                "127",
+                "{backend}/{}",
+                case.query
+            );
         }
         let mut local = SessionContext::default();
         replica.execute_with_session(&mut local, "BEGIN").unwrap();
-        for (table, _, binary, _, _) in &cases {
+        for (table, _, binary) in &tables {
             replica
                 .execute_with_session(
                     &mut local,
@@ -847,17 +905,26 @@ fn physical_vector_replication_matrix(quantization: Option<&str>) {
                 .unwrap();
         }
         replica.execute_with_session(&mut local, "COMMIT").unwrap();
-        for (table, _, _, _, sql) in &cases {
-            assert_eq!(scalar(&replica, sql), "129", "{backend}/{table}");
+        for case in &cases {
+            assert_eq!(
+                scalar(&replica, &case.query),
+                "129",
+                "{backend}/{}",
+                case.query
+            );
         }
         drop(replica);
         let promoted = open_strict_test_engine(target.path());
-        for (table, datatype, _, _, sql) in &cases {
+        for case in &cases {
+            assert_index(&promoted, case);
             assert_eq!(
-                scalar(&promoted, sql),
+                scalar(&promoted, &case.query),
                 "129",
-                "promoted restart {backend}/{table}"
+                "promoted restart {backend}/{}",
+                case.query
             );
+        }
+        for (table, datatype, _) in &tables {
             assert_eq!(
                 scalar(
                     &promoted,

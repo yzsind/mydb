@@ -1389,20 +1389,25 @@ pub fn estimated_row_width(schema: &crate::storage::TableSchema) -> f64 {
     let body: f64 = schema
         .columns
         .iter()
-        .map(|column| {
-            schema
-                .stats
-                .columns
-                .get(&column.name.to_ascii_lowercase())
-                .and_then(|stats| stats.average_width_bytes)
-                .unwrap_or(column.data_type.key_byte_length() as f64)
-            // The tuple header allowance already includes the null
-            // bitmap. Charging another bit per nullable column here
-            // double-counts storage and makes ANALYZE/non-ANALYZE
-            // widths disagree for otherwise identical schemas.
-        })
+        .map(|column| estimated_column_width(schema, column))
         .sum();
     header + body
+}
+
+pub(crate) fn estimated_column_width(
+    schema: &crate::storage::TableSchema,
+    column: &crate::storage::ColumnSchema,
+) -> f64 {
+    let name = column.name.as_str();
+    let stats = if name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        schema.stats.columns.get(&name.to_ascii_lowercase())
+    } else {
+        schema.stats.columns.get(name)
+    };
+    // The tuple header already accounts for the null bitmap.
+    stats
+        .and_then(|stats| stats.average_width_bytes)
+        .unwrap_or_else(|| column.data_type.key_byte_length() as f64)
 }
 
 /// Approximate the heap page count holding `rows` of `width` bytes.

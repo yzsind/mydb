@@ -19607,16 +19607,52 @@ fn empty_expr_schema() -> &'static TableSchema {
     EMPTY.get_or_init(|| TableSchema::synthetic_for_planning("", &[]))
 }
 
-pub(crate) fn expr_collation(expr: &Expr, table: &TableSchema) -> Option<ExprCollation> {
-    crate::util::stack::ensure_stack(
-        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
-        || expr_collation_checked(expr, table),
-    )
+// Scoped to one immutable expression and its schema. The two derivations are
+// metadata only; conversion evaluation and error ordering stay in the visitor.
+#[derive(Default)]
+struct CollationValidationMemo {
+    collations: std::cell::RefCell<ahash::AHashMap<*const Expr, Option<ExprCollation>>>,
+    static_values: std::cell::RefCell<ahash::AHashMap<*const Expr, bool>>,
 }
 
-fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollation> {
+pub(crate) fn expr_collation(expr: &Expr, table: &TableSchema) -> Option<ExprCollation> {
+    expr_collation_memo(expr, table, None)
+}
+
+fn expr_collation_memo(
+    expr: &Expr,
+    table: &TableSchema,
+    memo: Option<&CollationValidationMemo>,
+) -> Option<ExprCollation> {
+    let infer = || {
+        crate::util::stack::ensure_stack(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+            || expr_collation_checked(expr, table, memo),
+        )
+    };
+    // Synthetic literals may reuse a stack address. Only cache compound
+    // nodes of the immutable AST that can entail repeated subtree walks.
+    let Some(memo) = memo.filter(|_| matches!(expr, Expr::Function { .. } | Expr::Case { .. }))
+    else {
+        return infer();
+    };
+    let key = std::ptr::from_ref(expr);
+    if let Some(value) = memo.collations.borrow().get(&key).copied() {
+        return value;
+    }
+    let value = infer();
+    memo.collations.borrow_mut().insert(key, value);
+    value
+}
+
+fn expr_collation_checked(
+    expr: &Expr,
+    table: &TableSchema,
+    memo: Option<&CollationValidationMemo>,
+) -> Option<ExprCollation> {
     if let Expr::Function { name, args, .. } = expr {
-        if function_result_type(name) == ColumnType::Geometry {
+        let result_type = function_result_type(name);
+        if result_type == ColumnType::Geometry {
             return Some(ExprCollation {
                 charset: "binary",
                 collation_id: crate::charset::BINARY_COLLATION_ID,
@@ -19685,10 +19721,10 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
             // marker. Neither can change the result charset/collation.
             return args
                 .first()
-                .and_then(|source| expr_collation(source, table));
+                .and_then(|source| expr_collation_memo(source, table, memo));
         }
         if name.eq_ignore_ascii_case("CONCAT") || name.eq_ignore_ascii_case("CONCAT_WS") {
-            return aggregate_expr_collation_details(args.iter(), table, name)
+            return aggregate_expr_collation_details(args.iter(), table, memo, name)
                 .ok()
                 .flatten();
         }
@@ -19701,7 +19737,7 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
             // BIGINT UNSIGNED. Preserve the argument's binary derivation so a
             // comparison against x'..' never attempts binary→utf8 conversion.
             if let Some(arg) = args.first() {
-                if let Some(collation) = expr_collation(arg, table) {
+                if let Some(collation) = expr_collation_memo(arg, table, memo) {
                     let info = crate::charset::resolve_collation_id(collation.collation_id)?;
                     if info.binary && info.charset == "binary" {
                         return Some(collation);
@@ -19737,11 +19773,11 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
             });
         }
         if xml::is_xml(name) {
-            return aggregate_expr_collation_details(args.iter(), table, name)
+            return aggregate_expr_collation_details(args.iter(), table, memo, name)
                 .ok()
                 .flatten();
         }
-        if function_result_type(name) == ColumnType::Blob {
+        if result_type == ColumnType::Blob {
             let info = crate::charset::resolve_collation("binary").ok()?;
             return Some(ExprCollation {
                 charset: info.charset,
@@ -19750,7 +19786,7 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
             });
         }
         if matches!(
-            function_result_type(name),
+            result_type,
             ColumnType::Tiny
                 | ColumnType::Short
                 | ColumnType::MediumInt
@@ -19772,10 +19808,11 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
                 coercibility: 5,
             });
         }
-        if function_result_type(name) == ColumnType::VarString {
-            if let Some(collation) = aggregate_expr_collation_details(args.iter(), table, name)
-                .ok()
-                .flatten()
+        if result_type == ColumnType::VarString {
+            if let Some(collation) =
+                aggregate_expr_collation_details(args.iter(), table, memo, name)
+                    .ok()
+                    .flatten()
             {
                 return Some(collation);
             }
@@ -19831,6 +19868,7 @@ fn expr_collation_checked(expr: &Expr, table: &TableSchema) -> Option<ExprCollat
         } => aggregate_expr_collation_details(
             results.iter().chain(else_result.as_deref()),
             table,
+            memo,
             "case",
         )
         .ok()
@@ -19883,8 +19921,20 @@ pub(crate) fn aggregate_expr_collations<'a, I>(
 where
     I: Iterator<Item = &'a Expr> + Clone,
 {
+    aggregate_expr_collations_memo(operands, table, None, operation)
+}
+
+fn aggregate_expr_collations_memo<'a, I>(
+    operands: I,
+    table: &TableSchema,
+    memo: Option<&CollationValidationMemo>,
+    operation: &str,
+) -> Result<Option<u16>, QueryError>
+where
+    I: Iterator<Item = &'a Expr> + Clone,
+{
     Ok(
-        aggregate_expr_collation_details(operands, table, operation)?
+        aggregate_expr_collation_details(operands, table, memo, operation)?
             .map(|collation| collation.collation_id),
     )
 }
@@ -19899,6 +19949,7 @@ pub(crate) fn aggregate_static_expr_collations(
 fn aggregate_expr_collation_details<'a, I>(
     operands: I,
     table: &TableSchema,
+    memo: Option<&CollationValidationMemo>,
     operation: &str,
 ) -> Result<Option<ExprCollation>, QueryError>
 where
@@ -19939,14 +19990,16 @@ where
         return Ok(operands
             .clone()
             .next()
-            .and_then(|expr| expr_collation(expr, table)));
+            .and_then(|expr| expr_collation_memo(expr, table, memo)));
     }
     // Derive each operand once. Every derivation recurses through the
     // operand's own string arguments, so repeated per-pass derivation would
     // make nested string functions exponential in their nesting depth.
     let collated: smallvec::SmallVec<[(&Expr, ExprCollation); 4]> = operands
         .clone()
-        .filter_map(|expr| expr_collation(expr, table).map(|collation| (expr, collation)))
+        .filter_map(|expr| {
+            expr_collation_memo(expr, table, memo).map(|collation| (expr, collation))
+        })
         .collect();
     let string_operands = collated.len();
     let charset_introducers_only = string_operands >= 2
@@ -20143,6 +20196,7 @@ fn validate_constant_string_conversion(
     target: &Expr,
     source: &Expr,
     table: &TableSchema,
+    memo: Option<&CollationValidationMemo>,
 ) -> Result<(), QueryError> {
     // Decide from the source first: deriving the target's type and collation
     // walks its whole subtree, which nested string functions repeat per level.
@@ -20151,7 +20205,7 @@ fn validate_constant_string_conversion(
     // not a constant string merely because `eval_const` can interpret its
     // AST. Evaluating it here mutates the session once before the first row.
     // ASCII text and numeric literals are representable in every charset.
-    if !expr_is_static_value(source)
+    if !expr_is_static_value_memo(source, memo)
         || match source {
             Expr::Literal(Literal::String(text)) => text.is_ascii(),
             Expr::Literal(
@@ -20183,7 +20237,7 @@ fn validate_constant_string_conversion(
     ) {
         return Ok(());
     }
-    let Some(target_collation) = expr_collation(target, table) else {
+    let Some(target_collation) = expr_collation_memo(target, table, memo) else {
         return Ok(());
     };
     if target_collation.charset == "binary" {
@@ -21353,13 +21407,31 @@ fn function_is_runtime_dependent(upper: &str) -> bool {
 /// their type metadata survives, but their values are still safe to evaluate
 /// for deterministic conversion/error validation.
 fn expr_is_static_value(expr: &Expr) -> bool {
-    crate::util::stack::ensure_stack(
-        crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
-        || expr_is_static_value_checked(expr),
-    )
+    expr_is_static_value_memo(expr, None)
 }
 
-fn expr_is_static_value_checked(expr: &Expr) -> bool {
+fn expr_is_static_value_memo(expr: &Expr, memo: Option<&CollationValidationMemo>) -> bool {
+    let inspect = || {
+        crate::util::stack::ensure_stack(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+            || expr_is_static_value_checked(expr, memo),
+        )
+    };
+    let Some(memo) = memo.filter(|_| !matches!(expr, Expr::Literal(_) | Expr::BoundValue(_)))
+    else {
+        return inspect();
+    };
+    let key = std::ptr::from_ref(expr);
+    if let Some(value) = memo.static_values.borrow().get(&key).copied() {
+        return value;
+    }
+    let value = inspect();
+    memo.static_values.borrow_mut().insert(key, value);
+    value
+}
+
+fn expr_is_static_value_checked(expr: &Expr, memo: Option<&CollationValidationMemo>) -> bool {
+    let is_static = |expr| expr_is_static_value_memo(expr, memo);
     // Every constant expression is static by the structural rules below (its
     // children are constant too), so only the constant leaves need a case;
     // asking `expr_is_constant` per level would make this quadratic.
@@ -21368,26 +21440,24 @@ fn expr_is_static_value_checked(expr: &Expr) -> bool {
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)
         | Expr::IsNotNull(expr)
-        | Expr::GroupKeyRef { expr, .. } => expr_is_static_value(expr),
+        | Expr::GroupKeyRef { expr, .. } => is_static(expr),
         Expr::Binary { left, right, .. }
         | Expr::Like {
             expr: left,
             pattern: right,
             ..
-        } => expr_is_static_value(left) && expr_is_static_value(right),
-        Expr::InList { expr, list, .. } => {
-            expr_is_static_value(expr) && list.iter().all(expr_is_static_value)
-        }
+        } => is_static(left) && is_static(right),
+        Expr::InList { expr, list, .. } => is_static(expr) && list.iter().all(is_static),
         Expr::QuantifiedComparison { left, right, .. } => {
-            expr_is_static_value(left)
+            is_static(left)
                 && match right {
-                    QuantifiedComparisonRight::List(list) => list.iter().all(expr_is_static_value),
+                    QuantifiedComparisonRight::List(list) => list.iter().all(is_static),
                     QuantifiedComparisonRight::Subquery(_) => false,
                 }
         }
         Expr::Between {
             expr, low, high, ..
-        } => expr_is_static_value(expr) && expr_is_static_value(low) && expr_is_static_value(high),
+        } => is_static(expr) && is_static(low) && is_static(high),
         Expr::Function { name, args, .. } => {
             let upper = name.to_ascii_uppercase();
             !is_stored_function_name(name)
@@ -21397,7 +21467,7 @@ fn expr_is_static_value_checked(expr: &Expr) -> bool {
                 // MySQL validates its deterministic text result while
                 // resolving comparisons even for an empty input relation.
                 && (upper == "FROM_UNIXTIME" || !function_is_runtime_dependent(&upper))
-                && args.iter().all(expr_is_static_value)
+                && args.iter().all(is_static)
         }
         Expr::Case {
             operand,
@@ -21405,16 +21475,12 @@ fn expr_is_static_value_checked(expr: &Expr) -> bool {
             results,
             else_result,
         } => {
-            operand
-                .as_ref()
-                .is_none_or(|expr| expr_is_static_value(expr))
-                && conditions.iter().all(expr_is_static_value)
-                && results.iter().all(expr_is_static_value)
-                && else_result
-                    .as_ref()
-                    .is_none_or(|expr| expr_is_static_value(expr))
+            operand.as_ref().is_none_or(|expr| is_static(expr))
+                && conditions.iter().all(is_static)
+                && results.iter().all(is_static)
+                && else_result.as_ref().is_none_or(|expr| is_static(expr))
         }
-        Expr::Tuple(items) => items.iter().all(expr_is_static_value),
+        Expr::Tuple(items) => items.iter().all(is_static),
         _ => false,
     }
 }
@@ -22875,16 +22941,24 @@ pub(crate) fn validate_dml_temporal_functions(expr: &Expr) -> Result<(), QueryEr
 /// path.
 pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Result<(), QueryError> {
     #[inline(never)]
-    fn visit(expr: &Expr, table: &TableSchema) -> Result<(), QueryError> {
+    fn visit(
+        expr: &Expr,
+        table: &TableSchema,
+        memo: Option<&CollationValidationMemo>,
+    ) -> Result<(), QueryError> {
         let _depth = ExpressionDepthGuard::enter()?;
         crate::util::stack::with_stack(
             crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
-            || visit_inner(expr, table),
+            || visit_inner(expr, table, memo),
         )?
     }
 
     #[inline(never)]
-    fn visit_inner(expr: &Expr, table: &TableSchema) -> Result<(), QueryError> {
+    fn visit_inner(
+        expr: &Expr,
+        table: &TableSchema,
+        memo: Option<&CollationValidationMemo>,
+    ) -> Result<(), QueryError> {
         match expr {
             Expr::Binary { left, op, right } => {
                 if matches!(
@@ -22904,22 +22978,24 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                             return Err(operand_columns_error(left_items.len()));
                         }
                         for (left_item, right_item) in left_items.iter().zip(right_items) {
-                            aggregate_expr_collations(
+                            aggregate_expr_collations_memo(
                                 [left_item, right_item].into_iter(),
                                 table,
+                                memo,
                                 "comparison",
                             )?;
                         }
                     } else {
-                        aggregate_expr_collations(
+                        aggregate_expr_collations_memo(
                             [left.as_ref(), right.as_ref()].into_iter(),
                             table,
+                            memo,
                             "comparison",
                         )?;
                     }
                 }
-                visit(left, table)?;
-                visit(right, table)
+                visit(left, table, memo)?;
+                visit(right, table, memo)
             }
             Expr::InList { expr, list, .. } => {
                 if let Expr::Tuple(items) = expr.as_ref() {
@@ -22931,15 +23007,16 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                             return Err(operand_columns_error(items.len()));
                         }
                         for (left, right) in items.iter().zip(rhs) {
-                            aggregate_expr_collations(
+                            aggregate_expr_collations_memo(
                                 [left, right].into_iter(),
                                 table,
+                                memo,
                                 "comparison",
                             )?;
-                            visit(right, table)?;
+                            visit(right, table, memo)?;
                         }
                     }
-                    return visit(expr, table);
+                    return visit(expr, table, memo);
                 }
                 if !matches!(
                     expr_type_descriptor(expr, table).class,
@@ -22950,15 +23027,16 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         | ExprTypeClass::Float
                         | ExprTypeClass::Bit { .. }
                 ) {
-                    aggregate_expr_collations(
+                    aggregate_expr_collations_memo(
                         std::iter::once(expr.as_ref()).chain(list.iter()),
                         table,
+                        memo,
                         "in",
                     )?;
                 }
-                visit(expr, table)?;
+                visit(expr, table, memo)?;
                 for item in list {
-                    visit(item, table)?;
+                    visit(item, table, memo)?;
                 }
                 Ok(())
             }
@@ -22974,11 +23052,21 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         return Err(operand_columns_error(items.len()));
                     }
                     for ((item, lo), hi) in items.iter().zip(lows).zip(highs) {
-                        aggregate_expr_collations([item, lo].into_iter(), table, "comparison")?;
-                        aggregate_expr_collations([item, hi].into_iter(), table, "comparison")?;
-                        visit(item, table)?;
-                        visit(lo, table)?;
-                        visit(hi, table)?;
+                        aggregate_expr_collations_memo(
+                            [item, lo].into_iter(),
+                            table,
+                            memo,
+                            "comparison",
+                        )?;
+                        aggregate_expr_collations_memo(
+                            [item, hi].into_iter(),
+                            table,
+                            memo,
+                            "comparison",
+                        )?;
+                        visit(item, table, memo)?;
+                        visit(lo, table, memo)?;
+                        visit(hi, table, memo)?;
                     }
                     return Ok(());
                 }
@@ -22997,30 +23085,32 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         let _ = eval_const(operand)?;
                     }
                 }
-                aggregate_expr_collations(
+                aggregate_expr_collations_memo(
                     [expr.as_ref(), low.as_ref(), high.as_ref()].into_iter(),
                     table,
+                    memo,
                     "between",
                 )?;
-                visit(expr, table)?;
-                visit(low, table)?;
-                visit(high, table)
+                visit(expr, table, memo)?;
+                visit(low, table, memo)?;
+                visit(high, table, memo)
             }
             Expr::Like { expr, pattern, .. } => {
-                aggregate_expr_collations(
+                aggregate_expr_collations_memo(
                     [expr.as_ref(), pattern.as_ref()].into_iter(),
                     table,
+                    memo,
                     "like",
                 )?;
-                visit(expr, table)?;
-                visit(pattern, table)
+                visit(expr, table, memo)?;
+                visit(pattern, table, memo)
             }
             Expr::Function { name, args, .. } => {
                 let upper = name.to_ascii_uppercase();
                 if upper == "COLLATE" && args.len() == 2 {
                     if let Expr::Literal(Literal::String(name)) = &args[1] {
                         let target = crate::charset::resolve_collation(name)?;
-                        if let Some(source) = expr_collation(&args[0], table) {
+                        if let Some(source) = expr_collation_memo(&args[0], table, memo) {
                             if source.charset != target.charset && source.charset != "binary" {
                                 return Err(crate::error::catalog::ER_COLLATION_CHARSET_MISMATCH
                                     .error(format!(
@@ -23096,7 +23186,12 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                             | ExprTypeClass::Bit { .. }
                     ) {
                         let connection_literal = Expr::Literal(Literal::String(String::new()));
-                        validate_constant_string_conversion(&connection_literal, source, table)?;
+                        validate_constant_string_conversion(
+                            &connection_literal,
+                            source,
+                            table,
+                            memo,
+                        )?;
                     }
                 }
                 match upper.as_str() {
@@ -23107,7 +23202,7 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         // diagnostics in MySQL (prepared execution differs
                         // because the parameter is not a source constant).
                         for extent in args.iter().skip(1).take(2) {
-                            if expr_is_static_value(extent) {
+                            if expr_is_static_value_memo(extent, memo) {
                                 if let Ok(value) = eval_const(extent) {
                                     let _ = string_extent_arg(&value);
                                 }
@@ -23115,24 +23210,24 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         }
                     }
                     "LEFT" | "RIGHT" | "REPEAT" if args.len() >= 2 => {
-                        if expr_is_static_value(&args[1]) {
+                        if expr_is_static_value_memo(&args[1], memo) {
                             if let Ok(value) = eval_const(&args[1]) {
                                 let _ = string_extent_arg(&value);
                             }
                         }
                     }
                     "LPAD" | "RPAD" if args.len() >= 2 => {
-                        if expr_is_static_value(&args[1]) {
+                        if expr_is_static_value_memo(&args[1], memo) {
                             if let Ok(value) = eval_const(&args[1]) {
                                 let _ = string_extent_arg(&value);
                             }
                         }
                         if args.len() == 3 {
-                            validate_constant_string_conversion(&args[0], &args[2], table)?;
+                            validate_constant_string_conversion(&args[0], &args[2], table, memo)?;
                         }
                     }
                     "SPACE" if !args.is_empty() => {
-                        if expr_is_static_value(&args[0]) {
+                        if expr_is_static_value_memo(&args[0], memo) {
                             if let Ok(value) = eval_const(&args[0]) {
                                 let _ = string_extent_arg(&value);
                             }
@@ -23150,24 +23245,24 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                         }
                     }
                     "LOCATE" if args.len() >= 2 => {
-                        validate_constant_string_conversion(&args[1], &args[0], table)?;
+                        validate_constant_string_conversion(&args[1], &args[0], table, memo)?;
                     }
                     "INSTR" if args.len() == 2 => {
-                        validate_constant_string_conversion(&args[0], &args[1], table)?;
+                        validate_constant_string_conversion(&args[0], &args[1], table, memo)?;
                     }
                     "POSITION" if args.len() == 2 => {
-                        validate_constant_string_conversion(&args[1], &args[0], table)?;
+                        validate_constant_string_conversion(&args[1], &args[0], table, memo)?;
                     }
                     "SUBSTRING_INDEX" | "REPLACE" if args.len() >= 2 => {
                         for source in &args[1..] {
-                            validate_constant_string_conversion(&args[0], source, table)?;
+                            validate_constant_string_conversion(&args[0], source, table, memo)?;
                         }
                     }
                     "INSERT" if args.len() == 4 => {
-                        validate_constant_string_conversion(&args[0], &args[3], table)?;
+                        validate_constant_string_conversion(&args[0], &args[3], table, memo)?;
                     }
                     "TRIM" if args.len() >= 2 => {
-                        validate_constant_string_conversion(&args[0], &args[1], table)?;
+                        validate_constant_string_conversion(&args[0], &args[1], table, memo)?;
                     }
                     "GREATEST" | "LEAST" if args.len() >= 2 => {
                         // A binary-string argument selects MySQL's binary
@@ -23187,18 +23282,20 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                                         &args[left],
                                         &args[right],
                                         table,
+                                        memo,
                                     )?;
                                     validate_constant_string_conversion(
                                         &args[right],
                                         &args[left],
                                         table,
+                                        memo,
                                     )?;
                                 }
                             }
                         }
                         let mut charsets = std::collections::BTreeSet::new();
                         for arg in args {
-                            if let Some(collation) = expr_collation(arg, table) {
+                            if let Some(collation) = expr_collation_memo(arg, table, memo) {
                                 let info =
                                     crate::charset::resolve_collation_id(collation.collation_id)
                                         .unwrap_or_else(connection_collation_info);
@@ -23306,21 +23403,25 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                     } else {
                         args.as_slice()
                     };
-                    let result_collation =
-                        aggregate_expr_collations(args.iter(), table, &upper.to_ascii_lowercase())?;
+                    let result_collation = aggregate_expr_collations_memo(
+                        args.iter(),
+                        table,
+                        memo,
+                        &upper.to_ascii_lowercase(),
+                    )?;
                     if let Some(result_collation) = result_collation {
                         if let Some(target) = args.iter().find(|arg| {
-                            expr_collation(arg, table)
+                            expr_collation_memo(arg, table, memo)
                                 .is_some_and(|collation| collation.collation_id == result_collation)
                         }) {
                             for source in args {
-                                validate_constant_string_conversion(target, source, table)?;
+                                validate_constant_string_conversion(target, source, table, memo)?;
                             }
                         }
                     }
                 }
                 for arg in args {
-                    visit(arg, table)?;
+                    visit(arg, table, memo)?;
                 }
                 Ok(())
             }
@@ -23332,47 +23433,64 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
             } => {
                 if let Some(operand) = operand {
                     for condition in conditions {
-                        aggregate_expr_collations(
+                        aggregate_expr_collations_memo(
                             [operand.as_ref(), condition].into_iter(),
                             table,
+                            memo,
                             "comparison",
                         )?;
-                        validate_constant_string_conversion(operand, condition, table)?;
-                        validate_constant_string_conversion(condition, operand, table)?;
+                        validate_constant_string_conversion(operand, condition, table, memo)?;
+                        validate_constant_string_conversion(condition, operand, table, memo)?;
                     }
-                    visit(operand, table)?;
+                    visit(operand, table, memo)?;
                 }
                 for condition in conditions {
-                    visit(condition, table)?;
+                    visit(condition, table, memo)?;
                 }
-                aggregate_expr_collations(
+                aggregate_expr_collations_memo(
                     results.iter().chain(else_result.as_deref().into_iter()),
                     table,
+                    memo,
                     "case",
                 )?;
                 for result in results {
-                    visit(result, table)?;
+                    visit(result, table, memo)?;
                 }
                 if let Some(result) = else_result {
-                    visit(result, table)?;
+                    visit(result, table, memo)?;
                 }
                 Ok(())
             }
             Expr::WindowFunction { name, args, .. } => {
                 if matches!(name.to_ascii_uppercase().as_str(), "LEAD" | "LAG") && args.len() >= 3 {
-                    validate_constant_string_conversion(&args[0], &args[2], table)?;
+                    validate_constant_string_conversion(&args[0], &args[2], table, memo)?;
                 }
                 crate::parser::visit::try_for_each_expr_child_with_frame(expr, |child| {
-                    visit(child, table)
+                    visit(child, table, memo)
                 })
             }
             // Subquery operands retain the existing binding boundary.
             Expr::InSubquery { .. } => Ok(()),
-            _ => crate::parser::visit::try_for_each_expr_child(expr, |child| visit(child, table)),
+            _ => crate::parser::visit::try_for_each_expr_child(expr, |child| {
+                visit(child, table, memo)
+            }),
         }
     }
 
-    visit(expr, table)
+    // Tiny expressions rarely repeat a sizeable subtree. Size the memo
+    // decision with a bounded traversal and avoid allocations on that path.
+    let mut budget = 32;
+    let large = crate::parser::visit::try_inspect_value_expr(expr, |_| {
+        budget -= 1;
+        if budget == 0 {
+            Err(())
+        } else {
+            Ok(true)
+        }
+    })
+    .is_err();
+    let memo = large.then(CollationValidationMemo::default);
+    visit(expr, table, memo.as_ref())
 }
 
 #[inline]

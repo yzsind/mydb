@@ -704,7 +704,7 @@ fn show_variables_and_status_like_are_filtered() {
 #[test]
 fn storage_runtime_variables_are_visible_and_settable() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = open_test_engine(dir.path());
+    let engine = open_test_engine_with_buffer_pool_pages(dir.path(), 512);
     let mut session = SessionContext::default();
 
     let QueryResponse::ResultSet(vars) = engine
@@ -4389,7 +4389,7 @@ fn split_sql_script(sql: &str) -> Vec<String> {
 #[test]
 fn mysql_general_log_table_persists_and_truncates() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = open_test_engine(dir.path());
+    let engine = open_complete_memory_test_engine(dir.path());
     engine
         .sql_log_for_tests()
         .set_global_variable("log_output", "TABLE")
@@ -4418,7 +4418,7 @@ fn mysql_general_log_table_persists_and_truncates() {
     assert_eq!(rows.rows[0][1], Value::Bytes(b"SELECT 1".to_vec()));
 
     drop(engine);
-    let engine = open_test_engine(dir.path());
+    let engine = open_complete_memory_test_engine(dir.path());
     let QueryResponse::ResultSet(rows) = engine
         .execute_with_session(&mut session, "SELECT command_type FROM mysql.general_log")
         .unwrap()

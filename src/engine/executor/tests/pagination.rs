@@ -4,7 +4,9 @@ use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
 
 fn fixture() -> (tempfile::TempDir, StorageQueryEngine) {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
-    let engine = open_test_engine(dir.path());
+    // Wide pagination inputs and their indexes must fit independently of the
+    // per-query sort/spill budgets. Buffer eviction is covered separately.
+    let engine = open_test_engine_with_buffer_pool_pages(dir.path(), 4_096);
     (dir, engine)
 }
 
@@ -266,9 +268,16 @@ fn pagination_resident_sort_window_preserves_typed_keys_and_selection() {
         ("id,stamp", "ti", "stamp ASC,id DESC", "1=1"),
         ("id,f", "fi", "f ASC,id DESC", "1=1"),
     ] {
+        let base = format!(
+            "SELECT {columns} FROM t FORCE INDEX({index}) WHERE {predicate} ORDER BY {order}"
+        );
+        // Each order has an id tie-breaker. One full legacy sort supplies the
+        // exact slices for all four independent resident-window executions.
+        let sorted = with_sort_key_encode(false, || query_rows(&engine, &base));
         for offset in [12000, 18000, 23995, 30000] {
-            let sql = format!("SELECT {columns} FROM t FORCE INDEX({index}) WHERE {predicate} ORDER BY {order} LIMIT 17 OFFSET {offset}");
-            let expected = with_sort_key_encode(false, || query_rows(&engine, &sql));
+            let sql = format!("{base} LIMIT 17 OFFSET {offset}");
+            let start = offset.min(sorted.len());
+            let expected = &sorted[start..(start + 17).min(sorted.len())];
             let before = RESIDENT_WINDOW_HITS.load(Ordering::Relaxed);
             let budget = Arc::new(MemBudget::new(16 * 1024 * 1024));
             let actual = with_query_budget(budget.clone(), || query_rows(&engine, &sql));

@@ -161,12 +161,13 @@ mod tests {
         for ch in (0..=0x10ffff).filter_map(char::from_u32) {
             text.push(ch);
             if text.len() >= 8192 {
+                let actual = buffer.primary_weights(&text);
                 assert_eq!(
-                    buffer.primary_weights(&text),
+                    actual,
                     crate::charset::weight_string(&text, Some("utf8mb4_0900_ai_ci"))
                 );
                 assert!(
-                    buffer.primary_weights(&text).len()
+                    actual.len()
                         <= crate::charset::uca9_primary_byte_bound(text.as_bytes()).unwrap()
                 );
                 text.clear();
