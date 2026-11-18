@@ -2516,10 +2516,13 @@ mod base_backup_tests {
             panic!()
         };
         assert!(ack.accepted);
-        assert!(matches!(
-            protocol::read_frame_async(&mut first).await.unwrap(),
-            Message::BaseBackupStart(_)
-        ));
+        loop {
+            match protocol::read_frame_async(&mut first).await.unwrap() {
+                Message::Heartbeat(_) | Message::BaseBackupManifest(_) => continue,
+                Message::BaseBackupStart(_) => break,
+                other => panic!("unexpected backup capture frame: {other:?}"),
+            }
+        }
         let mut second = tokio::net::TcpStream::connect(service.bind_addr())
             .await
             .unwrap();
@@ -2590,10 +2593,13 @@ mod base_backup_tests {
         assert!(
             matches!(protocol::read_frame_async(&mut stream).await.unwrap(), Message::HandshakeAck(ack) if ack.accepted)
         );
-        assert!(matches!(
-            protocol::read_frame_async(&mut stream).await.unwrap(),
-            Message::BaseBackupStart(_)
-        ));
+        loop {
+            match protocol::read_frame_async(&mut stream).await.unwrap() {
+                Message::Heartbeat(_) | Message::BaseBackupManifest(_) => continue,
+                Message::BaseBackupStart(_) => break,
+                other => panic!("unexpected backup capture frame: {other:?}"),
+            }
+        }
         // A stalled network receiver leaves most of this file unread by the
         // sender. Mutate its existing inode, just like an in-place page flush.
         std::fs::write(dir.path().join(relative), vec![0x99; original.len()]).unwrap();

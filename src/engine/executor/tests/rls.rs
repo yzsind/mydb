@@ -1,6 +1,93 @@
 //! Row security behavior across identities and execution vehicles.
 use super::*;
 
+#[test]
+fn issue_17_parallel_local_load_enforces_insert_with_check() {
+    use crate::engine::api::QueryEngine;
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_relaxed_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    for sql in [
+        "CREATE TABLE tenant_rows(id INT PRIMARY KEY,tenant_id INT,payload VARCHAR(64))",
+        "CREATE USER alice",
+        "GRANT INSERT ON test.tenant_rows TO alice",
+        "ALTER TABLE tenant_rows ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON tenant_rows USING(tenant_id=42) WITH CHECK(tenant_id=42)",
+    ] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    let mut alice = user("alice", 77017);
+    let data = (0..3000)
+        .map(|id| format!("{id}\t7\tx\n"))
+        .collect::<String>();
+    let statement = crate::parser::parse_statement(
+        "LOAD DATA /*+ PARALLEL(4) */ LOCAL INFILE 'ignored' INTO TABLE tenant_rows",
+    )
+    .unwrap();
+    let response = engine.execute_load_data_statement_from_reader(
+        &mut alice,
+        statement,
+        Box::new(std::io::Cursor::new(data.into_bytes())),
+    );
+    assert_eq!(response.unwrap_err().code(), 50130);
+    assert_eq!(
+        rows(&engine, &mut root, "SELECT COUNT(*) FROM tenant_rows"),
+        vec![vec![Value::Int(0)]]
+    );
+}
+
+#[test]
+fn issue_17_bulk_load_retains_authorized_bypass_fast_path() {
+    use crate::engine::api::QueryEngine;
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_relaxed_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    for statement in [
+        "CREATE TABLE bypass_rows(id INT PRIMARY KEY,tenant_id INT)",
+        "CREATE USER alice",
+        "GRANT INSERT ON test.bypass_rows TO alice",
+        "ALTER TABLE bypass_rows ENABLE ROW LEVEL SECURITY",
+        "CREATE POLICY p ON bypass_rows USING(tenant_id=42) WITH CHECK(tenant_id=42)",
+    ] {
+        engine.execute_with_session(&mut root, statement).unwrap();
+    }
+    let mut alice = user("alice", 77018);
+    let data = (0..3000).map(|id| format!("{id}\t7\n")).collect::<String>();
+    let load = |session: &mut SessionContext| {
+        engine.execute_load_data_statement_from_reader(
+            session,
+            crate::parser::parse_statement(
+                "LOAD DATA /*+ PARALLEL(4) */ LOCAL INFILE 'ignored' INTO TABLE bypass_rows",
+            )
+            .unwrap(),
+            Box::new(std::io::Cursor::new(data.as_bytes().to_vec())),
+        )
+    };
+    let before = engine.db_handle().load_shadow_perf_snapshot()[0];
+    load(&mut root).unwrap();
+    assert!(engine.db_handle().load_shadow_perf_snapshot()[0] > before);
+    engine
+        .execute_with_session(&mut root, "TRUNCATE TABLE bypass_rows")
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "GRANT BYPASS_RLS ON *.* TO alice")
+        .unwrap();
+    let before = engine.db_handle().load_shadow_perf_snapshot()[0];
+    load(&mut alice).unwrap();
+    assert!(engine.db_handle().load_shadow_perf_snapshot()[0] > before);
+    engine
+        .execute_with_session(&mut root, "TRUNCATE TABLE bypass_rows")
+        .unwrap();
+    engine
+        .execute_with_session(&mut root, "REVOKE BYPASS_RLS ON *.* FROM alice")
+        .unwrap();
+    assert_eq!(load(&mut alice).unwrap_err().code(), 50130);
+    assert_eq!(
+        rows(&engine, &mut root, "SELECT COUNT(*) FROM bypass_rows"),
+        vec![vec![Value::Int(0)]]
+    );
+}
+
 fn user(name: &str, connection_id: u32) -> SessionContext {
     SessionContext {
         user: name.into(),

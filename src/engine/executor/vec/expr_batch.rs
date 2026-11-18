@@ -2888,7 +2888,20 @@ pub fn batch_schema_to_input(schema: &BatchSchema) -> InputSchema {
             crate::engine::expr_type::ExprType::from_column_type(field.column_type, &field.source)
         })
         .collect();
-    let mut input = InputSchema::new_with_bound_types(cols, bound_types);
+    let mut input = InputSchema::new_with_bound_types_and_stored_decimals(
+        cols,
+        bound_types,
+        schema
+            .fields()
+            .iter()
+            .enumerate()
+            .filter_map(|(index, field)| {
+                (matches!(field.column_type, ColumnType::Decimal { .. })
+                    && !field.source.org_name.is_empty()
+                    && !field.source.round_decimal_result)
+                    .then_some(index)
+            }),
+    );
     input.mark_numeric_display_columns(schema.fields().iter().enumerate().filter_map(
         |(index, field)| {
             (field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0).then_some((
@@ -3447,7 +3460,7 @@ mod tests {
         }
         let mut nulls = Bitmap::new_all_valid(values.len());
         nulls.set(2, false);
-        for name in ["utf8mb4_0900_ai_ci", "utf8mb4_0900_as_cs", "utf8mb4_bin"] {
+        for name in ["utf8mb4_0900_ai_ci", "utf8mb4_0900_bin", "utf8mb4_bin"] {
             let info = crate::charset::resolve_collation(name).unwrap();
             let actual =
                 distinct_key_utf8_column(info.id, &offsets, &input, Some(nulls.clone())).unwrap();
@@ -5112,7 +5125,7 @@ mod tests {
         for collation in [
             "utf8mb4_bin",
             "utf8mb4_0900_ai_ci",
-            "utf8mb4_0900_as_cs",
+            "utf8mb4_0900_bin",
             "utf8mb4_0900_bin",
         ] {
             let collation_id = crate::charset::resolve_collation(collation).unwrap().id;

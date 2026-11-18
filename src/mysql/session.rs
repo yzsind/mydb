@@ -46,7 +46,9 @@ use crate::parser::{
     number_statement_placeholders, Assignment, Delete, Insert, InsertSource, LimitValue, Literal,
     OrderBy, Update,
 };
-use crate::parser::{parse_statement, Expr, Select, SelectItem, Statement, SubQuery};
+use crate::parser::{parse_statement, Expr, Select, Statement};
+#[cfg(test)]
+use crate::parser::{SelectItem, SubQuery};
 use crate::storage::error;
 use crate::types::{Column, QueryError};
 use crate::util::logging::log_message;
@@ -255,6 +257,7 @@ pub struct Session<E: QueryEngine> {
     /// command hot path must not rescan every prepared handle after each
     /// COM_STMT_EXECUTE.
     prepared_memory_bytes: u64,
+    connection_attrs_charge_bytes: usize,
     prepared_execute_failed: bool,
     next_statement_id: u32,
     /// Database explicitly selected by the client. Execution retains mydb's
@@ -754,6 +757,7 @@ struct PreparedStatement {
     /// `Com_*` status classification of `sql`, derived once at PREPARE.
     com_kind: Option<crate::engine::status_counters::ComKind>,
     long_data: Vec<Option<Vec<u8>>>,
+    has_long_data: bool,
     long_data_error: Option<QueryError>,
     cursor: Option<PreparedCursor>,
     result_metadata: Option<PreparedResultMetadata>,
@@ -1046,6 +1050,29 @@ impl<E> Session<E>
 where
     E: QueryEngine,
 {
+    fn charge_connection_attrs(
+        &mut self,
+        attrs: &std::collections::BTreeMap<String, String>,
+    ) -> Result<(), QueryError> {
+        let bytes = attrs
+            .iter()
+            .fold(0usize, |bytes, (key, value)| {
+                bytes
+                    .saturating_add(192)
+                    .saturating_add(key.capacity())
+                    .saturating_add(value.capacity())
+            })
+            .saturating_mul(3);
+        if bytes > self.connection_attrs_charge_bytes {
+            self._connection_buffer_charge
+                .try_grow(bytes - self.connection_attrs_charge_bytes)?;
+        } else {
+            self._connection_buffer_charge
+                .shrink(self.connection_attrs_charge_bytes - bytes);
+        }
+        self.connection_attrs_charge_bytes = bytes;
+        Ok(())
+    }
     #[inline]
     fn client_capabilities(&self) -> u32 {
         self.capabilities.runtime()
@@ -1470,6 +1497,7 @@ where
             text_shape_memos: TextShapeMemoCache::try_new(),
             prepared: PreparedMap::default(),
             prepared_memory_bytes: 0,
+            connection_attrs_charge_bytes: 0,
             prepared_execute_failed: false,
             next_statement_id: 1,
             process_database: None,
@@ -1923,6 +1951,11 @@ where
                 self.context.login_user = handshake.username.clone();
                 self.context.host = client_host;
                 Self::apply_auth_outcome(&mut self.context, auth_outcome);
+                if let Err(err) = self.charge_connection_attrs(&handshake.connection_attrs) {
+                    self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
+                        .await?;
+                    return Err(io::Error::new(io::ErrorKind::OutOfMemory, err.message()));
+                }
                 self.context.connection_attrs = handshake.connection_attrs.clone();
                 self.context.character_set_client = handshake_collation.charset.to_string();
                 self.context.character_set_connection = handshake_collation.charset.to_string();
@@ -3221,6 +3254,12 @@ where
             }
         }
 
+        if let Err(err) = self.charge_connection_attrs(&context.connection_attrs) {
+            crate::engine::auth::release_connection(&context.authenticated_as);
+            self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
+                .await?;
+            return Ok(());
+        }
         if let Err(err) = self.close_session_blocking().await {
             crate::engine::auth::release_connection(&context.authenticated_as);
             self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
@@ -4981,11 +5020,9 @@ where
             statement_has_computed_ordering(statement)
                 || matches!(statement, Statement::Select(select) if select.derived.is_some())
         });
-        let needs_async_progress = computed_ordering
-            && parsed.as_deref().is_some_and(|statement| {
-                statement_contains_fusion(statement)
-                    || statement_contains_blocking_function(statement)
-            });
+        let needs_async_progress = parsed.as_deref().is_some_and(|statement| {
+            statement_contains_fusion(statement) || statement_contains_blocking_function(statement)
+        });
         let mut prepared = PreparedStatement {
             original_sql_sensitivity: crate::engine::http::SensitivityMemo::new(&sql),
             original_sql: Arc::from(sql.as_str()),
@@ -5016,6 +5053,7 @@ where
             com_kind: crate::engine::status_counters::classify_query_com(&effective_sql),
             parsed,
             long_data: vec![None; param_count],
+            has_long_data: false,
             long_data_error: None,
             cursor: None,
             result_metadata,
@@ -5154,6 +5192,22 @@ where
     }
 
     async fn handle_stmt_execute(&mut self, payload: &[u8]) -> io::Result<()> {
+        let result = self.handle_stmt_execute_inner(payload).await;
+        if result.is_ok() && !self.kill_flag.load(Ordering::Acquire) {
+            if let Some(id) = payload
+                .get(..4)
+                .and_then(|bytes| bytes.try_into().ok())
+                .map(u32::from_le_bytes)
+            {
+                if let Some(statement) = self.prepared.get_mut(&id) {
+                    clear_prepared_long_data(statement);
+                }
+            }
+        }
+        result
+    }
+
+    async fn handle_stmt_execute_inner(&mut self, payload: &[u8]) -> io::Result<()> {
         self.context.xml_parameter_types = None;
         if let Some(err) = self.context.cancelled_error() {
             return self.write_stmt_execute_response(Err(err)).await;
@@ -5406,7 +5460,7 @@ where
                 };
                 let mut compiled_result = None;
                 if let Some(arc) = parsed_arc.as_ref() {
-                    if computed_ordering {
+                    if computed_ordering || needs_async_progress {
                         let engine = Arc::clone(&self.engine);
                         let mut context = self.park_context();
                         let parsed = Arc::clone(arc);
@@ -8365,8 +8419,18 @@ fn has_quoted_charset_introducer(bytes: &[u8]) -> bool {
     })
 }
 
+fn decode_client_sql_bytes(session: &SessionContext, bytes: &[u8]) -> Result<String, QueryError> {
+    if session.character_set_client.eq_ignore_ascii_case("binary") {
+        std::str::from_utf8(bytes).map(str::to_owned).map_err(|_| {
+            crate::error::catalog::ER_INVALID_CHARACTER_STRING.error("Invalid SQL client encoding")
+        })
+    } else {
+        crate::charset::decode_bytes(&session.character_set_client, bytes)
+    }
+}
+
 fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, QueryError> {
-    match crate::charset::decode_bytes(&session.character_set_client, bytes) {
+    match decode_client_sql_bytes(session, bytes) {
         Ok(sql) if !has_quoted_charset_introducer(bytes) => Ok(sql),
         decoded => {
             let mode = crate::sql_lex::SqlLexMode::from_parser_bits(
@@ -8450,9 +8514,7 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                             .is_some_and(|name| crate::charset::resolve_charset(name).is_ok())
                     };
                 if !introducer && !concatenating {
-                    if let Ok(text) =
-                        crate::charset::decode_bytes(&session.character_set_client, raw)
-                    {
+                    if let Ok(text) = decode_client_sql_bytes(session, raw) {
                         sql.push_str(&text);
                         continue;
                     }
@@ -8517,13 +8579,13 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                         body,
                         ..
                     } => {
-                        sql.push_str(&crate::charset::decode_bytes(
-                            &session.character_set_client,
+                        sql.push_str(&decode_client_sql_bytes(
+                            session,
                             &bytes[segment.range.start..body.start],
                         )?);
                         sql.push_str(&decode_session_sql(session, &bytes[body.clone()])?);
-                        sql.push_str(&crate::charset::decode_bytes(
-                            &session.character_set_client,
+                        sql.push_str(&decode_client_sql_bytes(
+                            session,
                             &bytes[body.end..segment.range.end],
                         )?);
                     }
@@ -8713,6 +8775,7 @@ fn append_prepared_long_data(
         return Err(err);
     }
     let slot = entry.long_data[param_id].get_or_insert_with(Vec::new);
+    entry.has_long_data = true;
     if slot.try_reserve_exact(required - old_len).is_err() {
         entry.memory_charge.shrink(minimum_growth);
         let err = error(
@@ -8740,6 +8803,10 @@ fn append_prepared_long_data(
 }
 
 fn clear_prepared_long_data(statement: &mut PreparedStatement) {
+    if !statement.has_long_data {
+        return;
+    }
+    statement.has_long_data = false;
     let released = statement
         .long_data
         .iter()
@@ -10759,50 +10826,22 @@ fn statement_contains_blocking_function<'q>(
 }
 
 fn select_contains_blocking_function(stmt: &Select) -> bool {
-    stmt.projection
-        .iter()
-        .any(|item| select_item_contains_blocking_function(item))
-        || stmt
-            .selection
-            .as_ref()
-            .is_some_and(expr_contains_blocking_function)
-        || stmt.joins.iter().any(|join| {
-            join.condition
-                .as_ref()
-                .is_some_and(expr_contains_blocking_function)
-                || join.derived.as_ref().is_some_and(|derived| match derived {
-                    SubQuery::Select(s) => select_contains_blocking_function(s),
-                    stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
-                        statement_contains_blocking_function(stmt)
-                    }
-                })
-        })
-        || stmt.group_by.iter().any(expr_contains_blocking_function)
-        || stmt
-            .having
-            .as_ref()
-            .is_some_and(expr_contains_blocking_function)
-        || stmt
-            .order_by
-            .iter()
-            .any(|order| expr_contains_blocking_function(&order.expr))
-        || stmt.derived.as_ref().is_some_and(|derived| match derived {
-            SubQuery::Select(s) => select_contains_blocking_function(s),
-            stmt @ (SubQuery::SetOp(_) | SubQuery::Rrf(_) | SubQuery::WithCte(_)) => {
-                statement_contains_blocking_function(stmt)
-            }
-        })
-}
-
-fn select_item_contains_blocking_function(item: &SelectItem) -> bool {
-    match item {
-        SelectItem::Expr { expr, .. } => expr_contains_blocking_function(expr),
-        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    struct Blocking(bool);
+    impl crate::parser::visit::AstVisitor for Blocking {
+        fn enter_expr(&mut self, expr: &Expr) {
+            self.0 |= expr_is_blocking_function(expr);
+        }
+        fn continue_expr_walk(&self) -> bool {
+            !self.0
+        }
     }
+    let mut visitor = Blocking(false);
+    crate::parser::visit::visit_select(&mut visitor, stmt);
+    visitor.0
 }
 
-fn expr_contains_blocking_function(expr: &Expr) -> bool {
-    crate::parser::visit::any_expr(expr, |expr| match expr {
+fn expr_is_blocking_function(expr: &Expr) -> bool {
+    match expr {
         Expr::WindowFunction { .. } => true,
         Expr::Function { name, .. } => {
             crate::engine::ai::is_function(name)
@@ -10815,7 +10854,7 @@ fn expr_contains_blocking_function(expr: &Expr) -> bool {
                 || name.eq_ignore_ascii_case("LASTVAL")
         }
         _ => false,
-    })
+    }
 }
 
 /// AST-level twin of [`ddl_cache_scope`] for the prepared-statement
@@ -11709,6 +11748,7 @@ mod tests {
             static_has_http: false,
             com_kind: None,
             long_data: vec![None],
+            has_long_data: false,
             long_data_error: None,
             cursor: None,
             result_metadata: None,
@@ -11728,6 +11768,46 @@ mod tests {
             )
             .unwrap(),
         }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn issue_20_failed_execute_consumes_long_data() {
+        struct Engine;
+        impl QueryEngine for Engine {
+            fn execute(
+                &self,
+                _: &mut SessionContext,
+                _: &str,
+            ) -> Result<QueryResponse, QueryError> {
+                Ok(QueryResponse::Ok)
+            }
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut session = Session::new(
+            1,
+            peer,
+            stream,
+            None,
+            Arc::new(Engine),
+            Arc::new(SessionRegistry::new()),
+        );
+        let mut prepared = empty_prepared_statement();
+        append_prepared_long_data(&mut prepared, 0, b"AAA").unwrap();
+        session.prepared.insert(1, prepared);
+        let mut payload = 1u32.to_le_bytes().to_vec();
+        payload.push(2);
+        payload.extend_from_slice(&1u32.to_le_bytes());
+        session.handle_stmt_execute(&payload).await.unwrap();
+        let packet = crate::mysql::packet::read_packet(&mut client)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(packet.payload[0], 0xff);
+        assert!(session.prepared[&1].long_data[0].is_none());
     }
 
     #[test]
@@ -15160,6 +15240,38 @@ mod stream_tests;
 #[cfg(test)]
 mod release_audit_sql_tests {
     use super::*;
+
+    #[test]
+    fn issue_19_binary_client_preserves_sql_octets() {
+        let session = SessionContext {
+            character_set_client: "binary".into(),
+            ..SessionContext::default()
+        };
+        for sql in [
+            "SELECT HEX('é'),LENGTH('é')",
+            "SELECT `表` FROM `数据`",
+            "SELECT /*!80000 'é' */",
+        ] {
+            assert_eq!(decode_session_sql(&session, sql.as_bytes()).unwrap(), sql);
+        }
+        assert_eq!(
+            decode_session_sql(&session, b"SELECT '\xff'").unwrap(),
+            "SELECT X'ff'"
+        );
+    }
+
+    #[test]
+    fn issue_36_blocking_classifier_visits_table_sources() {
+        for sql in [
+            "SELECT SLEEP(1) FROM t LIMIT 1",
+            "SELECT GET_LOCK('issue36',1) FROM t LIMIT 1",
+            "SELECT * FROM JSON_TABLE(SLEEP(1),'$' COLUMNS(x INT PATH '$')) jt",
+            "VALUES ROW(SLEEP(1))",
+        ] {
+            let statement = crate::parser::parse_statement(sql).unwrap();
+            assert!(statement_contains_blocking_function(&statement), "{sql}");
+        }
+    }
 
     #[test]
     fn audit1108_introducer_adjacent_literals_keep_all_raw_octets() {

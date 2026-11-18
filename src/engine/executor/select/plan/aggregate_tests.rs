@@ -156,7 +156,9 @@ fn row_spill_reports_missing_occupied_partition() {
     let (_, slots) = spec("SELECT COUNT(*) FROM t");
     // The producer claims this bucket was completed. Losing its file must
     // return an error, rather than silently treating it as an empty bucket.
-    assert!(merge_row_hash_agg_spill_partitions(&tmp, &[7], &schema, &[], &slots, None).is_err());
+    assert!(
+        merge_row_hash_agg_spill_partitions(&tmp, &[7], &schema, &[], &[], &slots, None).is_err()
+    );
 }
 
 #[test]

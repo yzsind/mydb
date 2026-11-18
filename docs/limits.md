@@ -34,6 +34,8 @@ Limits fall into three classes:
 | Transaction admission | Requested default `cores × 4` (min 8), reduced to available blocking-worker capacity; explicit setting capped at 4096 | Configurable |
 | Parallel query degree | Session sysvar range **1–256**; startup and hint requests have separate bounds | Configurable |
 | Max packet / statement size | **1 GiB** (`max_allowed_packet`), default 64 MiB | Configurable |
+| Retained connection attributes | **512 bytes**, at most 64 name/value pairs; excess attributes are discarded and counted in `Performance_schema_session_connect_attrs_lost` | Fixed |
+| MySQL receiver active table maps | **4096** per statement, also bounded by unified memory admission; exceeding the limit stops the receiver with an explicit error | Fixed |
 | Expression nesting depth | **1,024** (left-deep operator chains count one level per operator) | Fixed |
 | SELECT nesting depth | **63** | Fixed |
 | Set-operation branches | **128 in debug / 1,024 in optimized builds** with the default 8 MiB worker stack; stack-derived, clamped to 128–1,024 | Derived |

@@ -407,29 +407,62 @@ fn release_audit_replication_show_until_reports_condition_and_reset_clears_it() 
 #[test]
 fn p0_xa_prepare_accepts_scoped_row_flags_and_preserves_fk_checks() {
     let (_dir, engine) = release_audit_engine();
-    engine.execute("CREATE TABLE p0_xa(id INT PRIMARY KEY,v INT)").unwrap();
+    engine
+        .execute("CREATE TABLE p0_xa(id INT PRIMARY KEY,v INT)")
+        .unwrap();
     let manager = ReplicationManager {
-        data_dir: _dir.path().into(), engine: engine.clone(),
-        channels: Mutex::new(HashMap::new()), retired_gtids: Mutex::new(None),
+        data_dir: _dir.path().into(),
+        engine: engine.clone(),
+        channels: Mutex::new(HashMap::new()),
+        retired_gtids: Mutex::new(None),
     };
-    manager.change_source(ReplicationChannelConfig {
-        source_host: "127.0.0.1".into(), ..Default::default()
-    }).unwrap();
-    let channel = ChannelRunner::new(_dir.path().into(), engine.clone(), manager.ensure_channel(DEFAULT_CHANNEL).unwrap());
+    manager
+        .change_source(ReplicationChannelConfig {
+            source_host: "127.0.0.1".into(),
+            ..Default::default()
+        })
+        .unwrap();
+    let channel = ChannelRunner::new(
+        _dir.path().into(),
+        engine.clone(),
+        manager.ensure_channel(DEFAULT_CHANNEL).unwrap(),
+    );
     let xid = crate::xa::Xid::new(1, b"p0".to_vec(), vec![]).unwrap();
     let record = RelayRecord {
-        source_file: "binlog.000001".into(), source_pos: 100,
+        source_uuid: "test-source".into(),
+        source_file: "binlog.000001".into(),
+        source_pos: 100,
         gtid: None,
-        op: RelayOp::RowsWithForeignKeyChecks { enabled: false,
-            op: Box::new(RelayOp::WriteRows { database: "test".into(), table: "p0_xa".into(),
-                rows: vec![vec![Value::Int(1), Value::Int(10)]] }) },
+        op: RelayOp::RowsWithForeignKeyChecks {
+            enabled: false,
+            op: Box::new(RelayOp::WriteRows {
+                database: "test".into(),
+                table: "p0_xa".into(),
+                rows: vec![vec![Value::Int(1), Value::Int(10)]],
+            }),
+        },
     };
-    let boundary = RelayRecord { source_pos: 200, op: RelayOp::XaPrepare { xid: xid.clone(), source_ts: 1 }, ..record.clone() };
-    channel.apply_xa_prepare(&xid, &[record], &boundary).unwrap();
+    let boundary = RelayRecord {
+        source_pos: 200,
+        op: RelayOp::XaPrepare {
+            xid: xid.clone(),
+            source_ts: 1,
+        },
+        ..record.clone()
+    };
+    channel
+        .apply_xa_prepare(&xid, &[record], &boundary)
+        .unwrap();
     assert!(crate::storage::fk_checks_enabled());
     channel.apply_xa_finish(&xid, true).unwrap();
-    let response = engine.execute("SELECT id,v FROM p0_xa").unwrap().materialize().unwrap();
-    let QueryResponse::ResultSet(rows) = response else { panic!("expected rows") };
+    let response = engine
+        .execute("SELECT id,v FROM p0_xa")
+        .unwrap()
+        .materialize()
+        .unwrap();
+    let QueryResponse::ResultSet(rows) = response else {
+        panic!("expected rows")
+    };
     assert_eq!(rows.rows, vec![vec![Value::Int(1), Value::Int(10)]]);
     assert!(!xa_row_operation(&boundary.op));
 }

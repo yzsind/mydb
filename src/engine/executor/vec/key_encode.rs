@@ -68,7 +68,7 @@ fn push_integer(value: i128, buf: &mut Vec<u8>) {
     buf.extend_from_slice(&value.to_le_bytes());
 }
 
-fn encode_value_key(key: ValueKey, buf: &mut Vec<u8>) {
+pub(crate) fn encode_value_key(key: ValueKey, buf: &mut Vec<u8>) {
     match key {
         ValueKey::Null => buf.push(0),
         ValueKey::Int(value) => push_integer(value, buf),
@@ -110,6 +110,11 @@ fn push_len_bytes(bytes: &[u8], buf: &mut Vec<u8>) {
 /// Push the canonical String tag plus a length-prefixed collation key.
 #[inline]
 fn push_string_key(s: &str, collation_id: Option<u16>, buf: &mut Vec<u8>) {
+    if collation_id == Some(63) {
+        buf.push(4);
+        push_len_bytes(s.as_bytes(), buf);
+        return;
+    }
     buf.push(3);
     match collation_id {
         Some(id) => crate::charset::with_collation_key_by_id(id, s, |key| push_len_bytes(key, buf)),

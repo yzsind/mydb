@@ -73,6 +73,7 @@ pub(crate) struct InputSchema {
     by_column: HashMap<String, Vec<usize>>,
     by_qualified: HashMap<(String, String), usize>,
     bitwise_silent_string_columns: HashSet<usize>,
+    stored_decimal_columns: smallvec::SmallVec<[usize; 4]>,
     numeric_display: HashMap<usize, u16>,
     fingerprint: u64,
 }
@@ -144,6 +145,14 @@ impl InputSchema {
                 table.columns[idx].state != crate::storage::ColumnState::Dropped
             });
         }
+        schema.stored_decimal_columns = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter_map(|(index, _)| {
+                matches!(table.result_type(index), ColumnType::Decimal { .. }).then_some(index)
+            })
+            .collect();
         schema.bitwise_silent_string_columns = table
             .columns
             .iter()
@@ -178,6 +187,7 @@ impl InputSchema {
             by_column: HashMap::new(),
             by_qualified: HashMap::new(),
             bitwise_silent_string_columns: HashSet::new(),
+            stored_decimal_columns: smallvec::SmallVec::new(),
             numeric_display: HashMap::new(),
             fingerprint: 0,
         };
@@ -192,13 +202,15 @@ impl InputSchema {
         schema
     }
 
-    pub(crate) fn new_with_bound_types(
+    pub(crate) fn new_with_bound_types_and_stored_decimals(
         columns: Vec<InputColumn>,
         bound_types: Vec<crate::engine::expr_type::ExprType>,
+        stored_decimals: impl IntoIterator<Item = usize>,
     ) -> Self {
         debug_assert_eq!(columns.len(), bound_types.len());
         let mut schema = Self::with_fingerprint(columns, 0);
         schema.bound_types = bound_types;
+        schema.stored_decimal_columns.extend(stored_decimals);
         schema.fingerprint = schema.compute_fingerprint();
         schema
     }
@@ -282,6 +294,13 @@ impl InputSchema {
             .saturating_add(by_qualified)
             .saturating_add(by_qualified_payload)
             .saturating_add(silent)
+            .saturating_add(if self.stored_decimal_columns.spilled() {
+                self.stored_decimal_columns
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<usize>())
+            } else {
+                0
+            })
             .saturating_add(
                 self.numeric_display
                     .capacity()
@@ -434,6 +453,9 @@ impl InputSchema {
             self.bitwise_silent_string_columns
                 .contains(&index)
                 .hash(&mut hasher);
+            self.stored_decimal_columns
+                .contains(&index)
+                .hash(&mut hasher);
         }
         hasher.finish()
     }
@@ -560,6 +582,7 @@ pub(crate) fn table_input_fingerprint(table: &TableSchema) -> u64 {
                         | crate::storage::DataTypeKind::Blob { .. }
                 )
                 .hash(&mut hasher);
+                matches!(table.result_type(idx), ColumnType::Decimal { .. }).hash(&mut hasher);
             }
         })
     });
@@ -1175,6 +1198,7 @@ impl ExprProgram {
                 ExprNode::SubstringConst { expr, .. } => visit(expr),
                 ExprNode::Function { kernel, args, .. } => match kernel {
                     FunctionKernel::TemporalString(_)
+                    | FunctionKernel::DecimalString(_)
                     | FunctionKernel::Concat
                     | FunctionKernel::ConcatWs
                     | FunctionKernel::Crc32
@@ -4907,11 +4931,21 @@ fn try_compile_substring_const(
     }))
 }
 
-/// Retain declared FSP at a string boundary while keeping the expression
-/// compiled. Non-temporal arguments require no additional runtime node.
+/// Retain bound decimal scale, temporal FSP and bit width at a string
+/// boundary while keeping the expression compiled.
 fn compile_string_node(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, CompileError> {
     let node = compile_node(expr, schema)?;
+    if matches!(&node, ExprNode::Column(index) if schema.stored_decimal_columns.contains(index)) {
+        return Ok(node);
+    }
     match input_expr_type(expr, schema).kind {
+        crate::engine::expr_type::ExprTypeKind::Decimal { scale, .. } => Ok(ExprNode::Function {
+            kernel: FunctionKernel::DecimalString(scale),
+            args: vec![node],
+            collation_id: None,
+            suppress_string_truncation: false,
+            result_coercion: None,
+        }),
         crate::engine::expr_type::ExprTypeKind::Bit { bits } => Ok(ExprNode::Function {
             kernel: FunctionKernel::BitString(bits),
             args: vec![node],
@@ -6734,7 +6768,7 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
                                 crate::engine::expr::FieldComparisonDomain::Double
                                     | crate::engine::expr::FieldComparisonDomain::ExactNumeric
                             )
-                        ) || matches!(kernel, FunctionKernel::Char) || matches!(kernel, FunctionKernel::Math(function) if function.numeric_hex_literals()) {
+                        ) || matches!(kernel, FunctionKernel::Char) || crate::engine::expr::function_uses_numeric_hex_literals(name) || matches!(kernel, FunctionKernel::Math(function) if function.numeric_hex_literals()) {
                             if let Expr::Literal(
                                 Literal::HexBytes(bytes) | Literal::BitBytes(bytes),
                             ) = arg
@@ -7867,6 +7901,16 @@ impl FunctionKernel {
             }
             FunctionKernel::TemporalString(fsp) => {
                 crate::engine::expr::temporal_string_value(args[0].eval(row, scratch)?, fsp)
+            }
+            FunctionKernel::DecimalString(scale) => {
+                let value = args[0].eval(row, scratch)?;
+                Ok(crate::engine::expr::decimal_result_value_owned(
+                    value,
+                    ColumnType::Decimal {
+                        precision: 65,
+                        scale,
+                    },
+                ))
             }
             FunctionKernel::MakeSet => {
                 if args.len() < 2 {
@@ -10857,6 +10901,13 @@ mod legacy_escape_tests {
                 ("qTY", ColumnType::LongLong),
             ],
             vec![("a", ColumnType::LongLong)],
+            vec![(
+                "d",
+                ColumnType::Decimal {
+                    precision: 65,
+                    scale: 30,
+                },
+            )],
             vec![
                 ("MixEdCase", ColumnType::VarString),
                 ("MixEdCase", ColumnType::LongLong),

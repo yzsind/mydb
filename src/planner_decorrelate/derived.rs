@@ -48,6 +48,10 @@ pub fn pushdown_derived_predicates(select: &mut Select) -> usize {
     if let Some(inner) = select.derived.as_ref().and_then(SubQuery::as_select) {
         if !derived_pushdown_safe(inner)
             || select
+                .from
+                .first()
+                .is_some_and(|table| !table.column_aliases.is_empty())
+            || select
                 .joins
                 .iter()
                 .any(|join| matches!(join.join_type, JoinType::Right | JoinType::Full))

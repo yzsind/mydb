@@ -122,6 +122,7 @@ impl BinlogFileHeader {
 pub struct EventStreamReader {
     fde: FormatDescriptionEvent<'static>,
     table_map: HashMap<u64, TableMapEvent<'static>>,
+    cache_table_maps: bool,
 }
 
 impl EventStreamReader {
@@ -130,6 +131,16 @@ impl EventStreamReader {
         Self {
             fde: FormatDescriptionEvent::new(version),
             table_map: Default::default(),
+            cache_table_maps: true,
+        }
+    }
+
+    /// Disable the duplicate cache when the consumer owns table-map lifetime.
+    pub fn set_table_map_cache_enabled(&mut self, enabled: bool) {
+        self.cache_table_maps = enabled;
+        if !enabled {
+            self.table_map.clear();
+            self.table_map.shrink_to_fit();
         }
     }
 
@@ -219,7 +230,7 @@ impl EventStreamReader {
             // we'll redefine fde with an actual one
             let fde = event.read_event::<FormatDescriptionEvent<'_>>()?;
             self.fde = fde.into_owned().with_footer(event.footer());
-        } else if event_type == EventType::TABLE_MAP_EVENT as u8 {
+        } else if event_type == EventType::TABLE_MAP_EVENT as u8 && self.cache_table_maps {
             // we'll maintain known table maps
             let tme = event.read_event::<TableMapEvent<'_>>()?;
             self.table_map.insert(tme.table_id(), tme.into_owned());

@@ -5932,7 +5932,7 @@ impl TableChecksum {
 
     fn update_row(&mut self, values: &[Value]) {
         let mut temporal = [0u8; 32];
-        let mut decimal = [0u8; 48];
+        let mut decimal = [0u8; 258];
         let mut integer = itoa::Buffer::new();
         for (i, value) in values.iter().enumerate() {
             if i != 0 {

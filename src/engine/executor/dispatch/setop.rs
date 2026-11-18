@@ -52,6 +52,7 @@ fn chained_union_all(
             .enumerate()
             .filter(|(_, (target, source))| {
                 target.column_type == ColumnType::Vector
+                    || matches!(target.column_type, ColumnType::Decimal { .. })
                     || (matches!(target.column_type, ColumnType::VarString | ColumnType::Blob)
                         && matches!(
                             source.column_type,
@@ -593,7 +594,10 @@ fn unify_setop_numeric_columns(
             }
             continue;
         }
-        if matches!(left_type, ColumnType::VarString | ColumnType::Blob) {
+        if matches!(
+            left_type,
+            ColumnType::VarString | ColumnType::Blob | ColumnType::Decimal { .. }
+        ) {
             for (rows, source) in [
                 (&mut left.rows, &left_sources[i]),
                 (&mut right.rows, &right_sources[i]),

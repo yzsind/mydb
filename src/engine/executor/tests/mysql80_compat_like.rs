@@ -634,7 +634,7 @@ fn randomized_multilingual_like_index_candidates_have_no_false_negatives() {
     let mut session = SessionContext::default();
     for (table, collation) in [
         ("like_prop_ai", "utf8mb4_0900_ai_ci"),
-        ("like_prop_as", "utf8mb4_0900_as_cs"),
+        ("like_prop_as", "utf8mb4_0900_bin"),
         ("like_prop_bin", "utf8mb4_bin"),
     ] {
         exec(

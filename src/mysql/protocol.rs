@@ -458,6 +458,13 @@ pub fn parse_ssl_request(payload: &[u8]) -> Result<SslRequest, String> {
     })
 }
 
+static CONNECTION_ATTRIBUTES_LOST: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn connection_attributes_lost() -> u64 {
+    CONNECTION_ATTRIBUTES_LOST.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 fn parse_connection_attributes(
     cursor: &mut Cursor<'_>,
     payload_len: usize,
@@ -473,15 +480,57 @@ fn parse_connection_attributes(
     }
 
     let mut attrs = BTreeMap::new();
-    while cursor.position < attrs_end {
-        let key = cursor.read_lenenc_string()?;
-        let value = cursor.read_lenenc_string()?;
-        attrs.insert(key, value);
+    let mut block = Cursor::new(&cursor.input[cursor.position..attrs_end]);
+    let mut retained = 0usize;
+    let mut lost = false;
+    while block.remaining() > 0 {
+        let key = block
+            .read_lenenc_bytes()
+            .map_err(|_| boundary_error.to_string())?;
+        let value = block
+            .read_lenenc_bytes()
+            .map_err(|_| boundary_error.to_string())?;
+        let bytes = key.len().saturating_add(value.len());
+        if attrs.len() < 64 && retained.saturating_add(bytes) <= 512 {
+            let key = String::from_utf8_lossy(key);
+            let value = String::from_utf8_lossy(value);
+            let decoded_bytes = key.len().saturating_add(value.len());
+            if retained.saturating_add(decoded_bytes) <= 512 {
+                retained += decoded_bytes;
+                attrs.insert(key.into_owned(), value.into_owned());
+            } else {
+                lost = true;
+            }
+        } else {
+            lost = true;
+        }
     }
-    if cursor.position != attrs_end {
-        return Err(boundary_error.to_string());
+    cursor.position = attrs_end;
+    if lost {
+        CONNECTION_ATTRIBUTES_LOST.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
     Ok(attrs)
+}
+
+#[cfg(test)]
+#[test]
+fn issue_40_connect_attributes_bound_retained_bytes() {
+    let mut attributes = Vec::new();
+    write_lenenc_string(&mut attributes, b"client");
+    write_lenenc_string(&mut attributes, &vec![b'x'; 1024 * 1024]);
+    let mut payload = Vec::new();
+    write_lenenc_string(&mut payload, &attributes);
+    let mut cursor = Cursor::new(&payload);
+    let retained =
+        parse_connection_attributes(&mut cursor, payload.len(), "invalid attributes").unwrap();
+    assert!(
+        retained
+            .iter()
+            .map(|(k, v)| k.len() + v.len())
+            .sum::<usize>()
+            <= 512
+    );
+    assert_eq!(cursor.position, payload.len());
 }
 
 pub fn parse_handshake_response(payload: &[u8]) -> Result<HandshakeResponse, String> {
@@ -1522,7 +1571,7 @@ pub fn binary_row_packet_into_with_charset(
                 // both text and binary result sets. Encode straight
                 // into a stack buffer to avoid the `String` alloc
                 // that `to_display_string()` would incur per row.
-                let mut buf = [0u8; 48];
+                let mut buf = [0u8; 258];
                 let bytes = crate::types::write_decimal_compact_canonical(*mag, *scale, &mut buf);
                 write_lenenc_string(payload, bytes);
             }
@@ -2751,7 +2800,7 @@ fn write_text_value_inner(
         // into a stack buffer to avoid the per-row `String` allocation
         // that `to_display_string()` would incur.
         Value::DecimalCompact(mag, scale) => {
-            let mut buf = [0u8; 48];
+            let mut buf = [0u8; 258];
             let bytes = crate::types::write_decimal_compact_canonical(*mag, *scale, &mut buf);
             write_lenenc_string(payload, bytes);
         }
@@ -3178,12 +3227,6 @@ impl<'a> Cursor<'a> {
         let value = String::from_utf8_lossy(&self.input[self.position..end]).to_string();
         self.position = end + 1;
         Ok(value)
-    }
-
-    fn read_lenenc_string(&mut self) -> Result<String, String> {
-        let len = self.read_lenenc_int()? as usize;
-        let bytes = self.read_bytes(len)?;
-        Ok(String::from_utf8_lossy(bytes).to_string())
     }
 
     fn read_lenenc_bytes(&mut self) -> Result<&'a [u8], String> {

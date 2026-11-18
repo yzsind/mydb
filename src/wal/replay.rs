@@ -801,7 +801,7 @@ fn scan_replay_segment(
         path: path.to_owned(),
         first_lsn,
         last_lsn: next_lsn.saturating_sub(1),
-        size_bytes: file.metadata().map_err(io_err)?.len(),
+        size_bytes: end,
         status: WalSegmentStatus::Reclaimable,
     };
     Ok(SegmentReplayScan {
@@ -968,7 +968,7 @@ impl ReplayScan {
                 path: path.clone(),
                 first_lsn,
                 last_lsn: next.saturating_sub(1),
-                size_bytes: file.metadata().map_err(io_err)?.len(),
+                size_bytes: end,
                 status: if index + 1 == discovered.len() {
                     WalSegmentStatus::Active
                 } else {

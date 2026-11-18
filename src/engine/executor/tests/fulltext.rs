@@ -513,7 +513,7 @@ fn fulltext_comment_ddl_roundtrip_and_auto_increment_validation() {
     let engine = open_test_engine(dir.path());
     let sql = "CREATE TABLE `mysql_struct_test2` (\
         `id` bigint unsigned NOT NULL AUTO_INCREMENT,\
-        `char_col` char(3) CHARACTER SET utf8mb4 COLLATE utf8mb4_la_0900_as_cs DEFAULT 'ab',\
+        `char_col` char(3) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_bin DEFAULT 'ab',\
         FULLTEXT KEY `idx_fulltext` (`char_col`) COMMENT '全文索引'\
         ) ENGINE=InnoDB AUTO_INCREMENT=16 DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_0900_ai_ci";
     let err = engine.execute(sql).unwrap_err();
@@ -531,7 +531,7 @@ fn fulltext_comment_ddl_roundtrip_and_auto_increment_validation() {
     let ddl =
         rows_to_strings(exec_set(&engine, "SHOW CREATE TABLE mysql_struct_test2"))[0][1].clone();
     assert!(ddl.contains("COMMENT '全文索引'"), "{ddl}");
-    assert!(ddl.contains("utf8mb4_la_0900_as_cs"), "{ddl}");
+    assert!(ddl.contains("utf8mb4_0900_bin"), "{ddl}");
     engine
         .execute(&ddl.replace("`mysql_struct_test2`", "`fulltext_comment_copy`"))
         .unwrap();

@@ -279,6 +279,8 @@ for syntax and operational limits.
 | GEOMETRY family | ◑ | SRID+WKB, common functions, and spatial indexes work; see GIS boundaries |
 | VECTOR(n) | ➕ | MySQL 8.0.46 Community Server has no equivalent type |
 
+The UCA 9.0 collations implemented for SQL use are `utf8mb4_0900_ai_ci` and `utf8mb4_0900_bin`. Other registered `utf8mb4_*0900*` variants, including accent-sensitive and locale-tailored variants, return error 1235 when selected by name or handshake ID and are not marked compiled in collation metadata. They do not silently fall back to approximate Unicode comparisons.
+
 BOOLEAN is a TINYINT-compatible alias. mydb does not implement the physical
 row formats of the MySQL storage engines; `ENGINE=InnoDB` is a compatibility
 alias for the native mydb engine.
@@ -993,7 +995,7 @@ mydb ships **two fully independent** replication stacks, distinguished in the SQ
 - ◑ Single SQL applier (no MTS multi-threaded/parallel apply; `replica_parallel_*` is advisory); consecutive
   row-only source transactions still commit independently in order but may share a bounded durability barrier at the highest WAL LSN.
 
-STRICT apply errors remain errors after STOP/START or restart. Recovery skips a row transaction only when an apply receipt committed atomically with its data proves that the source boundary was already applied; relay replay does not force IDEMPOTENT mode.
+STRICT apply errors remain errors after STOP/START or restart. Recovery skips a row transaction only when an apply receipt committed atomically with its data proves that the same source UUID and boundary were already applied; relay replay does not force IDEMPOTENT mode.
 
 Connection failures retry until STOP REPLICA. SOURCE_RETRY_COUNT is advisory
 and produces a warning; the legacy Source_Retry_Count status value of 86400

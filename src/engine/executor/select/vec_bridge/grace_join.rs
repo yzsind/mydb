@@ -471,7 +471,9 @@ impl GraceRangePartitioning {
                 }
                 if vec_hash_join::encode_join_key_with_collations(
                     batch, build_keys, null_safe, collations, row, &mut key,
-                ) {
+                )
+                .ok()?
+                {
                     if let Some(value) =
                         crate::engine::executor::vec::key_encode::single_integer_key(&key)
                     {
@@ -817,7 +819,7 @@ pub(super) fn spill_vec_join_batch(
             key_collations,
             row_idx,
             &mut key,
-        );
+        )?;
         if filter_probe && !component_prefiltered {
             // Grace replay previously wrote every probe row before it knew
             // whether any build key could match.  A build-side bloom has no

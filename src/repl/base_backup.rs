@@ -49,6 +49,83 @@ use sha2::{Digest, Sha256};
 
 const CHUNK_BYTES: usize = 1024 * 1024;
 
+#[cfg(test)]
+#[tokio::test]
+async fn issue_39_large_manifest_roundtrips_across_frames() {
+    let count = 100_000;
+    let prefix = format!("schemas/test/{}", "directory0123456789/".repeat(36));
+    assert!(count * (prefix.len() + 24) > protocol::MAX_PAYLOAD_BYTES);
+    let files = (0..count)
+        .map(|index| BaseBackupFile {
+            path: format!("{prefix}{index}.heap"),
+            len: index as u64,
+        })
+        .collect();
+    let (writer, mut reader) = tokio::io::duplex(64 * 1024);
+    let mut writer = BufWriter::new(writer);
+    let (sent, received) = tokio::join!(
+        write_backup_manifest(&mut writer, 42, files, 4 * 1024 * 1024),
+        read_backup_manifest(&mut reader)
+    );
+    sent.unwrap();
+    let (manifest, _memory) = received.unwrap();
+    assert_eq!(manifest.backup_lsn, 42);
+    assert_eq!(manifest.files.len(), count);
+    assert_eq!(manifest.files.last().unwrap().len, (count - 1) as u64);
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn issue_39_manifest_continuations_require_consistent_lsn() {
+    let mut bytes = Vec::new();
+    protocol::write_frame(
+        &mut bytes,
+        &Message::BaseBackupManifest(BaseBackupStart {
+            backup_lsn: 1,
+            files: Vec::new(),
+        }),
+    )
+    .unwrap();
+    protocol::write_frame(
+        &mut bytes,
+        &Message::BaseBackupStart(BaseBackupStart {
+            backup_lsn: 2,
+            files: Vec::new(),
+        }),
+    )
+    .unwrap();
+    assert!(read_backup_manifest(&mut bytes.as_slice()).await.is_err());
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn issue_38_backup_capture_sends_progress_before_start() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+    engine.execute("CREATE TABLE busy(id INT)").unwrap();
+    let mut owner = crate::engine::SessionContext::default();
+    engine.execute_with_session(&mut owner, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut owner, "INSERT INTO busy VALUES (1)")
+        .unwrap();
+    let (sender, mut reader) = tokio::io::duplex(4096);
+    let mut writer = BufWriter::new(sender);
+    let response = {
+        let capture =
+            stream_base_backup(&mut writer, engine.database_for_replication(), dir.path());
+        tokio::pin!(capture);
+        tokio::select! {
+            result = &mut capture => panic!("capture finished before progress: {result:?}"),
+            frame = read_backup_frame_with_timeout(&mut reader,Duration::from_millis(100)) => frame,
+        }
+    };
+    engine.execute_with_session(&mut owner, "ROLLBACK").unwrap();
+    assert!(
+        matches!(response, Ok(Message::Heartbeat(_))),
+        "{response:?}"
+    );
+}
+
 /// Subdirectories of `<data-dir>` whose contents go into a base
 /// backup. With the v33 layout all user/dictionary heaps and indexes
 /// live under `schemas/<db>/{tables,indexes}/`, so a recursive sweep
@@ -117,6 +194,7 @@ impl BackupSnapshotFiles {
     pub(crate) fn last_path(&self) -> Option<&Path> {
         self.0.last().map(PathBuf::as_path)
     }
+    #[cfg(test)]
     pub(crate) fn capture(
         &mut self,
         root: &Path,
@@ -185,7 +263,7 @@ fn is_paged_zone_map(path: &Path) -> Result<bool, QueryError> {
 /// — base backup is a one-shot operation per replica, not a hot path.
 pub async fn stream_base_backup<W>(
     writer: &mut BufWriter<W>,
-    db: &Database,
+    db: &std::sync::Arc<Database>,
     data_dir: &Path,
 ) -> Result<BaseBackupSnapshot, QueryError>
 where
@@ -196,146 +274,206 @@ where
 
 pub(crate) async fn stream_base_backup_with_chunk_bytes<W>(
     writer: &mut BufWriter<W>,
-    db: &Database,
+    db: &std::sync::Arc<Database>,
     data_dir: &Path,
     chunk_bytes: usize,
 ) -> Result<BaseBackupSnapshot, QueryError>
 where
     W: tokio::io::AsyncWriteExt + Unpin,
 {
-    let logical_gate = crate::storage::capture::logical_apply_gate(db)?;
-    let logical_capture = logical_gate.try_write_arc().ok_or_else(|| {
-        error(
-            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-            "base backup capture deferred: logical applier is completing a transaction",
-        )
-    })?;
-    db.capture
-        .active
-        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-        .map_err(|_| {
+    struct CancelCapture(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for CancelCapture {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Release);
+        }
+    }
+    let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let _cancel = CancelCapture(cancelled.clone());
+    let capture_db = db.clone();
+    let capture_dir = data_dir.to_path_buf();
+    let mut capture = tokio::task::spawn_blocking(move || {
+        let db = capture_db;
+        let data_dir = capture_dir.as_path();
+        let check_capture = || {
+            if cancelled.load(Ordering::Acquire) {
+                Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED
+                    .error("base backup capture cancelled"))
+            } else {
+                Ok(())
+            }
+        };
+        let logical_gate = crate::storage::capture::logical_apply_gate(&db)?;
+        let logical_capture = logical_gate.try_write_arc().ok_or_else(|| {
             error(
                 crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                "another physical backup is active",
+                "base backup capture deferred: logical applier is completing a transaction",
             )
         })?;
-    let manager =
-        crate::repl::global_manager().filter(|manager| manager.role() == crate::repl::Role::Master);
-    db.capture.draining.store(true, Ordering::SeqCst);
-    let freeze_guard = BackupFreezeGuard {
-        manager,
-        capture_active: std::sync::Arc::clone(&db.capture.active),
-        capture_draining: &db.capture.draining,
-        capture_floor: &db.capture.capture_floor,
-    };
-    let drain_timeout = crate::util::env::var("MYDB_REPL_BASE_BACKUP_DRAIN_MS")
-        .ok()
-        .and_then(|value| value.parse::<u64>().ok())
-        .unwrap_or(3000);
-    let drain_deadline = std::time::Instant::now() + Duration::from_millis(drain_timeout);
-    loop {
-        if db.xa_status_counters().0 > 0 {
-            return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                "native base backup cannot capture XA PREPARED branches; resolve them with XA COMMIT or XA ROLLBACK before seeding"));
-        }
-        if !db.has_active_backup_conflicts() && db.capture.admissions.load(Ordering::SeqCst) == 0 {
-            break;
-        }
-        if std::time::Instant::now() >= drain_deadline {
-            return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                format!("base backup drain timed out after {drain_timeout}ms; active source writers remain; finish transactions or increase MYDB_REPL_BASE_BACKUP_DRAIN_MS")));
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    if let Some(manager) = &freeze_guard.manager {
-        manager.backup_capture_frozen.store(true, Ordering::SeqCst);
-    }
-    let admission_freeze = db.capture.freeze();
-    if db.has_active_backup_conflicts() || db.capture.admissions.load(Ordering::SeqCst) != 0 {
-        return Err(error(
-            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-            "base backup capture deferred: source writer raced admission; retry",
-        ));
-    }
-    // Capture the boundary BEFORE the fuzzy checkpoint. Replaying its tail
-    // cannot skip a record published during the checkpoint flush window.
-    let backup_lsn = db.wal_log().lock().next_lsn().saturating_sub(1);
-    // Also protect the boundary without a process-global replication manager
-    // (embedded services). A quiescent checkpoint must not collapse its tail.
-    db.capture
-        .capture_floor
-        .store(backup_lsn.max(1), Ordering::Release);
-    db.checkpoint()?;
-
-    let mut snapshots = BackupSnapshotFiles::default();
-    let opened = {
-        // SQL write admission does not cover background purge/compaction.
-        // Drain those physical mutations before flushing and copying files.
-        let _maintenance = db.backup_maintenance_capture_guard()?;
-        // Keep the LSN boundary above this guard: a rebuild completed after
-        // checkpoint is replayed from its FPI records on top of this baseline.
-        // Do not hold a parking_lot guard over asynchronous network transfer.
-        let _zone_capture = db.zone_map_backup_capture_guard()?;
-        // 2. Snapshot the file list. We sort by path so the protocol is
-        //    deterministic (helps debugging — the manifest order matches
-        //    chunk order).
-        let mut files: Vec<(PathBuf, BaseBackupFile)> = Vec::new();
-        for sub in BACKUP_DIRS {
-            let dir = data_dir.join(sub);
-            collect_files(&dir, sub, &mut files)?;
-        }
-        for relative in BACKUP_FILES {
-            let path = data_dir.join(relative);
-            let Ok(meta) = fs::metadata(&path) else {
-                continue;
-            };
-            if meta.is_file() {
-                files.push((
-                    path,
-                    BaseBackupFile {
-                        path: (*relative).to_string(),
-                        len: meta.len(),
-                    },
-                ));
-            }
-        }
-        // Deliberately NOT included: the master's role.json. Shipping it
-        // would overwrite the replica's identity with the MASTER's
-        // node_uuid and role=master — the replica keeps its own role file.
-        files.sort_by(|a, b| a.1.path.cmp(&b.1.path));
-        let mut opened = Vec::<(PathBuf, BaseBackupFile)>::with_capacity(files.len());
-        for (path, mut entry) in files {
-            let mut file = File::open(&path).map_err(|err| {
+        db.capture
+            .active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| {
                 error(
                     crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                    format!("base backup open {}: {err}", path.display()),
+                    "another physical backup is active",
                 )
             })?;
-            // Windows directory enumeration can retain a stale length while
-            // a writer remains open. Bind the manifest length to the opened
-            // file identity, using its current EOF while writes are fenced.
-            entry.len = file.metadata().map_err(io_err)?.len();
-            // Open handles do not freeze mutable heap/undo/catalog pages.
-            // Copy while source writes are fenced; release admission before
-            // network transfer so a slow replica cannot stall source DML.
-            file = snapshots.capture(data_dir, &mut file, entry.len)?;
-            drop(file);
-            opened.push((snapshots.last_path().unwrap().to_path_buf(), entry));
+        let manager = crate::repl::global_manager()
+            .filter(|manager| manager.role() == crate::repl::Role::Master);
+        db.capture.draining.store(true, Ordering::SeqCst);
+        let freeze_guard = BackupFreezeGuard {
+            manager,
+            capture_active: std::sync::Arc::clone(&db.capture.active),
+            capture_draining: &db.capture.draining,
+            capture_floor: &db.capture.capture_floor,
+        };
+        let drain_timeout = match crate::util::env::var("MYDB_REPL_BASE_BACKUP_DRAIN_MS") {
+            Ok(value) => value
+                .parse::<u64>()
+                .ok()
+                .filter(|value| *value <= 3_600_000)
+                .ok_or_else(|| {
+                    crate::error::catalog::ER_WRONG_VALUE_FOR_VAR
+                        .error("MYDB_REPL_BASE_BACKUP_DRAIN_MS must be between 0 and 3600000")
+                })?,
+            Err(std::env::VarError::NotPresent) => 3000,
+            Err(_) => {
+                return Err(crate::error::catalog::ER_WRONG_VALUE_FOR_VAR
+                    .error("Invalid MYDB_REPL_BASE_BACKUP_DRAIN_MS"))
+            }
+        };
+        let drain_deadline = std::time::Instant::now() + Duration::from_millis(drain_timeout);
+        loop {
+            check_capture()?;
+            if db.xa_status_counters().0 > 0 {
+                return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                "native base backup cannot capture XA PREPARED branches; resolve them with XA COMMIT or XA ROLLBACK before seeding"));
+            }
+            if !db.has_active_backup_conflicts()
+                && db.capture.admissions.load(Ordering::SeqCst) == 0
+            {
+                break;
+            }
+            if std::time::Instant::now() >= drain_deadline {
+                return Err(error(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                format!("base backup drain timed out after {drain_timeout}ms; active source writers remain; finish transactions or increase MYDB_REPL_BASE_BACKUP_DRAIN_MS")));
+            }
+            std::thread::sleep(Duration::from_millis(10));
         }
-        opened
-    };
-    drop(admission_freeze);
-    drop(freeze_guard);
-    drop(logical_capture);
+        if let Some(manager) = &freeze_guard.manager {
+            manager.backup_capture_frozen.store(true, Ordering::SeqCst);
+        }
+        let admission_freeze = db.capture.freeze();
+        if db.has_active_backup_conflicts() || db.capture.admissions.load(Ordering::SeqCst) != 0 {
+            return Err(error(
+                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                "base backup capture deferred: source writer raced admission; retry",
+            ));
+        }
+        // Capture the boundary BEFORE the fuzzy checkpoint. Replaying its tail
+        // cannot skip a record published during the checkpoint flush window.
+        let backup_lsn = db.wal_log().lock().next_lsn().saturating_sub(1);
+        // Also protect the boundary without a process-global replication manager
+        // (embedded services). A quiescent checkpoint must not collapse its tail.
+        db.capture
+            .capture_floor
+            .store(backup_lsn.max(1), Ordering::Release);
+        check_capture()?;
+        db.checkpoint()?;
+        check_capture()?;
 
-    let manifest: Vec<BaseBackupFile> = opened.iter().map(|(_, m)| m.clone()).collect();
-    let start = Message::BaseBackupStart(BaseBackupStart {
-        backup_lsn,
-        files: manifest,
+        let mut snapshots = BackupSnapshotFiles::default();
+        let mut manifest_memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::NativeReplicationTransient,0,
+        )?;
+        let opened = {
+            // SQL write admission does not cover background purge/compaction.
+            // Drain those physical mutations before flushing and copying files.
+            let _maintenance = db.backup_maintenance_capture_guard()?;
+            // Keep the LSN boundary above this guard: a rebuild completed after
+            // checkpoint is replayed from its FPI records on top of this baseline.
+            // Do not hold a parking_lot guard over asynchronous network transfer.
+            let _zone_capture = db.zone_map_backup_capture_guard()?;
+            // 2. Snapshot the file list. We sort by path so the protocol is
+            //    deterministic (helps debugging — the manifest order matches
+            //    chunk order).
+            let mut files: Vec<(PathBuf, BaseBackupFile)> = Vec::new();
+            for sub in BACKUP_DIRS {
+                let dir = data_dir.join(sub);
+                collect_files_checked(&dir, sub, &mut files, &check_capture, &mut manifest_memory)?;
+            }
+            for relative in BACKUP_FILES {
+                let path = data_dir.join(relative);
+                let Ok(meta) = fs::metadata(&path) else {
+                    continue;
+                };
+                if meta.is_file() {
+                    check_capture()?;
+                    manifest_memory.try_grow(
+                        512usize.saturating_add(path.as_os_str().len().saturating_mul(4)),
+                    )?;
+                    files.push((
+                        path,
+                        BaseBackupFile {
+                            path: (*relative).to_string(),
+                            len: meta.len(),
+                        },
+                    ));
+                }
+            }
+            // Deliberately NOT included: the master's role.json. Shipping it
+            // would overwrite the replica's identity with the MASTER's
+            // node_uuid and role=master — the replica keeps its own role file.
+            files.sort_by(|a, b| a.1.path.cmp(&b.1.path));
+            let mut opened = Vec::<(PathBuf, BaseBackupFile)>::with_capacity(files.len());
+            for (path, mut entry) in files {
+                check_capture()?;
+                let mut file = File::open(&path).map_err(|err| {
+                    error(
+                        crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
+                        format!("base backup open {}: {err}", path.display()),
+                    )
+                })?;
+                // Windows directory enumeration can retain a stale length while
+                // a writer remains open. Bind the manifest length to the opened
+                // file identity, using its current EOF while writes are fenced.
+                entry.len = file.metadata().map_err(io_err)?.len();
+                // Open handles do not freeze mutable heap/undo/catalog pages.
+                // Copy while source writes are fenced; release admission before
+                // network transfer so a slow replica cannot stall source DML.
+                file =
+                    snapshots.capture_checked(&data_dir, &mut file, entry.len, &check_capture)?;
+                drop(file);
+                opened.push((snapshots.last_path().unwrap().to_path_buf(), entry));
+            }
+            opened
+        };
+        drop(admission_freeze);
+        drop(freeze_guard);
+        drop(logical_capture);
+
+        Ok::<_, QueryError>((backup_lsn, opened, snapshots, manifest_memory))
     });
-    write_backup_frame(writer, &start, Duration::from_secs(60))
-        .await
-        .map_err(io_err)?;
+    let mut progress = tokio::time::interval(Duration::from_secs(5));
+    let (backup_lsn, opened, _snapshots, _source_manifest_memory) = loop {
+        tokio::select! {
+            result = &mut capture => break result.map_err(|err| crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED.error(format!("base backup capture task failed: {err}")))??,
+            _ = progress.tick() => {
+                let heartbeat = Message::Heartbeat(protocol::Heartbeat {
+                    master_lsn:0,durable_lsn:0,master_time_ms:0,timeline_uuid:[0;16],generation:0,source_frozen:false,fence_lsn:0,fence_token_hash:String::new(),
+                });
+                write_backup_frame(writer,&heartbeat,Duration::from_secs(60)).await.map_err(io_err)?;
+            }
+        }
+    };
+
+    write_backup_manifest(
+        writer,
+        backup_lsn,
+        opened.iter().map(|(_, file)| file.clone()).collect(),
+        4 * 1024 * 1024,
+    )
+    .await?;
 
     // 3. Stream each file in CHUNK_BYTES-sized chunks. Each file
     //    finishes with an `eof: true` chunk so the replica can close
@@ -396,6 +534,111 @@ where
     Ok(BaseBackupSnapshot { backup_lsn })
 }
 
+async fn write_backup_manifest<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut BufWriter<W>,
+    backup_lsn: u64,
+    files: Vec<BaseBackupFile>,
+    limit: usize,
+) -> Result<(), QueryError> {
+    let mut chunk = Vec::new();
+    let mut bytes = 12usize;
+    for file in files {
+        let size = file.path.len().checked_add(12).ok_or_else(|| {
+            crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED
+                .error("base backup manifest size overflow")
+        })?;
+        if size > protocol::MAX_PAYLOAD_BYTES - 12 {
+            return Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED
+                .error("base backup manifest path exceeds frame limit"));
+        }
+        if !chunk.is_empty() && bytes.saturating_add(size) > limit {
+            write_backup_frame(
+                writer,
+                &Message::BaseBackupManifest(BaseBackupStart {
+                    backup_lsn,
+                    files: std::mem::take(&mut chunk),
+                }),
+                Duration::from_secs(60),
+            )
+            .await
+            .map_err(io_err)?;
+            bytes = 12;
+        }
+        bytes += size;
+        chunk.push(file);
+    }
+    write_backup_frame(
+        writer,
+        &Message::BaseBackupStart(BaseBackupStart {
+            backup_lsn,
+            files: chunk,
+        }),
+        Duration::from_secs(60),
+    )
+    .await
+    .map_err(io_err)
+}
+
+async fn read_backup_manifest<R: tokio::io::AsyncReadExt + Unpin>(
+    reader: &mut R,
+) -> Result<
+    (
+        BaseBackupStart,
+        crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    ),
+    QueryError,
+> {
+    use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMemoryCharge};
+    let mut memory =
+        ControlledMemoryCharge::try_new(ControlledMemoryCategory::NativeReplicationTransient, 0)?;
+    let mut files = Vec::new();
+    let mut expected_lsn = None;
+    loop {
+        let frame = read_backup_frame(reader).await.map_err(io_err)?;
+        let (chunk, done) = match frame {
+            Message::Heartbeat(_) if expected_lsn.is_none() => continue,
+            Message::BaseBackupStart(chunk) => (chunk, true),
+            Message::BaseBackupManifest(chunk) => (chunk, false),
+            Message::Close(close) => {
+                return Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED.error(close.reason))
+            }
+            other => {
+                return Err(
+                    crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED.error(format!(
+                        "base backup: expected manifest, got {:?}",
+                        other.msg_type()
+                    )),
+                )
+            }
+        };
+        if expected_lsn.is_some_and(|lsn| lsn != chunk.backup_lsn) {
+            return Err(crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED
+                .error("base backup manifest LSN changed"));
+        }
+        expected_lsn = Some(chunk.backup_lsn);
+        let bytes = chunk
+            .files
+            .iter()
+            .fold(chunk.files.len().saturating_mul(512), |sum, file| {
+                sum.saturating_add(file.path.capacity().saturating_mul(3))
+            });
+        memory.try_grow(bytes)?;
+        files.try_reserve(chunk.files.len()).map_err(|_| {
+            crate::error::catalog::ER_OUTOFMEMORY.error("base backup manifest allocation failed")
+        })?;
+        files.extend(chunk.files);
+        if done {
+            return Ok((
+                BaseBackupStart {
+                    backup_lsn: chunk.backup_lsn,
+                    files,
+                },
+                memory,
+            ));
+        }
+    }
+}
+
 async fn write_backup_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut BufWriter<W>,
     message: &Message,
@@ -417,10 +660,25 @@ async fn write_backup_frame<W: tokio::io::AsyncWriteExt + Unpin>(
 /// Recursively walk `dir`, emitting one manifest entry per regular file.
 /// The recorded `path` is `<relative_prefix>/<rel_path_under_dir>` using
 /// `/` separators so the protocol stays platform-neutral.
+#[cfg(test)]
 fn collect_files(
     dir: &Path,
     relative_prefix: &str,
     out: &mut Vec<(PathBuf, BaseBackupFile)>,
+) -> Result<(), QueryError> {
+    let mut memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+        crate::engine::executor::mem_budget::ControlledMemoryCategory::NativeReplicationTransient,
+        0,
+    )?;
+    collect_files_checked(dir, relative_prefix, out, &|| Ok(()), &mut memory)
+}
+
+fn collect_files_checked(
+    dir: &Path,
+    relative_prefix: &str,
+    out: &mut Vec<(PathBuf, BaseBackupFile)>,
+    check: &impl Fn() -> Result<(), QueryError>,
+    memory: &mut crate::engine::executor::mem_budget::ControlledMemoryCharge,
 ) -> Result<(), QueryError> {
     if !dir.exists() {
         return Ok(());
@@ -432,6 +690,7 @@ fn collect_files(
         )
     })?;
     for entry in entries {
+        check()?;
         let entry = entry.map_err(|err| {
             error(
                 crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -450,7 +709,7 @@ fn collect_files(
         };
         let next_prefix = format!("{relative_prefix}/{name}");
         if ft.is_dir() {
-            collect_files(&path, &next_prefix, out)?;
+            collect_files_checked(&path, &next_prefix, out, check, memory)?;
             continue;
         }
         if !ft.is_file() {
@@ -472,6 +731,7 @@ fn collect_files(
                 format!("base backup meta: {err}"),
             )
         })?;
+        memory.try_grow(512usize.saturating_add(path.as_os_str().len().saturating_mul(4)))?;
         out.push((
             path,
             BaseBackupFile {
@@ -734,37 +994,7 @@ pub(crate) async fn perform_base_backup_into_with_config(
     // After the handshake the master sends a `BaseBackupStart` because
     // we set `request_base_backup = true`. Anything else is a
     // protocol violation.
-    let start: BaseBackupStart = match read_backup_frame(&mut reader).await {
-        Ok(Message::BaseBackupStart(s)) => s,
-        Ok(Message::Close(close)) => {
-            return Err(error(
-                crate::error::catalog::MYDB_ER_BASE_BACKUP_FAILED,
-                close.reason,
-            ))
-        }
-        Ok(other) => {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                format!(
-                    "base backup: expected BaseBackupStart, got {:?}",
-                    other.msg_type()
-                ),
-            ))
-        }
-        Err(err) => return Err(io_err(err)),
-    };
-    // Retain admission for the manifest and its verification maps throughout
-    // installation, rather than dropping all accounting after frame decode.
-    let manifest_bytes = start
-        .files
-        .iter()
-        .fold(start.files.len().saturating_mul(512), |bytes, file| {
-            bytes.saturating_add(file.path.capacity().saturating_mul(3))
-        });
-    let _manifest_memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
-        crate::engine::executor::mem_budget::ControlledMemoryCategory::NativeReplicationTransient,
-        manifest_bytes,
-    )?;
+    let (start, _manifest_memory) = read_backup_manifest(&mut reader).await?;
     let total_bytes = start.files.iter().try_fold(0u64, |sum, file| {
         sum.checked_add(file.len).ok_or_else(|| {
             error(

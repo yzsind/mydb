@@ -33,10 +33,13 @@ def main() -> int:
         help="report queries without canonical fixtures as skipped instead of failing",
     )
     parser.add_argument("--comparison-manifest", type=Path,
-                        help="JSON query contracts: explicit types and ORDER BY tie keys; default exact ordered TSV")
+                        help="JSON query contracts; defaults to expected-dir/comparison.json if present, otherwise exact ordered TSV")
     args = parser.parse_args()
+    manifest = args.comparison_manifest
+    if manifest is None and (args.expected_dir / 'comparison.json').is_file():
+        manifest = args.expected_dir / 'comparison.json'
     try:
-        contracts = comparison_contracts(args.comparison_manifest)
+        contracts = comparison_contracts(manifest)
     except (OSError, ValueError) as error:
         parser.error(str(error))
 

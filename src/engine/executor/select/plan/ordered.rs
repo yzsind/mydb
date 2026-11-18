@@ -1258,6 +1258,7 @@ pub(in crate::engine::executor::select) fn execute_streaming_aggregate(
 
     let mut out = Vec::new();
     let mut current_keys: Option<Vec<Value>> = None;
+    let mut group_collations = Vec::new();
     let mut current_sample: Option<Vec<PlanField>> = None;
     let mut current_accs: Vec<Box<dyn Accumulator>> = Vec::new();
     let mut have_active = false;
@@ -1303,6 +1304,10 @@ pub(in crate::engine::executor::select) fn execute_streaming_aggregate(
     while let Some(row) = stream.next()? {
         crate::engine::cancel::check_cancelled()?;
         if compiled_group_by.is_none() {
+            group_collations = group_by
+                .iter()
+                .map(|expr| super::super::eval::plan_expr_collation(expr, &row).map(|info| info.id))
+                .collect();
             let schema = crate::engine::executor::select::eval::input_schema_for_plan_row(&row);
             compiled_group_by = Some(
                 group_by
@@ -1333,7 +1338,7 @@ pub(in crate::engine::executor::select) fn execute_streaming_aggregate(
             .iter()
             .map(|compiled| compiled.eval(&row))
             .collect::<Result<Vec<_>, _>>()?;
-        let same = matches!(&current_keys, Some(prev) if values_equal_for_grouping(prev, &keys));
+        let same = matches!(&current_keys, Some(prev) if values_equal_for_grouping(prev, &keys, &group_collations));
         if !same && have_active {
             // Flush previous group.
             let keys_prev = current_keys.take().expect("group keys missing");
@@ -1392,16 +1397,21 @@ pub(in crate::engine::executor::select) fn execute_streaming_rollup_aggregate(
     let mut active: Vec<Option<RollupGroupState>> = (0..=group_by_len).map(|_| None).collect();
     let mut prev_keys: Option<Vec<Value>> = None;
 
-    let common_prefix_len = |left: &[Value], right: &[Value]| -> usize {
-        let mut len = 0usize;
-        while len < left.len()
-            && len < right.len()
-            && values_equal_for_grouping(&left[len..=len], &right[len..=len])
-        {
-            len += 1;
-        }
-        len
-    };
+    let common_prefix_len =
+        |left: &[Value], right: &[Value], collations: &[Option<u16>]| -> usize {
+            let mut len = 0usize;
+            while len < left.len()
+                && len < right.len()
+                && values_equal_for_grouping(
+                    &left[len..=len],
+                    &right[len..=len],
+                    &collations[len..=len],
+                )
+            {
+                len += 1;
+            }
+            len
+        };
 
     let mut stream = execute_plan_stream(db, txn, input)?;
     while let Some(row) = stream.next()? {
@@ -1412,7 +1422,15 @@ pub(in crate::engine::executor::select) fn execute_streaming_rollup_aggregate(
             .collect::<Result<Vec<_>, _>>()?;
         let common = prev_keys
             .as_ref()
-            .map(|prev| common_prefix_len(prev, &keys))
+            .map(|prev| {
+                let collations = group_by
+                    .iter()
+                    .map(|expr| {
+                        super::super::eval::plan_expr_collation(expr, &row).map(|info| info.id)
+                    })
+                    .collect::<Vec<_>>();
+                common_prefix_len(prev, &keys, &collations)
+            })
             .unwrap_or(0);
         if prev_keys.is_none() {
             active[0] = Some(RollupGroupState {
@@ -1507,16 +1525,22 @@ pub(super) fn emit_streaming_accum_group(
 /// aggregate uses through `ValueKey`.
 /// NULLs compare equal to NULLs (so all NULL-keyed rows form a
 /// single group, matching SQL standard GROUP BY behaviour).
-pub(super) fn values_equal_for_grouping(left: &[Value], right: &[Value]) -> bool {
+pub(super) fn values_equal_for_grouping(
+    left: &[Value],
+    right: &[Value],
+    collations: &[Option<u16>],
+) -> bool {
     if left.len() != right.len() {
         return false;
     }
-    for (l, r) in left.iter().zip(right.iter()) {
+    for (index, (l, r)) in left.iter().zip(right.iter()).enumerate() {
         match (l, r) {
             (Value::Null, Value::Null) => continue,
             (Value::Null, _) | (_, Value::Null) => return false,
             _ => {
-                if crate::engine::expr::ValueKey::from(l) != crate::engine::expr::ValueKey::from(r)
+                let collation = collations.get(index).copied().flatten();
+                if crate::engine::expr::ValueKey::from_with_collation(l, collation)
+                    != crate::engine::expr::ValueKey::from_with_collation(r, collation)
                 {
                     return false;
                 }

@@ -85,7 +85,7 @@ mod crash_consistency {
 mod rotation_consistency {
     use super::*;
     #[test]
-    fn crash_consistency_unsynced_rotated_tail_is_recoverable() {
+    fn crash_consistency_corrupt_rotated_prefix_fails_closed() {
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
         let log = Arc::new(parking_lot::Mutex::new(
             LogManager::open(dir.path()).unwrap(),
@@ -110,11 +110,13 @@ mod rotation_consistency {
         bytes[offset as usize + 20..].fill(0);
         fs::write(path, bytes).unwrap();
         let reopened = LogManager::open(dir.path());
-        assert!(
-            reopened.is_ok(),
-            "an uncommitted rotated suffix must not make recovery fatal: {:?}",
-            reopened.err()
-        );
+        // Later pending segments can contain acknowledged relaxed commits.
+        // A damaged predecessor must therefore fail closed, rather than
+        // silently deleting that suffix and pretending recovery succeeded.
+        let error = reopened
+            .err()
+            .expect("corrupt sealed history must be rejected");
+        assert!(error.message().contains("corrupt sealed WAL"), "{error:?}");
     }
 }
 

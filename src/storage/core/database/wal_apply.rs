@@ -1237,7 +1237,7 @@ impl Database {
                 txns.next_txn_id = txns.next_txn_id.max(txn_id + 1);
                 txns.next_scn = txns.next_scn.max(commit_scn + 1);
                 let was_writer = if let Some(slot) = txns.slots.get_mut(&txn_id) {
-                    let was_writer = slot.is_writer;
+                    let was_writer = slot.is_writer && slot.status.is_in_flight();
                     slot.status = TxnStatus::Committed;
                     slot.commit_scn = Some(commit_scn);
                     was_writer
@@ -1285,239 +1285,282 @@ impl Database {
         // (and apply paths that need to resolve a new path → table_id)
         // see the post-commit world.
         let delta = self.applier_dd_dirty_txns.lock().remove(&txn_id);
-        if delta.as_ref().is_some_and(|delta| delta.has_binlog_intent) {
-            crate::binlog::prepared::cleanup(&self.data_dir, txn_id);
-        }
-        if let Some(delta) = delta.filter(|delta| delta.dd_touched) {
-            // Imported history lives in DD properties and may have changed
-            // without any SQL setter running on this physical replica.
-            self.invalidate_imported_gtids();
-            if !delta.object_ids.is_empty() {
-                let object_ids = delta.object_ids.into_iter().collect::<Vec<_>>();
-                let mut loaded = Vec::with_capacity(object_ids.len());
-                for object_id in object_ids.iter().copied() {
-                    match self.load_table_descriptor_from_dd(object_id) {
-                        Ok(table) => loaded.push((object_id, table)),
-                        Err(err) => {
-                            crate::util::logging::log_message(format_args!(
+        let result = (|| {
+            if delta.as_ref().is_some_and(|delta| delta.has_binlog_intent) {
+                crate::binlog::prepared::cleanup(&self.data_dir, txn_id);
+            }
+            if let Some(delta) = delta.as_ref().filter(|delta| delta.dd_touched) {
+                // Imported history lives in DD properties and may have changed
+                // without any SQL setter running on this physical replica.
+                self.invalidate_imported_gtids();
+                if !delta.object_ids.is_empty() {
+                    let object_ids = delta.object_ids.iter().copied().collect::<Vec<_>>();
+                    let mut loaded = Vec::with_capacity(object_ids.len());
+                    for object_id in object_ids.iter().copied() {
+                        match self.load_table_descriptor_from_dd(object_id) {
+                            Ok(table) => loaded.push((object_id, table)),
+                            Err(err) => {
+                                crate::util::logging::log_message(format_args!(
                                 "mydb-repl applier: catalog delta object_id={object_id} failed: {}",
                                 err.message()
                             ));
+                                self.quarantine_mvcc(format!(
+                                    "replicated catalog decode failed: {}",
+                                    err.message()
+                                ));
+                                return Err(err);
+                            }
+                        }
+                    }
+                    let requests: Vec<_> = loaded
+                        .iter()
+                        .filter_map(|(_, t)| t.as_ref())
+                        .map(|t| MdlRequest {
+                            key: MdlObjectKey::table(&t.database, &t.name),
+                            lock_type: MdlLockType::Exclusive,
+                        })
+                        .collect();
+                    let _new_names = if requests.is_empty() {
+                        None
+                    } else {
+                        Some(self.lock_replicated_catalog(requests)?)
+                    };
+                    let prebuild = loaded.iter().filter_map(|(_, t)| t.as_ref()).all(|t| {
+                        t.primary_publication_job_id != 0
+                            && old_tables.iter().any(|old| {
+                                old.id == t.id && old.active_generation == t.active_generation
+                            })
+                            && t.indexes.iter().any(|i| {
+                                i.primary
+                                    && !matches!(
+                                        old_index_states.get(&(t.id, i.index_id)),
+                                        Some((IndexState::Public, _))
+                                    )
+                            })
+                    });
+                    if prebuild {
+                        if let Err(err) = self.materialize_replicated_indexes(
+                            &loaded,
+                            &old_index_states,
+                            &old_tables,
+                        ) {
                             self.quarantine_mvcc(format!(
-                                "replicated catalog decode failed: {}",
+                                "replicated index materialization failed: {}",
                                 err.message()
                             ));
                             return Err(err);
                         }
                     }
-                }
-                let requests: Vec<_> = loaded
-                    .iter()
-                    .filter_map(|(_, t)| t.as_ref())
-                    .map(|t| MdlRequest {
-                        key: MdlObjectKey::table(&t.database, &t.name),
-                        lock_type: MdlLockType::Exclusive,
-                    })
-                    .collect();
-                let _new_names = if requests.is_empty() {
-                    None
-                } else {
-                    Some(self.lock_replicated_catalog(requests)?)
-                };
-                let prebuild = loaded.iter().filter_map(|(_, t)| t.as_ref()).all(|t| {
-                    t.primary_publication_job_id != 0
-                        && old_tables.iter().any(|old| {
-                            old.id == t.id && old.active_generation == t.active_generation
-                        })
-                        && t.indexes.iter().any(|i| {
-                            i.primary
-                                && !matches!(
-                                    old_index_states.get(&(t.id, i.index_id)),
-                                    Some((IndexState::Public, _))
-                                )
-                        })
-                });
-                if prebuild {
-                    if let Err(err) =
-                        self.materialize_replicated_indexes(&loaded, &old_index_states, &old_tables)
-                    {
+                    if let Err(err) = self.retire_replicated_index_handles(&loaded, &old_tables) {
                         self.quarantine_mvcc(format!(
-                            "replicated index materialization failed: {}",
+                            "replicated index retirement failed: {}",
                             err.message()
                         ));
                         return Err(err);
                     }
-                }
-                if let Err(err) = self.retire_replicated_index_handles(&loaded, &old_tables) {
-                    self.quarantine_mvcc(format!(
-                        "replicated index retirement failed: {}",
-                        err.message()
-                    ));
-                    return Err(err);
-                }
-                let incoming_security_objects: HashSet<_> = loaded.iter()
-                    .filter_map(|(_, table)| table.as_ref().map(|table| table.object_id)).collect();
-                let security_changes = loaded.iter().filter_map(|(id, new)| {
-                    if let Some(table) = new {
-                        Some((table.object_id, Some((table.id, table.row_security.clone()))))
-                    } else {
-                        old_tables.iter().find(|table| table.id == *id && !incoming_security_objects.contains(&table.object_id)).map(|table| (table.object_id, None))
-                    }
-                }).collect();
-                let security_publication = self.catalog.row_security.prepare(security_changes, |id, version| {
-                    if let Some(old) = old_tables.iter().find(|table| table.id == id && table.row_security.version == version) {
-                        Ok(old.row_security.clone())
-                    } else { self.load_row_security_snapshot(id, version) }
-                }).map_err(|err| {
-                    self.quarantine_mvcc(format!("replicated policy publication failed: {}", err.message()));
-                    err
-                })?;
-                {
-                    let mut catalog = self.catalog.write().map_err(|_| {
-                        self.quarantine_mvcc("replicated catalog lock poisoned");
-                        error(crate::error::catalog::ER_GET_ERRNO, "catalog lock poisoned")
-                    })?;
-                    for (object_id, table) in &loaded {
-                        catalog
-                            .tables
-                            .retain(|_, existing| existing.id != *object_id);
-                        if let Some(table) = table {
-                            // Promotion allocates from the live catalog. Physical
-                            // partition IDs share the same namespace as table IDs.
-                            let max_id = table
-                                .storage_ids()
-                                .into_iter()
-                                .chain(std::iter::once(table.id))
-                                .max()
-                                .unwrap_or(table.id);
-                            catalog.next_table_id =
-                                catalog.next_table_id.max(max_id.saturating_add(1));
-                            for column in &table.columns {
-                                self.read_definition_highwater
-                                    .fetch_max(column.not_null_from_scn, Ordering::Release);
+                    let incoming_security_objects: HashSet<_> = loaded
+                        .iter()
+                        .filter_map(|(_, table)| table.as_ref().map(|table| table.object_id))
+                        .collect();
+                    let security_changes = loaded
+                        .iter()
+                        .filter_map(|(id, new)| {
+                            if let Some(table) = new {
+                                Some((
+                                    table.object_id,
+                                    Some((table.id, table.row_security.clone())),
+                                ))
+                            } else {
+                                old_tables
+                                    .iter()
+                                    .find(|table| {
+                                        table.id == *id
+                                            && !incoming_security_objects.contains(&table.object_id)
+                                    })
+                                    .map(|table| (table.object_id, None))
                             }
-                            for index in &table.indexes {
-                                self.read_definition_highwater
-                                    .fetch_max(index.readable_from_scn, Ordering::Release);
+                        })
+                        .collect();
+                    let security_publication = self
+                        .catalog
+                        .row_security
+                        .prepare(security_changes, |id, version| {
+                            if let Some(old) = old_tables.iter().find(|table| {
+                                table.id == id && table.row_security.version == version
+                            }) {
+                                Ok(old.row_security.clone())
+                            } else {
+                                self.load_row_security_snapshot(id, version)
                             }
-                            self.primary_definition_highwater
-                                .fetch_max(table.primary_definition_scn, Ordering::Release);
-                            if table.row_generation_txn_id == txn_id {
-                                self.primary_definition_highwater.fetch_max(commit_scn, Ordering::Release);
-                            }
-                            if table.primary_definition_scn != 0 {
-                                self.table_locks_sharded
-                                    .set_schema_floor(table.id, table.schema_version);
-                                for id in table.storage_ids() {
-                                    self.table_locks_sharded
-                                        .set_schema_floor(id, table.schema_version);
-                                }
-                            }
-                            catalog.tables.insert(table.qualified_name(), table.clone());
-                        }
-                    }
-                    if let Some(publication) = security_publication { publication.publish(); }
-                }
-                // CatalogManager keeps a compact id→key index and bounded
-                // descriptor/header caches outside the live Catalog value.
-                // WAL apply must publish those structures as well; updating
-                // only `live.tables` leaves a freshly replicated CREATE
-                // invisible to normal table lookup until restart.
-                self.catalog.publish_table_deltas(&object_ids);
-                for (_, table) in &loaded {
-                    let Some(table) = table else { continue };
-                    let Some(previous) = old_tables.iter().find(|old| old.id == table.id) else {
-                        continue;
-                    };
-                    if table.stats.analyze_revision < previous.stats.analyze_revision
-                        || (table.active_generation != previous.active_generation
-                            && table.stats.row_count == 0
-                            && table.stats.columns.is_empty())
-                    {
-                        self.drop_table_modification_delta(table.id);
-                        continue;
-                    }
-                    if previous.stats.analyze_revision != table.stats.analyze_revision {
-                        // The DD row includes the baselines folded by the
-                        // source ANALYZE. Replay only those subtractions;
-                        // DML committed after its snapshot stays visible.
-                        if let Some(counter) = self.table_live_row_deltas.read().get(&table.id) {
-                            // The revision transition proves this source baseline has not
-                            // been folded before. Later DELETEs may have reversed the sign.
-                            counter.fetch_sub(
-                                table.stats.last_analyze_live_baseline,
-                                Ordering::Relaxed,
-                            );
-                        }
-                        if let Some(counter) = self.table_modification_deltas.read().get(&table.id)
-                        {
-                            let baseline = table.stats.last_analyze_modification_baseline;
-                            let _ = counter.fetch_update(
-                                Ordering::Relaxed,
-                                Ordering::Relaxed,
-                                |current| Some(current.saturating_sub(baseline)),
-                            );
-                        }
-                    }
-                }
-                if !prebuild {
-                    if let Err(err) =
-                        self.materialize_replicated_indexes(&loaded, &old_index_states, &old_tables)
-                    {
-                        self.quarantine_mvcc(format!(
-                            "replicated index materialization failed: {}",
-                            err.message()
-                        ));
-                        return Err(err);
-                    }
-                }
-                if !delta.invalidate_all {
-                    return Ok(());
-                }
-            }
-            let _auth_mdl = self.lock_auth_catalog_write_mdl()?;
-            match self.load_non_table_families_from_store() {
-                Ok(loaded) => {
+                        })
+                        .map_err(|err| {
+                            self.quarantine_mvcc(format!(
+                                "replicated policy publication failed: {}",
+                                err.message()
+                            ));
+                            err
+                        })?;
                     {
                         let mut catalog = self.catalog.write().map_err(|_| {
                             self.quarantine_mvcc("replicated catalog lock poisoned");
                             error(crate::error::catalog::ER_GET_ERRNO, "catalog lock poisoned")
                         })?;
-                        catalog.next_table_id = catalog.next_table_id.max(loaded.next_table_id);
-                        catalog.next_sequence_id =
-                            catalog.next_sequence_id.max(loaded.next_sequence_id);
-                        catalog.databases = loaded.databases;
-                        catalog.views = loaded.views;
-                        catalog.routines = loaded.routines;
-                        catalog.triggers = loaded.triggers;
-                        catalog.events = loaded.events;
-                        catalog.sequences = loaded.sequences;
-                        catalog.auth = loaded.auth;
+                        for (object_id, table) in &loaded {
+                            catalog
+                                .tables
+                                .retain(|_, existing| existing.id != *object_id);
+                            if let Some(table) = table {
+                                // Promotion allocates from the live catalog. Physical
+                                // partition IDs share the same namespace as table IDs.
+                                let max_id = table
+                                    .storage_ids()
+                                    .into_iter()
+                                    .chain(std::iter::once(table.id))
+                                    .max()
+                                    .unwrap_or(table.id);
+                                catalog.next_table_id =
+                                    catalog.next_table_id.max(max_id.saturating_add(1));
+                                for column in &table.columns {
+                                    self.read_definition_highwater
+                                        .fetch_max(column.not_null_from_scn, Ordering::Release);
+                                }
+                                for index in &table.indexes {
+                                    self.read_definition_highwater
+                                        .fetch_max(index.readable_from_scn, Ordering::Release);
+                                }
+                                self.primary_definition_highwater
+                                    .fetch_max(table.primary_definition_scn, Ordering::Release);
+                                if table.row_generation_txn_id == txn_id {
+                                    self.primary_definition_highwater
+                                        .fetch_max(commit_scn, Ordering::Release);
+                                }
+                                if table.primary_definition_scn != 0 {
+                                    self.table_locks_sharded
+                                        .set_schema_floor(table.id, table.schema_version);
+                                    for id in table.storage_ids() {
+                                        self.table_locks_sharded
+                                            .set_schema_floor(id, table.schema_version);
+                                    }
+                                }
+                                catalog.tables.insert(table.qualified_name(), table.clone());
+                            }
+                        }
+                        if let Some(publication) = security_publication {
+                            publication.publish();
+                        }
                     }
-                    self.initialize_sequence_runtimes()?;
-                    self.initialize_sequence_sync()?;
-                    self.publish_auth_snapshot().map_err(|err| {
-                        self.quarantine_mvcc(format!(
-                            "replicated auth publication failed: {}",
-                            err.message()
-                        ));
-                        err
-                    })?;
+                    // CatalogManager keeps a compact id→key index and bounded
+                    // descriptor/header caches outside the live Catalog value.
+                    // WAL apply must publish those structures as well; updating
+                    // only `live.tables` leaves a freshly replicated CREATE
+                    // invisible to normal table lookup until restart.
+                    self.catalog.publish_table_deltas(&object_ids);
+                    for (_, table) in &loaded {
+                        let Some(table) = table else { continue };
+                        let Some(previous) = old_tables.iter().find(|old| old.id == table.id)
+                        else {
+                            continue;
+                        };
+                        if table.stats.analyze_revision < previous.stats.analyze_revision
+                            || (table.active_generation != previous.active_generation
+                                && table.stats.row_count == 0
+                                && table.stats.columns.is_empty())
+                        {
+                            self.drop_table_modification_delta(table.id);
+                            continue;
+                        }
+                        if previous.stats.analyze_revision != table.stats.analyze_revision {
+                            // The DD row includes the baselines folded by the
+                            // source ANALYZE. Replay only those subtractions;
+                            // DML committed after its snapshot stays visible.
+                            if let Some(counter) = self.table_live_row_deltas.read().get(&table.id)
+                            {
+                                // The revision transition proves this source baseline has not
+                                // been folded before. Later DELETEs may have reversed the sign.
+                                counter.fetch_sub(
+                                    table.stats.last_analyze_live_baseline,
+                                    Ordering::Relaxed,
+                                );
+                            }
+                            if let Some(counter) =
+                                self.table_modification_deltas.read().get(&table.id)
+                            {
+                                let baseline = table.stats.last_analyze_modification_baseline;
+                                let _ = counter.fetch_update(
+                                    Ordering::Relaxed,
+                                    Ordering::Relaxed,
+                                    |current| Some(current.saturating_sub(baseline)),
+                                );
+                            }
+                        }
+                    }
+                    if !prebuild {
+                        if let Err(err) = self.materialize_replicated_indexes(
+                            &loaded,
+                            &old_index_states,
+                            &old_tables,
+                        ) {
+                            self.quarantine_mvcc(format!(
+                                "replicated index materialization failed: {}",
+                                err.message()
+                            ));
+                            return Err(err);
+                        }
+                    }
+                    if !delta.invalidate_all {
+                        return Ok(());
+                    }
                 }
-                Err(err) => {
-                    crate::util::logging::log_message(format_args!(
+                let _auth_mdl = self.lock_auth_catalog_write_mdl()?;
+                match self.load_non_table_families_from_store() {
+                    Ok(loaded) => {
+                        {
+                            let mut catalog = self.catalog.write().map_err(|_| {
+                                self.quarantine_mvcc("replicated catalog lock poisoned");
+                                error(crate::error::catalog::ER_GET_ERRNO, "catalog lock poisoned")
+                            })?;
+                            catalog.next_table_id = catalog.next_table_id.max(loaded.next_table_id);
+                            catalog.next_sequence_id =
+                                catalog.next_sequence_id.max(loaded.next_sequence_id);
+                            catalog.databases = loaded.databases;
+                            catalog.views = loaded.views;
+                            catalog.routines = loaded.routines;
+                            catalog.triggers = loaded.triggers;
+                            catalog.events = loaded.events;
+                            catalog.sequences = loaded.sequences;
+                            catalog.auth = loaded.auth;
+                        }
+                        self.initialize_sequence_runtimes()?;
+                        self.initialize_sequence_sync()?;
+                        self.publish_auth_snapshot().map_err(|err| {
+                            self.quarantine_mvcc(format!(
+                                "replicated auth publication failed: {}",
+                                err.message()
+                            ));
+                            err
+                        })?;
+                    }
+                    Err(err) => {
+                        crate::util::logging::log_message(format_args!(
                         "mydb-repl applier: catalog reload after commit_scn={commit_scn} failed: {}",
                         err.message()
                     ));
-                    self.quarantine_mvcc(format!(
-                        "replicated catalog reload failed: {}",
-                        err.message()
-                    ));
-                    return Err(err);
+                        self.quarantine_mvcc(format!(
+                            "replicated catalog reload failed: {}",
+                            err.message()
+                        ));
+                        return Err(err);
+                    }
                 }
             }
+            Ok(())
+        })();
+        if result.is_err() {
+            if let Some(delta) = delta {
+                self.applier_dd_dirty_txns.lock().insert(txn_id, delta);
+            }
         }
-        Ok(())
+        result
     }
 
     fn apply_abort_txn(&self, txn_id: u64, complete: bool) {

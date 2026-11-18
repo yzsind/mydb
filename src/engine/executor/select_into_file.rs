@@ -631,6 +631,13 @@ fn with_value_bytes<R>(
     charset: &str,
     consume: impl FnOnce(&[u8]) -> Result<R, QueryError>,
 ) -> Result<R, QueryError> {
+    let shaped;
+    let value = if let Some(column) = column.filter(|column| column.source.round_decimal_result) {
+        shaped = crate::engine::expr::decimal_result_value(value, column.column_type);
+        shaped.as_ref()
+    } else {
+        value
+    };
     if let (Value::UInt(value), Some(column)) = (value, column) {
         if let ColumnType::Bit { bits } = column.column_type {
             let width = usize::from(bits).div_ceil(8);
@@ -656,7 +663,7 @@ fn with_value_bytes<R>(
             consume(buffer.format(*value).as_bytes())
         }
         Value::DecimalCompact(magnitude, scale) => {
-            let mut buffer = [0u8; 48];
+            let mut buffer = [0u8; 258];
             consume(crate::types::write_decimal_compact_canonical(
                 *magnitude,
                 *scale,

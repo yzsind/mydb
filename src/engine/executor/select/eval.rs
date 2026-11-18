@@ -278,7 +278,16 @@ pub(super) fn input_schema_for_plan_row(row: &PlanRow) -> crate::engine::expr_pr
         ));
     }
     let mut schema =
-        crate::engine::expr_program::InputSchema::new_with_bound_types(columns, bound_types);
+        crate::engine::expr_program::InputSchema::new_with_bound_types_and_stored_decimals(
+            columns,
+            bound_types,
+            row.fields.iter().enumerate().filter_map(|(index, field)| {
+                (matches!(field.column_type, ColumnType::Decimal { .. })
+                    && !field.meta.source.org_name.is_empty()
+                    && !field.meta.source.round_decimal_result)
+                    .then_some(index)
+            }),
+        );
     schema.mark_numeric_display_columns(row.fields.iter().enumerate().filter_map(
         |(index, field)| {
             (field.source.flags & crate::mysql::protocol::ZEROFILL_FLAG != 0).then_some((

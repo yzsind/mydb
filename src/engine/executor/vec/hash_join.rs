@@ -306,7 +306,7 @@ pub struct VecJoinSpec<'a> {
 /// Encode one row's join key. Returning false means the row has a NULL key in a non-null-safe
 /// column, which can never match under any join semantics. NULL in a null-safe column is encoded
 /// as the 0xFF sentinel of `encode_from_column_row` (NULL <=> NULL hits).
-#[inline]
+#[inline(always)]
 pub(crate) fn encode_join_key_with_collations(
     batch: &Batch,
     keys: &[usize],
@@ -314,14 +314,14 @@ pub(crate) fn encode_join_key_with_collations(
     key_collations: &[Option<u16>],
     r: usize,
     buf: &mut Vec<u8>,
-) -> bool {
+) -> Result<bool, QueryError> {
     buf.clear();
     let cols = batch.columns();
     for (i, &c) in keys.iter().enumerate() {
         let col = &cols[c];
         if col.is_null(r) {
             if !null_safe.get(i).copied().unwrap_or(false) {
-                return false;
+                return Ok(false);
             }
             // Same canonical NULL tag as the shared value/column encoder.
             buf.push(0);
@@ -338,9 +338,35 @@ pub(crate) fn encode_join_key_with_collations(
                 .or(batch.schema().fields()[c].source.collation_id),
             _ => None,
         };
+        if collation == Some(63) {
+            let source = batch.schema().fields()[c].source.collation_id;
+            if crate::engine::expr::binary_key_source_charset(collation, source).is_some() {
+                encode_transcoded_binary_key(col, r, source, buf)?;
+                continue;
+            }
+        }
         super::key_encode::encode_nonnull_from_column_row_with_collation(col, r, collation, buf);
     }
-    true
+    Ok(true)
+}
+
+// Keep legacy character-set conversion out of the common key encoder's
+// instruction footprint. UTF-8 and nonbinary comparisons never enter here.
+#[cold]
+#[inline(never)]
+fn encode_transcoded_binary_key(
+    column: &ColumnVector,
+    row: usize,
+    source: Option<u16>,
+    out: &mut Vec<u8>,
+) -> Result<(), QueryError> {
+    let key = crate::engine::expr::ValueKey::from_with_source_collation(
+        &column.value_at(row),
+        Some(63),
+        source,
+    )?;
+    super::key_encode::encode_value_key(key, out);
+    Ok(())
 }
 
 /// Fill the batch's visible row indices into the reusable buffer.
@@ -455,9 +481,13 @@ impl<'a> PayloadProbe<'a> {
         }
     }
 
-    #[inline]
-    pub(crate) fn lookup(&self, row: usize, key: &mut Vec<u8>) -> (bool, Option<&'a [u32]>) {
-        match self {
+    #[inline(always)]
+    pub(crate) fn lookup(
+        &self,
+        row: usize,
+        key: &mut Vec<u8>,
+    ) -> Result<(bool, Option<&'a [u32]>), QueryError> {
+        Ok(match self {
             Self::Packed { index, batch, keys } => index.lookup(batch, keys, row),
             Self::I64 { index, column } => {
                 let usable = column.usable(row);
@@ -493,7 +523,7 @@ impl<'a> PayloadProbe<'a> {
                 collations,
             } => {
                 let usable =
-                    encode_join_key_with_collations(batch, keys, null_safe, collations, row, key);
+                    encode_join_key_with_collations(batch, keys, null_safe, collations, row, key)?;
                 (
                     usable,
                     if usable {
@@ -503,7 +533,7 @@ impl<'a> PayloadProbe<'a> {
                     },
                 )
             }
-        }
+        })
     }
 }
 
@@ -853,7 +883,7 @@ fn collect_build_payload_impl(
                     key_collations,
                     r,
                     &mut key_buf,
-                ) {
+                )? {
                     continue;
                 }
                 if cap.is_some() {
@@ -934,7 +964,7 @@ pub(crate) fn collect_full_build_payload(
                 key_collations,
                 row,
                 &mut key_buf,
-            ) {
+            )? {
                 if cap.is_some() {
                     build_bytes = build_bytes.saturating_add(BUILD_INDEX_ROW_ID_BYTES);
                     if !index.contains_key(key_buf.as_slice()) {
@@ -1076,7 +1106,7 @@ fn collect_build_keyset_with_collations(
                 key_collations,
                 r,
                 &mut key_buf,
-            ) {
+            )? {
                 continue;
             }
             // Check existence by borrow first and clone only new keys — zero allocation for duplicate keys.
@@ -1266,7 +1296,7 @@ impl ProbeKernel {
             if position > 0 && position & 1023 == 0 {
                 crate::engine::cancel::check_cancelled()?;
             }
-            let hits = self.lookup_row(index, batch, row);
+            let hits = self.lookup_row(index, batch, row)?;
             sink.accept(row as u32, hits)?;
         }
         sink.finish()
@@ -1278,7 +1308,7 @@ impl ProbeKernel {
         index: &'a BuildIndex,
         batch: &Batch,
         row: usize,
-    ) -> Option<&'a [u32]> {
+    ) -> Result<Option<&'a [u32]>, QueryError> {
         let usable = encode_join_key_with_collations(
             batch,
             &self.probe_keys,
@@ -1286,16 +1316,16 @@ impl ProbeKernel {
             &self.key_collations,
             row,
             &mut self.key_buf,
-        );
+        )?;
         if !usable {
-            return None;
+            return Ok(None);
         }
         if self
             .bloom
             .as_ref()
             .is_some_and(|filter| !filter.contains(self.key_buf.as_slice()))
         {
-            return None;
+            return Ok(None);
         }
 
         let hits = index.get(self.key_buf.as_slice()).map(SmallVec::as_slice);
@@ -1320,7 +1350,7 @@ impl ProbeKernel {
                 }
             }
         }
-        hits
+        Ok(hits)
     }
 }
 
@@ -1545,7 +1575,7 @@ pub(crate) fn run_inner_hash_join_into(
                 if position & 1023 == 0 {
                     crate::engine::cancel::check_cancelled()?;
                 }
-                let (usable, hits) = lookup.lookup(row, &mut kernel.key_buf);
+                let (usable, hits) = lookup.lookup(row, &mut kernel.key_buf)?;
                 rejected += u64::from(usable && hits.is_none());
                 sink.accept(row as u32, hits)?;
             }
@@ -1629,7 +1659,7 @@ pub fn run_inner_hash_join_partitioned(
                     spec.key_collations,
                     r,
                     &mut key_buf,
-                ) {
+                )? {
                     batch_pids[r] = (super::key_encode::fxhash(&key_buf) % parts as u64) as u8;
                 }
             }
@@ -1671,7 +1701,7 @@ pub fn run_inner_hash_join_partitioned(
                                 spec.key_collations,
                                 r,
                                 &mut key_buf,
-                            ) {
+                            )? {
                                 continue;
                             }
                             index
@@ -1723,7 +1753,7 @@ pub fn run_inner_hash_join_partitioned(
                 spec.key_collations,
                 r,
                 &mut key_buf,
-            ) {
+            )? {
                 continue;
             }
             let pid = (super::key_encode::fxhash(&key_buf) % parts as u64) as usize;
@@ -1943,7 +1973,7 @@ pub(crate) fn run_outer_hash_join_into(
                 spec.key_collations,
                 probe_row,
                 &mut key_buf,
-            );
+            )?;
             let hits = usable
                 .then(|| payload.index.get(key_buf.as_slice()))
                 .flatten();
@@ -2156,7 +2186,7 @@ pub(crate) fn run_semi_anti_hash_join_into(
                         key_collations,
                         r,
                         &mut key_buf,
-                    );
+                    )?;
                     let matched = usable && set.contains(key_buf.as_slice());
                     if matched != is_anti {
                         sel.push(r as u32);
@@ -2192,7 +2222,7 @@ pub(crate) fn run_semi_anti_hash_join_into(
                         key_collations,
                         r,
                         &mut key_buf,
-                    );
+                    )?;
                     let mut matched = false;
                     if let Some(hits) = usable
                         .then(|| payload.index.get(key_buf.as_slice()))
@@ -2471,7 +2501,7 @@ impl StreamingProbe {
                     .get(self.probe_kernel.key_buf.as_slice())
                     .map(SmallVec::as_slice)
             } else {
-                self.probe_kernel.lookup_row(&payload.index, batch, row)
+                self.probe_kernel.lookup_row(&payload.index, batch, row)?
             };
             if let Some(hits) = hits {
                 let count =
@@ -2575,7 +2605,9 @@ mod tests {
                                 &[],
                                 row,
                                 &mut pk,
-                            ) {
+                            )
+                            .unwrap()
+                            {
                                 continue;
                             }
                             for b in [&build, &nulls] {
@@ -2588,7 +2620,9 @@ mod tests {
                                         &[],
                                         br,
                                         &mut bk,
-                                    ) && bk == pk
+                                    )
+                                    .unwrap()
+                                        && bk == pk
                                     {
                                         let (first, second) = if build_first {
                                             (b.row(br), p.row(row))
@@ -2705,7 +2739,8 @@ mod tests {
                     &[collation],
                     row,
                     &mut encoded,
-                );
+                )
+                .unwrap();
                 index.entry(encoded.clone()).or_default().push(row as u32);
             }
             let payload = BuildPayload {
@@ -2889,7 +2924,9 @@ mod tests {
                         &[],
                         row,
                         &mut key,
-                    ) {
+                    )
+                    .unwrap()
+                    {
                         oracle.entry(key.clone()).or_default().push(row as u32);
                     }
                 }
@@ -2914,13 +2951,14 @@ mod tests {
                             &[],
                             row,
                             &mut key,
-                        );
+                        )
+                        .unwrap();
                         let expected = if usable {
                             oracle.get(&key).map(SmallVec::as_slice)
                         } else {
                             None
                         };
-                        let actual = lookup.lookup(row, &mut Vec::new());
+                        let actual = lookup.lookup(row, &mut Vec::new()).unwrap();
                         assert_eq!(actual, (usable, expected));
                     }
                 }

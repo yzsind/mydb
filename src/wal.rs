@@ -1524,15 +1524,21 @@ fn discover_all_segments(dir: &Path) -> Result<Vec<(u64, PathBuf)>, QueryError> 
             Some(s) => s,
             None => continue,
         };
-        if !name_str.starts_with("wal-") || !name_str.ends_with(".log") {
+        let Some(id_part) = name_str.strip_prefix("wal-").and_then(|name| {
+            name.strip_suffix(".log")
+                .or_else(|| name.strip_suffix(".log.pending"))
+        }) else {
             continue;
-        }
-        let id_part = &name_str[4..name_str.len() - 4];
+        };
         if let Ok(id) = u64::from_str_radix(id_part, 16) {
             segments.push((id, entry.path()));
         }
     }
     segments.sort_by_key(|(id, _)| *id);
+    if segments.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(crate::error::catalog::ER_GET_ERRNO
+            .error("duplicate published and pending WAL segment identity"));
+    }
     Ok(segments)
 }
 
@@ -1647,18 +1653,6 @@ impl LogManager {
             let _ = fs::remove_file(dir.join(WAL_PREP_TMP_NAME));
         }
         let discovered = discover_segments(&dir)?;
-        if !read_only {
-            for entry in fs::read_dir(&dir).map_err(io_err)? {
-                let entry = entry.map_err(io_err)?;
-                let name = entry.file_name();
-                if name
-                    .to_str()
-                    .is_some_and(|name| name.starts_with("wal-") && name.ends_with(".log.pending"))
-                {
-                    fs::remove_file(entry.path()).map_err(io_err)?;
-                }
-            }
-        }
 
         // No segments yet — bootstrap segment 1. Don't preallocate the
         // extent up front: the caller (production: `Database::open_with_config`,
@@ -1765,8 +1759,19 @@ impl LogManager {
                         "WAL changed since recovery snapshot",
                     ));
                 }
+                let mut sealed = bootstrap.segments[..bootstrap.segments.len() - 1].to_vec();
+                for segment in &mut sealed {
+                    let (_, path) = discovered
+                        .iter()
+                        .find(|(id, _)| *id == segment.segment_id)
+                        .ok_or_else(|| {
+                            crate::error::catalog::ER_GET_ERRNO
+                                .error("WAL changed since recovery snapshot")
+                        })?;
+                    segment.path = path.clone();
+                }
                 (
-                    bootstrap.segments[..bootstrap.segments.len() - 1].to_vec(),
+                    sealed,
                     bootstrap.txn_last_lsn.clone(),
                     bootstrap.stats,
                     active.first_lsn,
@@ -1852,7 +1857,7 @@ impl LogManager {
         // `set_max_segment_bytes` (the production path always does;
         // tests that need a small segment cap set it explicitly), the
         // setter will reapply preallocation up to the new ceiling.
-        let size_bytes = fs::metadata(&active_path).map(|m| m.len()).unwrap_or(0);
+        let size_bytes = end_offset;
 
         // For the active segment, derive [first_lsn, last_lsn] from the
         // scan: any record whose lsn falls outside every sealed range
@@ -1872,6 +1877,33 @@ impl LogManager {
         if !read_only {
             sync_wal_file(&file)?;
         }
+        let pending_publications = if read_only {
+            Vec::new()
+        } else {
+            for segment in &sealed_meta {
+                if segment
+                    .path
+                    .extension()
+                    .is_some_and(|extension| extension == "pending")
+                {
+                    sync_wal_file(
+                        &OpenOptions::new()
+                            .read(true)
+                            .write(true)
+                            .open(&segment.path)
+                            .map_err(io_err)?,
+                    )?;
+                }
+            }
+            discovered
+                .iter()
+                .filter(|(_, path)| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "pending")
+                })
+                .map(|(id, _)| *id)
+                .collect()
+        };
         let (new_lsn_tx, _) = watch::channel(active_last_lsn);
         let (durable_lsn_tx, _) = watch::channel(active_last_lsn);
         let state_atomics = Arc::new(LogStateAtomics::default());
@@ -1889,7 +1921,7 @@ impl LogManager {
         let (encode_scratch, encode_scratch_charge) = controlled_wal_buffer(0)?;
         let (pending_write_bytes, pending_write_charge) =
             controlled_wal_buffer(write_buffer_bytes)?;
-        Ok(Self {
+        let mut log = Self {
             read_only,
             source_clock,
             budget: None,
@@ -1930,8 +1962,12 @@ impl LogManager {
             zero_fill_min_sync_us: ZERO_FILL_MIN_RESERVE_SYNC_US,
             pending_sealed_sync: Vec::new(),
             directory_sync_pending: false,
-            pending_publications: Vec::new(),
-        })
+            pending_publications,
+        };
+        if !read_only {
+            log.publish_synced_prefix(active_last_lsn)?;
+        }
+        Ok(log)
     }
 
     /// Lock-free handle to the few LogManager fields the hot path
@@ -5482,12 +5518,11 @@ fn scan_segment_with_id(
 fn inspect_segment(path: &Path, segment_id: u64) -> Result<WalSegmentInfo, QueryError> {
     let mut first_lsn = None;
     let mut last_lsn = 0;
-    visit_segment_records(path, segment_id, false, |record| {
+    let (_, size_bytes) = visit_segment_records(path, segment_id, false, |record| {
         first_lsn.get_or_insert(record.lsn);
         last_lsn = record.lsn;
         Ok(())
     })?;
-    let size_bytes = fs::metadata(path).map(|m| m.len()).unwrap_or(0);
     let first_lsn = first_lsn.unwrap_or(FIRST_LSN);
     let last_lsn = last_lsn.max(first_lsn.saturating_sub(1));
     Ok(WalSegmentInfo {
@@ -10081,6 +10116,76 @@ mod tests {
         log.finish_sync_to(high_water, 0);
         assert!(log.durable_lsn() >= target);
         assert!(log.pending_sealed_sync.is_empty());
+    }
+
+    #[test]
+    fn issue_15_relaxed_pending_rotation_survives_reopen() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = open_log_with_segment_cap(dir.path(), 2048);
+        append_filler(&mut log, 1, 12);
+        let target = log
+            .append(
+                2,
+                WalPayload::CommitTxn {
+                    commit_scn: 7,
+                    commit_unix_us: 7,
+                    binlog: None,
+                },
+            )
+            .unwrap();
+        log.prepare_sync_to(target).unwrap();
+        let pending = log.path().to_path_buf();
+        assert!(pending.to_string_lossy().ends_with(".log.pending"));
+        // Copy the OS-visible bytes before Drop can run a durability barrier.
+        let crash = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let crash_wal = crate::storage::naming::system_wal_dir(crash.path());
+        fs::create_dir_all(&crash_wal).unwrap();
+        fs::copy(
+            dir.path().join("system/storage.control"),
+            crash.path().join("system/storage.control"),
+        )
+        .unwrap();
+        for entry in fs::read_dir(&log.dir).unwrap() {
+            let entry = entry.unwrap();
+            fs::copy(entry.path(), crash_wal.join(entry.file_name())).unwrap();
+        }
+        let reopened = LogManager::open(crash.path()).unwrap();
+        assert_eq!(reopened.next_lsn(), target + 1);
+        let scan = LogManager::scan(crash.path()).unwrap();
+        assert_eq!(scan.records.last().unwrap().lsn, target);
+    }
+
+    #[test]
+    fn issue_21_replay_segment_excludes_preallocated_tail() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let mut log = open_log_with_segment_cap(dir.path(), 4096);
+        append_filler(&mut log, 1, 20);
+        log.flush().unwrap();
+        let segments = log.segment_snapshot();
+        let sealed = segments
+            .iter()
+            .find(|segment| segment.segment_id != log.active_segment_id())
+            .unwrap();
+        let valid = sealed.size_bytes;
+        let path = sealed.path.clone();
+        drop(log);
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(valid + 4096)
+            .unwrap();
+        let scan = LogManager::scan_replay(dir.path()).unwrap();
+        let reopened = LogManager::open_from_replay(dir.path(), &scan).unwrap();
+        assert_eq!(
+            reopened
+                .segment_snapshot()
+                .iter()
+                .find(|info| info.segment_id == sealed.segment_id)
+                .unwrap()
+                .size_bytes,
+            valid
+        );
     }
 
     #[test]

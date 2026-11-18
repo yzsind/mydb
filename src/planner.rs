@@ -26042,7 +26042,15 @@ fn propagate_equivalence_constraints(db: &Database, select: &mut Select) {
     let sources: Vec<_> = select
         .from
         .iter()
-        .chain(select.joins.iter().map(|j| &j.table))
+        .filter(|_| select.derived.is_none())
+        .chain(
+            select
+                .joins
+                .iter()
+                .filter(|join| join.derived.is_none())
+                .map(|j| &j.table),
+        )
+        .filter(|table| !crate::engine::executor::cte::has_cte(&table.name))
         .filter_map(|t| db.table(&t.name).ok().map(|schema| (t.clone(), schema)))
         .collect();
     let column = |key: &EqColumnKey| {

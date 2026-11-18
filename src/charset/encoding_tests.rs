@@ -111,7 +111,11 @@ fn name_indexes_resolve_all_canonical_quoted_and_uppercase_names() {
             collation.name.to_uppercase(),
             format!("'{}'", collation.name),
         ] {
-            assert_eq!(resolve_collation(&name).unwrap(), collation);
+            if collation.is_compiled {
+                assert_eq!(resolve_collation(&name).unwrap(), collation);
+            } else {
+                assert_eq!(resolve_collation(&name).unwrap_err().code(), 1235);
+            }
         }
     }
     assert_eq!(resolve_charset("utf8").unwrap().name, "utf8mb3");

@@ -1362,7 +1362,7 @@ impl HashJoinBatchOperator<'_> {
                     &self.key_collations,
                     row,
                     &mut encoded,
-                ) {
+                )? {
                     if candidates.contains(encoded.as_slice()) {
                         continue;
                     }
@@ -1394,7 +1394,7 @@ impl HashJoinBatchOperator<'_> {
                     &self.key_collations,
                     row,
                     &mut encoded,
-                );
+                )?;
                 if usable && candidates.contains(encoded.as_slice()) {
                     match_rows = match_rows.saturating_add(1);
                     if !matched.contains(encoded.as_slice()) {
@@ -1427,7 +1427,7 @@ impl HashJoinBatchOperator<'_> {
                     &self.key_collations,
                     row,
                     &mut encoded,
-                );
+                )?;
                 let exists = usable && matched.contains(encoded.as_slice());
                 if exists == (self.join_type == JoinType::Semi) {
                     selected.push(row as u32);
@@ -1868,7 +1868,7 @@ impl HashJoinBatchOperator<'_> {
         };
 
         for probe_row in batch.visible_indices() {
-            let (usable, hits) = lookup.lookup(probe_row, &mut key);
+            let (usable, hits) = lookup.lookup(probe_row, &mut key)?;
             if usable && hits.is_none() {
                 analyze_stats::add_pending_runtime_filter_rejected(1);
             }
@@ -1970,7 +1970,7 @@ impl HashJoinBatchOperator<'_> {
         loop {
             let mut active = Vec::with_capacity(DEFAULT_BATCH_ROWS);
             for probe_row in probes.by_ref().take(DEFAULT_BATCH_ROWS) {
-                let (usable, hits) = lookup.lookup(probe_row, &mut key);
+                let (usable, hits) = lookup.lookup(probe_row, &mut key)?;
                 if usable && hits.is_none() {
                     analyze_stats::add_pending_runtime_filter_rejected(1);
                 }
@@ -2084,7 +2084,7 @@ impl HashJoinBatchOperator<'_> {
             &self.key_collations,
         );
         for probe_row in batch.visible_indices() {
-            let (usable, hits) = lookup.lookup(probe_row, &mut key);
+            let (usable, hits) = lookup.lookup(probe_row, &mut key)?;
             if usable && hits.is_none() {
                 analyze_stats::add_pending_runtime_filter_rejected(1);
             }

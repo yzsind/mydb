@@ -27,6 +27,7 @@ pub(super) struct NumericRead {
     input: Input,
     places: i32,
     dynamic_scale: bool,
+    string_scale: Option<u8>,
 }
 fn places_arg(node: &ExprNode) -> Option<i32> {
     let parse = |value: &Value| match value {
@@ -107,7 +108,15 @@ impl NumericRead {
             }
             _ => return None,
         };
-        let ExprNode::Column(column) = args.first()? else {
+        let (argument, string_scale) = match args.first()? {
+            ExprNode::Function {
+                kernel: FunctionKernel::DecimalString(scale),
+                args,
+                ..
+            } if kind == Kind::Cast && args.len() == 1 => (&args[0], Some(*scale)),
+            argument => (argument, None),
+        };
+        let ExprNode::Column(column) = argument else {
             return None;
         };
         let field = schema.fields().get(*column)?;
@@ -169,6 +178,7 @@ impl NumericRead {
             input,
             places,
             dynamic_scale,
+            string_scale,
         })
     }
     pub(super) fn contract(&self) -> Contract {
@@ -201,7 +211,9 @@ impl NumericRead {
                     ColumnVector::Null { .. } => 0,
                     _ => return None,
                 };
-                usize::from(scale).max(39).checked_add(3)?
+                usize::from(scale.max(self.string_scale.unwrap_or(0)))
+                    .max(39)
+                    .checked_add(3)?
             }
             Kind::Cast => 20,
             _ => 32,
@@ -358,7 +370,10 @@ impl NumericRead {
                 }
                 Kind::Cast => {
                     if self.input == Input::Decimal {
-                        append_decimal(magnitude, scale, &mut data);
+                        let target = self.string_scale.unwrap_or(scale);
+                        let magnitude =
+                            crate::util::decimal::rescale_round_i128(magnitude, scale, target)?;
+                        append_decimal(magnitude, target, &mut data);
                     } else {
                         let mut buffer = itoa::Buffer::new();
                         data.extend_from_slice(buffer.format(magnitude as u64).as_bytes());

@@ -1,6 +1,6 @@
 # mydb Native Physical Replication
 
-Native replication is a mydb→mydb WAL stream independent of the MySQL binlog. Protocol v3 only connects nodes whose physical formats match exactly and distinguishes four progress watermarks:
+Native replication is a mydb→mydb WAL stream independent of the MySQL binlog. Protocol v4 only connects nodes whose physical formats match exactly and distinguishes four progress watermarks:
 
 - `received_lsn`: network frames have passed envelope/WAL CRC and range validation;
 - `durable_lsn`: frames have entered the replica's durable WAL;
@@ -110,6 +110,10 @@ Optimizer statistics are authoritative dictionary state received from the source
 ## Base Backup
 
 Capture pauses admission of new writers and lets existing write transactions finish for up to `MYDB_REPL_BASE_BACKUP_DRAIN_MS` (default 3000 ms). A timeout releases admission and reports active source writers; it does not leave the source frozen. The subsequent file-copy window still pauses physical mutations. Resolve XA PREPARED branches with XA COMMIT or XA ROLLBACK before seeding; the native seed protocol currently rejects them explicitly.
+
+`MYDB_REPL_BASE_BACKUP_DRAIN_MS` accepts 0 through 3,600,000 ms. Capture runs on a blocking worker and sends progress heartbeats every five seconds; the replica's 60-second read timeout measures silence between frames, rather than total capture time. Disconnecting a replica cancels draining and private file copying at their next cancellation check and releases capture admission.
+
+Native protocol version 4 streams large file manifests as bounded continuation frames followed by a final start frame. Each frame retains the 64 MiB protocol ceiling; manifests normally use 4 MiB chunks and are subject to unified memory admission. There is no single-frame limit on the complete file list. All manifest frames must identify the same backup LSN.
 
 A failed initial boot can leave empty directories, zero-length dictionary heaps, and WAL headers. These do not constitute a completed seed: once a source is configured, mydb seeds the node while preserving its UUID. Existing progress, dictionary heap data, WAL records, or user object files prevent implicit initial seeding.
 

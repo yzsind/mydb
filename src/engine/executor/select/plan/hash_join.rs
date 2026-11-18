@@ -29,6 +29,8 @@ pub(in crate::engine::executor::select) struct HashJoinKeyPlan {
     /// compiled field offset so every row-mode bucket, bloom and partition
     /// hash uses the same schema-derived semantics as the vector engine.
     pub(in crate::engine::executor::select) collation_ids: smallvec::SmallVec<[Option<u16>; 2]>,
+    pub(in crate::engine::executor::select) source_collation_ids:
+        smallvec::SmallVec<[Option<u16>; 2]>,
 }
 
 impl<'a> HashJoinSpec<'a> {
@@ -1162,6 +1164,7 @@ pub(super) fn compile_hash_join_key_plan(
     }
     Some(HashJoinKeyPlan {
         field_indices,
+        source_collation_ids: collation_ids.clone(),
         collation_ids,
     })
 }
@@ -3749,6 +3752,7 @@ pub(super) fn try_execute_streaming_inner_hash_join(
     let bloom_ref = bloom.as_ref();
     let probe_key_indices_ref: &[usize] = &probe_key_indices;
     let probe_key_collations_ref: &[Option<u16>] = &probe_key_plan.collation_ids;
+    let probe_source_collations_ref: &[Option<u16>] = &probe_key_plan.source_collation_ids;
     let probe_templates_ref: &[PlanField] = &probe_templates;
     let projection_ref: &[usize] = &projection_owned;
     let output_positions_ref: &[usize] = &output_positions;
@@ -3796,6 +3800,7 @@ pub(super) fn try_execute_streaming_inner_hash_join(
                 bloom_ref,
                 probe_key_indices_ref,
                 probe_key_collations_ref,
+                probe_source_collations_ref,
                 probe_templates_ref,
                 output_positions_ref,
                 emit_slots_ref,
@@ -3874,6 +3879,7 @@ pub(super) fn try_execute_streaming_inner_hash_join(
                                 bloom_ref,
                                 probe_key_indices_ref,
                                 probe_key_collations_ref,
+                                probe_source_collations_ref,
                                 probe_templates_ref,
                                 output_positions_ref,
                                 emit_slots_ref,
@@ -4052,6 +4058,7 @@ pub(super) fn streaming_probe_one_worker(
     bloom: Option<&BloomFilter>,
     probe_key_indices: &[usize],
     probe_key_collations: &[Option<u16>],
+    probe_source_collations: &[Option<u16>],
     probe_templates: &[PlanField],
     output_positions: &[usize],
     emit_slots: Option<&[StreamEmitSlot]>,
@@ -4129,10 +4136,11 @@ pub(super) fn streaming_probe_one_worker(
                             has_unsafe_null = true;
                             break;
                         }
-                        key.push(ValueKey::from_with_collation(
+                        key.push(ValueKey::from_with_source_collation(
                             v,
                             probe_key_collations.get(i).copied().flatten(),
-                        ));
+                            probe_source_collations.get(i).copied().flatten(),
+                        )?);
                     }
                     if has_unsafe_null {
                         record_hash_join_null_skipped();
@@ -6369,8 +6377,12 @@ pub(super) fn partition_for_row_fast(
             }
             return Ok(0);
         }
-        ValueKey::from_with_collation(value, key_plan.collation_ids.get(i).copied().flatten())
-            .hash(&mut h);
+        ValueKey::from_with_source_collation(
+            value,
+            key_plan.collation_ids.get(i).copied().flatten(),
+            key_plan.source_collation_ids.get(i).copied().flatten(),
+        )?
+        .hash(&mut h);
     }
     Ok(h.finish() % p)
 }
@@ -6459,10 +6471,11 @@ pub(super) fn compute_join_key_fast(
         if is_null && !null_safe_bit {
             return Ok(None);
         }
-        out.push(ValueKey::from_with_collation(
+        out.push(ValueKey::from_with_source_collation(
             value,
             key_plan.collation_ids.get(i).copied().flatten(),
-        ));
+            key_plan.source_collation_ids.get(i).copied().flatten(),
+        )?);
     }
     Ok(Some(out))
 }

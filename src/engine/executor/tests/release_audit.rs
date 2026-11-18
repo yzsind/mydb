@@ -98,7 +98,7 @@ fn release_audit_explicit_collation_and_mixed_join() {
         ("s COLLATE utf8mb4_bin='ABC'", "2"),
         ("s COLLATE utf8mb4_bin='abc '", "1,3"),
         ("s=_binary'ABC'", "1,2"),
-        ("s COLLATE utf8mb4_0900_as_cs LIKE 'A%'", "2"),
+        ("s COLLATE utf8mb4_0900_bin LIKE 'A%'", "2"),
         ("s COLLATE utf8mb4_bin IN ('abc','ABC')", "1,2,3"),
     ] {
         let actual = rows(

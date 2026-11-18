@@ -368,11 +368,18 @@ struct PersistedChannel {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct RelayRecord {
-    source_file: String,
+struct RelayRecord<S: Default = String, O = RelayOp> {
+    #[serde(default)]
+    source_uuid: S,
+    source_file: S,
     source_pos: u64,
-    gtid: Option<String>,
-    op: RelayOp,
+    gtid: Option<S>,
+    op: O,
+}
+
+struct CachedTableMap {
+    event: mysql::binlog::events::TableMapEvent<'static>,
+    _memory: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
 /// Session-scoped state extracted from the source-side QUERY_EVENT
@@ -2064,6 +2071,10 @@ impl ChannelRunner {
     /// TxnCommit/DDL record boundary, so this reads a whole number of
     /// transactions. Row records buffer until their commit marker.
     fn sql_apply_available(&self, durable: u64) -> Result<(), QueryError> {
+        if self.until_should_stop_after("", 0, None) {
+            self.stop_on_until();
+            return Ok(());
+        }
         let path = relay_log_path(&self.data_dir, &self.status_snapshot().channel);
         if !path.exists() {
             return Ok(());
@@ -2334,6 +2345,9 @@ impl ChannelRunner {
                     *pending_bytes = pending_bytes.saturating_add(txn_bytes);
                     if pending_commits.len() as u64 >= self.runtime.flush_policy.apply_batch_txns
                         || *pending_bytes >= self.runtime.flush_policy.apply_batch_bytes
+                        || self.runtime.until.lock().ok().is_some_and(|until| {
+                            matches!(*until, Some(UntilCondition::SqlAfterGtids(_)))
+                        })
                     {
                         self.flush_pending_relay_commits(path, pending_commits, pending_bytes)?;
                     }
@@ -2781,6 +2795,9 @@ impl ChannelRunner {
                 }
             });
         }
+        if probed_uuid.is_none() {
+            self.update_status(|status| status.source_uuid.clear());
+        }
 
         let (file, pos) = self.start_position(cfg)?;
         {
@@ -2808,8 +2825,8 @@ impl ChannelRunner {
             .get_binlog_stream_with_checksum(request, checksum)
             .map_err(|err| source_io_error("request binlog stream", err))?;
 
-        let mut table_maps: HashMap<u64, mysql::binlog::events::TableMapEvent<'static>> =
-            HashMap::new();
+        stream.set_table_map_cache_enabled(false);
+        let mut table_maps: HashMap<u64, CachedTableMap> = HashMap::new();
         let mut txn = TxnBuffer::default();
         let mut current_file = file;
         self.update_status(|status| {
@@ -2878,7 +2895,7 @@ impl ChannelRunner {
         event: &mysql::binlog::events::Event,
         current_file: &mut String,
         progress_pos: u64,
-        table_maps: &mut HashMap<u64, mysql::binlog::events::TableMapEvent<'static>>,
+        table_maps: &mut HashMap<u64, CachedTableMap>,
         txn: &mut TxnBuffer,
     ) -> Result<(), QueryError> {
         let Some(data) = event.read_data().map_err(|err| {
@@ -2899,8 +2916,10 @@ impl ChannelRunner {
         match data {
             EventData::FormatDescriptionEvent(_) | EventData::PreviousGtidsEvent(_) => {}
             EventData::RotateEvent(ev) => {
+                *current_file = decode_binlog_file_name(ev.name_raw())?;
                 if !ev.is_fake() {
-                    *current_file = decode_binlog_file_name(ev.name_raw())?;
+                    table_maps.clear();
+                    table_maps.shrink_to(64);
                     self.update_status(|status| {
                         status.source_log_file = current_file.clone();
                         status.source_log_pos = ev.position();
@@ -2927,9 +2946,28 @@ impl ChannelRunner {
                 });
             }
             EventData::TableMapEvent(ev) => {
-                table_maps.insert(ev.table_id(), ev.into_owned());
+                if table_maps.len() >= 4096 && !table_maps.contains_key(&ev.table_id()) {
+                    mark_io_error_fatal();
+                    return Err(crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG
+                        .error("source statement exceeds the 4096 active TABLE_MAP limit"));
+                }
+                let memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                    crate::engine::executor::mem_budget::ControlledMemoryCategory::BinlogTransient,
+                    (event.header().event_size() as usize)
+                        .saturating_mul(4)
+                        .saturating_add(256),
+                )?;
+                table_maps.insert(
+                    ev.table_id(),
+                    CachedTableMap {
+                        event: ev.into_owned(),
+                        _memory: memory,
+                    },
+                );
             }
             EventData::GtidEvent(ev) => {
+                table_maps.clear();
+                table_maps.shrink_to(64);
                 let gtid = format_gtid(ev.sid(), ev.gno());
                 txn.gtid = Some(gtid.clone());
                 self.update_status(|status| {
@@ -2937,6 +2975,8 @@ impl ChannelRunner {
                 });
             }
             EventData::AnonymousGtidEvent(_) => {
+                table_maps.clear();
+                table_maps.shrink_to(64);
                 txn.gtid = None;
             }
             EventData::QueryEvent(ev) => {
@@ -2964,6 +3004,8 @@ impl ChannelRunner {
                 }
                 if sql.eq_ignore_ascii_case("COMMIT") {
                     self.io_commit_txn(current_file, progress_pos, txn)?;
+                    table_maps.clear();
+                    table_maps.shrink_to(64);
                     return Ok(());
                 }
                 if is_session_query(&sql) {
@@ -3023,6 +3065,8 @@ impl ChannelRunner {
             }
             EventData::XidEvent(_) => {
                 self.io_commit_txn(current_file, progress_pos, txn)?;
+                table_maps.clear();
+                table_maps.shrink_to(64);
             }
             EventData::RowsEvent(rows) => {
                 let table_id = rows.table_id();
@@ -3032,6 +3076,7 @@ impl ChannelRunner {
                         format!("rows event references missing TABLE_MAP id {table_id}"),
                     ));
                 };
+                let table_map = &table_map.event;
                 use mysql_common::proto::MySerialize;
                 let mut fde = Vec::new();
                 let mut map_bytes = Vec::new();
@@ -3049,6 +3094,13 @@ impl ChannelRunner {
                 // SQL thread reads it back and applies at the commit marker.
                 self.append_relay(current_file, progress_pos, txn.gtid.clone(), &op)?;
                 txn.event_count = txn.event_count.saturating_add(1);
+                if rows
+                    .flags()
+                    .contains(mysql_common::binlog::consts::RowsEventFlags::STMT_END)
+                {
+                    table_maps.clear();
+                    table_maps.shrink_to(64);
+                }
             }
             EventData::StopEvent | EventData::IgnorableEvent(_) | EventData::RowsQueryEvent(_) => {}
             EventData::TransactionPayloadEvent(ev) => {
@@ -3059,6 +3111,7 @@ impl ChannelRunner {
                     )
                 })?;
                 let mut payload_reader = EventStreamReader::new(BinlogVersion::Version4);
+                payload_reader.set_table_map_cache_enabled(false);
                 loop {
                     let Some(inner_event) = payload_reader
                         .read_decompressed(&mut payload)
@@ -3529,15 +3582,27 @@ impl ChannelRunner {
         op: &RelayOp,
         force_sync_override: Option<bool>,
     ) -> Result<(), QueryError> {
-        let path = relay_log_path(&self.data_dir, &self.status_snapshot().channel);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|err| io_error("create relay directory", err))?;
-        }
+        let (channel, source_uuid) = self
+            .runtime
+            .status
+            .lock()
+            .map(|status| (status.channel.clone(), status.source_uuid.clone()))
+            .unwrap_or_else(|_| {
+                let status = ReplicationStatus::from_config(
+                    &ReplicationChannelConfig::default(),
+                    &self.data_dir,
+                );
+                (status.channel, status.source_uuid)
+            });
+        let path = relay_log_path(&self.data_dir, &channel);
+        // The serializer finishes before returning; the buffered writer owns
+        // encoded bytes and never retains references to event payloads.
         let record = RelayRecord {
-            source_file: file.to_string(),
+            source_uuid: source_uuid.as_str(),
+            source_file: file,
             source_pos: pos,
-            gtid,
-            op: op.clone(),
+            gtid: gtid.as_deref(),
+            op,
         };
         // Transaction boundaries are group-fsynced. DDL remains an immediate
         // barrier; transactional DDL is an intra-transaction record and is
@@ -3580,6 +3645,10 @@ impl ChannelRunner {
             ));
         }
         if slot.is_none() {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .map_err(|err| io_error("create relay directory", err))?;
+            }
             let file = OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -3611,7 +3680,7 @@ impl ChannelRunner {
                 .lock()
                 .map_err(|_| poisoned_lock("relay sync state lock poisoned"))?;
             sync.pending_boundaries = sync.pending_boundaries.saturating_add(1);
-            sync.latest_source_file = record.source_file.clone();
+            sync.latest_source_file = record.source_file.to_owned();
             sync.latest_source_pos = record.source_pos;
             sync.latest_boundary_offset = writer
                 .get_ref()
@@ -3619,8 +3688,8 @@ impl ChannelRunner {
                 .map_err(|e| io_error("stat relay boundary", e))?
                 .len()
                 + writer.buffer().len() as u64;
-            if let Some(gtid) = &record.gtid {
-                sync.pending_gtids.push(gtid.clone());
+            if let Some(gtid) = record.gtid {
+                sync.pending_gtids.push(gtid.to_owned());
             }
             let sync_now = ddl_barrier
                 || sync.pending_boundaries >= self.runtime.flush_policy.relay_sync_txns
@@ -3972,7 +4041,7 @@ impl ChannelRunner {
         // Only a receipt committed atomically with row events proves replay.
         // STRICT failures have no receipt and must fail again after restart.
         let key = replication_property_key("rows", &self.status_snapshot().channel, b"");
-        let recovered: Option<(String, u64)> = self
+        let recovered: Option<RowReceipt> = self
             .engine
             .database_for_replication()
             .replication_property(&key)?
@@ -3981,7 +4050,7 @@ impl ChannelRunner {
                     .map_err(|err| io_error("decode row apply receipt", std::io::Error::other(err)))
             })
             .transpose()?;
-        struct Guard(Option<(String, u64)>);
+        struct Guard(Option<RowReceipt>);
         impl Drop for Guard {
             fn drop(&mut self) {
                 RECOVERED_ROW_RECEIPT.with(|slot| {
@@ -7184,6 +7253,188 @@ fn io_error(action: &str, err: std::io::Error) -> QueryError {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relay_borrowed_serialization_preserves_versioned_bytes() {
+        for op in [
+            RelayOp::Noop,
+            RelayOp::TxnCommit {
+                event_count: 17,
+                commit_ts: 42,
+            },
+        ] {
+            let owned = RelayRecord {
+                source_uuid: "6f317611-5378-4a0b-9d1a-326f124afaff".to_owned(),
+                source_file: "mysql-bin.000042".to_owned(),
+                source_pos: 1234,
+                gtid: Some("6f317611-5378-4a0b-9d1a-326f124afaff:123".to_owned()),
+                op,
+            };
+            let borrowed = RelayRecord {
+                source_uuid: owned.source_uuid.as_str(),
+                source_file: owned.source_file.as_str(),
+                source_pos: owned.source_pos,
+                gtid: owned.gtid.as_deref(),
+                op: &owned.op,
+            };
+            assert_eq!(
+                crate::storage::metadata::encode(
+                    crate::storage::metadata::RELAY,
+                    crate::storage::format_versions::MYSQL_RELAY_VERSION,
+                    &borrowed
+                )
+                .unwrap(),
+                crate::storage::metadata::encode(
+                    crate::storage::metadata::RELAY,
+                    crate::storage::format_versions::MYSQL_RELAY_VERSION,
+                    &owned
+                )
+                .unwrap(),
+            );
+        }
+    }
+
+    #[test]
+    fn issue_16_row_receipts_do_not_cover_a_different_source() {
+        let applied = RowReceipt {
+            source_uuid: "source-a".into(),
+            file: "bin.000010".into(),
+            pos: 1000,
+        };
+        let mut record = RelayRecord {
+            source_uuid: "source-b".into(),
+            source_file: "bin.000001".into(),
+            source_pos: 500,
+            gtid: None,
+            op: RelayOp::Noop,
+        };
+        assert!(!source_boundary_covers(&applied, &record));
+        record.source_file = "bin.000010".into();
+        assert!(!source_boundary_covers(&applied, &record));
+        record.source_uuid = "source-a".into();
+        assert!(source_boundary_covers(&applied, &record));
+    }
+
+    #[test]
+    fn issue_16_recovered_receipt_does_not_skip_replacement_source_rows() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        engine
+            .execute("CREATE TABLE source_rows(id INT PRIMARY KEY)")
+            .unwrap();
+        let (runtime, runner) = make_split_runner(dir.path(), engine.clone());
+        for (source, file, id) in [("source-a", "bin.000010", 1), ("source-b", "bin.000001", 2)] {
+            runtime.status.lock().unwrap().source_uuid = source.into();
+            let gtid = format!(
+                "{}:1",
+                if id == 1 {
+                    "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+                } else {
+                    "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee"
+                }
+            );
+            runner
+                .append_relay(
+                    file,
+                    120,
+                    Some(gtid.clone()),
+                    &RelayOp::WriteRows {
+                        database: "test".into(),
+                        table: "source_rows".into(),
+                        rows: vec![vec![Value::Int(id)]],
+                    },
+                )
+                .unwrap();
+            runner
+                .io_commit_txn(
+                    file,
+                    180,
+                    &mut TxnBuffer {
+                        gtid: Some(gtid),
+                        event_count: 1,
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            runner.replay_relay_tail().unwrap();
+        }
+        let QueryResponse::ResultSet(result) = engine
+            .execute("SELECT id FROM source_rows ORDER BY id")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!()
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+        assert!(gtid_set_contains(
+            &runner.status_snapshot().executed_gtid_set,
+            "bbbbbbbb-bbbb-cccc-dddd-eeeeeeeeeeee:1"
+        ));
+    }
+
+    #[test]
+    fn issue_27_until_after_gtid_stops_at_tail_batch_boundary() {
+        for transactions in [1, 3] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+            let (runtime, runner) = make_split_runner(dir.path(), engine);
+            let sid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+            *runtime.until.lock().unwrap() =
+                Some(UntilCondition::SqlAfterGtids(format!("{sid}:1")));
+            for n in 1..=transactions {
+                let mut txn = TxnBuffer {
+                    gtid: Some(format!("{sid}:{n}")),
+                    ..TxnBuffer::default()
+                };
+                runner
+                    .io_commit_txn("bin.000001", 100 + n * 50, &mut txn)
+                    .unwrap();
+            }
+            let durable = runtime.relay_gate.lock().unwrap().durable_offset;
+            runner.sql_apply_available(durable).unwrap();
+            assert!(
+                runtime.stop.load(Ordering::Acquire),
+                "tail batch with {transactions} transactions"
+            );
+            let status = runner.status_snapshot();
+            assert!(gtid_set_contains(
+                &status.executed_gtid_set,
+                &format!("{sid}:1")
+            ));
+            assert!(!gtid_set_contains(
+                &status.executed_gtid_set,
+                &format!("{sid}:2")
+            ));
+        }
+    }
+
+    #[test]
+    fn issue_41_table_maps_are_released_at_transaction_boundaries() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+        let (_, runner) = make_split_runner(dir.path(), engine);
+        let mut reader = EventStreamReader::new(BinlogVersion::Version4);
+        let mut maps = HashMap::new();
+        let mut file = "bin.000001".to_string();
+        let mut txn = TxnBuffer::default();
+        for id in 1u64..=100 {
+            let mut body = id.to_le_bytes()[..6].to_vec();
+            body.extend_from_slice(&[0, 0, 4]);
+            body.extend_from_slice(b"test\0");
+            body.extend_from_slice(&[1, b't', 0, 1, 3, 0, 0]);
+            let bytes = test_event_bytes(EventType::TABLE_MAP_EVENT, 80, body);
+            let event = reader.read(&bytes[..]).unwrap().unwrap();
+            runner
+                .handle_source_event(&event, &mut file, 80, &mut maps, &mut txn)
+                .unwrap();
+        }
+        let bytes = test_event_bytes(EventType::XID_EVENT, 100, 1u64.to_le_bytes().to_vec());
+        let event = reader.read(&bytes[..]).unwrap().unwrap();
+        runner
+            .handle_source_event(&event, &mut file, 100, &mut maps, &mut txn)
+            .unwrap();
+        assert!(maps.is_empty());
+    }
     use super::*;
     include!("repl/release_audit_tests.rs");
     use mysql_common::binlog::consts::{EventFlags, EventType, TransactionPayloadCompressionType};
@@ -8509,7 +8760,8 @@ mod tests {
         let decoded: PersistedChannel =
             metadata::decode(metadata::CHANNEL, versions::MYSQL_CHANNEL_VERSION, &bytes).unwrap();
         assert_eq!(decoded.config.source_log_pos, 17);
-        let record = RelayRecord {
+        let record: RelayRecord = RelayRecord {
+            source_uuid: "test-source".into(),
             source_file: "mysql-bin.000001".into(),
             source_pos: 19,
             gtid: Some("00000000-0000-4000-8000-000000000001:7".into()),
@@ -8883,6 +9135,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000003".into(),
                 source_pos: 800,
                 gtid: None,
@@ -8897,6 +9150,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000003".into(),
                 source_pos: 900,
                 gtid: None,
@@ -8926,6 +9180,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000001".to_string(),
                 source_pos: 120,
                 gtid: gtid.clone(),
@@ -8939,6 +9194,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000001".to_string(),
                 source_pos: 180,
                 gtid: gtid.clone(),
@@ -8956,6 +9212,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000001".to_string(),
                 source_pos: 240,
                 gtid: None,
@@ -9021,6 +9278,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000001".to_string(),
                 source_pos: 120,
                 gtid: gtid.clone(),
@@ -9034,6 +9292,7 @@ mod tests {
         append_test_relay(
             dir.path(),
             &RelayRecord {
+                source_uuid: "test-source".into(),
                 source_file: "bin.000001".to_string(),
                 source_pos: 180,
                 gtid: gtid.clone(),
@@ -9375,6 +9634,7 @@ mod tests {
             io_committed_pos: Mutex::new(None),
         });
         let runner = ChannelRunner::new(dir.to_path_buf(), engine, Arc::clone(&runtime));
+        runtime.status.lock().unwrap().source_uuid = "test-source".into();
         (runtime, runner)
     }
 

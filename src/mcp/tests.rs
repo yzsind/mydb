@@ -21,6 +21,9 @@ struct Harness {
 }
 impl Harness {
     fn new(config: McpConfig) -> Self {
+        Self::with_rest_config(config, RestConfig::from_startup().unwrap())
+    }
+    fn with_rest_config(config: McpConfig, rest: RestConfig) -> Self {
         std::fs::create_dir_all("/tmp/mydb/mcp").unwrap();
         let dir = tempfile::tempdir_in("/tmp/mydb/mcp").unwrap();
         let mut storage = StorageConfig::from_env();
@@ -35,11 +38,7 @@ impl Harness {
             .unwrap(),
         );
         let token = Self::key(&engine, "mcp-test");
-        let sql = sql::State::new(
-            RestConfig::from_startup().unwrap(),
-            engine.clone(),
-            engine.registry().clone(),
-        );
+        let sql = sql::State::new(rest, engine.clone(), engine.registry().clone());
         let app = router(sql.clone(), config).layer(Extension(Self::peer()));
         Self {
             _dir: dir,
@@ -140,6 +139,27 @@ impl Harness {
     async fn close(&self) {
         self.sql.close_all().await;
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn issue_32_post_commit_capacity_failure_preserves_execution_state() {
+    let mut rest = RestConfig::from_startup().unwrap();
+    rest.memory_limit = 1024 * 1024;
+    let h = Harness::with_rest_config(McpConfig::default(), rest);
+    h.engine
+        .execute("CREATE TABLE receipt(id INT PRIMARY KEY,v MEDIUMTEXT)")
+        .unwrap();
+    let response = h.call("execute_sql",json!({"database":"test","sql":"INSERT INTO receipt VALUES (1,REPEAT('x',220000)) RETURNING v","request_id":"issue32_post_commit_001"})).await;
+    let value = &response["structuredContent"];
+    let QueryResponse::ResultSet(rows) = h.engine.execute("SELECT COUNT(*) FROM receipt").unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(rows.rows, vec![vec![crate::types::Value::Int(1)]]);
+    assert_eq!(value["execution_outcome"], "succeeded", "{value}");
+    assert_eq!(value["transaction_state"], "idle", "{value}");
+    assert_eq!(value["request_id"], "issue32_post_commit_001", "{value}");
+    h.close().await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn mcp_discovery_versions_and_tools() {

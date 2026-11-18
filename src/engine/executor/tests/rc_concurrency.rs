@@ -1,5 +1,81 @@
 use super::*;
 
+#[test]
+fn issue_14_range_writes_wait_for_deleted_or_moved_candidates() {
+    for mutation in ["DELETE FROM t WHERE id=1", "UPDATE t SET v=99 WHERE id=1"] {
+        for statement in [
+            "UPDATE t SET v=v+10 WHERE id BETWEEN 1 AND 2",
+            "UPDATE t SET v=v+10 WHERE v BETWEEN 1 AND 2",
+            "DELETE FROM t WHERE v BETWEEN 1 AND 2",
+            "SELECT id FROM t WHERE v BETWEEN 1 AND 2 FOR UPDATE",
+        ] {
+            let (_dir, e) = fixture();
+            let mut owner = session();
+            sql(&e, &mut owner, "BEGIN");
+            sql(&e, &mut owner, mutation);
+            let worker_engine = e.clone();
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || {
+                let mut waiter = session();
+                sql(&worker_engine, &mut waiter, "BEGIN");
+                let result = worker_engine.execute_with_session(&mut waiter, statement);
+                sender.send(result.is_ok()).unwrap();
+                sql(&worker_engine, &mut waiter, "COMMIT");
+                result
+            });
+            let early = receiver.recv_timeout(Duration::from_millis(100)).ok();
+            sql(&e, &mut owner, "ROLLBACK");
+            let response = worker.join().unwrap().unwrap();
+            assert!(early.is_none(), "did not wait: {mutation}; {statement}");
+            if statement.starts_with("SELECT") {
+                let QueryResponse::ResultSet(result) = response.materialize().unwrap() else {
+                    panic!()
+                };
+                assert_eq!(result.rows.len(), 2);
+            } else if statement.starts_with("UPDATE") {
+                assert_eq!(
+                    rows(&e, &mut owner, "SELECT v FROM t ORDER BY id"),
+                    vec![vec![Value::Int(11)], vec![Value::Int(12)]]
+                );
+            } else {
+                assert!(rows(&e, &mut owner, "SELECT id FROM t").is_empty());
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_37_unique_reservations_honor_nowait_and_skip_locked() {
+    for mutation in ["DELETE FROM t WHERE id=1", "INSERT INTO t VALUES (3,3)"] {
+        for mode in ["FOR UPDATE", "FOR SHARE"] {
+            let (_dir, e) = fixture();
+            let mut owner = session();
+            let mut reader = session();
+            sql(&e, &mut owner, "BEGIN");
+            sql(&e, &mut owner, mutation);
+            sql(&e, &mut reader, "BEGIN");
+            let id = if mutation.starts_with("DELETE") { 1 } else { 3 };
+            let started = Instant::now();
+            let error = e
+                .execute_with_session(
+                    &mut reader,
+                    &format!("SELECT id FROM t WHERE id={id} {mode} NOWAIT"),
+                )
+                .unwrap_err();
+            assert_eq!(error.code(), 3572, "{mutation}; {mode}");
+            assert!(started.elapsed() < Duration::from_millis(500));
+            assert!(rows(
+                &e,
+                &mut reader,
+                &format!("SELECT id FROM t WHERE id={id} {mode} SKIP LOCKED")
+            )
+            .is_empty());
+            sql(&e, &mut owner, "ROLLBACK");
+            sql(&e, &mut reader, "ROLLBACK");
+        }
+    }
+}
+
 fn session() -> SessionContext {
     static NEXT: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(100);
     SessionContext {

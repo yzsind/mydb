@@ -911,7 +911,7 @@ fn unicode_superset_and_concat_none_derivation_are_bound_without_false_conflicts
         .execute(
             "CREATE TABLE ct_superset (\
              u1 VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_ai_ci,\
-             u2 VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_0900_as_cs,\
+             u2 VARCHAR(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci,\
              legacy VARCHAR(10) CHARACTER SET latin1 COLLATE latin1_swedish_ci)",
         )
         .unwrap();

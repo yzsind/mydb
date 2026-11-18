@@ -2321,7 +2321,7 @@ pub(super) fn materialize_row_ids_in_order(
         let mut by_id = db
             .read_row_columns_many_with_handle(heap, &table.schema, row_ids, txn, cols)?
             .into_iter()
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<hashbrown::HashMap<_, _, ahash::RandomState>>();
         let mut rows = Vec::with_capacity(row_ids.len());
         for row_id in row_ids {
             if let Some(values) = by_id.remove(row_id) {
@@ -2334,7 +2334,7 @@ pub(super) fn materialize_row_ids_in_order(
             .read_rows_many_with_handle(heap, &table.schema, row_ids, txn)?
             .into_iter()
             .map(|row| (row.row_id, row.values))
-            .collect::<std::collections::HashMap<_, _>>();
+            .collect::<hashbrown::HashMap<_, _, ahash::RandomState>>();
         let mut rows = Vec::with_capacity(row_ids.len());
         for row_id in row_ids {
             if let Some(values) = by_id.remove(row_id) {
