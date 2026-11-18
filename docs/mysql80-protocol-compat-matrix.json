@@ -1,6 +1,6 @@
 {
   "baseline": "MySQL Community Server 8.0.46",
-  "reviewed_at": "2026-11-17",
+  "reviewed_at": "2026-11-18",
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
@@ -50,9 +50,9 @@
     "review_scope": "Source and documentation contract review; focused regression and local protocol rehearsal. This fingerprint is a review trigger, not proof all combinations are supported.",
     "source_sha256": {
       "src/mysql/protocol.rs": "cec9d31bf841b246bc926a631dc3bc9cd0d831fdc11c46cdc10c2e6031f113bc",
-      "src/mysql/server.rs": "49fb84a0b3ec74ff15b38c2e6826de6dbb752bfb3227dc4aa1f1e86630a0f043",
+      "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
       "src/mysql/session.rs": "4958f2b27866c1219d5ff15faaf53641f64a4d23c0bdf924a15fb70e45c3cdc5",
-      "src/binlog.rs": "570e14d6b0e08426980ee27e379bfc6a421d1040f10d4ea9f4a8a00c34847d1f"
+      "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023"
     },
     "test_sources": [
       "src/mysql/session/auth_handshake_tests.rs",
@@ -61,7 +61,10 @@
       "src/engine/executor/tests/rest_access_keys.rs",
       "src/mysql/session/auth_handshake_tests.rs",
       "src/engine/executor/tests/dump_compatibility.rs",
-      "src/engine/executor/tests/mysql80_compat_binlog_multi.rs"
+      "src/engine/executor/tests/mysql80_compat_binlog_multi.rs",
+      "src/mysql/server.rs",
+      "src/binlog/audit_tests.rs",
+      "src/engine/executor/tests/mysql80_compat_auth.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
   }
