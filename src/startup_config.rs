@@ -8,7 +8,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::fs;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -80,6 +80,7 @@ enum OptionKind {
     NonNegativeFloat,
     LogOutput,
     IpAddr,
+    SocketAddr,
     String,
     NonEmpty,
     Enum(&'static [&'static str]),
@@ -181,6 +182,14 @@ static OPTION_SPECS: &[OptionSpec] = &[
         name: "rest_tls_mode",
         env: "MYDB_REST_TLS_MODE",
         kind: OptionKind::Enum(&["required", "disabled"]),
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
+        name: "rest_loopback_http_addr",
+        env: "MYDB_REST_LOOPBACK_HTTP_ADDR",
+        kind: OptionKind::SocketAddr,
         aliases: &[],
         cli: true,
         sensitive: false,
@@ -1992,6 +2001,11 @@ fn validate_spec(spec: &OptionSpec, raw: &str) -> Result<String, String> {
             .parse::<IpAddr>()
             .map(|value| value.to_string())
             .map_err(|_| invalid("expected an IP address")),
+        OptionKind::SocketAddr => raw
+            .trim()
+            .parse::<SocketAddr>()
+            .map(|value| value.to_string())
+            .map_err(|_| invalid("expected an IPv4:port or [IPv6]:port address")),
         OptionKind::String => Ok(raw.to_string()),
         OptionKind::NonEmpty if raw.is_empty() => Err(invalid("value must not be empty")),
         OptionKind::NonEmpty => Ok(raw.to_string()),

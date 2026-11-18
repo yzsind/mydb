@@ -7,6 +7,7 @@ use std::{
 pub struct RestConfig {
     pub enabled: bool,
     pub addr: SocketAddr,
+    pub loopback_http_addr: Option<SocketAddr>,
     pub tls: bool,
     pub cert: Option<PathBuf>,
     pub key: Option<PathBuf>,
@@ -56,6 +57,23 @@ impl RestConfig {
                 ))
             }
         };
+        let loopback_http_addr = crate::startup_config::var_os("MYDB_REST_LOOPBACK_HTTP_ADDR")
+            .map(|raw| {
+                raw.to_str()
+                    .and_then(|s| s.parse::<SocketAddr>().ok())
+                    .filter(|addr| addr.ip().is_loopback())
+                    .ok_or_else(|| {
+                        std::io::Error::other(
+                            "rest_loopback_http_addr requires a loopback IP address and port",
+                        )
+                    })
+            })
+            .transpose()?;
+        if loopback_http_addr.is_some() && !tls {
+            return Err(std::io::Error::other(
+                "rest_loopback_http_addr requires rest_tls_mode=required",
+            ));
+        }
         let cert = crate::startup_config::var_os("MYDB_REST_SSL_CERT").map(PathBuf::from);
         let key = crate::startup_config::var_os("MYDB_REST_SSL_KEY").map(PathBuf::from);
         if cert.is_some() != key.is_some() || (!tls && (cert.is_some() || !host.is_loopback())) {
@@ -78,6 +96,7 @@ impl RestConfig {
         Ok(Self {
             enabled,
             addr: SocketAddr::new(host, port),
+            loopback_http_addr,
             tls,
             cert,
             key,

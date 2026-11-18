@@ -20,8 +20,9 @@ use failure::{Failure, Result};
 use runtime::{Identity, Peer};
 use serde::Deserialize;
 use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::{future, io, sync::Arc, time::Duration};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_stream::StreamExt;
 pub struct RestServer<E: QueryEngine> {
     state: Arc<runtime::State<E>>,
@@ -86,62 +87,178 @@ impl<E: QueryEngine> RestServer<E> {
                 },
             ))
     }
-    pub async fn run_with_listener(&self, listener: TcpListener) -> std::io::Result<()> {
-        if self.state.config.tls != self.tls.is_some() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+    pub async fn run_with_listener(&self, listener: TcpListener) -> io::Result<()> {
+        self.run_with_listeners(listener, None).await
+    }
+
+    pub async fn run_with_listeners(
+        &self,
+        listener: TcpListener,
+        loopback_http_listener: Option<TcpListener>,
+    ) -> io::Result<()> {
+        let config = &self.state.config;
+        if config.tls != self.tls.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "REST TLS configuration and acceptor must agree",
             ));
         }
         if self.tls.is_none() && !listener.local_addr()?.ip().is_loopback() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
                 "Plaintext REST requires an actual loopback listener",
             ));
         }
-        let sockets = Arc::new(tokio::sync::Semaphore::new(
-            self.state.config.max_connections,
-        ));
+        if config.loopback_http_addr.is_some() != loopback_http_listener.is_some() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "rest_loopback_http_addr and the additional HTTP listener must agree",
+            ));
+        }
+        if let Some(local) = &loopback_http_listener {
+            if !config.tls || !local.local_addr()?.ip().is_loopback() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "The additional REST HTTP listener requires primary TLS and an actual loopback address",
+                ));
+            }
+        }
+
+        let sockets = Arc::new(Semaphore::new(config.max_connections));
         let router = self.router();
         // HTTP/2 admission must leave room for cancellation/status requests even
         // when SQL occupies every execution slot on the client's connection.
         let control_streams = if self.mcp.is_some() { 8 } else { 0 };
         let mut sweep = tokio::time::interval(Duration::from_millis(100));
         let mut sweeping: Option<tokio::task::JoinHandle<()>> = None;
-        loop {
-            tokio::select! {
-             _=crate::mysql::shutdown::shutdown_notified()=>break,
-             _=sweep.tick()=>{
-                if sweeping.as_ref().is_none_or(|task| task.is_finished()) {
-                    let state = self.state.clone();
-                    sweeping = Some(tokio::spawn(async move { state.sweep().await; }));
+        let result = {
+            let primary = self.accept_connections(
+                &listener,
+                self.tls.as_ref(),
+                &router,
+                &sockets,
+                control_streams,
+            );
+            let local = async {
+                match &loopback_http_listener {
+                    Some(listener) => {
+                        self.accept_connections(listener, None, &router, &sockets, control_streams)
+                            .await
+                    }
+                    None => future::pending().await,
                 }
-             },
-             accepted=listener.accept()=>{
-              let(stream,addr)=match accepted{Ok(v)=>v,Err(e)if matches!(e.kind(),std::io::ErrorKind::Interrupted|std::io::ErrorKind::ConnectionAborted)=>continue,Err(e) if crate::mysql::server::is_fd_pressure_error(&e) || crate::mysql::server::is_transient_accept_error(&e) => {crate::util::logging::log_message(format_args!("REST transient accept failure: {e}"));tokio::time::sleep(Duration::from_millis(100)).await;continue}, Err(e) => return Err(e)};
-              let Ok(permit)=sockets.clone().try_acquire_owned()else{drop(stream);continue};
-              let tls=self.tls.clone();let app=router.clone();let config=self.state.config.clone();
-              if let Err(error) = crate::util::connection_dispatch::spawn(move||async move{
-               let _permit=permit;let _=stream.set_nodelay(true);
-               let mut peer=Peer{host:addr.ip().to_string(),cipher:None,version:None,subject:None,issuer:None};
-               if let Some(tls)=tls{
-                let Ok(Ok(stream))=tokio::time::timeout(Duration::from_secs(5),tls.accept(stream)).await else{return};
-                let connection=stream.get_ref().1;
-                peer.cipher=connection.negotiated_cipher_suite().map(|v|crate::mysql::session::tls_names::cipher_name(v.suite()));
-                peer.version=connection.protocol_version().map(|v|format!("{v:?}"));
-                if let Some(cert)=connection.peer_certificates().and_then(|v|v.first()){if let Ok((_,cert))=x509_parser::parse_x509_certificate(cert.as_ref()){peer.subject=Some(crate::mysql::session::tls_names::distinguished_name(cert.subject()));peer.issuer=Some(crate::mysql::session::tls_names::distinguished_name(cert.issuer()));}}
-                serve(stream,app.layer(Extension(peer)),config,control_streams).await;
-               }else{serve(stream,app.layer(Extension(peer)),config,control_streams).await;}
-              }) { crate::util::logging::log_message(format_args!("REST connection dispatch failed: {error}")); }
-
-             }
+            };
+            tokio::pin!(primary, local);
+            loop {
+                tokio::select! {
+                    _ = crate::mysql::shutdown::shutdown_notified() => break Ok(()),
+                    result = &mut primary => break result,
+                    result = &mut local => break result,
+                    _ = sweep.tick() => {
+                        if sweeping.as_ref().is_none_or(|task| task.is_finished()) {
+                            let state = self.state.clone();
+                            sweeping = Some(tokio::spawn(async move { state.sweep().await; }));
+                        }
+                    }
+                }
             }
+        };
+        drop(listener);
+        drop(loopback_http_listener);
+        if let Err(error) = &result {
+            crate::util::logging::log_message(format_args!("{error}"));
+            crate::mysql::shutdown::request_shutdown(
+                crate::mysql::shutdown::ShutdownSource::HttpListener,
+                crate::mysql::shutdown::ShutdownIntent::Halt,
+            );
         }
         if let Some(task) = sweeping {
             let _ = task.await;
         }
         self.state.close_all().await;
-        Ok(())
+        result
+    }
+
+    async fn accept_connections(
+        &self,
+        listener: &TcpListener,
+        tls: Option<&tokio_rustls::TlsAcceptor>,
+        router: &Router,
+        sockets: &Arc<Semaphore>,
+        control_streams: usize,
+    ) -> io::Result<()> {
+        use crate::mysql::server::{is_fd_pressure_error, is_transient_accept_error};
+        use crate::mysql::session::tls_names::{cipher_name, distinguished_name};
+
+        let local_addr = listener.local_addr()?;
+        loop {
+            let (stream, addr) = match listener.accept().await {
+                Ok(accepted) => accepted,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        io::ErrorKind::Interrupted | io::ErrorKind::ConnectionAborted
+                    ) =>
+                {
+                    continue;
+                }
+                Err(error) if is_fd_pressure_error(&error) || is_transient_accept_error(&error) => {
+                    crate::util::logging::log_message(format_args!(
+                        "REST transient accept failure on {local_addr}: {error}"
+                    ));
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    continue;
+                }
+                Err(error) => {
+                    return Err(io::Error::new(
+                        error.kind(),
+                        format!("REST listener on {local_addr} failed: {error}"),
+                    ));
+                }
+            };
+            let Ok(permit) = sockets.clone().try_acquire_owned() else {
+                continue;
+            };
+            let tls = tls.cloned();
+            let app = router.clone();
+            let config = self.state.config.clone();
+            if let Err(error) = crate::util::connection_dispatch::spawn(move || async move {
+                let _permit = permit;
+                let _ = stream.set_nodelay(true);
+                let mut peer = Peer {
+                    host: addr.ip().to_string(),
+                    cipher: None,
+                    version: None,
+                    subject: None,
+                    issuer: None,
+                };
+                if let Some(tls) = tls {
+                    let Ok(Ok(stream)) =
+                        tokio::time::timeout(Duration::from_secs(5), tls.accept(stream)).await
+                    else {
+                        return;
+                    };
+                    let connection = stream.get_ref().1;
+                    peer.cipher = connection
+                        .negotiated_cipher_suite()
+                        .map(|v| cipher_name(v.suite()));
+                    peer.version = connection.protocol_version().map(|v| format!("{v:?}"));
+                    if let Some(cert) = connection.peer_certificates().and_then(|v| v.first()) {
+                        if let Ok((_, cert)) = x509_parser::parse_x509_certificate(cert.as_ref()) {
+                            peer.subject = Some(distinguished_name(cert.subject()));
+                            peer.issuer = Some(distinguished_name(cert.issuer()));
+                        }
+                    }
+                    serve(stream, app.layer(Extension(peer)), config, control_streams).await;
+                } else {
+                    serve(stream, app.layer(Extension(peer)), config, control_streams).await;
+                }
+            }) {
+                crate::util::logging::log_message(format_args!(
+                    "REST connection dispatch failed on {local_addr}: {error}"
+                ));
+            }
+        }
     }
 }
 /// Connection-level abort for response deadlines, including HTTP/2 flow
@@ -261,7 +378,7 @@ async fn endpoint<E: QueryEngine>(
         return Ok(Json(value).into_response());
     }
     if parts.get(2) == Some(&"sessions") && parts.len() >= 4 {
-        let session = state.session(parts[3], &identity.key_id)?;
+        let session = state.session(parts[3], &identity)?;
         if method == axum::http::Method::DELETE {
             session.close().await;
             state.sessions.lock().remove(&session.id);

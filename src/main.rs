@@ -160,8 +160,25 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     let rest_config = mydb::rest::RestConfig::from_startup()?;
     let mcp_config = mydb::mcp::McpConfig::from_startup()?;
     let http_enabled = rest_config.enabled || mcp_config.enabled;
+    let bind_http = |addr, scheme| {
+        mydb::mysql::server::bind_listener(addr).map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("Cannot bind REST/MCP {scheme} listener on {addr}: {error}"),
+            )
+        })
+    };
+    let rest_scheme = if rest_config.tls { "HTTPS" } else { "HTTP" };
     let rest_listener = if http_enabled {
-        Some(mydb::mysql::server::bind_listener(rest_config.addr)?)
+        Some(bind_http(rest_config.addr, rest_scheme)?)
+    } else {
+        None
+    };
+    let loopback_http_listener = if http_enabled {
+        rest_config
+            .loopback_http_addr
+            .map(|addr| bind_http(addr, "loopback HTTP"))
+            .transpose()?
     } else {
         None
     };
@@ -298,11 +315,19 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
             mydb::rest::RestServer::new(rest_config, engine.clone(), registry.clone(), rest_tls)
                 .with_mcp(mcp_config);
         log_message(format_args!(
-            "mydb HTTP SQL/MCP listening on {}",
-            listener.local_addr()?
+            "mydb HTTP SQL/MCP listening on {} ({rest_scheme})",
+            listener.local_addr()?,
         ));
+        if let Some(local) = &loopback_http_listener {
+            log_message(format_args!(
+                "mydb HTTP SQL/MCP listening on {} (loopback HTTP)",
+                local.local_addr()?,
+            ));
+        }
         Some(tokio::spawn(async move {
-            server.run_with_listener(listener).await
+            server
+                .run_with_listeners(listener, loopback_http_listener)
+                .await
         }))
     } else {
         None
@@ -411,6 +436,7 @@ fn print_help() {
          \x20 --rest-enabled ON|OFF          Enable REST SQL (default OFF)\n\
          \x20 --rest-host IP --rest-port N    REST address (default 127.0.0.1:8739)\n\
          \x20 --rest-tls-mode required|disabled  HTTPS by default; plaintext loopback only\n\
+         \x20 --rest-loopback-http-addr IP:PORT  Optional loopback HTTP endpoint alongside HTTPS\n\
          \nHTTP SQL calls:\n\
          \x20 --http-enabled ON|OFF          Enable HTTP SQL calls (default ON)\n\
          \x20 --http-local-config PATH       Optional node egress/CA/account policy\n\

@@ -59,6 +59,7 @@ for the `/mcp` endpoint, authentication and `mcp_*` limits.
 | `rest_enabled` | `OFF` |
 | `rest_host`, `rest_port` | `127.0.0.1`, `8739` |
 | `rest_tls_mode` | `required`; `disabled` requires loopback |
+| `rest_loopback_http_addr` | Unset; optional loopback HTTP address with `rest_tls_mode=required` |
 | `rest_ssl_cert`, `rest_ssl_key` | Unset; supply both or neither |
 | `rest_max_connections` | `512` |
 | `rest_max_sessions` | `256`; also subject to SQL connection limits |

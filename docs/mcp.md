@@ -29,6 +29,10 @@ server certificate or an ephemeral self-signed certificate. Install a trusted
 certificate for remote clients. `rest_tls_mode=disabled` permits HTTP only on
 an actual loopback listener. HTTP/1.1 and HTTPS HTTP/2 are supported.
 
+Use [`rest_loopback_http_addr`](rest-api.md#serve-local-http-alongside-https)
+to serve `/mcp` over loopback HTTP while remote clients use the primary HTTPS
+listener. This also works when MCP is enabled on its own.
+
 ## Credentials and clients
 
 Create an API key through a TLS-authenticated MySQL connection:

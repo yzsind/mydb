@@ -590,10 +590,7 @@ impl<E: QueryEngine> Handler<E> {
             }
             "get_session" | "close_session" => {
                 let a: SessionArgs = decode(raw)?;
-                let session = self
-                    .state
-                    .sql
-                    .session(&a.session_id, &lease.identity.key_id)?;
+                let session = self.state.sql.session(&a.session_id, &lease.identity)?;
                 if name == "close_session" {
                     session.close().await;
                     return Ok(
@@ -654,9 +651,7 @@ impl<E: QueryEngine> Handler<E> {
                     "Persistent sessions select their database with USE",
                 ));
             }
-            self.state
-                .sql
-                .session(&session_id, &lease.identity.key_id)?
+            self.state.sql.session(&session_id, &lease.identity)?
         } else {
             let session =
                 sql::create_session(self.state.sql.clone(), lease.identity.clone(), database)

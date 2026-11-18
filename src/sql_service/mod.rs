@@ -234,11 +234,15 @@ impl<E: QueryEngine> State<E> {
             }
         }
     }
-    pub fn session(&self, id: &str, key: &str) -> Result<Arc<Session<E>>> {
+    pub fn session(&self, id: &str, identity: &Identity) -> Result<Arc<Session<E>>> {
         self.sessions
             .lock()
             .get(id)
-            .filter(|s| s.key_id == key && !s.closed.load(Ordering::Acquire))
+            .filter(|s| {
+                s.key_id == identity.key_id
+                    && s.tls_established == identity.peer.tls_established()
+                    && !s.closed.load(Ordering::Acquire)
+            })
             .cloned()
             .ok_or_else(Failure::not_found)
     }
@@ -302,6 +306,10 @@ pub struct Peer {
     pub issuer: Option<String>,
 }
 impl Peer {
+    fn tls_established(&self) -> bool {
+        self.cipher.is_some()
+    }
+
     pub fn auth_request(&self) -> auth::AuthRequest<'_> {
         auth::AuthRequest {
             replacing_account: None,
@@ -311,7 +319,7 @@ impl Peer {
             auth_plugin: None,
             nonce: &[],
             client_capabilities: 0,
-            tls_established: self.cipher.is_some(),
+            tls_established: self.tls_established(),
             tls_cipher: self.cipher.as_deref(),
             tls_version: self.version.as_deref(),
             x509_subject: self.subject.as_deref(),
@@ -383,6 +391,8 @@ pub fn authenticate<E: QueryEngine>(
 pub struct Session<E: QueryEngine> {
     pub id: String,
     pub key_id: String,
+    // The engine retains transport identity in the initial session context.
+    tls_established: bool,
     pub owner: AccountKey,
     pub engine: Arc<E>,
     pub registry: Arc<SessionRegistry>,
@@ -564,6 +574,7 @@ pub async fn create_session<E: QueryEngine>(
         ctx.authenticated_as = account.clone();
         ctx.user = account.user.clone();
         ctx.login_user = account.user.clone();
+        let tls_established = identity.peer.tls_established();
         ctx.host = identity.peer.host;
         ctx.active_roles = identity.outcome.context.active_roles;
         ctx.auth_epoch = identity.outcome.context.epoch;
@@ -581,7 +592,7 @@ pub async fn create_session<E: QueryEngine>(
         ctx.set_cancel_handle(Some(handle.cancel_handle()));
         let info = json!({"id":id,"connection_id":ctx.connection_id,"database":ctx.current_database,"autocommit":ctx.autocommit,"in_transaction":false,"closed":false});
         let session = Arc::new(Session {
-            id, key_id: identity.key_id, owner: account,
+            id, key_id: identity.key_id, tls_established, owner: account,
             engine: state.engine.clone(), registry: state.registry.clone(), handle,
             context: Mutex::new(Some(ctx)), slot: Mutex::new(Some(slot)),
             txn_admission: Mutex::new(None),

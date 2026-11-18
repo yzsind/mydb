@@ -434,6 +434,7 @@ async fn mcp_busy_cancel_timeout_disconnect_and_admission_cleanup() {
     let sid = open["structuredContent"]["id"].as_str().unwrap();
     let id = "mcp_cancel_request_001";
     let request=h.request("tools/call",json!({"name":"execute_sql","arguments":{"session_id":sid,"sql":"SELECT SLEEP(10)","request_id":id,"timeout_ms":15000}}));
+    let identity = sql::authenticate(&h.sql, request.headers(), Harness::peer()).unwrap();
     let task = tokio::spawn(h.app.clone().oneshot(request));
     wait_running(&h, id).await;
     let busy = h
@@ -474,14 +475,7 @@ async fn mcp_busy_cancel_timeout_disconnect_and_admission_cleanup() {
     let _ = task.await;
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
-            let key = h
-                .sql
-                .sessions
-                .lock()
-                .get(sid)
-                .map(|s| s.key_id.clone())
-                .unwrap_or_default();
-            if h.sql.session(sid, &key).is_err() {
+            if h.sql.session(sid, &identity).is_err() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
