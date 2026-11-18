@@ -1,11 +1,11 @@
 use super::*;
 
 fn check_category(json: &str) {
-    let fixture: FixtureFile = serde_json::from_str(json).unwrap();
+    let fixture: FixtureFile<'_> = serde_json::from_str(json).unwrap();
     let mut scalar_fixture = None;
     for function in fixture.functions {
         let mut case = function
-            .cases
+            .parse_cases()
             .into_iter()
             .next()
             .expect("function fixture has a case");

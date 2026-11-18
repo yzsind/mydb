@@ -2864,13 +2864,15 @@ pub(crate) fn estimate_equijoin_rows(
     // for a composite NDV.  Doing it only in the single-column fallback loses
     // an otherwise exact `(a,b)` index statistic when the extracted key list
     // is `(a,b,equivalent_a)`.
+    let left_eq = PlanColumnEquivalences::new(left);
+    let right_eq = PlanColumnEquivalences::new(right);
     let mut effective_left_keys = Vec::with_capacity(left_keys.len());
     let mut effective_right_keys = Vec::with_capacity(right_keys.len());
     for (left_key, right_key) in left_keys.iter().zip(right_keys) {
         let redundant = effective_left_keys.iter().zip(&effective_right_keys).any(
             |(prior_left, prior_right)| {
-                exprs_equivalent_in_plan(left, left_key, prior_left)
-                    && exprs_equivalent_in_plan(right, right_key, prior_right)
+                left_eq.equivalent(left_key, prior_left)
+                    && right_eq.equivalent(right_key, prior_right)
             },
         );
         if !redundant {

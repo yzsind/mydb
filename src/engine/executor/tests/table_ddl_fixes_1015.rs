@@ -51,6 +51,10 @@ fn copy_recovery_ignores_unpublished_partial_intents() {
 
 #[test]
 fn primary_key_nullability_survives_modify_change_and_copy() {
+    let dir = fixture();
+    let prep = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut cases = Vec::new();
     for partition in ["", " PARTITION BY HASH(id) PARTITIONS 2"] {
         for alter in [
             "MODIFY id INT NULL",
@@ -60,46 +64,56 @@ fn primary_key_nullability_survives_modify_change_and_copy() {
             "ADD extra INT, MODIFY id BIGINT NULL",
             "CHANGE id renamed BIGINT NULL, ALGORITHM=COPY, LOCK=NONE",
         ] {
-            let dir = fixture();
-            let prep = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
-            let engine = open_strict_test_engine(dir.path());
-            engine.execute(&format!("CREATE TABLE t(id INT NOT NULL,k VARCHAR(10) NOT NULL,PRIMARY KEY(id,k)){partition}")).unwrap();
-            engine.execute("INSERT INTO t VALUES(1,'a')").unwrap();
-            prep.finish().unwrap();
-            engine.execute(&format!("ALTER TABLE t {alter}")).unwrap();
+            let table = format!("pk_case_{}", cases.len());
+            engine.execute(&format!("CREATE TABLE {table}(id INT NOT NULL,k VARCHAR(10) NOT NULL,PRIMARY KEY(id,k)){partition}")).unwrap();
+            engine
+                .execute(&format!("INSERT INTO {table} VALUES(1,'a')"))
+                .unwrap();
             let name = if alter.contains("CHANGE") {
                 "renamed"
             } else {
                 "id"
             };
-            let verify = |engine: &StorageQueryEngine| {
-                let table = engine.database().table("test.t").unwrap();
-                assert!(
-                    !table.columns[table.column_index(name).unwrap()].nullable,
-                    "{alter}{partition}"
-                );
-                assert_eq!(
-                    engine
-                        .execute(&format!("INSERT INTO t({name},k) VALUES(NULL,'b')"))
-                        .unwrap_err()
-                        .code(),
-                    1048
-                );
-                assert_eq!(
-                    rows(engine, &format!("SELECT {name},k FROM t")),
-                    vec![vec![Value::Int(1), Value::String("a".into())]]
-                );
-            };
-            verify(&engine);
-            if !partition.is_empty() {
-                engine
-                    .execute("ALTER TABLE t REBUILD PARTITION p0")
-                    .unwrap();
-            }
-            drop(engine);
-            let engine = open_strict_test_engine(dir.path());
-            verify(&engine);
+            cases.push((table, partition, alter, name));
         }
+    }
+    prep.finish().unwrap();
+
+    let verify = |engine: &StorageQueryEngine, table: &str, name: &str, case: &str| {
+        let schema = engine.database().table(&format!("test.{table}")).unwrap();
+        assert!(
+            !schema.columns[schema.column_index(name).unwrap()].nullable,
+            "{case}"
+        );
+        assert_eq!(
+            engine
+                .execute(&format!("INSERT INTO {table}({name},k) VALUES(NULL,'b')"))
+                .unwrap_err()
+                .code(),
+            1048,
+            "{case}"
+        );
+        assert_eq!(
+            rows(engine, &format!("SELECT {name},k FROM {table}")),
+            vec![vec![Value::Int(1), Value::String("a".into())]],
+            "{case}"
+        );
+    };
+    for (table, partition, alter, name) in &cases {
+        engine
+            .execute(&format!("ALTER TABLE {table} {alter}"))
+            .unwrap();
+        verify(&engine, table, name, &format!("{alter}{partition}"));
+        if !partition.is_empty() {
+            engine
+                .execute(&format!("ALTER TABLE {table} REBUILD PARTITION p0"))
+                .unwrap();
+        }
+    }
+    drop(engine);
+    let engine = open_strict_test_engine(dir.path());
+    for (table, partition, alter, name) in cases {
+        verify(&engine, &table, name, &format!("{alter}{partition}"));
     }
 }
 
@@ -294,65 +308,72 @@ fn exchange_accepts_equal_checks_with_different_names_and_order() {
 
 #[test]
 fn modify_change_inline_check_copy_publishes_atomically() {
+    let dir = fixture();
+    let prep = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    let mut cases = Vec::new();
     for lock in ["DEFAULT", "SHARED", "EXCLUSIVE", "NONE"] {
         for change in [false, true] {
             for invalid in [false, true] {
-                let dir = fixture();
-                let prep = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
-                let engine = open_strict_test_engine(dir.path());
+                let table = format!("check_case_{}", cases.len());
                 engine
-                    .execute("CREATE TABLE t(id INT PRIMARY KEY,a INT,KEY ai(a))")
+                    .execute(&format!(
+                        "CREATE TABLE {table}(id INT PRIMARY KEY,a INT,KEY ai(a))"
+                    ))
                     .unwrap();
                 let value = if invalid { -5 } else { 5 };
                 engine
-                    .execute(&format!("INSERT INTO t VALUES(1,{value})"))
+                    .execute(&format!("INSERT INTO {table} VALUES(1,{value})"))
                     .unwrap();
-                prep.finish().unwrap();
                 let (action, column) = if change {
                     ("CHANGE a b BIGINT CHECK(b>0)", "b")
                 } else {
                     ("MODIFY a BIGINT CHECK(a>0)", "a")
                 };
-                let result = engine.execute(&format!(
-                    "ALTER TABLE t {action},ALGORITHM=COPY,LOCK={lock}"
-                ));
-                if invalid {
-                    assert_eq!(result.unwrap_err().code(), 3819);
-                    let schema = engine.database().table("test.t").unwrap();
-                    assert_eq!(schema.columns[1].name, "a");
-                    assert_eq!(
-                        schema.columns[1].data_type,
-                        crate::storage::DataTypeKind::Int
-                    );
-                    assert!(schema.check_constraints.is_empty());
-                } else {
-                    result.unwrap();
-                    assert_eq!(
-                        engine
-                            .execute(&format!("INSERT INTO t(id,{column}) VALUES(2,-1)"))
-                            .unwrap_err()
-                            .code(),
-                        3819
-                    );
-                }
-                let column = if invalid { "a" } else { column };
-                assert_eq!(
-                    rows(
-                        &engine,
-                        &format!(
-                            "SELECT id,{column} FROM t FORCE INDEX(ai) WHERE {column}={value}"
-                        )
-                    ),
-                    vec![vec![Value::Int(1), Value::Int(value)]]
-                );
-                drop(engine);
-                let engine = open_strict_test_engine(dir.path());
-                assert_eq!(
-                    rows(&engine, &format!("SELECT id,{column} FROM t")),
-                    vec![vec![Value::Int(1), Value::Int(value)]]
-                );
+                cases.push((table, lock, invalid, action, column, value));
             }
         }
+    }
+    prep.finish().unwrap();
+    for (table, lock, invalid, action, column, value) in &mut cases {
+        let result = engine.execute(&format!(
+            "ALTER TABLE {table} {action},ALGORITHM=COPY,LOCK={lock}"
+        ));
+        if *invalid {
+            assert_eq!(result.unwrap_err().code(), 3819);
+            let schema = engine.database().table(&format!("test.{table}")).unwrap();
+            assert_eq!(schema.columns[1].name, "a");
+            assert_eq!(
+                schema.columns[1].data_type,
+                crate::storage::DataTypeKind::Int
+            );
+            assert!(schema.check_constraints.is_empty());
+            *column = "a";
+        } else {
+            result.unwrap();
+            assert_eq!(
+                engine
+                    .execute(&format!("INSERT INTO {table}(id,{column}) VALUES(2,-1)"))
+                    .unwrap_err()
+                    .code(),
+                3819
+            );
+        }
+        assert_eq!(
+            rows(
+                &engine,
+                &format!("SELECT id,{column} FROM {table} FORCE INDEX(ai) WHERE {column}={value}")
+            ),
+            vec![vec![Value::Int(1), Value::Int(*value)]]
+        );
+    }
+    drop(engine);
+    let engine = open_strict_test_engine(dir.path());
+    for (table, _, _, _, column, value) in cases {
+        assert_eq!(
+            rows(&engine, &format!("SELECT id,{column} FROM {table}")),
+            vec![vec![Value::Int(1), Value::Int(value)]]
+        );
     }
 }
 

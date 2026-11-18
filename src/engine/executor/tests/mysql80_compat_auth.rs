@@ -5387,7 +5387,9 @@ fn fail_stopped_kill_and_lifecycle_commands_enforce_privileges() {
         crate::engine::status_counters::SessionStatus::new_untracked(),
         AccountKey::new("root", "localhost"),
     );
-    engine.database().quarantine_mvcc("injected WAL write failure");
+    engine
+        .database()
+        .quarantine_mvcc("injected WAL write failure");
 
     for (sql, code) in [
         ("KILL QUERY 12345", 1095),
@@ -5417,11 +5419,15 @@ fn fail_stopped_kill_and_lifecycle_commands_enforce_privileges() {
         engine.execute_with_session(&mut root, sql).unwrap();
     }
     assert_eq!(handle.query_cancel_generation(), 2);
-    assert!(!handle.kill_flag().load(std::sync::atomic::Ordering::Acquire));
+    assert!(!handle
+        .kill_flag()
+        .load(std::sync::atomic::Ordering::Acquire));
     engine
         .execute_with_session(&mut root, "KILL CONNECTION 12345")
         .unwrap();
-    assert!(handle.kill_flag().load(std::sync::atomic::Ordering::Acquire));
+    assert!(handle
+        .kill_flag()
+        .load(std::sync::atomic::Ordering::Acquire));
     assert!(engine
         .shutdown()
         .unwrap_err()

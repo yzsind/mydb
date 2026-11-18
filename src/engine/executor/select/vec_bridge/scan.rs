@@ -267,18 +267,28 @@ impl StorageBatchStream {
             .iter()
             .map(|task| task.page_hi.saturating_sub(task.page_lo))
             .fold(0, u64::saturating_add);
-        if !self.db.eligible_for_full_heap_scan_reuse(pages, multiple_heaps) {
+        if !self
+            .db
+            .eligible_for_full_heap_scan_reuse(pages, multiple_heaps)
+        {
             return Ok(());
         }
 
         let mut scans = Vec::new();
         for tasks in groups {
             let first = &tasks[0];
-            if first.page_lo != 0 || tasks.windows(2).any(|pair| pair[0].page_hi != pair[1].page_lo) {
+            if first.page_lo != 0
+                || tasks
+                    .windows(2)
+                    .any(|pair| pair[0].page_hi != pair[1].page_lo)
+            {
                 return Ok(());
             }
             let last = &tasks[tasks.len() - 1];
-            let Some(scan) = self.db.start_full_heap_scan(first.storage_id, last.page_hi)? else {
+            let Some(scan) = self
+                .db
+                .start_full_heap_scan(first.storage_id, last.page_hi)?
+            else {
                 return Ok(());
             };
             scans.push((first.storage_id, scan));
@@ -388,8 +398,9 @@ impl BatchOperator for StorageBatchStream {
                 task.page_lo,
                 task.page_hi,
                 self.full_heap_scans.as_ref().and_then(|scans| {
-                    let index =
-                        scans.binary_search_by_key(&task.storage_id, |(id, _)| *id).ok()?;
+                    let index = scans
+                        .binary_search_by_key(&task.storage_id, |(id, _)| *id)
+                        .ok()?;
                     Some(&scans[index].1)
                 }),
                 &mut self.direct_scratch,
@@ -2158,7 +2169,8 @@ pub(super) fn try_build_direct_batch_scan<'a>(
         use_zone_map,
         parallel_degree.map(|degree| degree as u32),
     )?;
-    let mut stream = StorageBatchStream::new(db, txn, table, proj, scan_tasks.clone(), morsel_pages)?;
+    let mut stream =
+        StorageBatchStream::new(db, txn, table, proj, scan_tasks.clone(), morsel_pages)?;
     if !use_zone_map && runtime_filters.is_empty() {
         stream.track_full_heap_scans(&scan_tasks)?;
     }

@@ -56,9 +56,10 @@ use crate::engine::cbo::{CboContext, Cost, ExecutionMode, PhysicalProperties};
 use crate::parser::{Expr, JoinType, QueryHint};
 use crate::planner::{
     choose_join_with_hints, collect_physical_plan_tables, combine_conjuncts, estimated_rows,
-    expr_can_resolve_in_table_set, expr_columns_resolved_across, expr_touches_table_set, plan_cost,
-    PhysicalPlan, PlanTable,
+    expr_touches_table_set, join_predicate_resolver_masks, plan_cost, PhysicalPlan, PlanTable,
 };
+#[cfg(test)]
+use crate::planner::{expr_can_resolve_in_table_set, expr_columns_resolved_across};
 use std::time::{Duration, Instant};
 
 /// Maximum number of base relations the bushy DP searches exhaustively.
@@ -129,28 +130,21 @@ pub struct JoinGraph {
     pub scans: Vec<PhysicalPlan>,
     /// The set of base tables behind each scan (a single-table scan
     /// reports one entry; a CTE-with-join scan may report several).
-    pub scan_tables: Vec<Vec<PlanTable>>,
-    /// Boolean adjacency: `edges[i][j]` is true iff at least one
-    /// predicate references columns from both relation `i` and `j`.
-    pub edges: Vec<Vec<bool>>,
+    #[cfg(test)]
+    scan_tables: Vec<Vec<PlanTable>>,
+    /// Neighbor mask for each relation, derived from cross-relation predicates.
+    neighbors: Vec<u32>,
+    scan_names: Vec<String>,
     /// All cross-relation predicates, in the order they were supplied.
     pub cross_preds: Vec<Expr>,
     /// Relations touched by each predicate. This makes the hot straddling
     /// test a pair of bit operations rather than a recursive AST walk.
     predicate_relation_masks: Vec<u32>,
-    /// Precomputed table sets for every subset when the graph is small enough
-    /// for DPsub.  Predicate placement used to rebuild these vectors for every
-    /// cell pair, which made planning time dominated by Arc/String cloning on
-    /// wide join islands.
-    subset_tables: Option<Vec<Vec<PlanTable>>>,
-    /// Connectivity is a pure property of a relation mask.  Cache it once for
-    /// the DP-sized graph instead of walking the graph for every bipartition.
-    connected_masks: Option<Vec<bool>>,
-    /// `predicate_resolved_masks[p][s]` says every concrete column of
-    /// predicate `p` resolves within subset `s`. Together with
-    /// `predicate_relation_masks` this records the earliest legal placement
-    /// stage for multi-table residuals.
-    predicate_resolved_masks: Option<Vec<Vec<bool>>>,
+    /// Cache only subsets visited by the bounded search.
+    connected_masks: Option<Vec<std::cell::Cell<Option<bool>>>>,
+    /// The resolver masks for each predicate's concrete column references.
+    /// This grows with the expressions instead of the number of subsets.
+    predicate_resolvers: Vec<Option<smallvec::SmallVec<[u32; 4]>>>,
 }
 
 impl JoinGraph {
@@ -173,61 +167,35 @@ impl JoinGraph {
                     })
             })
             .collect();
-        let mut edges = vec![vec![false; n]; n];
-        for predicate_mask in &predicate_relation_masks {
-            for i in 0..n {
-                for j in (i + 1)..n {
-                    if i < u32::BITS as usize
-                        && j < u32::BITS as usize
-                        && (*predicate_mask & (1u32 << i)) != 0
-                        && (*predicate_mask & (1u32 << j)) != 0
-                    {
-                        edges[i][j] = true;
-                        edges[j][i] = true;
-                    }
-                }
+        let mut neighbors = vec![0; n];
+        for &mask in &predicate_relation_masks {
+            let mut remaining = mask;
+            while remaining != 0 {
+                let index = remaining.trailing_zeros() as usize;
+                let bit = 1 << index;
+                remaining &= !bit;
+                neighbors[index] |= mask & !bit;
             }
         }
-        let subset_tables = if n <= MAX_DP_TABLES {
-            let mut subsets = vec![Vec::new(); 1usize << n];
-            for mask in 1usize..(1usize << n) {
-                let bit = mask.trailing_zeros() as usize;
-                let previous = mask & !(1usize << bit);
-                subsets[mask] = subsets[previous].clone();
-                subsets[mask].extend(scan_tables[bit].iter().cloned());
-            }
-            Some(subsets)
-        } else {
-            None
-        };
-        let predicate_resolved_masks = subset_tables.as_ref().map(|subsets| {
-            cross_preds
-                .iter()
-                .map(|predicate| {
-                    subsets
-                        .iter()
-                        .map(|tables| expr_columns_resolved_across(predicate, tables, &[]))
-                        .collect()
-                })
-                .collect()
-        });
-        let mut graph = Self {
+        let scan_names = scan_tables
+            .iter()
+            .map(|tables| stable_scan_name(tables))
+            .collect();
+        let predicate_resolvers = cross_preds
+            .iter()
+            .map(|predicate| join_predicate_resolver_masks(predicate, &scan_tables))
+            .collect();
+        Self {
             scans,
+            #[cfg(test)]
             scan_tables,
-            edges,
+            neighbors,
+            scan_names,
             cross_preds,
             predicate_relation_masks,
-            subset_tables,
-            connected_masks: None,
-            predicate_resolved_masks,
-        };
-        if n <= MAX_DP_TABLES {
-            let connected = (0..(1u32 << n))
-                .map(|mask| graph.compute_connected(mask))
-                .collect();
-            graph.connected_masks = Some(connected);
+            connected_masks: (n <= MAX_DP_TABLES).then(|| vec![std::cell::Cell::new(None); 1 << n]),
+            predicate_resolvers,
         }
-        graph
     }
 
     pub fn n(&self) -> usize {
@@ -240,61 +208,46 @@ impl JoinGraph {
     /// Cartesian product, which we forbid in the DP and leave for a
     /// final fallback.
     pub fn is_connected(&self, mask: u32) -> bool {
-        if let Some(cached) = self.connected_masks.as_ref() {
-            return cached.get(mask as usize).copied().unwrap_or(false);
+        if let Some(cache) = self.connected_masks.as_ref() {
+            return cache.get(mask as usize).is_some_and(|cell| {
+                cell.get().unwrap_or_else(|| {
+                    let connected = self.compute_connected(mask);
+                    cell.set(Some(connected));
+                    connected
+                })
+            });
         }
         self.compute_connected(mask)
     }
 
     fn compute_connected(&self, mask: u32) -> bool {
-        if mask == 0 {
+        let first = mask.trailing_zeros() as usize;
+        if first >= self.n() || mask == 0 {
             return false;
         }
-        let n = self.n();
-        let lowest_bit = mask.trailing_zeros() as usize;
-        if lowest_bit >= n {
-            return false;
-        }
-        let mut visited: u32 = 1 << lowest_bit;
-        let mut frontier: u32 = visited;
+        let mut visited = 1_u32 << first;
+        let mut frontier = visited;
         while frontier != 0 {
             let bit = frontier.trailing_zeros() as usize;
-            frontier &= !(1u32 << bit);
-            for j in 0..n {
-                if (mask & (1 << j)) != 0 && (visited & (1 << j)) == 0 && self.edges[bit][j] {
-                    visited |= 1 << j;
-                    frontier |= 1 << j;
-                }
-            }
+            frontier &= !(1 << bit);
+            let fresh = self.neighbors[bit] & mask & !visited;
+            visited |= fresh;
+            frontier |= fresh;
         }
         visited == mask
     }
 
-    fn tables_for_mask(&self, mask: u32) -> Vec<PlanTable> {
-        if let Some(subsets) = self.subset_tables.as_ref() {
-            if let Some(tables) = subsets.get(mask as usize) {
-                return tables.clone();
-            }
-        }
-        (0..self.n())
-            .filter(|i| (mask & (1 << i)) != 0)
-            .flat_map(|i| self.scan_tables[i].iter().cloned())
-            .collect()
-    }
-
-    /// True if there exists at least one predicate touching both
-    /// `left_mask` and `right_mask` (both expected to be sub-graphs of
-    /// the same overall set, with `left & right == 0`).
-    pub fn has_edge_between(&self, left_mask: u32, right_mask: u32) -> bool {
-        let n = self.n();
-        for i in 0..n {
-            if (left_mask & (1 << i)) == 0 {
-                continue;
-            }
-            for j in 0..n {
-                if (right_mask & (1 << j)) != 0 && self.edges[i][j] {
-                    return true;
-                }
+    /// True if a predicate touches both disjoint subgraphs.
+    pub fn has_edge_between(&self, mut left_mask: u32, right_mask: u32) -> bool {
+        while left_mask != 0 {
+            let bit = left_mask.trailing_zeros() as usize;
+            left_mask &= !(1 << bit);
+            if self
+                .neighbors
+                .get(bit)
+                .is_some_and(|neighbors| neighbors & right_mask != 0)
+            {
+                return true;
             }
         }
         false
@@ -356,37 +309,13 @@ impl JoinGraph {
         let mut joinable = Vec::new();
         let mut still = Vec::new();
         for &id in candidates {
-            let Some(pred) = self.cross_preds.get(id) else {
-                continue;
-            };
-            let cached_joinable = self
-                .predicate_relation_masks
-                .get(id)
-                .zip(self.predicate_resolved_masks.as_ref())
-                .and_then(|(&predicate_mask, resolved)| {
-                    let combined = left_mask | right_mask;
-                    resolved.get(id).and_then(|by_subset| {
-                        by_subset.get(combined as usize).map(|&all_resolved| {
-                            (predicate_mask & left_mask) != 0
-                                && (predicate_mask & right_mask) != 0
-                                && all_resolved
-                        })
-                    })
-                });
-            #[cfg(debug_assertions)]
-            if let Some(cached) = cached_joinable {
-                let left_tables = self.tables_for_mask(left_mask);
-                let right_tables = self.tables_for_mask(right_mask);
-                let legacy = expr_can_resolve_in_table_set(pred, &left_tables, &right_tables)
-                    && expr_columns_resolved_across(pred, &left_tables, &right_tables);
-                debug_assert_eq!(cached, legacy, "cached predicate placement diverged");
-            }
-            let can_join = cached_joinable.unwrap_or_else(|| {
-                let left_tables = self.tables_for_mask(left_mask);
-                let right_tables = self.tables_for_mask(right_mask);
-                expr_can_resolve_in_table_set(pred, &left_tables, &right_tables)
-                    && expr_columns_resolved_across(pred, &left_tables, &right_tables)
-            });
+            let touches = self.predicate_relation_masks[id];
+            let combined = left_mask | right_mask;
+            let can_join = (touches & left_mask) != 0
+                && (touches & right_mask) != 0
+                && self.predicate_resolvers[id]
+                    .as_ref()
+                    .is_some_and(|masks| masks.iter().all(|mask| mask & combined != 0));
             if can_join {
                 joinable.push(id);
             } else {
@@ -678,12 +607,13 @@ fn multi_start_greedy(
     seeds.sort_by(|&a, &b| {
         estimated_rows(&graph.scans[a])
             .total_cmp(&estimated_rows(&graph.scans[b]))
-            .then_with(|| stable_scan_name(graph, a).cmp(&stable_scan_name(graph, b)))
+            .then_with(|| graph.scan_names[a].cmp(&graph.scan_names[b]))
     });
 
     let mut best: Option<CompletePlan> = None;
+    let mut first_extensions = [None; u32::BITS as usize];
     for seed in seeds {
-        let Some(complete) = complete_greedy_walk(
+        let Some((complete, first)) = complete_greedy_walk(
             ctx,
             graph,
             query_hints,
@@ -691,11 +621,12 @@ fn multi_start_greedy(
             graph.scans[seed].clone(),
             (0..graph.cross_preds.len()).collect(),
             0.0,
-            vec![stable_scan_name(graph, seed)],
+            vec![graph.scan_names[seed].clone()],
             "relation_seed",
         ) else {
             break;
         };
+        first_extensions[seed] = first;
         if best
             .as_ref()
             .is_none_or(|current| complete_plan_cmp(&complete, current).is_lt())
@@ -713,7 +644,9 @@ fn multi_start_greedy(
     let mut pair_seeds = Vec::new();
     for left_idx in 0..n {
         for right_idx in 0..n {
-            if left_idx == right_idx {
+            // A walk started from this relation has already explored the
+            // identical directed prefix and its deterministic continuation.
+            if left_idx == right_idx || first_extensions[left_idx] == Some(right_idx) {
                 continue;
             }
             let (joinable, still) = graph.straddling_predicate_ids(
@@ -725,8 +658,8 @@ fn multi_start_greedy(
                 continue;
             }
             pair_seeds.push((
-                stable_scan_name(graph, left_idx),
-                stable_scan_name(graph, right_idx),
+                &graph.scan_names[left_idx],
+                &graph.scan_names[right_idx],
                 left_idx,
                 right_idx,
                 joinable,
@@ -745,7 +678,7 @@ fn multi_start_greedy(
             query_hints,
         );
         let rows = estimated_rows(&head);
-        let Some(complete) = complete_greedy_walk(
+        let Some((complete, _)) = complete_greedy_walk(
             ctx,
             graph,
             query_hints,
@@ -753,7 +686,7 @@ fn multi_start_greedy(
             head,
             still,
             rows,
-            vec![left_name, right_name],
+            vec![left_name.clone(), right_name.clone()],
             "edge_seed",
         ) else {
             break;
@@ -777,11 +710,46 @@ fn refine_complete_order(
     query_hints: &[QueryHint],
     mut best: CompletePlan,
 ) -> CompletePlan {
+    #[derive(Clone)]
+    struct Prefix {
+        head: PhysicalPlan,
+        placed: u32,
+        remaining: Vec<usize>,
+        max_rows: f64,
+    }
+    let seed = |first: usize| Prefix {
+        head: graph.scans[first].clone(),
+        placed: 1u32 << first,
+        remaining: (0..graph.cross_preds.len()).collect(),
+        max_rows: 0.0,
+    };
+    let append = |prefix: Prefix, next: usize| {
+        let right_mask = 1u32 << next;
+        let (joinable, remaining) =
+            graph.straddling_predicate_ids(prefix.placed, right_mask, &prefix.remaining);
+        if joinable.is_empty() {
+            return None;
+        }
+        let head = choose_join_with_hints(
+            ctx,
+            prefix.head,
+            graph.scans[next].clone(),
+            JoinType::Inner,
+            graph.combine_predicate_ids(&joinable),
+            query_hints,
+        );
+        Some(Prefix {
+            max_rows: prefix.max_rows.max(estimated_rows(&head)),
+            head,
+            placed: prefix.placed | right_mask,
+            remaining,
+        })
+    };
     let n = graph.n();
-    if n > MAX_DP_TABLES || best.signature.len() != n {
+    if n < 2 || n > MAX_DP_TABLES || best.signature.len() != n {
         return best;
     }
-    let names: Vec<_> = (0..n).map(|index| stable_scan_name(graph, index)).collect();
+    let names = &graph.scan_names;
     // Diagnostic signatures are not relation identities. If two derived
     // sources expose the same signature, keep the original valid incumbent
     // rather than resolving both occurrences to the first relation.
@@ -802,6 +770,9 @@ fn refine_complete_order(
         else {
             break;
         };
+        // Relocating a relation leaves the order before min(from, to)
+        // unchanged. Price that exact prefix once for this refinement pass.
+        let mut prefixes = vec![Some(seed(order[0]))];
         let mut changed = false;
         for from in 0..n {
             for to in 0..n {
@@ -815,39 +786,33 @@ fn refine_complete_order(
                 let mut candidate_order = order.clone();
                 let relation = candidate_order.remove(from);
                 candidate_order.insert(to, relation);
-                let first = candidate_order[0];
-                let mut head = graph.scans[first].clone();
-                let mut placed = 1u32 << first;
-                let mut remaining: Vec<_> = (0..graph.cross_preds.len()).collect();
-                let mut max_rows = 0.0f64;
-                let mut connected = true;
-                for &next in &candidate_order[1..] {
-                    let (joinable, still) =
-                        graph.straddling_predicate_ids(placed, 1u32 << next, &remaining);
-                    if joinable.is_empty() {
-                        connected = false;
-                        break;
-                    }
-                    head = choose_join_with_hints(
-                        ctx,
-                        head,
-                        graph.scans[next].clone(),
-                        JoinType::Inner,
-                        graph.combine_predicate_ids(&joinable),
-                        query_hints,
-                    );
-                    max_rows = max_rows.max(estimated_rows(&head));
-                    placed |= 1u32 << next;
-                    remaining = still;
+                let common = from.min(to);
+                while prefixes.len() < common {
+                    let next = order[prefixes.len()];
+                    let prefix = prefixes
+                        .last()
+                        .unwrap()
+                        .clone()
+                        .and_then(|p| append(p, next));
+                    prefixes.push(prefix);
                 }
-                if !connected {
+                let start = if common == 0 {
+                    Some(seed(candidate_order[0]))
+                } else {
+                    prefixes[common - 1].clone()
+                };
+                let Some(state) = start.and_then(|start| {
+                    candidate_order[common.max(1)..]
+                        .iter()
+                        .try_fold(start, |prefix, &next| append(prefix, next))
+                }) else {
                     continue;
-                }
+                };
                 let candidate = CompletePlan {
-                    cost: plan_cost(&head),
-                    plan: head,
-                    remaining,
-                    max_intermediate_rows: max_rows,
+                    cost: plan_cost(&state.head),
+                    plan: state.head,
+                    remaining: state.remaining,
+                    max_intermediate_rows: state.max_rows,
                     signature: candidate_order
                         .iter()
                         .map(|&index| names[index].clone())
@@ -878,18 +843,35 @@ fn complete_greedy_walk(
     mut max_intermediate_rows: f64,
     mut signature: Vec<String>,
     source: &'static str,
-) -> Option<CompletePlan> {
+) -> Option<(CompletePlan, Option<usize>)> {
     let full = (1u32 << graph.n()) - 1;
+    let mut first_extension = None;
     while placed != full {
-        let mut connected_best: Option<(usize, PhysicalPlan, Vec<usize>, f64, Cost, String)> = None;
-        let mut disconnected_best: Option<(usize, PhysicalPlan, Vec<usize>, f64, Cost, String)> =
-            None;
+        let mut connected = Vec::new();
+        let mut disconnected = Vec::new();
         for right_idx in 0..graph.n() {
             if (placed & (1u32 << right_idx)) != 0 {
                 continue;
             }
             let right_mask = 1u32 << right_idx;
             let (joinable, still) = graph.straddling_predicate_ids(placed, right_mask, &remaining);
+            if joinable.is_empty() {
+                disconnected.push(right_idx);
+            } else {
+                connected.push((right_idx, joinable, still));
+            }
+        }
+        // The walk always prefers a connected extension. Price Cartesian
+        // extensions only when the current component is exhausted.
+        if connected.is_empty() {
+            connected.extend(
+                disconnected
+                    .into_iter()
+                    .map(|right_idx| (right_idx, Vec::new(), remaining.clone())),
+            );
+        }
+        let mut best = None;
+        for (right_idx, joinable, still) in connected {
             let candidate = choose_join_with_hints(
                 ctx,
                 head.clone(),
@@ -900,41 +882,41 @@ fn complete_greedy_walk(
             );
             let rows = estimated_rows(&candidate);
             let cost = plan_cost(&candidate);
-            let stable_name = stable_scan_name(graph, right_idx);
+            let stable_name = graph.scan_names[right_idx].as_str();
             let entry = (right_idx, candidate, still, rows, cost, stable_name);
-            let slot = if joinable.is_empty() {
-                &mut disconnected_best
-            } else {
-                &mut connected_best
-            };
-            if slot
+            if best
                 .as_ref()
                 .is_none_or(|current| greedy_step_cmp(&entry, current).is_lt())
             {
-                *slot = Some(entry);
+                best = Some(entry);
             }
         }
-        let (right_idx, candidate, still, rows, _cost, name) =
-            connected_best.or(disconnected_best)?;
+        let (right_idx, candidate, still, rows, _cost, name) = best?;
+        if placed.count_ones() == 1 && rows.is_finite() && rows.is_sign_positive() {
+            first_extension = Some(right_idx);
+        }
         placed |= 1u32 << right_idx;
         remaining = still;
         max_intermediate_rows = max_intermediate_rows.max(rows);
-        signature.push(name);
+        signature.push(name.to_owned());
         head = candidate;
     }
-    Some(CompletePlan {
-        cost: plan_cost(&head),
-        plan: head,
-        remaining,
-        max_intermediate_rows,
-        signature,
-        source,
-    })
+    Some((
+        CompletePlan {
+            cost: plan_cost(&head),
+            plan: head,
+            remaining,
+            max_intermediate_rows,
+            signature,
+            source,
+        },
+        first_extension,
+    ))
 }
 
 fn greedy_step_cmp(
-    a: &(usize, PhysicalPlan, Vec<usize>, f64, Cost, String),
-    b: &(usize, PhysicalPlan, Vec<usize>, f64, Cost, String),
+    a: &(usize, PhysicalPlan, Vec<usize>, f64, Cost, &str),
+    b: &(usize, PhysicalPlan, Vec<usize>, f64, Cost, &str),
 ) -> std::cmp::Ordering {
     a.3.total_cmp(&b.3)
         .then_with(|| a.4.total.total_cmp(&b.4.total))
@@ -942,8 +924,8 @@ fn greedy_step_cmp(
         .then_with(|| a.5.cmp(&b.5))
 }
 
-fn stable_scan_name(graph: &JoinGraph, idx: usize) -> String {
-    let mut names: Vec<String> = graph.scan_tables[idx]
+fn stable_scan_name(tables: &[PlanTable]) -> String {
+    let mut names: Vec<String> = tables
         .iter()
         .map(|table| {
             format!(
@@ -1377,15 +1359,8 @@ mod tests {
         let mut graph = JoinGraph::new(scans, vec![]);
         // Override adjacency manually with the supplied edges.
         for (i, j) in edges {
-            graph.edges[*i][*j] = true;
-            graph.edges[*j][*i] = true;
-        }
-        if n <= MAX_DP_TABLES {
-            graph.connected_masks = Some(
-                (0..(1u32 << n))
-                    .map(|mask| graph.compute_connected(mask))
-                    .collect(),
-            );
+            graph.neighbors[*i] |= 1 << j;
+            graph.neighbors[*j] |= 1 << i;
         }
         graph
     }
@@ -1589,16 +1564,37 @@ mod tests {
 
     #[test]
     fn straddling_predicates_splits_correctly() {
-        // 3 tables wired in a chain: 0 - 1 - 2.
-        // Predicate "0 joins 2 directly" (a synthetic skip-link) should be
-        // returned as joinable iff one mask covers 0 and the other 2.
-        // We don't construct real predicates here — instead we call
-        // straddling_predicates with an empty candidate list to verify
-        // the API contract on edge inputs.
-        let g = fake_graph(3, &[(0, 1), (1, 2)]);
-        let (j, s) = g.straddling_predicates(0b001, 0b110, &[]);
-        assert!(j.is_empty());
-        assert!(s.is_empty());
+        let predicates = [
+            "a.id = b.id",
+            "a.id = b.id OR b.id = c.id",
+            "shared = a.id",
+            "a.id = b.id AND unknown_column = 1",
+            "a.id = b.id AND EXISTS (SELECT 1)",
+        ]
+        .map(|sql| crate::parser::parse_expr_fragment(sql).unwrap())
+        .to_vec();
+        for size in [3, MAX_DP_TABLES + 1] {
+            let mut scans = vec![
+                named_scan("a", 20, &["id", "shared"]),
+                named_scan("b", 20, &["id"]),
+                named_scan("c", 20, &["id", "shared"]),
+            ];
+            scans.extend((3..size).map(|i| named_scan(&format!("t{i}"), 20, &["other"])));
+            let graph = JoinGraph::new(scans, predicates.clone());
+            for (left, right) in [(0b001, 0b010), (0b011, 0b100), (0b101, 0b010)] {
+                let ids = (0..predicates.len()).collect::<Vec<_>>();
+                let (joined, pending) = graph.straddling_predicate_ids(left, right, &ids);
+                let (expected_joined, expected_pending) =
+                    graph.straddling_predicates(left, right, &predicates);
+                let resolve = |ids: Vec<usize>| {
+                    ids.into_iter()
+                        .map(|id| predicates[id].clone())
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(resolve(joined), expected_joined);
+                assert_eq!(resolve(pending), expected_pending);
+            }
+        }
     }
 
     #[test]

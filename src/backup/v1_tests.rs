@@ -2058,6 +2058,8 @@ fn startup_retention_guard_supports_an_absent_source_directory() {
 
 #[test]
 fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds() {
+    use std::fmt::Write as _;
+
     struct Environment(Vec<(&'static str, Option<String>)>);
     impl Drop for Environment {
         fn drop(&mut self) {
@@ -2113,80 +2115,111 @@ fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds(
         let source = engine(&root.path().join("source"));
         let mut inputs = Vec::new();
         let mut fixtures = Vec::new();
-        for datatype in ["FLOAT32", "FLOAT16", "BFLOAT16", "INT8", "BINARY"] {
-            let table = format!("docs_{}", datatype.to_ascii_lowercase());
-            let binary = datatype == "BINARY";
-            let dim = if binary { 128 } else { 4 };
-            let metric = if binary { "HAMMING" } else { "L2" };
-            // Every vector index remains beyond twenty ordinary indexes.
-            // Independent algorithms/codecs share immutable typed input and
-            // fulltext state; FORCE INDEX and EXPLAIN pin every vector case.
-            let indexes = (0..20)
-                .map(|i| format!(",INDEX ordinary_{i}(extra)"))
-                .collect::<String>();
-            source.execute(&format!("CREATE TABLE {table}(id INT PRIMARY KEY,extra INT,body TEXT,v VECTOR({dim},{datatype}) NOT NULL,FULLTEXT KEY ft(body){indexes})")).unwrap();
+        // Keep multiple heaps and more than twenty ordinary indexes before
+        // every vector index. Several element types can use the same rows,
+        // fulltext index and ordinary indexes within one heap.
+        for (table, types) in [
+            ("docs_float32", &["FLOAT32"][..]),
+            (
+                "docs_native",
+                &["FLOAT16", "BFLOAT16", "INT8", "BINARY"][..],
+            ),
+        ] {
+            let mut ddl = format!(
+                "CREATE TABLE {table}(id INT PRIMARY KEY,extra INT,body TEXT,FULLTEXT KEY ft(body)"
+            );
+            let mut columns = Vec::new();
+            for &datatype in types {
+                let column = format!("v_{}", datatype.to_ascii_lowercase());
+                let dim = if datatype == "BINARY" { 128 } else { 4 };
+                write!(ddl, ",{column} VECTOR({dim},{datatype}) NOT NULL").unwrap();
+                columns.push((column, datatype));
+            }
+            for i in 0..20 {
+                write!(ddl, ",INDEX ordinary_{i}(extra)").unwrap();
+            }
+            ddl.push(')');
+            source.execute(&ddl).unwrap();
+
+            let vector = |id, datatype| {
+                if datatype == "BINARY" {
+                    format!(
+                        "[{}]",
+                        (0..128)
+                            .map(|bit| if bit < id { "1" } else { "0" })
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    )
+                } else if id == 0 {
+                    "[0,0,0,0]".to_owned()
+                } else {
+                    format!("[{id},1,2,3]")
+                }
+            };
+            let payloads = |id| {
+                columns
+                    .iter()
+                    .map(|(_, datatype)| format!(", '{}'", vector(id, *datatype)))
+                    .collect::<String>()
+            };
             let values = (1..=20)
-                .map(|id| {
-                    let vector = if binary {
-                        format!(
-                            "[{}]",
-                            (0..128)
-                                .map(|bit| if bit < id { "1" } else { "0" })
-                                .collect::<Vec<_>>()
-                                .join(",")
-                        )
-                    } else {
-                        format!("[{id},1,2,3]")
-                    };
-                    format!("({id},{id},'database baseline','{vector}')")
-                })
+                .map(|id| format!("({id},{id},'database baseline'{})", payloads(id)))
                 .collect::<Vec<_>>()
                 .join(",");
             source
                 .execute(&format!("INSERT INTO {table} VALUES {values}"))
                 .unwrap();
-            let zero = format!(
-                "[{}]",
-                std::iter::repeat_n("0", dim).collect::<Vec<_>>().join(",")
-            );
-            let query_vector = if binary {
-                format!("TO_VECTOR('{zero}','BINARY')")
-            } else {
-                format!("TO_VECTOR('{zero}')")
-            };
-            let quantizations: &[&str] = if datatype == "FLOAT32" {
-                &["none", "sq8", "sq4", "pq", "bq"]
-            } else {
-                &["none"]
-            };
-            for algorithm in ["HNSW", "IVF"] {
-                for &quantization in quantizations {
-                    let index = format!("vx_{}_{quantization}", algorithm.to_ascii_lowercase());
-                    let options = if algorithm == "HNSW" {
-                        "m=4,ef_construction=32,ef_search=128"
-                    } else {
-                        "nlist=2,nprobe=2"
-                    };
-                    let quant = if quantization == "pq" {
-                        "quantization=pq,pq_m=2,pq_bits=4".to_owned()
-                    } else {
-                        format!("quantization={quantization}")
-                    };
-                    source.execute(&format!("CREATE INDEX {index} ON {table}(v) USING {algorithm} WITH(metric={metric},{options},{quant})")).unwrap();
-                    let projection = format!("id,DISTANCE(v,{query_vector},'{metric}') d,body");
-                    let sql = format!("SELECT {projection} FROM {table} FORCE INDEX({index}) ORDER BY d,id LIMIT 20");
-                    let oracle = format!("SELECT /*+ NO_VECTOR_INDEX */ {projection} FROM {table} ORDER BY d,id LIMIT 20");
-                    let expected_base = rows(&source, &oracle);
-                    assert_index(&source, &sql, &index);
-                    assert_eq!(
-                        rows(&source, &sql),
-                        expected_base,
-                        "source {backend}/{table}/{index}"
-                    );
-                    fixtures.push((table.clone(), index, sql, oracle, expected_base));
+
+            let zero_assignments = columns
+                .iter()
+                .map(|(column, datatype)| format!("{column}='{}'", vector(0, *datatype)))
+                .collect::<Vec<_>>()
+                .join(",");
+            inputs.push((table, zero_assignments, payloads(0)));
+
+            for (column, datatype) in &columns {
+                let zero = vector(0, *datatype);
+                let (metric, query_vector) = if *datatype == "BINARY" {
+                    ("HAMMING", format!("TO_VECTOR('{zero}','BINARY')"))
+                } else {
+                    ("L2", format!("TO_VECTOR('{zero}')"))
+                };
+                let projection = format!("id,DISTANCE({column},{query_vector},'{metric}') d,body");
+                let oracle = format!("SELECT /*+ NO_VECTOR_INDEX */ {projection} FROM {table} ORDER BY d,id LIMIT 20");
+                let expected_base = rows(&source, &oracle);
+                let quantizations: &[&str] = if *datatype == "FLOAT32" {
+                    &["none", "sq8", "sq4", "pq", "bq"]
+                } else {
+                    &["none"]
+                };
+                for algorithm in ["HNSW", "IVF"] {
+                    for &quantization in quantizations {
+                        let index = format!(
+                            "vx_{column}_{}_{quantization}",
+                            algorithm.to_ascii_lowercase()
+                        );
+                        let options = if algorithm == "HNSW" {
+                            "m=4,ef_construction=32,ef_search=128"
+                        } else {
+                            "nlist=2,nprobe=2"
+                        };
+                        let quant = if quantization == "pq" {
+                            "quantization=pq,pq_m=2,pq_bits=4".to_owned()
+                        } else {
+                            format!("quantization={quantization}")
+                        };
+                        source.execute(&format!("CREATE INDEX {index} ON {table}({column}) USING {algorithm} WITH(metric={metric},{options},{quant})")).unwrap();
+                        let sql = format!("SELECT {projection} FROM {table} FORCE INDEX({index}) ORDER BY d,id LIMIT 20");
+                        assert_index(&source, &sql, &index);
+                        assert_eq!(
+                            rows(&source, &sql),
+                            expected_base,
+                            "source {backend}/{table}/{index}"
+                        );
+                        fixtures.push((table, index, sql, oracle.clone(), expected_base.clone()));
+                    }
                 }
             }
-            inputs.push((table, zero));
         }
         assert_eq!(fixtures.len(), 18);
         preparation.finish().unwrap();
@@ -2227,10 +2260,10 @@ fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds(
         );
         // Keep separate committed UPDATE/DELETE/INSERT phases. Each DML now
         // maintains all independent indexes on its typed table simultaneously.
-        for (table, zero) in &inputs {
+        for (table, updates, zero) in &inputs {
             source
                 .execute(&format!(
-                    "UPDATE {table} SET v='{zero}',body='database updateddelta' WHERE id=20"
+                    "UPDATE {table} SET {updates},body='database updateddelta' WHERE id=20"
                 ))
                 .unwrap();
             source
@@ -2238,20 +2271,23 @@ fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds(
                 .unwrap();
             source
                 .execute(&format!(
-                    "INSERT INTO {table} VALUES(999,999,'database archiveddelta','{zero}')"
+                    "INSERT INTO {table} VALUES(999,999,'database archiveddelta'{zero})"
                 ))
                 .unwrap();
         }
+        let mut oracles = std::collections::HashMap::new();
         let expected_rows = fixtures
             .iter()
             .map(|(table, index, sql, oracle, _)| {
-                let expected = rows(&source, oracle);
+                let expected = oracles
+                    .entry(oracle.as_str())
+                    .or_insert_with(|| rows(&source, oracle));
                 assert_eq!(
-                    rows(&source, sql),
+                    &rows(&source, sql),
                     expected,
                     "source DML {backend}/{table}/{index}"
                 );
-                expected
+                expected.clone()
             })
             .collect::<Vec<_>>();
         let receipt = job(&coordinator, coordinator.backup_wal(&repository).unwrap());
@@ -2275,7 +2311,7 @@ fn all_vector_backends_and_fulltext_survive_base_and_pitr_without_heap_rebuilds(
                 "PITR {backend}/{table}/{index}"
             );
         }
-        for (table, _) in &inputs {
+        for (table, _, _) in &inputs {
             assert_eq!(
                 rows(
                     &restored,

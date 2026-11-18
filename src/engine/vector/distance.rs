@@ -2873,7 +2873,7 @@ pub(crate) struct PreparedNativeDistance {
     query: Vec<f32>,
     metric: Metric,
     stored_datatype: crate::vector::VectorDataType,
-    query_squared: f64,
+    query_norm: f64,
 }
 
 impl PreparedNativeDistance {
@@ -2904,7 +2904,11 @@ impl PreparedNativeDistance {
             query: decoded,
             metric,
             stored_datatype,
-            query_squared,
+            query_norm: if metric == Metric::Cosine {
+                query_squared.sqrt()
+            } else {
+                0.0
+            },
         })
     }
 
@@ -2946,10 +2950,10 @@ impl PreparedNativeDistance {
         Ok(match self.metric {
             Metric::L2 | Metric::Dot => sum,
             Metric::Cosine => {
-                if self.query_squared == 0.0 || squared == 0.0 {
+                if self.query_norm == 0.0 || squared == 0.0 {
                     f64::NAN
                 } else {
-                    1.0 - (sum / (self.query_squared.sqrt() * squared.sqrt())).clamp(-1.0, 1.0)
+                    1.0 - (sum / (self.query_norm * squared.sqrt())).clamp(-1.0, 1.0)
                 }
             }
             _ => unreachable!(),
@@ -2963,26 +2967,24 @@ fn decode_native_block<V: crate::vector::VectorInput + ?Sized>(
     out: &mut [f32],
 ) {
     use crate::vector::VectorDataType as D;
-    use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
     match value.datatype() {
         D::Float16 | D::BFloat16 => {
-            let mut words = [0u16; 64];
-            for (word, bytes) in words
-                .iter_mut()
-                .zip(value.payload()[start * 2..(start + out.len()) * 2].chunks_exact(2))
+            let bytes = &value.payload()[start * 2..(start + out.len()) * 2];
+            #[cfg(target_endian = "little")]
             {
-                *word = u16::from_le_bytes(bytes.try_into().unwrap());
+                // SAFETY: every bit pattern is valid for u16. align_to
+                // returns only the aligned middle and never reads past bytes.
+                if let ([], words, []) = unsafe { bytes.align_to::<u16>() } {
+                    decode_half_words(value.datatype(), words, out);
+                    return;
+                }
             }
-            let words = &words[..out.len()];
-            if value.datatype() == D::Float16 {
-                words
-                    .reinterpret_cast::<half::f16>()
-                    .convert_to_f32_slice(out);
-            } else {
-                words
-                    .reinterpret_cast::<half::bf16>()
-                    .convert_to_f32_slice(out);
+            let mut words = [0u16; 64];
+            let words = &mut words[..out.len()];
+            for (word, pair) in words.iter_mut().zip(bytes.chunks_exact(2)) {
+                *word = u16::from_le_bytes([pair[0], pair[1]]);
             }
+            decode_half_words(value.datatype(), words, out);
         }
         D::Float32 => {
             for (x, bytes) in out
@@ -2998,6 +3000,20 @@ fn decode_native_block<V: crate::vector::VectorInput + ?Sized>(
             }
         }
         D::Binary => unreachable!("binary distances use packed kernels"),
+    }
+}
+
+#[inline]
+fn decode_half_words(datatype: crate::vector::VectorDataType, words: &[u16], out: &mut [f32]) {
+    use half::slice::{HalfBitsSliceExt, HalfFloatSliceExt};
+    if datatype == crate::vector::VectorDataType::Float16 {
+        words
+            .reinterpret_cast::<half::f16>()
+            .convert_to_f32_slice(out);
+    } else {
+        words
+            .reinterpret_cast::<half::bf16>()
+            .convert_to_f32_slice(out);
     }
 }
 
@@ -3061,6 +3077,43 @@ mod prepared_native_tests {
             D::Binary => unreachable!(),
         };
         VectorValue::new(datatype, dimension as u32, payload)
+    }
+
+    #[test]
+    fn half_blocks_decode_the_same_bits_at_both_alignments() {
+        for datatype in [D::Float16, D::BFloat16] {
+            let source = value(datatype, 129, 0);
+            let mut bytes = vec![0; source.payload.len() + 1];
+            for offset in 0..=1 {
+                bytes[offset..offset + source.payload.len()].copy_from_slice(&source.payload);
+                let input = crate::vector::VectorRef {
+                    datatype,
+                    dimension: source.dimension,
+                    payload: &bytes[offset..offset + source.payload.len()],
+                };
+                for start in [0, 64, 128] {
+                    let count = (129 - start).min(64);
+                    let mut decoded = [0.0; 64];
+                    decode_native_block(&input, start, &mut decoded[..count]);
+                    for (actual, pair) in decoded[..count]
+                        .iter()
+                        .zip(source.payload[start * 2..].chunks_exact(2))
+                    {
+                        let word = u16::from_le_bytes([pair[0], pair[1]]);
+                        let expected = if datatype == D::Float16 {
+                            half::f16::from_bits(word).to_f32()
+                        } else {
+                            half::bf16::from_bits(word).to_f32()
+                        };
+                        assert_eq!(
+                            actual.to_bits(),
+                            expected.to_bits(),
+                            "{datatype:?}/{offset}/{start}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -8,6 +8,8 @@
 
 Mixed transactional and analytical workloads, with native AI retrieval.
 
+[English](README.md) · [简体中文](readme_cn.md)
+
 [Download](https://github.com/yzsind/mydb/releases/tag/v1.0.0) · [Why MyDB](docs/why-mydb.md) · [Performance evaluation](#performance-evaluation) · [Testing](#testing) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
 </div>
