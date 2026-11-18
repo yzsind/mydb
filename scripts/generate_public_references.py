@@ -101,6 +101,7 @@ See [interface stability](configuration.md#interface-stability).
             "Bytes": "Byte size",
             "Mebibytes": "MiB (bare number)",
             "IpAddr": "IPv4 or IPv6 address",
+            "SocketAddr": "IPv4:port or [IPv6]:port",
             "NonEmpty": "Nonempty string",
             "String": "String",
         }

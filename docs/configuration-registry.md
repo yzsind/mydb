@@ -174,6 +174,7 @@ See [interface stability](configuration.md#interface-stability).
 | `rest_default_timeout_ms` | `MYDB_REST_DEFAULT_TIMEOUT_MS` | `Integer 1..1073741824` | — | Yes |
 | `rest_enabled` | `MYDB_REST_ENABLED` | `ON/OFF` | — | Yes |
 | `rest_host` | `MYDB_REST_HOST` | `IPv4 or IPv6 address` | — | Yes |
+| `rest_loopback_http_addr` | `MYDB_REST_LOOPBACK_HTTP_ADDR` | `IPv4:port or [IPv6]:port` | — | Yes |
 | `rest_max_connections` | `MYDB_REST_MAX_CONNECTIONS` | `Integer 1..1073741824` | — | Yes |
 | `rest_max_header_bytes` | `MYDB_REST_MAX_HEADER_BYTES` | `Integer 1..1073741824` | — | Yes |
 | `rest_max_inflight` | `MYDB_REST_MAX_INFLIGHT` | `Integer 1..1073741824` | — | Yes |

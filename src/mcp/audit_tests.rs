@@ -477,7 +477,7 @@ async fn audit_failed_atomic_rollback_closes_session_before_reuse() {
         Arc::new(FailedRollback(h.engine.clone())),
         h.engine.registry().clone(),
     );
-    let session = sql::create_session(state.clone(), identity, Some("test".into()))
+    let session = sql::create_session(state.clone(), identity.clone(), Some("test".into()))
         .await
         .unwrap();
     state
@@ -508,7 +508,7 @@ async fn audit_failed_atomic_rollback_closes_session_before_reuse() {
     let sql::Payload::Structured(value, _) = chunk.payload else {
         panic!()
     };
-    let rejected_reuse = state.session(&session.id, &session.key_id).is_err();
+    let rejected_reuse = state.session(&session.id, &identity).is_err();
     drop(execution);
     state.close_all().await;
     h.close().await;

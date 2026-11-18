@@ -18,17 +18,18 @@ fn engine() -> (tempfile::TempDir, Arc<StorageQueryEngine>) {
     );
     (dir, engine)
 }
-fn identity(engine: &StorageQueryEngine) -> Identity {
+fn test_key(engine: &StorageQueryEngine, sql: &str) -> String {
     let mut s = SessionContext::default();
     s.mysql_authenticated = true;
     s.ssl_cipher = Some("TLS_AES_256_GCM_SHA384".into());
-    let r = engine
-        .execute_with_session(&mut s, "CREATE API KEY 'test'")
-        .unwrap();
+    let r = engine.execute_with_session(&mut s, sql).unwrap();
     let crate::engine::api::QueryResponse::ResultSet(r) = r else {
         panic!()
     };
-    let token = r.rows[0][6].to_display_string();
+    r.rows[0][6].to_display_string()
+}
+fn identity(engine: &StorageQueryEngine) -> Identity {
+    let token = test_key(engine, "CREATE API KEY 'test'");
     let peer = Peer {
         host: "127.0.0.1".into(),
         cipher: None,
@@ -398,6 +399,166 @@ async fn rest_protocol_required_tls_never_falls_back_to_plaintext() {
         server.run_with_listener(listener).await.unwrap_err().kind(),
         std::io::ErrorKind::InvalidInput
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_protocol_dual_listeners_share_sql_and_enforce_transport() {
+    let (_dir, engine) = engine();
+    let key = test_key(&engine, "CREATE API KEY 'loopback'");
+    let mut root = SessionContext::default();
+    for sql in [
+        "CREATE USER 'strict_rest'@'127.0.0.1' REQUIRE SSL",
+        "GRANT SELECT ON test.* TO 'strict_rest'@'127.0.0.1'",
+    ] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    let tls_key = test_key(
+        &engine,
+        "CREATE API KEY 'strict' FOR 'strict_rest'@'127.0.0.1'",
+    );
+    let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let secondary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let primary_addr = primary.local_addr().unwrap();
+    let https = format!("https://{primary_addr}");
+    let http = format!("http://{}", secondary.local_addr().unwrap());
+    let mut config = RestConfig::from_startup().unwrap();
+    config.enabled = true;
+    config.loopback_http_addr = Some(secondary.local_addr().unwrap());
+    config.max_sessions = 1;
+    let tls = crate::mysql::server::load_or_generate_tls_acceptor(None).unwrap();
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), tls);
+    let task =
+        tokio::spawn(async move { server.run_with_listeners(primary, Some(secondary)).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .danger_accept_invalid_certs(true)
+        .pool_max_idle_per_host(0)
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+
+    let session = client
+        .post(format!("{http}/api/v1/sessions"))
+        .bearer_auth(&key)
+        .json(&json!({"database":"test"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session.status(), StatusCode::CREATED);
+    let session = session.json::<Value>().await.unwrap();
+    let id = session["id"].as_str().unwrap();
+    for sql in [
+        "CREATE TABLE dual_listener (id INT PRIMARY KEY)",
+        "INSERT INTO dual_listener VALUES (42)",
+    ] {
+        let response = client
+            .post(format!("{http}/api/v1/sessions/{id}/sql"))
+            .bearer_auth(&key)
+            .json(&json!({"sql":sql}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "{sql}");
+    }
+    let foreign_session = client
+        .get(format!("{https}/api/v1/sessions/{id}"))
+        .bearer_auth(&key)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(foreign_session.status(), StatusCode::NOT_FOUND);
+    let session_limit = client
+        .post(format!("{https}/api/v1/sessions"))
+        .bearer_auth(&tls_key)
+        .json(&json!({}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(session_limit.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(
+        client
+            .delete(format!("{http}/api/v1/sessions/{id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    let query = json!({"sql":"SELECT id FROM test.dual_listener"});
+    let denied = client
+        .post(format!("{http}/api/v1/sql"))
+        .bearer_auth(&tls_key)
+        .json(&query)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+    let result = client
+        .post(format!("{https}/api/v1/sql"))
+        .bearer_auth(&tls_key)
+        .json(&query)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(result.status(), StatusCode::OK);
+    assert_eq!(
+        result.json::<Value>().await.unwrap()["results"][0]["rows"],
+        json!([["42"]])
+    );
+    assert!(client
+        .get(format!("http://{primary_addr}/health/live"))
+        .send()
+        .await
+        .is_err());
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
+}
+
+#[tokio::test]
+async fn rest_protocol_dual_listeners_share_connection_limit() {
+    let (_dir, engine) = engine();
+    let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let secondary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let https = format!("https://{}/health/live", primary.local_addr().unwrap());
+    let http = format!("http://{}/health/live", secondary.local_addr().unwrap());
+    let mut config = RestConfig::from_startup().unwrap();
+    config.loopback_http_addr = Some(secondary.local_addr().unwrap());
+    config.max_connections = 1;
+    let tls = crate::mysql::server::load_or_generate_tls_acceptor(None).unwrap();
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), tls);
+    let task =
+        tokio::spawn(async move { server.run_with_listeners(primary, Some(secondary)).await });
+    let client = || {
+        reqwest::Client::builder()
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .http1_only()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap()
+    };
+    let local_client = client();
+    let remote_client = client();
+    let live = local_client.get(&http).send().await.unwrap();
+    assert_eq!(live.status(), StatusCode::OK);
+    live.bytes().await.unwrap();
+    assert!(remote_client.get(&https).send().await.is_err());
+    drop(local_client);
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if let Ok(live) = remote_client.get(&https).send().await {
+                assert_eq!(live.status(), StatusCode::OK);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("Closing the local connection should release the shared permit");
+    task.abort();
+    assert!(task.await.unwrap_err().is_cancelled());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

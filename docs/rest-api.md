@@ -23,6 +23,35 @@ an ephemeral self-signed certificate. `rest_tls_mode=disabled` is permitted
 only on loopback. When `ssl_ca` is configured, verified client certificate
 identity is available to account `REQUIRE X509` checks.
 
+### Serve local HTTP alongside HTTPS
+
+Keep the primary listener in `required` mode and add a separate loopback
+address for local clients.
+
+```ini
+[mydb]
+rest_enabled = ON
+rest_host = 10.0.0.5
+rest_port = 8740
+rest_tls_mode = required
+rest_ssl_cert = /etc/mydb/server-cert.pem
+rest_ssl_key = /etc/mydb/server-key.pem
+rest_loopback_http_addr = 127.0.0.1:8739
+```
+
+Replace `10.0.0.5` with the interface address reachable by remote clients and
+configure them to trust a certificate that matches their HTTPS URL. Local clients
+use `http://127.0.0.1:8739`. The optional address accepts a loopback IP and port,
+including bracketed IPv6 such as `[::1]:8739`. Choose addresses and ports that
+can be bound at the same time. If either bind fails, startup fails.
+
+Both listeners serve the enabled REST and MCP routes and share the connection,
+session, execution and memory limits. Each persistent SQL session is available
+on its original listener to its owning API key. Each request authenticates with
+its actual peer and TLS state when accessing REST SQL or MCP. A global
+`require_secure_transport` policy or account TLS requirement requires HTTPS
+for authenticated operations.
+
 ## Create, list, reveal, and revoke API keys
 
 Use a TLS-authenticated MySQL connection:
