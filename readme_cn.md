@@ -10,7 +10,7 @@
 
 [English](README.md) · [简体中文](readme_cn.md)
 
-[下载](https://github.com/yzsind/mydb/releases/tag/v1.0.0) · [为什么选择 MyDB](docs/why-mydb.md) · [性能评测](#性能评测) · [测试验证](#测试验证) · [快速开始](#快速开始) · [为 AI 智能体而构建](#为-ai-智能体而构建) · [文档](docs/README.md) · [MySQL 兼容性](docs/mysql80-compatibility.md)
+[下载](https://github.com/yzsind/mydb/releases/tag/v1.0.1) · [为什么选择 MyDB](docs/why-mydb.md) · [性能评测](#性能评测) · [测试验证](#测试验证) · [快速开始](#快速开始) · [为 AI 智能体而构建](#为-ai-智能体而构建) · [文档](docs/README.md) · [MySQL 兼容性](docs/mysql80-compatibility.md)
 
 </div>
 
@@ -23,7 +23,7 @@ MyDB 是使用 Rust 构建的通用数据库，面向 **HTAP（混合事务与�
 应用可以复用 MySQL 客户端和驱动，原生 REST 和 MCP 接口则让服务与智能体直接访问同一个引擎。
 自动 Zone Maps、在线模式变更和可直接查询的备份，减少了访问调优、数据结构演进以及历史数据检查所需的工作。
 
-MyDB 1.0.0 是公开预览版本，用于功能验证和受控环境下的评估。
+MyDB 1.0.1 是公开预览版本，用于功能验证和受控环境下的评估。
 
 | 核心优势 | 带来的能力 |
 | --- | --- |
@@ -96,7 +96,7 @@ TPC-DS 仅统计 MyDB/MySQL 结果文件一致的查询；这一子集与历史�
 
 ## 快速开始
 
-可从 [1.0.0 发布页面](https://github.com/yzsind/mydb/releases/tag/v1.0.0)
+可从 [1.0.1 发布页面](https://github.com/yzsind/mydb/releases/tag/v1.0.1)
 下载 macOS ARM64、Linux x86_64 和 Windows x64 的预编译包，页面同时提供 SHA256 校验和与平台验证详情。
 
 ### 运行下载的二进制程序

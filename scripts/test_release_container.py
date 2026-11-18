@@ -15,6 +15,7 @@ from pathlib import Path
 import shutil
 import subprocess
 import time
+import tomllib
 import uuid
 
 import pymysql
@@ -103,7 +104,9 @@ def main():
     result = {'passed':False,'base_image':args.base_image,'script_sha256':sha(Path(__file__).resolve())}
     names = []
     containers = 'mydb-release-' + uuid.uuid4().hex[:10]
-    image = 'mydb-candidate:1.0.0-' + containers[-10:]
+    version = tomllib.loads((ROOT / 'Cargo.toml').read_text())['package']['version']
+    client_version = tomllib.loads((ROOT / 'clients/mydb-cli/Cargo.toml').read_text())['package']['version']
+    image = f'mydb-candidate:{version}-' + containers[-10:]
     clients = []
     volume = containers + '-workspace' if args.native_volume else None
     volume_created = False
@@ -205,7 +208,7 @@ def main():
         assert command(['docker','exec',name,'id','-u'])=='10001'
         assert conn._sock.cipher()
         command(['docker','exec',name,'sh','-ec','test -s /usr/share/licenses/mydb/third-party/packages.json; test -s /usr/local/bin/mydb-backup; test -s /usr/local/bin/mydb-cli'])
-        assert command(['docker','exec',name,'mydb-cli','--version']) == 'mydb-cli 1.0.0'
+        assert command(['docker','exec',name,'mydb-cli','--version']) == f'mydb-cli {client_version}'
         query(conn,'CREATE TABLE image_rows(id INT PRIMARY KEY,v DECIMAL(20,4),b LONGBLOB,KEY kv(v))')
         with conn.cursor() as cursor:cursor.executemany('INSERT INTO image_rows VALUES(%s,%s,%s)',expected)
         verify(conn)

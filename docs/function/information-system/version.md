@@ -25,7 +25,7 @@ Returns a string containing the MySQL compatibility version, the mydb product ve
 SELECT VERSION();
 ```
 
-For example: `8.0.46-mydb-1.0.0-20261116`. `@@version` and the protocol handshake use the same string.
+For example: `8.0.46-mydb-1.0.1-20261116`. `@@version` and the protocol handshake use the same string.
 
 ## Notes
 
