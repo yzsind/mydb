@@ -1203,15 +1203,14 @@ fn compare_query(
 ) {
     let oracle = run_query(engine, session_setup, sql, ORACLE);
     let limit = without_trailing_limit(sql);
-    let oracle_full = match (&oracle, &limit) {
-        (Outcome::Rows(_), Some((unlimited, _))) => {
-            match run_query(engine, session_setup, unlimited, ORACLE) {
-                Outcome::Rows(rows) => Some(rows),
-                Outcome::Error(..) => None,
-            }
-        }
-        _ => None,
+    let oracle_sorted = match &oracle {
+        Outcome::Rows(rows) => Some(sorted(rows)),
+        Outcome::Error(..) => None,
     };
+    // The unlimited oracle is only needed to resolve a different LIMIT tie.
+    // Keep it lazy and shared across configurations: ordinary exact matches
+    // must not execute and materialize an additional unbounded query.
+    let oracle_full = std::cell::OnceCell::new();
     if let Outcome::Error(code, message) = &oracle {
         report
             .oracle_errors
@@ -1229,7 +1228,7 @@ fn compare_query(
             (Outcome::Rows(expected), Outcome::Rows(actual)) => {
                 // Results are compared as multisets: an ORDER BY whose keys do
                 // not determine a total order may legitimately permute ties.
-                if rows_match(&sorted(expected), &sorted(actual)) {
+                if rows_match(oracle_sorted.as_ref().unwrap(), &sorted(actual)) {
                     continue;
                 }
                 // ORDER BY ... LIMIT may keep any rows that tie at the
@@ -1237,6 +1236,13 @@ fn compare_query(
                 let tie_ok = limit.is_some()
                     && expected.len() == actual.len()
                     && oracle_full
+                        .get_or_init(|| {
+                            let (unlimited, _) = limit.as_ref().unwrap();
+                            match run_query(engine, session_setup, unlimited, ORACLE) {
+                                Outcome::Rows(rows) => Some(rows),
+                                Outcome::Error(..) => None,
+                            }
+                        })
                         .as_ref()
                         .is_some_and(|full| is_sub_multiset(actual, full));
                 if !tie_ok {
@@ -1278,6 +1284,45 @@ const KNOWN_ORACLE_ERRORS: &[(&str, &str)] = &[
     ),
 ];
 
+// Captured from the original fixtures. Smaller inputs must not turn a query
+// that exercised real output rows into a vacuous equality of empty results.
+// Existing empty queries may gain coverage, so this is an upper bound.
+const KNOWN_EMPTY_ORACLES: &[(&str, &str)] = &[
+    ("tpch", "q02"),
+    ("tpch", "q20"),
+    ("tpch", "q21"),
+    ("tpcds", "q03"),
+    ("tpcds", "q06"),
+    ("tpcds", "q08"),
+    ("tpcds", "q14b"),
+    ("tpcds", "q21"),
+    ("tpcds", "q23b"),
+    ("tpcds", "q24a"),
+    ("tpcds", "q24b"),
+    ("tpcds", "q30"),
+    ("tpcds", "q33"),
+    ("tpcds", "q34"),
+    ("tpcds", "q37"),
+    ("tpcds", "q39a"),
+    ("tpcds", "q39b"),
+    ("tpcds", "q40"),
+    ("tpcds", "q41"),
+    ("tpcds", "q43"),
+    ("tpcds", "q44"),
+    ("tpcds", "q54"),
+    ("tpcds", "q56"),
+    ("tpcds", "q57"),
+    ("tpcds", "q58"),
+    ("tpcds", "q60"),
+    ("tpcds", "q64"),
+    ("tpcds", "q65"),
+    ("tpcds", "q72"),
+    ("tpcds", "q74"),
+    ("tpcds", "q81"),
+    ("tpcds", "q82"),
+    ("tpcds", "q91"),
+];
+
 fn finish(suite: &str, report: Report) {
     let unexpected_errors: Vec<&String> = report
         .oracle_errors
@@ -1298,6 +1343,14 @@ fn finish(suite: &str, report: Report) {
     );
     let mut problems = report.failures.clone();
     problems.extend(unexpected_errors.into_iter().cloned());
+    let family = suite.split_whitespace().next().unwrap();
+    problems.extend(
+        report
+            .empty
+            .iter()
+            .filter(|name| !KNOWN_EMPTY_ORACLES.contains(&(family, name.as_str())))
+            .map(|name| format!("{name}: previously nonempty oracle became empty")),
+    );
     assert!(
         problems.is_empty(),
         "{suite} differential corpus found {} problem(s):\n{}",
@@ -1320,6 +1373,65 @@ fn on_query_stack(body: impl FnOnce() + Send + 'static) {
     }
 }
 
+const CORPUS_POOL_PAGES: u64 = 8_192;
+
+fn open_corpus_fixture(
+    dir: &std::path::Path,
+    suite: &str,
+    queries: &[(String, String)],
+    build: fn(&StorageQueryEngine, &[(String, String)]),
+    shards: usize,
+) -> StorageQueryEngine {
+    if shards > 1 {
+        if let (Some(run), Some(root)) = (
+            std::env::var_os("NEXTEST_RUN_ID"),
+            std::env::var_os("MYDB_TEST_TMP_DIR"),
+        ) {
+            // Every shard builds the same data and statistics. Build one
+            // durable image for this run and give each process a private
+            // copy, with its own catalog, buffer pool and runtime state.
+            let root = std::path::PathBuf::from(root)
+                .join("differential-fixtures")
+                .join(run);
+            std::fs::create_dir_all(&root).unwrap();
+            let fixture = root.join(suite);
+            let lock = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(root.join(format!("{suite}.lock")))
+                .unwrap();
+            lock.lock().unwrap();
+            if !fixture.is_dir() {
+                let staging = tempfile::tempdir_in(&root).unwrap();
+                let data = staging.path().join("data");
+                std::fs::create_dir(&data).unwrap();
+                let mut config = memory_test_storage_config();
+                config.durability = crate::storage::DurabilityMode::Strict;
+                config.buffer_pool_pages = CORPUS_POOL_PAGES;
+                let prepare = crate::platform::fs::FixtureSyncBatch::new(&data).unwrap();
+                let engine =
+                    StorageQueryEngine::open_with_storage_config_without_background_workers(
+                        &data, config,
+                    )
+                    .unwrap();
+                build(&engine, queries);
+                engine.shutdown().unwrap();
+                drop(engine);
+                prepare.finish().unwrap();
+                std::fs::rename(&data, &fixture).unwrap();
+            }
+            drop(lock);
+            crate::util::file::copy_fixture_tree(&fixture, dir).unwrap();
+            return open_test_engine_with_buffer_pool_pages(dir, CORPUS_POOL_PAGES);
+        }
+    }
+    let engine = open_test_engine_with_buffer_pool_pages(dir, CORPUS_POOL_PAGES);
+    build(&engine, queries);
+    engine
+}
+
 fn run_suite(
     suite: &str,
     queries: Vec<(String, String)>,
@@ -1330,8 +1442,7 @@ fn run_suite(
 ) {
     std::fs::create_dir_all("/tmp/mydb").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-    let engine = open_test_engine_with_buffer_pool_pages(dir.path(), 8_192);
-    build(&engine, &queries);
+    let engine = open_corpus_fixture(dir.path(), suite, &queries, build, shards);
     let filter = std::env::var("MYDB_DIFF_QUERIES").ok();
     let mut report = Report::default();
     for (index, (name, sql)) in queries.iter().enumerate() {
@@ -1412,11 +1523,11 @@ fn build_shapes(engine: &StorageQueryEngine, _queries: &[(String, String)]) {
          CASE WHEN n % 13 = 0 THEN NULL ELSE (n * 104729 % 1000) / 7.0 END, \
          CONCAT(REPEAT('x', n % 7), 'k', n % 23), \
          DATE_ADD('2020-01-01', INTERVAL n % 400 DAY) \
-         FROM generate_series(1, 3000) gs(n)",
+         FROM generate_series(1, 1025) gs(n)",
         "INSERT INTO sb SELECT n, CASE WHEN n % 7 = 0 THEN NULL ELSE n % 53 END, \
          ELT(1 + n % 4, 'a', 'c', 'e', NULL), \
          CAST((n * 31 % 2001 - 1000) / 10 AS DECIMAL(10,1)), n / 3.0, \
-         CONCAT('k', n % 29) FROM generate_series(1, 1500) gs(n)",
+         CONCAT('k', n % 29) FROM generate_series(1, 513) gs(n)",
         "ALTER TABLE sb ADD INDEX idx_sb_k (k)",
         "ANALYZE TABLE sa",
         "ANALYZE TABLE sb",

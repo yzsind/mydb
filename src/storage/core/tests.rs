@@ -28983,6 +28983,11 @@ fn compact_memory_seed_preserves_dictionary_rows_roots_and_private_mutations() {
     let compact = root.path().join("compact");
     crate::util::file::copy_fixture_tree(&source, &compact).unwrap();
     crate::test_seed_setup::compact_memory_seed(&compact, &empty_indexes).unwrap();
+    let templates = crate::test_seed_setup::empty_heap_templates_dir(&compact);
+    assert!(empty_indexes.iter().all(|(id, _)| {
+        let name = format!("{id}.heap");
+        !compact.join("system/catalog").join(&name).exists() && templates.join(name).is_file()
+    }));
     assert!(empty_indexes
         .iter()
         .flat_map(|(_, paths)| paths)
@@ -29007,6 +29012,9 @@ fn compact_memory_seed_preserves_dictionary_rows_roots_and_private_mutations() {
                     .unwrap();
                     assert_eq!(serde_json::to_value(db.catalog()).unwrap(), catalog);
                     if cached {
+                        assert!(empty_indexes
+                            .iter()
+                            .any(|(id, _)| !db.table_path(*id).exists()));
                         let table = crate::storage::data_dictionary::dd_table_schema(
                             crate::storage::data_dictionary::DD_CHECK_CONSTRAINTS,
                         )

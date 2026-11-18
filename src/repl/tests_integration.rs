@@ -46,6 +46,7 @@ async fn initialize_replica_fixture(
     master: std::net::SocketAddr,
     dir: &std::path::Path,
 ) -> ReplicaProgress {
+    let preparation = crate::platform::fs::FixtureSyncBatch::new(dir).unwrap();
     let mut role = crate::repl::role::RoleState::new_standalone();
     role.role = crate::repl::role::Role::Replica;
     role.master_endpoint = Some(master.to_string());
@@ -59,6 +60,7 @@ async fn initialize_replica_fixture(
     )
     .await
     .unwrap();
+    preparation.finish().unwrap();
     crate::repl::replica::progress::load_progress(dir)
         .unwrap()
         .unwrap()
@@ -661,6 +663,9 @@ mod online_apply {
         Arc<PlMutex<String>>,
     ) {
         let dir = TempDir::new().unwrap();
+        // This private base is not opened until every received file has
+        // completed the shared device barrier.
+        let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
         let mut role = crate::repl::role::RoleState::new_standalone();
         role.role = crate::repl::role::Role::Replica;
         role.master_endpoint = Some(master_addr.to_string());
@@ -675,6 +680,7 @@ mod online_apply {
         )
         .await
         .unwrap();
+        preparation.finish().unwrap();
         let progress = crate::repl::replica::progress::load_progress(dir.path())
             .unwrap()
             .unwrap();
@@ -2435,6 +2441,39 @@ mod base_backup_tests {
         .await
         .unwrap();
         (engine, dir, service)
+    }
+
+    #[tokio::test]
+    async fn base_backup_sync_failure_keeps_live_tree_and_progress_unpublished() {
+        let (_engine, _master_dir, service) = build_master_with_base_backup().await;
+        let addr = service.bind_addr();
+        let target = TempDir::new().unwrap();
+        let existing = target.path().join("schemas/local");
+        std::fs::create_dir_all(existing.parent().unwrap()).unwrap();
+        std::fs::write(&existing, b"previous live tree").unwrap();
+        let replica_uuid = generate_uuid_string();
+        let staging = target
+            .path()
+            .join(format!(".native-repl-stage-{replica_uuid}"));
+        crate::platform::fs::inject_path_sync_error_for_test(&staging, libc::EIO);
+
+        let result = perform_base_backup_into_with_config(
+            &addr.ip().to_string(),
+            addr.port(),
+            &replica_uuid,
+            target.path(),
+            ReplConfig::test_defaults(),
+        )
+        .await;
+        let error = result.expect_err("a failed final sync must not install the backup");
+        let injected = std::io::Error::from_raw_os_error(libc::EIO);
+        assert_eq!(error.message(), format!("base backup io: {injected}"));
+        assert_eq!(std::fs::read(&existing).unwrap(), b"previous live tree");
+        assert!(crate::repl::replica::progress::load_progress(target.path())
+            .unwrap()
+            .is_none());
+        assert!(!staging.exists());
+        service.shutdown().await;
     }
 
     #[tokio::test]

@@ -45,7 +45,9 @@ pub(super) fn memory_test_storage_config() -> StorageConfig {
         lock_wait: Duration::from_millis(1_000),
         group_commit_window: Duration::from_micros(0),
         wal_segment_bytes: 64 * 1024 * 1024,
-        buffer_pool_pages: 512,
+        // SQL fixtures need room for their inputs independently of query
+        // work-area budgets. Eviction tests choose explicit small pools.
+        buffer_pool_pages: 2_048,
         buffer_pool_io_threads: 1,
         buffer_pool_prefetch_pages: 0,
         undo_retention: Duration::from_millis(60_000),
@@ -63,6 +65,24 @@ fn open_test_engine(dir: &std::path::Path) -> StorageQueryEngine {
     .unwrap();
     crate::engine::sysvar::builtin::query::allow_test_server_files();
     engine
+}
+
+/// Reopen fixtures retain complete backing metadata with Memory durability.
+fn open_complete_memory_test_engine(dir: &std::path::Path) -> StorageQueryEngine {
+    let seed = crate::util::env::var("MYDB_TEST_SEED_DIR").ok();
+    let catalog =
+        if seed.is_some() && crate::util::env::var("MYDB_TEST_SEED_CATALOG_SOURCE").ok() == seed {
+            crate::util::env::var("MYDB_TEST_SEED_CATALOG").ok()
+        } else {
+            None
+        };
+    crate::util::env::with_vars(
+        &[
+            ("MYDB_TEST_MEMORY_SEED_DIR", seed.as_deref()),
+            ("MYDB_TEST_MEMORY_CATALOG", catalog.as_deref()),
+        ],
+        || open_test_engine(dir),
+    )
 }
 
 /// Size large query inputs independently of the operator budgets under test.

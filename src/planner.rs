@@ -5778,24 +5778,14 @@ pub(crate) fn plan_output_width(plan: &PhysicalPlan) -> f64 {
 
 fn projected_row_width(table: &PlanTable, projection: Option<&[usize]>) -> f64 {
     use crate::engine::cbo::operator_cost::estimated_row_width;
-    let full = estimated_row_width(&table.schema);
-    let Some(columns) = projection else {
-        return full;
+    let Some(columns) = projection.filter(|columns| !columns.is_empty()) else {
+        return estimated_row_width(&table.schema);
     };
-    if columns.is_empty() || table.schema.columns.is_empty() {
-        return full;
-    }
     let body = columns
         .iter()
         .filter_map(|index| table.schema.columns.get(*index))
         .map(|column| {
-            table
-                .schema
-                .stats
-                .columns
-                .get(&column.name.to_ascii_lowercase())
-                .and_then(|stats| stats.average_width_bytes)
-                .unwrap_or(column.data_type.key_byte_length() as f64)
+            crate::engine::cbo::operator_cost::estimated_column_width(&table.schema, column)
         })
         .sum::<f64>();
     (16.0 + body).max(8.0)
@@ -15959,9 +15949,10 @@ enum JoinHintPref {
 
 fn resolve_join_hint(
     hints: &[QueryHint],
-    left_tables: &[PlanTable],
-    right_tables: &[PlanTable],
+    left: &PhysicalPlan,
+    right: &PhysicalPlan,
 ) -> JoinHintPref {
+    let mut plan_tables = None;
     for hint in hints {
         let (pref, tables) = match hint {
             QueryHint::HashJoin { tables } => (JoinHintPref::ForceHash, tables),
@@ -15970,6 +15961,12 @@ fn resolve_join_hint(
             QueryHint::IndexNlj { tables } => (JoinHintPref::ForceIndexNlj, tables),
             _ => continue,
         };
+        let (left_tables, right_tables) = plan_tables.get_or_insert_with(|| {
+            (
+                collect_physical_plan_tables(left),
+                collect_physical_plan_tables(right),
+            )
+        });
         if !hint_tables_are_in_join(tables, left_tables, right_tables) {
             continue;
         }
@@ -18452,9 +18449,7 @@ pub(crate) fn choose_join_with_hints(
     condition: Option<Expr>,
     query_hints: &[QueryHint],
 ) -> PhysicalPlan {
-    let left_tables = collect_physical_plan_tables(&left);
-    let right_tables = collect_physical_plan_tables(&right);
-    let join_hint = resolve_join_hint(query_hints, &left_tables, &right_tables);
+    let join_hint = resolve_join_hint(query_hints, &left, &right);
 
     let left_rows = estimated_rows(&left);
     let right_rows = estimated_rows(&right);
@@ -18997,15 +18992,40 @@ fn ndv_for_column(schema: &TableSchema, col: &str) -> Option<u64> {
     }
 }
 
-fn exprs_equivalent_in_plan(plan: &PhysicalPlan, left: &Expr, right: &Expr) -> bool {
-    let (Some(left), Some(right)) = (equivalence_column_key(left), equivalence_column_key(right))
-    else {
-        return left == right;
-    };
-    if left == right {
-        return true;
+/// The equivalence relation of an immutable plan subtree. Build it lazily
+/// because syntactically equal keys and single-key joins often need no graph.
+struct PlanColumnEquivalences<'a> {
+    plan: &'a PhysicalPlan,
+    components: std::cell::OnceCell<HashMap<EqColumnKey, usize>>,
+}
+
+impl<'a> PlanColumnEquivalences<'a> {
+    fn new(plan: &'a PhysicalPlan) -> Self {
+        Self {
+            plan,
+            components: std::cell::OnceCell::new(),
+        }
     }
 
+    fn equivalent(&self, left: &Expr, right: &Expr) -> bool {
+        let (Some(left), Some(right)) =
+            (equivalence_column_key(left), equivalence_column_key(right))
+        else {
+            return left == right;
+        };
+        if left == right {
+            return true;
+        }
+        let components = self
+            .components
+            .get_or_init(|| plan_column_equivalence_components(self.plan));
+        components
+            .get(&left)
+            .is_some_and(|id| components.get(&right) == Some(id))
+    }
+}
+
+fn plan_column_equivalence_components(plan: &PhysicalPlan) -> HashMap<EqColumnKey, usize> {
     fn add_edge(graph: &mut HashMap<EqColumnKey, Vec<EqColumnKey>>, left: &Expr, right: &Expr) {
         let (Some(left), Some(right)) =
             (equivalence_column_key(left), equivalence_column_key(right))
@@ -19018,7 +19038,7 @@ fn exprs_equivalent_in_plan(plan: &PhysicalPlan, left: &Expr, right: &Expr) -> b
 
     fn add_expr_edges(graph: &mut HashMap<EqColumnKey, Vec<EqColumnKey>>, expr: &Expr) {
         let mut conjuncts = Vec::new();
-        split_conjuncts(expr, &mut conjuncts);
+        collect_expr_conjuncts(expr, &mut conjuncts);
         for conjunct in conjuncts {
             if let Expr::Binary {
                 left,
@@ -19026,7 +19046,7 @@ fn exprs_equivalent_in_plan(plan: &PhysicalPlan, left: &Expr, right: &Expr) -> b
                 right,
             } = conjunct
             {
-                add_edge(graph, &left, &right);
+                add_edge(graph, left, right);
             }
         }
     }
@@ -19069,20 +19089,24 @@ fn exprs_equivalent_in_plan(plan: &PhysicalPlan, left: &Expr, right: &Expr) -> b
 
     let mut graph = HashMap::new();
     collect(plan, &mut graph);
-    let mut pending = vec![left.clone()];
-    let mut seen = HashSet::new();
-    while let Some(current) = pending.pop() {
-        if !seen.insert(current.clone()) {
+    let mut components = HashMap::with_capacity(graph.len());
+    let mut pending = Vec::new();
+    for (id, key) in graph.keys().enumerate() {
+        if components.contains_key(key) {
             continue;
         }
-        if current == right {
-            return true;
-        }
-        if let Some(neighbors) = graph.get(&current) {
-            pending.extend(neighbors.iter().cloned());
+        pending.push(key);
+        while let Some(key) = pending.pop() {
+            if let std::collections::hash_map::Entry::Vacant(entry) = components.entry(key.clone())
+            {
+                entry.insert(id);
+                if let Some(neighbors) = graph.get(key) {
+                    pending.extend(neighbors);
+                }
+            }
         }
     }
-    false
+    components
 }
 
 /// Estimate one match per prefiltered row when its keyset came from the same
@@ -19971,6 +19995,7 @@ fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
         return None;
     }
     let tables = collect_physical_plan_tables(plan);
+    let equivalences = PlanColumnEquivalences::new(plan);
     for table in &tables {
         for index in table.schema.iter_queryable_indexes().filter(|i| {
             !i.is_fulltext() && !i.is_spatial() && !i.is_vector() && !i.has_multi_valued_parts()
@@ -19989,14 +20014,24 @@ fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
                         !table.schema.columns[slot].nullable
                             && keys.iter().any(|key| {
                                 plan_key_equivalent_to_table_column(
-                                    plan, &tables, key, table, column,
+                                    &equivalences,
+                                    &tables,
+                                    key,
+                                    table,
+                                    column,
                                 )
                             })
                     })
                 })
                 && keys.iter().all(|key| {
                     table.schema.columns.iter().any(|column| {
-                        plan_key_equivalent_to_table_column(plan, &tables, key, table, &column.name)
+                        plan_key_equivalent_to_table_column(
+                            &equivalences,
+                            &tables,
+                            key,
+                            table,
+                            &column.name,
+                        )
                     })
                 })
             {
@@ -20004,7 +20039,7 @@ fn composite_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
             }
             if index.columns.len() < keys.len()
                 || !keys.iter().zip(index.columns.iter()).all(|(key, column)| {
-                    plan_key_equivalent_to_table_column(plan, &tables, key, table, column)
+                    plan_key_equivalent_to_table_column(&equivalences, &tables, key, table, column)
                 })
             {
                 continue;
@@ -20035,6 +20070,7 @@ fn multi_column_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
         return None;
     }
     let tables = collect_physical_plan_tables(plan);
+    let equivalences = PlanColumnEquivalences::new(plan);
     for table in &tables {
         for group in table.schema.stats.multi_column_stats.values() {
             if group.columns.len() != keys.len() || group.distinct_count == 0 {
@@ -20044,7 +20080,13 @@ fn multi_column_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
             let matched = keys.iter().all(|key| {
                 group.columns.iter().enumerate().any(|(idx, column)| {
                     if used[idx]
-                        || !plan_key_equivalent_to_table_column(plan, &tables, key, table, column)
+                        || !plan_key_equivalent_to_table_column(
+                            &equivalences,
+                            &tables,
+                            key,
+                            table,
+                            column,
+                        )
                     {
                         return false;
                     }
@@ -20066,6 +20108,7 @@ fn multi_column_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
 /// unrelated filter does not prove that the join-key universe shrank.
 fn uncollected_joint_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u64> {
     let tables = collect_physical_plan_tables(plan);
+    let equivalences = PlanColumnEquivalences::new(plan);
     tables.iter().find_map(|table| {
         let rows = table.schema.stats.row_count;
         if rows == 0 {
@@ -20074,7 +20117,13 @@ fn uncollected_joint_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u
         let mut product = 1_u64;
         for key in keys {
             let column = table.schema.columns.iter().find(|column| {
-                plan_key_equivalent_to_table_column(plan, &tables, key, table, &column.name)
+                plan_key_equivalent_to_table_column(
+                    &equivalences,
+                    &tables,
+                    key,
+                    table,
+                    &column.name,
+                )
             })?;
             let ndv = ndv_for_column(&table.schema, &column.name)?;
             product = product.saturating_mul(ndv).min(rows);
@@ -20093,7 +20142,7 @@ fn uncollected_joint_ndv_in_plan(plan: &PhysicalPlan, keys: &[Expr]) -> Option<u
 /// single table in the subtree. That keeps equivalence inference conservative
 /// for joins containing same-named columns without aliases.
 fn plan_key_equivalent_to_table_column(
-    plan: &PhysicalPlan,
+    equivalences: &PlanColumnEquivalences<'_>,
     tables: &[PlanTable],
     key: &Expr,
     table: &PlanTable,
@@ -20129,7 +20178,7 @@ fn plan_key_equivalent_to_table_column(
     }
     candidates
         .iter()
-        .any(|candidate| exprs_equivalent_in_plan(plan, key, candidate))
+        .any(|candidate| equivalences.equivalent(key, candidate))
 }
 
 /// Recursively search the physical plan tree for the schema of a base
@@ -21616,71 +21665,72 @@ pub(crate) fn expr_columns_resolved_across(
     left_tables: &[PlanTable],
     right_tables: &[PlanTable],
 ) -> bool {
-    let mut all_resolved = true;
-    check_expr_columns_resolved(expr, left_tables, right_tables, &mut all_resolved);
-    all_resolved
+    visit_join_predicate_columns(expr, |qualifier, column| {
+        left_tables
+            .iter()
+            .chain(right_tables)
+            .any(|table| join_predicate_column_resolves(table, qualifier, column))
+    })
 }
 
-fn check_expr_columns_resolved(
+fn join_predicate_column_resolves(
+    table: &PlanTable,
+    qualifier: Option<&str>,
+    column: &str,
+) -> bool {
+    qualifier.is_none_or(|q| matches_table(q, &table.schema.name, table.alias.as_deref()))
+        && table_has_column(table, column)
+}
+
+fn visit_join_predicate_columns(
     expr: &Expr,
-    left_tables: &[PlanTable],
-    right_tables: &[PlanTable],
-    all_resolved: &mut bool,
-) {
-    let _ = crate::parser::visit::try_inspect_value_expr(expr, |node| {
-        match node {
-            Expr::Identifier(name) => {
-                let resolves = |tables: &[PlanTable]| {
-                    tables.iter().any(|t| {
-                        t.schema
-                            .columns
-                            .iter()
-                            .any(|c| c.name.eq_ignore_ascii_case(name))
-                    })
-                };
-                if !resolves(left_tables) && !resolves(right_tables) {
-                    *all_resolved = false;
-                }
-            }
-            Expr::CompoundIdentifier(parts) => {
-                if let Some(column) = parts.last() {
-                    let qualifier = if parts.len() >= 2 {
-                        Some(parts[parts.len() - 2].as_str())
-                    } else {
-                        None
-                    };
-                    let matches_set = |tables: &[PlanTable]| {
-                        tables.iter().any(|t| {
-                            qualifier.is_none_or(|q| {
-                                matches_table(q, &t.schema.name, t.alias.as_deref())
-                            }) && t
-                                .schema
-                                .columns
-                                .iter()
-                                .any(|c| c.name.eq_ignore_ascii_case(column))
-                        })
-                    };
-                    if !matches_set(left_tables) && !matches_set(right_tables) {
-                        *all_resolved = false;
-                    }
-                }
-            }
+    mut visit: impl FnMut(Option<&str>, &str) -> bool,
+) -> bool {
+    crate::parser::visit::try_inspect_value_expr(expr, |node| {
+        let resolved = match node {
+            Expr::Identifier(name) => visit(None, name),
+            Expr::CompoundIdentifier(parts) => parts.last().is_none_or(|column| {
+                let qualifier = parts.len().checked_sub(2).map(|i| parts[i].as_str());
+                visit(qualifier, column)
+            }),
             Expr::Subquery(_)
             | Expr::Exists { .. }
             | Expr::InSubquery { .. }
-            | Expr::QuantifiedComparison { .. } => *all_resolved = false,
-            // These were opaque to this conservative guard before sharing traversal.
+            | Expr::QuantifiedComparison { .. } => false,
+            // Keep these nodes opaque, as in the direct scope check.
             Expr::Tuple(_) | Expr::GroupKeyRef { .. } | Expr::WindowFunction { .. } => {
-                return Ok(false)
+                return Ok(false);
             }
-            _ => {}
+            _ => true,
+        };
+        resolved.then_some(true).ok_or(())
+    })
+    .is_ok()
+}
+
+/// Each referenced column needs at least one resolver in a candidate subset.
+/// An opaque subquery or unresolved column leaves the predicate pending.
+pub(crate) fn join_predicate_resolver_masks(
+    expr: &Expr,
+    relations: &[Vec<PlanTable>],
+) -> Option<smallvec::SmallVec<[u32; 4]>> {
+    let mut masks = smallvec::SmallVec::new();
+    visit_join_predicate_columns(expr, |qualifier, column| {
+        let mut mask = 0;
+        for (index, tables) in relations.iter().take(u32::BITS as usize).enumerate() {
+            if tables
+                .iter()
+                .any(|table| join_predicate_column_resolves(table, qualifier, column))
+            {
+                mask |= 1 << index;
+            }
         }
-        if *all_resolved {
-            Ok(true)
-        } else {
-            Err(())
+        if mask != 0 && !masks.contains(&mask) {
+            masks.push(mask);
         }
-    });
+        mask != 0
+    })
+    .then_some(masks)
 }
 
 /// The `JoinType` of a join node at the root of `plan`, if it is one.
@@ -22711,6 +22761,8 @@ pub(crate) fn extract_join_keys_for_plans(
 ) -> Option<(Vec<Expr>, Vec<Expr>, Vec<bool>, Option<Expr>)> {
     let left_tables = collect_physical_plan_tables(left);
     let right_tables = collect_physical_plan_tables(right);
+    let left_eq = PlanColumnEquivalences::new(left);
+    let right_eq = PlanColumnEquivalences::new(right);
     let mut conjuncts = Vec::new();
     split_conjuncts(expr, &mut conjuncts);
     let mut left_keys = Vec::new();
@@ -22737,8 +22789,8 @@ pub(crate) fn extract_join_keys_for_plans(
                         if left_keys.iter().zip(&right_keys).zip(&null_safe).any(
                             |((prior_left, prior_right), prior_null_safe)| {
                                 *prior_null_safe == is_null_safe
-                                    && exprs_equivalent_in_plan(left, a, prior_left)
-                                    && exprs_equivalent_in_plan(right, b, prior_right)
+                                    && left_eq.equivalent(a, prior_left)
+                                    && right_eq.equivalent(b, prior_right)
                             },
                         ) {
                             continue;
@@ -22752,8 +22804,8 @@ pub(crate) fn extract_join_keys_for_plans(
                         if left_keys.iter().zip(&right_keys).zip(&null_safe).any(
                             |((prior_left, prior_right), prior_null_safe)| {
                                 *prior_null_safe == is_null_safe
-                                    && exprs_equivalent_in_plan(left, b, prior_left)
-                                    && exprs_equivalent_in_plan(right, a, prior_right)
+                                    && left_eq.equivalent(b, prior_left)
+                                    && right_eq.equivalent(a, prior_right)
                             },
                         ) {
                             continue;

@@ -3347,6 +3347,7 @@ fn load_data_vector_text_and_base64_and_ctas_warning() {
     drop(engine);
 
     let _base64 = HnswEnv::set(&[("MYDB_LOAD_DATA_VECTOR_FORMAT", "base64")]);
+    let dir = tempfile::tempdir().unwrap();
     let engine = open_hnsw_test_engine(dir.path());
     engine
         .execute("CREATE TABLE encoded (id INT PRIMARY KEY, emb VECTOR(2) NOT NULL)")

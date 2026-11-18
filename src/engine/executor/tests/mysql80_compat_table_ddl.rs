@@ -1759,7 +1759,7 @@ fn multi_action_alter_with_copy_rewrite() {
 #[test]
 fn partitioned_table_copy_rewrite() {
     let dir = tempfile::tempdir().unwrap();
-    let engine = open_test_engine(dir.path());
+    let engine = open_complete_memory_test_engine(dir.path());
     exec_ok(
         &engine,
         "CREATE TABLE t1 (id INT, v VARCHAR(10)) \
@@ -1787,10 +1787,9 @@ fn partitioned_table_copy_rewrite() {
         panic!("expected result set");
     };
     assert_eq!(result.rows, vec![vec![Value::Int(7)]]);
-    // Data survives restart, preserving WAL/recovery consistency.
+    // Memory restart data assertions are covered by the strict fixture below.
     drop(engine);
-    let engine = open_test_engine(dir.path());
-    let _ = engine; // Memory durability: restart assertions are covered by strict-mode tests.
+    let _engine = open_complete_memory_test_engine(dir.path());
 }
 
 #[test]

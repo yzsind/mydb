@@ -60,6 +60,8 @@ fn matrix(backend: &str) {
             .unwrap();
         populate(&engine);
         for metric in ["L2", "COSINE", "DOT"] {
+            let tail = format!("id, DISTANCE(v,TO_VECTOR('[0.123,1.937,-2.781,3.619,-4.483,5.271,-6.157]'),'{metric}') d FROM items ORDER BY d LIMIT 32");
+            let exact = query_rows(&engine, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}"));
             for algo in ["HNSW", "IVF"] {
                 for quant in ["none", "sq8", "sq4", "pq", "bq"] {
                     // Each new index gets fresh runtime counters and model
@@ -68,10 +70,7 @@ fn matrix(backend: &str) {
                     engine
                         .execute(&ddl)
                         .unwrap_or_else(|e| panic!("{backend} {datatype} {ddl}: {e}"));
-                    let tail=format!("id, DISTANCE(v,TO_VECTOR('[0.123,1.937,-2.781,3.619,-4.483,5.271,-6.157]'),'{metric}') d FROM items ORDER BY d LIMIT 32");
                     let sql = format!("SELECT /*+ HNSW_EF(64) IVF_NPROBE(64) */ {tail}");
-                    let exact =
-                        query_rows(&engine, &format!("SELECT /*+ NO_VECTOR_INDEX */ {tail}"));
                     let actual = query_rows(&engine, &sql);
                     assert_eq!(
                         actual, exact,
@@ -653,8 +652,8 @@ fn check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml(datatype: 
         .collect::<Vec<_>>()
         .join(",");
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
-    let engine = open_strict_test_engine(dir.path());
     let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();
+    let engine = open_strict_test_engine(dir.path());
     // Keep the original 2,048-row input and PQ's additional exact-query
     // row in separate tables. Independent indexes share their immutable
     // input and one reopen; FORCE INDEX plus EXPLAIN pins every case.
@@ -674,7 +673,6 @@ fn check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml(datatype: 
     engine
         .execute("INSERT INTO pq_items VALUES(3000,'[1,2,3,4,5,6,7,8,9]')")
         .unwrap();
-    preparation.finish().unwrap();
     let mut cases = Vec::new();
     let mut oracles = std::collections::HashMap::new();
     for metric in ["L2", "COSINE", "DOT"] {
@@ -714,6 +712,9 @@ fn check_quantized_hnsw_parallel_paged_image_survives_restart_and_dml(datatype: 
             cases.push((index, sql, exact, expected.clone()));
         }
     }
+    // The initial image is private until this reopen boundary. Flush its
+    // complete batch before checking recovery and subsequent durable DML.
+    preparation.finish().unwrap();
     drop(engine);
     let engine = open_strict_test_engine(dir.path());
     for (index, sql, _, expected) in &cases {

@@ -1019,6 +1019,8 @@ pub struct Database {
     temporal_history: TemporalHistory,
     temporal_hlc_rollback_total: AtomicU64,
     data_dir: PathBuf,
+    #[cfg(test)]
+    lazy_fixture_heaps: Option<crate::util::file::LazyFixtureHeaps>,
     /// Exclusive lock on `data_dir`, held for this handle's lifetime so no
     /// second `mydb` process can open the same directory concurrently (see
     /// [`crate::storage::dir_lock`]). Released when the `Database` drops.

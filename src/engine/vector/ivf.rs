@@ -290,9 +290,7 @@ fn kmeans_update<V: AsRef<[f32]> + Sync>(
             }
             sums.fill(0.0);
             for &i in cluster {
-                for (a, &x) in sums.iter_mut().zip(samples[i as usize].as_ref().iter()) {
-                    *a += x as f64;
-                }
+                accumulate_centroid_sample(&mut sums, samples[i as usize].as_ref());
             }
             let inv = 1.0 / cluster.len() as f64;
             for (x, &sum) in center.iter_mut().zip(&sums) {
@@ -320,10 +318,83 @@ fn kmeans_update<V: AsRef<[f32]> + Sync>(
     });
 }
 
+fn accumulate_centroid_sample(sums: &mut [f64], sample: &[f32]) {
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    let mut start = 0;
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    let start = 0;
+    // Each lane is an independent coordinate. Updating four coordinates at
+    // once keeps every coordinate's original f64 additions in sample order.
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let end = sums.len().min(sample.len()) / 4 * 4;
+        // SAFETY: each load and store is inside the corresponding slice,
+        // and the mutable destination is disjoint from the source.
+        unsafe {
+            while start < end {
+                let values = vld1q_f32(sample.as_ptr().add(start));
+                let dst = sums.as_mut_ptr().add(start);
+                let low = vaddq_f64(vld1q_f64(dst), vcvt_f64_f32(vget_low_f32(values)));
+                let high = vaddq_f64(vld1q_f64(dst.add(2)), vcvt_f64_f32(vget_high_f32(values)));
+                vst1q_f64(dst, low);
+                vst1q_f64(dst.add(2), high);
+                start += 4;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        let end = sums.len().min(sample.len()) / 4 * 4;
+        // SAFETY: SSE2 is baseline on x86_64, and each load and store fits
+        // inside the corresponding slice.
+        unsafe {
+            while start < end {
+                let values = _mm_loadu_ps(sample.as_ptr().add(start));
+                let dst = sums.as_mut_ptr().add(start);
+                let low = _mm_add_pd(_mm_loadu_pd(dst), _mm_cvtps_pd(values));
+                let high = _mm_add_pd(
+                    _mm_loadu_pd(dst.add(2)),
+                    _mm_cvtps_pd(_mm_movehl_ps(values, values)),
+                );
+                _mm_storeu_pd(dst, low);
+                _mm_storeu_pd(dst.add(2), high);
+                start += 4;
+            }
+        }
+    }
+    for (sum, &coordinate) in sums[start..].iter_mut().zip(&sample[start..]) {
+        *sum += f64::from(coordinate);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::RowId;
+
+    #[test]
+    fn centroid_accumulation_matches_scalar_bits_for_vectors_and_tails() {
+        for dim in [0, 1, 3, 4, 5, 17, 768] {
+            let mut actual = vec![-0.0; dim];
+            let mut expected = actual.clone();
+            for scale in [1.0, f32::MIN_POSITIVE, 1e20, -1e20, -1.0] {
+                let sample = (0..dim)
+                    .map(|i| (i as f32 % 11.0 - 5.0) * scale)
+                    .collect::<Vec<_>>();
+                for (sum, &coordinate) in expected.iter_mut().zip(&sample) {
+                    *sum += f64::from(coordinate);
+                }
+                accumulate_centroid_sample(&mut actual, &sample);
+                assert!(actual
+                    .iter()
+                    .zip(&expected)
+                    .all(|(&a, &b)| a.to_bits() == b.to_bits()));
+            }
+        }
+    }
+
     #[test]
     fn nearest_centroid_batch_matches_single_row_oracle() {
         for dim in [1, 31, 32, 65, 768] {

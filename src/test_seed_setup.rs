@@ -3,7 +3,7 @@
 #[path = "bin/test_seed.rs"]
 mod seed;
 
-pub(crate) use seed::compact_memory_seed;
+pub(crate) use seed::{compact_memory_seed, empty_heap_templates_dir};
 
 #[test]
 #[ignore = "fixture generator invoked explicitly by the nextest setup script"]

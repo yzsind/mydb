@@ -1364,6 +1364,14 @@ impl NativeIvf {
             None
         };
         drop(sample);
+        self.install_training(centers, codec)
+    }
+
+    fn install_training(
+        &self,
+        centers: Vec<VectorValue>,
+        codec: Option<ScanCodec>,
+    ) -> Result<(), QueryError> {
         let mut state = self.state.write();
         state.cursor_epoch = state.cursor_epoch.wrapping_add(1);
         state
@@ -2380,13 +2388,16 @@ mod tests {
             let coded = index(datatype, dim, metric, 24);
             let plain = index(datatype, dim, metric, 24);
             let sample: Vec<_> = all.iter().step_by(4).cloned().collect();
-            coded.initialize_from_sample(sample.clone(), 24).unwrap();
-            plain.initialize_from_sample(sample, 24).unwrap();
+            coded.initialize_from_sample(sample, 24).unwrap();
+            // Hold coarse routing fixed while comparing the scan paths.
+            // Both indexes maintain their own postings through every DML.
+            plain
+                .install_training(coded.state.read().centers.clone(), None)
+                .unwrap();
             assert!(
                 coded.state.read().codec.is_some(),
                 "{datatype:?} {metric:?}"
             );
-            plain.state.write().codec = None;
             // Rows inserted while the codec is withheld stay uncoded.
             let codec = coded.state.write().codec.take();
             for ivf in [&coded, &plain] {

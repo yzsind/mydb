@@ -557,6 +557,21 @@ fn cache_shard_count(capacity: usize) -> usize {
     }
 }
 
+fn new_statement_lru<K: std::hash::Hash + Eq, V>(
+    capacity: NonZeroUsize,
+) -> LruCache<K, V, AhashState> {
+    #[cfg(test)]
+    {
+        // Most test processes execute only a few statements. Grow the hash
+        // tables on demand while preserving the normal shard and eviction limits.
+        let mut cache = LruCache::unbounded_with_hasher(AhashState::new());
+        cache.resize(capacity);
+        cache
+    }
+    #[cfg(not(test))]
+    LruCache::with_hasher(capacity, AhashState::new())
+}
+
 /// Storage mechanics shared by caches; validity and accounting stay with
 /// each cache because parsed source and compiled plans have different epochs.
 struct ShardedLru<K, V> {
@@ -572,10 +587,7 @@ impl<K: std::hash::Hash + Eq, V> ShardedLru<K, V> {
         let shards = (0..shard_count)
             .map(|index| {
                 let capacity = capacity / shard_count + usize::from(index < capacity % shard_count);
-                Mutex::new(LruCache::with_hasher(
-                    NonZeroUsize::new(capacity).unwrap(),
-                    AhashState::new(),
-                ))
+                Mutex::new(new_statement_lru(NonZeroUsize::new(capacity).unwrap()))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
@@ -1700,8 +1712,7 @@ impl<T: PreparedDmlCacheEntry> EpochDmlCache<T> {
         let shards = (0..shard_count)
             .map(|index| {
                 let capacity = capacity / shard_count + usize::from(index < capacity % shard_count);
-                let cap = NonZeroUsize::new(capacity).unwrap();
-                Mutex::new(LruCache::with_hasher(cap, AhashState::new()))
+                Mutex::new(new_statement_lru(NonZeroUsize::new(capacity).unwrap()))
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();

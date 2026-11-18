@@ -327,6 +327,18 @@ impl Database {
         };
         #[cfg(test)]
         let seeded_test_directory = seed_empty_test_data_dir(&data_dir, config.durability)?;
+        #[cfg(test)]
+        let lazy_fixture_heaps = if seeded_test_directory && config.durability == DurabilityMode::Memory {
+            crate::util::env::var_os("MYDB_TEST_MEMORY_SEED_DIR")
+                .or_else(|| crate::util::env::var_os("MYDB_TEST_SEED_DIR"))
+                .map(PathBuf::from)
+                .map(|seed| crate::util::file::LazyFixtureHeaps::new(crate::test_seed_setup::empty_heap_templates_dir(&seed)))
+                .transpose()
+                .map_err(io_err)?
+                .flatten()
+        } else {
+            None
+        };
         // The freshly cloned seed is still private fixture construction.
         // Drain each file normally, then finish its device barrier before
         // exposing the database. Existing directories retain normal recovery.
@@ -701,6 +713,8 @@ impl Database {
         let source_clock = log.lock().source_clock();
         source_clock.fetch_max(commit_hlc_seed, Ordering::Release);
         let mut db = Self {
+            #[cfg(test)]
+            lazy_fixture_heaps,
             _snapshot_runtime: snapshot_runtime,
             _image_repository_lease: image_repository_lease,
             capture,
