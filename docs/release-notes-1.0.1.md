@@ -10,9 +10,6 @@ writes. These notes cover changes since
 **Release maturity** — 1.0.1 is a public preview for feature validation,
 compatibility testing, and evaluation in controlled environments.
 
-**Release status** — Planned. Package availability and validation results will
-be recorded when the release is published.
-
 ## Moving from 1.0.0 to 1.0.1
 
 **Use a fresh data directory.** The WAL format advances from 40 to 41 for the
@@ -252,26 +249,27 @@ See the [result checker documentation](../scripts/README.md).
 
 ## Release validation
 
-The release is planned from the final `v1.0.1` source tag using Rust 1.95.0,
+The release is built from the `v1.0.1` source tag using Rust 1.95.0,
 locked dependencies, the default server features, and the repository's release
 profile. The release checks cover server and CLI CI, recovery and replication
 safety tests, and native verification of extracted packages. Package checks
 cover file hashes, binary versions and help, required TLS, typed SQL,
 transaction rollback, crash recovery, and secondary index reads. Linux packages
-also require the glibc 2.17 ABI check. The GitHub Release will record the final
+also require the glibc 2.17 ABI check. The
+[GitHub Release](https://github.com/yzsind/mydb/releases/tag/v1.0.1) records the
 source commit and validation results.
 
-## Planned release packages
+## Release packages
 
-The GitHub Release is planned to include the following archives and `SHA256SUMS`.
+The GitHub Release provides the following archives and `SHA256SUMS`.
 
-| Platform | Archive | Planned native validation |
+| Platform | Archive | Native validation environment |
 | --- | --- | --- |
 | macOS Apple Silicon | `mydb-1.0.1-macos-arm64.tar.gz` | macOS ARM64 |
 | Linux x86_64 (glibc 2.17 baseline) | `mydb-1.0.1-linux-x86_64.tar.gz` | Ubuntu 24.04 x86_64 |
 | Windows x64 | `mydb-1.0.1-windows-x86_64.zip` | GitHub `windows-2022` x64 runner |
 
-Each runtime archive is planned to include `mydb`, `mydb-cli`, `mydb-backup`,
+Each runtime archive includes `mydb`, `mydb-cli`, `mydb-backup`,
 the Apache-2.0 license, third-party license texts, and required corresponding
 MPL source archives. Windows executables use the `.exe` suffix and require
 compatible Visual C++ and Universal CRT runtimes.
@@ -280,7 +278,7 @@ compatible Visual C++ and Universal CRT runtimes.
 
 - [Documentation](README.md) and the new [Simplified Chinese project README](../readme_cn.md)
 - [Feature overview](feature-overview.md) and [issue reporting guide](reporting-issues.md)
-- [Source changes since 1.0.0](https://github.com/yzsind/mydb/compare/v1.0.0...4953c70cc1898508d101acb4b4a6930347554016)
+- [Source changes since 1.0.0](https://github.com/yzsind/mydb/compare/v1.0.0...v1.0.1)
 - [Report an issue](https://github.com/yzsind/mydb/issues) with the exact version,
   OS, relevant logs, and reproducible SQL or scripts.
 - [Apache License 2.0](../LICENSE)

@@ -8,7 +8,7 @@ Public product, SQL, deployment, and operations documentation. Start with the
 | Document | Contents |
 | --- | --- |
 | [Project README](../README.md) | Downloads, quick start, building, and client examples |
-| [MyDB 1.0.1 Release Notes](release-notes-1.0.1.md) | Planned public preview, changes since 1.0.0, and migration requirements |
+| [MyDB 1.0.1 Release Notes](release-notes-1.0.1.md) | Public preview, changes since 1.0.0, and migration requirements |
 | [MyDB 1.0.0 Release Notes](release-notes-1.0.0.md) | Public-preview scope, features, packages, and compatibility boundaries |
 | [Why MyDB](why-mydb.md) | HTAP mixed workloads, AI capabilities, application benefits, and performance evidence |
 | [Feature Overview](feature-overview.md) | Capabilities, limitations, and release maturity |
