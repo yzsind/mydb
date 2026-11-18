@@ -2131,18 +2131,66 @@ fn execute_function_value(
 ) -> Result<Value, QueryError> {
     let routine = db
         .routine_definition(&session.current_database, RoutineKindSchema::Function, name)
-        .ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_SP_DOES_NOT_EXIST,
-                format!("FUNCTION {name} does not exist"),
-            )
-        })?;
+        .ok_or_else(|| missing_function(&session.current_database, name))?;
     // Calls originating in a routine expression do not pass through the
     // outer statement resolver. Check against the *current* execution
     // identity here so INVOKER/DEFINER transitions and nested calls cannot
     // bypass routine-level EXECUTE.
     authorize_routine_execute(db, session, &routine)?;
     execute_function_schema(db, session, &routine, args, registry)
+}
+
+pub(super) fn validate_prepared_function_names(
+    db: &Database,
+    session: &SessionContext,
+    statement: &crate::parser::Statement,
+) -> Result<(), QueryError> {
+    struct Validate<'a> {
+        db: &'a Database,
+        database: &'a str,
+        error: Option<QueryError>,
+    }
+    impl crate::parser::visit::AstVisitor for Validate<'_> {
+        fn enter_expr(&mut self, expr: &Expr) {
+            if let Expr::Function { name, .. } = expr {
+                if self.error.is_none()
+                    && crate::parser::stored_only_function(name).is_some()
+                    && self
+                        .db
+                        .routine_definition(self.database, RoutineKindSchema::Function, name)
+                        .is_none()
+                {
+                    self.error = Some(missing_function(self.database, name));
+                }
+            }
+        }
+    }
+    let mut validator = Validate {
+        db,
+        database: &session.current_database,
+        error: None,
+    };
+    crate::parser::visit::visit_statement(&mut validator, statement);
+    validator.error.map_or(Ok(()), Err)
+}
+
+pub(crate) fn missing_function(database: &str, name: &str) -> QueryError {
+    if let Some(routine) = crate::parser::stored_only_function(name) {
+        if database.is_empty() {
+            return error(
+                crate::error::catalog::ER_NO_DB_ERROR,
+                "No database selected",
+            );
+        }
+        return error(
+            crate::error::catalog::ER_FUNC_INEXISTENT_NAME_COLLISION,
+            format!("FUNCTION {database}.{routine} does not exist. Check the 'Function Name Parsing and Resolution' section in the Reference Manual"),
+        );
+    }
+    error(
+        crate::error::catalog::ER_SP_DOES_NOT_EXIST,
+        format!("FUNCTION {name} does not exist"),
+    )
 }
 
 fn execute_function_schema(

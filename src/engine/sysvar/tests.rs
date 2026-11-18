@@ -179,7 +179,7 @@ fn session_only_variable_rejects_set_global() {
     let mut s = SessionContext::default();
     let err = registry()
         .write(
-            "sql_log_off",
+            "show_create_table_skip_secondary_engine",
             SetScope::Global,
             &mut s,
             None,

@@ -1898,15 +1898,8 @@ fn prepare_window_final_projection(
                 let mut source = crate::types::ColumnSource::default();
                 source.canonical_metadata_name = metadata_result;
                 descriptor.apply_to_source(&mut source);
-                source.round_decimal_result = crate::parser::visit::any_expr(expr, |node| {
-                    matches!(
-                        node,
-                        Expr::Binary {
-                            op: crate::parser::BinaryOp::Div,
-                            ..
-                        }
-                    )
-                });
+                source.round_decimal_result =
+                    crate::engine::expr::decimal_result_needs_shaping(expr);
                 final_columns.push(Column {
                     source,
                     name: name.clone(),

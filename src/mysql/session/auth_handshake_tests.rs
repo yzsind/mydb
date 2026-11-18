@@ -176,3 +176,103 @@ async fn handshake_deferred_native_credentials_do_not_charge_a_failed_login() {
         native_login(engine.clone(), "native", "secret", true, true).await;
     }
 }
+
+#[tokio::test]
+async fn ignore_space_handshake_and_temporal_binary_prepare() {
+    use mysql::consts::{CapabilityFlags, ColumnType};
+    use mysql::prelude::Queryable;
+
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = Arc::new(StorageQueryEngine::open(dir.path()).unwrap());
+    engine
+        .execute_with_session(
+            &mut SessionContext::default(),
+            "CREATE USER 'syntax_client'@'%' IDENTIFIED WITH mysql_native_password BY 'secret'",
+        )
+        .unwrap();
+
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (stream, peer) = listener.accept().await.unwrap();
+        Session::new(
+            1,
+            peer,
+            stream,
+            None,
+            engine,
+            Arc::new(SessionRegistry::new()),
+        )
+        .run()
+        .await
+    });
+
+    tokio::task::spawn_blocking(move || {
+        fn error_code(error: mysql::Error) -> u16 {
+            match error {
+                mysql::Error::MySqlError(error) => error.code,
+                other => panic!("expected a server error: {other}"),
+            }
+        }
+        let mut client = mysql::Conn::new(
+            mysql::OptsBuilder::default()
+                .ip_or_hostname(Some("127.0.0.1"))
+                .tcp_port(address.port())
+                .user(Some("syntax_client"))
+                .pass(Some("secret"))
+                .prefer_socket(false)
+                .additional_capabilities(CapabilityFlags::CLIENT_IGNORE_SPACE),
+        )
+        .unwrap();
+        let mode: String = client.query_first("SELECT @@sql_mode").unwrap().unwrap();
+        assert!(mode.split(',').any(|mode| mode == "IGNORE_SPACE"));
+        let count = client.prep("SELECT COUNT /* comment */ (*)").unwrap();
+        client.query_drop("SET sql_mode=''").unwrap();
+        assert_eq!(
+            error_code(client.query_drop("SELECT COUNT (*)").unwrap_err()),
+            1064
+        );
+        assert_eq!(client.exec_first::<u64, _, _>(&count, ()).unwrap(), Some(1));
+
+        client
+            .query_drop("SET time_zone='+00:00', timestamp=1700000000.123456")
+            .unwrap();
+        let stmt = client
+            .prep("SELECT UTC_TIMESTAMP, UTC_TIMESTAMP(3), CURRENT_USER")
+            .unwrap();
+        let columns = stmt.columns();
+        assert_eq!(columns[0].name_str(), "UTC_TIMESTAMP");
+        assert_eq!(columns[0].column_type(), ColumnType::MYSQL_TYPE_DATETIME);
+        assert_eq!(columns[0].decimals(), 0);
+        assert_eq!(columns[1].decimals(), 3);
+        let row: (mysql::Value, mysql::Value, String) =
+            client.exec_first(&stmt, ()).unwrap().unwrap();
+        assert_eq!(row.0, mysql::Value::Date(2023, 11, 14, 22, 13, 20, 0));
+        assert_eq!(row.1, mysql::Value::Date(2023, 11, 14, 22, 13, 20, 123_000));
+        assert_eq!(row.2, "syntax_client@%");
+        for (sql, code) in [
+            ("SELECT UTC_TIMESTAMP(?)", 1064),
+            ("SELECT CURRENT_TIME(1+2)", 1064),
+            ("SELECT UTC_TIMESTAMP(7)", 1426),
+            ("SELECT NOW ()", 1046),
+        ] {
+            assert_eq!(error_code(client.prep(sql).unwrap_err()), code, "{sql}");
+        }
+
+        client.reset().unwrap();
+        let (session_mode, global_mode): (String, String) = client
+            .query_first("SELECT @@session.sql_mode, @@global.sql_mode")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session_mode, global_mode);
+        client
+            .change_user(mysql::ChangeUserOpts::default())
+            .unwrap();
+        let mode: String = client.query_first("SELECT @@sql_mode").unwrap().unwrap();
+        assert!(mode.split(',').any(|mode| mode == "IGNORE_SPACE"));
+    })
+    .await
+    .unwrap();
+    assert!(server.await.unwrap().is_ok());
+}

@@ -3,8 +3,8 @@
 //! pipeline.
 
 use crate::engine::sysvar::backend::SysVar;
-use crate::engine::sysvar::ctx::WriteCtx;
-use crate::engine::sysvar::meta::{Access, DataType, Scope, SysVarDef};
+use crate::engine::sysvar::ctx::{ReadCtx, WriteCtx};
+use crate::engine::sysvar::meta::{Access, DataType, Scope, SelectType, SysVarDef};
 use crate::engine::sysvar::registry::Registry;
 use crate::engine::sysvar::value::SysVarValue;
 use crate::types::QueryError;
@@ -12,6 +12,13 @@ use crate::types::QueryError;
 /// Read a binlog / GTID variable's current value out of the
 /// `binlog::variables_snapshot` pipeline (single source of truth).
 fn snapshot_value(canon: &str) -> SysVarValue {
+    match canon {
+        "log_bin" => return SysVarValue::Bool(crate::binlog::enabled()),
+        "log_replica_updates" => {
+            return SysVarValue::Bool(crate::binlog::config_snapshot().log_replica_updates);
+        }
+        _ => {}
+    }
     crate::binlog::variables_snapshot()
         .into_iter()
         .find(|(n, _)| (*n).eq_ignore_ascii_case(canon))
@@ -36,8 +43,17 @@ pub(crate) fn register(reg: &mut Registry) {
     ];
     for name in read_only {
         let canon: &'static str = *name;
+        let def = SysVarDef::new(canon, Scope::Global, DataType::String { max_len: None });
+        let def = match canon {
+            "log_bin" => def.with_select_type(SelectType::Bool),
+            "binlog_expire_logs_seconds" | "server_id" | "expire_logs_days"
+            | "max_binlog_cache_size" | "max_binlog_stmt_cache_size" => {
+                def.with_select_type(SelectType::UInt)
+            }
+            _ => def,
+        };
         reg.register(SysVar::settable(
-            SysVarDef::new(canon, Scope::Global, DataType::String { max_len: None })
+            def
                 .with_access(Access::ReadOnly)
                 .with_doc("Binlog / GTID configuration (configured at server startup)."),
             move |_ctx| snapshot_value(canon),
@@ -90,46 +106,57 @@ pub(crate) fn register(reg: &mut Registry) {
         ));
     }
 
-    // Boundary variables: mydb's value is fixed, but a `SET` to the supported
-    // value is an idempotent no-op and anything else is a clear MySQL-aligned
-    // error (never a silent read-only rejection or no-op). Needs
-    // SYSTEM_VARIABLES_ADMIN like any GLOBAL write.
+    // The supported value domain is independent of GLOBAL/SESSION scope.
     type Validator = fn(&str) -> Result<(), QueryError>;
-    let validated: &[(&'static str, Validator)] = &[
+    let validated: [(&str, DataType, SysVarValue, Validator); 4] = [
         (
             "binlog_format",
-            crate::binlog::validate_binlog_format as Validator,
+            DataType::Enum { values: &["MIXED", "STATEMENT", "ROW"] },
+            SysVarValue::String("ROW".into()),
+            crate::binlog::validate_binlog_format,
         ),
-        ("binlog_row_image", crate::binlog::validate_binlog_row_image),
         (
-            "binlog_row_metadata",
-            crate::binlog::validate_binlog_row_metadata,
+            "binlog_row_image",
+            DataType::Enum { values: &["MINIMAL", "NOBLOB", "FULL"] },
+            SysVarValue::String("FULL".into()),
+            crate::binlog::validate_binlog_row_image,
         ),
         (
             "binlog_row_value_options",
+            DataType::Enum { values: &["", "PARTIAL_JSON"] },
+            SysVarValue::String(String::new()),
             crate::binlog::validate_binlog_row_value_options,
         ),
         (
             "binlog_transaction_compression",
+            DataType::Bool,
+            SysVarValue::Bool(false),
             crate::binlog::validate_binlog_transaction_compression,
         ),
     ];
-    for (name, validate) in validated {
-        let canon: &'static str = *name;
-        let validate: Validator = *validate;
-        reg.register(SysVar::settable(
-            SysVarDef::new(canon, Scope::Global, DataType::String { max_len: None })
-                .with_access(Access::SuperReadWrite)
-                .with_doc(
-                    "Binlog format/image knob. mydb accepts only its supported value \
-                     (ROW / FULL / '' / OFF) as an idempotent no-op; other values error.",
-                ),
-            move |_ctx| snapshot_value(canon),
-            move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-                validate(&v.to_display_string())
-            },
-        ));
+    for (name, data_type, default, validate) in validated {
+        reg.register(
+            SysVar::session_advisory(
+                SysVarDef::new(name, Scope::Both, data_type)
+                    .with_access(Access::SuperReadWrite)
+                    .with_doc("Binlog compatibility setting with validated supported values."),
+                default,
+            )
+            .with_validation(move |ctx, value| {
+                validate_binlog_set_context(name, ctx)?;
+                validate(&value.to_display_string())
+            }),
+        );
     }
+    reg.register(SysVar::settable(
+        SysVarDef::new(
+            "binlog_row_metadata", Scope::Global, DataType::String { max_len: None },
+        )
+        .with_access(Access::SuperReadWrite)
+        .with_doc("mydb always writes FULL table metadata."),
+        |_| snapshot_value("binlog_row_metadata"),
+        |_, value| crate::binlog::validate_binlog_row_metadata(&value.to_display_string()),
+    ));
 
     // sync_binlog — runtime-writable, real effect on the fsync cadence.
     reg.register(SysVar::settable(
@@ -318,4 +345,41 @@ pub(crate) fn register(reg: &mut Registry) {
             Ok(())
         },
     ));
+}
+
+fn validate_binlog_set_context(name: &str, ctx: &ReadCtx<'_>) -> Result<(), QueryError> {
+    use crate::error::catalog::*;
+    let Some(session) = ctx.session else { return Ok(()); };
+    if name == "binlog_format" && ctx.scope == Scope::Session {
+        if !session.temp_tables.is_empty() {
+            return Err(ER_TEMP_TABLE_PREVENTS_SWITCH_SESSION_BINLOG_FORMAT
+                .error("Cannot change the session binlog format with open temporary tables"));
+        }
+        if session.routine_atomic_depth > 0 {
+            return Err(ER_STORED_FUNCTION_PREVENTS_SWITCH_BINLOG_FORMAT
+                .error("Cannot change the binlog format inside a stored function or trigger"));
+        }
+        if session.in_transaction() {
+            return Err(ER_INSIDE_TRANSACTION_PREVENTS_SWITCH_BINLOG_FORMAT
+                .error("Cannot change the session binlog format inside a transaction"));
+        }
+    }
+    if name == "binlog_row_value_options" {
+        if session.routine_atomic_depth > 0 {
+            return Err(ER_VARIABLE_NOT_SETTABLE_IN_SF_OR_TRIGGER
+                .error(format!("Cannot set {name} inside a stored function or trigger")));
+        }
+        if session.routine_mdl_depth > 0 {
+            return Err(ER_VARIABLE_NOT_SETTABLE_IN_SP
+                .error(format!("Cannot set {name} inside a stored procedure")));
+        }
+    }
+    if session.in_transaction()
+        && (name == "binlog_row_value_options"
+            || (name == "binlog_transaction_compression" && ctx.scope == Scope::Session))
+    {
+        return Err(ER_VARIABLE_NOT_SETTABLE_IN_TRANSACTION
+            .error(format!("Cannot set {name} inside a transaction")));
+    }
+    Ok(())
 }

@@ -373,8 +373,15 @@ pub(in crate::engine::executor) fn execute_set_statement(
                 session.set_user_variable(&name, Value::Null)?;
                 continue;
             }
-            let value = eval_set_assignment_value(session, db, subquery_txn, &assignment.value)?;
-            session.set_user_variable(&name, value)?;
+            let value =
+                eval_set_assignment_value(session, db, subquery_txn, &assignment.value, false)?;
+            let fsp = match &value {
+                Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_) => {
+                    crate::engine::expr::expression_metadata_decimals(&assignment.value)
+                }
+                _ => None,
+            };
+            session.set_user_variable_with_precision(&name, value, fsp)?;
             continue;
         }
 
@@ -382,7 +389,7 @@ pub(in crate::engine::executor) fn execute_set_statement(
             ensure_no_xa_branch_for_local_txn(session, "SET autocommit")?;
         }
 
-        // ---- SET <var> = DEFAULT: reset to compiled-in default. ----------
+        // Session DEFAULT normally copies the live global value when present.
         if matches!(
             assignment.value,
             Expr::Default(_) | Expr::DefaultQualified(_)
@@ -391,7 +398,9 @@ pub(in crate::engine::executor) fn execute_set_statement(
             let value = if set_scope.requested_scope() == sysvar::Scope::Session
                 && registry
                     .get(&name)
-                    .is_some_and(|var| var.scope() == sysvar::Scope::Both)
+                    .is_some_and(|var| {
+                        var.scope() == sysvar::Scope::Both && !var.def.compiled_session_default
+                    })
             {
                 registry.read(&name, sysvar::Scope::Global, None, Some(db.as_ref()))?
             } else {
@@ -408,7 +417,7 @@ pub(in crate::engine::executor) fn execute_set_statement(
             continue;
         }
 
-        let value = eval_set_assignment_value(session, db, subquery_txn, &assignment.value)?;
+        let value = eval_set_assignment_value(session, db, subquery_txn, &assignment.value, true)?;
         // Validate (coerce + scope/access check) WITHOUT writing.
         match sysvar::registry().validate_sql_value(
             &name,
@@ -541,6 +550,7 @@ pub(super) fn execute_set_names_statement(
     };
     let collation_name = match collation {
         Some(collation) => crate::charset::resolve_collation(collation)?.name,
+        None if charset_info.name == "utf8mb4" => session.sysvars.default_collation_for_utf8mb4,
         None => crate::charset::default_collation_for_charset(charset_info.name)?,
     };
     crate::charset::validate_charset_collation_pair(charset_info.name, collation_name)?;
@@ -660,17 +670,27 @@ pub(super) fn execute_reset_persist(
     Ok(QueryResponse::Ok)
 }
 
+fn unknown_assignment_column(name: &str) -> QueryError {
+    error(
+        crate::error::catalog::ER_BAD_FIELD_ERROR,
+        format!("Unknown column '{name}' in 'field list'"),
+    )
+}
+
 fn eval_set_assignment_value(
     session: &SessionContext,
     db: &Arc<Database>,
     txn: Option<TxnView>,
     expr: &Expr,
+    allow_barewords: bool,
 ) -> Result<Value, QueryError> {
     match expr {
-        // Bare identifiers are MySQL charset/enum-style barewords (`SET
-        // names = utf8mb4`). `@@` references have their own AST node.
-        Expr::Identifier(name) => Ok(Value::String(name.clone())),
-        Expr::CompoundIdentifier(parts) => Ok(Value::String(parts.join("."))),
+        // System variables accept bare enum/charset names. A user-variable
+        // assignment uses ordinary expression name resolution.
+        Expr::Identifier(name) if allow_barewords => Ok(Value::String(name.clone())),
+        Expr::CompoundIdentifier(parts) if allow_barewords => Ok(Value::String(parts.join("."))),
+        Expr::Identifier(name) => Err(unknown_assignment_column(name)),
+        Expr::CompoundIdentifier(parts) => Err(unknown_assignment_column(&parts.join("."))),
         Expr::UserVariable(name) => Ok(session.user_variable(name).cloned().unwrap_or(Value::Null)),
         Expr::SystemVariable { scope, name } => {
             crate::engine::expr::eval_system_variable(*scope, name, Some(db))
@@ -710,25 +730,44 @@ fn eval_set_assignment_value(
         Expr::Unary {
             op: crate::parser::UnaryOp::Neg,
             expr,
-        } => crate::engine::expr::eval_negate(eval_set_assignment_value(session, db, txn, expr)?),
+        } => crate::engine::expr::eval_negate(eval_set_assignment_value(
+            session,
+            db,
+            txn,
+            expr,
+            allow_barewords,
+        )?),
         Expr::Unary {
             op: crate::parser::UnaryOp::Not,
             expr,
         } => Ok(Value::Int(
-            (!crate::engine::expr::truthy(&eval_set_assignment_value(session, db, txn, expr)?))
-                as i64,
+            (!crate::engine::expr::truthy(&eval_set_assignment_value(
+                session,
+                db,
+                txn,
+                expr,
+                allow_barewords,
+            )?)) as i64,
         )),
         Expr::Binary { left, op, right } => {
             match op {
                 crate::parser::BinaryOp::And => {
                     let l = crate::engine::expr::logical_value(&eval_set_assignment_value(
-                        session, db, txn, left,
+                        session,
+                        db,
+                        txn,
+                        left,
+                        allow_barewords,
                     )?);
                     if l == Some(false) {
                         return Ok(Value::Int(0));
                     }
                     let r = crate::engine::expr::logical_value(&eval_set_assignment_value(
-                        session, db, txn, right,
+                        session,
+                        db,
+                        txn,
+                        right,
+                        allow_barewords,
                     )?);
                     return Ok(crate::engine::expr::combine_logical(
                         crate::parser::BinaryOp::And,
@@ -737,8 +776,8 @@ fn eval_set_assignment_value(
                     ));
                 }
                 crate::parser::BinaryOp::Concat => {
-                    let l = eval_set_assignment_value(session, db, txn, left)?;
-                    let r = eval_set_assignment_value(session, db, txn, right)?;
+                    let l = eval_set_assignment_value(session, db, txn, left, allow_barewords)?;
+                    let r = eval_set_assignment_value(session, db, txn, right, allow_barewords)?;
                     if matches!(l, Value::Null) || matches!(r, Value::Null) {
                         return Ok(Value::Null);
                     }
@@ -751,13 +790,21 @@ fn eval_set_assignment_value(
                 }
                 crate::parser::BinaryOp::Or => {
                     let l = crate::engine::expr::logical_value(&eval_set_assignment_value(
-                        session, db, txn, left,
+                        session,
+                        db,
+                        txn,
+                        left,
+                        allow_barewords,
                     )?);
                     if l == Some(true) {
                         return Ok(Value::Int(1));
                     }
                     let r = crate::engine::expr::logical_value(&eval_set_assignment_value(
-                        session, db, txn, right,
+                        session,
+                        db,
+                        txn,
+                        right,
+                        allow_barewords,
                     )?);
                     return Ok(crate::engine::expr::combine_logical(
                         crate::parser::BinaryOp::Or,
@@ -767,8 +814,8 @@ fn eval_set_assignment_value(
                 }
                 _ => {}
             }
-            let l = eval_set_assignment_value(session, db, txn, left)?;
-            let r = eval_set_assignment_value(session, db, txn, right)?;
+            let l = eval_set_assignment_value(session, db, txn, left, allow_barewords)?;
+            let r = eval_set_assignment_value(session, db, txn, right, allow_barewords)?;
             match op {
                 crate::parser::BinaryOp::And
                 | crate::parser::BinaryOp::Or
@@ -815,8 +862,8 @@ fn eval_set_assignment_value(
             // matcher so it inherits the same NULL/collation rules as
             // WHERE/HAVING LIKE. The prior byte-exact call quietly lost
             // CI folding under `utf8mb4_0900_ai_ci`.
-            let value = eval_set_assignment_value(session, db, txn, expr)?;
-            let pat = eval_set_assignment_value(session, db, txn, pattern)?;
+            let value = eval_set_assignment_value(session, db, txn, expr, allow_barewords)?;
+            let pat = eval_set_assignment_value(session, db, txn, pattern, allow_barewords)?;
             Ok(crate::engine::expr::eval_like_values(
                 &value,
                 &pat,
@@ -830,11 +877,11 @@ fn eval_set_assignment_value(
             results,
             else_result,
         } => crate::engine::expr::eval_case(operand, conditions, results, else_result, |e| {
-            eval_set_assignment_value(session, db, txn, e)
+            eval_set_assignment_value(session, db, txn, e, allow_barewords)
         }),
         Expr::Function { name, args, .. } => {
             crate::engine::expr::eval_function(name, args, |arg| {
-                eval_set_assignment_value(session, db, txn, arg)
+                eval_set_assignment_value(session, db, txn, arg, allow_barewords)
             })
         }
         _ => Err(error(

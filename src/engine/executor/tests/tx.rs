@@ -17,7 +17,7 @@ fn autocommit_set_variants_are_not_swallowed_by_jdbc_stub() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(result.rows, vec![vec![Value::String("0".into())]]);
+    assert_eq!(result.rows, vec![vec![Value::Int(0)]]);
 
     engine
         .execute_with_session(&mut session, "SET @@session.autocommit=TRUE")

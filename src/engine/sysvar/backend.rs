@@ -196,6 +196,31 @@ impl SysVar {
         var
     }
 
+    /// Advisory settings use the same session inheritance and scope rules as
+    /// dedicated session fields, with storage allocated only for overrides.
+    pub(crate) fn session_advisory(def: SysVarDef, default: SysVarValue) -> Self {
+        let name = def.name;
+        let read = move |ctx: &ReadCtx<'_>| {
+            if ctx.scope == Scope::Session {
+                if let Some(value) = ctx.session.and_then(|session| {
+                    session.sysvars.advisory_variables.get(name)
+                }) {
+                    return value.clone();
+                }
+            }
+            default.clone()
+        };
+        let write = move |ctx: &mut WriteCtx<'_>, value| {
+            ctx.session.sysvars.advisory_variables.insert(name, value);
+            Ok(())
+        };
+        match def.scope {
+            Scope::Both => Self::session_backed(def, read, write),
+            Scope::Session => Self::settable(def, read, write),
+            Scope::Global => unreachable!("advisory session variable must have session scope"),
+        }
+    }
+
     /// Pure backend validation, performed before any SET assignment is applied.
     pub fn with_validation<F>(mut self, validate: F) -> Self
     where

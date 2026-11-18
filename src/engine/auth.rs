@@ -2333,6 +2333,24 @@ impl AuthCatalog {
         })
     }
 
+    /// Some restricted session variables require an explicit dynamic grant,
+    /// including one inherited from an active role.
+    pub(crate) fn account_has_explicit_global_dynamic_privilege(
+        &self,
+        ctx: &AuthorizationContext,
+        names: &[&str],
+    ) -> bool {
+        let has_grant = |account: &AccountKey| {
+            self.grants_for(account).any(|grant| {
+                grant.scope == PrivilegeScope::Global
+                    && matches!(&grant.privilege, Privilege::Dynamic(name)
+                        if names.iter().any(|allowed| name.eq_ignore_ascii_case(allowed)))
+            })
+        };
+        has_grant(&ctx.authenticated_as)
+            || role_cache::with_roles(self, ctx, |roles| roles.iter().any(has_grant))
+    }
+
     fn roles_have_privilege(
         &self,
         roles: &BTreeSet<AccountKey>,

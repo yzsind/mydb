@@ -29,16 +29,26 @@ pub fn register(reg: &mut Registry) {
         let parsed = value
             .parse::<i64>()
             .expect("generated Performance Schema size default is numeric");
+        let unsigned = name.ends_with("_classes")
+            || matches!(name,
+                "performance_schema_max_digest_sample_age" | "performance_schema_max_file_handles"
+                | "performance_schema_max_statement_stack"
+            );
+        let data_type = if unsigned {
+            DataType::UInt { min: 0, max: i64::MAX as u64 }
+        } else {
+            DataType::Int { min: -1, max: i64::MAX }
+        };
         reg.register(SysVar::runtime_read_only(
-            SysVarDef::new(
-                name,
-                Scope::Global,
-                DataType::Int {
-                    min: -1,
-                    max: i64::MAX,
-                },
-            ),
-            move || SysVarValue::Int(crate::engine::perf_setup::configured_i64(name, parsed)),
+            SysVarDef::new(name, Scope::Global, data_type),
+            move || {
+                let value = crate::engine::perf_setup::configured_i64(name, parsed);
+                if unsigned {
+                    SysVarValue::UInt(u64::try_from(value).unwrap_or(parsed as u64))
+                } else {
+                    SysVarValue::Int(value)
+                }
+            },
         ));
     }
 }

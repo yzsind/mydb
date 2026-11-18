@@ -730,7 +730,7 @@ fn storage_runtime_variables_are_visible_and_settable() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(selected.rows, vec![vec![Value::String("8".into())]]);
+    assert_eq!(selected.rows, vec![vec![Value::UInt(8)]]);
 
     let QueryResponse::ResultSet(status) = engine
         .execute_with_session(&mut session, "SELECT 'mydb' AS Type, METRIC_NAME AS Name, METRIC_VALUE AS Status FROM information_schema.MYDB_ENGINE_STATUS")
@@ -776,10 +776,7 @@ fn binlog_variables_and_disabled_status_are_visible() {
     };
     assert_eq!(
         selected.rows,
-        vec![vec![
-            Value::String("OFF".into()),
-            Value::String("OFF".into())
-        ]]
+        vec![vec![Value::Int(0), Value::String("OFF".into())]]
     );
 
     let err = engine
@@ -1127,7 +1124,7 @@ fn cbo_coefficients_are_visible_and_settable_via_sql() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(selected.rows, vec![vec![Value::String("7.5".into())]]);
+    assert_eq!(selected.rows, vec![vec![Value::Double(7.5)]]);
 
     // Restore default so later tests aren't perturbed by the global
     // state mutation.
@@ -2500,7 +2497,7 @@ fn performance_schema_core_tables_are_queryable() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(ps.rows[0][0], Value::String("1".to_string()));
+    assert_eq!(ps.rows[0][0], Value::Int(1));
 }
 
 #[test]
@@ -4473,6 +4470,89 @@ fn mysql_slow_log_table_records_finished_statements() {
 }
 
 #[test]
+fn slow_log_obeys_session_thresholds_and_inherits_global_changes() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut existing = SessionContext::default();
+    engine
+        .execute_with_session(&mut existing, "SET SESSION long_query_time=3600")
+        .unwrap();
+    engine.execute_with_session(&mut existing,
+        "SET GLOBAL long_query_time=0, GLOBAL min_examined_row_limit=0, GLOBAL log_output='TABLE', GLOBAL slow_query_log=ON").unwrap();
+    let mut new_session = SessionContext::default();
+    engine.execute_with_session(&mut existing, "SELECT 4101").unwrap();
+    for sql in [
+        "SELECT 4102",
+        "SET SESSION min_examined_row_limit=10",
+        "SELECT 4103",
+        "SET SESSION min_examined_row_limit=DEFAULT",
+        "SELECT 4104",
+    ] {
+        engine.execute_with_session(&mut new_session, sql).unwrap();
+    }
+    let QueryResponse::ResultSet(result) = engine.execute_with_session(&mut existing,
+        "SELECT sql_text FROM mysql.slow_log WHERE sql_text IN ('SELECT 4101', 'SELECT 4102', 'SELECT 4103', 'SELECT 4104') ORDER BY sql_text").unwrap().materialize().unwrap()
+    else {
+        panic!("expected slow log result set");
+    };
+    assert_eq!(result.rows, vec![
+        vec![Value::Bytes(b"SELECT 4102".to_vec())],
+        vec![Value::Bytes(b"SELECT 4104".to_vec())],
+    ]);
+}
+
+#[test]
+fn slow_log_variables_have_typed_select_results_and_text_show_values() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    let sql = "SELECT @@GLOBAL.SLOW_QUERY_LOG, @@global.long_query_time";
+    let prepared = engine.describe_prepared_statement(&mut session, sql).unwrap();
+    assert_eq!(prepared[0].column_type, ColumnType::LongLong);
+    assert_eq!(prepared[0].source.length, Some(1));
+    assert_eq!(prepared[0].source.decimals, Some(0));
+    assert_eq!(prepared[1].column_type, ColumnType::Double);
+    assert_eq!(prepared[1].source.length, Some(23));
+    assert_eq!(prepared[1].source.decimals, Some(6));
+
+    for (setting, flag) in [("ON", 1), ("OFF", 0)] {
+        engine
+            .execute_with_session(
+                &mut session,
+                &format!("SET GLOBAL slow_query_log = {setting}, GLOBAL long_query_time = 1.25"),
+            )
+            .unwrap();
+        let QueryResponse::ResultSet(selected) =
+            engine.execute_with_session(&mut session, sql).unwrap()
+        else {
+            panic!("expected result set");
+        };
+        assert_eq!(selected.columns, prepared);
+        assert!(
+            matches!(&selected.rows[0][..], [Value::Int(n), Value::Double(1.25)] if *n == flag)
+        );
+
+        let QueryResponse::ResultSet(shown) = engine
+            .execute_with_session(
+                &mut session,
+                "SHOW GLOBAL VARIABLES WHERE Variable_name IN ('slow_query_log', 'long_query_time')",
+            )
+            .unwrap()
+        else {
+            panic!("expected result set");
+        };
+        assert_eq!(shown.columns[1].column_type, ColumnType::VarString);
+        assert_eq!(
+            shown.rows,
+            vec![
+                vec![Value::String("long_query_time".into()), Value::String("1.25".into())],
+                vec![Value::String("slow_query_log".into()), Value::String(setting.into())],
+            ]
+        );
+    }
+}
+
+#[test]
 fn logging_variables_and_flush_logs_are_sql_visible() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
@@ -4488,7 +4568,7 @@ fn logging_variables_and_flush_logs_are_sql_visible() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(selected.rows[0][0], Value::String("1".into()));
+    assert_eq!(selected.rows[0][0], Value::Int(1));
 
     engine
         .execute_with_session(&mut session, "SET GLOBAL log_output = 'TABLE'")

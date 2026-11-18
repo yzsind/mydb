@@ -4,6 +4,7 @@
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
+    "CLIENT_IGNORE_SPACE": "compatible",
     "CLIENT_INTERACTIVE": "compatible",
     "CLIENT_MULTI_STATEMENTS": "compatible_and_runtime_toggleable",
     "CLIENT_MULTI_RESULTS": "compatible",

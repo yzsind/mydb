@@ -724,48 +724,6 @@ fn parse_statement_source(
     result.map_err(|error| literal_map.error(original, error))
 }
 
-/// The spacing restriction applies only in expression/function-call grammar.
-fn native_function_requires_adjacency(name: &str) -> bool {
-    const NATIVE_NAMES: &[&[u8]] = &[
-        b"ADDDATE",
-        b"BIT_AND",
-        b"BIT_OR",
-        b"BIT_XOR",
-        b"CAST",
-        b"COUNT",
-        b"CURDATE",
-        b"CURTIME",
-        b"DATE_ADD",
-        b"DATE_SUB",
-        b"EXTRACT",
-        b"GROUP_CONCAT",
-        b"MAX",
-        b"MID",
-        b"MIN",
-        b"NOW",
-        b"POSITION",
-        b"SESSION_USER",
-        b"STD",
-        b"STDDEV",
-        b"STDDEV_POP",
-        b"STDDEV_SAMP",
-        b"SUBDATE",
-        b"SUBSTR",
-        b"SUBSTRING",
-        b"SUM",
-        b"SYSDATE",
-        b"SYSTEM_USER",
-        b"TRIM",
-        b"VARIANCE",
-        b"VAR_POP",
-        b"VAR_SAMP",
-    ];
-
-    NATIVE_NAMES
-        .iter()
-        .any(|native| name.as_bytes().eq_ignore_ascii_case(native))
-}
-
 /// Return the effective statement beginning at its first executable token.
 fn sql_after_leading_trivia(
     sql: &str,
@@ -938,27 +896,6 @@ impl Dialect for MydbDialect {
         if stacker::remaining_stack().is_some_and(|bytes| bytes < 512 * 1024) {
             return Some(super::budget::grow_sqlparser_prefix(parser));
         }
-        if current_parser_sql_mode_bits() & crate::engine::api::SQL_MODE_IGNORE_SPACE == 0 {
-            let head = parser.peek_token_ref();
-            if let Token::Word(word) = &head.token {
-                let next = parser.peek_nth_token_ref(1);
-                if word.quote_style.is_none()
-                    && next.token == Token::LParen
-                    && head.span.end != next.span.start
-                    && native_function_requires_adjacency(&word.value)
-                    && !(0..=parser.get_current_index())
-                        .rev()
-                        .map(|index| &parser.token_at(index).token)
-                        .find(|token| !matches!(token, Token::Whitespace(_)))
-                        .is_some_and(|token| *token == Token::Period)
-                {
-                    return Some(Err(ParserError::ParserError(format!(
-                        "whitespace before '(' after native function {} requires IGNORE_SPACE at Line: {}, Column: {}",
-                        word.value, head.span.start.line, head.span.start.column,
-                    ))));
-                }
-            }
-        }
         let bit_prefixed = if let Token::Word(word) = &parser.peek_token_ref().token {
             if word.quote_style.is_none() && word.value.starts_with('_') {
                 if let Token::SingleQuotedByteStringLiteral(bits) =
@@ -984,7 +921,8 @@ impl Dialect for MydbDialect {
         } else {
             None
         };
-        let native = bit_prefixed
+        let native = super::function_names::parse_prefix(parser)
+            .or(bit_prefixed)
             .or_else(|| super::adapter::parse_high_prefix(parser, PREC_PREFIX))
             .or_else(|| super::adapter::parse_cast_prefix(parser, PREC_COLLATE))
             .or_else(|| super::adapter::parse_json_value_prefix(parser))

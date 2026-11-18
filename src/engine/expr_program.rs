@@ -2221,15 +2221,7 @@ impl ExprCompiler {
             column_reference_bound,
             capability,
             result_type,
-            round_decimal_result: crate::parser::visit::any_expr(expr, |node| {
-                matches!(
-                    node,
-                    Expr::Binary {
-                        op: BinaryOp::Div,
-                        ..
-                    }
-                )
-            }),
+            round_decimal_result: crate::engine::expr::decimal_result_needs_shaping(expr),
             coerce_conditional_result,
             cache_charge: None,
         })

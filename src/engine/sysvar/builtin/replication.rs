@@ -323,9 +323,15 @@ pub(crate) fn register(reg: &mut Registry) {
     }
 
     // Replication-related read-only knobs that monitoring tools probe.
+    for name in ["slave_skip_errors", "replica_skip_errors"] {
+        reg.register(SysVar::const_read_only(
+            SysVarDef::new(name, Scope::Global, DataType::String { max_len: None })
+                .without_persistence()
+                .with_doc("Unsupported replication error-skip setting; read-only."),
+            SysVarValue::String("OFF".into()),
+        ));
+    }
     for name in &[
-        "slave_skip_errors",
-        "replica_skip_errors",
         "skip_name_resolve",
         "skip_show_database",
         "skip_external_locking",

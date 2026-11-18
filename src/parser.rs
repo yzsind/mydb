@@ -33,6 +33,8 @@ mod bulk_string;
 mod convert;
 mod entry;
 mod extensions;
+mod function_names;
+pub(crate) use function_names::{is_clock_precision_function, stored_only_function};
 mod grammar;
 mod intrinsic;
 mod manual;

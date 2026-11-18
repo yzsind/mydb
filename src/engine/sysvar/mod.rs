@@ -76,8 +76,7 @@ pub fn read_var(
     session: Option<&SessionContext>,
     db: Option<&Database>,
 ) -> Result<crate::types::Value, QueryError> {
-    let v = registry().read(name, scope, session, db)?;
-    Ok(v.to_select_value())
+    registry().read_value(name, scope, session, db)
 }
 
 /// Convenience: apply one `SET` assignment.

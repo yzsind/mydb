@@ -394,15 +394,7 @@ pub(super) fn projection_result_columns(
                     column.source.canonical_metadata_name |= metadata_result;
                 }
                 column.source.round_decimal_result |=
-                    crate::parser::visit::any_expr(expr, |node| {
-                        matches!(
-                            node,
-                            Expr::Binary {
-                                op: crate::parser::BinaryOp::Div,
-                                ..
-                            }
-                        )
-                    });
+                    crate::engine::expr::decimal_result_needs_shaping(expr);
                 columns.push(column);
             }
         }

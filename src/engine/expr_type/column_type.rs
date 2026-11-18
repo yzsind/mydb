@@ -238,6 +238,9 @@ fn infer_column_type_checked<const SCHEMA: bool>(
         Expr::Default(_) | Expr::DefaultQualified(_) | Expr::Tuple(_) => ColumnType::VarString,
         Expr::GroupKeyRef { expr, .. } => recurse(expr),
         Expr::Grouping(_) => ColumnType::LongLong,
+        Expr::SystemVariable { name, .. } => crate::engine::sysvar::registry()
+            .select_type(name)
+            .map_or(ColumnType::VarString, |ty| ty.column_type()),
         Expr::BoundValue(value) => match value {
             Value::Int(_) | Value::UInt(_) => ColumnType::LongLong,
             Value::Float(_) => ColumnType::Float,
