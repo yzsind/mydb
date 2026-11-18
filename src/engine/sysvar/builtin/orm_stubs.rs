@@ -255,8 +255,15 @@ fn register_innodb_stubs(reg: &mut Registry) {
         ("innodb_compression_level", 6),
     ] {
         reg.register(SysVar::const_read_only(
-            SysVarDef::new(name, Scope::Global, DataType::UInt { min: 0, max: u64::MAX })
-                .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::UInt {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            )
+            .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
             SysVarValue::UInt(value),
         ));
     }
@@ -300,22 +307,21 @@ fn register_innodb_stubs(reg: &mut Registry) {
     for &(name, default) in u64_stubs {
         let cell: &'static AtomicU64 = leak_atomic_u64(name, default);
         let select_type = match name {
-            "innodb_buffer_pool_size" | "innodb_open_files" | "innodb_autoinc_lock_mode" => SelectType::Int,
+            "innodb_buffer_pool_size" | "innodb_open_files" | "innodb_autoinc_lock_mode" => {
+                SelectType::Int
+            }
             "innodb_random_read_ahead" => SelectType::Bool,
             _ => SelectType::UInt,
         };
-        let max = if select_type == SelectType::Int { i64::MAX as u64 } else { u64::MAX };
+        let max = if select_type == SelectType::Int {
+            i64::MAX as u64
+        } else {
+            u64::MAX
+        };
         reg.register(SysVar::settable(
-            SysVarDef::new(
-                name,
-                Scope::Global,
-                DataType::UInt {
-                    min: 0,
-                    max,
-                },
-            )
-            .with_select_type(select_type)
-            .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
+            SysVarDef::new(name, Scope::Global, DataType::UInt { min: 0, max })
+                .with_select_type(select_type)
+                .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
             move |_ctx| SysVarValue::UInt(cell.load(Ordering::Relaxed)),
             move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
                 cell.store(v.as_u64().unwrap_or(0), Ordering::Relaxed);
@@ -329,8 +335,15 @@ fn register_innodb_stubs(reg: &mut Registry) {
     ] {
         let cell = leak_atomic_u64(name, default.to_bits());
         reg.register(SysVar::settable(
-            SysVarDef::new(name, Scope::Global, DataType::Double { min: 0.0, max: u64::MAX as f64 })
-                .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::Double {
+                    min: 0.0,
+                    max: u64::MAX as f64,
+                },
+            )
+            .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
             move |_ctx| SysVarValue::Double(f64::from_bits(cell.load(Ordering::Relaxed))),
             move |_ctx, value| {
                 cell.store(value.as_f64().unwrap().to_bits(), Ordering::Relaxed);
@@ -448,8 +461,15 @@ fn register_misc_stubs(reg: &mut Registry) {
         ("innodb_buffer_pool_chunk_size", 134_217_728),
     ] {
         reg.register(SysVar::const_read_only(
-            SysVarDef::new(name, Scope::Global, DataType::UInt { min: 0, max: u64::MAX })
-                .with_doc("MySQL-compat stub."),
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::UInt {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            )
+            .with_doc("MySQL-compat stub."),
             SysVarValue::UInt(value),
         ));
     }
@@ -493,9 +513,10 @@ fn register_misc_stubs(reg: &mut Registry) {
         let cell: &'static std::sync::atomic::AtomicBool = leak_atomic_bool(name, default);
         let def = SysVarDef::new(name, Scope::Global, DataType::Bool);
         let def = match name {
-            "schema_definition_cache" | "sync_master_info" | "sync_relay_log" | "sync_relay_log_info" => {
-                def.with_select_type(SelectType::UInt)
-            }
+            "schema_definition_cache"
+            | "sync_master_info"
+            | "sync_relay_log"
+            | "sync_relay_log_info" => def.with_select_type(SelectType::UInt),
             "ssl_fips_mode" => def.with_select_type(SelectType::Text),
             _ => def,
         };
@@ -548,11 +569,22 @@ fn register_misc_stubs(reg: &mut Registry) {
     for &(name, default) in i64_stubs {
         let cell: &'static AtomicI64 = leak_atomic_i64(name, default);
         let select_type = match name {
-            "delayed_insert_limit" | "delayed_insert_timeout" | "delayed_queue_size" | "flush_time"
-            | "max_connect_errors" | "max_relay_log_size" | "max_write_lock_count"
-            | "rpl_read_size" | "rpl_stop_replica_timeout" | "rpl_stop_slave_timeout"
-            | "slow_launch_time" | "stored_program_cache" | "stored_program_definition_cache"
-            | "table_open_cache_instances" | "temptable_max_mmap" | "temptable_max_ram" => SelectType::UInt,
+            "delayed_insert_limit"
+            | "delayed_insert_timeout"
+            | "delayed_queue_size"
+            | "flush_time"
+            | "max_connect_errors"
+            | "max_relay_log_size"
+            | "max_write_lock_count"
+            | "rpl_read_size"
+            | "rpl_stop_replica_timeout"
+            | "rpl_stop_slave_timeout"
+            | "slow_launch_time"
+            | "stored_program_cache"
+            | "stored_program_definition_cache"
+            | "table_open_cache_instances"
+            | "temptable_max_mmap"
+            | "temptable_max_ram" => SelectType::UInt,
             "temptable_use_mmap" => SelectType::Bool,
             _ => SelectType::Int,
         };
@@ -561,7 +593,11 @@ fn register_misc_stubs(reg: &mut Registry) {
                 name,
                 Scope::Global,
                 DataType::Int {
-                    min: if select_type == SelectType::UInt { 0 } else { i64::MIN },
+                    min: if select_type == SelectType::UInt {
+                        0
+                    } else {
+                        i64::MIN
+                    },
                     max: i64::MAX,
                 },
             )
@@ -621,13 +657,18 @@ fn register_misc_stubs(reg: &mut Registry) {
         let cell: &'static std::sync::RwLock<String> = leak_string(n, d);
         let data_type = match name {
             "source_verify_checksum" => DataType::Bool,
-            "replica_net_timeout" | "slave_net_timeout" | "report_port" | "admin_port"
-            | "mysqlx_port" => DataType::UInt { min: 0, max: u64::MAX },
+            "replica_net_timeout"
+            | "slave_net_timeout"
+            | "report_port"
+            | "admin_port"
+            | "mysqlx_port" => DataType::UInt {
+                min: 0,
+                max: u64::MAX,
+            },
             _ => DataType::String { max_len: None },
         };
         reg.register(SysVar::settable(
-            SysVarDef::new(n, Scope::Global, data_type)
-                .with_doc("MySQL-compat stub."),
+            SysVarDef::new(n, Scope::Global, data_type).with_doc("MySQL-compat stub."),
             move |_ctx| {
                 let s = cell.read().map(|s| s.clone()).unwrap_or_default();
                 SysVarValue::String(s)
@@ -648,10 +689,30 @@ fn register_scoped_advisory_variables(reg: &mut Registry) {
     for (name, scope, default, session_access) in [
         ("end_markers_in_json", Scope::Both, false, Access::ReadWrite),
         ("innodb_table_locks", Scope::Both, true, Access::ReadWrite),
-        ("keep_files_on_create", Scope::Both, false, Access::ReadWrite),
-        ("show_create_table_skip_secondary_engine", Scope::Session, false, Access::ReadWrite),
-        ("show_create_table_verbosity", Scope::Both, false, Access::ReadWrite),
-        ("show_old_temporals", Scope::Both, false, Access::SessionAdmin),
+        (
+            "keep_files_on_create",
+            Scope::Both,
+            false,
+            Access::ReadWrite,
+        ),
+        (
+            "show_create_table_skip_secondary_engine",
+            Scope::Session,
+            false,
+            Access::ReadWrite,
+        ),
+        (
+            "show_create_table_verbosity",
+            Scope::Both,
+            false,
+            Access::ReadWrite,
+        ),
+        (
+            "show_old_temporals",
+            Scope::Both,
+            false,
+            Access::SessionAdmin,
+        ),
     ] {
         reg.register(SysVar::session_advisory(
             SysVarDef::new(name, scope, DataType::Bool)
@@ -665,7 +726,9 @@ fn register_scoped_advisory_variables(reg: &mut Registry) {
         SysVarDef::new(
             "updatable_views_with_limit",
             Scope::Both,
-            DataType::Enum { values: &["NO", "YES"] },
+            DataType::Enum {
+                values: &["NO", "YES"],
+            },
         )
         .with_doc("MySQL compatibility setting for views with LIMIT."),
         SysVarValue::String("YES".into()),
@@ -675,7 +738,10 @@ fn register_scoped_advisory_variables(reg: &mut Registry) {
         SysVarDef::new(
             "preload_buffer_size",
             Scope::Both,
-            DataType::UInt { min: 1024, max: 1024 * 1024 * 1024 },
+            DataType::UInt {
+                min: 1024,
+                max: 1024 * 1024 * 1024,
+            },
         )
         .with_scope_access(Access::SessionAdmin, Access::ReadWrite)
         .with_doc("Advisory index preloading buffer size."),
@@ -697,11 +763,15 @@ fn register_scoped_advisory_variables(reg: &mut Registry) {
         .with_validation(|ctx, value| {
             if ctx.scope == Scope::Session && value.as_u64() != Some(0) {
                 let global = crate::engine::sysvar::registry().read(
-                    "max_delayed_threads", Scope::Global, None, ctx.db,
+                    "max_delayed_threads",
+                    Scope::Global,
+                    None,
+                    ctx.db,
                 )?;
                 if *value != global {
                     return Err(crate::engine::sysvar::wrong_value_for_var(
-                        "max_delayed_threads", &value.to_display_string(),
+                        "max_delayed_threads",
+                        &value.to_display_string(),
                     ));
                 }
             }

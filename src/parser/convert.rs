@@ -6075,7 +6075,6 @@ fn convert_select_item(item: &SqlSelectItem) -> Result<SelectItem, ParseError> {
     }
 }
 
-
 fn convert_projection_expr(expr: &SqlExpr) -> Result<Expr, ParseError> {
     let converted = convert_expr(expr)?;
     if matches!(converted, Expr::Default(None)) && !parser_fragment_mode() {

@@ -30,14 +30,22 @@ pub fn register(reg: &mut Registry) {
             .parse::<i64>()
             .expect("generated Performance Schema size default is numeric");
         let unsigned = name.ends_with("_classes")
-            || matches!(name,
-                "performance_schema_max_digest_sample_age" | "performance_schema_max_file_handles"
-                | "performance_schema_max_statement_stack"
+            || matches!(
+                name,
+                "performance_schema_max_digest_sample_age"
+                    | "performance_schema_max_file_handles"
+                    | "performance_schema_max_statement_stack"
             );
         let data_type = if unsigned {
-            DataType::UInt { min: 0, max: i64::MAX as u64 }
+            DataType::UInt {
+                min: 0,
+                max: i64::MAX as u64,
+            }
         } else {
-            DataType::Int { min: -1, max: i64::MAX }
+            DataType::Int {
+                min: -1,
+                max: i64::MAX,
+            }
         };
         reg.register(SysVar::runtime_read_only(
             SysVarDef::new(name, Scope::Global, data_type),

@@ -612,12 +612,14 @@ fn account_has_sysvar_admin(
     };
     let ctx = session.authorization_context();
     if access == Access::SessionAdmin {
-        return db.with_auth_catalog(|auth| {
-            auth.account_has_explicit_global_dynamic_privilege(
-                &ctx,
-                &["SYSTEM_VARIABLES_ADMIN", "SESSION_VARIABLES_ADMIN"],
-            )
-        }).unwrap_or(false);
+        return db
+            .with_auth_catalog(|auth| {
+                auth.account_has_explicit_global_dynamic_privilege(
+                    &ctx,
+                    &["SYSTEM_VARIABLES_ADMIN", "SESSION_VARIABLES_ADMIN"],
+                )
+            })
+            .unwrap_or(false);
     }
     let required = RequiredPrivilege {
         privilege: Privilege::Dynamic("SYSTEM_VARIABLES_ADMIN".to_string()),

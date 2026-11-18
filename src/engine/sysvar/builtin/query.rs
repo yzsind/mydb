@@ -529,8 +529,16 @@ pub(crate) fn register(reg: &mut Registry) {
         },
     ));
     for (name, min, doc) in [
-        ("optimizer_trace_offset", i64::MIN, "Offset into trace ring buffer (kept for compat)."),
-        ("optimizer_trace_limit", 0, "Trace ring buffer capacity (kept for compat)."),
+        (
+            "optimizer_trace_offset",
+            i64::MIN,
+            "Offset into trace ring buffer (kept for compat).",
+        ),
+        (
+            "optimizer_trace_limit",
+            0,
+            "Trace ring buffer capacity (kept for compat).",
+        ),
     ] {
         register_advisory_integer(
             reg,
@@ -550,7 +558,10 @@ pub(crate) fn register(reg: &mut Registry) {
         SysVarDef::new(
             "optimizer_trace_features",
             Scope::Both,
-            DataType::UInt { min: 0, max: u64::MAX },
+            DataType::UInt {
+                min: 0,
+                max: u64::MAX,
+            },
         )
         .with_select_type(SelectType::Text)
         .with_doc("Bitmap of optimizer trace features."),

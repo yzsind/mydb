@@ -202,9 +202,10 @@ impl SysVar {
         let name = def.name;
         let read = move |ctx: &ReadCtx<'_>| {
             if ctx.scope == Scope::Session {
-                if let Some(value) = ctx.session.and_then(|session| {
-                    session.sysvars.advisory_variables.get(name)
-                }) {
+                if let Some(value) = ctx
+                    .session
+                    .and_then(|session| session.sysvars.advisory_variables.get(name))
+                {
                     return value.clone();
                 }
             }

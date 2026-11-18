@@ -60,29 +60,40 @@ fn warn_deprecated_collation(charset: &str) {
 pub(crate) fn register(reg: &mut Registry) {
     reg.register(SysVar::session_backed(
         SysVarDef::new(
-            "default_collation_for_utf8mb4", Scope::Both, DataType::String { max_len: Some(64) },
+            "default_collation_for_utf8mb4",
+            Scope::Both,
+            DataType::String { max_len: Some(64) },
         )
         .with_compiled_session_default()
         .with_doc("Default collation for the session's utf8mb4 encoding."),
         |ctx| {
-            SysVarValue::String(ctx.session.map_or(crate::charset::DEFAULT_COLLATION, |session| {
-                session.sysvars.default_collation_for_utf8mb4
-            }).into())
+            SysVarValue::String(
+                ctx.session
+                    .map_or(crate::charset::DEFAULT_COLLATION, |session| {
+                        session.sysvars.default_collation_for_utf8mb4
+                    })
+                    .into(),
+            )
         },
         |ctx, value| {
-            let raw = value.as_str().ok_or_else(|| {
-                wrong_value_for_var("default_collation_for_utf8mb4", "NULL")
-            })?;
+            let raw = value
+                .as_str()
+                .ok_or_else(|| wrong_value_for_var("default_collation_for_utf8mb4", "NULL"))?;
             let collation = if let Ok(id) = raw.parse::<u16>() {
                 crate::charset::resolve_collation_id(id).ok_or_else(|| {
-                    crate::error::catalog::ER_UNKNOWN_COLLATION.error(format!("Unknown collation: '{raw}'"))
+                    crate::error::catalog::ER_UNKNOWN_COLLATION
+                        .error(format!("Unknown collation: '{raw}'"))
                 })?
             } else {
                 crate::charset::resolve_collation(raw)?
             };
             if !matches!(collation.name, "utf8mb4_0900_ai_ci" | "utf8mb4_general_ci") {
-                return Err(crate::error::catalog::ER_INVALID_DEFAULT_UTF8MB4_COLLATION
-                    .error(format!("Invalid default collation for utf8mb4: '{}'", collation.name)));
+                return Err(
+                    crate::error::catalog::ER_INVALID_DEFAULT_UTF8MB4_COLLATION.error(format!(
+                        "Invalid default collation for utf8mb4: '{}'",
+                        collation.name
+                    )),
+                );
             }
             ctx.session.sysvars.default_collation_for_utf8mb4 = collation.name;
             Ok(())

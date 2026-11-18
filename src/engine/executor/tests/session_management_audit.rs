@@ -52,7 +52,12 @@ fn session_audit_diagnostics_and_atomic_set() {
         .execute_with_session(&mut s, "SET autocommit=0, time_zone='Not/AZone'")
         .is_err());
     assert!(s.autocommit);
-    for name in ["timestamp", "show_create_table_skip_secondary_engine", "rand_seed1", "rand_seed2"] {
+    for name in [
+        "timestamp",
+        "show_create_table_skip_secondary_engine",
+        "rand_seed1",
+        "rand_seed2",
+    ] {
         let err = engine
             .execute_with_session(&mut s, &format!("SELECT @@global.{name}"))
             .unwrap_err();

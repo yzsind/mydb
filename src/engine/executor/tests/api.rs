@@ -4480,7 +4480,9 @@ fn slow_log_obeys_session_thresholds_and_inherits_global_changes() {
     engine.execute_with_session(&mut existing,
         "SET GLOBAL long_query_time=0, GLOBAL min_examined_row_limit=0, GLOBAL log_output='TABLE', GLOBAL slow_query_log=ON").unwrap();
     let mut new_session = SessionContext::default();
-    engine.execute_with_session(&mut existing, "SELECT 4101").unwrap();
+    engine
+        .execute_with_session(&mut existing, "SELECT 4101")
+        .unwrap();
     for sql in [
         "SELECT 4102",
         "SET SESSION min_examined_row_limit=10",
@@ -4495,10 +4497,13 @@ fn slow_log_obeys_session_thresholds_and_inherits_global_changes() {
     else {
         panic!("expected slow log result set");
     };
-    assert_eq!(result.rows, vec![
-        vec![Value::Bytes(b"SELECT 4102".to_vec())],
-        vec![Value::Bytes(b"SELECT 4104".to_vec())],
-    ]);
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Bytes(b"SELECT 4102".to_vec())],
+            vec![Value::Bytes(b"SELECT 4104".to_vec())],
+        ]
+    );
 }
 
 #[test]
@@ -4507,7 +4512,9 @@ fn slow_log_variables_have_typed_select_results_and_text_show_values() {
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
     let sql = "SELECT @@GLOBAL.SLOW_QUERY_LOG, @@global.long_query_time";
-    let prepared = engine.describe_prepared_statement(&mut session, sql).unwrap();
+    let prepared = engine
+        .describe_prepared_statement(&mut session, sql)
+        .unwrap();
     assert_eq!(prepared[0].column_type, ColumnType::LongLong);
     assert_eq!(prepared[0].source.length, Some(1));
     assert_eq!(prepared[0].source.decimals, Some(0));
@@ -4545,8 +4552,14 @@ fn slow_log_variables_have_typed_select_results_and_text_show_values() {
         assert_eq!(
             shown.rows,
             vec![
-                vec![Value::String("long_query_time".into()), Value::String("1.25".into())],
-                vec![Value::String("slow_query_log".into()), Value::String(setting.into())],
+                vec![
+                    Value::String("long_query_time".into()),
+                    Value::String("1.25".into())
+                ],
+                vec![
+                    Value::String("slow_query_log".into()),
+                    Value::String(setting.into())
+                ],
             ]
         );
     }

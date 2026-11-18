@@ -46,15 +46,15 @@ pub(crate) fn register(reg: &mut Registry) {
         let def = SysVarDef::new(canon, Scope::Global, DataType::String { max_len: None });
         let def = match canon {
             "log_bin" => def.with_select_type(SelectType::Bool),
-            "binlog_expire_logs_seconds" | "server_id" | "expire_logs_days"
-            | "max_binlog_cache_size" | "max_binlog_stmt_cache_size" => {
-                def.with_select_type(SelectType::UInt)
-            }
+            "binlog_expire_logs_seconds"
+            | "server_id"
+            | "expire_logs_days"
+            | "max_binlog_cache_size"
+            | "max_binlog_stmt_cache_size" => def.with_select_type(SelectType::UInt),
             _ => def,
         };
         reg.register(SysVar::settable(
-            def
-                .with_access(Access::ReadOnly)
+            def.with_access(Access::ReadOnly)
                 .with_doc("Binlog / GTID configuration (configured at server startup)."),
             move |_ctx| snapshot_value(canon),
             move |_ctx: &mut WriteCtx<'_>, _v: SysVarValue| -> Result<(), QueryError> {
@@ -111,19 +111,25 @@ pub(crate) fn register(reg: &mut Registry) {
     let validated: [(&str, DataType, SysVarValue, Validator); 4] = [
         (
             "binlog_format",
-            DataType::Enum { values: &["MIXED", "STATEMENT", "ROW"] },
+            DataType::Enum {
+                values: &["MIXED", "STATEMENT", "ROW"],
+            },
             SysVarValue::String("ROW".into()),
             crate::binlog::validate_binlog_format,
         ),
         (
             "binlog_row_image",
-            DataType::Enum { values: &["MINIMAL", "NOBLOB", "FULL"] },
+            DataType::Enum {
+                values: &["MINIMAL", "NOBLOB", "FULL"],
+            },
             SysVarValue::String("FULL".into()),
             crate::binlog::validate_binlog_row_image,
         ),
         (
             "binlog_row_value_options",
-            DataType::Enum { values: &["", "PARTIAL_JSON"] },
+            DataType::Enum {
+                values: &["", "PARTIAL_JSON"],
+            },
             SysVarValue::String(String::new()),
             crate::binlog::validate_binlog_row_value_options,
         ),
@@ -150,7 +156,9 @@ pub(crate) fn register(reg: &mut Registry) {
     }
     reg.register(SysVar::settable(
         SysVarDef::new(
-            "binlog_row_metadata", Scope::Global, DataType::String { max_len: None },
+            "binlog_row_metadata",
+            Scope::Global,
+            DataType::String { max_len: None },
         )
         .with_access(Access::SuperReadWrite)
         .with_doc("mydb always writes FULL table metadata."),
@@ -349,7 +357,9 @@ pub(crate) fn register(reg: &mut Registry) {
 
 fn validate_binlog_set_context(name: &str, ctx: &ReadCtx<'_>) -> Result<(), QueryError> {
     use crate::error::catalog::*;
-    let Some(session) = ctx.session else { return Ok(()); };
+    let Some(session) = ctx.session else {
+        return Ok(());
+    };
     if name == "binlog_format" && ctx.scope == Scope::Session {
         if !session.temp_tables.is_empty() {
             return Err(ER_TEMP_TABLE_PREVENTS_SWITCH_SESSION_BINLOG_FORMAT
@@ -366,8 +376,9 @@ fn validate_binlog_set_context(name: &str, ctx: &ReadCtx<'_>) -> Result<(), Quer
     }
     if name == "binlog_row_value_options" {
         if session.routine_atomic_depth > 0 {
-            return Err(ER_VARIABLE_NOT_SETTABLE_IN_SF_OR_TRIGGER
-                .error(format!("Cannot set {name} inside a stored function or trigger")));
+            return Err(ER_VARIABLE_NOT_SETTABLE_IN_SF_OR_TRIGGER.error(format!(
+                "Cannot set {name} inside a stored function or trigger"
+            )));
         }
         if session.routine_mdl_depth > 0 {
             return Err(ER_VARIABLE_NOT_SETTABLE_IN_SP

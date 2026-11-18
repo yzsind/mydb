@@ -1,8 +1,8 @@
 //! Logging variables backed by the active logging service and session thresholds.
 
+use crate::engine::logging;
 use crate::engine::sysvar::backend::SysVar;
 use crate::engine::sysvar::ctx::WriteCtx;
-use crate::engine::logging;
 use crate::engine::sysvar::meta::{Access, DataType, Scope, SelectType, SysVarDef};
 use crate::engine::sysvar::registry::Registry;
 use crate::engine::sysvar::value::SysVarValue;
@@ -29,10 +29,12 @@ pub(crate) fn register(reg: &mut Registry) {
         ("log_error_services", "Active log services chain."),
     ];
     for &(name, doc) in names {
-        let mut def = SysVarDef::new(name, Scope::Global, DataType::String { max_len: None })
-            .with_doc(doc);
+        let mut def =
+            SysVarDef::new(name, Scope::Global, DataType::String { max_len: None }).with_doc(doc);
         def = match name {
-            "general_log" | "slow_query_log" | "log_slow_admin_statements"
+            "general_log"
+            | "slow_query_log"
+            | "log_slow_admin_statements"
             | "log_queries_not_using_indexes" => def.with_select_type(SelectType::Bool),
             "log_error_verbosity" => def.with_select_type(SelectType::UInt),
             _ => def,
@@ -55,7 +57,10 @@ pub(crate) fn register(reg: &mut Registry) {
             SysVarDef::new(
                 "long_query_time",
                 Scope::Both,
-                DataType::Double { min: 0.0, max: f64::MAX },
+                DataType::Double {
+                    min: 0.0,
+                    max: f64::MAX,
+                },
             )
             .with_doc("Slow log threshold in seconds."),
             |ctx| match (ctx.scope, ctx.session) {
@@ -68,7 +73,10 @@ pub(crate) fn register(reg: &mut Registry) {
                 if ctx.is_global() {
                     logging::set_global_variable("long_query_time", &value.to_config_string())?;
                 } else {
-                    ctx.session.sysvars.slow_log.set_long_query_time(value.as_f64().unwrap());
+                    ctx.session
+                        .sysvars
+                        .slow_log
+                        .set_long_query_time(value.as_f64().unwrap());
                 }
                 Ok(())
             },
@@ -80,7 +88,10 @@ pub(crate) fn register(reg: &mut Registry) {
             SysVarDef::new(
                 "min_examined_row_limit",
                 Scope::Both,
-                DataType::UInt { min: 0, max: u64::MAX },
+                DataType::UInt {
+                    min: 0,
+                    max: u64::MAX,
+                },
             )
             .with_scope_access(Access::SessionAdmin, Access::ReadWrite)
             .with_doc("Minimum examined rows for slow log inclusion."),
@@ -92,7 +103,10 @@ pub(crate) fn register(reg: &mut Registry) {
             },
             |ctx, value| {
                 if ctx.is_global() {
-                    logging::set_global_variable("min_examined_row_limit", &value.to_config_string())?;
+                    logging::set_global_variable(
+                        "min_examined_row_limit",
+                        &value.to_config_string(),
+                    )?;
                 } else {
                     ctx.session.sysvars.slow_log.min_examined_row_limit = value.as_u64().unwrap();
                 }

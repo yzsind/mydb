@@ -396,12 +396,9 @@ pub(in crate::engine::executor) fn execute_set_statement(
         ) {
             let registry = sysvar::registry();
             let value = if set_scope.requested_scope() == sysvar::Scope::Session
-                && registry
-                    .get(&name)
-                    .is_some_and(|var| {
-                        var.scope() == sysvar::Scope::Both && !var.def.compiled_session_default
-                    })
-            {
+                && registry.get(&name).is_some_and(|var| {
+                    var.scope() == sysvar::Scope::Both && !var.def.compiled_session_default
+                }) {
                 registry.read(&name, sysvar::Scope::Global, None, Some(db.as_ref()))?
             } else {
                 registry

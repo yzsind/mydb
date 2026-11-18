@@ -33,10 +33,13 @@ fn system_variable_result_types_match_prepare_and_keep_show_text() {
         "source_verify_checksum",
     ] {
         let sql = format!("SELECT @@global.{name}");
-        let columns = engine.describe_prepared_statement(&mut session, &sql).unwrap();
+        let columns = engine
+            .describe_prepared_statement(&mut session, &sql)
+            .unwrap();
         assert_eq!(columns[0].column_type, ColumnType::LongLong, "{name}");
         assert_eq!(columns[0].source.length, Some(1), "{name}");
-        let QueryResponse::ResultSet(result) = engine.execute_with_session(&mut session, &sql).unwrap()
+        let QueryResponse::ResultSet(result) =
+            engine.execute_with_session(&mut session, &sql).unwrap()
         else {
             panic!("expected a result set for {name}");
         };
@@ -47,7 +50,11 @@ fn system_variable_result_types_match_prepare_and_keep_show_text() {
             ref value => panic!("expected a numeric switch for {name}, got {value:?}"),
         };
         assert_eq!(
-            one_row(&engine, &mut session, &format!("SHOW GLOBAL VARIABLES LIKE '{name}'")),
+            one_row(
+                &engine,
+                &mut session,
+                &format!("SHOW GLOBAL VARIABLES LIKE '{name}'")
+            ),
             vec![Value::String(name.into()), Value::String(setting.into())]
         );
     }
@@ -56,17 +63,27 @@ fn system_variable_result_types_match_prepare_and_keep_show_text() {
         .execute_with_session(&mut session, "SET SESSION timestamp=123.12345678")
         .unwrap();
     let sql = "SELECT @@session.autocommit, @@session.sql_select_limit, @@session.timestamp, @@global.log_output";
-    let prepared = engine.describe_prepared_statement(&mut session, sql).unwrap();
+    let prepared = engine
+        .describe_prepared_statement(&mut session, sql)
+        .unwrap();
     let QueryResponse::ResultSet(result) = engine.execute_with_session(&mut session, sql).unwrap()
     else {
         panic!("expected a result set");
     };
     assert_eq!(result.columns, prepared);
-    assert_ne!(result.columns[1].source.flags & crate::mysql::protocol::UNSIGNED_FLAG, 0);
+    assert_ne!(
+        result.columns[1].source.flags & crate::mysql::protocol::UNSIGNED_FLAG,
+        0
+    );
     assert_eq!(result.columns[2].source.decimals, Some(6));
     assert!(matches!(
         &result.rows[0][..],
-        [Value::Int(1), Value::UInt(u64::MAX), Value::Double(123.12345678), Value::String(_)]
+        [
+            Value::Int(1),
+            Value::UInt(u64::MAX),
+            Value::Double(123.12345678),
+            Value::String(_)
+        ]
     ));
 }
 
@@ -1161,32 +1178,44 @@ fn scope_defaults_are_inherited_by_new_sessions_and_reset_from_global() {
     ).unwrap();
     assert_eq!(one_row(&engine, &mut existing, sql), inherited);
     engine
-        .execute_with_session(&mut existing, "SET @@LOCAL.show_create_table_skip_secondary_engine=ON")
+        .execute_with_session(
+            &mut existing,
+            "SET @@LOCAL.show_create_table_skip_secondary_engine=ON",
+        )
         .unwrap();
     let sql = "SELECT @@show_create_table_skip_secondary_engine";
     assert_eq!(one_row(&engine, &mut existing, sql), vec![Value::Int(1)]);
     assert_eq!(one_row(&engine, &mut new_session, sql), vec![Value::Int(0)]);
 
-    engine.execute_with_session(
-        &mut existing,
-        "SET GLOBAL default_collation_for_utf8mb4='utf8mb4_general_ci'",
-    ).unwrap();
+    engine
+        .execute_with_session(
+            &mut existing,
+            "SET GLOBAL default_collation_for_utf8mb4='utf8mb4_general_ci'",
+        )
+        .unwrap();
     let mut inherited_collation = SessionContext::default();
     let sql = "SELECT @@session.default_collation_for_utf8mb4";
-    assert_eq!(one_row(&engine, &mut inherited_collation, sql), vec![
-        Value::String("utf8mb4_general_ci".into()),
-    ]);
+    assert_eq!(
+        one_row(&engine, &mut inherited_collation, sql),
+        vec![Value::String("utf8mb4_general_ci".into()),]
+    );
     engine
         .execute_with_session(&mut inherited_collation, "SET NAMES utf8mb4")
         .unwrap();
-    assert_eq!(inherited_collation.collation_connection, "utf8mb4_general_ci");
-    engine.execute_with_session(
-        &mut inherited_collation,
-        "SET SESSION default_collation_for_utf8mb4=DEFAULT",
-    ).unwrap();
-    assert_eq!(one_row(&engine, &mut inherited_collation, sql), vec![
-        Value::String("utf8mb4_0900_ai_ci".into()),
-    ]);
+    assert_eq!(
+        inherited_collation.collation_connection,
+        "utf8mb4_general_ci"
+    );
+    engine
+        .execute_with_session(
+            &mut inherited_collation,
+            "SET SESSION default_collation_for_utf8mb4=DEFAULT",
+        )
+        .unwrap();
+    assert_eq!(
+        one_row(&engine, &mut inherited_collation, sql),
+        vec![Value::String("utf8mb4_0900_ai_ci".into()),]
+    );
 }
 
 #[test]
@@ -1311,11 +1340,7 @@ fn mydb_lob_inline_max_runtime_tunable_changes_externalization() {
 
     // Default inline_max=4096 keeps a 2000B value inline without externalization.
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_inline_max");
-    assert_eq!(
-        row[0],
-        Value::UInt(4096),
-        "The default must be 4096"
-    );
+    assert_eq!(row[0], Value::UInt(4096), "The default must be 4096");
     let ext0 = lob_status_metric(&engine, "dml_lob_chains_externalized");
     engine
         .execute_with_session(&mut s, "INSERT INTO t VALUES (1, REPEAT('x', 2000))")
@@ -1331,11 +1356,7 @@ fn mydb_lob_inline_max_runtime_tunable_changes_externalization() {
         .execute_with_session(&mut s, "SET GLOBAL mydb_lob_inline_max = 1024")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_inline_max");
-    assert_eq!(
-        row[0],
-        Value::UInt(1024),
-        "SET must expose the new value"
-    );
+    assert_eq!(row[0], Value::UInt(1024), "SET must expose the new value");
     // SHOW VARIABLES must reflect the change too.
     let QueryResponse::ResultSet(vars) = engine
         .execute_with_session(&mut s, "SHOW VARIABLES LIKE 'mydb_lob_inline_max'")
@@ -1393,21 +1414,13 @@ fn mydb_lob_compression_runtime_tunable() {
     let mut s = SessionContext::default();
     // Default off is zero.
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_compression");
-    assert_eq!(
-        row[0],
-        Value::UInt(0),
-        "Compression defaults to off=0"
-    );
+    assert_eq!(row[0], Value::UInt(0), "Compression defaults to off=0");
     // Enable at runtime with 1 for LZ4.
     engine
         .execute_with_session(&mut s, "SET GLOBAL mydb_lob_compression = 1")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_compression");
-    assert_eq!(
-        row[0],
-        Value::UInt(1),
-        "The value must be 1 after SET"
-    );
+    assert_eq!(row[0], Value::UInt(1), "The value must be 1 after SET");
     // Compressible large LOBs written after enabling must round-trip transparently byte-for-byte.
     engine
         .execute_with_session(&mut s, "CREATE TABLE c (id INT PRIMARY KEY, b LONGBLOB)")

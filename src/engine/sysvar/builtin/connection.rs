@@ -389,8 +389,10 @@ pub(crate) fn register(reg: &mut Registry) {
         reg.register(if name == "session_track_gtids" {
             var.with_validation(|ctx, _| {
                 if ctx.session.is_some_and(|session| session.in_transaction()) {
-                    return Err(crate::error::catalog::ER_VARIABLE_NOT_SETTABLE_IN_TRANSACTION
-                        .error("Cannot set session_track_gtids inside a transaction"));
+                    return Err(
+                        crate::error::catalog::ER_VARIABLE_NOT_SETTABLE_IN_TRANSACTION
+                            .error("Cannot set session_track_gtids inside a transaction"),
+                    );
                 }
                 Ok(())
             })

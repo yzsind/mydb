@@ -706,8 +706,12 @@ pub(crate) fn compiled_variable_default(name: &str) -> SysVarValue {
 pub(crate) fn variable_value(name: &str) -> SysVarValue {
     let Some(service) = active_service() else {
         return match name {
-            "general_log" | "slow_query_log" | "log_slow_admin_statements"
-            | "log_queries_not_using_indexes" | "long_query_time" | "min_examined_row_limit"
+            "general_log"
+            | "slow_query_log"
+            | "log_slow_admin_statements"
+            | "log_queries_not_using_indexes"
+            | "long_query_time"
+            | "min_examined_row_limit"
             | "log_error_verbosity" => compiled_variable_default(name),
             _ => SysVarValue::String(String::new()),
         };
