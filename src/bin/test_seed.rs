@@ -35,6 +35,18 @@ where
     }
     fs::create_dir_all(&seed_dir)?;
 
+    // The reserve is a runtime file. Keep it out of cloned fixtures and opt
+    // ordinary nextest fixtures out unless the test run explicitly enables it.
+    let reserve_override = env::var_os("MYDB_DISK_RECOVERY_RESERVE_BYTES");
+    env::set_var("MYDB_DISK_RECOVERY_RESERVE_BYTES", "0");
+    if reserve_override.is_none() {
+        append_nextest_value(
+            Path::new(&nextest_env),
+            "MYDB_DISK_RECOVERY_RESERVE_BYTES",
+            "0",
+        )?;
+    }
+
     // Keep seed creation deterministic and cheap regardless of developer
     // shell settings. The on-disk image is a normal clean strict-mode data
     // directory and can subsequently be opened by any test StorageConfig.

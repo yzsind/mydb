@@ -5370,6 +5370,65 @@ fn audit_password_administrator_exemptions_preserve_explicit_replace_checks() {
 }
 
 #[test]
+fn fail_stopped_kill_and_lifecycle_commands_enforce_privileges() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut root = SessionContext::default();
+    for sql in ["CREATE TABLE t (id INT PRIMARY KEY)", "CREATE USER alice"] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    let mut alice = user_session(&engine, "alice");
+    let handle = engine.registry.register_authenticated(
+        12345,
+        "root".into(),
+        "localhost:45000".into(),
+        "test".into(),
+        crate::engine::status_counters::SessionStatus::new_untracked(),
+        AccountKey::new("root", "localhost"),
+    );
+    engine.database().quarantine_mvcc("injected WAL write failure");
+
+    for (sql, code) in [
+        ("KILL QUERY 12345", 1095),
+        ("KILL CONNECTION 12345", 1095),
+        ("SHUTDOWN", 1142),
+        ("RESTART", 1142),
+    ] {
+        let err = engine.execute_with_session(&mut alice, sql).unwrap_err();
+        assert_eq!(err.code(), code, "{sql}: {err:?}");
+    }
+    for sql in [
+        "SELECT * FROM t",
+        "INSERT INTO t VALUES (1)",
+        "KILL QUERY 12345; INSERT INTO t VALUES (1)",
+    ] {
+        let err = engine.execute_with_session(&mut root, sql).unwrap_err();
+        assert!(
+            err.is(crate::error::catalog::ER_SERVER_SHUTDOWN),
+            "{sql}: {err:?}"
+        );
+    }
+    assert_eq!(handle.query_cancel_generation(), 0);
+    for sql in [
+        "/* operator */ KILL QUERY 12345",
+        "/*!80000 KILL QUERY 12345 */",
+    ] {
+        engine.execute_with_session(&mut root, sql).unwrap();
+    }
+    assert_eq!(handle.query_cancel_generation(), 2);
+    assert!(!handle.kill_flag().load(std::sync::atomic::Ordering::Acquire));
+    engine
+        .execute_with_session(&mut root, "KILL CONNECTION 12345")
+        .unwrap();
+    assert!(handle.kill_flag().load(std::sync::atomic::Ordering::Acquire));
+    assert!(engine
+        .shutdown()
+        .unwrap_err()
+        .is_internal(crate::error::InternalErrorKind::ShutdownRecoveryRequired));
+}
+
+#[test]
 fn audit_kill_checks_matched_account_and_live_grants() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

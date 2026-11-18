@@ -1418,6 +1418,10 @@ pub(crate) fn global_status_pairs(
     push("Mydb_recyclebin_pressure", recycle[0]);
     push("Mydb_recyclebin_pressure_purges", recycle[1]);
     push("Mydb_recyclebin_cleanup_failures", recycle[2]);
+    let disk = db.disk_pressure_status();
+    push("Mydb_disk_write_limited", disk[0]);
+    push("Mydb_disk_available_bytes", disk[1]);
+    push("Mydb_disk_recovery_reserve_armed", disk[2]);
     push("Mydb_active_transactions", st.active_transactions as u64);
     push("Mydb_undo_bytes", st.undo_bytes);
     push("Mydb_undo_records", st.undo_records as u64);

@@ -774,6 +774,7 @@ impl Database {
     }
 
     pub fn purge_recyclebin_all(&self) -> Result<(), QueryError> {
+        self.check_disk_write()?;
         // Bound both memory and the set of candidate IDs. New recycling must
         // not make a long-running administrative statement chase the tail.
         let upper = IndexBound {
@@ -818,6 +819,13 @@ impl Database {
         if entry.purging {
             return Ok(());
         }
+        let _disk_budget = if self.disk_space_limited() {
+            let intent: DropTableIntent = serde_json::from_str(&entry.manifest)
+                .map_err(|err| crate::recyclebin::failure(err.to_string()))?;
+            self.admit_disk_cleanup(Some(&intent), entry.manifest.len() as u64, false)?
+        } else {
+            None
+        };
         let key = table_key(crate::recyclebin::DATABASE, name);
         let table = self.table(&key)?;
         self.check_ddl_table_lock(table.id)?;
@@ -1096,6 +1104,11 @@ impl Database {
                     "recycle-bin physical ownership mismatch",
                 ));
             }
+            let _disk_budget = match self.admit_disk_cleanup(Some(&intent), entry.manifest.len() as u64, false) {
+                Ok(budget) => budget,
+                Err(err) if err.is(crate::error::catalog::ER_DISK_FULL_NOWAIT) => continue,
+                Err(err) => return Err(err),
+            };
             let covered = self.log.lock().last_lsn();
             if covered != 0 && self.config.durability != DurabilityMode::Memory {
                 crate::wal::LogManager::sync_durable_to(&self.log, covered)?;

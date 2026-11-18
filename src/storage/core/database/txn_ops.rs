@@ -1054,7 +1054,92 @@ impl Database {
     /// Gate each new SQL write statement while allowing an admitted
     /// transaction to commit or physically roll back under WAL pressure.
     pub(crate) fn check_write_statement_budget(&self) -> Result<(), QueryError> {
+        self.check_disk_write()?;
         self.capture.budget.check(1)
+    }
+
+    #[inline]
+    pub(crate) fn check_disk_write(&self) -> Result<(), QueryError> {
+        if let Some(pressure) = &self.disk_pressure {
+            pressure.check_write(self.disk_pending_page_bytes())?;
+        }
+        Ok(())
+    }
+
+    fn disk_pending_page_bytes(&self) -> u64 {
+        self.buffer_pool.dirty_pages.load(Ordering::Relaxed).saturating_mul(PAGE_SIZE as u64)
+    }
+
+    pub(crate) fn disk_spill_floor(&self, path: &Path) -> u64 {
+        #[cfg(unix)]
+        return self.disk_pressure.as_ref().map_or(0, |pressure| {
+            pressure.spill_floor(path, self.disk_pending_page_bytes())
+        });
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            0
+        }
+    }
+
+    pub(crate) fn disk_space_limited(&self) -> bool {
+        self.disk_pressure
+            .as_ref()
+            .is_some_and(|pressure| pressure.limited(self.disk_pending_page_bytes()))
+    }
+
+    pub(crate) fn disk_pressure_status(&self) -> [u64; 3] {
+        self.disk_pressure.as_ref().map_or([0; 3], |pressure| {
+            [
+                self.disk_space_limited() as u64,
+                pressure.available(),
+                pressure.is_armed() as u64,
+            ]
+        })
+    }
+
+    fn admit_disk_cleanup(
+        &self,
+        intent: Option<&DropTableIntent>,
+        catalog_bytes: u64,
+        binlogged_ddl: bool,
+    ) -> Result<Option<crate::storage::disk_pressure::CleanupLease<'_>>, QueryError> {
+        let Some(pressure) = &self.disk_pressure else {
+            return Ok(None);
+        };
+        if !binlogged_ddl && !self.disk_space_limited() {
+            return Ok(None);
+        }
+        if intent.is_some_and(|intent| !intent.vector_directories.is_empty()) {
+            return Err(crate::storage::disk_pressure::limited_error(
+                "vector-directory retirement requires ordinary write headroom",
+            ));
+        }
+        let (path_bytes, files) = intent.map_or((0, 0), |intent| {
+            let path_bytes = intent.files.iter().chain(&intent.vector_files)
+                .map(|path| path.len() as u64).sum::<u64>();
+            (path_bytes, intent.files.len().saturating_add(intent.vector_files.len()))
+        });
+        if binlogged_ddl && self.active_write_txns_atomic.load(Ordering::Acquire) != 0 {
+            return Err(crate::storage::disk_pressure::limited_error(
+                "wait for the admitted writing transactions to commit or roll back before cleanup",
+            ));
+        }
+        let lease = pressure.cleanup(
+            self.disk_pending_page_bytes(),
+            catalog_bytes.saturating_add(path_bytes),
+            files,
+            binlogged_ddl,
+        )?;
+        if self.active_write_txns_atomic.load(Ordering::Acquire) != 0 {
+            return Err(crate::storage::disk_pressure::limited_error(
+                "wait for the admitted writing transactions to commit or roll back before cleanup",
+            ));
+        }
+        if let Some(lease) = &lease {
+            lease.require_binlog_durability();
+        }
+        Ok(lease)
     }
 
     /// Begin a DML transaction. Identical to [`begin_txn`] except that the
@@ -1071,6 +1156,7 @@ impl Database {
     /// and the in-flight-writer watermark.
     pub fn begin_dml_txn(&self) -> Result<TxnView, QueryError> {
         self.ensure_writable()?;
+        self.check_disk_write()?;
         if !current_redo_enabled()
             && (self.capture.redo_required() || crate::repl::physical_replication_active())
         {
@@ -1101,6 +1187,7 @@ impl Database {
         };
         let txn = {
             let mut txns = self.txns_write()?;
+            self.check_disk_write()?;
             let view = txns.register_new_slot(slot);
             self.active_write_txns_atomic
                 .store(txns.active_write_count, Ordering::SeqCst);
@@ -4187,6 +4274,16 @@ impl Database {
     /// removes the previous pass's residual set; failure to converge is an
     /// explicit shutdown error rather than claiming a clean restart point.
     pub(crate) fn checkpoint_for_shutdown(&self) -> Result<(), QueryError> {
+        if let Err(fail_stop) = self.ensure_operational() {
+            // Leave the last durable checkpoint and its WAL intact for startup
+            // recovery. The engine has drained the other storage writers.
+            self.buffer_pool.shutdown_flusher();
+            return Err(QueryError::internal_control(
+                crate::error::InternalErrorKind::ShutdownRecoveryRequired,
+                crate::error::catalog::ER_SERVER_SHUTDOWN,
+                fail_stop.message(),
+            ));
+        }
         if self.is_snapshot_read_only() {
             return Ok(());
         }
@@ -4224,7 +4321,11 @@ impl Database {
     /// that surfaces as a global commit stall. With the next segment prepared
     /// ahead of time, rotation is only a cheap metadata rename.
     pub fn ensure_next_wal_segment_prepared(&self) -> Result<(), QueryError> {
-        if self.config.durability == DurabilityMode::Memory {
+        if self.config.durability == DurabilityMode::Memory
+            || self.disk_pressure.as_ref().is_some_and(|pressure| {
+                !pressure.allows_wal_preallocation(self.disk_pending_page_bytes())
+            })
+        {
             return Ok(());
         }
         crate::wal::LogManager::ensure_next_segment(&self.log)

@@ -61,6 +61,9 @@ pub(in crate::engine::executor) fn enforce_session_write_access(
     statement: &Statement,
 ) -> Result<(), QueryError> {
     ensure_xa_statement_allowed(session, statement)?;
+    if db.disk_space_limited() {
+        enforce_disk_space_access(db, session, statement)?;
+    }
     // (1) Session's transaction_read_only / BEGIN READ ONLY.
     let transaction_read_only = if session.active_txn_isolation.is_none() {
         session.next_txn_read_only.unwrap_or(session.read_only_txn)
@@ -101,6 +104,57 @@ pub(in crate::engine::executor) fn enforce_session_write_access(
         ));
     }
     Ok(())
+}
+
+fn enforce_disk_space_access(
+    db: &Database,
+    session: &SessionContext,
+    statement: &Statement,
+) -> Result<(), QueryError> {
+    use crate::recyclebin::Command;
+    let idle = !session.in_transaction() && session.xa_branch.is_none();
+    match statement {
+        Statement::RecycleBin(Command::Purge { name: Some(_) }) if idle => Ok(()),
+        Statement::DropTable {
+            names,
+            temporary: false,
+            ..
+        } if idle
+            && names.len() == 1
+            && session.sysvars.mydb_recyclebin == Some(false)
+            && session.resolve_temp_table_name(&names[0]).is_none() =>
+        {
+            Ok(())
+        }
+        Statement::XaEnd { .. } | Statement::XaCommit { .. } | Statement::XaRollback { .. } => {
+            Ok(())
+        }
+        Statement::BinlogAdmin { sql } if crate::binlog::is_read_only_admin_sql(sql) => Ok(()),
+        Statement::Set(assignments)
+            if assignments.iter().any(|assignment| {
+                matches!(
+                    assignment.scope,
+                    Some(
+                        crate::parser::SetScope::Global
+                            | crate::parser::SetScope::Persist
+                            | crate::parser::SetScope::PersistOnly
+                    ),
+                )
+            }) =>
+        {
+            db.check_disk_write()
+        }
+        Statement::SelectIntoFile { .. }
+        | Statement::FlushTables { .. }
+        | Statement::FlushLogs { .. }
+        | Statement::LockTables(_)
+        | Statement::BinlogAdmin { .. }
+        | Statement::ReplicationAdmin { .. }
+        | Statement::MydbReplicationAdmin { .. }
+        | Statement::BackupAdmin { .. } => db.check_disk_write(),
+        _ if crate::statement_effects::is_replica_forbidden(statement) => db.check_disk_write(),
+        _ => Ok(()),
+    }
 }
 
 /// B2: MySQL 8.0 lets an account write while `read_only` is set only if it

@@ -479,6 +479,7 @@ pub struct BinlogCommit {
     order_state: Arc<BinlogCommitOrder>,
     group_sync: Arc<BinlogGroupSync>,
     durable: AtomicBool,
+    force_sync: bool,
     published: bool,
 }
 
@@ -1337,6 +1338,9 @@ pub(crate) fn shutdown_retention() {
 }
 static FALLBACK_CONFIG: OnceLock<BinlogConfig> = OnceLock::new();
 static COMMIT_GATE: OnceLock<parking_lot::Mutex<()>> = OnceLock::new();
+// Keep the files and GTID state used to price a low-space DDL stable
+// across its catalog commit. The retention worker takes this before COMMIT_GATE.
+static RETENTION_GATE: parking_lot::Mutex<()> = parking_lot::const_mutex(());
 static GLOBAL_READ_LOCK: AtomicBool = AtomicBool::new(false);
 static GLOBAL_READ_LOCK_CHANGED: parking_lot::Condvar = parking_lot::Condvar::new();
 // The atomic is only an empty-set fast path. Ownership changes and checks
@@ -1424,6 +1428,9 @@ pub fn init_global(data_dir: PathBuf, config: BinlogConfig) -> Result<(), QueryE
                     drop(stopped);
                     let Some(manager) = weak.upgrade() else {
                         break;
+                    };
+                    let Some(_retention) = RETENTION_GATE.try_lock() else {
+                        continue;
                     };
                     let _gate = commit_gate();
                     if let Err(err) = manager.maintain_retention(SystemTime::now()) {
@@ -1785,6 +1792,7 @@ pub fn binary_logs() -> Result<Vec<BinaryLogInfo>, QueryError> {
 pub fn restore_imported_gtids(db: &Database) -> Result<(), QueryError> {
     let imported = db.imported_gtid_set()?;
     if let Some(manager) = manager() {
+        let _retention = RETENTION_GATE.lock();
         let _gate = commit_gate();
         let mut state = manager.state.lock();
         state.gtid_executed = crate::gtid::union(&state.gtid_executed, &imported);
@@ -2151,11 +2159,13 @@ pub fn handle_admin_sql_scoped(
         AdminCommand::BinaryLogs => show_binary_logs(),
         AdminCommand::Replicas => show_replicas(),
         AdminCommand::FlushBinaryLogs => {
+            let _retention = RETENTION_GATE.lock();
             let _commit_gate = commit_gate();
             require_manager()?.rotate()?;
             Ok(QueryResponse::Ok)
         }
         AdminCommand::ResetMaster => {
+            let _retention = RETENTION_GATE.lock();
             let _commit_gate = commit_gate();
             require_manager()?.reset_master(wal_boundary)?;
             Ok(QueryResponse::Ok)
@@ -2582,6 +2592,20 @@ pub(crate) fn admin_privilege(sql: &str) -> Option<crate::engine::auth::Privileg
     })
 }
 
+pub(crate) fn is_read_only_admin_sql(sql: &str) -> bool {
+    matches!(
+        AdminCommand::classify(sql),
+        Some(
+            AdminCommand::MasterStatus
+                | AdminCommand::BinaryLogs
+                | AdminCommand::BinlogEvents
+                | AdminCommand::Replicas
+                | AdminCommand::Profiles
+                | AdminCommand::Profile
+        )
+    )
+}
+
 pub fn is_binlog_admin_sql(sql: &str) -> bool {
     // Head guard — only these keywords ever start a binlog admin command.
     // Without this gate `normalize_admin_sql` allocated two full-payload
@@ -2911,6 +2935,7 @@ impl BinlogSourceManager {
         let index_path = dir.join(format!("{}.index", config.base_name));
         let manifest_path = dir.join("manifest.json");
         finish_interrupted_reset(&dir, &config)?;
+        finish_interrupted_cleanup_rotation(&dir, &index_path, &manifest_path)?;
         let manifest = read_manifest_file(&manifest_path)?;
         if manifest
             .as_ref()
@@ -3807,6 +3832,10 @@ impl BinlogSourceManager {
     }
 
     pub fn rotate(&self) -> Result<(), QueryError> {
+        self.rotate_with_policy(false)
+    }
+
+    fn rotate_with_policy(&self, durable_cleanup: bool) -> Result<(), QueryError> {
         self.flush_all_staged_writes()?;
         // The caller holds COMMIT_GATE, so no new order can be allocated.
         // Wait without holding manager.state: earlier commits must publish
@@ -3815,7 +3844,18 @@ impl BinlogSourceManager {
         let barrier = self.commit_order.state.lock().next_alloc;
         self.commit_order.wait_publish(barrier)?;
         let mut state = self.state.lock();
-        self.rotate_locked(&mut state)?;
+        if let Err(err) = self.rotate_locked(&mut state, durable_cleanup) {
+            if durable_cleanup {
+                let message = format!(
+                    "binlog cleanup rotation requires recovery: {}",
+                    err.message()
+                );
+                self.group_sync.state.lock().fatal_error = Some(message.clone());
+                self.group_sync.cv.notify_all();
+                self.commit_order.fail(message);
+            }
+            return Err(err);
+        }
         drop(state);
         self.notify.notify_waiters();
         Ok(())
@@ -3829,6 +3869,7 @@ impl BinlogSourceManager {
         &self,
         wal_boundary: impl FnOnce() -> Result<u64, QueryError>,
     ) -> Result<(), QueryError> {
+        self.check_cleanup_rotation_resolved()?;
         let active_replicas = self.dump_registry.lock().list();
         if !active_replicas.is_empty() {
             return Err(error(crate::error::catalog::ER_EMPTY_PIPELINE_FOR_ERROR_LOG_SERVICE,
@@ -3950,6 +3991,8 @@ impl BinlogSourceManager {
     /// down to "what we still need to replay from", and by
     /// retention-driven housekeeping.
     pub fn purge_before(&self, cut_off: &str) -> Result<(), QueryError> {
+        let _retention = RETENTION_GATE.lock();
+        self.check_cleanup_rotation_resolved()?;
         use chrono::{Local, NaiveDateTime};
         let parsed = NaiveDateTime::parse_from_str(cut_off, "%Y-%m-%d %H:%M:%S")
             .or_else(|_| NaiveDateTime::parse_from_str(cut_off, "%Y-%m-%dT%H:%M:%S"))
@@ -4011,6 +4054,8 @@ impl BinlogSourceManager {
     }
 
     pub fn purge_to(&self, target_file: &str) -> Result<(), QueryError> {
+        let _retention = RETENTION_GATE.lock();
+        self.check_cleanup_rotation_resolved()?;
         let mut state = self.state.lock();
         let Some(target_idx) = state.files.iter().position(|info| info.name == target_file) else {
             return Err(error(
@@ -4031,6 +4076,18 @@ impl BinlogSourceManager {
             return Ok(());
         }
         self.finish_purge_locked(&mut state, purged, cold_purged)
+    }
+
+    fn check_cleanup_rotation_resolved(&self) -> Result<(), QueryError> {
+        if cleanup_rotation_manifest(&self.manifest_path)
+            .try_exists()
+            .map_err(io_error)?
+        {
+            return Err(io_error(std::io::Error::other(
+                "binary log cleanup rotation requires a restart",
+            )));
+        }
+        Ok(())
     }
 
     /// Merge only removed events into gtid_purged, then persist the live
@@ -4244,7 +4301,7 @@ impl BinlogSourceManager {
             self.stage_spooled_txn_commit(Arc::clone(spool), commit_scn)?
         } else {
             let encoded = encode_pending_ops(&lease.pending.as_ref().unwrap().ops)?;
-            self.stage_encoded_txn_commit(encoded, commit_scn)?
+            self.stage_encoded_txn_commit(encoded, commit_scn, current_durable_cleanup(txn_id))?
         };
         lease.pending.take();
         Ok(Some(staged))
@@ -4254,6 +4311,7 @@ impl BinlogSourceManager {
         &self,
         body: Vec<(u8, Vec<u8>, bool)>,
         commit_scn: u64,
+        durable_cleanup: bool,
     ) -> Result<BinlogCommit, QueryError> {
         let may_have_statement = body.iter().any(|(kind, _, _)| *kind == QUERY_EVENT);
         // Storage DDL still participates in WAL commit/publication ordering,
@@ -4297,7 +4355,7 @@ impl BinlogSourceManager {
             .is_none_or(|end| end > BINLOG_FILE_POSITION_LIMIT);
         if would_cross_configured || would_overflow_position {
             drop(state);
-            self.rotate()?;
+            self.rotate_with_policy(durable_cleanup)?;
             state = self.state.lock();
         }
         if state
@@ -4336,6 +4394,7 @@ impl BinlogSourceManager {
             order_state: Arc::clone(&self.commit_order),
             group_sync: Arc::clone(&self.group_sync),
             durable: AtomicBool::new(false),
+            force_sync: durable_cleanup,
             published: false,
         })
     }
@@ -4352,11 +4411,19 @@ impl BinlogSourceManager {
 
     fn sync_staged_commit(&self, commit: &BinlogCommit) -> Result<(), QueryError> {
         self.group_sync.requests.fetch_add(1, Ordering::Relaxed);
-        let result = self.flush_staged_through(commit.order);
-        if result.is_ok() {
-            commit.durable.store(true, Ordering::Release);
+        self.flush_staged_through(commit.order)?;
+        if commit.force_sync {
+            // A WAL commit for irreversible cleanup may make the catalog and
+            // its file retirement durable. The referenced binlog must survive
+            // that same failure even when group sync is disabled.
+            let file = OpenOptions::new()
+                .write(true)
+                .open(self.dir.join(&commit.reference.file))
+                .map_err(io_error)?;
+            self.sync_file(&file)?;
         }
-        result
+        commit.durable.store(true, Ordering::Release);
+        Ok(())
     }
 
     fn register_staged_write(
@@ -4755,7 +4822,11 @@ impl BinlogSourceManager {
         Ok(appended)
     }
 
-    fn rotate_locked(&self, state: &mut BinlogState) -> Result<(), QueryError> {
+    fn rotate_locked(
+        &self,
+        state: &mut BinlogState,
+        durable_cleanup: bool,
+    ) -> Result<(), QueryError> {
         // rotate() drained and published earlier transactions before taking
         // this latch. Retention may now safely unlink the old file.
         self.group_sync.state.lock().writer = None;
@@ -4763,44 +4834,82 @@ impl BinlogSourceManager {
         while self.dir.join(&next_file).exists() {
             next_file = next_binlog_file_name(&self.config.base_name, &next_file);
         }
+        let bootstrap = bootstrap_file_events(&self.config, 4, &state.gtid_executed);
+        let next_pos = 4 + bootstrap
+            .iter()
+            .map(|(_, event)| event.len() as u64)
+            .sum::<u64>();
+        let staging = if durable_cleanup {
+            let staging = cleanup_rotation_manifest(&self.manifest_path);
+            write_manifest_file(
+                &staging,
+                &self.config,
+                &next_file,
+                next_pos,
+                &state.gtid_executed,
+                &state.gtid_purged,
+                state.next_gno,
+                state.sequence_number,
+            )?;
+            Some(staging)
+        } else {
+            None
+        };
         // MySQL Rotate_log_event payload's position field is the offset of
         // the first real event in the *new* file — always 4 (right after
         // the 4-byte magic). Writing the outgoing file's active_pos leaves
         // the replica seeding Read_Source_Log_Pos to a bogus offset.
         let rotate_payload = encode_rotate_payload(4, &next_file);
-        self.append_events_locked(
+        let outgoing = self.append_events_locked(
             state,
             vec![(ROTATE_EVENT, rotate_payload, false)],
-            true,
-            true,
-            true,
+            /* publish */ !durable_cleanup,
+            /* sync_now */ !durable_cleanup,
+            /* write_now */ true,
         )?;
+        if durable_cleanup {
+            let old = OpenOptions::new()
+                .write(true)
+                .open(self.dir.join(&state.active_file))
+                .map_err(io_error)?;
+            self.sync_file(&old)?;
+        }
 
         let new_path = self.dir.join(&next_file);
         ensure_binlog_file(&new_path)?;
-        let start = 4_u64;
-        let bootstrap = bootstrap_file_events(&self.config, start, &state.gtid_executed);
         append_bytes(&new_path, &concat_event_bytes(&bootstrap))?;
-        let mut pos = start;
+        if let Some(staging) = &staging {
+            // The index is the rotation commit point. The staged manifest is
+            // already durable, and recovery can finish installing it.
+            write_index_with_tail(&self.index_path, &state.files, Some(&next_file))?;
+            install_cleanup_rotation_manifest(&self.dir, staging, &self.manifest_path)?;
+            for chunk in outgoing {
+                state.push_event(chunk);
+            }
+            state.trim_published_events();
+        }
+        let mut pos = 4;
         for (event_type, bytes) in bootstrap {
             let end_pos = pos + bytes.len() as u64;
-            let chunk = BinlogEventChunk {
+            state.push_event(BinlogEventChunk {
                 file: next_file.clone(),
                 start_pos: pos,
                 end_pos,
                 event_type,
                 gtid: extract_gtid_from_event(&bytes),
                 bytes: Arc::new(bytes),
-            };
-            state.push_event(chunk);
+            });
             pos = end_pos;
         }
         state.active_file = next_file.clone();
-        state.active_pos = pos;
+        state.active_pos = next_pos;
         state.files.push(BinaryLogInfo {
             name: next_file,
-            size: pos,
+            size: next_pos,
         });
+        if durable_cleanup {
+            return Ok(());
+        }
         self.apply_retention_locked(state)?;
         self.persist_locked(state)
     }
@@ -5060,7 +5169,8 @@ struct DdlTxnContext {
     sql: String,
     query: BinlogQueryContext,
     account: crate::engine::auth::AccountKey,
-    staged: bool,
+    staged_txn: Option<u64>,
+    durable_cleanup: bool,
 }
 
 #[must_use]
@@ -5080,7 +5190,8 @@ pub fn enter_ddl_txn_context(
         sql: sql.to_string(),
         query: query.clone(),
         account: account.clone(),
-        staged: false,
+        staged_txn: None,
+        durable_cleanup: false,
     };
     let prior = DDL_TXN_CONTEXT.with(|slot| slot.replace(Some(current)));
     DdlTxnContextGuard {
@@ -5125,7 +5236,7 @@ pub fn stage_current_ddl_transaction(txn_id: u64) -> Result<bool, QueryError> {
         let Some(context) = slot.as_mut() else {
             return Ok(false);
         };
-        if context.staged {
+        if context.staged_txn.is_some() {
             return Ok(true);
         }
         // CatalogTxn suppresses row-level DD binlogging. Re-enable recording
@@ -5133,13 +5244,137 @@ pub fn stage_current_ddl_transaction(txn_id: u64) -> Result<bool, QueryError> {
         // only when the issuing session had sql_log_bin enabled.
         let _logical_ddl = SessionSqlLogBinGuard::new(true);
         record_ddl_transactional_with(txn_id, &context.database, &context.sql, &context.query)?;
-        context.staged = true;
+        context.staged_txn = Some(txn_id);
         Ok(true)
     })
 }
 
 pub fn current_ddl_transaction_staged() -> bool {
-    DDL_TXN_CONTEXT.with(|slot| slot.borrow().as_ref().is_some_and(|context| context.staged))
+    DDL_TXN_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|context| context.staged_txn.is_some())
+    })
+}
+
+pub(crate) struct LowSpaceDdlBinlog {
+    pub(crate) directory: PathBuf,
+    writes: [u64; 7],
+    _retention: parking_lot::MutexGuard<'static, ()>,
+}
+
+impl LowSpaceDdlBinlog {
+    pub(crate) fn required_bytes(&self, unit: u64) -> u64 {
+        self.writes
+            .iter()
+            .fold(3u64.saturating_mul(unit), |total, &bytes| {
+                total.saturating_add(bytes.div_ceil(unit).saturating_mul(unit))
+            })
+    }
+
+    pub(crate) fn require_durability(&self) {
+        DDL_TXN_CONTEXT.with(|slot| {
+            if let Some(context) = slot.borrow_mut().as_mut() {
+                context.durable_cleanup = true;
+            }
+        });
+    }
+}
+
+pub(crate) fn budget_low_space_ddl() -> Result<Option<LowSpaceDdlBinlog>, QueryError> {
+    if should_skip_recording() {
+        return Ok(None);
+    }
+    let retention = RETENTION_GATE.try_lock().ok_or_else(|| {
+        crate::storage::disk_pressure::limited_error(
+            "binary log retention is running; retry cleanup",
+        )
+    })?;
+    let manager = require_manager()?;
+    let query = DDL_TXN_CONTEXT.with(|slot| {
+        let slot = slot.borrow();
+        let ddl = slot
+            .as_ref()
+            .filter(|ddl| ddl.staged_txn.is_none())
+            .ok_or_else(|| {
+                crate::storage::disk_pressure::limited_error(
+                    "cleanup requires an unstaged transactional DDL binary log context",
+                )
+            })?;
+        encode_query_payload_with(&ddl.database, &ddl.sql, &ddl.query)
+    })?;
+    let _gate = commit_gate();
+    manager.flush_all_staged_writes()?;
+    // A committer can have left the active-writer count before publishing.
+    // Price rotation using the complete published GTID prefix.
+    let barrier = manager.commit_order.state.lock().next_alloc;
+    manager.commit_order.wait_publish(barrier)?;
+    let state = manager.state.lock();
+    let config = &manager.config;
+    let gtid = encode_gtid_payload(config, state.next_gno, state.sequence_number, true);
+    let transaction = encoded_event_bytes(
+        config,
+        &[(GTID_EVENT, gtid, false), (QUERY_EVENT, query, false)],
+    )?;
+    // Count a possible rotation even if the current file appears to have
+    // room. Include the outgoing event, new file's GTID prefix, and the
+    // staging allocations for both metadata files. Leave room for a second
+    // generation of metadata on checkpoint or startup, even on a separate
+    // binary log filesystem.
+    let next_file = format!("{}.{}", config.base_name, u64::MAX);
+    let outgoing = encoded_event_size(config, encode_rotate_payload(4, &next_file).len(), false)?;
+    let bootstrap = bootstrap_file_events(config, 4, &state.gtid_executed);
+    let new_file = bootstrap.iter().fold(4u64, |bytes, (_, event)| {
+        bytes.saturating_add(event.len() as u64)
+    });
+    let index = state
+        .files
+        .iter()
+        .fold(next_file.len() as u64 + 1, |bytes, file| {
+            bytes.saturating_add(file.name.len() as u64 + 1)
+        });
+    let after_commit = append_gtid(
+        &state.gtid_executed,
+        &format!("{}:{}", config.server_uuid, state.next_gno.max(1)),
+    );
+    let manifest = encode_manifest(
+        config,
+        &next_file,
+        BINLOG_FILE_POSITION_LIMIT,
+        if after_commit.len() > state.gtid_executed.len() {
+            &after_commit
+        } else {
+            &state.gtid_executed
+        },
+        &state.gtid_purged,
+        u64::MAX,
+        u64::MAX,
+    )?;
+    Ok(Some(LowSpaceDdlBinlog {
+        directory: manager.dir.clone(),
+        writes: [
+            transaction,
+            outgoing,
+            new_file,
+            index,
+            manifest.len() as u64,
+            index,
+            manifest.len() as u64,
+        ],
+        _retention: retention,
+    }))
+}
+
+pub(crate) fn recording_ddl() -> bool {
+    !should_skip_recording()
+}
+
+fn current_durable_cleanup(txn_id: u64) -> bool {
+    DDL_TXN_CONTEXT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .is_some_and(|context| context.durable_cleanup && context.staged_txn == Some(txn_id))
+    })
 }
 
 impl Drop for DdlTxnContextGuard {
@@ -6950,6 +7185,69 @@ fn finish_interrupted_reset(dir: &Path, config: &BinlogConfig) -> Result<(), Que
     crate::platform::fs::sync_path(dir).map_err(io_error)
 }
 
+fn cleanup_rotation_manifest(manifest: &Path) -> PathBuf {
+    manifest.with_extension("rotate")
+}
+
+fn install_cleanup_rotation_manifest(
+    dir: &Path,
+    staging: &Path,
+    manifest: &Path,
+) -> Result<(), QueryError> {
+    fs::rename(staging, manifest).map_err(io_error)?;
+    crate::platform::fs::sync_path(dir).map_err(io_error)
+}
+
+fn finish_interrupted_cleanup_rotation(
+    dir: &Path,
+    index: &Path,
+    manifest: &Path,
+) -> Result<(), QueryError> {
+    let staging = cleanup_rotation_manifest(manifest);
+    let Some(next) = read_manifest_file(&staging)? else {
+        return Ok(());
+    };
+    let invalid = || {
+        error(
+            crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+            "binlog cleanup rotation manifest does not match the index",
+        )
+    };
+    let live = read_manifest_file(manifest)?.ok_or_else(invalid)?;
+    let files = read_index_file(index)?;
+    validate_dump_file_name(&next.active_file)?;
+    let next_file = &next.active_file;
+    let (base, suffix) = next_file.rsplit_once('.').ok_or_else(invalid)?;
+    if base != live.config.base_name
+        || suffix.len() < 6
+        || suffix.parse::<u32>().is_err()
+        || binlog_pos_ge((&live.active_file, 0), (next_file, 0))
+    {
+        return Err(invalid());
+    }
+    match files.as_slice() {
+        [.., old, new] if old == &live.active_file && new == next_file => {
+            let path = dir.join(new);
+            let size = disk::validated_file_size(&path)?;
+            if size != next.active_position || size == 4 {
+                return Err(invalid());
+            }
+            disk::validate_range(&path, 4, size)?;
+            install_cleanup_rotation_manifest(dir, &staging, manifest)
+        }
+        [.., old] if old == &live.active_file => {
+            match fs::remove_file(dir.join(next_file)) {
+                Ok(()) => (),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => (),
+                Err(err) => return Err(io_error(err)),
+            }
+            fs::remove_file(staging).map_err(io_error)?;
+            crate::platform::fs::sync_path(dir).map_err(io_error)
+        }
+        _ => Err(invalid()),
+    }
+}
+
 fn committed_binlog_refs_from_wal(
     data_dir: &Path,
 ) -> Result<Vec<crate::wal::WalBinlogRef>, QueryError> {
@@ -7119,9 +7417,17 @@ fn append_bytes(path: &Path, bytes: &[u8]) -> Result<(), QueryError> {
 }
 
 fn write_index_file(path: &Path, files: &[BinaryLogInfo]) -> Result<(), QueryError> {
+    write_index_with_tail(path, files, None)
+}
+
+fn write_index_with_tail(
+    path: &Path,
+    files: &[BinaryLogInfo],
+    next_file: Option<&str>,
+) -> Result<(), QueryError> {
     let mut out = String::new();
-    for file in files {
-        out.push_str(&file.name);
+    for name in files.iter().map(|file| file.name.as_str()).chain(next_file) {
+        out.push_str(name);
         out.push('\n');
     }
     crate::repl::durable::atomic_write_sync(path, &path.with_extension("index.tmp"), out.as_bytes())
@@ -7216,6 +7522,32 @@ fn write_manifest_file(
     next_gno: u64,
     sequence_number: u64,
 ) -> Result<(), QueryError> {
+    let bytes = encode_manifest(
+        config,
+        active_file,
+        active_pos,
+        gtid_executed,
+        gtid_purged,
+        next_gno,
+        sequence_number,
+    )?;
+    let tmp = path.with_extension("json.tmp");
+    let result = crate::repl::durable::atomic_write_sync(path, &tmp, &bytes).map_err(io_error);
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
+}
+
+fn encode_manifest(
+    config: &BinlogConfig,
+    active_file: &str,
+    active_pos: u64,
+    gtid_executed: &str,
+    gtid_purged: &str,
+    next_gno: u64,
+    sequence_number: u64,
+) -> Result<Vec<u8>, QueryError> {
     #[derive(Serialize)]
     struct Manifest<'a> {
         version: u32,
@@ -7237,18 +7569,12 @@ fn write_manifest_file(
         sequence_number,
         config,
     };
-    let bytes = serde_json::to_vec_pretty(&manifest).map_err(|err| {
+    serde_json::to_vec_pretty(&manifest).map_err(|err| {
         error(
             crate::error::catalog::ER_UNKNOWN_ERROR,
             format!("failed to encode binlog manifest: {err}"),
         )
-    })?;
-    let tmp = path.with_extension("json.tmp");
-    let result = crate::repl::durable::atomic_write_sync(path, &tmp, &bytes).map_err(io_error);
-    if result.is_err() {
-        let _ = fs::remove_file(tmp);
-    }
-    result
+    })
 }
 
 fn io_error(err: std::io::Error) -> QueryError {

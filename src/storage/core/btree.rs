@@ -10690,23 +10690,32 @@ impl IndexFile {
         let upper = self.next_page_id();
         let page_lo = page_lo.max(INDEX_EMPTY_ROOT).min(upper);
         let page_hi = page_hi.max(page_lo).min(upper);
-        let window = self.buffer_pool.effective_prefetch_window() as u64;
+        let batched = self.buffer_pool.batch_index_sweep(upper);
+        let window = if batched {
+            0
+        } else {
+            self.buffer_pool.effective_prefetch_window() as u64
+        };
         if window > 0 {
             self.prefetch_page_range(page_lo, page_hi);
         }
+        let mut loaded = Vec::new();
         let mut count = 0u64;
         for page_id in page_lo..page_hi {
-            if window > 0 {
+            let key = self.page_key_ref(page_id);
+            let summary = if batched {
+                self.buffer_pool
+                    .pin_batched_scan_page(key, page_hi, AccessIntent::IndexSweep, &mut loaded)?
+                    .with_index_raw_bytes(raw_leaf_count_and_writer_bound)?
+            } else {
                 let prefetch_at = page_id.saturating_add(window);
-                if prefetch_at < page_hi {
+                if window > 0 && prefetch_at < page_hi {
                     self.buffer_pool.prefetch_page(self.page_key(prefetch_at));
                 }
-            }
-            let pinned = self
-                .buffer_pool
-                .pin_page_with_intent_ref(self.page_key_ref(page_id), AccessIntent::Scan)?;
-            let summary = pinned.with_index_raw_bytes(raw_leaf_count_and_writer_bound)?;
-            drop(pinned);
+                self.buffer_pool
+                    .pin_page_with_intent_ref(key, AccessIntent::Scan)?
+                    .with_index_raw_bytes(raw_leaf_count_and_writer_bound)?
+            };
             let Some((leaf_count, page_max_trx_id)) = summary else {
                 continue;
             };

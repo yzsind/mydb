@@ -1822,7 +1822,7 @@ impl MemBudget {
         })
     }
 
-    fn reclaim_database(&self) -> Option<Arc<crate::storage::Database>> {
+    pub(super) fn reclaim_database(&self) -> Option<Arc<crate::storage::Database>> {
         self.reclaim_database.as_ref().and_then(Weak::upgrade)
     }
 

@@ -1005,6 +1005,7 @@ pub struct Database {
     open_mode: DatabaseOpenMode,
     pub(crate) capture: super::capture::CaptureState,
     pub(crate) services: super::capture::DatabaseServices,
+    disk_pressure: Option<super::disk_pressure::DiskPressure>,
     recovery_context: RecoveryContext,
     visibility_cache_id: u64,
     next_snapshot_id: AtomicU64,
@@ -3057,6 +3058,10 @@ struct RuntimeStorageConfig {
 enum AccessIntent {
     Normal,
     Scan,
+    /// Physical B-tree page sweep with same-file cold-page recycling.
+    IndexSweep,
+    /// Admit new background pages cold without changing the heat of hits.
+    Maintenance,
     /// Sequential SQL scan over a physically small heap. The first pass has
     /// the same cold admission as `Scan`; a second logical pass promotes the
     /// frame, with a deliberately low replacement-priority ceiling.
@@ -3065,6 +3070,12 @@ enum AccessIntent {
     /// Batched non-covering lookup. A newly admitted page stays cold; a
     /// later probe batch that finds it resident promotes it to the hot set.
     Probe,
+}
+
+impl AccessIntent {
+    fn admits_cold(self) -> bool {
+        self != Self::Normal
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3254,6 +3265,8 @@ struct Frame {
     /// cache hit counter this starts at zero for Prefetch, so consuming a
     /// prefetched page during the first scan does not masquerade as reuse.
     small_scan_accesses: AtomicU8,
+    /// This scan frame reused a cold allocation from the same file.
+    scan_recycle: AtomicBool,
     pin_count: AtomicUsize,
     state: AtomicU8,
     /// Wait queue for this frame's Loading -> Ready/Discarded transition.
@@ -3389,6 +3402,8 @@ pub(crate) struct BufferPageDiagnostic {
 struct RawPageLease {
     bytes: Vec<u8>,
     charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    /// Replacement hint carried by the allocation across concurrent admissions.
+    scan_file_hash: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -3449,6 +3464,8 @@ struct BufferPoolShard {
     /// Append-only weak candidates for O(1)-amortized cold recycling.
     /// Stale entries are intentionally discarded lazily by the evictor.
     cold_candidates: Mutex<VecDeque<std::sync::Weak<Frame>>>,
+    /// Scan replacements are indexed separately from the first-pass FIFO.
+    scan_recycle_candidates: Mutex<VecDeque<std::sync::Weak<Frame>>>,
     /// Fixed-size raw page allocations detached from evicted frames and ready
     /// for immediate reuse by a miss admitted to this shard.
     recycled_raw_pages: Mutex<Vec<RawPageLease>>,
@@ -3603,6 +3620,12 @@ struct BulkFlushRange {
     last: u64,
 }
 
+struct PrefetchRequest {
+    key: PageKey,
+    enqueued_us: u64,
+    scan_progress: Option<Arc<AtomicU64>>,
+}
+
 struct BufferPool {
     capacity_pages: AtomicU64,
     /// Percentage of the buffer pool used to classify a physical SQL scan as
@@ -3740,7 +3763,7 @@ struct BufferPool {
     // "queue wait" (issued -> drained by IO worker) from "lead time"
     // (loaded -> first hit). The instant is encoded as microseconds
     // since `pool_started`, kept as u64 for cheap atomic transport.
-    prefetch_queue: Mutex<VecDeque<(PageKey, u64)>>,
+    prefetch_queue: Mutex<VecDeque<PrefetchRequest>>,
     // Bounded scheduling hints only. Dirty frames and their recovery LSNs
     // remain authoritative if a range is evicted, replaced or interrupted.
     bulk_flush_ranges: Mutex<[Option<BulkFlushRange>; BUFFER_POOL_BULK_FLUSH_RANGES]>,
@@ -4869,6 +4892,8 @@ pub(crate) struct HeapFile {
     /// extension serialised separately via `extend_mutex` so two
     /// allocators don't race on `set_len`.
     page_count: std::sync::atomic::AtomicU64,
+    /// Completion time of the last full payload scan of this heap image.
+    last_full_payload_scan_us: Arc<AtomicU64>,
     file_key: Arc<BufferPageFileKey>,
     buffer_pool: Arc<BufferPool>,
     row_migrations: std::sync::atomic::AtomicU64,

@@ -2102,6 +2102,7 @@ impl VectorIndexFile {
             let mut pending = Some(after);
             let replaced = self.buffer_pool.try_replace_resident_logged_page(
                 &key,
+                AccessIntent::Normal,
                 |before, anchored, _| {
                     let mut after = pending.take().expect("replacement callback runs once");
                     let payload = anchored

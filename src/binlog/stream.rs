@@ -270,6 +270,7 @@ impl BinlogSourceManager {
             order_state: Arc::clone(&self.commit_order),
             group_sync: Arc::clone(&self.group_sync),
             durable: AtomicBool::new(false),
+            force_sync: false,
             published: false,
         })
     }

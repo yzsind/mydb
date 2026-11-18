@@ -6,6 +6,7 @@ pub(crate) use core::take_buffered_txn_begin;
 pub(crate) use core::MappedVectorNavigation;
 pub(crate) mod data_dictionary;
 pub(crate) mod dir_lock;
+pub(crate) mod disk_pressure;
 pub(crate) mod file_generation;
 #[cfg(test)]
 pub(crate) mod format_golden;
@@ -79,7 +80,7 @@ pub(crate) use core::{
 pub(crate) use core::{
     decode_row_into_sink_fast, decode_row_schema_columns_into_with_plan_ext_for_layout,
     f32_from_order_u32, f64_from_order_u64, fast_decode_fallback_reason, format_decimal_v3,
-    DirectScanScratch, FastDecodeFallbackReason, OnlineWalApplyContext, PayloadStreamHit,
+    DirectScanScratch, FastDecodeFallbackReason, FullHeapScan, OnlineWalApplyContext, PayloadStreamHit,
     RowDecodeSink, VisibleRootScanScratch, ORDER_STATS_CACHE_HITS, ORDER_STATS_CACHE_INVALIDATIONS,
     ORDER_STATS_CACHE_MISSES,
 };
