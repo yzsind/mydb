@@ -6386,3 +6386,44 @@ fn exact_integer_arithmetic_bounds_reuse_literal_statistics_and_access() {
         assert!(expr_literal_value(&expression(text)).is_none(), "{text}");
     }
 }
+
+#[test]
+fn issue_5_index_join_pruning_uses_schema_column_slots() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE outer_rows (id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE inner_rows (obsolete INT, id INT PRIMARY KEY, payload INT, extra INT)",
+        )
+        .unwrap();
+    engine
+        .execute("ALTER TABLE inner_rows DROP obsolete")
+        .unwrap();
+    engine
+        .execute("ALTER TABLE inner_rows MODIFY extra INT FIRST")
+        .unwrap();
+    let Statement::Select(select) = parse_statement("SELECT /*+ ORDERED INDEX_NLJ(o,i) */ i.payload FROM outer_rows o LEFT JOIN inner_rows i ON o.id=i.id").unwrap() else {
+        unreachable!()
+    };
+    let plan = build_physical_plan(engine.db_for_tests(), &select).unwrap();
+    fn projection(plan: &PhysicalPlan) -> Option<(&PlanTable, &[usize])> {
+        if let PhysicalPlan::IndexNestedLoopJoin {
+            right_table,
+            right_projected_columns: Some(columns),
+            ..
+        } = plan
+        {
+            return Some((right_table, columns));
+        }
+        plan.children().iter().find_map(|child| projection(child))
+    }
+    let (table, columns) =
+        projection(&plan).expect("forced index join must retain a narrow projection");
+    assert_eq!(columns.len(), 2);
+    assert!(columns.contains(&table.schema.column_index("id").unwrap()));
+    assert!(columns.contains(&table.schema.column_index("payload").unwrap()));
+    assert!(!columns.contains(&table.schema.column_index("extra").unwrap()));
+}

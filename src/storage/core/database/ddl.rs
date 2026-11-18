@@ -6748,6 +6748,7 @@ impl Database {
                     | A::DropPrimaryKey
                     | A::ConvertToCharset { .. }
                     | A::MoveColumn { .. }
+                    | A::SetColumnComment { .. }
             )
         }) {
             return Ok(None);
@@ -6890,6 +6891,15 @@ impl Database {
                 }
                 A::MoveColumn { column, position } => {
                     move_column_in_candidate(&mut candidate, column, position)?;
+                }
+                A::SetColumnComment { column, comment } => {
+                    let position = candidate.column_index(column)?;
+                    crate::storage::schema::check_comment_len(
+                        crate::storage::schema::CommentTarget::Field,
+                        column,
+                        comment,
+                    )?;
+                    candidate.columns[position].comment = comment.clone();
                 }
                 A::AddIndex(_) => {
                     let mut index = added_indexes.remove(0);

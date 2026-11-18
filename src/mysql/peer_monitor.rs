@@ -1,9 +1,53 @@
 //! Transport-close observation without consuming command or TLS bytes.
 
 use std::io;
+use std::sync::{Arc, OnceLock};
 use tokio::net::TcpStream;
 
-#[cfg(target_os = "linux")]
+use crate::engine::session_registry::SessionHandle;
+
+/// Peer closure must stay observable while a connection runs synchronous SQL.
+/// Register both the close descriptor and its task on a separate I/O reactor;
+/// spawning on the connection's current-thread runtime would still starve it.
+fn monitor_runtime() -> io::Result<&'static tokio::runtime::Runtime> {
+    static RUNTIME: OnceLock<io::Result<tokio::runtime::Runtime>> = OnceLock::new();
+    RUNTIME
+        .get_or_init(|| {
+            let _cpu_scope = crate::util::connection_dispatch::unpin_for_spawn()?;
+            tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(1)
+                .thread_name("mydb-peer-close")
+                .enable_io()
+                .enable_time()
+                .build()
+        })
+        .as_ref()
+        .map_err(|err| io::Error::new(err.kind(), format!("peer-close reactor: {err}")))
+}
+
+pub(crate) struct PeerDisconnectWatch(tokio::task::JoinHandle<()>);
+
+impl PeerDisconnectWatch {
+    pub(crate) fn new(stream: &TcpStream, session: Arc<SessionHandle>) -> io::Result<Self> {
+        let runtime = monitor_runtime()?;
+        let _entered = runtime.enter();
+        let peer = PeerCloseMonitor::new(stream)?;
+        Ok(Self(runtime.spawn(async move {
+            peer.closed().await;
+            session.peer_disconnected();
+        })))
+    }
+}
+
+impl Drop for PeerDisconnectWatch {
+    fn drop(&mut self) {
+        // Bound descriptor and session-handle ownership to the command loop,
+        // including normal COM_QUIT, task cancellation and unwinding.
+        self.0.abort();
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) struct PeerCloseMonitor {
     closed: tokio::io::unix::AsyncFd<std::os::fd::OwnedFd>,
 }
@@ -50,21 +94,76 @@ impl PeerCloseMonitor {
         .map_err(io::Error::from)?;
         Ok(Self { closed })
     }
+}
 
+#[cfg(target_os = "macos")]
+impl PeerCloseMonitor {
+    pub(crate) fn new(stream: &TcpStream) -> io::Result<Self> {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+        // A private read filter can request a watermark above the socket's
+        // receive capacity without changing the connection's SO_RCVLOWAT.
+        // EOF/errors still wake it even with unread command or TLS bytes.
+        // Ordinary input must not wake a second reactor for every query.
+        // SAFETY: kqueue takes no pointers and returns a fresh owned fd.
+        let raw = unsafe { libc::kqueue() };
+        if raw < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the successful kqueue call transferred this fd to us.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // SAFETY: fd is open, and F_SETFD takes an integer flag argument.
+        if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let event = libc::kevent {
+            ident: stream.as_raw_fd() as _,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: libc::NOTE_LOWAT,
+            data: i32::MAX as _,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: both fds are open, event is initialized and copied by the
+        // kernel, and a zero output count requires no eventlist or timeout.
+        if unsafe {
+            libc::kevent(
+                fd.as_raw_fd(),
+                &event,
+                1,
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null(),
+            )
+        } < 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the private fd stays open and unchanged until AsyncFd
+        // deregisters it on drop; no mutable backing-fd access escapes.
+        let closed = unsafe {
+            tokio::io::unix::AsyncFd::register_with_interest(fd, tokio::io::Interest::READABLE)
+        }
+        .map_err(io::Error::from)?;
+        Ok(Self { closed })
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PeerCloseMonitor {
     pub(crate) async fn closed(&self) {
-        // An epoll fd is readable when its ready list is nonempty. Every
-        // subscribed event terminates this wait, so no event drain/rearm or
-        // timer is needed. Cancelling a pending wait preserves the watch.
+        // The private event queue becomes readable only on closure/error.
+        // No drain/rearm is needed because the first event ends the wait.
         let _ = self.closed.readable().await;
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub(crate) struct PeerCloseMonitor {
     stream: TcpStream,
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 impl PeerCloseMonitor {
     pub(crate) fn new(stream: &TcpStream) -> io::Result<Self> {
         #[cfg(unix)]
@@ -113,7 +212,49 @@ mod tests {
         (client, server)
     }
 
-    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn disconnect_watch_cancels_without_consuming_pipeline_bytes() {
+        let (mut client, mut server) = pair().await;
+        let registry = crate::engine::session_registry::SessionRegistry::new();
+        let session = registry.register(1, "root".into(), "localhost".into(), "test".into());
+        let _watch = PeerDisconnectWatch::new(&server, Arc::clone(&session)).unwrap();
+        client.write_all(b"queued command").await.unwrap();
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), session.notified())
+            .await
+            .unwrap();
+        assert!(session
+            .kill_flag()
+            .load(std::sync::atomic::Ordering::Acquire));
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"queued command");
+    }
+
+    #[tokio::test]
+    async fn dropping_disconnect_watch_stops_the_observer() {
+        let (client, server) = pair().await;
+        let registry = crate::engine::session_registry::SessionRegistry::new();
+        let session = registry.register(1, "root".into(), "localhost".into(), "test".into());
+        let watch = PeerDisconnectWatch::new(&server, Arc::clone(&session)).unwrap();
+        let task = watch.0.abort_handle();
+        drop(watch);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(client);
+        assert!(!session
+            .kill_flag()
+            .load(std::sync::atomic::Ordering::Acquire));
+        // The observer no longer retains the session handle or transport.
+        assert_eq!(Arc::strong_count(&session), 2);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn queued_commands_do_not_wake_the_close_monitor() {
         use std::future::Future;
@@ -198,7 +339,7 @@ mod tests {
             .unwrap();
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[tokio::test]
     async fn reset_is_observed_without_consuming_input() {
         let (client, server) = pair().await;

@@ -2669,10 +2669,9 @@ fn apply_fulltext_needs_score_flags(
     });
 }
 
-/// Substitute select-list alias references in GROUP BY with the aliased
-/// expression, honouring MySQL's resolution order for GROUP BY/HAVING:
-/// the FROM clause is searched *before* the select list (the opposite of
-/// ORDER BY), so an alias that shadows a real column must lose. The
+/// Resolve GROUP BY ordinals, aliases and selected field names. A unique
+/// FROM column takes precedence over an alias. If FROM is ambiguous, a
+/// uniquely selected field can supply the binding instead. The
 /// column check needs schema knowledge, hence the `db` parameter; when
 /// the scope cannot be built (e.g. CTE sources without a catalog
 /// identity) the alias substitution proceeds unconditionally — the
@@ -2683,29 +2682,44 @@ fn apply_fulltext_needs_score_flags(
 /// the `resolve_group_ref_expr` fallback still handles them for
 /// internally-built selects.
 pub(crate) fn resolve_group_by_refs(db: &Database, select: &mut Select) {
+    if select.group_by.is_empty() {
+        return;
+    }
     let aliases = projection_alias_exprs(select);
+    let needs_scope = select.group_by.iter().any(|expr| {
+        let Expr::Identifier(name) = expr else {
+            return false;
+        };
+        select.projection.iter().any(|item| match item {
+            SelectItem::Expr { expr, alias } => alias
+                .as_deref()
+                .or_else(|| expr_column_name(expr))
+                .is_some_and(|output| output.eq_ignore_ascii_case(name)),
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => true,
+        })
+    });
     let has_ordinal = select.group_by.iter().any(|expr| {
         matches!(expr, Expr::Literal(crate::parser::Literal::Int(_)))
             || matches!(expr, Expr::Literal(crate::parser::Literal::UInt(_)))
     });
-    if aliases.is_empty() && !has_ordinal {
+    if aliases.is_empty() && !needs_scope && !has_ordinal {
         return;
     }
-    let projection_exprs: Vec<Expr> = select
-        .projection
-        .iter()
-        .filter_map(|item| match item {
-            SelectItem::Expr { expr, .. } => Some(expr.clone()),
-            _ => None,
-        })
-        .collect();
-    // Build the column scope only when some GROUP BY identifier actually
-    // collides with an alias name — the only case where the FROM-first
-    // precedence question arises. Keeps the common path free of catalog
-    // lookups (validation builds its own scope right after anyway).
-    let needs_scope = select.group_by.iter().any(|expr| {
-        matches!(expr, Expr::Identifier(name) if aliases.contains_key(&name.to_ascii_lowercase()))
-    });
+    let projection_exprs: Vec<Expr> = if has_ordinal {
+        select
+            .projection
+            .iter()
+            .filter_map(|item| match item {
+                SelectItem::Expr { expr, .. } => Some(expr.clone()),
+                _ => None,
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+    // Build the scope only for names present in the SELECT output. Unique
+    // FROM columns retain precedence; ambiguous input names may bind to a
+    // selected field instead.
     let scope = if needs_scope {
         build_column_scope(db, select, None).ok()
     } else {
@@ -2726,7 +2740,15 @@ pub(crate) fn resolve_group_by_refs(db: &Database, select: &mut Select) {
         };
         if let Expr::Identifier(name) = expr {
             if let Some(scope) = &scope {
-                if scope.column_matches(None, name, true) > 0 {
+                let matches = scope.column_matches(None, name, true);
+                if matches > 1 {
+                    if let Some(target) = group_by_selected_column(&select.projection, scope, name)
+                    {
+                        *expr = target;
+                        continue;
+                    }
+                }
+                if matches > 0 {
                     // A visible FROM column wins over a same-named alias.
                     if aliases.contains_key(&name.to_ascii_lowercase()) {
                         // Resolution is intentionally invoked on the
@@ -2766,6 +2788,67 @@ pub(crate) fn resolve_group_by_refs(db: &Database, select: &mut Select) {
             }
         }
     }
+}
+
+/// Find one selected source field, including wildcard expansion. Different
+/// fields sharing an output name remain ambiguous; repeated fields are safe.
+fn group_by_selected_column(
+    projection: &[SelectItem],
+    scope: &ColumnScope<'_>,
+    name: &str,
+) -> Option<Expr> {
+    let mut target: Option<Expr> = None;
+    let mut add = |expr: &Expr| {
+        if target
+            .as_ref()
+            .is_some_and(|old| !expr_semantically_eq(old, expr))
+        {
+            return None;
+        }
+        target.get_or_insert_with(|| expr.clone());
+        Some(())
+    };
+    for item in projection {
+        match item {
+            SelectItem::Expr { expr, alias } => {
+                if alias
+                    .as_deref()
+                    .or_else(|| expr_column_name(expr))
+                    .is_some_and(|output| output.eq_ignore_ascii_case(name))
+                {
+                    if !expr_column_name(expr)
+                        .is_some_and(|column| column.eq_ignore_ascii_case(name))
+                    {
+                        return None;
+                    }
+                    add(expr)?;
+                }
+            }
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
+                for table in scope.tables.iter().filter(|table| {
+                    table.visible
+                        && match item {
+                            SelectItem::QualifiedWildcard(qualifier) => {
+                                table.matches_name(qualifier)
+                            }
+                            _ => true,
+                        }
+                }) {
+                    if table
+                        .wildcard_columns
+                        .iter()
+                        .any(|column| column.eq_ignore_ascii_case(name))
+                    {
+                        add(&Expr::CompoundIdentifier(vec![
+                            table.alias.as_ref().unwrap_or(&table.name).clone(),
+                            name.to_owned(),
+                        ]))?;
+                    }
+                }
+            }
+        }
+    }
+    target
 }
 
 fn integer_affine_group_offset(expr: &Expr, base: &str) -> Option<i128> {
@@ -5045,6 +5128,14 @@ fn validate_select_in_column_scope(
         }
     }
     for expr in &select.group_by {
+        if let Expr::Identifier(name) = expr {
+            if scope.column_matches(None, name, true) > 1 {
+                if let Some(target) = group_by_selected_column(&select.projection, scope, name) {
+                    validate_expr_columns(db, &target, scope, None, true)?;
+                    continue;
+                }
+            }
+        }
         // Nested/derived query blocks can be validated while their parent
         // scope is being built, before the child reaches
         // `prepare_select_for_planning` and has `GROUP BY <select-alias>`

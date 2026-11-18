@@ -50,6 +50,8 @@ use crate::storage::error;
 use crate::types::{Column, QueryError};
 use crate::util::logging::log_message;
 
+#[cfg(test)]
+mod disconnect_tests;
 mod routine_results;
 pub(crate) mod tls_names;
 
@@ -1626,20 +1628,20 @@ where
     }
 
     async fn command_loop_with_disconnect(&mut self) -> io::Result<()> {
-        let peer = self.stream.peer_monitor()?;
-        let handle = self.handle.as_ref().map(Arc::clone);
-        let commands = self.command_loop();
-        tokio::pin!(commands);
-        tokio::select! {
-            biased;
-            result = &mut commands => result,
-            _ = peer.closed() => {
-                if let Some(handle) = handle { handle.peer_disconnected(); }
-                // Retain ownership of the in-flight context until cooperative
-                // cancellation completes; ordinary teardown then rolls back.
-                commands.await
-            }
-        }
+        let _peer = self
+            .handle
+            .as_ref()
+            .map(|handle| {
+                super::peer_monitor::PeerDisconnectWatch::new(
+                    self.stream.tcp_stream()?,
+                    Arc::clone(handle),
+                )
+            })
+            .transpose()?;
+        // The independent observer sets the normal connection-cancel flag.
+        // Retain the executing context until cooperative cancellation returns;
+        // ordinary teardown then rolls back and releases its locks.
+        self.command_loop().await
     }
 
     async fn run_init_connect(&mut self) -> Result<(), QueryError> {
@@ -9860,20 +9862,17 @@ enum MysqlStream {
 }
 
 impl MysqlStream {
-    /// Observe transport closure without consuming pipelined commands or TLS
-    /// records. Linux subscribes to closure separately from readable input.
-    fn peer_monitor(&self) -> io::Result<super::peer_monitor::PeerCloseMonitor> {
-        let stream = match self {
-            Self::Plain(stream) => stream.get_ref(),
-            Self::Tls(stream) => stream.get_ref().0.get_ref(),
-            Self::Upgrading => {
-                return Err(io::Error::new(
-                    io::ErrorKind::NotConnected,
-                    "TLS upgrade in progress",
-                ))
-            }
-        };
-        super::peer_monitor::PeerCloseMonitor::new(stream)
+    /// Share the underlying transport without consuming buffered commands or
+    /// TLS records. The peer observer only watches closure/error readiness.
+    fn tcp_stream(&self) -> io::Result<&TcpStream> {
+        match self {
+            Self::Plain(stream) => Ok(stream.get_ref()),
+            Self::Tls(stream) => Ok(stream.get_ref().0.get_ref()),
+            Self::Upgrading => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "TLS upgrade in progress",
+            )),
+        }
     }
 }
 
@@ -10869,7 +10868,8 @@ mod tests {
             .unwrap();
         let (server, _) = listener.accept().await.unwrap();
         let mut stream = MysqlStream::Plain(BufReader::new(server));
-        let peer = stream.peer_monitor().unwrap();
+        let peer = super::super::peer_monitor::PeerCloseMonitor::new(stream.tcp_stream().unwrap())
+            .unwrap();
         client.write_all(b"queued command").await.unwrap();
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(75), peer.closed())
