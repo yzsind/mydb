@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, RwLock};
 use std::time::Duration;
 
@@ -10,6 +10,7 @@ use chrono::{Local, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::engine::api::{QueryResponse, SessionContext};
+use crate::engine::sysvar::SysVarValue;
 use crate::storage::error;
 use crate::types::{QueryError, Value};
 
@@ -136,11 +137,27 @@ pub struct SqlLogConfig {
     pub slow_query_log_file: PathBuf,
     pub error_log_file: PathBuf,
     pub long_query_time: Duration,
+    /// The configured value read by SQL before conversion to the log threshold.
+    long_query_time_seconds: f64,
     pub min_examined_row_limit: u64,
     pub log_slow_admin_statements: bool,
     pub log_queries_not_using_indexes: bool,
     pub log_timestamps: LogTimestampMode,
     pub log_error_verbosity: u8,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionSlowLogConfig {
+    pub(crate) long_query_time_seconds: f64,
+    long_query_time: Duration,
+    pub(crate) min_examined_row_limit: u64,
+}
+
+impl SessionSlowLogConfig {
+    pub(crate) fn set_long_query_time(&mut self, seconds: f64) {
+        self.long_query_time_seconds = seconds;
+        self.long_query_time = seconds_duration(seconds);
+    }
 }
 
 impl SqlLogConfig {
@@ -155,10 +172,18 @@ impl SqlLogConfig {
             .ok()
             .and_then(|raw| LogOutput::parse(&raw).ok())
             .unwrap_or_default();
-        let long_query_time = env_value("MYDB_LONG_QUERY_TIME")
+        let (long_query_time, long_query_time_seconds) = env_value("MYDB_LONG_QUERY_TIME")
             .ok()
-            .and_then(|raw| parse_seconds_duration(&raw).ok())
-            .unwrap_or(query_log.slow_sql_threshold);
+            .and_then(|raw| parse_seconds(&raw).ok())
+            .map_or_else(
+                || {
+                    (
+                        query_log.slow_sql_threshold,
+                        query_log.slow_sql_threshold.as_secs_f64(),
+                    )
+                },
+                |seconds| (seconds_duration(seconds), seconds),
+            );
         let min_examined_row_limit = env_value("MYDB_MIN_EXAMINED_ROW_LIMIT")
             .ok()
             .and_then(|raw| raw.parse().ok())
@@ -190,6 +215,7 @@ impl SqlLogConfig {
                 .map(PathBuf::from)
                 .unwrap_or(default_error),
             long_query_time,
+            long_query_time_seconds,
             min_examined_row_limit,
             log_slow_admin_statements: env_bool("MYDB_LOG_SLOW_ADMIN_STATEMENTS").unwrap_or(false),
             log_queries_not_using_indexes: env_bool("MYDB_LOG_QUERIES_NOT_USING_INDEXES")
@@ -216,7 +242,6 @@ pub struct SqlLogService {
     general_on: AtomicBool,
     slow_on: AtomicBool,
     output_bits: AtomicU32,
-    long_query_micros: AtomicU64,
 }
 
 #[derive(Debug)]
@@ -296,7 +321,6 @@ impl SqlLogService {
             general_on: AtomicBool::new(config.general_log),
             slow_on: AtomicBool::new(config.slow_query_log),
             output_bits: AtomicU32::new(config.log_output.0 as u32),
-            long_query_micros: AtomicU64::new(duration_to_micros(config.long_query_time)),
             config: RwLock::new(config),
             files: Mutex::new(files),
         });
@@ -346,11 +370,9 @@ impl SqlLogService {
                 *config = candidate;
             }
             "long_query_time" => {
-                config.long_query_time = parse_seconds_duration(raw)?;
-                self.long_query_micros.store(
-                    duration_to_micros(config.long_query_time),
-                    Ordering::Release,
-                );
+                let seconds = parse_seconds(raw)?;
+                config.long_query_time_seconds = seconds;
+                config.long_query_time = seconds_duration(seconds);
             }
             "min_examined_row_limit" => {
                 config.min_examined_row_limit = raw.parse::<u64>().map_err(|_| {
@@ -471,8 +493,8 @@ impl SqlLogService {
         metadata: QueryLogMetadata,
         result: &Result<QueryResponse, QueryError>,
     ) {
-        let threshold = Duration::from_micros(self.long_query_micros.load(Ordering::Acquire));
-        if elapsed < threshold {
+        let slow_log = session.sysvars.slow_log;
+        if elapsed < slow_log.long_query_time {
             return;
         }
         // `Slow_queries` counts every statement over `long_query_time`,
@@ -487,7 +509,6 @@ impl SqlLogService {
         if output == LogOutput::NONE {
             return;
         }
-        let config = self.config_snapshot();
         let rows_sent = response_rows_sent(result);
         // P1-D3: prefer the per-statement counter populated by storage
         // scans; fall back to rows_sent when the statement never went
@@ -497,9 +518,10 @@ impl SqlLogService {
         // practice but keeps the log monotonic vs. what the client
         // observed).
         let rows_examined = metadata.rows_examined.max(rows_sent);
-        if rows_examined < config.min_examined_row_limit {
+        if rows_examined < slow_log.min_examined_row_limit {
             return;
         }
+        let config = self.config_snapshot();
         let sql_text = redact_sql_for_log(sql.trim());
         let row = SlowLogRow {
             start_time: now_ts6(config.log_timestamps),
@@ -618,6 +640,24 @@ pub fn active_service() -> Option<Arc<SqlLogService>> {
         .and_then(|guard| guard.clone())
 }
 
+pub(crate) fn session_slow_log_defaults() -> SessionSlowLogConfig {
+    if let Some(service) = active_service() {
+        if let Ok(config) = service.config.read() {
+            return SessionSlowLogConfig {
+                long_query_time_seconds: config.long_query_time_seconds,
+                long_query_time: config.long_query_time,
+                min_examined_row_limit: config.min_examined_row_limit,
+            };
+        }
+    }
+    let threshold = QueryLogConfig::default().slow_sql_threshold;
+    SessionSlowLogConfig {
+        long_query_time_seconds: threshold.as_secs_f64(),
+        long_query_time: threshold,
+        min_examined_row_limit: 0,
+    }
+}
+
 pub fn register_active(service: Arc<SqlLogService>) {
     if let Ok(mut guard) = active_service_cell().write() {
         *guard = Some(service);
@@ -633,17 +673,19 @@ pub fn set_global_variable(name: &str, raw: &str) -> Result<bool, QueryError> {
 
 /// Defaults are independent of the active configuration. Only filesystem
 /// location depends on the service, which may open after registry creation.
-pub(crate) fn compiled_variable_default(name: &str) -> String {
-    match name {
+pub(crate) fn compiled_variable_default(name: &str) -> SysVarValue {
+    SysVarValue::String(match name {
         "general_log" | "log_slow_admin_statements" | "log_queries_not_using_indexes" => {
-            "OFF".into()
+            return SysVarValue::Bool(false);
         }
-        "slow_query_log" => "ON".into(),
+        "slow_query_log" => return SysVarValue::Bool(true),
         "log_output" => LogOutput::default().as_mysql_value().into(),
-        "long_query_time" => duration_secs(QueryLogConfig::default().slow_sql_threshold),
-        "min_examined_row_limit" => "0".into(),
+        "long_query_time" => {
+            return SysVarValue::Double(QueryLogConfig::default().slow_sql_threshold.as_secs_f64());
+        }
+        "min_examined_row_limit" => return SysVarValue::UInt(0),
         "log_timestamps" => "SYSTEM".into(),
-        "log_error_verbosity" => "2".into(),
+        "log_error_verbosity" => return SysVarValue::UInt(2),
         "log_error_services" => "log_filter_internal; log_sink_internal".into(),
         "general_log_file" | "slow_query_log_file" | "log_error" => {
             let file = match name {
@@ -658,53 +700,49 @@ pub(crate) fn compiled_variable_default(name: &str) -> String {
                 .to_string()
         }
         _ => unreachable!("unregistered logging variable"),
-    }
+    })
 }
 
-pub fn variables_snapshot() -> Vec<(&'static str, String)> {
+pub(crate) fn variable_value(name: &str) -> SysVarValue {
     let Some(service) = active_service() else {
-        return Vec::new();
+        return match name {
+            "general_log"
+            | "slow_query_log"
+            | "log_slow_admin_statements"
+            | "log_queries_not_using_indexes"
+            | "long_query_time"
+            | "min_examined_row_limit"
+            | "log_error_verbosity" => compiled_variable_default(name),
+            _ => SysVarValue::String(String::new()),
+        };
     };
-    let config = service.config_snapshot();
-    vec![
-        ("general_log", on_off(config.general_log).to_string()),
-        (
-            "general_log_file",
-            config.general_log_file.display().to_string(),
-        ),
-        ("log_output", config.log_output.as_mysql_value().to_string()),
-        ("slow_query_log", on_off(config.slow_query_log).to_string()),
-        (
-            "slow_query_log_file",
-            config.slow_query_log_file.display().to_string(),
-        ),
-        ("long_query_time", duration_secs(config.long_query_time)),
-        (
-            "min_examined_row_limit",
-            config.min_examined_row_limit.to_string(),
-        ),
-        (
-            "log_slow_admin_statements",
-            on_off(config.log_slow_admin_statements).to_string(),
-        ),
-        (
-            "log_queries_not_using_indexes",
-            on_off(config.log_queries_not_using_indexes).to_string(),
-        ),
-        (
-            "log_timestamps",
-            config.log_timestamps.as_mysql_value().to_string(),
-        ),
-        ("log_error", config.error_log_file.display().to_string()),
-        (
-            "log_error_verbosity",
-            config.log_error_verbosity.to_string(),
-        ),
-        (
-            "log_error_services",
-            "log_filter_internal; log_sink_internal".to_string(),
-        ),
-    ]
+    let fallback;
+    let guard = service.config.read();
+    let config = match &guard {
+        Ok(config) => &**config,
+        Err(_) => {
+            fallback = SqlLogConfig::from_env(&service.data_dir, &QueryLogConfig::default());
+            &fallback
+        }
+    };
+    SysVarValue::String(match name {
+        "general_log" => return SysVarValue::Bool(config.general_log),
+        "general_log_file" => config.general_log_file.display().to_string(),
+        "log_output" => config.log_output.as_mysql_value().into(),
+        "slow_query_log" => return SysVarValue::Bool(config.slow_query_log),
+        "slow_query_log_file" => config.slow_query_log_file.display().to_string(),
+        "long_query_time" => return SysVarValue::Double(config.long_query_time_seconds),
+        "min_examined_row_limit" => return SysVarValue::UInt(config.min_examined_row_limit),
+        "log_slow_admin_statements" => return SysVarValue::Bool(config.log_slow_admin_statements),
+        "log_queries_not_using_indexes" => {
+            return SysVarValue::Bool(config.log_queries_not_using_indexes);
+        }
+        "log_timestamps" => config.log_timestamps.as_mysql_value().into(),
+        "log_error" => config.error_log_file.display().to_string(),
+        "log_error_verbosity" => return SysVarValue::UInt(config.log_error_verbosity.into()),
+        "log_error_services" => "log_filter_internal; log_sink_internal".into(),
+        _ => unreachable!("unregistered logging variable"),
+    })
 }
 
 pub fn record_error_log_line(prio: &str, subsystem: &str, data: &str) {
@@ -928,7 +966,7 @@ fn parse_bool(raw: &str) -> Result<bool, QueryError> {
     })
 }
 
-fn parse_seconds_duration(raw: &str) -> Result<Duration, QueryError> {
+fn parse_seconds(raw: &str) -> Result<f64, QueryError> {
     let seconds = raw.trim().parse::<f64>().map_err(|_| {
         error(
             crate::error::catalog::ER_WRONG_TYPE_FOR_VAR,
@@ -941,11 +979,11 @@ fn parse_seconds_duration(raw: &str) -> Result<Duration, QueryError> {
             format!("incorrect duration value: '{raw}'"),
         ));
     }
-    Ok(Duration::from_micros((seconds * 1_000_000.0) as u64))
+    Ok(seconds)
 }
 
-fn duration_to_micros(value: Duration) -> u64 {
-    value.as_micros().min(u64::MAX as u128) as u64
+fn seconds_duration(seconds: f64) -> Duration {
+    Duration::from_micros((seconds * 1_000_000.0) as u64)
 }
 
 fn now_ts6(mode: LogTimestampMode) -> String {
@@ -1056,14 +1094,6 @@ fn duration_secs(value: Duration) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_string()
-}
-
-fn on_off(value: bool) -> &'static str {
-    if value {
-        "ON"
-    } else {
-        "OFF"
-    }
 }
 
 fn io_err(err: std::io::Error) -> QueryError {

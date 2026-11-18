@@ -572,7 +572,7 @@ fn innodb_lock_wait_timeout_round_trips_session_and_global() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(result.rows, vec![vec![Value::String("7".into())]]);
+    assert_eq!(result.rows, vec![vec![Value::UInt(7)]]);
 
     // lock_wait_timeout (MDL) is also a real, settable sysvar.
     engine

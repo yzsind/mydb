@@ -65,7 +65,7 @@ fn innodb_strict_mode_is_session_writable_and_warns() {
 
     assert_eq!(
         select_one(&engine, &mut session, "SELECT @@session.innodb_strict_mode",),
-        Value::String("0".to_string())
+        Value::Int(0)
     );
 
     let other_session = SessionContext::default();
@@ -117,7 +117,7 @@ fn set_persist_only_skips_runtime_write() {
     let live = select_one(&engine, &mut session, "SELECT @@foreign_key_checks");
     assert_eq!(
         live,
-        Value::String("1".to_string()),
+        Value::Int(1),
         "PERSIST_ONLY must not touch the runtime value"
     );
 
@@ -375,12 +375,12 @@ fn sql_log_bin_is_registered_and_round_trips() {
 
     // Defaults ON in MySQL.
     let v = select_one(&engine, &mut session, "SELECT @@sql_log_bin");
-    assert_eq!(v, Value::String("1".to_string()));
+    assert_eq!(v, Value::Int(1));
 
     // Toggle and read back.
     exec(&engine, &mut session, "SET SESSION sql_log_bin = 0").unwrap();
     let v = select_one(&engine, &mut session, "SELECT @@sql_log_bin");
-    assert_eq!(v, Value::String("0".to_string()));
+    assert_eq!(v, Value::Int(0));
     assert!(!session.sql_log_bin, "session field must reflect SET");
 
     // sql_log_bin has no global default; reject an ineffective GLOBAL write.

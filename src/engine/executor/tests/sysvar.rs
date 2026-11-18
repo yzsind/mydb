@@ -7,14 +7,95 @@ use crate::engine::api::SessionContext;
 use crate::types::Value;
 
 #[test]
+fn system_variable_result_types_match_prepare_and_keep_show_text() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for name in [
+        "binlog_transaction_compression",
+        "general_log",
+        "innodb_adaptive_hash_index",
+        "innodb_file_per_table",
+        "innodb_force_load_corrupted",
+        "innodb_log_compressed_pages",
+        "innodb_log_writer_threads",
+        "innodb_print_all_deadlocks",
+        "innodb_rollback_on_timeout",
+        "innodb_stats_on_metadata",
+        "innodb_status_output",
+        "innodb_status_output_locks",
+        "innodb_table_locks",
+        "innodb_undo_log_truncate",
+        "log_bin",
+        "log_queries_not_using_indexes",
+        "log_replica_updates",
+        "log_slow_admin_statements",
+        "source_verify_checksum",
+    ] {
+        let sql = format!("SELECT @@global.{name}");
+        let columns = engine
+            .describe_prepared_statement(&mut session, &sql)
+            .unwrap();
+        assert_eq!(columns[0].column_type, ColumnType::LongLong, "{name}");
+        assert_eq!(columns[0].source.length, Some(1), "{name}");
+        let QueryResponse::ResultSet(result) =
+            engine.execute_with_session(&mut session, &sql).unwrap()
+        else {
+            panic!("expected a result set for {name}");
+        };
+        assert_eq!(result.columns, columns, "{name}");
+        let setting = match result.rows[0][0] {
+            Value::Int(0) => "OFF",
+            Value::Int(1) => "ON",
+            ref value => panic!("expected a numeric switch for {name}, got {value:?}"),
+        };
+        assert_eq!(
+            one_row(
+                &engine,
+                &mut session,
+                &format!("SHOW GLOBAL VARIABLES LIKE '{name}'")
+            ),
+            vec![Value::String(name.into()), Value::String(setting.into())]
+        );
+    }
+
+    engine
+        .execute_with_session(&mut session, "SET SESSION timestamp=123.12345678")
+        .unwrap();
+    let sql = "SELECT @@session.autocommit, @@session.sql_select_limit, @@session.timestamp, @@global.log_output";
+    let prepared = engine
+        .describe_prepared_statement(&mut session, sql)
+        .unwrap();
+    let QueryResponse::ResultSet(result) = engine.execute_with_session(&mut session, sql).unwrap()
+    else {
+        panic!("expected a result set");
+    };
+    assert_eq!(result.columns, prepared);
+    assert_ne!(
+        result.columns[1].source.flags & crate::mysql::protocol::UNSIGNED_FLAG,
+        0
+    );
+    assert_eq!(result.columns[2].source.decimals, Some(6));
+    assert!(matches!(
+        &result.rows[0][..],
+        [
+            Value::Int(1),
+            Value::UInt(u64::MAX),
+            Value::Double(123.12345678),
+            Value::String(_)
+        ]
+    ));
+}
+
+#[test]
 fn deadlock_detect_global_alias_scope_and_validation() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let engine = open_test_engine(dir.path());
     let mut admin = SessionContext::default();
     let mut existing = SessionContext::default();
     let query = "SELECT @@global.innodb_deadlock_detect, @@mydb_deadlock_detect";
-    let enabled = vec![Value::String("1".into()), Value::String("1".into())];
-    let disabled = vec![Value::String("0".into()), Value::String("0".into())];
+    let enabled = vec![Value::Int(1), Value::Int(1)];
+    let disabled = vec![Value::Int(0), Value::Int(0)];
     assert_eq!(one_row(&engine, &mut existing, query), enabled);
     engine
         .execute_with_session(&mut admin, "SET GLOBAL mydb_deadlock_detect=OFF")
@@ -431,7 +512,7 @@ fn mydb_redo_enabled_scope_inheritance_and_transaction_freeze() {
 
     assert_eq!(
         one_row(&engine, &mut existing, "SELECT @@session.mydb_redo_enabled")[0],
-        Value::String("1".to_string())
+        Value::Int(1)
     );
     engine
         .execute_with_session(&mut existing, "SET GLOBAL mydb_redo_enabled=OFF")
@@ -439,7 +520,7 @@ fn mydb_redo_enabled_scope_inheritance_and_transaction_freeze() {
     // GLOBAL is a connection default; it must not mutate existing sessions.
     assert_eq!(
         one_row(&engine, &mut existing, "SELECT @@session.mydb_redo_enabled")[0],
-        Value::String("1".to_string())
+        Value::Int(1)
     );
     let mut inherited = SessionContext::default();
     assert!(!inherited.redo_enabled);
@@ -1045,7 +1126,7 @@ fn default_table_encryption_compatibility_probe_returns_false() {
     ] {
         assert_eq!(
             one_row(&engine, &mut session, sql),
-            vec![Value::String("0".to_string())],
+            vec![Value::Int(0)],
             "{sql} should report disabled"
         );
     }
@@ -1071,11 +1152,78 @@ fn unknown_variable_in_strict_mode_returns_1193() {
 }
 
 #[test]
+fn scope_defaults_are_inherited_by_new_sessions_and_reset_from_global() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut existing = SessionContext::default();
+    let sql = "SELECT @@sql_log_off, @@session.max_delayed_threads, @@updatable_views_with_limit";
+    let initial = vec![Value::Int(0), Value::UInt(20), Value::String("YES".into())];
+    assert_eq!(one_row(&engine, &mut existing, sql), initial);
+    engine.execute_with_session(
+        &mut existing,
+        "SET GLOBAL sql_log_off=ON, GLOBAL max_delayed_threads=21, GLOBAL updatable_views_with_limit='NO'",
+    ).unwrap();
+    let mut new_session = SessionContext::default();
+    assert_eq!(one_row(&engine, &mut existing, sql), initial);
+    let inherited = vec![Value::Int(1), Value::UInt(21), Value::String("NO".into())];
+    assert_eq!(one_row(&engine, &mut new_session, sql), inherited);
+    let err = engine
+        .execute_with_session(&mut existing, "SET max_delayed_threads=20")
+        .unwrap_err();
+    assert_eq!(err.code(), 1231);
+
+    engine.execute_with_session(
+        &mut existing,
+        "SET SESSION sql_log_off=DEFAULT, max_delayed_threads=DEFAULT, SESSION updatable_views_with_limit=DEFAULT",
+    ).unwrap();
+    assert_eq!(one_row(&engine, &mut existing, sql), inherited);
+    engine
+        .execute_with_session(
+            &mut existing,
+            "SET @@LOCAL.show_create_table_skip_secondary_engine=ON",
+        )
+        .unwrap();
+    let sql = "SELECT @@show_create_table_skip_secondary_engine";
+    assert_eq!(one_row(&engine, &mut existing, sql), vec![Value::Int(1)]);
+    assert_eq!(one_row(&engine, &mut new_session, sql), vec![Value::Int(0)]);
+
+    engine
+        .execute_with_session(
+            &mut existing,
+            "SET GLOBAL default_collation_for_utf8mb4='utf8mb4_general_ci'",
+        )
+        .unwrap();
+    let mut inherited_collation = SessionContext::default();
+    let sql = "SELECT @@session.default_collation_for_utf8mb4";
+    assert_eq!(
+        one_row(&engine, &mut inherited_collation, sql),
+        vec![Value::String("utf8mb4_general_ci".into()),]
+    );
+    engine
+        .execute_with_session(&mut inherited_collation, "SET NAMES utf8mb4")
+        .unwrap();
+    assert_eq!(
+        inherited_collation.collation_connection,
+        "utf8mb4_general_ci"
+    );
+    engine
+        .execute_with_session(
+            &mut inherited_collation,
+            "SET SESSION default_collation_for_utf8mb4=DEFAULT",
+        )
+        .unwrap();
+    assert_eq!(
+        one_row(&engine, &mut inherited_collation, sql),
+        vec![Value::String("utf8mb4_0900_ai_ci".into()),]
+    );
+}
+
+#[test]
 fn set_global_on_session_only_var_returns_1228() {
     let mut s = SessionContext::default();
     let err = crate::engine::sysvar::registry()
         .write(
-            "sql_log_off",
+            "show_create_table_skip_secondary_engine",
             crate::engine::sysvar::SetScope::Global,
             &mut s,
             None,
@@ -1155,7 +1303,7 @@ fn innodb_stub_variables_round_trip() {
         .execute_with_session(&mut s, "SET GLOBAL innodb_buffer_pool_size = 268435456")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.innodb_buffer_pool_size");
-    assert_eq!(row[0], Value::String("268435456".to_string()));
+    assert_eq!(row[0], Value::Int(268435456));
     let row = one_row(&engine, &mut s, "SELECT @@innodb_version");
     assert_eq!(row[0], Value::String("8.0.0".to_string()));
 }
@@ -1192,11 +1340,7 @@ fn mydb_lob_inline_max_runtime_tunable_changes_externalization() {
 
     // Default inline_max=4096 keeps a 2000B value inline without externalization.
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_inline_max");
-    assert_eq!(
-        row[0],
-        Value::String("4096".to_string()),
-        "The default must be 4096"
-    );
+    assert_eq!(row[0], Value::UInt(4096), "The default must be 4096");
     let ext0 = lob_status_metric(&engine, "dml_lob_chains_externalized");
     engine
         .execute_with_session(&mut s, "INSERT INTO t VALUES (1, REPEAT('x', 2000))")
@@ -1212,11 +1356,7 @@ fn mydb_lob_inline_max_runtime_tunable_changes_externalization() {
         .execute_with_session(&mut s, "SET GLOBAL mydb_lob_inline_max = 1024")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_inline_max");
-    assert_eq!(
-        row[0],
-        Value::String("1024".to_string()),
-        "SET must expose the new value"
-    );
+    assert_eq!(row[0], Value::UInt(1024), "SET must expose the new value");
     // SHOW VARIABLES must reflect the change too.
     let QueryResponse::ResultSet(vars) = engine
         .execute_with_session(&mut s, "SHOW VARIABLES LIKE 'mydb_lob_inline_max'")
@@ -1274,21 +1414,13 @@ fn mydb_lob_compression_runtime_tunable() {
     let mut s = SessionContext::default();
     // Default off is zero.
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_compression");
-    assert_eq!(
-        row[0],
-        Value::String("0".to_string()),
-        "Compression defaults to off=0"
-    );
+    assert_eq!(row[0], Value::UInt(0), "Compression defaults to off=0");
     // Enable at runtime with 1 for LZ4.
     engine
         .execute_with_session(&mut s, "SET GLOBAL mydb_lob_compression = 1")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_lob_compression");
-    assert_eq!(
-        row[0],
-        Value::String("1".to_string()),
-        "The value must be 1 after SET"
-    );
+    assert_eq!(row[0], Value::UInt(1), "The value must be 1 after SET");
     // Compressible large LOBs written after enabling must round-trip transparently byte-for-byte.
     engine
         .execute_with_session(&mut s, "CREATE TABLE c (id INT PRIMARY KEY, b LONGBLOB)")
@@ -1324,7 +1456,7 @@ fn mydb_lob_other_knobs_round_trip() {
         let row = one_row(&engine, &mut s, &format!("SELECT @@global.{var}"));
         assert_eq!(
             row[0],
-            Value::String(val.to_string()),
+            Value::UInt(val.parse().unwrap()),
             "{var} SET/@@global must round-trip {val}"
         );
     }
@@ -1349,14 +1481,14 @@ fn mydb_group_commit_knobs_round_trip() {
         .execute_with_session(&mut s, "SET GLOBAL mydb_group_commit_us = 250")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_group_commit_us");
-    assert_eq!(row[0], Value::String("250".to_string()));
+    assert_eq!(row[0], Value::UInt(250));
 
     // Zero means natural batching and is valid.
     engine
         .execute_with_session(&mut s, "SET GLOBAL mydb_group_commit_us = 0")
         .unwrap();
     let row = one_row(&engine, &mut s, "SELECT @@global.mydb_group_commit_us");
-    assert_eq!(row[0], Value::String("0".to_string()));
+    assert_eq!(row[0], Value::UInt(0));
 
     engine
         .execute_with_session(&mut s, "SET GLOBAL mydb_group_commit_adaptive = 1")
@@ -1366,7 +1498,7 @@ fn mydb_group_commit_knobs_round_trip() {
         &mut s,
         "SELECT @@global.mydb_group_commit_adaptive",
     );
-    assert_eq!(row[0], Value::String("1".to_string()));
+    assert_eq!(row[0], Value::UInt(1));
 
     // Boolean value 2 must be rejected.
     let err = engine
@@ -1612,9 +1744,9 @@ fn show_gipk_in_create_table_and_information_schema_compatibility() {
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
     let name = "show_gipk_in_create_table_and_information_schema";
-    let value = |s: &str| vec![Value::String(s.into())];
+    let value = |flag| vec![Value::Int(flag)];
     let read = format!("SELECT @@{name}");
-    assert_eq!(one_row(&engine, &mut session, &read), value("1"));
+    assert_eq!(one_row(&engine, &mut session, &read), value(1));
     assert_eq!(
         one_row(
             &engine,
@@ -1657,10 +1789,10 @@ fn show_gipk_in_create_table_and_information_schema_compatibility() {
             assert_eq!(on.rows, off.rows, "{sql}");
         }
     }
-    assert_eq!(one_row(&engine, &mut session, &read), value("0"));
+    assert_eq!(one_row(&engine, &mut session, &read), value(0));
     assert_eq!(
         one_row(&engine, &mut session, &format!("SELECT @@global.{name}")),
-        value("1")
+        value(1)
     );
     assert_eq!(
         one_row(
@@ -1677,7 +1809,7 @@ fn show_gipk_in_create_table_and_information_schema_compatibility() {
         let enabled = matches!(raw, "ON" | "1" | "TRUE" | "'on'");
         assert_eq!(
             one_row(&engine, &mut session, &read),
-            value(if enabled { "1" } else { "0" })
+            value(i64::from(enabled))
         );
     }
     for (raw, code) in [
@@ -1691,7 +1823,7 @@ fn show_gipk_in_create_table_and_information_schema_compatibility() {
             .execute_with_session(&mut session, &format!("SET {name}={raw}"))
             .unwrap_err();
         assert_eq!(err.code(), code, "{raw}");
-        assert_eq!(one_row(&engine, &mut session, &read), value("0"));
+        assert_eq!(one_row(&engine, &mut session, &read), value(0));
     }
 
     let mut existing = SessionContext::default();
@@ -1699,32 +1831,32 @@ fn show_gipk_in_create_table_and_information_schema_compatibility() {
         .execute_with_session(&mut session, &format!("SET GLOBAL {name}=OFF"))
         .unwrap();
     let mut inherited = SessionContext::default();
-    assert_eq!(one_row(&engine, &mut existing, &read), value("1"));
-    assert_eq!(one_row(&engine, &mut inherited, &read), value("0"));
+    assert_eq!(one_row(&engine, &mut existing, &read), value(1));
+    assert_eq!(one_row(&engine, &mut inherited, &read), value(0));
     engine
         .execute_with_session(&mut existing, &format!("SET SESSION {name}=DEFAULT"))
         .unwrap();
-    assert_eq!(one_row(&engine, &mut existing, &read), value("0"));
+    assert_eq!(one_row(&engine, &mut existing, &read), value(0));
 
     engine
         .execute_with_session(&mut session, &format!("SET PERSIST_ONLY {name}=ON"))
         .unwrap();
     assert_eq!(
         one_row(&engine, &mut session, &format!("SELECT @@global.{name}")),
-        value("0")
+        value(0)
     );
-    assert_eq!(one_row(&engine, &mut session, &format!("SELECT VARIABLE_VALUE FROM performance_schema.persisted_variables WHERE VARIABLE_NAME='{name}'")), value("ON"));
+    assert_eq!(one_row(&engine, &mut session, &format!("SELECT VARIABLE_VALUE FROM performance_schema.persisted_variables WHERE VARIABLE_NAME='{name}'")), vec![Value::String("ON".into())]);
     crate::engine::sysvar::registry::apply_persisted_on_startup(engine.database());
     assert_eq!(
         one_row(&engine, &mut session, &format!("SELECT @@global.{name}")),
-        value("1")
+        value(1)
     );
-    assert_eq!(one_row(&engine, &mut session, &read), value("0"));
+    assert_eq!(one_row(&engine, &mut session, &read), value(0));
     engine
         .execute_with_session(&mut session, &format!("SET PERSIST {name}=OFF"))
         .unwrap();
-    assert_eq!(one_row(&engine, &mut session, &format!("SELECT VARIABLE_VALUE FROM information_schema.global_variables WHERE VARIABLE_NAME='{name}'")), value("OFF"));
-    assert_eq!(one_row(&engine, &mut existing, &format!("SELECT VARIABLE_VALUE FROM information_schema.session_variables WHERE VARIABLE_NAME='{name}'")), value("OFF"));
+    assert_eq!(one_row(&engine, &mut session, &format!("SELECT VARIABLE_VALUE FROM information_schema.global_variables WHERE VARIABLE_NAME='{name}'")), vec![Value::String("OFF".into())]);
+    assert_eq!(one_row(&engine, &mut existing, &format!("SELECT VARIABLE_VALUE FROM information_schema.session_variables WHERE VARIABLE_NAME='{name}'")), vec![Value::String("OFF".into())]);
     engine
         .execute_with_session(&mut session, &format!("RESET PERSIST {name}"))
         .unwrap();
@@ -1742,7 +1874,7 @@ fn show_gipk_in_create_table_and_information_schema_compatibility() {
     engine
         .execute_with_session(&mut session, &format!("SET {name}=DEFAULT"))
         .unwrap();
-    assert_eq!(one_row(&engine, &mut session, &read), value("1"));
+    assert_eq!(one_row(&engine, &mut session, &read), value(1));
 }
 
 #[test]
@@ -1758,7 +1890,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut session,
             "SELECT @@information_schema_stats_expiry"
         ),
-        value("86400")
+        vec![Value::UInt(86400)]
     );
     engine
         .execute_with_session(
@@ -1772,7 +1904,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut session,
             "SELECT @@session.information_schema_stats_expiry"
         ),
-        value("0")
+        vec![Value::UInt(0)]
     );
     assert_eq!(
         one_row(
@@ -1780,7 +1912,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut session,
             "SELECT @@global.information_schema_stats_expiry"
         ),
-        value("86400")
+        vec![Value::UInt(86400)]
     );
     assert_eq!(
         one_row(
@@ -1800,7 +1932,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut other,
             "SELECT @@information_schema_stats_expiry"
         ),
-        value("86400")
+        vec![Value::UInt(86400)]
     );
     engine
         .execute_with_session(
@@ -1815,7 +1947,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut inherited,
             "SELECT @@information_schema_stats_expiry"
         ),
-        value("31536000")
+        vec![Value::UInt(31536000)]
     );
     assert_eq!(
         one_row(
@@ -1823,7 +1955,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut other,
             "SELECT @@information_schema_stats_expiry"
         ),
-        value("86400")
+        vec![Value::UInt(86400)]
     );
     engine
         .execute_with_session(
@@ -1837,7 +1969,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut session,
             "SELECT @@information_schema_stats_expiry"
         ),
-        value("31536000")
+        vec![Value::UInt(31536000)]
     );
     for (raw, code) in [
         ("-1", 1231),
@@ -1859,7 +1991,7 @@ fn information_schema_stats_expiry_compatibility() {
                 &mut session,
                 "SELECT @@information_schema_stats_expiry"
             ),
-            value("31536000")
+            vec![Value::UInt(31536000)]
         );
     }
     engine
@@ -1874,7 +2006,7 @@ fn information_schema_stats_expiry_compatibility() {
             &mut session,
             "SELECT @@global.information_schema_stats_expiry"
         ),
-        value("31536000")
+        vec![Value::UInt(31536000)]
     );
     assert_eq!(one_row(&engine, &mut session, "SELECT VARIABLE_VALUE FROM performance_schema.persisted_variables WHERE VARIABLE_NAME='information_schema_stats_expiry'"), value("60"));
     engine
@@ -1933,7 +2065,7 @@ fn mydb_wal_write_buffer_sql_round_trip() {
             &mut session,
             "SELECT @@global.mydb_wal_write_buffer_bytes",
         );
-        assert_eq!(row[0], Value::String(bytes.to_string()));
+        assert_eq!(row[0], Value::UInt(bytes));
     }
     for value in ["-1", "1073741825"] {
         assert!(engine
@@ -1948,5 +2080,5 @@ fn mydb_wal_write_buffer_sql_round_trip() {
         &mut session,
         "SELECT @@global.mydb_wal_write_buffer_bytes",
     );
-    assert_eq!(row[0], Value::String("1048576".into()));
+    assert_eq!(row[0], Value::UInt(1048576));
 }

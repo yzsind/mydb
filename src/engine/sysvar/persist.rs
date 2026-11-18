@@ -149,8 +149,7 @@ impl PersistedVariables {
 
     #[cfg(test)]
     /// Insert / replace one persisted variable and rewrite the file.
-    /// `value` is serialised through `SysVarValue::to_display_string()` so
-    /// the file holds canonical MySQL text representations.
+    /// The file holds lossless text representations of system variables.
     pub fn upsert(
         &self,
         name: &str,
@@ -167,7 +166,7 @@ impl PersistedVariables {
             name.to_string(),
             PersistedEntry {
                 name: name.to_string(),
-                value: value.to_display_string(),
+                value: value.to_config_string(),
                 timestamp_ms,
                 user: user.to_string(),
                 host: host.to_string(),
@@ -201,7 +200,7 @@ impl PersistedVariables {
             canonical.clone(),
             PersistedEntry {
                 name: canonical,
-                value: value.to_display_string(),
+                value: value.to_config_string(),
                 timestamp_ms,
                 user: user.to_string(),
                 host: host.to_string(),

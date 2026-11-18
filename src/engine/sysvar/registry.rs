@@ -16,7 +16,7 @@ use super::value::SysVarValue;
 use crate::engine::api::SessionContext;
 use crate::engine::auth::{Privilege, PrivilegeScope, RequiredPrivilege};
 use crate::storage::Database;
-use crate::types::QueryError;
+use crate::types::{QueryError, Value};
 
 /// Snapshot row used by `SHOW VARIABLES`, `information_schema.global_variables`,
 /// `performance_schema.global_variables`. Returned by
@@ -205,6 +205,25 @@ impl Registry {
         db: Option<&Database>,
     ) -> Result<SysVarValue, QueryError> {
         self.read_with_explicit_session(name, scope, false, session, db)
+            .map(|(_, value)| value)
+    }
+
+    pub(crate) fn select_type(&self, name: &str) -> Option<crate::engine::expr_type::ExprType> {
+        if matches!(name, "warning_count" | "error_count") {
+            return super::meta::SelectType::UInt.descriptor();
+        }
+        self.get_entry(name)?.def.select_type().descriptor()
+    }
+
+    pub(crate) fn read_value(
+        &self,
+        name: &str,
+        scope: Scope,
+        session: Option<&SessionContext>,
+        db: Option<&Database>,
+    ) -> Result<Value, QueryError> {
+        self.read_with_explicit_session(name, scope, false, session, db)
+            .and_then(|(var, value)| var.def.select_type().sql_value(var.def.name, value))
     }
 
     /// SQL distinguishes implicit @@x lookup from explicit @@session.x / @@local.x.
@@ -214,7 +233,7 @@ impl Registry {
         scope: crate::parser::SystemVariableScope,
         session: Option<&SessionContext>,
         db: Option<&Database>,
-    ) -> Result<SysVarValue, QueryError> {
+    ) -> Result<Value, QueryError> {
         use crate::parser::SystemVariableScope;
         self.read_with_explicit_session(
             name,
@@ -230,6 +249,7 @@ impl Registry {
             session,
             db,
         )
+        .and_then(|(var, value)| var.def.select_type().sql_value(var.def.name, value))
     }
 
     fn read_with_explicit_session(
@@ -239,7 +259,7 @@ impl Registry {
         explicit_session: bool,
         session: Option<&SessionContext>,
         db: Option<&Database>,
-    ) -> Result<SysVarValue, QueryError> {
+    ) -> Result<(&SysVar, SysVarValue), QueryError> {
         let var = self
             .get_entry(name)
             .ok_or_else(|| unknown_system_variable(name))?;
@@ -257,7 +277,7 @@ impl Registry {
             _ => scope,
         };
         let ctx = ReadCtx::new(session, db, effective_scope);
-        Ok((var.read)(&ctx))
+        Ok((var, (var.read)(&ctx)))
     }
 
     /// Shared scope/access gate. Both preflight and application recheck it;
@@ -303,9 +323,15 @@ impl Registry {
         // SYSTEM_VARIABLES_ADMIN privilege bit (role closure + SUPER
         // implication), not a hard-coded username, so a granted non-root
         // admin passes here just as it does in the dispatcher.
-        if matches!(var.def.access_for(effective_scope), Access::SuperReadWrite)
-            && !account_has_sysvar_admin(session, db, effective_scope)
+        let access = var.def.access_for(effective_scope);
+        if matches!(access, Access::SuperReadWrite | Access::SessionAdmin)
+            && !account_has_sysvar_admin(session, db, effective_scope, access)
         {
+            if access == Access::SessionAdmin {
+                return Err(crate::error::catalog::ER_SPECIFIC_ACCESS_DENIED_ERROR.error(
+                    "Access denied; you need (at least one of) the SYSTEM_VARIABLES_ADMIN or SESSION_VARIABLES_ADMIN privilege(s) for this operation",
+                ));
+            }
             return Err(access_denied(var.def.name));
         }
         Ok(effective_scope)
@@ -572,7 +598,12 @@ pub fn apply_option_file_on_startup(
 /// takes effect and a renamed-away root loses its implicit power. When no
 /// Database handle is available (rare internal call sites) grants can't be
 /// consulted, so only system sessions pass.
-fn account_has_sysvar_admin(session: &SessionContext, db: Option<&Database>, scope: Scope) -> bool {
+fn account_has_sysvar_admin(
+    session: &SessionContext,
+    db: Option<&Database>,
+    scope: Scope,
+    access: Access,
+) -> bool {
     if session.internal_system_session {
         return true;
     }
@@ -580,6 +611,16 @@ fn account_has_sysvar_admin(session: &SessionContext, db: Option<&Database>, sco
         return false;
     };
     let ctx = session.authorization_context();
+    if access == Access::SessionAdmin {
+        return db
+            .with_auth_catalog(|auth| {
+                auth.account_has_explicit_global_dynamic_privilege(
+                    &ctx,
+                    &["SYSTEM_VARIABLES_ADMIN", "SESSION_VARIABLES_ADMIN"],
+                )
+            })
+            .unwrap_or(false);
+    }
     let required = RequiredPrivilege {
         privilege: Privilege::Dynamic("SYSTEM_VARIABLES_ADMIN".to_string()),
         scope: PrivilegeScope::Global,

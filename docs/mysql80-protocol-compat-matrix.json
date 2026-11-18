@@ -4,6 +4,7 @@
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
+    "CLIENT_IGNORE_SPACE": "compatible",
     "CLIENT_INTERACTIVE": "compatible",
     "CLIENT_MULTI_STATEMENTS": "compatible_and_runtime_toggleable",
     "CLIENT_MULTI_RESULTS": "compatible",
@@ -49,9 +50,9 @@
   "evidence": {
     "review_scope": "Source and documentation contract review; focused regression and local protocol rehearsal. This fingerprint is a review trigger, not proof all combinations are supported.",
     "source_sha256": {
-      "src/mysql/protocol.rs": "cec9d31bf841b246bc926a631dc3bc9cd0d831fdc11c46cdc10c2e6031f113bc",
+      "src/mysql/protocol.rs": "7d56b1c0915b1cda9ec91015f9d03c14e68a24942e2db54289530f685608c503",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "4958f2b27866c1219d5ff15faaf53641f64a4d23c0bdf924a15fb70e45c3cdc5",
+      "src/mysql/session.rs": "9f5222f5fb7f26d5daff93b48dc14598b3b69d006c975d9a328e3dbd61d10f3d",
       "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023"
     },
     "test_sources": [

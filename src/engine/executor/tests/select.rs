@@ -7700,20 +7700,14 @@ fn group_concat_max_len_session_variable_round_trips() {
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
 
-    // Default per MySQL 8.0. The sysvar registry serialises every
-    // variable on the wire as a CSTRING (`Value::String`) — matches how
-    // MySQL renders `SELECT @@var` to clients regardless of the
-    // underlying numeric type.
+    // SELECT @@ renders the MySQL 8.0 default as an unsigned integer.
     let QueryResponse::ResultSet(default_var) = engine
         .execute_with_session(&mut session, "SELECT @@group_concat_max_len")
         .unwrap()
     else {
         panic!("expected result set");
     };
-    assert_eq!(
-        default_var.rows,
-        vec![vec![Value::String("1024".to_string())]]
-    );
+    assert_eq!(default_var.rows, vec![vec![Value::UInt(1024)]]);
 
     // Raise it for this session, then verify SHOW VARIABLES surfaces it.
     engine
@@ -7786,10 +7780,7 @@ fn group_concat_max_len_session_variable_round_trips() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(
-        other_var.rows,
-        vec![vec![Value::String("1024".to_string())]]
-    );
+    assert_eq!(other_var.rows, vec![vec![Value::UInt(1024)]]);
 }
 
 /// `group_concat_max_len` (MySQL 8.0 default = 1024 bytes) caps the

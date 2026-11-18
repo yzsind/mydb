@@ -3880,6 +3880,7 @@ impl QueryEngine for StorageQueryEngine {
                 }
             }
         }
+        routines::validate_prepared_function_names(&self.db, session, &statement)?;
         // Templates bind the database, never a temporary table's physical key.
         // EXECUTE resolves the logical name against the current session registry.
         if session.temp_tables.is_empty() {

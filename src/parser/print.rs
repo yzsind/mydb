@@ -8,10 +8,11 @@ pub(super) fn quote_ident(name: &str) -> String {
     format!("`{}`", name.replace('`', "``"))
 }
 
-/// Function names lose their source quoting in the scalar AST. Restore
-/// quoting for punctuation and syntax keywords while retaining native-call
-/// spelling (quoting a native name would mean a stored function in MySQL).
+/// Render routine-only calls with quotes so reparsing cannot bind a native function.
 fn function_name_sql(name: &str) -> std::borrow::Cow<'_, str> {
+    if let Some(routine) = super::stored_only_function(name) {
+        return std::borrow::Cow::Owned(quote_ident(routine));
+    }
     fn needs_quotes(part: &str) -> bool {
         if part.is_empty()
             || part.as_bytes()[0].is_ascii_digit()
@@ -30,6 +31,7 @@ fn function_name_sql(name: &str) -> std::borrow::Cow<'_, str> {
             .binary_search(&upper.as_ref())
             .is_ok()
             && !crate::engine::cbo::function_cost::is_known_builtin_function(part)
+            && !super::is_aggregate_function(part)
     }
     if !name.split('.').any(needs_quotes) {
         return std::borrow::Cow::Borrowed(name);

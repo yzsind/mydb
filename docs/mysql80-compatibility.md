@@ -292,8 +292,11 @@ alias for the native mydb engine.
 - ✅ The parsing semantics of `PIPES_AS_CONCAT`, `HIGH_NOT_PRECEDENCE`, and `ANSI`
   enter the parser/plan-cache key; switching the session mode after PREPARE does
   not reinterpret the original AST.
-- ✅ `IGNORE_SPACE` (also implied by `ANSI`) controls whitespace between a native
-  function name and `(`; schema-qualified stored functions are exempt.
+- ✅ Keyword functions such as `UTC_TIMESTAMP` and `CURRENT_USER` support both
+  bare and parenthesized syntax. `IGNORE_SPACE` (also implied by `ANSI`) governs
+  lexer-sensitive function names in expressions and identifier positions.
+  Quoting or qualifying those names preserves stored-routine lookup.
+  Temporal precision arguments are checked during parsing, including PREPARE.
 - ✅ `||` is fixed at parse time as either logical `OR` or string `CONCAT`;
   persistent expressions such as views, CHECK, generated
   columns, and partitions use mode-independent normalized SQL.
@@ -356,6 +359,7 @@ Closing the loop on MySQL 8.0 semantics:
 - **DELETE in both forms**: `DELETE t1,t2 FROM refs` and `DELETE FROM t1,t2 USING refs` are both supported; the `tbl_name.*` target suffix; per-table `PARTITION(...)` pruning.
 - **`UPDATE LOW_PRIORITY [IGNORE]`**: ✅ IGNORE covers everything (unique key 1062 / NOT NULL 1048 / FK 1452·1451 / out-of-range 1264 / truncation 1265·1366 / CHECK 3819 converted row-wise to warnings and skipped).
 - **True no-op detection for UPDATE**: column-wise post-coercion comparison; no-op rows write nothing to heap/undo/binlog and do not refresh `ON UPDATE CURRENT_TIMESTAMP`.
+- **`CLIENT_IGNORE_SPACE`** enables the session's `IGNORE_SPACE` mode at login and on change-user. Reset connection restores the global SQL mode.
 - **`CLIENT_FOUND_ROWS`**: the OK packet returns matched/changed per the bit + `Rows matched: N Changed: M Warnings: W`.
 - **CTE-driven DML**, **`SELECT ... INTO @var`**, **`DO expr`**: ✅
 - ➕ **`INSERT / UPDATE / DELETE ... RETURNING`**: a PostgreSQL 18-style extension returning NEW/NEW/OLD respectively by default, with explicit `OLD`/`NEW` references and `WITH (OLD AS ..., NEW AS ...)` aliases. Supports plain, ODKU, single-target JOIN DML, prepared statements, and updatable views; UPDATE/DELETE RETURNING that genuinely modifies multiple target tables returns 1235.

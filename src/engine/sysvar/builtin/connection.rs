@@ -380,12 +380,25 @@ pub(crate) fn register(reg: &mut Registry) {
     }
 
     for name in ["session_track_gtids", "session_track_transaction_info"] {
-        reg.register(SysVar::settable(
-            SysVarDef::new(name, Scope::Session, DataType::Enum { values: &["OFF"] })
+        let var = SysVar::settable(
+            SysVarDef::new(name, Scope::Both, DataType::Enum { values: &["OFF"] })
                 .with_doc("Only OFF is supported until the corresponding producer is implemented."),
             |_ctx| SysVarValue::String("OFF".to_string()),
             |_ctx: &mut WriteCtx<'_>, _value: SysVarValue| -> Result<(), QueryError> { Ok(()) },
-        ));
+        );
+        reg.register(if name == "session_track_gtids" {
+            var.with_validation(|ctx, _| {
+                if ctx.session.is_some_and(|session| session.in_transaction()) {
+                    return Err(
+                        crate::error::catalog::ER_VARIABLE_NOT_SETTABLE_IN_TRANSACTION
+                            .error("Cannot set session_track_gtids inside a transaction"),
+                    );
+                }
+                Ok(())
+            })
+        } else {
+            var
+        });
     }
 
     reg.register(SysVar::settable(

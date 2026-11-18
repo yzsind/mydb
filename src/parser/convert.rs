@@ -1,6 +1,7 @@
 //! Conversion from sqlparser 0.61 AST into mydb public AST.
 
 use super::entry::parse_error_with_spec_at_zero as numeric_spec_error;
+use super::function_names::{scalar_call_name, validate_clock_column_option, validate_identifier};
 use super::*;
 
 /// LIKE escape-clause conversion with MySQL defaults: no ESCAPE clause
@@ -938,9 +939,9 @@ fn convert_view_definer(
             host: host.value,
         })),
         sqlparser::ast::GranteeName::ObjectName(name) => {
-            let name = object_name_to_string(name)?;
-            if name.eq_ignore_ascii_case("CURRENT_USER")
-                || name.eq_ignore_ascii_case("CURRENT_USER()")
+            if matches!(name.0.as_slice(), [ObjectNamePart::Identifier(ident)]
+                if ident.quote_style.is_none() && (ident.value.eq_ignore_ascii_case("CURRENT_USER")
+                    || ident.value.eq_ignore_ascii_case("CURRENT_USER()")))
             {
                 // An explicit CURRENT_USER must remain distinguishable from
                 // an omitted DEFINER, especially when ALTER replaces an owner.
@@ -949,7 +950,7 @@ fn convert_view_definer(
                     host: String::new(),
                 }))
             } else {
-                parse_definer_account(&name)
+                parse_definer_account(&object_name_to_string(name)?)
                     .map(Some)
                     .ok_or_else(|| parse_error_at_zero("invalid view definer"))
             }
@@ -2010,6 +2011,9 @@ pub(super) fn convert_insert(
     let mut columns = if columns.is_empty() {
         None
     } else {
+        for column in &columns {
+            validate_identifier(column)?;
+        }
         Some(columns.into_iter().map(ident_value).collect())
     };
     // C1 — a `WITH … SELECT` INSERT source carries CTE definitions. We lift
@@ -2291,6 +2295,7 @@ fn prepare_query(sql: &str, query: &Query) -> Result<PreparedQuery, ParseError> 
                     sql: sql.into(),
                 }));
             }
+            validate_table_alias(alias)?;
             let name = alias.name.value.clone();
             if !names.insert(name.to_ascii_lowercase()) {
                 let mut err = parse_error_at_zero(format!("Not unique table/alias: '{name}'"));
@@ -3460,6 +3465,7 @@ fn convert_column_parts(
             "reserved column names MOD and BOTH must be quoted",
         ));
     }
+    validate_identifier(&name)?;
     let long_alias = matches!(&data_type, SqlDataType::Custom(name, modifiers)
         if name.to_string().eq_ignore_ascii_case("LONG") && modifiers.is_empty());
     let year_alias = matches!(&data_type, SqlDataType::Custom(name, _)
@@ -3523,7 +3529,19 @@ fn convert_column_parts(
                         distinct: false,
                     });
                 } else {
-                    default = Some(convert_expr(&expr)?);
+                    validate_clock_column_option(&expr)?;
+                    default = Some(convert_expr(&expr).map_err(|err| {
+                        if err.spec == crate::error::catalog::ER_TOO_BIG_PRECISION
+                            && matches!(expr, SqlExpr::Function(_))
+                        {
+                            parse_error_with_spec_at_zero(
+                                crate::error::catalog::ER_INVALID_DEFAULT,
+                                format!("Invalid default value for '{column_name}'"),
+                            )
+                        } else {
+                            err
+                        }
+                    })?);
                 }
             }
             ColumnOption::PrimaryKey(_) => {
@@ -3638,7 +3656,19 @@ fn convert_column_parts(
                 }
             }
             ColumnOption::OnUpdate(expr) => {
-                on_update = Some(convert_expr(&expr)?);
+                validate_clock_column_option(&expr)?;
+                on_update = Some(convert_expr(&expr).map_err(|err| {
+                    if err.spec == crate::error::catalog::ER_TOO_BIG_PRECISION
+                        && matches!(expr, SqlExpr::Function(_))
+                    {
+                        parse_error_with_spec_at_zero(
+                            crate::error::catalog::ER_INVALID_ON_UPDATE,
+                            format!("Invalid ON UPDATE clause for '{column_name}' column"),
+                        )
+                    } else {
+                        err
+                    }
+                })?);
             }
             generated_option @ ColumnOption::Generated { .. } => {
                 generated = Some(convert_generated_column_option(sql, generated_option)?);
@@ -4307,6 +4337,11 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             let system_variable = parts
                 .first()
                 .is_some_and(|part| part.quote_style.is_none() && part.value.starts_with("@@"));
+            if !system_variable {
+                for part in parts {
+                    validate_identifier(part)?;
+                }
+            }
             let parts = parts.iter().cloned().map(ident_value).collect::<Vec<_>>();
             if system_variable {
                 system_variable_expr(&parts.join("."))
@@ -4612,7 +4647,7 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                 err.spec = crate::error::catalog::ER_NOT_SUPPORTED_YET;
                 return Err(err);
             }
-            let name = object_name_to_string(&function.name)?;
+            let name = scalar_call_name(function, function_object_name(&function.name)?)?;
             validate_function_syntax(function, &name)?;
             let mut args = convert_function_args(&function.args)?;
             if name.eq_ignore_ascii_case("DEFAULT") {
@@ -6027,14 +6062,25 @@ fn convert_select_item(item: &SqlSelectItem) -> Result<SelectItem, ParseError> {
             }
         },
         SqlSelectItem::UnnamedExpr(expr) => Ok(SelectItem::Expr {
-            expr: convert_expr(expr)?,
+            expr: convert_projection_expr(expr)?,
             alias: None,
         }),
-        SqlSelectItem::ExprWithAlias { expr, alias } => Ok(SelectItem::Expr {
-            expr: convert_expr(expr)?,
-            alias: Some(alias.value.clone()),
-        }),
+        SqlSelectItem::ExprWithAlias { expr, alias } => {
+            validate_identifier(alias)?;
+            Ok(SelectItem::Expr {
+                expr: convert_projection_expr(expr)?,
+                alias: Some(alias.value.clone()),
+            })
+        }
     }
+}
+
+fn convert_projection_expr(expr: &SqlExpr) -> Result<Expr, ParseError> {
+    let converted = convert_expr(expr)?;
+    if matches!(converted, Expr::Default(None)) && !parser_fragment_mode() {
+        return parse_error_from_sql_span(expr.span(), "expected DEFAULT(column)", vec![]);
+    }
+    Ok(converted)
 }
 
 fn convert_expr_list(exprs: &[SqlExpr]) -> Result<Vec<Expr>, ParseError> {
@@ -6358,6 +6404,17 @@ fn convert_table_with_joins(
 fn convert_table_factor(
     factor: &TableFactor,
 ) -> Result<(TableRef, Option<SubQuery>, bool), TableConversionError> {
+    match factor {
+        TableFactor::Table { alias, .. }
+        | TableFactor::Derived { alias, .. }
+        | TableFactor::NestedJoin { alias, .. }
+        | TableFactor::JsonTable { alias, .. } => {
+            if let Some(alias) = alias {
+                validate_table_alias(alias)?;
+            }
+        }
+        _ => {}
+    }
     match factor {
         // PostgreSQL `generate_series(start, stop [, step])` table function.
         // sqlparser parses this as `TableFactor::Table { args: Some(..) }`; the
@@ -6809,7 +6866,7 @@ fn convert_group_by(
             sqlparser::ast::Expr::Function(function) => function,
             _ => return Ok(false),
         };
-        let name = object_name_to_string(&function.name)?;
+        let name = function_object_name(&function.name)?;
         if !matches!(
             extensions::get(&name),
             Some(extensions::Extension::EmptyGroupingSet)
@@ -7007,7 +7064,7 @@ fn convert_group_by(
                 append_set_product(sets, vec![Vec::new()])
             }
             sqlparser::ast::Expr::Function(function) => {
-                let name = object_name_to_string(&function.name)?;
+                let name = function_object_name(&function.name)?;
                 if name.eq_ignore_ascii_case("ROLLUP") {
                     *modifier = GroupByModifier::Rollup;
                     let converted = function_grouping_args(&function.args)?
@@ -9298,11 +9355,22 @@ fn dedupe_query_hints(
     (accepted, warnings)
 }
 
+fn validate_table_alias(alias: &TableAlias) -> Result<(), ParseError> {
+    validate_identifier(&alias.name)?;
+    for column in &alias.columns {
+        validate_identifier(&column.name)?;
+    }
+    Ok(())
+}
+
 fn table_alias_name(alias: &TableAlias) -> String {
     alias.name.value.clone()
 }
 
 fn assignment_column_name(name: &ObjectName) -> Result<String, ParseError> {
+    if let Some(ObjectNamePart::Identifier(ident)) = name.0.first() {
+        validate_identifier(ident)?;
+    }
     let mut last = "";
     for part in &name.0 {
         match part {
@@ -9404,11 +9472,17 @@ fn join_name_parts<'a>(
 fn object_name_to_qualified(name: ObjectName) -> Result<QualifiedName, ParseError> {
     let mut parts = name.0.into_iter();
     let first = match parts.next() {
-        Some(ObjectNamePart::Identifier(ident)) => ident.value,
+        Some(ObjectNamePart::Identifier(ident)) => {
+            validate_identifier(&ident)?;
+            ident.value
+        }
         _ => return Err(parse_error_at_zero("expected catalog object name")),
     };
     let (database, object) = match parts.next() {
-        Some(ObjectNamePart::Identifier(ident)) => (Some(first), ident.value),
+        Some(ObjectNamePart::Identifier(ident)) => {
+            validate_identifier(&ident)?;
+            (Some(first), ident.value)
+        }
         None => (None, first),
         _ => return Err(parse_error_at_zero("expected catalog object name")),
     };
@@ -9420,17 +9494,61 @@ fn object_name_to_qualified(name: ObjectName) -> Result<QualifiedName, ParseErro
 
 fn database_object_name(name: ObjectName) -> Result<String, ParseError> {
     match name.0.as_slice() {
-        [ObjectNamePart::Identifier(identifier)] => Ok(identifier.value.clone()),
+        [ObjectNamePart::Identifier(identifier)] => {
+            validate_identifier(identifier)?;
+            Ok(identifier.value.clone())
+        }
         _ => Err(parse_error_at_zero("expected one database identifier")),
     }
 }
 
-fn object_name_to_string(name: impl std::borrow::Borrow<ObjectName>) -> Result<String, ParseError> {
-    join_name_parts(name.borrow().0.iter().map(|part| match part {
-        ObjectNamePart::Identifier(ident) if ident.value.contains('.') => Err(parse_error_at_zero(
+fn function_object_name(name: &ObjectName) -> Result<String, ParseError> {
+    if name
+        .0
+        .iter()
+        .any(|part| part.as_ident().is_some_and(|ident| ident.value.is_empty()))
+    {
+        return Err(parse_error_at_zero(
+            "function name components must be nonempty",
+        ));
+    }
+    if let [ObjectNamePart::Identifier(ident)] = name.0.as_slice() {
+        validate_name_component(ident).map(str::to_owned)
+    } else {
+        let parts = name.0.split_last();
+        if let Some((_, qualifiers)) = parts {
+            for part in qualifiers {
+                if let ObjectNamePart::Identifier(ident) = part {
+                    validate_identifier(ident)?;
+                }
+            }
+        }
+        object_name_parts_to_string(name)
+    }
+}
+
+fn validate_name_component(ident: &Ident) -> Result<&str, ParseError> {
+    if ident.value.contains('.') {
+        return Err(parse_error_at_zero(
             "Dots inside quoted object identifiers are not supported",
-        )),
-        ObjectNamePart::Identifier(ident) => Ok(ident.value.as_str()),
+        ));
+    }
+    Ok(&ident.value)
+}
+
+fn object_name_to_string(name: impl std::borrow::Borrow<ObjectName>) -> Result<String, ParseError> {
+    let name = name.borrow();
+    for part in &name.0 {
+        if let ObjectNamePart::Identifier(ident) = part {
+            validate_identifier(ident)?;
+        }
+    }
+    object_name_parts_to_string(name)
+}
+
+fn object_name_parts_to_string(name: &ObjectName) -> Result<String, ParseError> {
+    join_name_parts(name.0.iter().map(|part| match part {
+        ObjectNamePart::Identifier(ident) => validate_name_component(ident),
         ObjectNamePart::Function(_) => parse_error_from_sql_span(
             sqlparser::tokenizer::Span::empty(),
             "unsupported object name",

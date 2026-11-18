@@ -125,7 +125,20 @@ impl<'a> Cursor<'a> {
     fn name(&mut self, strings: bool) -> Result<String, ParseError> {
         let token = self.peek()?.ok_or_else(|| self.expected("identifier"))?;
         let name = match token.kind {
-            SqlTokenKind::Word => self.tokens.token_text(&token).to_owned(),
+            SqlTokenKind::Word => {
+                let name = self.tokens.token_text(&token);
+                if !strings
+                    && super::super::function_names::reserved_identifier(
+                        name,
+                        self.sql,
+                        token.span.start,
+                        token.span.end,
+                    )
+                {
+                    return Err(self.expected("quoted identifier"));
+                }
+                name.to_owned()
+            }
             SqlTokenKind::QuotedIdentifier => self.tokens.decoded_quoted_text(&token).unwrap(),
             SqlTokenKind::String if strings => self.tokens.decoded_quoted_text(&token).unwrap(),
             _ => return Err(self.expected("identifier")),

@@ -2759,13 +2759,16 @@ pub struct SessionSysVarState {
     pub default_week_format: u64,
     /// `lc_messages` / `lc_time_names` — localisation.
     pub lc_messages: String,
-    /// Per-session values of advisory integer compatibility settings.
-    pub advisory_uints: std::collections::HashMap<&'static str, u64>,
+    /// Per-session values of advisory compatibility settings.
+    pub(crate) advisory_variables:
+        std::collections::HashMap<&'static str, crate::engine::sysvar::SysVarValue>,
+    pub(crate) slow_log: crate::engine::logging::SessionSlowLogConfig,
     pub lc_time_names: String,
     /// `collation_database` is mirrored above; keep `collation_server`
     /// as a session override of the global (mostly cosmetic).
     pub collation_server: String,
     pub character_set_server: String,
+    pub(crate) default_collation_for_utf8mb4: &'static str,
     /// `div_precision_increment` — extra decimal scale for `/`.
     pub div_precision_increment: u64,
     /// `transaction_alloc_block_size` — advisory.
@@ -2911,10 +2914,12 @@ impl Default for SessionSysVarState {
                 crate::engine::sysvar::builtin::charset::global_block_encryption_mode(),
             default_week_format: 0,
             lc_messages: "en_US".to_string(),
-            advisory_uints: Default::default(),
+            advisory_variables: Default::default(),
+            slow_log: crate::engine::logging::session_slow_log_defaults(),
             lc_time_names: "en_US".to_string(),
             collation_server: server_collation.to_string(),
             character_set_server: server_charset.to_string(),
+            default_collation_for_utf8mb4: crate::charset::DEFAULT_COLLATION,
             div_precision_increment: 4,
             transaction_alloc_block_size: 8192,
             transaction_prealloc_size: 4096,
@@ -3668,6 +3673,47 @@ impl SessionContext {
     }
 
     pub fn set_user_variable(&mut self, name: &str, value: Value) -> Result<(), QueryError> {
+        self.set_user_variable_with_precision(name, value, None)
+    }
+
+    pub(crate) fn set_user_variable_with_precision(
+        &mut self,
+        name: &str,
+        value: Value,
+        fsp: Option<u8>,
+    ) -> Result<(), QueryError> {
+        let mut buffer = [0u8; 32];
+        // MySQL stores DATE/TIME/DATETIME/TIMESTAMP assignments as text.
+        let value = match value {
+            Value::Date(days) => Value::String(
+                String::from_utf8(crate::types::write_date_canonical(days, &mut buffer).to_vec())
+                    .expect("canonical DATE is UTF-8"),
+            ),
+            Value::Time(micros) => Value::String(
+                String::from_utf8(
+                    crate::types::write_time_canonical_with_fsp(micros, fsp, &mut buffer).to_vec(),
+                )
+                .expect("canonical TIME is UTF-8"),
+            ),
+            Value::DateTime(micros) | Value::Timestamp(micros) => {
+                let local = if matches!(value, Value::Timestamp(_)) {
+                    crate::engine::expr::utc_timestamp_to_local_datetime_micros_in_tz(
+                        micros,
+                        &self.sysvars.time_zone,
+                    )?
+                } else {
+                    micros
+                };
+                Value::String(
+                    String::from_utf8(
+                        crate::types::write_datetime_canonical_with_fsp(local, fsp, &mut buffer)
+                            .to_vec(),
+                    )
+                    .expect("canonical DATETIME is UTF-8"),
+                )
+            }
+            other => other,
+        };
         self.user_variables
             .insert(normalize_user_variable_name(name), value)?;
         self.mark_pfs_variables_dirty();

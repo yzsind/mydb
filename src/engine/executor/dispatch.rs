@@ -7611,6 +7611,7 @@ fn execute_sql_prepare(
         expand_views(db, session, &mut validation_statement, 0)
     })?;
     qualify_statement_tables(db, session, &mut validation_statement)?;
+    super::routines::validate_prepared_function_names(db, session, &validation_statement)?;
     let routine_resolution = super::routines::resolve_stored_functions(
         db,
         session,

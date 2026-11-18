@@ -23,6 +23,7 @@ pub const CLIENT_LOCAL_FILES: u32 = 0x0000_0080;
 /// the *changed* row count — important for ORMs implementing optimistic
 /// locking on the executeUpdate() return value.
 pub const CLIENT_FOUND_ROWS: u32 = 0x0000_0002;
+pub const CLIENT_IGNORE_SPACE: u32 = 0x0000_0100;
 pub const CLIENT_PROTOCOL_41: u32 = 0x0000_0200;
 /// Client sets this when it is an interactive session (e.g. the `mysql`
 /// CLI). The server then uses `interactive_timeout` instead of
@@ -190,6 +191,7 @@ const BINARY_COLLATION: u16 = 63;
 
 const SERVER_CAPABILITIES: u32 = CLIENT_LONG_PASSWORD
     | CLIENT_FOUND_ROWS
+    | CLIENT_IGNORE_SPACE
     | CLIENT_LONG_FLAG
     | CLIENT_CONNECT_WITH_DB
     | CLIENT_LOCAL_FILES

@@ -344,6 +344,7 @@ mod foreign_keys;
 mod fulltext;
 mod function_compat;
 mod function_name_case;
+mod function_name_resolution;
 mod functional_index;
 mod generate_series;
 mod geometry_type;

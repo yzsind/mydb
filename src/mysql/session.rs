@@ -29,16 +29,17 @@ use crate::mysql::protocol::{
     parse_change_user_request, parse_handshake_response, parse_query_attributes, parse_ssl_request,
     parse_stmt_execute_params, server_capabilities, stmt_param_to_sql, stmt_prepare_ok_packet,
     uses_caching_sha2, write_lenenc_int, NegotiatedCapabilities, StmtParamType, StmtParamValue,
-    CLIENT_COMPRESS, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_INTERACTIVE,
-    CLIENT_MULTI_RESULTS, CLIENT_MULTI_STATEMENTS, CLIENT_OPTIONAL_RESULTSET_METADATA,
-    CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41, CLIENT_PS_MULTI_RESULTS, CLIENT_QUERY_ATTRIBUTES,
-    CLIENT_SESSION_TRACK, CLIENT_SSL, CLIENT_ZSTD_COMPRESSION_ALGORITHM, COM_BINLOG_DUMP,
-    COM_BINLOG_DUMP_GTID, COM_CHANGE_USER, COM_DEBUG, COM_INIT_DB, COM_PING, COM_PROCESS_INFO,
-    COM_PROCESS_KILL, COM_QUERY, COM_QUIT, COM_REFRESH, COM_REGISTER_SLAVE, COM_RESET_CONNECTION,
-    COM_SET_OPTION, COM_STATISTICS, COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_FETCH,
-    COM_STMT_PREPARE, COM_STMT_RESET, COM_STMT_SEND_LONG_DATA, SERVER_MORE_RESULTS_EXISTS,
-    SERVER_PS_OUT_PARAMS, SERVER_SESSION_STATE_CHANGED, SERVER_STATUS_AUTOCOMMIT,
-    SERVER_STATUS_CURSOR_EXISTS, SERVER_STATUS_IN_TRANS, SERVER_STATUS_LAST_ROW_SENT,
+    CLIENT_COMPRESS, CLIENT_DEPRECATE_EOF, CLIENT_FOUND_ROWS, CLIENT_IGNORE_SPACE,
+    CLIENT_INTERACTIVE, CLIENT_MULTI_RESULTS, CLIENT_MULTI_STATEMENTS,
+    CLIENT_OPTIONAL_RESULTSET_METADATA, CLIENT_PLUGIN_AUTH, CLIENT_PROTOCOL_41,
+    CLIENT_PS_MULTI_RESULTS, CLIENT_QUERY_ATTRIBUTES, CLIENT_SESSION_TRACK, CLIENT_SSL,
+    CLIENT_ZSTD_COMPRESSION_ALGORITHM, COM_BINLOG_DUMP, COM_BINLOG_DUMP_GTID, COM_CHANGE_USER,
+    COM_DEBUG, COM_INIT_DB, COM_PING, COM_PROCESS_INFO, COM_PROCESS_KILL, COM_QUERY, COM_QUIT,
+    COM_REFRESH, COM_REGISTER_SLAVE, COM_RESET_CONNECTION, COM_SET_OPTION, COM_STATISTICS,
+    COM_STMT_CLOSE, COM_STMT_EXECUTE, COM_STMT_FETCH, COM_STMT_PREPARE, COM_STMT_RESET,
+    COM_STMT_SEND_LONG_DATA, SERVER_MORE_RESULTS_EXISTS, SERVER_PS_OUT_PARAMS,
+    SERVER_SESSION_STATE_CHANGED, SERVER_STATUS_AUTOCOMMIT, SERVER_STATUS_CURSOR_EXISTS,
+    SERVER_STATUS_IN_TRANS, SERVER_STATUS_LAST_ROW_SENT,
 };
 #[cfg(test)]
 use crate::parser::{
@@ -1801,6 +1802,7 @@ where
                 );
                 self.context.client_found_rows =
                     self.client_capabilities() & CLIENT_FOUND_ROWS != 0;
+                apply_client_ignore_space(self.capabilities, &mut self.context);
                 let handshake_collation = match crate::charset::resolve_collation_id_checked(
                     handshake.character_set as u16,
                 ) {
@@ -3080,6 +3082,7 @@ where
         context.current_database.clear();
         context.connection_id = self.connection_id;
         context.client_found_rows = self.client_capabilities() & CLIENT_FOUND_ROWS != 0;
+        apply_client_ignore_space(self.capabilities, &mut context);
         context.host = client_host.clone();
         context.ssl_cipher = self.context.ssl_cipher.clone();
         context.ssl_version = self.context.ssl_version.clone();
@@ -10127,6 +10130,35 @@ fn is_show_processlist_sql(sql: &str) -> bool {
         }
         _ => false,
     }
+}
+
+fn apply_client_ignore_space(capabilities: NegotiatedCapabilities, context: &mut SessionContext) {
+    use crate::engine::api::SQL_MODE_IGNORE_SPACE;
+
+    if !capabilities.has(CLIENT_IGNORE_SPACE)
+        || context.temporal_sql_mode_bits & SQL_MODE_IGNORE_SPACE != 0
+    {
+        return;
+    }
+    let mut offset = 0;
+    for mode in context.sql_mode.split_inclusive(',') {
+        if !matches!(
+            mode.trim_end_matches(','),
+            "REAL_AS_FLOAT" | "PIPES_AS_CONCAT" | "ANSI_QUOTES"
+        ) {
+            break;
+        }
+        offset += mode.len();
+    }
+    if offset == context.sql_mode.len() {
+        if offset != 0 {
+            context.sql_mode.push(',');
+        }
+        context.sql_mode.push_str("IGNORE_SPACE");
+    } else {
+        context.sql_mode.insert_str(offset, "IGNORE_SPACE,");
+    }
+    context.temporal_sql_mode_bits |= SQL_MODE_IGNORE_SPACE;
 }
 
 /// A compound stored program is one COM_QUERY statement. The lexical fast

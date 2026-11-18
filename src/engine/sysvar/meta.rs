@@ -2,7 +2,8 @@
 //! `SysVarDef`. The registry stores a `&'static SysVarDef` per variable
 //! alongside its read / write function pointers (see `backend.rs`).
 
-use crate::types::QueryError;
+use crate::engine::expr_type::{fixed_integer_result, ExprType, ExprTypeKind, IntegerWidth};
+use crate::types::{QueryError, Value};
 
 use super::errors::{
     global_only_variable, out_of_range, read_only_variable, session_only_variable,
@@ -126,6 +127,9 @@ pub enum Access {
     /// is enforced once the auth layer wires the check in; until then
     /// behaves like `ReadWrite`.
     SuperReadWrite,
+    /// Session writes require an explicit SYSTEM_VARIABLES_ADMIN or
+    /// SESSION_VARIABLES_ADMIN dynamic grant.
+    SessionAdmin,
 }
 
 /// The space of values a variable accepts. `DataType::coerce` does the
@@ -358,6 +362,84 @@ fn match_enum(values: &[&'static str], raw: &str) -> Option<&'static str> {
         .find(|v| v.eq_ignore_ascii_case(raw_trim))
 }
 
+/// The SQL domain of `@@var`. Some backends keep display strings or use
+/// different domains for SET validation and SELECT metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectType {
+    Text,
+    Bool,
+    Int,
+    UInt,
+    Double,
+}
+
+impl SelectType {
+    pub(crate) fn descriptor(self) -> Option<ExprType> {
+        let mut result = match self {
+            Self::Text => return None,
+            Self::Bool | Self::Int | Self::UInt => {
+                fixed_integer_result(IntegerWidth::Big, self == Self::UInt, true)
+            }
+            Self::Double => ExprType::new(
+                ExprTypeKind::Float {
+                    single: false,
+                    precision: None,
+                    scale: Some(6),
+                },
+                true,
+            ),
+        };
+        result.max_octets = Some(match self {
+            Self::Bool => 1,
+            Self::Int | Self::UInt => 21,
+            Self::Double => 23,
+            Self::Text => unreachable!(),
+        });
+        Some(result)
+    }
+
+    pub(crate) fn sql_value(self, name: &str, value: SysVarValue) -> Result<Value, QueryError> {
+        if matches!(value, SysVarValue::Null) {
+            return Ok(Value::Null);
+        }
+        let converted = match self {
+            Self::Text => {
+                return Ok(match value {
+                    SysVarValue::String(text) => Value::String(text),
+                    other => Value::String(other.to_display_string()),
+                });
+            }
+            Self::Bool => match &value {
+                SysVarValue::String(text) => parse_bool_sysvar(text).ok().map(i64::from),
+                other => other.as_bool().map(i64::from),
+            }
+            .map(Value::Int),
+            Self::Int => match &value {
+                SysVarValue::String(text) => text.trim().parse::<i64>().ok(),
+                SysVarValue::Double(_) => None,
+                other => other.as_i64(),
+            }
+            .map(Value::Int),
+            Self::UInt => match &value {
+                SysVarValue::String(text) => text.trim().parse::<u64>().ok(),
+                SysVarValue::Double(_) => None,
+                other => other.as_u64(),
+            }
+            .map(Value::UInt),
+            Self::Double => match &value {
+                SysVarValue::String(text) => text.trim().parse::<f64>().ok(),
+                other => other.as_f64(),
+            }
+            .filter(|v| v.is_finite())
+            .map(Value::Double),
+        };
+        converted.ok_or_else(|| {
+            crate::error::catalog::ER_VAR_CANT_BE_READ
+                .error(format!("Variable '{name}' has an invalid stored value"))
+        })
+    }
+}
+
 /// Compile-time definition of one system variable. Stored as a `'static`
 /// in the registry; values flow through the read/write function pointers
 /// attached alongside it.
@@ -373,7 +455,11 @@ pub struct SysVarDef {
     pub global_access: Option<Access>,
     /// Unsupported capability probes cannot become effective after restart either.
     pub persistable: bool,
+    /// Whether SET SESSION ... = DEFAULT uses the compiled default.
+    pub(crate) compiled_session_default: bool,
     pub data_type: DataType,
+    /// Native SQL result metadata for variables that expose typed `@@` values.
+    pub(super) select_type: Option<SelectType>,
     /// Optional list of alias names that resolve to this variable. Used
     /// for MySQL legacy aliases (e.g. `tx_isolation` → `transaction_isolation`).
     pub aliases: &'static [&'static str],
@@ -391,7 +477,9 @@ impl SysVarDef {
             session_access: None,
             global_access: None,
             persistable: true,
+            compiled_session_default: false,
             data_type,
+            select_type: None,
             aliases: &[],
             doc: "",
         }
@@ -417,9 +505,29 @@ impl SysVarDef {
         self
     }
 
+    pub(crate) const fn with_compiled_session_default(mut self) -> Self {
+        self.compiled_session_default = true;
+        self
+    }
+
     pub const fn with_aliases(mut self, aliases: &'static [&'static str]) -> Self {
         self.aliases = aliases;
         self
+    }
+
+    pub(crate) const fn with_select_type(mut self, select_type: SelectType) -> Self {
+        self.select_type = Some(select_type);
+        self
+    }
+
+    pub(crate) fn select_type(&self) -> SelectType {
+        self.select_type.unwrap_or(match self.data_type {
+            DataType::Bool => SelectType::Bool,
+            DataType::Int { .. } => SelectType::Int,
+            DataType::UInt { .. } => SelectType::UInt,
+            DataType::Double { .. } => SelectType::Double,
+            _ => SelectType::Text,
+        })
     }
 
     pub const fn with_doc(mut self, doc: &'static str) -> Self {
@@ -437,7 +545,7 @@ impl SysVarDef {
 
     pub fn check_writable(&self, scope: Scope) -> Result<(), QueryError> {
         match self.access_for(scope) {
-            Access::ReadWrite | Access::SuperReadWrite => Ok(()),
+            Access::ReadWrite | Access::SuperReadWrite | Access::SessionAdmin => Ok(()),
             Access::ReadOnly => Err(read_only_variable(self.name)),
         }
     }

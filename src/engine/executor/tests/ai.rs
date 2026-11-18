@@ -236,7 +236,7 @@ fn ai_default_enabled_without_local_config() {
                 &mut session,
                 "SELECT @@GLOBAL.mydb_ai_enabled",
             ));
-            assert_eq!(rows.rows[0][0], Value::String("1".into()));
+            assert_eq!(rows.rows[0][0], Value::Int(1));
             for (index, url) in [
                 "http://10.1.2.3:11434",
                 "http://192.168.1.10:8000/v1",
