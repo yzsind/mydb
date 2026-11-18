@@ -7,7 +7,7 @@ use crate::parser::{BinaryOp, Expr, Literal};
 use crate::storage::{Database, TableSchema};
 use crate::types::{QueryError, Value};
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 #[path = "rls/binding.rs"]
 mod column_binding;
 pub(crate) use column_binding::{bind_target_columns, copied_security, materialize_policy};
@@ -66,15 +66,26 @@ impl BoundRowSecurity {
 pub(crate) struct RlsExecutionContext {
     policy_access_observed: bool,
     snapshot: Arc<AuthorizationSnapshot>,
-    bindings: std::collections::HashMap<BindingKey, Option<Arc<BoundRowSecurity>>>,
-    context_integers: std::collections::HashMap<String, [ContextIntegerSlot; 2]>,
-    expression_settings: std::collections::HashMap<
+    cache: Option<Box<RlsEvaluationCache>>,
+}
+
+#[derive(Default)]
+struct RlsEvaluationCache {
+    bindings: HashMap<BindingKey, Option<Arc<BoundRowSecurity>>>,
+    context_integers: HashMap<String, [ContextIntegerSlot; 2]>,
+    expression_settings: HashMap<
         String,
         (
             Arc<crate::engine::expr::SessionExprInfo>,
             crate::engine::executor::mem_budget::ControlledMemoryCharge,
         ),
     >,
+}
+
+impl RlsExecutionContext {
+    fn cache_mut(&mut self) -> &mut RlsEvaluationCache {
+        self.cache.get_or_insert_with(Box::default)
+    }
 }
 pub(crate) fn policy_access_observed() -> bool {
     EXECUTION.with(|state| {
@@ -92,6 +103,8 @@ pub(crate) fn policy_expression_info(
     if let Some(info) = EXECUTION.with(|state| {
         state.borrow().as_ref().and_then(|state| {
             state
+                .cache
+                .as_ref()?
                 .expression_settings
                 .get(encoded)
                 .map(|(info, _)| info.clone())
@@ -111,6 +124,7 @@ pub(crate) fn policy_expression_info(
     EXECUTION.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             state
+                .cache_mut()
                 .expression_settings
                 .insert(encoded.to_string(), (info.clone(), memory));
         }
@@ -206,6 +220,8 @@ pub(crate) fn context_integer_slot(
     let cached = EXECUTION.with(|state| {
         state.borrow().as_ref().and_then(|state| {
             state
+                .cache
+                .as_ref()?
                 .context_integers
                 .get(key)
                 .and_then(|slots| slots[usize::from(unsigned)].as_ref())
@@ -227,6 +243,7 @@ pub(crate) fn context_integer_slot(
             EXECUTION.with(|state| {
                 if let Some(state) = state.borrow_mut().as_mut() {
                     state
+                        .cache_mut()
                         .context_integers
                         .entry(key.to_string())
                         .or_insert_with(|| [None, None])[usize::from(unsigned)] =
@@ -316,11 +333,8 @@ impl EvaluationScope {
                 remember_statement_snapshot(&snapshot);
                 break snapshot;
             };
-            let captured = EvaluationSnapshot {
-                authorization: snapshot,
-                ancestors: POLICY_STACK.with(|stack| stack.borrow().clone()),
-            };
-            return Self::enter_snapshot(Some(&captured));
+            let ancestors = POLICY_STACK.with(|stack| stack.borrow().clone());
+            return Self::install(snapshot, ancestors);
         }
         let scope = Self::enter();
         authorization_snapshot(db);
@@ -336,10 +350,7 @@ impl EvaluationScope {
                 let current = state.as_mut()?;
                 // Reuse only an unallocated cache frame. A nested identity
                 // must never see bindings computed by its caller.
-                if current.bindings.capacity() != 0
-                    || current.context_integers.capacity() != 0
-                    || current.expression_settings.capacity() != 0
-                {
+                if current.cache.is_some() {
                     return None;
                 }
                 let policy =
@@ -366,7 +377,6 @@ impl EvaluationScope {
                     policy: crate::engine::auth::PolicySnapshot::capture(),
                 })
             });
-        let policy = crate::engine::auth::PolicySnapshotScope::enter(&snapshot.policy);
         let ancestors = POLICY_STACK.with(|stack| {
             let mut stack = stack.borrow_mut();
             let previous = stack.clone();
@@ -381,15 +391,18 @@ impl EvaluationScope {
             }
             previous
         });
+        Self::install(snapshot, ancestors)
+    }
+
+    fn install(snapshot: Arc<AuthorizationSnapshot>, ancestors: Vec<u64>) -> Self {
+        let policy = crate::engine::auth::PolicySnapshotScope::enter(&snapshot.policy);
         Self {
             reused_policy_access: None,
             previous: EXECUTION.with(|state| {
                 state.borrow_mut().replace(RlsExecutionContext {
                     policy_access_observed: false,
                     snapshot,
-                    bindings: std::collections::HashMap::new(),
-                    context_integers: std::collections::HashMap::new(),
-                    expression_settings: std::collections::HashMap::new(),
+                    cache: None,
                 })
             }),
             ancestors,
@@ -407,9 +420,7 @@ impl Drop for EvaluationScope {
                 // Nested evaluation may have populated any of these caches.
                 // Release both governed entries and bucket allocations at the
                 // same boundary as a fully isolated frame.
-                release_nested_cache(&mut current.bindings);
-                release_nested_cache(&mut current.context_integers);
-                release_nested_cache(&mut current.expression_settings);
+                current.cache = None;
                 return;
             }
             if let Some(previous) = self.previous.as_mut() {
@@ -420,12 +431,6 @@ impl Drop for EvaluationScope {
             *state = self.previous.take();
         });
         POLICY_STACK.with(|stack| *stack.borrow_mut() = std::mem::take(&mut self.ancestors));
-    }
-}
-
-fn release_nested_cache<K, V>(cache: &mut std::collections::HashMap<K, V>) {
-    if cache.capacity() != 0 {
-        *cache = std::collections::HashMap::with_hasher(cache.hasher().clone());
     }
 }
 
@@ -452,7 +457,7 @@ pub(crate) fn binding(
         state
             .borrow()
             .as_ref()
-            .and_then(|state| state.bindings.get(&key).cloned())
+            .and_then(|state| state.cache.as_ref()?.bindings.get(&key).cloned())
     }) {
         return Ok(cached);
     }
@@ -468,7 +473,7 @@ pub(crate) fn binding(
         if !security.enabled {
             EXECUTION.with(|state| {
                 if let Some(state) = state.borrow_mut().as_mut() {
-                    state.bindings.insert(key, None);
+                    state.cache_mut().bindings.insert(key, None);
                 }
             });
             return Ok(None);
@@ -554,7 +559,7 @@ pub(crate) fn binding(
     EXECUTION.with(|state| {
         if let Some(state) = state.borrow_mut().as_mut() {
             state.policy_access_observed |= result.is_some();
-            state.bindings.insert(key, result.clone());
+            state.cache_mut().bindings.insert(key, result.clone());
         }
     });
     Ok(result)
@@ -876,6 +881,7 @@ mod evaluation_scope_tests {
                 .borrow_mut()
                 .as_mut()
                 .unwrap()
+                .cache_mut()
                 .context_integers
                 .insert("tenant".into(), [Some((Value::Int(value), charge)), None]);
         });
@@ -884,7 +890,7 @@ mod evaluation_scope_tests {
     fn cached_integer() -> Option<Value> {
         EXECUTION.with(|state| {
             state.borrow().as_ref().and_then(|state| {
-                state.context_integers.get("tenant")?[0]
+                state.cache.as_ref()?.context_integers.get("tenant")?[0]
                     .as_ref()
                     .map(|(value, _)| value.clone())
             })

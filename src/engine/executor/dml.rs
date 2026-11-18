@@ -1282,6 +1282,7 @@ pub(super) fn execute_prepared_range_update(
                     &update.affected_indexes,
                     &update.required_columns,
                     update.decode_recipe.as_deref().map(|(plan, _)| plan),
+                    false,
                     Some(&mut predicate),
                     &apply,
                 )?;
@@ -1347,7 +1348,7 @@ pub(super) fn execute_prepared_point_update(
         crate::engine::api::set_statement_matched_rows(0);
         return Ok(QueryResponse::OkAffected { affected_rows: 0 });
     };
-    let update_result = match db.try_update_prepared_row_by_id_in_place_delta_noop(
+    let update_result = match db.try_update_locked_prepared_row_by_id_in_place_delta_noop(
         txn,
         &point.table,
         row_id,

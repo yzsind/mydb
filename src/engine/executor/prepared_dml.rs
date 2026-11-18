@@ -62,6 +62,7 @@ use crate::engine::api::{
     PreparedDmlPlan, PreparedLockingPointRead, PreparedPointAssignment, PreparedPointUpdate,
     PreparedPointWrite, PreparedPointWriteKind, QueryResponse, SessionContext,
 };
+use crate::engine::cache::PreparedPlanSemantics;
 use crate::engine::executor::dispatch::{
     acquire_prepared_statement_mdl, authorize_prepared_statement_with_epoch,
     prepared_required_privileges, prepared_statement_mdl_requests, statement_refs_temp_table,
@@ -406,6 +407,10 @@ fn compile_prepared_dml_in_context(
             Arc::new(statement)
         });
     let parsed = enum_statement.as_ref().unwrap_or(parsed);
+    let parameter_insert = match parsed.as_ref() {
+        Statement::Insert(insert) => insert_exec::compile_parameter_insert(&table, insert),
+        _ => None,
+    };
     let locking_point_read = match parsed.as_ref() {
         Statement::Select(select) => compile_locking_point_read(&table, select),
         _ => None,
@@ -426,8 +431,7 @@ fn compile_prepared_dml_in_context(
     Some(PreparedDmlPlan {
         original_statement,
         rls_bound,
-        semantics: super::plan_semantics(db, session),
-        optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
+        semantics: PreparedPlanSemantics::capture(db, session),
         statement: Arc::clone(parsed),
         rowid_demand: crate::storage::rowid::Demand::of(parsed),
         epoch,
@@ -437,6 +441,7 @@ fn compile_prepared_dml_in_context(
         table_schema_version,
         required_privileges: required_privileges.into(),
         mdl_requests: mdl_requests.into(),
+        parameter_insert,
         locking_point_read,
         point_write,
         range_update,
@@ -463,15 +468,14 @@ pub(super) fn memo_is_valid(
     // Capture BEFORE reading the descriptor: publishing concurrently after
     // validation must leave a different epoch for the under-MDL check.
     let catalog_epoch = db.catalog_publication_epoch();
-    let valid =
-        super::compiled_select::semantics_match(db, &dp.semantics, &dp.optimizer_switch, session)
-            && dp.epoch == current_epoch
-            && dp.cbo_epoch == crate::engine::cbo::cbo_epoch()
-            && db.table_key_identity_version_matches(
-                &dp.table_key,
-                dp.table_id,
-                dp.table_schema_version,
-            );
+    let valid = dp.semantics.matches_session(db, session)
+        && dp.epoch == current_epoch
+        && dp.cbo_epoch == crate::engine::cbo::cbo_epoch()
+        && db.table_key_identity_version_matches(
+            &dp.table_key,
+            dp.table_id,
+            dp.table_schema_version,
+        );
     if valid
         && dp
             .validated_catalog_epoch
@@ -543,14 +547,7 @@ pub(super) fn execute_prepared_dml_plan(
     connection_id: u64,
 ) -> Result<QueryResponse, QueryError> {
     let _rowid_demand = crate::storage::rowid::DemandScope::enter_cached(&dp.rowid_demand);
-    if dp.rls_bound
-        && !super::compiled_select::semantics_match(
-            db,
-            &dp.semantics,
-            &dp.optimizer_switch,
-            session,
-        )
-    {
+    if dp.rls_bound && !dp.semantics.matches_session(db, session) {
         return Err(crate::error::catalog::ER_NEED_REPREPARE
             .error("prepared DML security identity changed before statement execution"));
     }
@@ -592,18 +589,14 @@ pub(super) fn execute_prepared_dml_plan(
     } else {
         execute_dml_in_transaction_with_session(db, session, |db, session, txn| {
             match dp.statement.as_ref() {
-                Statement::Insert(stmt) => {
-                    // Plain `INSERT … VALUES` executes against the borrowed
-                    // cached AST with zero clone; only `INSERT … SELECT`
-                    // (which streams through the owned pipeline) falls back
-                    // to cloning the inner struct.
-                    if let Some(resp) =
-                        insert_exec::execute_insert_borrowed(db, session, txn, stmt, registry)?
-                    {
-                        return Ok(resp);
-                    }
-                    insert_exec::execute_insert(db, session, txn, stmt.clone(), registry)
-                }
+                Statement::Insert(stmt) => insert_exec::execute_insert_borrowed(
+                    db,
+                    session,
+                    txn,
+                    stmt,
+                    dp.parameter_insert.as_ref(),
+                    registry,
+                ),
                 Statement::Update(stmt) => {
                     if let Some(point) = dp.point_write.as_ref().filter(|point| {
                         matches!(point.kind, PreparedPointWriteKind::Update(_))

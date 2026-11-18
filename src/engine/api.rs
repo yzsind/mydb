@@ -1563,8 +1563,7 @@ impl QueryResponse {
 /// deferred key parts bind at EXECUTE time.
 #[derive(Debug)]
 pub struct PreparedSelectMemo {
-    pub(crate) semantics: crate::engine::cache::PlanSemantics,
-    pub(crate) optimizer_switch: Arc<str>,
+    pub(crate) semantics: crate::engine::cache::PreparedPlanSemantics,
     /// Per-handle L0 memo points at the same immutable artifact used by the
     /// cross-session compiled SELECT cache.
     pub(crate) compiled: Arc<crate::engine::cache::CompiledSelectPlan>,
@@ -1609,11 +1608,7 @@ pub struct PreparedSelectTemplate {
     pub(crate) has_locking_read: bool,
     pub(crate) deps: smallvec::SmallVec<[crate::engine::cache::PlanDep; 4]>,
     pub(crate) object_deps: smallvec::SmallVec<[crate::engine::cache::ObjectDep; 2]>,
-    pub(crate) semantics: crate::engine::cache::PlanSemantics,
-    /// Raw optimizer_switch spelling for allocation-free equality checks on
-    /// the plan-cache-off hot path. The hashed fingerprint remains in
-    /// `semantics` for canonical cache-key compatibility.
-    pub(crate) optimizer_switch: Arc<str>,
+    pub(crate) semantics: crate::engine::cache::PreparedPlanSemantics,
     pub(crate) required_privileges: Arc<[RequiredPrivilege]>,
     pub(crate) mdl_requests: Arc<[MdlRequest]>,
     /// The epoch memo is valid only for this exact authorization identity.
@@ -1666,8 +1661,7 @@ pub struct PreparedDmlPlan {
     /// predicates belong to one captured identity and must never be replayed.
     pub(crate) original_statement: Arc<Statement>,
     pub(crate) rls_bound: bool,
-    pub(crate) semantics: crate::engine::cache::PlanSemantics,
-    pub(crate) optimizer_switch: Arc<str>,
+    pub(crate) semantics: crate::engine::cache::PreparedPlanSemantics,
     pub(crate) statement: Arc<Statement>,
     /// ROWID pseudo-column demand of `statement`, derived at compile time.
     pub(crate) rowid_demand: crate::storage::rowid::Demand,
@@ -1680,6 +1674,7 @@ pub struct PreparedDmlPlan {
     pub(crate) table_schema_version: u64,
     pub(crate) required_privileges: Arc<[RequiredPrivilege]>,
     pub(crate) mdl_requests: Arc<[MdlRequest]>,
+    pub(crate) parameter_insert: Option<PreparedParameterInsert>,
     pub(crate) locking_point_read: Option<PreparedLockingPointRead>,
     pub(crate) point_write: Option<PreparedPointWrite>,
     pub(crate) range_update: Option<PreparedRangeUpdate>,
@@ -1694,6 +1689,12 @@ pub struct PreparedDmlPlan {
     /// `locking_point_read` and `point_write` respectively.
     pub(crate) locking_read_cover_memo: AtomicU64,
     pub(crate) point_write_cover_memo: AtomicU64,
+}
+
+#[derive(Debug)]
+pub(crate) struct PreparedParameterInsert {
+    pub(crate) row_width: usize,
+    pub(crate) row_count: usize,
 }
 
 #[derive(Debug)]

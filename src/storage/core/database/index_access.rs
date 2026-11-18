@@ -736,6 +736,15 @@ impl Database {
         if unsatisfiable {
             return Ok(Vec::new());
         }
+        self.lookup_index_resolved(table, index, &key)
+    }
+
+    fn lookup_index_resolved(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        key: &IndexKey,
+    ) -> Result<Vec<RowId>, QueryError> {
         if table.is_partitioned() {
             // RowId is per-partition; if the active partition prune
             // set narrows the search to one partition, the returned
@@ -754,14 +763,14 @@ impl Database {
             let mut out: Vec<RowId> = Vec::new();
             for sid in candidate_sids {
                 let ids = self.with_index_read(sid, &index.name, |index_file| {
-                    index_file.get(&key, !index.unique)
+                    index_file.get(key, !index.unique)
                 })?;
                 out.extend(ids);
             }
             return Ok(out);
         }
         self.with_index_read(table.id, &index.name, |index_file| {
-            index_file.get(&key, !index.unique)
+            index_file.get(key, !index.unique)
         })
     }
 
@@ -777,7 +786,7 @@ impl Database {
         if unsatisfiable {
             return Ok(Vec::new());
         }
-        let mut ids = self.lookup_index(table, index, key.clone())?;
+        let mut ids = self.lookup_index_resolved(table, index, &key)?;
         let before = ids.len();
         self.add_exact_index_visibility_repair_ids(table, index, txn, &key, &mut ids)?;
         if ids.len() != before {

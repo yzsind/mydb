@@ -27649,7 +27649,7 @@ fn buffer_pool_sharded_hits_count_concurrent_resident_reads_exactly() {
         pool.buffer_stats().hits,
         pool.shards
             .iter()
-            .map(|shard| shard.hits.load(Ordering::Relaxed))
+            .map(|shard| shard.hits.sum())
             .sum::<u64>()
     );
 }

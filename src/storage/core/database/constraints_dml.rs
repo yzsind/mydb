@@ -377,6 +377,24 @@ impl Database {
                 self.check_unique_constraint_via_merge(table, txn, index, rows)?;
                 continue;
             }
+            // Small batches of inline keys can also share leaf navigation.
+            // Only consume the proof that every key was absent. Any hit
+            // uses the source-order check below to report the same first
+            // conflict, including stale and concurrently updated entries.
+            if !table.is_partitioned()
+                && (4..=32).contains(&keys.len())
+                && keys.iter().all(|key| key.heap_capacity_bytes() == 0)
+            {
+                let mut sorted: smallvec::SmallVec<[IndexKey; 16]> =
+                    keys.iter().cloned().collect();
+                sorted.sort_unstable();
+                if self
+                    .probe_unique_keys_routed(table, txn, index, &sorted)?
+                    .is_some_and(|matches| matches.is_empty())
+                {
+                    continue;
+                }
+            }
             for (row, values) in rows.iter().enumerate() {
                 let _partition = if table.is_partitioned() {
                     Some(

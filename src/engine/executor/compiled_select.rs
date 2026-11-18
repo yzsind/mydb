@@ -28,6 +28,7 @@ use std::sync::Arc;
 use crate::engine::api::{
     PreparedSelectMemo, PreparedSelectTemplate, QueryResponse, SessionContext,
 };
+use crate::engine::cache::PreparedPlanSemantics;
 use crate::engine::executor::dispatch::{
     acquire_prepared_select_mdl, authorize_prepared_statement_with_epoch,
     prepared_required_privileges, prepared_statement_mdl_requests, select_has_window_functions,
@@ -165,8 +166,7 @@ pub(super) fn compile_uncached_prepared_select(
         has_locking_read: super::tx::select_has_locking_read(&normalized),
         deps,
         object_deps,
-        semantics: super::plan_semantics(db, session),
-        optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
+        semantics: PreparedPlanSemantics::capture(db, session),
         required_privileges,
         mdl_requests,
         authorization_account: session.authenticated_as.clone(),
@@ -195,32 +195,9 @@ pub(super) fn uncached_template_is_valid(
     template: &PreparedSelectTemplate,
     session: &SessionContext,
 ) -> bool {
-    semantics_match(db, &template.semantics, &template.optimizer_switch, session)
+    template.semantics.matches_session(db, session)
         && plan_deps_match_catalog(db, &template.deps)
         && plan_object_deps_match_catalog(db, &template.object_deps)
-}
-
-pub(super) fn semantics_match(
-    db: &Database,
-    semantics: &crate::engine::cache::PlanSemantics,
-    optimizer_switch: &str,
-    session: &SessionContext,
-) -> bool {
-    semantics
-        .rls_authorization
-        .as_ref()
-        .is_some_and(|identity| identity.matches_session(db, session))
-        && semantics.sql_mode_fingerprint == crate::binlog::sql_mode_str_to_bits(&session.sql_mode)
-        && optimizer_switch == session.sysvars.optimizer_switch
-        && semantics.sql_select_limit == session.sysvars.sql_select_limit
-        && semantics.use_invisible_indexes == session.sysvars.use_invisible_indexes
-        && semantics.time_zone.as_ref() == session.sysvars.time_zone
-        && semantics.character_set_client.as_ref() == session.character_set_client
-        && semantics.character_set_connection.as_ref() == session.character_set_connection
-        && semantics.collation_connection.as_ref() == session.collation_connection
-        && semantics.div_precision_increment
-            == session.sysvars.div_precision_increment.min(30) as u8
-        && semantics.group_concat_max_len == session.group_concat_max_len
 }
 
 /// Re-cost and compile an access path from a normalized template.  No result
@@ -274,7 +251,7 @@ pub(super) fn compile_prepared_select_from_memo(
 ) -> Option<PreparedSelectMemo> {
     let previous = previous.filter(|memo| {
         memo_catalog_is_valid(db, memo, plan_cache.current_epoch())
-            && semantics_match(db, &memo.semantics, &memo.optimizer_switch, session)
+            && memo.semantics.matches_session(db, session)
             && memo.authorization_account == session.authenticated_as
     });
     let (normalized, structural_fingerprint) = if let Some(previous) = previous {
@@ -376,8 +353,7 @@ pub(super) fn compile_prepared_select_from_memo(
         parameter_plan_signature.push_str(&selectivity);
     }
     Some(PreparedSelectMemo {
-        semantics: super::plan_semantics(db, session),
-        optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
+        semantics: PreparedPlanSemantics::capture(db, session),
         compiled,
         has_locking_read: super::tx::select_has_locking_read(&normalized),
         presentation_select: normalized,
@@ -422,7 +398,7 @@ pub(super) fn reusable_memo(
 ) -> Option<Arc<PreparedSelectMemo>> {
     let mut selectivity = None;
     let valid = |memo: &PreparedSelectMemo, selectivity: &mut Option<String>| {
-        semantics_match(db, &memo.semantics, &memo.optimizer_switch, session)
+        memo.semantics.matches_session(db, session)
             && memo_catalog_is_valid(db, memo, current_epoch)
             && current_parameter_signature_matches(db, memo, params, selectivity)
     };

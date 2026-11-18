@@ -4750,14 +4750,9 @@ impl QueryEngine for StorageQueryEngine {
         // Callers try this memo first for every prepared statement. Reject
         // non-SELECT statements before capturing the statement's
         // authorization snapshot; their own path captures it again.
-        if !matches!(parsed.as_ref(), Statement::Select(_)) {
+        let Statement::Select(select) = parsed.as_ref() else {
             return None;
-        }
-        self.attach_expression_registry(session);
-        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
-        let _group_concat_scope =
-            select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
-        let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
+        };
         if let Err(err) = dispatch::ensure_xa_statement_allowed(session, parsed) {
             return Some(Err(err));
         }
@@ -4770,7 +4765,7 @@ impl QueryEngine for StorageQueryEngine {
         {
             return None;
         }
-        if let Statement::Select(select) = parsed.as_ref() {
+        if select.limit.is_some() || select.offset.is_some() {
             let validation = crate::engine::params::with_params_slice(params, || {
                 crate::engine::params::validate_limit(select.limit.as_ref())?;
                 crate::engine::params::validate_limit(select.offset.as_ref())
@@ -4780,13 +4775,19 @@ impl QueryEngine for StorageQueryEngine {
             }
         }
         use crate::engine::api::PreparedSelectMemoState;
-        if statement_refs_temp_table(session, parsed) {
+        if matches!(state, PreparedSelectMemoState::Ineligible)
+            || statement_refs_temp_table(session, parsed)
+        {
             return None;
         }
+        self.attach_expression_registry(session);
+        let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
+        let _group_concat_scope =
+            select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
+        let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let current_epoch = self.plan_cache.current_epoch();
         if !self.plan_cache_enabled {
             let (template, compiled) = match state {
-                PreparedSelectMemoState::Ineligible => return None,
                 PreparedSelectMemoState::Uncached(template)
                     if compiled_select::uncached_template_is_valid(&self.db, template, session) =>
                 {
@@ -4840,7 +4841,6 @@ impl QueryEngine for StorageQueryEngine {
             _ => None,
         };
         let rp = match state {
-            PreparedSelectMemoState::Ineligible => return None,
             _ if reusable.is_some() => {
                 self.db.record_prepared_plan_reuse();
                 let rp = reusable.expect("checked above");

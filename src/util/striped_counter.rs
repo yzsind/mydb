@@ -15,6 +15,12 @@ pub(crate) struct StripedCounter {
     stripes: [CachePadded<AtomicU64>; STRIPES],
 }
 
+impl Default for StripedCounter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl StripedCounter {
     pub(crate) const fn new() -> Self {
         Self {

@@ -1156,6 +1156,9 @@ where
     fn publish_prepared_memory(&self) {
         if let Some(handle) = &self.handle {
             handle.set_protocol_prepared_memory_bytes(self.prepared_memory_bytes);
+            if !crate::engine::perf_setup::enabled() {
+                return;
+            }
             let prepared = self
                 .prepared
                 .iter()
@@ -1210,9 +1213,11 @@ where
             return;
         };
         handle.set_protocol_prepared_memory_bytes(self.prepared_memory_bytes);
-        handle.publish_pfs_redacted_prepared_statement(
-            self.prepared_statement_snapshot(statement_id, prepared),
-        );
+        if crate::engine::perf_setup::enabled() {
+            handle.publish_pfs_redacted_prepared_statement(
+                self.prepared_statement_snapshot(statement_id, prepared),
+            );
+        }
     }
 
     fn publish_pfs_variables(&mut self) {
@@ -2672,15 +2677,18 @@ where
                         1,
                     );
                     let statement_id = command_statement_id(&packet.payload);
-                    let execute_started = std::time::Instant::now();
+                    let execute_started =
+                        crate::engine::perf_setup::enabled().then(std::time::Instant::now);
                     self.prepared_execute_failed = false;
                     let execute_result = self.handle_stmt_execute(&packet.payload[1..]).await;
                     if let Some(statement_id) = statement_id {
-                        self.record_prepared_execute(
-                            statement_id,
-                            execute_started.elapsed(),
-                            execute_result.is_err() || self.prepared_execute_failed,
-                        );
+                        if let Some(started) = execute_started {
+                            self.record_prepared_execute(
+                                statement_id,
+                                started.elapsed(),
+                                execute_result.is_err() || self.prepared_execute_failed,
+                            );
+                        }
                         self.refresh_prepared_memory(statement_id);
                     }
                     execute_result?;
@@ -5235,6 +5243,7 @@ where
             original_sql,
             param_count,
             has_parsed_template,
+            is_select_template,
             normalized_sql,
             database,
             parser_sql_mode_bits,
@@ -5285,6 +5294,7 @@ where
                 prepared.original_sql.clone(),
                 prepared.param_count,
                 prepared.parsed.is_some(),
+                matches!(prepared.parsed.as_deref(), Some(Statement::Select(_))),
                 Arc::clone(&prepared.normalized_sql),
                 Arc::clone(&prepared.database),
                 prepared.parser_sql_mode_bits,
@@ -5300,8 +5310,7 @@ where
             crate::engine::status_counters::record_session_com(&self.context, kind);
         }
         if let Some(handle) = &self.handle {
-            handle.set_process_info_prechecked(Arc::clone(&original_sql), original_sql_sensitive);
-            handle.set_base_state(ProcessState::Executing);
+            handle.set_prepared_execution(Arc::clone(&original_sql), original_sql_sensitive);
         }
         self.engine
             .log_general_event(&self.context, "Execute", &original_sql);
@@ -5445,7 +5454,7 @@ where
             // the prepared-map borrow) and written back afterwards. Cursor
             // and non-cursor consumers share this plan. A `None` result means the
             // statement/session needs a different execution vehicle.
-            {
+            if is_select_template {
                 let (parsed_arc, computed_ordering, needs_async_progress, mut select_memo_state) = {
                     let entry = self
                         .prepared

@@ -2952,80 +2952,98 @@ pub(crate) struct ColumnPatchRange<'a> {
     pub offset_in_payload: usize,
     pub width: usize,
     pub kind: &'a ColumnKind,
+    pub stored_ordinal: usize,
+    pub null_offset: usize,
+    pub null_mask: u8,
 }
 
-/// Locate an inline column slot, including variable values and NULL slots.
-/// A variable slot can be patched only when the replacement has the same
-/// encoded width. External references must retain the ownership-aware path.
-/// Offsets are row-relative and cover the persisted layout, including old
-/// layouts retained by INSTANT DDL.
-pub(crate) fn column_patch_range<'a>(
-    payload: &[u8],
-    codec: &'a RowCodec,
-    column_index: usize,
-) -> Result<Option<(ColumnPatchRange<'a>, usize, u8)>, QueryError> {
-    if payload.first().copied() != Some(MVCC_ROW_VERSION) {
-        return Ok(None);
-    }
-    let (header, mut offset, has_external) = read_mvcc_header(payload)?;
-    if header.flags & MVCC_FLAG_ROW_PIECE != 0 {
-        return Ok(None);
-    }
-    let layout_id = read_varint(payload, &mut offset)? as u32;
-    let row_layout = codec.layout_for_id(layout_id)?;
-    let count = read_varint(payload, &mut offset)? as usize;
-    if count > row_layout.columns.len() {
-        return Ok(None);
-    }
-    let columns = &row_layout.columns[..count];
-    let Some(ordinal) = columns
-        .iter()
-        .position(|column| column.column_index == column_index)
-    else {
-        return Ok(None);
-    };
-    let layout = value_section_layout_for_prefix(row_layout, columns);
-    let fixed_start = offset
-        + count.div_ceil(8)
-        + if has_external {
-            layout.var_count.div_ceil(8)
-        } else {
-            0
+/// Parse the persisted layout once for every column changed by this patch.
+struct RowPatchLayout<'row, 'codec> {
+    payload: &'row [u8],
+    columns: &'codec [RowLayoutColumnCodec],
+    section: std::borrow::Cow<'codec, ValueSectionLayout>,
+    layout_id: u32,
+    null_start: usize,
+    external_start: usize,
+    fixed_start: usize,
+}
+
+impl<'row, 'codec> RowPatchLayout<'row, 'codec> {
+    fn parse(
+        payload: &'row [u8],
+        codec: &'codec RowCodec,
+        mut offset: usize,
+        has_external: bool,
+    ) -> Result<Option<Self>, QueryError> {
+        let layout_id = read_varint(payload, &mut offset)? as u32;
+        let row_layout = codec.layout_for_id(layout_id)?;
+        let count = read_varint(payload, &mut offset)? as usize;
+        let Some(columns) = row_layout.columns.get(..count) else {
+            return Ok(None);
         };
-    if fixed_start.saturating_add(layout.fixed_len) > payload.len() {
-        return Err(error(
-            crate::error::catalog::ER_GET_ERRNO,
-            "corrupt row payload",
-        ));
+        let section = value_section_layout_for_prefix(row_layout, columns);
+        let external_start = offset + count.div_ceil(8);
+        let fixed_start = external_start
+            + if has_external {
+                section.var_count.div_ceil(8)
+            } else {
+                0
+            };
+        if fixed_start.saturating_add(section.fixed_len) > payload.len() {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "corrupt row payload",
+            ));
+        }
+        Ok(Some(Self {
+            payload,
+            columns,
+            section,
+            layout_id,
+            null_start: offset,
+            external_start,
+            fixed_start,
+        }))
     }
-    let (column_start, width) = if let Some(fixed_offset) = layout.fixed_offsets[ordinal] {
-        (
-            fixed_start + fixed_offset,
-            fixed_width_for_kind(&columns[ordinal].kind).expect("fixed slot has a width"),
-        )
-    } else {
-        let var_ord = layout.var_ords[ordinal].expect("variable column has an ordinal");
-        if has_external {
-            let ext_start = offset + count.div_ceil(8);
-            if external_bit(&payload[ext_start..fixed_start], var_ord) {
+
+    /// Locate an inline slot. Externally owned values retain the full-row
+    /// path; variable values require a replacement of the same byte width.
+    fn column(&self, column_index: usize) -> Result<Option<ColumnPatchRange<'codec>>, QueryError> {
+        let Some((ordinal, column)) = self
+            .columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.column_index == column_index)
+        else {
+            return Ok(None);
+        };
+        let (column_start, width) = if let Some(fixed_offset) = self.section.fixed_offsets[ordinal] {
+            (
+                self.fixed_start + fixed_offset,
+                fixed_width_for_kind(&column.kind).expect("fixed slot has a width"),
+            )
+        } else {
+            let var_ord = self.section.var_ords[ordinal].expect("variable column has an ordinal");
+            if self.external_start != self.fixed_start
+                && external_bit(&self.payload[self.external_start..self.fixed_start], var_ord)
+            {
                 return Ok(None);
             }
-        }
-        let dir_start = fixed_start + layout.fixed_len;
-        let payload_start = dir_start + layout.var_count * 2;
-        let (start, width) = read_dir_entry(payload, dir_start, payload_start, var_ord)?;
-        checked_payload_slice(payload, payload_start, start, width)?;
-        (payload_start + start as usize, width as usize)
-    };
-    Ok(Some((
-        ColumnPatchRange {
+            let dir_start = self.fixed_start + self.section.fixed_len;
+            let payload_start = dir_start + self.section.var_count * 2;
+            let (start, width) = read_dir_entry(self.payload, dir_start, payload_start, var_ord)?;
+            checked_payload_slice(self.payload, payload_start, start, width)?;
+            (payload_start + start as usize, width as usize)
+        };
+        Ok(Some(ColumnPatchRange {
             offset_in_payload: column_start,
             width,
-            kind: &columns[ordinal].kind,
-        },
-        offset + ordinal / 8,
-        1u8 << (ordinal % 8),
-    )))
+            kind: &column.kind,
+            stored_ordinal: ordinal,
+            null_offset: self.null_start + ordinal / 8,
+            null_mask: 1u8 << (ordinal % 8),
+        }))
+    }
 }
 
 /// Body-relative sibling of [`fixed_column_byte_range_in_payload`]. `body`

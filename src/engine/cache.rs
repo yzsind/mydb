@@ -14,12 +14,12 @@ use lru::LruCache;
 use parking_lot::Mutex;
 use smallvec::SmallVec;
 
-use crate::engine::api::PreparedDmlPlan;
+use crate::engine::api::{PreparedDmlPlan, SessionContext};
 use crate::engine::auth::RequiredPrivilege;
 use crate::parser::{Expr, Select, SelectItem, Statement};
 use crate::planner::PhysicalPlan;
 use crate::storage::{
-    IndexKey, IndexSchema, MdlRequest, ProjectedReadPlan, RowDecodePlan, TableSchema,
+    Database, IndexKey, IndexSchema, MdlRequest, ProjectedReadPlan, RowDecodePlan, TableSchema,
 };
 
 /// Process-global registry so observability code (e.g. `SHOW ENGINE MYDB
@@ -383,6 +383,38 @@ impl Default for PlanSemantics {
             div_precision_increment: 4,
             group_concat_max_len: 1024,
         }
+    }
+}
+
+/// The live validation recipe for a prepared memo. Its identity already
+/// captures SQL mode, character sets, collation, time zone and decimal
+/// precision. Store the remaining settings beside that single snapshot.
+#[derive(Debug)]
+pub(crate) struct PreparedPlanSemantics {
+    identity: Arc<crate::engine::rls::PlanIdentity>,
+    optimizer_switch: Arc<str>,
+    sql_select_limit: u64,
+    use_invisible_indexes: bool,
+    group_concat_max_len: u64,
+}
+
+impl PreparedPlanSemantics {
+    pub(crate) fn capture(db: &Database, session: &SessionContext) -> Self {
+        Self {
+            identity: crate::engine::rls::session_signature(db, session),
+            optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
+            sql_select_limit: session.sysvars.sql_select_limit,
+            use_invisible_indexes: session.sysvars.use_invisible_indexes,
+            group_concat_max_len: session.group_concat_max_len,
+        }
+    }
+
+    pub(crate) fn matches_session(&self, db: &Database, session: &SessionContext) -> bool {
+        self.identity.matches_session(db, session)
+            && self.optimizer_switch.as_ref() == session.sysvars.optimizer_switch
+            && self.sql_select_limit == session.sysvars.sql_select_limit
+            && self.use_invisible_indexes == session.sysvars.use_invisible_indexes
+            && self.group_concat_max_len == session.group_concat_max_len
     }
 }
 

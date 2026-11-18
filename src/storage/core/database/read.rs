@@ -1815,14 +1815,12 @@ impl Database {
     /// patch checks and their error ordering, including cold/forwarded rows.
     #[allow(clippy::type_complexity)]
     fn read_mvcc_row_columns_for_update(
-        &self,
-        table_id: u64,
+        heap: &HeapHandle,
         row_id: RowId,
         columns: &[usize],
         decode_plan: Option<&RowDecodePlan>,
         changed_columns: &[usize],
     ) -> Result<Option<(RowHeader, Vec<Value>, usize, Option<HeapPatchSource>)>, QueryError> {
-        let heap = self.heap_handle(table_id)?;
         let heap = heap.read();
         heap.with_lob(|| {
             let compiled;
