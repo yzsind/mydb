@@ -1,6 +1,6 @@
 {
   "baseline": "MySQL Community Server 8.0.46",
-  "reviewed_at": "2026-11-17",
+  "reviewed_at": "2026-11-18",
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
@@ -51,8 +51,9 @@
     "source_sha256": {
       "src/mysql/protocol.rs": "cec9d31bf841b246bc926a631dc3bc9cd0d831fdc11c46cdc10c2e6031f113bc",
       "src/mysql/server.rs": "49fb84a0b3ec74ff15b38c2e6826de6dbb752bfb3227dc4aa1f1e86630a0f043",
-      "src/mysql/session.rs": "4958f2b27866c1219d5ff15faaf53641f64a4d23c0bdf924a15fb70e45c3cdc5",
-      "src/binlog.rs": "570e14d6b0e08426980ee27e379bfc6a421d1040f10d4ea9f4a8a00c34847d1f"
+      "src/mysql/session.rs": "663aa1e254710f197eab3d42de634d91d21e91ba91c9fe56069d5e9a361f5a16",
+      "src/binlog.rs": "570e14d6b0e08426980ee27e379bfc6a421d1040f10d4ea9f4a8a00c34847d1f",
+      "src/mysql/peer_monitor.rs": "bd38f8bdd57b3cb62f5000498a9d31160173f508e49644f54353b207aeb8885c"
     },
     "test_sources": [
       "src/mysql/session/auth_handshake_tests.rs",
@@ -61,7 +62,9 @@
       "src/engine/executor/tests/rest_access_keys.rs",
       "src/mysql/session/auth_handshake_tests.rs",
       "src/engine/executor/tests/dump_compatibility.rs",
-      "src/engine/executor/tests/mysql80_compat_binlog_multi.rs"
+      "src/engine/executor/tests/mysql80_compat_binlog_multi.rs",
+      "src/mysql/session/disconnect_tests.rs",
+      "src/mysql/peer_monitor.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
   }
