@@ -35,10 +35,10 @@
 //    lock-step with what the master did: `BeginTxn` registers an
 //    `Active` slot, `CommitTxn` flips the slot to
 //    `Committed { commit_scn }`, `EndTxn` to `RolledBack`, and
-//    `PrepareTxn` to `Prepared`. On `CommitTxn` we `fetch_max` the
-//    master's `commit_scn` into `next_scn_atomic`, so any local
-//    snapshot taken after the apply sees rows the master committed at
-//    or before that SCN.
+//    `PrepareTxn` to `Prepared`. Commit SCNs advance a gap-aware visible
+//    prefix, independently of the allocation counter. `CommitVisibility`
+//    supplies void completions and recovered source prefixes so an online
+//    replica does not wait forever for an unlogged commit reservation.
 //
 // 4. Data-dictionary writes are detected (any path `tables/<id>.heap`
 //    with `id ≥ DD_TABLE_ID_BASE`). Their txn_id is recorded in
@@ -733,6 +733,30 @@ impl Database {
                     row_id: *row_id,
                 }];
                 self.apply_index_batch_record(path, lsn, txn_id, &ops)?;
+            }
+            WalPayload::CommitVisibility {
+                resolved_scn,
+                visible_scn,
+            } => {
+                if txn_id != 0 {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "commit visibility proof must be system-scoped",
+                    ));
+                }
+                let frontier = {
+                    let mut txns = self.txns.write();
+                    txns.next_scn = txns
+                        .next_scn
+                        .max(resolved_scn.max(visible_scn).saturating_add(1));
+                    txns.mark_frontier_done(*resolved_scn);
+                    txns.seed_commit_frontier(*visible_scn)
+                };
+                self.next_scn_atomic.fetch_max(
+                    resolved_scn.max(visible_scn).saturating_add(1),
+                    Ordering::AcqRel,
+                );
+                self.publish_visible_frontier(frontier);
             }
             WalPayload::BeginTxn { start_scn } => {
                 self.apply_begin_txn(txn_id, *start_scn, lsn);
@@ -1802,6 +1826,7 @@ fn replica_payload_is_write(payload: &WalPayload) -> bool {
     !matches!(
         payload,
         WalPayload::BeginTxn { .. }
+            | WalPayload::CommitVisibility { .. }
             | WalPayload::CommitTxn { .. }
             | WalPayload::AbortTxn
             | WalPayload::EndTxn

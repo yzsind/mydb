@@ -169,6 +169,7 @@ pub(super) fn plan_persistent_alter(
                 | AlterAction::DropPrimaryKey
                 | AlterAction::ConvertToCharset { .. }
                 | AlterAction::MoveColumn { .. }
+                | AlterAction::SetColumnComment { .. }
         )
     });
     if indexes && !btree_indexes && stmt.actions.len() > 1 {

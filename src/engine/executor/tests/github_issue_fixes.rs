@@ -743,3 +743,339 @@ fn boolean_audit_bool_is_signed_tinyint() {
         "plain BOOL should render tinyint(1): {show}"
     );
 }
+
+#[test]
+fn issue_3_copy_modify_with_comment_is_atomic() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE alter_comment_repro (id INT PRIMARY KEY, `event` VARCHAR(128) NOT NULL COMMENT 'old', KEY event_idx (`event`))").unwrap();
+    engine
+        .execute("INSERT INTO alter_comment_repro VALUES (1, 'login')")
+        .unwrap();
+    engine.execute("ALTER TABLE alter_comment_repro MODIFY COLUMN `event` VARCHAR(32) NOT NULL COMMENT '事件'").unwrap();
+    let table = engine.database().table("test.alter_comment_repro").unwrap();
+    let column = &table.columns[table.column_index("event").unwrap()];
+    assert_eq!(column.comment, "事件");
+    assert!(matches!(
+        column.data_type,
+        crate::storage::DataTypeKind::VarChar { len: Some(32) }
+    ));
+    assert!(!column.nullable);
+    assert_eq!(rows(&engine, "SELECT id, `event` FROM alter_comment_repro FORCE INDEX(event_idx) WHERE `event`='login'"), vec![vec![Value::Int(1), Value::String("login".into())]]);
+}
+
+#[test]
+fn issue_5_index_join_after_column_reorder() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE parent (id INT PRIMARY KEY, payload INT NOT NULL)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT NOT NULL)")
+        .unwrap();
+    engine.execute("INSERT INTO parent VALUES (1,42)").unwrap();
+    engine.execute("INSERT INTO child VALUES (1,1)").unwrap();
+    engine
+        .execute("ALTER TABLE parent ADD COLUMN extra INT DEFAULT 7 AFTER id")
+        .unwrap();
+    assert_eq!(
+        rows(&engine, "SELECT id,extra,payload FROM parent"),
+        vec![vec![Value::Int(1), Value::Int(7), Value::Int(42)]]
+    );
+    assert_eq!(rows(&engine, "SELECT /*+ INDEX_NLJ(c,p) */ p.payload FROM child c LEFT JOIN parent p ON c.parent_id=p.id"), vec![vec![Value::Int(42)]]);
+}
+
+#[test]
+fn issue_6_group_by_unqualified_selected_column() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE measurements (item_id INT NOT NULL, amount INT NOT NULL)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE tags (item_id INT NOT NULL, tag VARCHAR(20))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO measurements VALUES (1,10),(1,20)")
+        .unwrap();
+    engine.execute("INSERT INTO tags VALUES (1,'tag')").unwrap();
+    assert_eq!(rows(&engine, "SELECT m.item_id, SUM(m.amount) AS total FROM measurements m LEFT JOIN tags t ON m.item_id=t.item_id GROUP BY item_id"), vec![vec![Value::Int(1),Value::DecimalCompact(30, 0)]]);
+}
+
+#[test]
+fn issue_3_copy_comment_lock_modes_rollback_and_reopen() {
+    for lock in ["DEFAULT", "EXCLUSIVE", "SHARED", "NONE"] {
+        let dir = tempfile::tempdir().unwrap();
+        let config = StorageConfig {
+            durability: crate::storage::DurabilityMode::Strict,
+            ..memory_test_storage_config()
+        };
+        {
+            let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+                dir.path(),
+                config.clone(),
+            )
+            .unwrap();
+            engine.execute("CREATE TABLE t (id INT PRIMARY KEY, v VARCHAR(128) NOT NULL COMMENT 'old', KEY ix(v))").unwrap();
+            engine.execute("INSERT INTO t VALUES (1,'login')").unwrap();
+            engine
+                .execute(&format!(
+                    "ALTER TABLE t MODIFY v VARCHAR(32) NOT NULL COMMENT '事件', LOCK={lock}"
+                ))
+                .unwrap();
+            let table = engine.database().table("test.t").unwrap();
+            assert_eq!(table.active_generation, 2, "one COPY for {lock}");
+            assert_eq!(
+                table.columns[table.column_index("v").unwrap()].comment,
+                "事件"
+            );
+            assert!(matches!(
+                table.columns[table.column_index("v").unwrap()].data_type,
+                crate::storage::DataTypeKind::VarChar { len: Some(32) }
+            ));
+            let before = rows(&engine, "SHOW CREATE TABLE t");
+            let generation = table.active_generation;
+            let err = engine
+                .execute(&format!(
+                    "ALTER TABLE t MODIFY v VARCHAR(3) NOT NULL COMMENT 'bad', LOCK={lock}"
+                ))
+                .unwrap_err();
+            assert_eq!(err.code(), 1406, "{lock}: {err:?}");
+            assert_eq!(rows(&engine, "SHOW CREATE TABLE t"), before);
+            assert_eq!(
+                engine.database().table("test.t").unwrap().active_generation,
+                generation
+            );
+            let err = engine
+                .execute(&format!(
+                    "ALTER TABLE t MODIFY v VARCHAR(16) NOT NULL COMMENT '{}', LOCK={lock}",
+                    "界".repeat(1025)
+                ))
+                .unwrap_err();
+            assert_eq!(err.code(), 1629, "{lock}: {err:?}");
+            assert_eq!(rows(&engine, "SHOW CREATE TABLE t"), before);
+            engine.execute(&format!("ALTER TABLE t CHANGE v renamed VARCHAR(16) NOT NULL COMMENT '改名' FIRST, LOCK={lock}")).unwrap();
+            let table = engine.database().table("test.t").unwrap();
+            assert_eq!(table.active_generation, 3);
+            assert_eq!(
+                table.columns[table.column_index("renamed").unwrap()].comment,
+                "改名"
+            );
+            assert_eq!(
+                rows(
+                    &engine,
+                    "SELECT renamed,id FROM t FORCE INDEX(ix) WHERE renamed='login'"
+                ),
+                vec![vec![Value::String("login".into()), Value::Int(1)]]
+            );
+        }
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            config,
+        )
+        .unwrap();
+        let table = engine.database().table("test.t").unwrap();
+        assert_eq!(
+            table.columns[table.column_index("renamed").unwrap()].comment,
+            "改名"
+        );
+        assert_eq!(
+            rows(
+                &engine,
+                "SELECT renamed,id FROM t FORCE INDEX(ix) WHERE renamed='login'"
+            ),
+            vec![vec![Value::String("login".into()), Value::Int(1)]]
+        );
+    }
+}
+
+#[test]
+fn issue_5_index_join_reordered_and_dropped_columns_matrix() {
+    use crate::engine::executor::vec::{with_vec_mode, VecMode};
+    for ddl in [
+        "ALTER TABLE parent ADD extra INT DEFAULT 7 FIRST",
+        "ALTER TABLE parent ADD extra INT DEFAULT 7 AFTER id",
+        "ALTER TABLE parent MODIFY payload INT NOT NULL FIRST",
+        "ALTER TABLE parent DROP unused",
+        "ALTER TABLE parent DROP unused, ADD extra INT DEFAULT 7 FIRST",
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = open_test_engine(dir.path());
+        engine.execute("CREATE TABLE parent (unused INT, id INT PRIMARY KEY, lookup_id INT, payload INT NOT NULL, text_value VARCHAR(20), KEY ix(lookup_id))").unwrap();
+        engine
+            .execute("CREATE TABLE child (id INT PRIMARY KEY, parent_id INT NOT NULL)")
+            .unwrap();
+        engine
+            .execute("INSERT INTO parent VALUES (0,1,1,42,'first'),(0,2,1,84,'second')")
+            .unwrap();
+        engine
+            .execute("INSERT INTO child VALUES (1,1),(2,99)")
+            .unwrap();
+        engine.execute(ddl).unwrap();
+        for mode in [VecMode::Off, VecMode::On] {
+            with_vec_mode(mode, || {
+                for join in ["JOIN", "LEFT JOIN"] {
+                    for key in ["id", "lookup_id"] {
+                        for projection in [
+                            "p.payload",
+                            "p.text_value",
+                            "p.id,p.payload,p.text_value",
+                            "c.id",
+                            "p.*",
+                        ] {
+                            let query = |hint| {
+                                format!("SELECT /*+ {hint}(c,p) */ {projection} FROM child c {join} parent p ON c.parent_id=p.{key} AND p.payload>0 ORDER BY c.id,p.id")
+                            };
+                            let expected = rows(&engine, &query("HASH_JOIN"));
+                            assert_eq!(
+                                rows(&engine, &query("INDEX_NLJ")),
+                                expected,
+                                "{ddl}: {}",
+                                query("INDEX_NLJ")
+                            );
+                        }
+                    }
+                }
+            });
+        }
+    }
+}
+
+#[test]
+fn issue_6_group_by_output_names_preserve_ambiguity_and_precedence() {
+    use crate::engine::executor::vec::{with_vec_mode, VecMode};
+    use crate::engine::params::with_params;
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE measurements (item_id INT NOT NULL, amount INT NOT NULL)")
+        .unwrap();
+    engine
+        .execute("CREATE TABLE tags (item_id INT NOT NULL, tag VARCHAR(20))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO measurements VALUES (1,10),(1,20),(2,40)")
+        .unwrap();
+    engine.execute("INSERT INTO tags VALUES (1,'tag')").unwrap();
+    let source = "FROM measurements m LEFT JOIN tags t ON m.item_id=t.item_id";
+    for mode in [VecMode::Off, VecMode::On] {
+        for sql_mode in [
+            "STRICT_TRANS_TABLES",
+            "STRICT_TRANS_TABLES,ONLY_FULL_GROUP_BY",
+        ] {
+            with_vec_mode(mode, || {
+                let mut session = SessionContext::default();
+                engine
+                    .execute_with_session(&mut session, &format!("SET sql_mode='{sql_mode}'"))
+                    .unwrap();
+                for select in ["m.item_id", "m.item_id AS item_id", "m.item_id,m.item_id"] {
+                    let query = format!("SELECT {select},SUM(m.amount) {source} GROUP BY ITEM_ID ORDER BY m.item_id");
+                    let expected = rows(
+                        &engine,
+                        &query.replace("GROUP BY ITEM_ID", "GROUP BY m.item_id"),
+                    );
+                    assert_eq!(
+                        super::support::result_rows(
+                            engine.execute_with_session(&mut session, &query).unwrap()
+                        ),
+                        expected,
+                        "{query}"
+                    );
+                }
+                for projection in [
+                    "item_id",
+                    "m.item_id,t.item_id",
+                    "m.item_id,t.tag AS item_id",
+                    "SUM(m.amount)",
+                    "m.item_id,t.*",
+                    "m.item_id,m.*,t.*",
+                ] {
+                    let query = format!("SELECT {projection} {source} GROUP BY item_id");
+                    let err = engine
+                        .execute_with_session(&mut session, &query)
+                        .unwrap_err();
+                    // Full-group validation can reject the conflicting alias
+                    // before input-name validation reaches the ambiguity.
+                    if sql_mode.contains("ONLY_FULL_GROUP_BY") && projection.contains("AS item_id")
+                    {
+                        assert_eq!(err.code(), 1055, "{query}");
+                    } else {
+                        assert_eq!(err.code(), 1052, "{query}");
+                    }
+                }
+                for projection in ["m.*", "m.*,m.item_id"] {
+                    let query = format!("SELECT {projection},SUM(m.amount) {source} GROUP BY item_id,m.amount ORDER BY m.item_id,m.amount");
+                    let expected = rows(
+                        &engine,
+                        &query.replace("GROUP BY item_id,", "GROUP BY m.item_id,"),
+                    );
+                    assert_eq!(
+                        super::support::result_rows(
+                            engine.execute_with_session(&mut session, &query).unwrap()
+                        ),
+                        expected,
+                        "{query}"
+                    );
+                }
+                let query = format!("SELECT m.item_id,SUM(m.amount) {source} GROUP BY item_id WITH ROLLUP ORDER BY m.item_id");
+                let expected = rows(
+                    &engine,
+                    &query.replace("GROUP BY item_id", "GROUP BY m.item_id"),
+                );
+                assert_eq!(
+                    super::support::result_rows(
+                        engine.execute_with_session(&mut session, &query).unwrap()
+                    ),
+                    expected
+                );
+                let query = format!("SELECT m.item_id,SUM(m.amount) {source} WHERE m.amount>? GROUP BY item_id ORDER BY m.item_id");
+                let prepared = engine.prepare_cached(&mut session, &query, 1).unwrap();
+                let result = with_params(vec![Value::Int(5)], || {
+                    engine
+                        .execute_prepared_statement(&mut session, &query, prepared.as_ref().clone())
+                        .unwrap()
+                        .unwrap()
+                })
+                .materialize()
+                .unwrap();
+                assert_eq!(
+                    super::support::result_rows(result),
+                    vec![
+                        vec![Value::Int(1), Value::DecimalCompact(30, 0)],
+                        vec![Value::Int(2), Value::DecimalCompact(40, 0)]
+                    ]
+                );
+            });
+        }
+    }
+    let mut session = SessionContext::default();
+    engine
+        .execute_with_session(&mut session, "SET sql_mode='STRICT_TRANS_TABLES'")
+        .unwrap();
+    assert_eq!(
+        super::support::result_rows(engine.execute_with_session(
+            &mut session,
+            "SELECT m.amount AS item_id,COUNT(*) FROM measurements m GROUP BY item_id ORDER BY 2"
+        ).unwrap()),
+        vec![
+            vec![Value::Int(40), Value::Int(1)],
+            vec![Value::Int(10), Value::Int(2)]
+        ]
+    );
+    let inner = format!("SELECT m.item_id,SUM(m.amount) AS total {source} GROUP BY item_id");
+    assert_eq!(
+        super::support::result_rows(
+            engine
+                .execute_with_session(
+                    &mut session,
+                    &format!("SELECT * FROM ({inner}) grouped ORDER BY item_id")
+                )
+                .unwrap()
+        ),
+        vec![
+            vec![Value::Int(1), Value::DecimalCompact(30, 0)],
+            vec![Value::Int(2), Value::DecimalCompact(40, 0)]
+        ]
+    );
+}

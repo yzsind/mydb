@@ -3231,6 +3231,7 @@ impl TransactionManager {
             if !matches!(
                 header.record_type,
                 WalRecordType::CheckpointEnd
+                    | WalRecordType::CommitVisibility
                     | WalRecordType::BeginTxn
                     | WalRecordType::CommitTxn
                     | WalRecordType::AbortTxn
@@ -3249,6 +3250,14 @@ impl TransactionManager {
                 } => {
                     manager.next_txn_id = manager.next_txn_id.max(*next_txn_id);
                     manager.next_scn = manager.next_scn.max(*next_scn);
+                }
+                WalPayload::CommitVisibility {
+                    resolved_scn,
+                    visible_scn,
+                } => {
+                    manager.next_scn = manager
+                        .next_scn
+                        .max(resolved_scn.max(visible_scn).saturating_add(1));
                 }
                 WalPayload::BeginTxn { start_scn } => {
                     manager.next_txn_id = manager.next_txn_id.max(record.txn_id + 1);
@@ -3793,9 +3802,9 @@ impl TransactionManager {
         self.commit_frontier
     }
 
-    /// Seed the resolved frontier from a source snapshot carried by replicated
-    /// WAL. A streamed `BeginTxn.start_scn` means every SCN at or below that
-    /// value was already published before the transaction began. On a fresh
+    /// Seed the resolved frontier from a source snapshot or visibility proof
+    /// carried by replicated WAL. `BeginTxn.start_scn` and the visible prefix
+    /// in `CommitVisibility` certify that earlier SCNs are resolved. On a fresh
     /// physical replica those earlier transactions can be present only in the
     /// base backup, so waiting for their WAL records would stall visibility
     /// forever.

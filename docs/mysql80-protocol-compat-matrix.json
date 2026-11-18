@@ -52,20 +52,22 @@
     "source_sha256": {
       "src/mysql/protocol.rs": "7d56b1c0915b1cda9ec91015f9d03c14e68a24942e2db54289530f685608c503",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "9f5222f5fb7f26d5daff93b48dc14598b3b69d006c975d9a328e3dbd61d10f3d",
-      "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023"
+      "src/mysql/session.rs": "f18c77aff8561e1c69670ee95cfc6b1416a0c619e6a86d091e6bedd5b78e1066",
+      "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023",
+      "src/mysql/peer_monitor.rs": "0ea7dc6481c8bdd31dbafcaa86dfe81aa0212cc638cd0e4324843205d80187fc"
     },
     "test_sources": [
       "src/mysql/session/auth_handshake_tests.rs",
       "src/mysql/session/stream_header_contract_tests.rs",
       "src/rest/tests.rs",
       "src/engine/executor/tests/rest_access_keys.rs",
-      "src/mysql/session/auth_handshake_tests.rs",
       "src/engine/executor/tests/dump_compatibility.rs",
       "src/engine/executor/tests/mysql80_compat_binlog_multi.rs",
       "src/mysql/server.rs",
       "src/binlog/audit_tests.rs",
-      "src/engine/executor/tests/mysql80_compat_auth.rs"
+      "src/engine/executor/tests/mysql80_compat_auth.rs",
+      "src/mysql/session/disconnect_tests.rs",
+      "src/mysql/peer_monitor.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
   }

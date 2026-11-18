@@ -1009,11 +1009,43 @@ impl Database {
     /// `ScnFrontierGuard` void path and by XA prepare. Monotonic via
     /// `fetch_max`.
     pub(crate) fn complete_commit_frontier(&self, scn: u64) {
+        // Order the proof before resolving the slot-side frontier: another
+        // publisher can immediately acknowledge commits above this void SCN.
+        // The prefix sampled here is already visible; a larger frontier may
+        // still be blocked behind earlier concurrent commits.
+        if let Err(err) = self.persist_commit_visibility(scn, self.visible_scn()) {
+            self.quarantine_mvcc(format!("commit visibility WAL failed: {}", err.message()));
+        }
         let frontier = {
             let mut txns = self.txns.write();
             txns.mark_frontier_done(scn)
         };
         self.publish_visible_frontier(frontier);
+    }
+
+    fn persist_commit_visibility(
+        &self,
+        resolved_scn: u64,
+        visible_scn: u64,
+    ) -> Result<(), QueryError> {
+        let lsn = self.append_wal(
+            0,
+            WalPayload::CommitVisibility {
+                resolved_scn,
+                visible_scn,
+            },
+        )?;
+        if self.config.durability == DurabilityMode::Strict {
+            LogManager::sync_durable_to(&self.log, lsn)?;
+        }
+        Ok(())
+    }
+
+    /// Persist the recovered/promotion prefix before a sender can expose WAL.
+    /// Every earlier data record precedes this proof in the same WAL stream.
+    pub(crate) fn log_replication_visibility(&self) -> Result<(), QueryError> {
+        let frontier = self.visible_scn();
+        self.persist_commit_visibility(frontier, frontier)
     }
 }
 
@@ -3019,6 +3051,20 @@ impl Database {
         crate::wal::with_promotion_wal(|| {
             for txn_id in active_ids.iter().copied() {
                 self.rollback_txn(txn_id)?;
+            }
+            if self.physical_replica_mode() {
+                // The old source is fenced and all active writers have been
+                // compensated. Unreceived commit reservations cannot resolve
+                // on this timeline; preserve the received committed prefix.
+                let resolved = self
+                    .txns
+                    .read()
+                    .next_scn
+                    .max(self.next_scn_atomic.load(Ordering::Acquire))
+                    .saturating_sub(1);
+                self.persist_commit_visibility(resolved, resolved)?;
+                let frontier = self.txns.write().seed_commit_frontier(resolved);
+                self.publish_visible_frontier(frontier);
             }
             Ok(active_ids.len())
         })

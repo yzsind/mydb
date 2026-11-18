@@ -187,6 +187,7 @@ impl Database {
                 | A::DropColumn(_)
                 | A::DropIndex(_)
                 | A::MoveColumn { .. }
+                | A::SetColumnComment { .. }
                 | A::ConvertToCharset { .. } => true,
                 _ => false,
             })

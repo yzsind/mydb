@@ -94,6 +94,10 @@ pub fn start_bound(
         )
     })?;
 
+    if let Some(db) = &init.db {
+        db.log_replication_visibility()?;
+    }
+
     let tracker = Arc::new(SenderTracker::default());
     let shutdown = Arc::new(Notify::new());
     let shutdown_flag = Arc::new(AtomicBool::new(false));
@@ -256,6 +260,43 @@ mod tests {
     use tempfile::TempDir;
     use tokio::io::{AsyncWriteExt, BufReader, BufWriter};
     use tokio::net::TcpStream;
+
+    #[tokio::test]
+    async fn master_start_persists_visibility_before_accepting_replicas() {
+        let dir = TempDir::new().unwrap();
+        let db = Arc::new(crate::storage::Database::open(dir.path()).unwrap());
+        let log = db.wal_log();
+        let start_lsn = log.lock().next_lsn();
+        let svc = start(MasterServiceInit {
+            bind_host: "127.0.0.1".into(),
+            bind_port: 0,
+            config: ReplConfig::test_defaults(),
+            master_uuid: [0xAA; 16],
+            epoch: 1,
+            server_version: "test-master".into(),
+            log: Arc::clone(&log),
+            slots: Arc::new(PlMutex::new(SlotRegistry::open(dir.path()).unwrap())),
+            db: Some(Arc::clone(&db)),
+            data_dir: Some(dir.path().to_path_buf()),
+            role_state: None,
+        })
+        .await
+        .unwrap();
+        let end_lsn = log.lock().last_lsn();
+        assert!(end_lsn >= start_lsn);
+        assert!(log.lock().durable_lsn() >= end_lsn);
+        let chunk = crate::wal::WalReader::open(&log, start_lsn)
+            .unwrap()
+            .next_chunk(end_lsn, 1 << 20)
+            .unwrap()
+            .unwrap();
+        let proof = crate::wal::decode_frame_for_replication(&chunk.bytes).unwrap();
+        assert!(matches!(proof.payload, WalPayload::CommitVisibility {
+            resolved_scn, visible_scn,
+        } if resolved_scn == db.read_only_statement_view(crate::storage::IsolationLevel::ReadCommitted, None).snapshot_scn
+            && visible_scn == resolved_scn));
+        svc.shutdown().await;
+    }
 
     fn append_filler_records(log: &Arc<crate::wal::LogMutex>, n: usize) -> Vec<u64> {
         let mut g = log.lock();

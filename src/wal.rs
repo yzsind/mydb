@@ -393,6 +393,7 @@ pub enum WalRecordType {
     SpatialPageBatch = 41,
     SpatialIndexUndo = 42,
     SpatialIndexClr = 43,
+    CommitVisibility = 44,
 }
 
 impl WalRecordType {
@@ -440,6 +441,7 @@ impl WalRecordType {
             41 => Self::SpatialPageBatch,
             42 => Self::SpatialIndexUndo,
             43 => Self::SpatialIndexClr,
+            44 => Self::CommitVisibility,
             38 => Self::VectorIndexModel,
             _ => {
                 return Err(error(
@@ -482,6 +484,12 @@ pub enum WalPayload {
         skip_lsn_start: u64,
         skip_lsn_end: u64,
         compensated: Vec<u64>,
+    },
+    /// Source proof of a resolved SCN and its fully published prefix. This
+    /// preserves voided commit allocations and recovery visibility on replicas.
+    CommitVisibility {
+        resolved_scn: u64,
+        visible_scn: u64,
     },
     BeginTxn {
         start_scn: u64,
@@ -2526,6 +2534,12 @@ impl LogManager {
         payload: WalPayload,
         prehash: bool,
     ) -> Result<PreEncodedRecord, QueryError> {
+        if txn_id != 0 && matches!(payload, WalPayload::CommitVisibility { .. }) {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "commit visibility proof must be system-scoped",
+            ));
+        }
         if let WalPayload::TxnBatch { records } = &payload {
             validate_txn_batch_records(records)?;
         }
@@ -3114,10 +3128,14 @@ impl LogManager {
             ));
         }
         let _admission = crate::engine::executor::mem_budget::StorageLatchAdmissionScope::enter();
-        if matches!(&payload, WalPayload::PageDelta { .. }) && txn_id != 0 {
+        if matches!(
+            &payload,
+            WalPayload::PageDelta { .. } | WalPayload::CommitVisibility { .. }
+        ) && txn_id != 0
+        {
             return Err(error(
                 crate::error::catalog::ER_GET_ERRNO,
-                "page delta must be system-scoped",
+                "WAL control record must be system-scoped",
             ));
         }
         if self.read_only {
@@ -3883,6 +3901,7 @@ impl LogManager {
         if matches!(
             payload,
             WalPayload::BeginTxn { .. }
+                | WalPayload::CommitVisibility { .. }
                 | WalPayload::CommitTxn { .. }
                 | WalPayload::Clr { .. }
                 | WalPayload::FileClr { .. }
@@ -4082,6 +4101,12 @@ fn inspect_wal_frame(bytes: &[u8]) -> Result<(WalRecordHeader, usize), QueryErro
         ));
     }
     let header = read_record_header(bytes)?;
+    if header.record_type == WalRecordType::CommitVisibility && header.txn_id != 0 {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "commit visibility proof must be system-scoped",
+        ));
+    }
     let reserved = read_u16(bytes, 34);
     if reserved != 0 {
         return Err(error(
@@ -4684,8 +4709,10 @@ fn frame_logical_start(ty: WalRecordType, lsn: u64, payload: &[u8]) -> Result<u6
         let ty = WalRecordType::from_u16(read_u16_checked(payload, &mut offset)?)?;
         let len = read_u32_checked(payload, &mut offset)? as usize;
         files_only &= ty == WalRecordType::FileCreate;
-        if matches!(ty, WalRecordType::TxnBatch | WalRecordType::PageDelta)
-            || (index + 1 == count && ty != WalRecordType::CommitTxn && !files_only)
+        if matches!(
+            ty,
+            WalRecordType::TxnBatch | WalRecordType::PageDelta | WalRecordType::CommitVisibility
+        ) || (index + 1 == count && ty != WalRecordType::CommitTxn && !files_only)
         {
             return Err(io_err(std::io::Error::other("invalid WAL batch structure")));
         }
@@ -4713,7 +4740,9 @@ fn validate_txn_batch_records(records: &[WalPayload]) -> Result<(), QueryError> 
         || records.iter().any(|record| {
             matches!(
                 record,
-                WalPayload::TxnBatch { .. } | WalPayload::PageDelta { .. }
+                WalPayload::TxnBatch { .. }
+                    | WalPayload::PageDelta { .. }
+                    | WalPayload::CommitVisibility { .. }
             )
         })
     {
@@ -4914,6 +4943,7 @@ impl WalPayload {
             WalPayload::PageDelta { .. } => WalRecordType::PageDelta,
             WalPayload::BeginTxn { .. } => WalRecordType::BeginTxn,
             WalPayload::CommitTxn { .. } => WalRecordType::CommitTxn,
+            WalPayload::CommitVisibility { .. } => WalRecordType::CommitVisibility,
             WalPayload::AbortTxn => WalRecordType::AbortTxn,
             WalPayload::EndTxn => WalRecordType::EndTxn,
             WalPayload::PageUpdate { .. } => WalRecordType::PageUpdate,
@@ -5906,10 +5936,14 @@ fn encode_record(record: &WalRecord) -> Result<Vec<u8>, QueryError> {
 /// that Vec growth still cost when the per-record buffer outgrew its
 /// initial 8-byte capacity.
 fn encode_record_into(record: &WalRecord, out: &mut Vec<u8>) -> Result<(), QueryError> {
-    if matches!(&record.payload, WalPayload::PageDelta { .. }) && record.txn_id != 0 {
+    if matches!(
+        &record.payload,
+        WalPayload::PageDelta { .. } | WalPayload::CommitVisibility { .. }
+    ) && record.txn_id != 0
+    {
         return Err(error(
             crate::error::catalog::ER_GET_ERRNO,
-            "page delta must be system-scoped",
+            "WAL control record must be system-scoped",
         ));
     }
     let payload_len = encoded_payload_len(&record.payload)?;
@@ -5953,6 +5987,13 @@ fn encode_payload_into(payload: &WalPayload, mut out: &mut Vec<u8>) -> Result<()
                     write_u64_vec(&mut out, *len);
                 }
             }
+        }
+        WalPayload::CommitVisibility {
+            resolved_scn,
+            visible_scn,
+        } => {
+            write_u64_vec(&mut out, *resolved_scn);
+            write_u64_vec(&mut out, *visible_scn);
         }
         WalPayload::BeginTxn { start_scn } => write_u64_vec(&mut out, *start_scn),
         WalPayload::CommitTxn {
@@ -6304,7 +6345,10 @@ fn encode_payload_into(payload: &WalPayload, mut out: &mut Vec<u8>) -> Result<()
         WalPayload::TxnBatch { records } => {
             write_u32_vec(&mut out, records.len() as u32);
             for record in records {
-                if matches!(record, WalPayload::TxnBatch { .. }) {
+                if matches!(
+                    record,
+                    WalPayload::TxnBatch { .. } | WalPayload::CommitVisibility { .. }
+                ) {
                     return Err(error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "nested WAL transaction batch",
@@ -6465,6 +6509,7 @@ fn encoded_payload_len(payload: &WalPayload) -> Result<usize, QueryError> {
             },
         ]),
         WalPayload::BeginTxn { .. } => Ok(8),
+        WalPayload::CommitVisibility { .. } => Ok(16),
         WalPayload::CommitTxn { binlog: None, .. } => Ok(16),
         WalPayload::CommitTxn {
             binlog: Some(binlog),
@@ -6676,7 +6721,10 @@ fn encoded_payload_len(payload: &WalPayload) -> Result<usize, QueryError> {
         WalPayload::TxnBatch { records } => {
             let mut len = 4usize;
             for record in records {
-                if matches!(record, WalPayload::TxnBatch { .. }) {
+                if matches!(
+                    record,
+                    WalPayload::TxnBatch { .. } | WalPayload::CommitVisibility { .. }
+                ) {
                     return Err(error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "nested WAL transaction batch",
@@ -6762,6 +6810,10 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
                 action,
             }
         }
+        WalRecordType::CommitVisibility => WalPayload::CommitVisibility {
+            resolved_scn: read_u64_checked(input, &mut offset)?,
+            visible_scn: read_u64_checked(input, &mut offset)?,
+        },
         WalRecordType::BeginTxn => WalPayload::BeginTxn {
             start_scn: read_u64_checked(input, &mut offset)?,
         },
@@ -7225,7 +7277,10 @@ fn decode_payload(record_type: WalRecordType, input: &[u8]) -> Result<WalPayload
             let mut records = Vec::with_capacity(count);
             for _ in 0..count {
                 let ty = WalRecordType::from_u16(read_u16_checked(input, &mut offset)?)?;
-                if ty == WalRecordType::TxnBatch {
+                if matches!(
+                    ty,
+                    WalRecordType::TxnBatch | WalRecordType::CommitVisibility
+                ) {
                     return Err(error(
                         crate::error::catalog::ER_GET_ERRNO,
                         "nested WAL transaction batch",

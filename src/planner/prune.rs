@@ -616,14 +616,15 @@ pub(super) fn join_prune_walk(
             let left_fields = join_prune_walk(left, &child_needed, true)?;
             let right_fields_full = join_prune_table_fields(right_table, None);
             if !semi_anti {
+                // Field order is logical; executor projections address schema slots.
                 let mut keep: Vec<usize> = right_fields_full
                     .iter()
-                    .enumerate()
-                    .filter(|(_, field)| child_needed.matches(field))
-                    .map(|(i, _)| i)
+                    .zip(right_table.schema.iter_visible_columns())
+                    .filter(|(field, _)| child_needed.matches(field))
+                    .map(|(_, (i, _))| i)
                     .collect();
                 if keep.is_empty() && !right_fields_full.is_empty() {
-                    keep.push(0);
+                    keep.push(right_table.schema.iter_visible_columns().next()?.0);
                 }
                 if keep.len() == right_fields_full.len() {
                     *right_projected_columns = None;

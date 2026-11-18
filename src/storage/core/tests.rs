@@ -31242,3 +31242,253 @@ fn release1106_replica_vector_journal_does_not_retain_transaction_payloads() {
         Some(1)
     );
 }
+
+#[test]
+fn replication_resolves_a_voided_commit_scn_without_another_transaction() {
+    let source_dir = tempfile::tempdir().unwrap();
+    let replica_dir = tempfile::tempdir().unwrap();
+    let source = open_relaxed_test_db(source_dir.path());
+    let replica = open_relaxed_test_db(replica_dir.path());
+    // The CI history committed SCNs 170, 171 and 173; the process died
+    // after reserving 172 but before logging that transaction's commit.
+    for db in [&source, &replica] {
+        for (index, payload) in [
+            WalPayload::BeginTxn { start_scn: 169 },
+            WalPayload::CommitTxn {
+                commit_scn: 170,
+                commit_unix_us: 170,
+                binlog: None,
+            },
+            WalPayload::CommitTxn {
+                commit_scn: 171,
+                commit_unix_us: 171,
+                binlog: None,
+            },
+            WalPayload::CommitTxn {
+                commit_scn: 173,
+                commit_unix_us: 173,
+                binlog: None,
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            db.apply_wal_record(&WalRecord {
+                source_time_us: 0,
+                lsn: index as u64 + 1,
+                prev_txn_lsn: 0,
+                txn_id: index as u64 + 100,
+                payload,
+            })
+            .unwrap();
+        }
+        assert_eq!(db.visible_scn(), 171);
+    }
+    let start = source.log.lock().next_lsn();
+    {
+        // A session's reduced-redo policy must not suppress transaction
+        // control proofs needed by an existing replication stream.
+        let _redo = RedoScopeGuard::new(false);
+        source.complete_commit_frontier(172);
+    }
+    assert_eq!(source.visible_scn(), 173);
+    source.log.lock().flush().unwrap();
+    let end = source.log.lock().last_lsn();
+    let mut reader = crate::wal::WalReader::open(&source.log, start).unwrap();
+    while let Some(chunk) = reader.next_chunk(end, 1 << 20).unwrap() {
+        let mut offset = 0;
+        while offset < chunk.bytes.len() {
+            let frame = crate::wal::decode_frame_for_replication(&chunk.bytes[offset..]).unwrap();
+            offset += frame.frame_len;
+            replica
+                .apply_wal_record(&WalRecord {
+                    source_time_us: frame.header.source_time_us,
+                    lsn: frame.header.lsn,
+                    prev_txn_lsn: frame.header.prev_txn_lsn,
+                    txn_id: frame.header.txn_id,
+                    payload: frame.payload,
+                })
+                .unwrap();
+        }
+    }
+    assert_eq!(
+        replica.visible_scn(),
+        source.visible_scn(),
+        "a fully applied replica must see the source's resolved commit prefix"
+    );
+}
+
+#[test]
+fn replication_visibility_proof_preserves_unresolved_earlier_scns() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let apply = |lsn, txn_id, payload| {
+        db.apply_wal_record(&WalRecord {
+            source_time_us: 0,
+            lsn,
+            prev_txn_lsn: 0,
+            txn_id,
+            payload,
+        })
+        .unwrap()
+    };
+    apply(1, 10, WalPayload::BeginTxn { start_scn: 100 });
+    apply(
+        2,
+        13,
+        WalPayload::CommitTxn {
+            commit_scn: 103,
+            commit_unix_us: 103,
+            binlog: None,
+        },
+    );
+    apply(
+        3,
+        0,
+        WalPayload::CommitVisibility {
+            resolved_scn: 102,
+            visible_scn: 100,
+        },
+    );
+    assert_eq!(db.visible_scn(), 100, "SCN 101 is still unresolved");
+    apply(
+        4,
+        11,
+        WalPayload::CommitTxn {
+            commit_scn: 101,
+            commit_unix_us: 101,
+            binlog: None,
+        },
+    );
+    assert_eq!(db.visible_scn(), 103);
+    apply(
+        5,
+        0,
+        WalPayload::CommitVisibility {
+            resolved_scn: 102,
+            visible_scn: 100,
+        },
+    );
+    assert_eq!(
+        db.visible_scn(),
+        103,
+        "replay must be monotonic and idempotent"
+    );
+    assert!(db
+        .apply_wal_record(&WalRecord {
+            source_time_us: 0,
+            lsn: 6,
+            prev_txn_lsn: 0,
+            txn_id: 20,
+            payload: WalPayload::CommitVisibility {
+                resolved_scn: 200,
+                visible_scn: 200
+            },
+        })
+        .is_err());
+    assert_eq!(db.visible_scn(), 103);
+}
+
+#[test]
+fn replication_recovery_visibility_proof_survives_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let db = open_relaxed_test_db(dir.path());
+        // Startup recovery resolves all allocated positions in the recovered
+        // range. Persist that proof before any new foreground BEGIN occurs.
+        let frontier = db.txns.write().seed_commit_frontier(173);
+        db.publish_visible_frontier(frontier);
+        db.log_replication_visibility().unwrap();
+        db.log.lock().flush().unwrap();
+    }
+    let db = open_relaxed_test_db(dir.path());
+    assert!(db.visible_scn() >= 173);
+    assert!(
+        db.next_scn_atomic.load(Ordering::Acquire) >= 174,
+        "recovery must not reuse an already resolved SCN"
+    );
+}
+
+#[test]
+fn replication_promotion_closes_abandoned_commit_scn_gaps() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.set_physical_replica_mode(true).unwrap();
+    for (index, payload) in [
+        WalPayload::BeginTxn { start_scn: 100 },
+        WalPayload::CommitTxn {
+            commit_scn: 103,
+            commit_unix_us: 103,
+            binlog: None,
+        },
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        db.apply_wal_record(&WalRecord {
+            source_time_us: 0,
+            lsn: index as u64 + 1,
+            prev_txn_lsn: 0,
+            txn_id: index as u64 + 10,
+            payload,
+        })
+        .unwrap();
+    }
+    assert_eq!(db.visible_scn(), 100);
+    assert_eq!(db.rollback_all_active_replication_txns().unwrap(), 1);
+    assert_eq!(db.visible_scn(), 103);
+    db.set_physical_replica_mode(false).unwrap();
+    let next = db.begin_txn().unwrap();
+    assert!(next.snapshot_scn >= 103);
+    db.rollback_txn(next.txn_id).unwrap();
+}
+
+#[test]
+fn voided_commit_scn_is_not_published_before_its_wal_proof() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    let base = db.visible_scn();
+    // A later publication cannot cross the unresolved SCN until its proof
+    // has passed the WAL serialization point.
+    let wal = db.log.lock();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+    let worker_db = Arc::clone(&db);
+    let worker_barrier = Arc::clone(&barrier);
+    let worker = crate::util::thread_spawn::spawn(move || {
+        worker_barrier.wait();
+        worker_db.complete_commit_frontier(base + 1);
+    });
+    barrier.wait();
+    std::thread::sleep(Duration::from_millis(75));
+    let frontier = db.txns.write().mark_frontier_done(base + 2);
+    db.publish_visible_frontier(frontier);
+    let observed = db.visible_scn();
+    drop(wal);
+    worker.join().unwrap();
+    assert_eq!(
+        observed, base,
+        "a concurrent publisher crossed an unlogged void completion"
+    );
+    assert_eq!(db.visible_scn(), base + 2);
+}
+
+#[test]
+fn replication_visibility_proof_uses_wal_pressure_emergency_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let before_lsn = db.log.lock().last_lsn();
+    let budget = &db.capture.budget;
+    budget.pending.store(1, Ordering::Release);
+    budget.limit.store(1, Ordering::Release);
+    budget.enabled.store(true, Ordering::Release);
+    assert!(budget.check(1).is_err());
+    let proof = db.log_replication_visibility();
+    budget.enabled.store(false, Ordering::Release);
+    proof.expect("visibility proofs must drain admitted work under WAL pressure");
+    assert!(db.log.lock().last_lsn() > before_lsn);
+    assert!(
+        budget.pending.load(Ordering::Acquire) > 1,
+        "emergency control records must still count towards retained WAL"
+    );
+    db.ensure_operational().unwrap();
+}
