@@ -3901,6 +3901,7 @@ impl LogManager {
         if matches!(
             payload,
             WalPayload::BeginTxn { .. }
+                | WalPayload::CommitVisibility { .. }
                 | WalPayload::CommitTxn { .. }
                 | WalPayload::Clr { .. }
                 | WalPayload::FileClr { .. }
@@ -7814,11 +7815,21 @@ pub(crate) fn wal_force_recover_enabled() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
 fn preallocate_segment(file: &File, bytes: u64) -> std::io::Result<()> {
     if bytes == 0 || !wal_preallocate_enabled() {
         return Ok(());
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    return allocate_physical_range(file, bytes);
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = file;
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn allocate_physical_range(file: &File, bytes: u64) -> std::io::Result<()> {
     let rc = unsafe { libc::posix_fallocate(file.as_raw_fd(), 0, bytes as libc::off_t) };
     if rc == 0 {
         Ok(())
@@ -7828,10 +7839,7 @@ fn preallocate_segment(file: &File, bytes: u64) -> std::io::Result<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn preallocate_segment(file: &File, bytes: u64) -> std::io::Result<()> {
-    if bytes == 0 || !wal_preallocate_enabled() {
-        return Ok(());
-    }
+pub(crate) fn allocate_physical_range(file: &File, bytes: u64) -> std::io::Result<()> {
     // `fstore_t` layout matches `<sys/fcntl.h>` on macOS. We ask for a
     // contiguous range first; on failure the kernel falls back to a
     // best-effort allocation which is still useful.
@@ -7875,8 +7883,8 @@ fn preallocate_segment(file: &File, bytes: u64) -> std::io::Result<()> {
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn preallocate_segment(_file: &File, _bytes: u64) -> std::io::Result<()> {
-    Ok(())
+pub(crate) fn allocate_physical_range(_file: &File, _bytes: u64) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 fn io_err(err: std::io::Error) -> QueryError {

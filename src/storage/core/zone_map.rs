@@ -10668,6 +10668,7 @@ impl Database {
         if should_stop() {
             return Ok(0);
         }
+        let _page_access = zone_map_page::MaintenanceAccessScope::enter();
         let ratio = self.zone_map_rebuild_ratio();
         let tables = self
             .catalog_read()?

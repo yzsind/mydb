@@ -276,8 +276,9 @@ pub fn shutdown_timeout() -> std::time::Duration {
 /// Safe re-exec relies on all data-dir / WAL / lock / socket fds being
 /// `O_CLOEXEC` (Rust std / tokio default on Linux+macOS), so `execve`
 /// closes them and the fresh image re-opens, re-locks, and re-binds
-/// without conflict. Must be called only after the final checkpoint has
-/// durably flushed (see `graceful_shutdown`).
+/// without conflict. Call only after the engine has drained its writers and
+/// either completed the final checkpoint or left startup to recover a
+/// fail-stopped database (see `graceful_shutdown`).
 #[cfg(unix)]
 pub fn re_exec() -> ! {
     use std::ffi::CString;

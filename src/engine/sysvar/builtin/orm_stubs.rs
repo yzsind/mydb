@@ -8,7 +8,7 @@ use std::sync::OnceLock;
 
 use crate::engine::sysvar::backend::SysVar;
 use crate::engine::sysvar::ctx::WriteCtx;
-use crate::engine::sysvar::meta::{DataType, Scope, SysVarDef};
+use crate::engine::sysvar::meta::{Access, DataType, Scope, SelectType, SysVarDef};
 use crate::engine::sysvar::registry::Registry;
 use crate::engine::sysvar::value::SysVarValue;
 use crate::types::QueryError;
@@ -34,7 +34,7 @@ pub(crate) fn register(reg: &mut Registry) {
         SysVarDef::new(
             "max_error_count",
             Scope::Both,
-            DataType::Int { min: 0, max: 65535 },
+            DataType::UInt { min: 0, max: 65535 },
         )
         .with_doc("Maximum stored conditions; warning_count includes discarded conditions."),
         |ctx| {
@@ -215,27 +215,12 @@ fn register_innodb_stubs(reg: &mut Registry) {
         ("innodb_default_row_format", "DYNAMIC"),
         ("innodb_flush_method", "fsync"),
         ("innodb_doublewrite", "ON"),
-        ("innodb_file_per_table", "ON"),
-        ("innodb_adaptive_hash_index", "ON"),
-        ("innodb_print_all_deadlocks", "OFF"),
-        ("innodb_stats_on_metadata", "OFF"),
-        ("innodb_status_output", "OFF"),
-        ("innodb_status_output_locks", "OFF"),
-        ("innodb_log_compressed_pages", "ON"),
-        ("innodb_undo_log_truncate", "ON"),
         ("innodb_change_buffering", "all"),
         ("innodb_redo_log_archive_dirs", ""),
         ("innodb_temp_data_file_path", "ibtmp1:12M:autoextend"),
         ("innodb_undo_directory", "./"),
         ("innodb_data_home_dir", ""),
         ("innodb_data_file_path", "ibdata1:12M:autoextend"),
-        ("innodb_force_recovery", "0"),
-        ("innodb_force_load_corrupted", "OFF"),
-        ("innodb_rollback_on_timeout", "OFF"),
-        ("innodb_table_locks", "ON"),
-        ("innodb_compression_failure_threshold_pct", "5"),
-        ("innodb_compression_level", "6"),
-        ("innodb_log_writer_threads", "ON"),
     ];
     for &(name, value) in str_stubs {
         let v = value.to_string();
@@ -243,6 +228,43 @@ fn register_innodb_stubs(reg: &mut Registry) {
             SysVarDef::new(name, Scope::Global, DataType::String { max_len: None })
                 .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
             SysVarValue::String(v),
+        ));
+    }
+    for (name, value) in [
+        ("innodb_file_per_table", true),
+        ("innodb_adaptive_hash_index", true),
+        ("innodb_print_all_deadlocks", false),
+        ("innodb_stats_on_metadata", false),
+        ("innodb_status_output", false),
+        ("innodb_status_output_locks", false),
+        ("innodb_log_compressed_pages", true),
+        ("innodb_undo_log_truncate", true),
+        ("innodb_force_load_corrupted", false),
+        ("innodb_rollback_on_timeout", false),
+        ("innodb_log_writer_threads", true),
+    ] {
+        reg.register(SysVar::const_read_only(
+            SysVarDef::new(name, Scope::Global, DataType::Bool)
+                .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
+            SysVarValue::Bool(value),
+        ));
+    }
+    for (name, value) in [
+        ("innodb_force_recovery", 0),
+        ("innodb_compression_failure_threshold_pct", 5),
+        ("innodb_compression_level", 6),
+    ] {
+        reg.register(SysVar::const_read_only(
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::UInt {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            )
+            .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
+            SysVarValue::UInt(value),
         ));
     }
 
@@ -261,8 +283,6 @@ fn register_innodb_stubs(reg: &mut Registry) {
         ("innodb_purge_threads", 4),
         ("innodb_open_files", 4000),
         ("innodb_autoinc_lock_mode", 2),
-        ("innodb_max_dirty_pages_pct", 75),
-        ("innodb_max_dirty_pages_pct_lwm", 10),
         ("innodb_flush_neighbors", 0),
         ("innodb_lru_scan_depth", 1024),
         // innodb_lock_wait_timeout — real sysvar in transaction.rs (M3).
@@ -286,19 +306,47 @@ fn register_innodb_stubs(reg: &mut Registry) {
     ];
     for &(name, default) in u64_stubs {
         let cell: &'static AtomicU64 = leak_atomic_u64(name, default);
+        let select_type = match name {
+            "innodb_buffer_pool_size" | "innodb_open_files" | "innodb_autoinc_lock_mode" => {
+                SelectType::Int
+            }
+            "innodb_random_read_ahead" => SelectType::Bool,
+            _ => SelectType::UInt,
+        };
+        let max = if select_type == SelectType::Int {
+            i64::MAX as u64
+        } else {
+            u64::MAX
+        };
+        reg.register(SysVar::settable(
+            SysVarDef::new(name, Scope::Global, DataType::UInt { min: 0, max })
+                .with_select_type(select_type)
+                .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
+            move |_ctx| SysVarValue::UInt(cell.load(Ordering::Relaxed)),
+            move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
+                cell.store(v.as_u64().unwrap_or(0), Ordering::Relaxed);
+                Ok(())
+            },
+        ));
+    }
+    for (name, default) in [
+        ("innodb_max_dirty_pages_pct", 75.0_f64),
+        ("innodb_max_dirty_pages_pct_lwm", 10.0_f64),
+    ] {
+        let cell = leak_atomic_u64(name, default.to_bits());
         reg.register(SysVar::settable(
             SysVarDef::new(
                 name,
                 Scope::Global,
-                DataType::UInt {
-                    min: 0,
-                    max: u64::MAX,
+                DataType::Double {
+                    min: 0.0,
+                    max: u64::MAX as f64,
                 },
             )
             .with_doc("InnoDB compat stub (mydb does not use InnoDB)."),
-            move |_ctx| SysVarValue::UInt(cell.load(Ordering::Relaxed)),
-            move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-                cell.store(v.as_u64().unwrap_or(0), Ordering::Relaxed);
+            move |_ctx| SysVarValue::Double(f64::from_bits(cell.load(Ordering::Relaxed))),
+            move |_ctx, value| {
+                cell.store(value.as_f64().unwrap().to_bits(), Ordering::Relaxed);
                 Ok(())
             },
         ));
@@ -396,11 +444,7 @@ fn register_misc_stubs(reg: &mut Registry) {
         // global password-reuse and require-current policy fallback.
         ("character_sets_dir", "/usr/share/mysql/charsets/"),
         ("ft_boolean_syntax", "+ -><()~*:\"\"&|"),
-        ("ft_min_word_len", "4"),
-        ("ft_max_word_len", "84"),
-        ("ft_query_expansion_limit", "20"),
         ("ft_stopword_file", "(built-in)"),
-        ("innodb_buffer_pool_chunk_size", "134217728"),
     ];
     for &(name, value) in ro_str {
         let v = value.to_string();
@@ -408,6 +452,25 @@ fn register_misc_stubs(reg: &mut Registry) {
             SysVarDef::new(name, Scope::Global, DataType::String { max_len: None })
                 .with_doc("MySQL-compat stub."),
             SysVarValue::String(v),
+        ));
+    }
+    for (name, value) in [
+        ("ft_min_word_len", 4),
+        ("ft_max_word_len", 84),
+        ("ft_query_expansion_limit", 20),
+        ("innodb_buffer_pool_chunk_size", 134_217_728),
+    ] {
+        reg.register(SysVar::const_read_only(
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::UInt {
+                    min: 0,
+                    max: u64::MAX,
+                },
+            )
+            .with_doc("MySQL-compat stub."),
+            SysVarValue::UInt(value),
         ));
     }
 
@@ -430,13 +493,8 @@ fn register_misc_stubs(reg: &mut Registry) {
         // activate_all_roles_on_login is registered for real in
         // `replication::register` — it drives login role activation.
         ("avoid_temporal_upgrade", false),
-        ("show_create_table_skip_secondary_engine", false),
-        ("show_create_table_verbosity", false),
-        ("show_old_temporals", false),
         ("show_compatibility_56", false),
-        ("end_markers_in_json", false),
         ("explicit_defaults_for_timestamp_compat", true),
-        ("keep_files_on_create", false),
         ("large_files_support", true),
         // partial_revokes is registered for real in `replication::register`
         // — it backs the L9 RestrictionEntry flow. The stub here used to
@@ -453,8 +511,17 @@ fn register_misc_stubs(reg: &mut Registry) {
     ];
     for &(name, default) in bool_stubs {
         let cell: &'static std::sync::atomic::AtomicBool = leak_atomic_bool(name, default);
+        let def = SysVarDef::new(name, Scope::Global, DataType::Bool);
+        let def = match name {
+            "schema_definition_cache"
+            | "sync_master_info"
+            | "sync_relay_log"
+            | "sync_relay_log_info" => def.with_select_type(SelectType::UInt),
+            "ssl_fips_mode" => def.with_select_type(SelectType::Text),
+            _ => def,
+        };
         reg.register(SysVar::settable(
-            SysVarDef::new(name, Scope::Global, DataType::Bool).with_doc("MySQL-compat stub."),
+            def.with_doc("MySQL-compat stub."),
             move |_ctx| SysVarValue::Bool(cell.load(std::sync::atomic::Ordering::Relaxed)),
             move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
                 cell.store(
@@ -472,7 +539,6 @@ fn register_misc_stubs(reg: &mut Registry) {
         ("delayed_queue_size", 1000),
         ("flush_time", 0),
         ("max_connect_errors", 100),
-        ("max_delayed_threads", 20),
         ("max_relay_log_size", 0),
         // max_sp_recursion_depth is a real settable sysvar (see query.rs),
         // wired to stored-procedure recursion enforcement.
@@ -480,7 +546,6 @@ fn register_misc_stubs(reg: &mut Registry) {
         ("max_write_lock_count", i64::MAX),
         ("metadata_locks_cache_size", 1024),
         ("metadata_locks_hash_instances", 8),
-        ("preload_buffer_size", 32768),
         ("range_alloc_block_size_compat", 4096),
         ("rpl_read_size", 8192),
         ("rpl_stop_replica_timeout", 31536000),
@@ -500,19 +565,43 @@ fn register_misc_stubs(reg: &mut Registry) {
         ("thread_pool_stall_limit", 6),
         ("thread_pool_algorithm", 0),
         ("tls_session_cache_timeout", 300),
-        ("updatable_views_with_limit", 1),
     ];
     for &(name, default) in i64_stubs {
         let cell: &'static AtomicI64 = leak_atomic_i64(name, default);
+        let select_type = match name {
+            "delayed_insert_limit"
+            | "delayed_insert_timeout"
+            | "delayed_queue_size"
+            | "flush_time"
+            | "max_connect_errors"
+            | "max_relay_log_size"
+            | "max_write_lock_count"
+            | "rpl_read_size"
+            | "rpl_stop_replica_timeout"
+            | "rpl_stop_slave_timeout"
+            | "slow_launch_time"
+            | "stored_program_cache"
+            | "stored_program_definition_cache"
+            | "table_open_cache_instances"
+            | "temptable_max_mmap"
+            | "temptable_max_ram" => SelectType::UInt,
+            "temptable_use_mmap" => SelectType::Bool,
+            _ => SelectType::Int,
+        };
         reg.register(SysVar::settable(
             SysVarDef::new(
                 name,
                 Scope::Global,
                 DataType::Int {
-                    min: i64::MIN,
+                    min: if select_type == SelectType::UInt {
+                        0
+                    } else {
+                        i64::MIN
+                    },
                     max: i64::MAX,
                 },
             )
+            .with_select_type(select_type)
             .with_doc("MySQL-compat stub."),
             move |_ctx| SysVarValue::Int(cell.load(Ordering::Relaxed)),
             move |_ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
@@ -539,7 +628,6 @@ fn register_misc_stubs(reg: &mut Registry) {
         ("admin_ssl_ca", ""),
         ("admin_ssl_cert", ""),
         ("admin_ssl_key", ""),
-        ("default_collation_for_utf8mb4", "utf8mb4_0900_ai_ci"),
         ("relay_log", ""),
         ("relay_log_index", ""),
         ("relay_log_basename", ""),
@@ -567,9 +655,20 @@ fn register_misc_stubs(reg: &mut Registry) {
         let n: &'static str = name;
         let d: &'static str = default;
         let cell: &'static std::sync::RwLock<String> = leak_string(n, d);
+        let data_type = match name {
+            "source_verify_checksum" => DataType::Bool,
+            "replica_net_timeout"
+            | "slave_net_timeout"
+            | "report_port"
+            | "admin_port"
+            | "mysqlx_port" => DataType::UInt {
+                min: 0,
+                max: u64::MAX,
+            },
+            _ => DataType::String { max_len: None },
+        };
         reg.register(SysVar::settable(
-            SysVarDef::new(n, Scope::Global, DataType::String { max_len: None })
-                .with_doc("MySQL-compat stub."),
+            SysVarDef::new(n, Scope::Global, data_type).with_doc("MySQL-compat stub."),
             move |_ctx| {
                 let s = cell.read().map(|s| s.clone()).unwrap_or_default();
                 SysVarValue::String(s)
@@ -582,6 +681,103 @@ fn register_misc_stubs(reg: &mut Registry) {
             },
         ));
     }
+
+    register_scoped_advisory_variables(reg);
+}
+
+fn register_scoped_advisory_variables(reg: &mut Registry) {
+    for (name, scope, default, session_access) in [
+        ("end_markers_in_json", Scope::Both, false, Access::ReadWrite),
+        ("innodb_table_locks", Scope::Both, true, Access::ReadWrite),
+        (
+            "keep_files_on_create",
+            Scope::Both,
+            false,
+            Access::ReadWrite,
+        ),
+        (
+            "show_create_table_skip_secondary_engine",
+            Scope::Session,
+            false,
+            Access::ReadWrite,
+        ),
+        (
+            "show_create_table_verbosity",
+            Scope::Both,
+            false,
+            Access::ReadWrite,
+        ),
+        (
+            "show_old_temporals",
+            Scope::Both,
+            false,
+            Access::SessionAdmin,
+        ),
+    ] {
+        reg.register(SysVar::session_advisory(
+            SysVarDef::new(name, scope, DataType::Bool)
+                .with_scope_access(session_access, Access::ReadWrite)
+                .with_doc("MySQL compatibility setting."),
+            SysVarValue::Bool(default),
+        ));
+    }
+
+    reg.register(SysVar::session_advisory(
+        SysVarDef::new(
+            "updatable_views_with_limit",
+            Scope::Both,
+            DataType::Enum {
+                values: &["NO", "YES"],
+            },
+        )
+        .with_doc("MySQL compatibility setting for views with LIMIT."),
+        SysVarValue::String("YES".into()),
+    ));
+
+    reg.register(SysVar::session_advisory(
+        SysVarDef::new(
+            "preload_buffer_size",
+            Scope::Both,
+            DataType::UInt {
+                min: 1024,
+                max: 1024 * 1024 * 1024,
+            },
+        )
+        .with_scope_access(Access::SessionAdmin, Access::ReadWrite)
+        .with_doc("Advisory index preloading buffer size."),
+        SysVarValue::UInt(32768),
+    ));
+
+    reg.register(
+        SysVar::session_advisory(
+            SysVarDef::new(
+                "max_delayed_threads",
+                Scope::Both,
+                DataType::UInt { min: 0, max: 16384 },
+            )
+            .with_aliases(&["max_insert_delayed_threads"])
+            .with_scope_access(Access::SessionAdmin, Access::ReadWrite)
+            .with_doc("Compatibility limit for deprecated INSERT DELAYED workers."),
+            SysVarValue::UInt(20),
+        )
+        .with_validation(|ctx, value| {
+            if ctx.scope == Scope::Session && value.as_u64() != Some(0) {
+                let global = crate::engine::sysvar::registry().read(
+                    "max_delayed_threads",
+                    Scope::Global,
+                    None,
+                    ctx.db,
+                )?;
+                if *value != global {
+                    return Err(crate::engine::sysvar::wrong_value_for_var(
+                        "max_delayed_threads",
+                        &value.to_display_string(),
+                    ));
+                }
+            }
+            Ok(())
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,56 @@ fn directory() -> tempfile::TempDir {
 }
 
 #[test]
+fn low_space_rotation_recovers_on_both_sides_of_index_commit() {
+    for index_committed in [false, true] {
+        let dir = directory();
+        let config = test_config(dir.path());
+        let manager = BinlogSourceManager::open(dir.path().into(), config.clone()).unwrap();
+        let old = manager.current_position().unwrap();
+        let manifest = manager.manifest_path.clone();
+        let index = manager.index_path.clone();
+        let staging = cleanup_rotation_manifest(&manifest);
+        let old_manifest = fs::read(&manifest).unwrap();
+        let old_index = fs::read(&index).unwrap();
+
+        manager.rotate_with_policy(true).unwrap();
+        let next = manager.current_position().unwrap();
+        let new_file = manager.dir.join(&next.file);
+        assert_eq!(
+            manager
+                .events_after(&old.file, old.position)
+                .unwrap()
+                .iter()
+                .filter(|event| event.event_type == ROTATE_EVENT)
+                .count(),
+            1,
+        );
+        drop(manager);
+        fs::rename(&manifest, &staging).unwrap();
+        fs::write(&manifest, old_manifest).unwrap();
+        if !index_committed {
+            fs::write(&index, old_index).unwrap();
+        }
+
+        let reopened = BinlogSourceManager::open(dir.path().into(), config).unwrap();
+        assert!(!staging.exists());
+        assert_eq!(new_file.exists(), index_committed);
+        assert_eq!(
+            reopened.current_position().unwrap(),
+            if index_committed { next } else { old.clone() }
+        );
+        assert_eq!(
+            reopened
+                .events_after(&old.file, old.position)
+                .unwrap()
+                .iter()
+                .any(|event| event.event_type == ROTATE_EVENT),
+            index_committed
+        );
+    }
+}
+
+#[test]
 fn audit_staged_positions_are_not_public() {
     let dir = directory();
     let manager = BinlogSourceManager::open(dir.path().into(), test_config(dir.path())).unwrap();
@@ -487,6 +537,7 @@ fn audit_gtid_flags_distinguish_row_only_and_ddl_transactions() {
                 false,
             )],
             2,
+            false,
         )
         .unwrap();
     assert_eq!(ddl.chunks[0].bytes[19], 1);
@@ -526,6 +577,7 @@ fn audit_gtid_flags_distinguish_row_only_and_ddl_transactions() {
                 false,
             )],
             3,
+            false,
         )
         .unwrap();
     assert_eq!(
@@ -543,12 +595,42 @@ fn audit_gtid_flags_distinguish_row_only_and_ddl_transactions() {
 }
 
 #[test]
+fn low_space_ddl_syncs_despite_disabled_group_sync_after_rotation() {
+    let dir = directory();
+    let mut config = test_config(dir.path());
+    config.sync_binlog = 0;
+    let manager = BinlogSourceManager::open(dir.path().into(), config).unwrap();
+    let old_file = manager.state.lock().active_file.clone();
+    manager.rotate_bytes.store(4, Ordering::Relaxed);
+    let drop_txn = manager
+        .stage_encoded_txn_commit(
+            vec![(
+                QUERY_EVENT,
+                encode_query_payload(1, "test", "DROP TABLE example"),
+                false,
+            )],
+            1,
+            true,
+        )
+        .unwrap();
+    assert_ne!(drop_txn.reference.file, old_file);
+    let before = manager.group_sync.sync_total_us.load(Ordering::Relaxed);
+    manager.sync_staged_commit(&drop_txn).unwrap();
+    assert!(manager.group_sync.sync_total_us.load(Ordering::Relaxed) > before);
+    manager.commit_order.finish_wal(drop_txn.order);
+    manager.publish_txn_commit(Some(drop_txn)).unwrap();
+    assert_eq!(manager.state.lock().files.len(), 2);
+}
+
+#[test]
 fn audit_abandoned_staged_commit_cannot_leave_a_writable_position_gap() {
     let dir = directory();
     let manager = BinlogSourceManager::open(dir.path().into(), test_config(dir.path())).unwrap();
     let commit = stage_test_write(&manager, 1);
     drop(commit);
-    assert!(manager.stage_encoded_txn_commit(Vec::new(), 2).is_err());
+    assert!(manager
+        .stage_encoded_txn_commit(Vec::new(), 2, false)
+        .is_err());
 }
 
 #[test]

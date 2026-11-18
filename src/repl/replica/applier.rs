@@ -224,6 +224,9 @@ impl Applier {
         master_uuid: &str,
         master_epoch: u64,
     ) -> Result<ApplyOutcome, QueryError> {
+        if let Some(db) = &self.db {
+            db.check_disk_write()?;
+        }
         // Pass 1: decode every frame past our applied watermark. While
         // decoding, cross-check the master-declared chunk metadata
         // (frame_count / start_lsn / end_lsn) against what the bytes

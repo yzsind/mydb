@@ -17,7 +17,7 @@ returns an error before the statement changes data, never a silent no-op.
 | Mixed Unicode identifiers | Mixed Unicode names are recognized consistently across supported statements |
 | Executable comments | MySQL 8.0 five-digit gate; missing separator emits warning 4164; inactive payload excluded |
 | Index options | CREATE/ALTER preserve supported primary-key options; UNIQUE constraint symbol supplies fallback index name |
-| Native function whitespace | Checked in expression-call context; table/column/foreign-key names unaffected; IGNORE_SPACE respected |
+| Function names and identifiers | Keyword functions support optional parentheses where MySQL allows them. Quoting, qualification, whitespace, comments, and IGNORE_SPACE govern native calls, routine lookup, and identifier positions. Temporal precision is checked during parsing |
 | Diagnostics | Errors refer to byte offsets and Unicode coordinates in the submitted SQL, including supported normalized syntax |
 | SQL batches | Each next statement parses using mode left by preceding statement; completed prefix retained on later failure |
 | Derived column aliases | SELECT/VALUES, wildcard and set-operation sources; width and duplicates checked after output expansion; joins/lateral/CTE retain metadata |

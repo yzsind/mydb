@@ -59,10 +59,10 @@ pub(crate) fn register(reg: &mut Registry) {
         SysVarDef::new(
             "protocol_version",
             Scope::Global,
-            DataType::Int { min: 0, max: 255 },
+            DataType::UInt { min: 0, max: 255 },
         )
         .with_doc("MySQL wire-protocol version."),
-        SysVarValue::Int(10),
+        SysVarValue::UInt(10),
     ));
     reg.register(SysVar::const_read_only(
         SysVarDef::new("license", Scope::Global, DataType::String { max_len: None }),

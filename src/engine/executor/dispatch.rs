@@ -4456,13 +4456,26 @@ pub(super) fn authorize_prepared_statement(
     authorize_prepared_statement_with_epoch(db, session, statement, required_privileges).map(|_| ())
 }
 
+pub(super) fn allowed_during_fail_stop(statement: &Statement) -> bool {
+    // These commands only signal a session or the process. They still use
+    // the published grants, including KILL ownership and SYSTEM_USER checks.
+    matches!(
+        statement,
+        Statement::Kill { .. } | Statement::Shutdown | Statement::Restart
+    )
+}
+
 pub(super) fn authorize_prepared_statement_with_epoch(
     db: &Arc<Database>,
     session: &SessionContext,
     statement: &Statement,
     required_privileges: &[RequiredPrivilege],
 ) -> Result<u64, QueryError> {
-    db.ensure_operational()?;
+    if let Err(fail_stop) = db.ensure_operational() {
+        if !allowed_during_fail_stop(statement) {
+            return Err(fail_stop);
+        }
+    }
     // Global SQL privileges never grant ownership of another session's table.
     // Apply this before root/internal-user privilege shortcuts and bound recipes.
     for required in required_privileges {
@@ -7598,6 +7611,7 @@ fn execute_sql_prepare(
         expand_views(db, session, &mut validation_statement, 0)
     })?;
     qualify_statement_tables(db, session, &mut validation_statement)?;
+    super::routines::validate_prepared_function_names(db, session, &validation_statement)?;
     let routine_resolution = super::routines::resolve_stored_functions(
         db,
         session,

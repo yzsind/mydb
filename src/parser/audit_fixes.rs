@@ -188,15 +188,19 @@ fn audit_primary_key_options_survive_create_and_alter() {
 }
 
 #[test]
-fn audit_native_function_spacing_is_expression_scoped() {
+fn audit_native_function_tokens_depend_on_spacing_and_identifier_context() {
     assert!(
         parse_statement("CREATE TABLE t(count INT, FOREIGN KEY(count) REFERENCES count (id))")
             .is_ok()
     );
-    rejects("SELECT COUNT (1)");
+    rejects("CREATE TABLE count(i INT)");
+    assert!(matches!(parse_expr_fragment("COUNT (1)").unwrap(),
+        Expr::Function { name, .. } if stored_only_function(&name) == Some("COUNT")));
     assert!(parse_statement("SELECT app.count (1)").is_ok());
     let _mode = ParserSqlModeGuard::activate(crate::engine::api::SQL_MODE_IGNORE_SPACE);
-    assert!(parse_statement("SELECT COUNT (1)").is_ok());
+    rejects("CREATE TABLE count (i INT)");
+    assert!(matches!(parse_expr_fragment("COUNT (1)").unwrap(),
+        Expr::Function { name, .. } if name == "COUNT"));
 }
 
 #[test]

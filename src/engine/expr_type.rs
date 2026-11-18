@@ -3148,11 +3148,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 _ => ExprType::new(Unknown, true),
             }
         }
-        Expr::Wildcard
-        | Expr::SystemVariable { .. }
-        | Expr::Default(_)
-        | Expr::DefaultQualified(_)
-        | Expr::Tuple(_) => ExprType::new(Unknown, true),
+        Expr::SystemVariable { name, .. } => crate::engine::sysvar::registry()
+            .select_type(name)
+            .unwrap_or_else(|| ExprType::new(Unknown, true)),
+        Expr::Wildcard | Expr::Default(_) | Expr::DefaultQualified(_) | Expr::Tuple(_) => {
+            ExprType::new(Unknown, true)
+        }
     }
 }
 

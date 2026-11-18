@@ -2403,9 +2403,7 @@ pub(crate) fn eval_system_variable(
                 _ => {}
             }
         }
-        crate::engine::sysvar::registry()
-            .read_sql(name, scope, Some(session), db)
-            .map(|value| value.to_select_value())
+        crate::engine::sysvar::registry().read_sql(name, scope, Some(session), db)
     })
 }
 
@@ -10039,6 +10037,14 @@ where
             }
             match eval_stored_function(name, arg_values) {
                 Some(result) => result,
+                None if crate::parser::stored_only_function(name).is_some() => {
+                    Err(with_session_view(|view| {
+                        crate::engine::executor::routines::missing_function(
+                            view.as_ref().map_or("", SessionView::database),
+                            name,
+                        )
+                    }))
+                }
                 None => Err(error(
                     crate::error::catalog::ER_SP_DOES_NOT_EXIST,
                     format!("function '{name}' is not supported"),
@@ -27315,9 +27321,20 @@ pub(crate) fn expr_result_type_in_table(expr: &Expr, table: &TableSchema) -> Col
     })
 }
 
-/// Coerce a selected CASE/IF branch to its already-bound semantic domain.
-/// Unlike the legacy ColumnType-only helper this preserves temporal FSP and
-/// is therefore suitable at projection/compiled-plan boundaries.
+/// Division and clock arithmetic keep extra runtime digits until the result
+/// boundary. Their bound DECIMAL scale controls the SQL result's presentation.
+pub(crate) fn decimal_result_needs_shaping(expr: &Expr) -> bool {
+    crate::parser::visit::any_expr(expr, |node| match node {
+        Expr::Binary {
+            op: BinaryOp::Div, ..
+        } => true,
+        Expr::Function { name, args, .. } => {
+            !args.is_empty() && crate::parser::is_clock_precision_function(name)
+        }
+        _ => false,
+    })
+}
+
 /// Shape exact decimals at an API/protocol result boundary, never mid-expression.
 pub(crate) fn decimal_result_value<'a>(
     value: &'a Value,
@@ -27325,7 +27342,7 @@ pub(crate) fn decimal_result_value<'a>(
 ) -> std::borrow::Cow<'a, Value> {
     if let ColumnType::Decimal { scale, .. } = column_type {
         if let Some(exact) = value.exact_decimal() {
-            if exact.scale() > scale {
+            if exact.scale() != scale {
                 return std::borrow::Cow::Owned(Value::from_exact_decimal(
                     crate::util::decimal::rescale_exact(exact, scale, true),
                 ));
@@ -27335,6 +27352,9 @@ pub(crate) fn decimal_result_value<'a>(
     std::borrow::Cow::Borrowed(value)
 }
 
+/// Coerce a selected CASE/IF branch to its already-bound semantic domain.
+/// Unlike the legacy ColumnType-only helper this preserves temporal FSP and
+/// is therefore suitable at projection/compiled-plan boundaries.
 pub(crate) fn coerce_result_to_expr_type(
     value: Value,
     result_type: crate::engine::expr_type::ExprType,

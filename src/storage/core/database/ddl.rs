@@ -3359,6 +3359,9 @@ impl Database {
     }
 
     pub fn drop_table(&self, name: &str) -> Result<(), QueryError> {
+        if self.disk_space_limited() {
+            return self.drop_tables(&[name.to_owned()], false);
+        }
         if self.recyclebin_enabled() { return self.recycle_drop_tables(&[name.to_string()], false); }
         let (database, table_name) = split_table_name(DEFAULT_DATABASE, name);
         check_table_ddl_writable(&database)?;
@@ -3429,7 +3432,16 @@ impl Database {
     }
 
     pub fn drop_tables(&self, names: &[String], if_exists: bool) -> Result<(), QueryError> {
-        if self.recyclebin_enabled() { return self.recycle_drop_tables(names, if_exists); }
+        if self.recyclebin_enabled() {
+            self.check_disk_write()?;
+            return self.recycle_drop_tables(names, if_exists);
+        }
+        let disk_limited = self.disk_space_limited();
+        if disk_limited && (names.len() != 1 || catalog_txn_batch_deferred()) {
+            return Err(crate::storage::disk_pressure::limited_error(
+                "permanent cleanup requires a standalone single-table DROP",
+            ));
+        }
         let mut resolved = Vec::with_capacity(names.len());
         let mut drop_set = BTreeSet::new();
         for name in names {
@@ -3453,6 +3465,19 @@ impl Database {
                     format!("Unknown table '{database}.{table_name}'"),
                 ));
             };
+            if disk_limited
+                && (table.system
+                    || !table.foreign_keys.is_empty()
+                    || !table.fk_referenced_by.is_empty()
+                    || self.catalog_read()?.triggers.values().any(|trigger| {
+                        trigger.table_database.eq_ignore_ascii_case(&database)
+                            && trigger.table_name.eq_ignore_ascii_case(&table_name)
+                    }))
+            {
+                return Err(crate::storage::disk_pressure::limited_error(
+                    "tables with dependent metadata require ordinary write headroom",
+                ));
+            }
             self.check_ddl_table_lock(table.id)?;
             drop_set.insert(key.clone());
             resolved.push((key, table));
@@ -3489,8 +3514,19 @@ impl Database {
             dropped.push((table.clone(), intent, None));
         }
         if dropped.is_empty() {
+            if disk_limited && crate::binlog::recording_ddl() {
+                // IF EXISTS can still delete the table on a logical replica.
+                // Keep that event inside a WAL transaction and its disk lease.
+                let _disk_budget = self.admit_disk_cleanup(None, 0, true)?;
+                CatalogTxn::new(self).commit_ddl()?;
+            }
             return Ok(());
         }
+        let _disk_budget = if disk_limited {
+            self.admit_disk_cleanup(Some(&dropped[0].1), 0, true)?
+        } else {
+            None
+        };
         for entry in &mut dropped {
             self.stage_table_retirement(&entry.1)?;
         }

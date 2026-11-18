@@ -34,21 +34,6 @@ impl SysVarValue {
         SysVarValue::String(String::new())
     }
 
-    /// Value returned by `SELECT @@var`. MySQL serialises every system
-    /// variable as a string on the wire (the wire types are CSTRING),
-    /// so we keep the same shape: bool → "1"/"0", everything else → its
-    /// MySQL-canonical display string, NULL stays NULL.
-    pub fn to_select_value(&self) -> Value {
-        match self {
-            SysVarValue::Null => Value::Null,
-            SysVarValue::Bool(b) => Value::String(if *b { "1" } else { "0" }.to_string()),
-            SysVarValue::Int(i) => Value::String(i.to_string()),
-            SysVarValue::UInt(u) => Value::String(u.to_string()),
-            SysVarValue::Double(d) => Value::String(format_double(*d)),
-            SysVarValue::String(s) => Value::String(s.clone()),
-        }
-    }
-
     /// MySQL-compatible display rendering used by `SHOW VARIABLES` and
     /// `information_schema.global_variables.VARIABLE_VALUE`.
     ///
@@ -64,6 +49,14 @@ impl SysVarValue {
             SysVarValue::Double(d) => format_double(*d),
             SysVarValue::String(s) => s.clone(),
             SysVarValue::Null => "NULL".to_string(),
+        }
+    }
+
+    /// Configuration must round-trip the value independently of SHOW formatting.
+    pub(crate) fn to_config_string(&self) -> String {
+        match self {
+            SysVarValue::Double(d) => d.to_string(),
+            _ => self.to_display_string(),
         }
     }
 
@@ -264,19 +257,6 @@ mod tests {
     fn bool_display_round_trip() {
         assert_eq!(SysVarValue::Bool(true).to_display_string(), "ON");
         assert_eq!(SysVarValue::Bool(false).to_display_string(), "OFF");
-    }
-
-    #[test]
-    fn select_value_for_bool_is_zero_one() {
-        // MySQL `SELECT @@autocommit` returns 1/0 not ON/OFF.
-        assert_eq!(
-            SysVarValue::Bool(true).to_select_value(),
-            Value::String("1".to_string())
-        );
-        assert_eq!(
-            SysVarValue::Bool(false).to_select_value(),
-            Value::String("0".to_string())
-        );
     }
 
     #[test]

@@ -94,6 +94,21 @@ fn cold_recycle_enabled() -> bool {
     *ENABLED.get_or_init(|| bool_env_enabled("MYDB_BUFFER_POOL_COLD_RECYCLE", true))
 }
 
+fn scan_recycle_file(
+    file: &Arc<BufferPageFileKey>,
+    intent: AccessIntent,
+) -> Option<&Arc<BufferPageFileKey>> {
+    match (&file.kind, intent) {
+        (BufferPageFileKind::Heap { .. }, AccessIntent::Scan | AccessIntent::Prefetch)
+        | (BufferPageFileKind::Index { .. }, AccessIntent::IndexSweep) => Some(file),
+        _ => None,
+    }
+}
+
+fn prefetch_passed_scan(page_id: u64, progress: Option<&AtomicU64>) -> bool {
+    progress.is_some_and(|progress| page_id < progress.load(Ordering::Acquire))
+}
+
 /// Read once per process; only consulted when opening a cached data file.
 /// Buffered I/O reuses the OS page cache warmed by bulk scans and avoids the
 /// extra descriptor and staging copies. Direct I/O remains an explicit override.
@@ -510,6 +525,21 @@ impl BufferPool {
         }
     }
 
+    /// Batch physical index sweeps when enough of the index can stay resident.
+    fn batch_index_sweep(&self, pages: u64) -> bool {
+        let working_set = self
+            .used_pages
+            .load(Ordering::Relaxed)
+            .saturating_sub(self.scan_origin_count.load(Ordering::Relaxed));
+        self.durability != DurabilityMode::Memory
+            && self.scan_cache_policy(pages) == ScanCachePolicy::Bulk
+            && pages
+                <= self
+                    .capacity_pages()
+                    .saturating_sub(working_set)
+                    .saturating_mul(2)
+    }
+
     fn new(
         capacity_pages: u64,
         log: Arc<crate::wal::LogMutex>,
@@ -859,7 +889,7 @@ impl BufferPool {
             if self.discard_one_recycled_raw_page() {
                 continue;
             }
-            if !self.evict_one_with_policy(true)? {
+            if !self.evict_one_with_policy(true, None)? {
                 if started.elapsed() >= timeout {
                     return Err(error(
                         crate::error::catalog::ER_WRONG_VALUE_FOR_VAR,
@@ -1036,10 +1066,18 @@ impl BufferPool {
             return Ok(None);
         }
         self.raw_page_allocations.fetch_add(1, Ordering::Relaxed);
-        Ok(Some(RawPageLease { bytes, charge }))
+        Ok(Some(RawPageLease {
+            bytes,
+            charge,
+            scan_file_hash: None,
+        }))
     }
 
-    fn claim_raw_page_lease(&self, preferred_shard: usize) -> Result<RawPageLease, QueryError> {
+    fn claim_raw_page_lease(
+        &self,
+        preferred_shard: usize,
+        scan_file: Option<&Arc<BufferPageFileKey>>,
+    ) -> Result<RawPageLease, QueryError> {
         let started = Instant::now();
         loop {
             if let Some(lease) = self.pop_recycled_raw_page(preferred_shard) {
@@ -1050,7 +1088,9 @@ impl BufferPool {
                 return Ok(lease);
             }
 
-            if self.evict_one_with_policy(true)? {
+            // A slot can be free while its raw allocation is still held by
+            // another loader. Keep the same scan policy at both admission gates.
+            if self.evict_one_with_policy(true, scan_file)? {
                 continue;
             }
             if started.elapsed() >= self.lock_wait {
@@ -1082,7 +1122,7 @@ impl BufferPool {
             if let Some(charge) = try_controlled_raw_page_charge(allocation_capacity) {
                 return Ok(charge);
             }
-            if self.evict_one_with_policy(true)? {
+            if self.evict_one_with_policy(true, None)? {
                 continue;
             }
             if started.elapsed() >= self.lock_wait {
@@ -2043,18 +2083,19 @@ impl BufferPool {
     fn try_replace_resident_logged_page(
         self: &Arc<Self>,
         key: &PageKey,
+        intent: AccessIntent,
         build: impl FnOnce(&[u8], bool, bool) -> Result<(u64, Vec<u8>), QueryError>,
     ) -> Result<Option<u64>, QueryError> {
         let Some(frame) = self.lookup_frame(key)? else {
             return Ok(None);
         };
-        if !self.try_pin_existing(&frame, AccessIntent::Normal) {
+        if !self.try_pin_existing(&frame, intent) {
             return Ok(None);
         }
         let pinned = PinnedFrame {
             pool: Arc::clone(self),
             frame,
-            intent: AccessIntent::Normal,
+            intent,
         };
         let _admission = crate::engine::executor::mem_budget::StorageLatchAdmissionScope::enter();
         self.wait_until_ready(&pinned.frame)?;
@@ -2095,8 +2136,14 @@ impl BufferPool {
         bytes.copy_from_slice(&after);
         self.write_requests.fetch_add(1, Ordering::Relaxed);
         pinned.frame.checksum_dirty.store(false, Ordering::Release);
-        let mark = pinned.frame.mark_dirty(lsn);
+        let mark = pinned.frame.mark_dirty_with_intent(lsn, intent);
         self.publish_dirty_mark(&pinned.frame, mark, lsn);
+        if zone_page
+            && intent == AccessIntent::Normal
+            && pinned.frame.scan_origin.load(Ordering::Relaxed)
+        {
+            self.promote_scan_origin(&pinned.frame);
+        }
         // Zone-map callers return checked patches. Vector callers validate the
         // base above and stamp a finalized replacement before publication.
         // Retain those proofs under the byte latch, avoiding another full CRC
@@ -2486,12 +2533,13 @@ impl BufferPool {
                 continue;
             }
 
-            self.ensure_capacity_for_insert(self.lock_wait)?;
+            let scan_file = scan_recycle_file(key.file, intent);
+            self.ensure_capacity_for_insert(self.lock_wait, scan_file)?;
             let key = key.into_owned();
             // One map lookup serves both the pre-load generation stamp
             // and the post-load re-check below.
             let generation_cell = self.file_generation_cell(&key.file)?;
-            let raw_page = self.claim_raw_page_lease(shard_idx)?;
+            let raw_page = self.claim_raw_page_lease(shard_idx, scan_file)?;
             let load_generation = generation_cell.load(Ordering::Acquire);
             let frame = Arc::new(Frame::new_loading(
                 key.clone(),
@@ -2547,13 +2595,7 @@ impl BufferPool {
             shard.insert(key.clone(), frame.clone());
             self.used_pages.fetch_add(1, Ordering::Relaxed);
             self.note_kind_added(&key);
-            if matches!(
-                intent,
-                AccessIntent::Scan
-                    | AccessIntent::SmallScan
-                    | AccessIntent::Prefetch
-                    | AccessIntent::Probe
-            ) {
+            if intent.admits_cold() {
                 self.observe_new_scan_origin(shard_idx, &frame);
             }
             drop(shard);
@@ -2620,7 +2662,7 @@ impl BufferPool {
                     .fetch_add(1, Ordering::Relaxed);
             }
             self.notify_frame_waiters();
-            if let Err(err) = self.ensure_capacity(self.lock_wait) {
+            if let Err(err) = self.ensure_capacity(self.lock_wait, scan_file) {
                 frame.unpin();
                 self.remove_frame_if_same(&frame)?;
                 self.notify_frame_waiters();
@@ -3302,6 +3344,12 @@ impl BufferPool {
                     }
                     let mark = frame.mark_dirty_with_intent(dirty_lsn, admission);
                     self.publish_dirty_mark(&frame, mark, dirty_lsn);
+                    if admission == AccessIntent::Normal
+                        && frame.scan_origin.load(Ordering::Relaxed)
+                        && matches!(key.file.kind, BufferPageFileKind::ZoneMap { .. })
+                    {
+                        self.promote_scan_origin(&frame);
+                    }
                     frame.prefetch.store(false, Ordering::Release);
                     Ok(())
                 })();
@@ -3310,7 +3358,7 @@ impl BufferPool {
                 return result;
             }
 
-            self.ensure_capacity_for_insert(self.lock_wait)?;
+            self.ensure_capacity_for_insert(self.lock_wait, None)?;
             let generation = self.file_generation(&key.file)?;
             let shard_idx = self.shard_index(&key);
             let raw_charge = self.claim_raw_page_memory(bytes.capacity())?;
@@ -3342,12 +3390,12 @@ impl BufferPool {
             self.note_kind_added(&key);
             self.dirty_pages.fetch_add(1, Ordering::Relaxed);
             self.note_dirty(&key, dirty_lsn);
-            drop(shard);
-            if admission == AccessIntent::Scan {
+            if admission.admits_cold() {
                 self.observe_new_scan_origin(shard_idx, &frame);
             }
+            drop(shard);
             self.push_clock_key(shard_idx, key.clone())?;
-            if let Err(err) = self.ensure_capacity(self.lock_wait) {
+            if let Err(err) = self.ensure_capacity(self.lock_wait, None) {
                 frame.unpin();
                 self.remove_frame_if_same(&frame)?;
                 self.notify_frame_waiters();
@@ -3386,7 +3434,7 @@ impl BufferPool {
         let new_capacity = capacity_pages.max(1);
         self.capacity_pages.store(new_capacity, Ordering::Release);
         self.trim_recycled_raw_pages();
-        let result = self.ensure_capacity(timeout);
+        let result = self.ensure_capacity(timeout, None);
         if result.is_err() {
             self.capacity_pages.store(old_capacity, Ordering::Release);
         }
@@ -4448,18 +4496,27 @@ impl BufferPool {
         }
     }
 
-    fn ensure_capacity_for_insert(&self, timeout: Duration) -> Result<(), QueryError> {
-        self.ensure_capacity_with_reserve(timeout, 1)
+    fn ensure_capacity_for_insert(
+        &self,
+        timeout: Duration,
+        scan_file: Option<&Arc<BufferPageFileKey>>,
+    ) -> Result<(), QueryError> {
+        self.ensure_capacity_with_reserve(timeout, 1, scan_file)
     }
 
-    fn ensure_capacity(&self, timeout: Duration) -> Result<(), QueryError> {
-        self.ensure_capacity_with_reserve(timeout, 0)
+    fn ensure_capacity(
+        &self,
+        timeout: Duration,
+        scan_file: Option<&Arc<BufferPageFileKey>>,
+    ) -> Result<(), QueryError> {
+        self.ensure_capacity_with_reserve(timeout, 0, scan_file)
     }
 
     fn ensure_capacity_with_reserve(
         &self,
         timeout: Duration,
         reserve_pages: u64,
+        scan_file: Option<&Arc<BufferPageFileKey>>,
     ) -> Result<(), QueryError> {
         let mut started = None;
         while self.used_pages.load(Ordering::Relaxed)
@@ -4477,7 +4534,7 @@ impl BufferPool {
                 || self.shutdown.load(Ordering::Acquire)
                 || timeout <= BUFFER_POOL_EVICT_SYNC_GRACE
                 || elapsed >= BUFFER_POOL_EVICT_SYNC_GRACE;
-            if self.evict_one_with_policy(allow_dirty_victim)? {
+            if self.evict_one_with_policy(allow_dirty_victim, scan_file)? {
                 continue;
             }
             let wait_started = Instant::now();
@@ -4558,16 +4615,20 @@ impl BufferPool {
     /// dirty victim path (still gated by `allow_dirty_victim`, so the
     /// grace-window wait-for-background behaviour is preserved when
     /// the caller insists on staying clean-only).
-    fn evict_one_with_policy(&self, allow_dirty_victim: bool) -> Result<bool, QueryError> {
+    fn evict_one_with_policy(
+        &self,
+        allow_dirty_victim: bool,
+        scan_file: Option<&Arc<BufferPageFileKey>>,
+    ) -> Result<bool, QueryError> {
         // One ticket belongs to the whole eviction attempt. Advancing once
         // for an empty cold queue and again for CLOCK produces a stride of
         // two, starving half of a power-of-two shard set in normal workloads.
         let start = self.eviction_hand.fetch_add(1, Ordering::Relaxed);
         if cold_recycle_enabled() {
             if self.scan_origin_count.load(Ordering::Relaxed) != 0 {
-                if let Some(victim) = self.find_cold_candidate(true, start)? {
+                if let Some(victim) = self.find_cold_candidate(start, scan_file)? {
                     self.cold_recycle_hits.fetch_add(1, Ordering::Relaxed);
-                    return self.consume_victim(victim, true);
+                    return self.consume_victim_with_policy(victim, true, false);
                 }
             }
             self.cold_recycle_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -4622,8 +4683,8 @@ impl BufferPool {
     /// A small stale budget bounds latency; CLOCK remains the progress path.
     fn find_cold_candidate(
         &self,
-        clean_only: bool,
         cold_start: usize,
+        scan_file: Option<&Arc<BufferPageFileKey>>,
     ) -> Result<Option<(usize, PageKey, Arc<Frame>)>, QueryError> {
         // Ordered MRR can have all candidates in one shard temporarily pinned
         // while sibling probe workers consume other shards. A 32-entry cap
@@ -4646,7 +4707,7 @@ impl BufferPool {
             // Requeued pinned/dirty candidates must not be inspected again
             // in this pass. Otherwise one unavailable frame can consume the
             // entire budget and hide eligible victims in every later shard.
-            let available = self.shards[shard_idx]
+            let mut candidates = self.shards[shard_idx]
                 .cold_candidates
                 .lock()
                 .map_err(|_| {
@@ -4654,55 +4715,83 @@ impl BufferPool {
                         crate::error::catalog::ER_GET_ERRNO,
                         "buffer pool cold queue lock poisoned",
                     )
-                })?
-                .len()
-                .min(STALE_BUDGET.saturating_sub(inspected));
+                })?;
+            let available = candidates.len().min(STALE_BUDGET - inspected);
             for _ in 0..available {
-                let candidate = self.shards[shard_idx]
-                    .cold_candidates
-                    .lock()
-                    .map_err(|_| {
-                        error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "buffer pool cold queue lock poisoned",
-                        )
-                    })?
-                    .pop_front();
-                let Some(candidate) = candidate else { break };
+                let Some(candidate) = candidates.pop_front() else {
+                    break;
+                };
                 inspected += 1;
                 let Some(frame) = candidate.upgrade() else {
-                    if inspected >= STALE_BUDGET {
-                        return Ok(None);
-                    }
                     continue;
                 };
                 if !frame.scan_origin.load(Ordering::Acquire) {
-                    if inspected >= STALE_BUDGET {
-                        return Ok(None);
-                    }
                     continue;
                 }
-                if over_quota_mask != 0 && over_quota_mask & (1 << frame.key.file.kind.slot()) == 0
+                if (over_quota_mask != 0 && over_quota_mask & (1 << frame.key.file.kind.slot()) == 0)
+                    || !frame.is_clean_eviction_candidate()
                 {
-                    if let Ok(mut queue) = self.shards[shard_idx].cold_candidates.lock() {
-                        queue.push_back(Arc::downgrade(&frame));
-                    }
-                    if inspected >= STALE_BUDGET {
-                        return Ok(None);
-                    }
+                    candidates.push_back(candidate);
                     continue;
                 }
-                if frame.pin_count.load(Ordering::Acquire) != 0
-                    || !frame.is_ready()
-                    || frame.deferred_pins.load(Ordering::Acquire) != 0
-                    || (clean_only && frame.dirty.load(Ordering::Acquire))
+                // Keep the FIFO order between files. Within a scan file, search
+                // all shards before recycling an older resident scan page.
+                // The insertion key and the eviction hand use different shards.
+                if let Some(file) = scan_file.filter(|file| *file == &frame.key.file) {
+                    drop(candidates);
+                    if let Some(recycled) =
+                        self.find_scan_recycle_candidate(shard_idx, Some(file), over_quota_mask)?
+                    {
+                        if let Ok(mut queue) = self.shards[shard_idx].cold_candidates.lock() {
+                            queue.push_front(candidate);
+                        }
+                        return Ok(Some(recycled));
+                    }
+                }
+                return Ok(Some((shard_idx, frame.key.clone(), frame)));
+            }
+            if inspected == STALE_BUDGET {
+                break;
+            }
+        }
+        self.find_scan_recycle_candidate(start, None, over_quota_mask)
+    }
+
+    fn find_scan_recycle_candidate(
+        &self,
+        start: usize,
+        file: Option<&Arc<BufferPageFileKey>>,
+        over_quota_mask: u8,
+    ) -> Result<Option<(usize, PageKey, Arc<Frame>)>, QueryError> {
+        const PROBES_PER_SHARD: usize = 32;
+        for offset in 0..self.shards.len() {
+            let shard_idx = (start + offset) % self.shards.len();
+            let mut candidates = self.shards[shard_idx]
+                .scan_recycle_candidates
+                .lock()
+                .map_err(|_| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "buffer pool scan recycle queue lock poisoned",
+                    )
+                })?;
+            let available = candidates.len().min(PROBES_PER_SHARD);
+            for _ in 0..available {
+                let candidate = candidates.pop_back().expect("scan candidate length");
+                let Some(frame) = candidate.upgrade() else {
+                    continue;
+                };
+                if !frame.scan_origin.load(Ordering::Acquire)
+                    || !frame.scan_recycle.load(Ordering::Acquire)
                 {
-                    if let Ok(mut queue) = self.shards[shard_idx].cold_candidates.lock() {
-                        queue.push_back(Arc::downgrade(&frame));
-                    }
-                    if inspected >= STALE_BUDGET {
-                        return Ok(None);
-                    }
+                    continue;
+                }
+                // Retain the weak entry until eviction wins the pin race.
+                candidates.push_front(candidate);
+                if file.is_some_and(|file| *file != frame.key.file || frame.prefetch.load(Ordering::Acquire))
+                    || (over_quota_mask != 0 && over_quota_mask & (1 << frame.key.file.kind.slot()) == 0)
+                    || !frame.is_clean_eviction_candidate()
+                {
                     continue;
                 }
                 return Ok(Some((shard_idx, frame.key.clone(), frame)));
@@ -4763,11 +4852,10 @@ impl BufferPool {
                 return Ok(false);
             }
         }
-        // Selection is only a hint. A writer can acquire a deferred WAL pin
-        // after selection and release its ordinary pin before our CAS wins.
-        // No new deferred pin can now be attached: add_deferred_pin uses the
-        // same ordinary pin CAS, which rejects EVICTING_PIN.
+        // A lookup can promote the page, or a writer can dirty it and attach
+        // a deferred WAL pin, between selection and the eviction CAS.
         if frame.deferred_pins.load(Ordering::Acquire) != 0
+            || (scan_origin_priority && !frame.scan_origin.load(Ordering::Acquire))
             || (!allow_dirty && frame.dirty.load(Ordering::Acquire))
         {
             frame.pin_count.store(0, Ordering::Release);
@@ -4830,7 +4918,17 @@ impl BufferPool {
             }
             self.dirty_set_remove(&key);
             drop(frames);
-            self.recycle_frame_raw_page(shard_idx, &frame);
+            if let Some(mut lease) = frame.take_raw_page_lease() {
+                if was_scan
+                    && matches!(
+                        key.file.kind,
+                        BufferPageFileKind::Heap { .. } | BufferPageFileKind::Index { .. }
+                    )
+                {
+                    lease.scan_file_hash = Some(key.file.hash);
+                }
+                self.recycle_raw_page(shard_idx, lease);
+            }
             // Leave the now-stale `key` in the clock VecDeque rather
             // than running `clock.retain` here (which is O(clock.len)).
             // `find_clock_victim` already tolerates dead keys — the
@@ -6092,20 +6190,7 @@ impl BufferPool {
             return Ok(());
         }
         let syscalls = read_cached_page_at(&file, buf, offset).map_err(io_err)?;
-        validate_page_owner(buf, &key.file.owner, key.page_id)?;
-        if matches!(key.file.kind, BufferPageFileKind::Heap { .. })
-            && key.page_id > 0
-            && crate::storage::naming::parse_relative_object_path(
-                &crate::storage::naming::wal_relative_object_path(&key.file.path),
-            )
-            .is_some()
-            && buf.iter().all(|b| *b == 0)
-        {
-            return Err(error(
-                crate::error::catalog::ER_GET_ERRNO,
-                "allocated heap page is zero",
-            ));
-        }
+        Self::validate_loaded_page(&key.file, key.page_id, buf)?;
         self.read_ios.fetch_add(1, Ordering::Relaxed);
         self.kind_read_ios[key.file.kind.slot()].fetch_add(1, Ordering::Relaxed);
         self.read_syscalls.fetch_add(syscalls, Ordering::Relaxed);
@@ -6115,7 +6200,7 @@ impl BufferPool {
             AccessIntent::Normal | AccessIntent::Probe => {
                 self.read_ios_normal.fetch_add(1, Ordering::Relaxed);
             }
-            AccessIntent::Scan => {
+            AccessIntent::Scan | AccessIntent::IndexSweep | AccessIntent::Maintenance => {
                 self.read_ios_scan.fetch_add(1, Ordering::Relaxed);
             }
             AccessIntent::SmallScan => {
@@ -6125,6 +6210,28 @@ impl BufferPool {
             AccessIntent::Prefetch => {
                 self.read_ios_prefetch.fetch_add(1, Ordering::Relaxed);
             }
+        }
+        Ok(())
+    }
+
+    fn validate_loaded_page(
+        file: &BufferPageFileKey,
+        page_id: u64,
+        bytes: &[u8],
+    ) -> Result<(), QueryError> {
+        validate_page_owner(bytes, &file.owner, page_id)?;
+        if matches!(file.kind, BufferPageFileKind::Heap { .. })
+            && page_id > 0
+            && bytes.iter().all(|b| *b == 0)
+            && crate::storage::naming::parse_relative_object_path(
+                &crate::storage::naming::wal_relative_object_path(&file.path),
+            )
+            .is_some()
+        {
+            return Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "allocated heap page is zero",
+            ));
         }
         Ok(())
     }
@@ -6975,7 +7082,13 @@ impl BufferPool {
     /// per call rather than one per window page (the per-window clones
     /// of a shared `file_key` refcount line were a measurable
     /// cross-worker hot spot on parallel scans).
-    fn prefetch_range(&self, file: &Arc<BufferPageFileKey>, start: u64, end: u64) {
+    fn prefetch_range(
+        &self,
+        file: &Arc<BufferPageFileKey>,
+        start: u64,
+        end: u64,
+        scan_progress: Option<&Arc<AtomicU64>>,
+    ) {
         let window = self.effective_prefetch_pages.load(Ordering::Relaxed);
         if window == 0 || self.durability == DurabilityMode::Memory || start >= end {
             return;
@@ -7012,7 +7125,7 @@ impl BufferPool {
             }
             to_enqueue.push(probe.clone());
         }
-        self.enqueue_prefetch_batch(to_enqueue, window);
+        self.enqueue_prefetch_batch(to_enqueue, window, scan_progress);
         self.maybe_adapt_prefetch();
     }
 
@@ -7083,13 +7196,18 @@ impl BufferPool {
             to_enqueue.push(key);
         }
         PREFETCH_SKIP_STATE.with(|c| c.set((pool_id, consec_hits, skip_budget)));
-        self.enqueue_prefetch_batch(to_enqueue, window);
+        self.enqueue_prefetch_batch(to_enqueue, window, None);
         self.maybe_adapt_prefetch();
     }
 
     /// Push surviving prefetch candidates onto the queue under a single
     /// lock and wake the IO workers.
-    fn enqueue_prefetch_batch(&self, to_enqueue: Vec<PageKey>, window: usize) {
+    fn enqueue_prefetch_batch(
+        &self,
+        to_enqueue: Vec<PageKey>,
+        window: usize,
+        scan_progress: Option<&Arc<AtomicU64>>,
+    ) {
         if to_enqueue.is_empty() {
             return;
         }
@@ -7134,7 +7252,11 @@ impl BufferPool {
                         .fetch_add(1, Ordering::Relaxed);
                     continue;
                 }
-                queue.push_back((key, now));
+                queue.push_back(PrefetchRequest {
+                    key,
+                    enqueued_us: now,
+                    scan_progress: scan_progress.cloned(),
+                });
                 enqueued += 1;
             }
             self.prefetch_queue_depth_peak
@@ -7159,9 +7281,9 @@ impl BufferPool {
                 return;
             };
             let mut removed = Vec::new();
-            queue.retain(|(key, _)| {
-                if matches(key) {
-                    removed.push(key.clone());
+            queue.retain(|request| {
+                if matches(&request.key) {
+                    removed.push(request.key.clone());
                     false
                 } else {
                     true
@@ -7262,6 +7384,7 @@ impl BufferPool {
     /// flag and its global count.
     fn promote_scan_origin(&self, frame: &Frame) -> bool {
         if frame.scan_origin.swap(false, Ordering::AcqRel) {
+            frame.scan_recycle.store(false, Ordering::Release);
             self.scan_origin_count.fetch_sub(1, Ordering::Relaxed);
             true
         } else {
@@ -7362,7 +7485,13 @@ impl BufferPool {
     fn observe_new_scan_origin(&self, shard_idx: usize, frame: &Arc<Frame>) {
         self.scan_origin_count.fetch_add(1, Ordering::Relaxed);
         if cold_recycle_enabled() {
-            if let Ok(mut candidates) = self.shards[shard_idx].cold_candidates.lock() {
+            let shard = &self.shards[shard_idx];
+            let queue = if frame.scan_recycle.load(Ordering::Relaxed) {
+                &shard.scan_recycle_candidates
+            } else {
+                &shard.cold_candidates
+            };
+            if let Ok(mut candidates) = queue.lock() {
                 let cap = self.cold_candidate_capacity_per_shard();
                 while candidates.len() >= cap {
                     candidates.pop_front();
@@ -7389,12 +7518,13 @@ impl BufferPool {
         for shard in &self.shards {
             // Reclamation must not wait behind foreground page admission.
             // A missed busy shard is bounded by its insertion-time cap.
-            let Ok(mut candidates) = shard.cold_candidates.try_lock() else {
-                continue;
-            };
-            candidates.retain(|candidate| candidate.strong_count() != 0);
-            candidates.truncate(cap);
-            candidates.shrink_to_fit();
+            for queue in [&shard.cold_candidates, &shard.scan_recycle_candidates] {
+                if let Ok(mut candidates) = queue.try_lock() {
+                    candidates.retain(|candidate| candidate.strong_count() != 0);
+                    candidates.truncate(cap);
+                    candidates.shrink_to_fit();
+                }
+            }
         }
     }
 
@@ -7477,7 +7607,7 @@ impl BufferPool {
     fn drain_prefetch_queue(self: &Arc<Self>) -> Result<(), QueryError> {
         let window = self.effective_prefetch_pages.load(Ordering::Relaxed);
         // One queue lock for the whole window instead of one per page.
-        let batch: Vec<(PageKey, u64)> = {
+        let batch: Vec<PrefetchRequest> = {
             let Ok(mut queue) = self.prefetch_queue.lock() else {
                 return Ok(());
             };
@@ -7489,56 +7619,70 @@ impl BufferPool {
         }
         let now = self.now_us();
         let mut pending = Vec::with_capacity(batch.len());
-        for (key, enqueued_us) in batch {
-            let wait_us = now.saturating_sub(enqueued_us);
+        for request in batch {
+            let wait_us = now.saturating_sub(request.enqueued_us);
             self.prefetch_queue_wait_us_total
                 .fetch_add(wait_us, Ordering::Relaxed);
             self.prefetch_queue_drains.fetch_add(1, Ordering::Relaxed);
-            if wait_us >= 500_000 {
+            if wait_us >= 500_000
+                || prefetch_passed_scan(request.key.page_id, request.scan_progress.as_deref())
+            {
                 self.prefetch_queue_drops.fetch_add(1, Ordering::Relaxed);
                 self.prefetch_stale_drops.fetch_add(1, Ordering::Relaxed);
-                self.complete_prefetch_admission(&key);
+                self.complete_prefetch_admission(&request.key);
                 continue;
             }
-            if self.lookup_frame(&key)?.is_some() {
-                self.complete_prefetch_admission(&key);
+            if self.lookup_frame(&request.key)?.is_some() {
+                self.complete_prefetch_admission(&request.key);
                 continue;
             }
-            pending.push(key);
+            pending.push(request);
         }
         if !batch_read_enabled() {
-            for key in pending {
-                if let Ok(pinned) = self.pin_page_with_intent(key.clone(), AccessIntent::Prefetch) {
-                    drop(pinned);
+            for request in pending {
+                if !prefetch_passed_scan(request.key.page_id, request.scan_progress.as_deref()) {
+                    if let Ok(pinned) =
+                        self.pin_page_with_intent(request.key.clone(), AccessIntent::Prefetch)
+                    {
+                        drop(pinned);
+                    }
                 }
-                self.complete_prefetch_admission(&key);
+                self.complete_prefetch_admission(&request.key);
             }
             return Ok(());
         }
         pending.sort_unstable_by(|left, right| {
-            left.file
+            left.key.file
                 .hash
-                .cmp(&right.file.hash)
-                .then_with(|| left.file.path.cmp(&right.file.path))
-                .then_with(|| left.page_id.cmp(&right.page_id))
+                .cmp(&right.key.file.hash)
+                .then_with(|| left.key.file.path.cmp(&right.key.file.path))
+                .then_with(|| left.key.page_id.cmp(&right.key.page_id))
         });
         let result = (|| -> Result<(), QueryError> {
             let mut start = 0usize;
             while start < pending.len() {
                 let mut end = start + 1;
                 while end < pending.len()
-                    && *pending[end].file == *pending[start].file
-                    && pending[end].page_id == pending[end - 1].page_id.saturating_add(1)
+                    && pending[end].key.file == pending[start].key.file
+                    && pending[end].key.page_id == pending[end - 1].key.page_id.saturating_add(1)
                 {
                     end += 1;
                 }
-                self.load_prefetch_run(&pending[start..end])?;
+                let requests = pending[start..end]
+                    .iter()
+                    .map(|request| (request.key.borrowed(), request.scan_progress.as_deref()));
+                self.load_page_run_with_timeout(
+                    requests,
+                    AccessIntent::Prefetch,
+                    self.lock_wait,
+                    None,
+                )?;
                 start = end;
             }
             Ok(())
         })();
-        for key in &pending {
-            self.complete_prefetch_admission(key);
+        for request in &pending {
+            self.complete_prefetch_admission(&request.key);
         }
         result
     }
@@ -7546,6 +7690,7 @@ impl BufferPool {
     /// Reserve all frames in a contiguous run before issuing one positioned
     /// read. Foreground readers that arrive meanwhile find `Loading` and wait
     /// for this operation instead of issuing a duplicate read.
+    #[cfg(test)]
     fn load_prefetch_run(self: &Arc<Self>, keys: &[PageKey]) -> Result<(), QueryError> {
         self.load_page_run(keys, AccessIntent::Prefetch)
     }
@@ -7555,7 +7700,12 @@ impl BufferPool {
         keys: &[PageKey],
         intent: AccessIntent,
     ) -> Result<(), QueryError> {
-        self.load_page_run_with_timeout(keys, intent, self.lock_wait)
+        self.load_page_run_with_timeout(
+            keys.iter().map(|key| (key.borrowed(), None)),
+            intent,
+            self.lock_wait,
+            None,
+        )
     }
 
     /// Synchronous scan read-ahead uses the same Loading/Ready publication
@@ -7578,30 +7728,114 @@ impl BufferPool {
             }
         }
         if keys.len() > 1 {
-            self.load_page_run_with_timeout(&keys, AccessIntent::Scan, Duration::ZERO)?;
+            self.load_page_run_with_timeout(
+                keys.iter().map(|key| (key.borrowed(), None)),
+                AccessIntent::Scan,
+                Duration::ZERO,
+                None,
+            )?;
         }
         Ok(())
     }
 
-    fn load_page_run_with_timeout(
-        self: &Arc<Self>,
-        keys: &[PageKey],
+    /// On a scan miss, read the bounded contiguous run up to the next resident
+    /// page. Retain the loader pins until the cursor visits those pages so
+    /// another worker's scan admissions cannot recycle them in the meantime.
+    fn pin_batched_scan_page<'pool>(
+        self: &'pool Arc<Self>,
+        key: PageKeyRef<'_>,
+        scan_end: u64,
+        intent: AccessIntent,
+        loaded: &mut Vec<PinnedFrame<&'pool Self>>,
+    ) -> Result<PinnedFrame<&'pool Self>, QueryError> {
+        if loaded
+            .last()
+            .is_some_and(|pin| pin.frame.key.page_id == key.page_id)
+        {
+            let pin = loaded.pop().expect("matching scan page");
+            if pin.frame.is_ready() {
+                return Ok(pin);
+            }
+        }
+        let candidate = self.lookup_frame_ref(key)?;
+        if candidate.is_none() && loaded.is_empty() {
+            let batch_pages = (self.capacity_pages() / 16).clamp(1, 64);
+            let limit = scan_end.min(key.page_id.saturating_add(batch_pages));
+            let mut end = key.page_id + 1;
+            while end < limit {
+                if self
+                    .lookup_frame_ref(PageKeyRef { page_id: end, ..key })?
+                    .is_some()
+                {
+                    break;
+                }
+                end += 1;
+            }
+            let count = (end - key.page_id) as usize;
+            if count > 1 {
+                let pages = (0..count).map(|i| {
+                    (
+                        PageKeyRef {
+                            page_id: key.page_id + i as u64,
+                            ..key
+                        },
+                        None,
+                    )
+                });
+                if self
+                    .load_page_run_with_timeout(
+                        pages,
+                        intent,
+                        Duration::ZERO,
+                        Some(loaded),
+                    )
+                    .is_ok()
+                {
+                    loaded.reverse();
+                    if loaded.last().is_some_and(|pin| {
+                        pin.frame.key.page_id == key.page_id && pin.frame.is_ready()
+                    }) {
+                        return Ok(loaded.pop().expect("matching scan page"));
+                    }
+                }
+                // A demand pin can wait for capacity and report errors for
+                // the requested page if the batch did not pin it.
+                loaded.clear();
+            }
+        }
+        let frame = self.pin_frame_with_candidate(key, intent, candidate)?;
+        Ok(PinnedFrame {
+            pool: self.as_ref(),
+            frame,
+            intent,
+        })
+    }
+
+    fn load_page_run_with_timeout<'a, 'pool>(
+        self: &'pool Arc<Self>,
+        pages: impl ExactSizeIterator<Item = (PageKeyRef<'a>, Option<&'a AtomicU64>)>,
         intent: AccessIntent,
         capacity_wait: Duration,
+        mut scan_pins: Option<&mut Vec<PinnedFrame<&'pool Self>>>,
     ) -> Result<(), QueryError> {
-        if keys.is_empty() {
+        let mut pages = pages.peekable();
+        let Some((key, _)) = pages.peek() else {
             return Ok(());
-        }
-        let file_key = keys[0].file.clone();
+        };
+        let file_key = key.file.clone();
+        let scan_file = scan_recycle_file(&file_key, intent);
         let generation_cell = self.file_generation_cell(&file_key)?;
         let initial_generation = generation_cell.load(Ordering::Acquire);
-        let mut reserved = Vec::with_capacity(keys.len());
-        for key in keys {
-            self.ensure_capacity_for_insert(capacity_wait)?;
-            let shard_idx = self.shard_index(key);
-            let raw_page = self.claim_raw_page_lease(shard_idx)?;
+        let mut reserved = Vec::with_capacity(pages.len());
+        for (key, scan_progress) in pages {
+            if prefetch_passed_scan(key.page_id, scan_progress) {
+                continue;
+            }
+            self.ensure_capacity_for_insert(capacity_wait, scan_file)?;
+            let shard_idx = self.shard_index_ref(key);
+            let raw_page = self.claim_raw_page_lease(shard_idx, scan_file)?;
             let frame = Arc::new(Frame::new_loading(
-                key.clone(),
+                key.into_owned(),
                 initial_generation,
                 intent,
                 raw_page,
@@ -7612,22 +7846,26 @@ impl BufferPool {
                     "buffer pool shard lock poisoned",
                 )
             })?;
-            if frames.contains_key(key) {
+            // A demand miss may have loaded and recycled the page since the
+            // worker dequeued its request. Recheck while publishing Loading.
+            if prefetch_passed_scan(key.page_id, scan_progress) || frames.contains_key(&key) {
                 drop(frames);
                 self.recycle_frame_raw_page(shard_idx, &frame);
                 continue;
             }
+            let key = &frame.key;
             frames.insert(key.clone(), frame.clone());
             self.used_pages.fetch_add(1, Ordering::Relaxed);
             self.note_kind_added(key);
             self.observe_new_scan_origin(shard_idx, &frame);
             drop(frames);
+            let clock_key = key.clone();
             reserved.push(PendingFrameLoad {
                 pool: self,
                 frame,
                 owns_pin: true,
             });
-            self.push_clock_key(shard_idx, key.clone())?;
+            self.push_clock_key(shard_idx, clock_key)?;
         }
         if reserved.is_empty() {
             return Ok(());
@@ -7674,8 +7912,10 @@ impl BufferPool {
                         )
                     })?;
                     guard.resize(PAGE_SIZE, 0);
-                    guard.fill(0);
                     guards.push(guard);
+                }
+                for guard in &mut guards[readable..] {
+                    guard.fill(0);
                 }
                 if readable != 0 {
                     let mut pages: Vec<&mut [u8]> = guards[..readable]
@@ -7686,7 +7926,7 @@ impl BufferPool {
                         read_cached_pages_at(&file, &mut pages, offset).map_err(io_err)?,
                     );
                     for (position, page) in pages.iter().enumerate() {
-                        validate_page_owner(page, &file_key.owner, first_page + position as u64)?;
+                        Self::validate_loaded_page(&file_key, first_page + position as u64, page)?;
                     }
                     readable_total = readable_total.saturating_add(readable);
                     batch_total = batch_total.saturating_add(1);
@@ -7713,7 +7953,7 @@ impl BufferPool {
                     self.read_ios_normal
                         .fetch_add(readable_pages as u64, Ordering::Relaxed);
                 }
-                AccessIntent::Scan => {
+                AccessIntent::Scan | AccessIntent::IndexSweep | AccessIntent::Maintenance => {
                     self.read_ios_scan
                         .fetch_add(readable_pages as u64, Ordering::Relaxed);
                 }
@@ -7770,7 +8010,18 @@ impl BufferPool {
             if intent == AccessIntent::Prefetch {
                 self.prefetch_completed.fetch_add(1, Ordering::Relaxed);
             }
-            frame.unpin();
+            if let Some(pins) = scan_pins.as_deref_mut() {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                self.shards[shard_idx].misses.fetch_add(1, Ordering::Relaxed);
+                record_query_buffer_miss();
+                pins.push(PinnedFrame {
+                    pool: self.as_ref(),
+                    frame: Arc::clone(frame),
+                    intent,
+                });
+            } else {
+                frame.unpin();
+            }
             pending.owns_pin = false;
         }
         self.notify_frame_waiters();
@@ -8985,6 +9236,7 @@ mod oldest_dirty_tests {
             RawPageLease {
                 bytes,
                 charge: controlled_raw_page_charge().unwrap(),
+                scan_file_hash: None,
             },
         ));
 
@@ -9040,6 +9292,7 @@ mod oldest_dirty_tests {
             RawPageLease {
                 bytes: vec![0; PAGE_SIZE],
                 charge: controlled_raw_page_charge().unwrap(),
+                scan_file_hash: None,
             },
         );
         let zero = vec![0; PAGE_SIZE];
@@ -9090,6 +9343,7 @@ mod oldest_dirty_tests {
                 RawPageLease {
                     bytes: vec![0; PAGE_SIZE],
                     charge: controlled_raw_page_charge().unwrap(),
+                    scan_file_hash: None,
                 },
             ))
         };
@@ -9364,7 +9618,7 @@ mod oldest_dirty_tests {
         }
         assert_eq!(pool.scan_origin_count.load(Ordering::Relaxed), 0);
         for _ in 0..8 {
-            assert!(pool.evict_one_with_policy(true).unwrap());
+            assert!(pool.evict_one_with_policy(true, None).unwrap());
         }
         let evictions = pool
             .shards
@@ -9856,6 +10110,7 @@ mod oldest_dirty_tests {
             RawPageLease {
                 bytes: vec![0; PAGE_SIZE],
                 charge: controlled_raw_page_charge().unwrap(),
+                scan_file_hash: None,
             },
         );
         for _ in 0..64 {
@@ -9940,6 +10195,144 @@ mod oldest_dirty_tests {
         drop(pool.pin_page(key(2)).unwrap());
         assert_eq!(pool.snapshot().cold_recycle_hits, 1);
         assert_eq!(pool.snapshot().cold_recycle_fallbacks, 0);
+    }
+
+    #[test]
+    fn repeated_heap_scan_reuses_cold_pages_and_keeps_point_page() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool =
+            BufferPool::new_with_options(8, log, DurabilityMode::Strict, Duration::ZERO, 1, 0);
+        let path = dir.path().join("repeated-scan.heap");
+        let stride = pool.shards.len() as u64;
+        File::create(&path)
+            .unwrap()
+            .set_len((12 * stride + 1) * PAGE_SIZE as u64)
+            .unwrap();
+        let file = Arc::new(BufferPool::heap_file_key(path, 1));
+        let key = |index| PageKey {
+            file: Arc::clone(&file),
+            page_id: index * stride,
+        };
+        // The scans all compete in one shard and never touch the point page.
+        drop(pool.pin_page(key(0)).unwrap());
+        let passes = [
+            ([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 12),
+            ([12, 1, 8, 2, 9, 3, 10, 4, 11, 5, 6, 7], 5),
+            ([8, 4, 9, 5, 11, 1, 10, 2, 12, 7, 6, 3], 6),
+        ];
+        for (order, expected_reads) in passes {
+            let before = pool.snapshot().read_ios;
+            for index in order {
+                drop(
+                    pool.pin_page_with_intent(key(index), AccessIntent::Scan)
+                        .unwrap(),
+                );
+            }
+            assert_eq!(pool.snapshot().read_ios - before, expected_reads);
+            assert!(pool.lookup_frame(&key(0)).unwrap().is_some());
+            assert!((2..=7).all(|index| pool.lookup_frame(&key(index)).unwrap().is_some()));
+        }
+    }
+
+    #[test]
+    fn batched_index_sweep_reuses_resident_pages_and_keeps_hot_point_page() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool =
+            BufferPool::new_with_options(128, log, DurabilityMode::Strict, Duration::ZERO, 1, 0);
+        let scan_end = 144;
+        let path = dir.path().join("index-sweep.idx");
+        File::create(&path)
+            .unwrap()
+            .set_len(PAGE_SIZE as u64 * (scan_end + 1))
+            .unwrap();
+        let file = Arc::new(BufferPool::index_file_key(path));
+        let key = |page_id| PageKeyRef {
+            file: &file,
+            page_id,
+        };
+        drop(pool.pin_page_ref(key(scan_end)).unwrap());
+
+        for pass in 0..4 {
+            let before = pool.snapshot();
+            let mut loaded = Vec::new();
+            for page_id in 0..scan_end {
+                drop(
+                    pool.pin_batched_scan_page(
+                        key(page_id),
+                        scan_end,
+                        AccessIntent::IndexSweep,
+                        &mut loaded,
+                    )
+                    .unwrap(),
+                );
+            }
+            let after = pool.snapshot();
+            assert!(loaded.is_empty());
+            assert!(after.batch_read_pages > before.batch_read_pages);
+            let reads = after.read_ios - before.read_ios;
+            if pass == 0 {
+                assert_eq!(reads, scan_end);
+            } else {
+                assert!(reads < 32, "pass {pass} reread {reads} pages");
+            }
+            let point = pool.pin_page_ref(key(scan_end)).unwrap();
+            assert_eq!(pool.snapshot().read_ios, after.read_ios);
+            drop(point);
+        }
+    }
+
+    #[test]
+    fn heap_scan_recycles_consumed_pages_across_shards_before_its_unused_prefetch() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool =
+            BufferPool::new_with_options(3, log, DurabilityMode::Strict, Duration::ZERO, 1, 0);
+        let path = dir.path().join("scan-read-ahead.heap");
+        let stride = pool.shards.len() as u64;
+        File::create(&path)
+            .unwrap()
+            .set_len((2 * stride + 1) * PAGE_SIZE as u64)
+            .unwrap();
+        let file = Arc::new(BufferPool::heap_file_key(path, 1));
+        let key = |page_id| PageKey {
+            file: Arc::clone(&file),
+            page_id,
+        };
+        for page_id in [0, stride, 2 * stride] {
+            drop(
+                pool.pin_page_with_intent(key(page_id), AccessIntent::Scan)
+                    .unwrap(),
+            );
+        }
+        // Releasing the slot before admission models another loader having
+        // made room. The replacement still inherits the raw allocation hint.
+        assert!(pool.evict_one_with_policy(true, Some(&file)).unwrap());
+        let consumed = pool.pin_page_with_intent(key(1), AccessIntent::Scan).unwrap();
+        assert!(consumed.frame.scan_recycle.load(Ordering::Relaxed));
+
+        // With that frame pinned, the next admission opens another slot.
+        pool.load_prefetch_run(&[key(2)]).unwrap();
+        let unread = pool.lookup_frame(&key(2)).unwrap().unwrap();
+        assert!(unread.scan_recycle.load(Ordering::Relaxed));
+        assert!(unread.prefetch.load(Ordering::Relaxed));
+        drop(consumed);
+
+        let first = pool.shard_index(&key(2 * stride));
+        assert_ne!(first, pool.shard_index(&key(1)));
+        let (_, victim, _) = pool.find_cold_candidate(first, Some(&file)).unwrap().unwrap();
+        assert_eq!(victim, key(1));
+        drop(pool.pin_page_with_intent(key(3), AccessIntent::Scan).unwrap());
+        assert!(pool.lookup_frame(&key(2 * stride)).unwrap().is_some());
+        assert!(pool.lookup_frame(&key(1)).unwrap().is_none());
+        assert!(pool.lookup_frame(&key(2)).unwrap().is_some());
     }
 
     #[test]
@@ -10541,6 +10934,7 @@ mod oldest_dirty_tests {
                 RawPageLease {
                     bytes: vec![0; PAGE_SIZE],
                     charge: controlled_raw_page_charge().unwrap(),
+                    scan_file_hash: None,
                 },
             ));
             frame
@@ -10565,7 +10959,7 @@ mod oldest_dirty_tests {
             .unwrap()
             .push_back(Arc::downgrade(&free));
         let (_, key, _) = pool
-            .find_cold_candidate(true, first)
+            .find_cold_candidate(first, None)
             .unwrap()
             .expect("a pinned candidate must not consume the whole search budget repeatedly");
         assert_eq!(key, free.key);
@@ -10699,7 +11093,7 @@ mod oldest_dirty_tests {
         };
         pool.store_page(key.clone(), vec![7; PAGE_SIZE], 1).unwrap();
 
-        assert!(!pool.evict_one_with_policy(false).unwrap());
+        assert!(!pool.evict_one_with_policy(false, None).unwrap());
         assert!(pool.capacity_pressure.load(Ordering::Acquire));
         assert!(pool.lookup_frame(&key).unwrap().is_some());
         assert_eq!(pool.snapshot().evict_sync_dirty_flushes, 0);
@@ -11484,6 +11878,33 @@ mod oldest_dirty_tests {
     }
 
     #[test]
+    fn scan_prefetch_drops_requests_the_cursor_has_passed() {
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool =
+            BufferPool::new_with_options(64, log, DurabilityMode::Memory, Duration::ZERO, 1, 4);
+        let path = dir.path().join("scan-prefetch.heap");
+        File::create(&path)
+            .unwrap()
+            .set_len(4 * PAGE_SIZE as u64)
+            .unwrap();
+        let file = Arc::new(BufferPool::heap_file_key(path, 1));
+        let key = |page_id| PageKey {
+            file: Arc::clone(&file),
+            page_id,
+        };
+        let progress = Arc::new(AtomicU64::new(1));
+        pool.enqueue_prefetch_batch(vec![key(1), key(2)], 4, Some(&progress));
+        progress.store(2, Ordering::Release);
+        pool.drain_prefetch_queue().unwrap();
+        assert_eq!(pool.read_ios_prefetch.load(Ordering::Relaxed), 1);
+        assert!(pool.lookup_frame(&key(1)).unwrap().is_none());
+        assert!(pool.lookup_frame(&key(2)).unwrap().is_some());
+    }
+
+    #[test]
     fn cancelling_prefetch_also_releases_duplicate_admission() {
         let dir = tempfile::tempdir().unwrap();
         let log = Arc::new(parking_lot::Mutex::new(
@@ -11499,7 +11920,7 @@ mod oldest_dirty_tests {
             page_id: 3,
         };
         let shard_idx = pool.shard_index(&key);
-        pool.enqueue_prefetch_batch(vec![key.clone()], 4);
+        pool.enqueue_prefetch_batch(vec![key.clone()], 4, None);
         assert!(pool.prefetch_queued_or_inflight[shard_idx]
             .lock()
             .unwrap()
@@ -11512,7 +11933,7 @@ mod oldest_dirty_tests {
             .lock()
             .unwrap()
             .contains(&key));
-        pool.enqueue_prefetch_batch(vec![key.clone()], 4);
+        pool.enqueue_prefetch_batch(vec![key.clone()], 4, None);
         assert_eq!(pool.prefetch_queue.lock().unwrap().len(), 1);
     }
 
@@ -11709,6 +12130,8 @@ impl Frame {
         intent: AccessIntent,
         raw_page: RawPageLease,
     ) -> Self {
+        let scan_recycle = scan_recycle_file(&key.file, intent)
+            .is_some_and(|file| raw_page.scan_file_hash == Some(file.hash));
         Self {
             key,
             raw_memory_charge: Mutex::new(Some(raw_page.charge)),
@@ -11716,6 +12139,7 @@ impl Frame {
             root_routing: parking_lot::Mutex::new(None),
             has_root_routing: AtomicBool::new(false),
             small_scan_accesses: AtomicU8::new(u8::from(intent == AccessIntent::SmallScan)),
+            scan_recycle: AtomicBool::new(scan_recycle),
             pin_count: AtomicUsize::new(1),
             state: AtomicU8::new(FrameIoState::Loading as u8),
             io_wait_lock: Mutex::new(()),
@@ -11737,16 +12161,10 @@ impl Frame {
             index_header_validated_epoch: AtomicU64::new(u64::MAX),
             heap_header_present: AtomicBool::new(false),
             heap_header_validated_epoch: AtomicU64::new(u64::MAX),
-            ref_bit: AtomicBool::new(true),
+            ref_bit: AtomicBool::new(intent != AccessIntent::Maintenance),
             usage_count: AtomicU8::new(initial_usage_count(intent)),
             prefetch: AtomicBool::new(intent == AccessIntent::Prefetch),
-            scan_origin: AtomicBool::new(matches!(
-                intent,
-                AccessIntent::Scan
-                    | AccessIntent::SmallScan
-                    | AccessIntent::Prefetch
-                    | AccessIntent::Probe
-            )),
+            scan_origin: AtomicBool::new(intent.admits_cold()),
             flushed_at_us: AtomicU64::new(0),
             flush_lock: Mutex::new(()),
         }
@@ -11785,6 +12203,7 @@ impl Frame {
             root_routing: parking_lot::Mutex::new(None),
             has_root_routing: AtomicBool::new(false),
             small_scan_accesses: AtomicU8::new(0),
+            scan_recycle: AtomicBool::new(false),
             pin_count: AtomicUsize::new(1),
             state: AtomicU8::new(FrameIoState::Ready as u8),
             io_wait_lock: Mutex::new(()),
@@ -11806,16 +12225,13 @@ impl Frame {
             index_header_validated_epoch: AtomicU64::new(u64::MAX),
             heap_header_present: AtomicBool::new(false),
             heap_header_validated_epoch: AtomicU64::new(u64::MAX),
-            ref_bit: AtomicBool::new(intent != AccessIntent::Prefetch),
+            ref_bit: AtomicBool::new(!matches!(
+                intent,
+                AccessIntent::Prefetch | AccessIntent::Maintenance
+            )),
             usage_count: AtomicU8::new(initial_usage_count(intent)),
             prefetch: AtomicBool::new(false),
-            scan_origin: AtomicBool::new(matches!(
-                intent,
-                AccessIntent::Scan
-                    | AccessIntent::SmallScan
-                    | AccessIntent::Prefetch
-                    | AccessIntent::Probe
-            )),
+            scan_origin: AtomicBool::new(intent.admits_cold()),
             flushed_at_us: AtomicU64::new(0),
             flush_lock: Mutex::new(()),
         }
@@ -11924,6 +12340,7 @@ impl Frame {
         Some(RawPageLease {
             bytes: page,
             charge,
+            scan_file_hash: None,
         })
     }
 
@@ -11951,7 +12368,7 @@ impl Frame {
         // Scan/Prefetch enters the "old" sublist with low usage. A subsequent
         // Normal access promotes the page into "young" (higher usage). This
         // protects hot pages from full-table-scan pollution.
-        if !self.ref_bit.load(Ordering::Relaxed) {
+        if intent != AccessIntent::Maintenance && !self.ref_bit.load(Ordering::Relaxed) {
             self.ref_bit.store(true, Ordering::Relaxed);
         }
         let prev = self.usage_count.load(Ordering::Acquire);
@@ -11966,7 +12383,7 @@ impl Frame {
                 }
                 None
             }
-            AccessIntent::Scan => {
+            AccessIntent::Scan | AccessIntent::IndexSweep => {
                 // Scan accesses keep the page in the cold sublist (usage <= 1).
                 if prev < 1 {
                     self.usage_count.fetch_max(1, Ordering::AcqRel);
@@ -11993,10 +12410,7 @@ impl Frame {
                 }
                 Some(prior)
             }
-            AccessIntent::Prefetch => {
-                // Prefetch is the lowest priority; do not even ensure ref_bit advanced.
-                None
-            }
+            AccessIntent::Prefetch | AccessIntent::Maintenance => None,
             AccessIntent::Probe => {
                 if prev < 1 {
                     self.usage_count.fetch_max(1, Ordering::AcqRel);
@@ -12008,6 +12422,13 @@ impl Frame {
                 None
             }
         }
+    }
+
+    fn is_clean_eviction_candidate(&self) -> bool {
+        self.pin_count.load(Ordering::Acquire) == 0
+            && self.is_ready()
+            && self.deferred_pins.load(Ordering::Acquire) == 0
+            && !self.dirty.load(Ordering::Acquire)
     }
 
     fn is_ready(&self) -> bool {
@@ -12026,9 +12447,9 @@ impl Frame {
 fn initial_usage_count(intent: AccessIntent) -> u8 {
     match intent {
         AccessIntent::Normal => 2,
-        AccessIntent::Scan => 1,
+        AccessIntent::Scan | AccessIntent::IndexSweep => 1,
         AccessIntent::SmallScan => 1,
-        AccessIntent::Prefetch => 0,
+        AccessIntent::Prefetch | AccessIntent::Maintenance => 0,
         AccessIntent::Probe => 1,
     }
 }

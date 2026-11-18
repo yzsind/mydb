@@ -381,6 +381,37 @@ struct CostProbeState {
 
 thread_local! {
     static COST_PROBE: std::cell::Cell<Option<CostProbeState>> = const { std::cell::Cell::new(None) };
+    static IN_MAINTENANCE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scope Zone Map page access on the maintenance thread. Concurrent SQL and
+/// explicit rebuilds on other threads keep their ordinary access intent.
+pub(super) struct MaintenanceAccessScope {
+    previous: bool,
+    _thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+impl MaintenanceAccessScope {
+    pub(super) fn enter() -> Self {
+        Self {
+            previous: IN_MAINTENANCE.replace(true),
+            _thread: std::marker::PhantomData,
+        }
+    }
+
+    fn intent(default: AccessIntent) -> AccessIntent {
+        if IN_MAINTENANCE.get() {
+            AccessIntent::Maintenance
+        } else {
+            default
+        }
+    }
+}
+
+impl Drop for MaintenanceAccessScope {
+    fn drop(&mut self) {
+        IN_MAINTENANCE.set(self.previous);
+    }
 }
 
 /// Costing records actual cold accesses on this thread. Nested planner work
@@ -493,7 +524,9 @@ impl PageFile {
         // Count repeated misses under eviction pressure: they are real I/O,
         // unlike repeated probes of a page that is still resident.
         let cold = measuring && self.pool.lookup_frame(&key)?.is_none();
-        let pinned = self.pool.pin_page_with_intent(key, intent)?;
+        let pinned = self
+            .pool
+            .pin_page_with_intent(key, MaintenanceAccessScope::intent(intent))?;
         if cold {
             COST_PROBE.with(|slot| {
                 if let Some(mut state) = slot.get().filter(|state| state.file_hash == self.key.hash)
@@ -567,6 +600,7 @@ impl PageFile {
             ControlledMemoryCategory, ControlledMemoryCharge,
         };
         let key = self.page_key(page)?;
+        let intent = MaintenanceAccessScope::intent(AccessIntent::Normal);
         // One encoding image plus WAL's owned image/compression workspace.
         // Bound this independently from the buffer pool's resident charge.
         // Writing an unready root is also the low-memory DML fallback: it
@@ -594,6 +628,7 @@ impl PageFile {
         if self.durability != DurabilityMode::Memory {
             if let Some(lsn) = self.pool.try_replace_resident_logged_page(
                 &key,
+                intent,
                 |before, anchored, validated| {
                     let mut after = pending.take().expect("replacement callback runs once");
                     let delta_eligible = kind != Kind::Meta
@@ -677,7 +712,8 @@ impl PageFile {
             log.append_reserved(lsn, 0, full)?;
             lsn
         };
-        self.pool.store_page(key, bytes, lsn)?;
+        self.pool
+            .store_page_with_admission(key, bytes, lsn, intent)?;
         Ok(Some(lsn))
     }
 
@@ -689,6 +725,76 @@ impl PageFile {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn zone_map_maintenance_admits_cold_without_changing_resident_heat() {
+        fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool = BufferPool::new(
+            8,
+            Arc::clone(&log),
+            DurabilityMode::Strict,
+            Duration::from_secs(5),
+        );
+        pool.shutdown_flusher();
+        let file = PageFile::new(
+            dir.path().join("maintenance.zm"),
+            17,
+            1,
+            Arc::clone(&pool),
+            log,
+            DurabilityMode::Strict,
+        )
+        .unwrap();
+        let frame = |page| {
+            pool.lookup_frame(&file.page_key(page).unwrap())
+                .unwrap()
+                .unwrap()
+        };
+        let heat = |frame: &Frame| {
+            (
+                frame.scan_origin.load(Ordering::Relaxed),
+                frame.ref_bit.load(Ordering::Relaxed),
+                frame.usage_count.load(Ordering::Relaxed),
+            )
+        };
+
+        file.write(0, Kind::Bounds, 0, &[]).unwrap();
+        pool.flush_and_evict_all().unwrap();
+        file.write(1, Kind::Bounds, 0, &[]).unwrap();
+        file.visit(1, AccessIntent::Normal, |_| Ok(())).unwrap();
+        let hot = frame(1);
+        hot.ref_bit.store(false, Ordering::Relaxed);
+        let hot_heat = heat(&hot);
+        assert!(!hot_heat.0 && hot_heat.2 > 0);
+
+        let cold_heat = (true, false, 0);
+        {
+            let _scope = MaintenanceAccessScope::enter();
+            file.visit(0, AccessIntent::Normal, |_| Ok(())).unwrap();
+            assert_eq!(heat(&frame(0)), cold_heat);
+            file.write(2, Kind::Bounds, 0, &[]).unwrap();
+            assert_eq!(heat(&frame(2)), cold_heat);
+            for page in 0..=2 {
+                file.visit(page, AccessIntent::Normal, |_| Ok(())).unwrap();
+                let lsn = file.write(page, Kind::Bounds, 0, &[]).unwrap();
+                let resident = frame(page);
+                assert_eq!(resident.dirty_lsn.load(Ordering::Relaxed), lsn);
+                assert_eq!(
+                    heat(&resident),
+                    if page == 1 { hot_heat } else { cold_heat }
+                );
+            }
+        }
+
+        file.visit(0, AccessIntent::Normal, |_| Ok(())).unwrap();
+        assert!(!heat(&frame(0)).0);
+        file.write(2, Kind::Bounds, 0, &[]).unwrap();
+        assert!(!heat(&frame(2)).0);
+    }
 
     #[test]
     fn zone_map_page_revocation_reclaims_memory_before_rejecting_write() {

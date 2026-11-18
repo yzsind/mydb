@@ -101,10 +101,9 @@ impl PeerCloseMonitor {
     pub(crate) fn new(stream: &TcpStream) -> io::Result<Self> {
         use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 
-        // A private read filter can request a watermark above the socket's
-        // receive capacity without changing the connection's SO_RCVLOWAT.
-        // EOF/errors still wake it even with unread command or TLS bytes.
-        // Ordinary input must not wake a second reactor for every query.
+        // A high private watermark suppresses ordinary data wakes without
+        // changing SO_RCVLOWAT. Darwin caps it at the receive capacity, so
+        // readiness must still be checked for a terminal event below.
         // SAFETY: kqueue takes no pointers and returns a fresh owned fd.
         let raw = unsafe { libc::kqueue() };
         if raw < 0 {
@@ -147,9 +146,51 @@ impl PeerCloseMonitor {
         .map_err(io::Error::from)?;
         Ok(Self { closed })
     }
+
+    pub(crate) async fn closed(&self) {
+        use std::os::fd::AsRawFd;
+        loop {
+            let Ok(mut ready) = self.closed.readable().await else {
+                return;
+            };
+            match ready.try_io(|inner| {
+                let mut event = std::mem::MaybeUninit::<libc::kevent>::uninit();
+                let timeout = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                // SAFETY: the private queue stays open; event has space for
+                // one result and the zero timeout makes this call nonblocking.
+                let count = unsafe {
+                    libc::kevent(
+                        inner.get_ref().as_raw_fd(),
+                        std::ptr::null(),
+                        0,
+                        event.as_mut_ptr(),
+                        1,
+                        &timeout,
+                    )
+                };
+                if count < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                if count == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                // SAFETY: a positive count initialized the sole output slot.
+                let event = unsafe { event.assume_init() };
+                Ok(event.flags & (libc::EV_EOF | libc::EV_ERROR) != 0)
+            }) {
+                Ok(Ok(true)) => return,
+                Ok(Ok(false)) | Err(_) => {}
+                Ok(Err(err)) if err.kind() == io::ErrorKind::Interrupted => {}
+                Ok(Err(_)) => return,
+            }
+        }
+    }
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[cfg(target_os = "linux")]
 impl PeerCloseMonitor {
     pub(crate) async fn closed(&self) {
         // The private event queue becomes readable only on closure/error.
@@ -364,5 +405,48 @@ mod tests {
             count() <= before,
             "closed observers must not retain descriptors"
         );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn nonterminal_kqueue_readiness_does_not_signal_disconnect() {
+        use std::os::fd::AsRawFd;
+        let (mut client, mut server) = pair().await;
+        let monitor = PeerCloseMonitor::new(&server).unwrap();
+        // Darwin clamps NOTE_LOWAT at the socket high watermark. Lower it
+        // explicitly to exercise a nonterminal event without a timing race.
+        let event = libc::kevent {
+            ident: server.as_raw_fd() as _,
+            filter: libc::EVFILT_READ,
+            flags: libc::EV_ADD | libc::EV_CLEAR,
+            fflags: libc::NOTE_LOWAT,
+            data: 1,
+            udata: std::ptr::null_mut(),
+        };
+        // SAFETY: both descriptors are open and event is initialized. There
+        // is no output array and the kernel copies the filter update.
+        assert_eq!(
+            unsafe {
+                libc::kevent(
+                    monitor.closed.get_ref().as_raw_fd(),
+                    &event,
+                    1,
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        client.write_all(b"queued command").await.unwrap();
+        let premature = tokio::time::timeout(Duration::from_millis(75), monitor.closed()).await;
+        client.shutdown().await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), monitor.closed())
+            .await
+            .unwrap();
+        let mut bytes = Vec::new();
+        server.read_to_end(&mut bytes).await.unwrap();
+        assert!(premature.is_err(), "ordinary data readiness is not EOF");
+        assert_eq!(bytes, b"queued command");
     }
 }

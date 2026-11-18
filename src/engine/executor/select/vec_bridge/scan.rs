@@ -24,6 +24,7 @@ pub(super) struct StorageBatchStream {
     pub(super) visited_storage_ids: std::collections::HashSet<u64>,
     pub(super) schema: Arc<BatchSchema>,
     pub(super) direct_scratch: crate::storage::DirectScanScratch,
+    full_heap_scans: Option<Arc<[(u64, crate::storage::FullHeapScan)]>>,
 }
 
 pub(super) const VEC_SCAN_MORSEL_PAGES: u64 = 16;
@@ -242,13 +243,64 @@ impl StorageBatchStream {
             pending: std::collections::VecDeque::new(),
             visited_storage_ids: std::collections::HashSet::new(),
             direct_scratch: crate::storage::DirectScanScratch::default(),
+            full_heap_scans: None,
             schema,
         })
+    }
+
+    fn track_full_heap_scans(
+        &mut self,
+        tasks: &[crate::engine::executor::select::parallel::ScanTask],
+    ) -> Result<(), QueryError> {
+        if scan_row_goal().is_some()
+            || crate::storage::rowid::query_column_index(&self.table.schema)
+                .is_some_and(|index| self.schema_cols.contains(&index))
+        {
+            return Ok(());
+        }
+        let groups = tasks.chunk_by(|left, right| left.storage_id == right.storage_id);
+        let multiple_heaps = tasks
+            .first()
+            .zip(tasks.last())
+            .is_some_and(|(first, last)| first.storage_id != last.storage_id);
+        let pages = tasks
+            .iter()
+            .map(|task| task.page_hi.saturating_sub(task.page_lo))
+            .fold(0, u64::saturating_add);
+        if !self
+            .db
+            .eligible_for_full_heap_scan_reuse(pages, multiple_heaps)
+        {
+            return Ok(());
+        }
+
+        let mut scans = Vec::new();
+        for tasks in groups {
+            let first = &tasks[0];
+            if first.page_lo != 0
+                || tasks
+                    .windows(2)
+                    .any(|pair| pair[0].page_hi != pair[1].page_lo)
+            {
+                return Ok(());
+            }
+            let last = &tasks[tasks.len() - 1];
+            let Some(scan) = self
+                .db
+                .start_full_heap_scan(first.storage_id, last.page_hi)?
+            else {
+                return Ok(());
+            };
+            scans.push((first.storage_id, scan));
+        }
+        self.full_heap_scans = Some(scans.into());
+        Ok(())
     }
 }
 
 impl BatchOperator for StorageBatchStream {
     fn sample_scan_pages(&mut self, max_pages: usize) -> bool {
+        self.full_heap_scans = None;
         sample_scan_tasks(&mut self.tasks, max_pages);
         true
     }
@@ -345,6 +397,12 @@ impl BatchOperator for StorageBatchStream {
                 &self.schema_cols,
                 task.page_lo,
                 task.page_hi,
+                self.full_heap_scans.as_ref().and_then(|scans| {
+                    let index = scans
+                        .binary_search_by_key(&task.storage_id, |(id, _)| *id)
+                        .ok()?;
+                    Some(&scans[index].1)
+                }),
                 &mut self.direct_scratch,
                 &mut consume,
             )?;
@@ -1423,7 +1481,7 @@ impl BatchOperator for ParallelStorageBatchStream {
             Some(ParallelStoragePending::Plain {
                 source, filtered, ..
             }) => {
-                sample_scan_tasks(&mut source.tasks, max_pages);
+                source.sample_scan_pages(max_pages);
                 if let Some(filtered) = filtered {
                     sample_scan_tasks(&mut filtered.tasks, max_pages);
                 }
@@ -2111,7 +2169,11 @@ pub(super) fn try_build_direct_batch_scan<'a>(
         use_zone_map,
         parallel_degree.map(|degree| degree as u32),
     )?;
-    let stream = StorageBatchStream::new(db, txn, table, proj, scan_tasks.clone(), morsel_pages)?;
+    let mut stream =
+        StorageBatchStream::new(db, txn, table, proj, scan_tasks.clone(), morsel_pages)?;
+    if !use_zone_map && runtime_filters.is_empty() {
+        stream.track_full_heap_scans(&scan_tasks)?;
+    }
     let mut runtime_filtered_candidate = FilteredStorageBatchStream::runtime_filter_candidate(
         db,
         txn,

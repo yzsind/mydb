@@ -6473,7 +6473,7 @@ fn buffer_pool_high_dirty_ratio_uses_available_clean_victim() {
     assert_eq!(before.dirty_pages, 3, "{before:?}");
     assert!(pool.dirty_ratio_high());
 
-    assert!(pool.evict_one_with_policy(false).unwrap());
+    assert!(pool.evict_one_with_policy(false, None).unwrap());
     let after = pool.snapshot();
     assert_eq!(after.dirty_pages, 3, "{after:?}");
     assert_eq!(after.flushes, before.flushes, "{after:?}");
@@ -6821,7 +6821,7 @@ fn prefetch_queue_is_bounded_below_buffer_capacity() {
             page_id,
         })
         .collect();
-    pool.enqueue_prefetch_batch(candidates, pool.effective_prefetch_window());
+    pool.enqueue_prefetch_batch(candidates, pool.effective_prefetch_window(), None);
 
     // Background workers may already have drained part of the queue by the
     // time this thread takes the lock.  The synchronously recorded peak is
@@ -7260,13 +7260,13 @@ fn prefetch_range_skips_resident_pages_and_enqueues_missing() {
         );
     }
     let before = pool.prefetches.load(Ordering::Relaxed);
-    pool.prefetch_range(&file, 0, 4);
+    pool.prefetch_range(&file, 0, 4, None);
     assert_eq!(
         pool.prefetches.load(Ordering::Relaxed),
         before,
         "fully-resident range must not enqueue prefetches"
     );
-    pool.prefetch_range(&file, 2, 8);
+    pool.prefetch_range(&file, 2, 8, None);
     let after = pool.prefetches.load(Ordering::Relaxed);
     assert_eq!(
         after - before,
@@ -7291,8 +7291,8 @@ fn overlapping_prefetch_ranges_are_unique_while_inflight() {
         1,
     ));
     let before = pool.prefetches.load(Ordering::Relaxed);
-    pool.prefetch_range(&file, 10, 18);
-    pool.prefetch_range(&file, 12, 20);
+    pool.prefetch_range(&file, 10, 18, None);
+    pool.prefetch_range(&file, 12, 20, None);
     assert_eq!(
         pool.prefetches.load(Ordering::Relaxed) - before,
         10,
@@ -8006,6 +8006,77 @@ fn buffer_pool_concurrent_cold_miss_reads_page_once() {
         "{status:?}"
     );
     assert!(status.buffer_hits - baseline.buffer_hits >= 7, "{status:?}");
+}
+
+#[test]
+fn plain_count_buffers_only_after_a_completed_full_payload_scan() {
+    use crate::engine::{QueryResponse, StorageQueryEngine};
+
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let mut config = test_storage_config(DurabilityMode::Strict, false);
+    config.buffer_pool_pages = 128;
+    config.buffer_pool_prefetch_pages = 0;
+    {
+        let engine =
+            StorageQueryEngine::open_with_storage_config(dir.path(), config.clone()).unwrap();
+        engine
+            .execute("CREATE TABLE t (pad VARBINARY(3000))")
+            .unwrap();
+        let values = vec!["(REPEAT('x',3000))"; 200].join(",");
+        engine
+            .execute(&format!("INSERT INTO t VALUES {values}"))
+            .unwrap();
+        engine.db_handle().flush_dirty_data().unwrap();
+    }
+    let engine = StorageQueryEngine::open_with_storage_config(dir.path(), config).unwrap();
+    let db = engine.db_handle();
+    let table = db.table("test.t").unwrap();
+    let pages = db.heap_page_count_for_storage(table.id).unwrap();
+    assert!(db.eligible_for_full_heap_scan_reuse(pages, false));
+    let partial = db.start_full_heap_scan(table.id, pages).unwrap().unwrap();
+    db.scan_rows_payloads_storage_streaming_range(
+        &table,
+        table.id,
+        TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
+        &[],
+        0,
+        2,
+        Some(&partial),
+        &mut DirectScanScratch::default(),
+        &mut |_| Ok(()),
+    )
+    .unwrap();
+
+    let heap_reads = || db.storage_status().buffer_pool_read_ios_by_kind[0];
+    let count = || {
+        let QueryResponse::ResultSet(result) = engine
+            .execute("SELECT COUNT(*) FROM t")
+            .unwrap()
+            .materialize()
+            .unwrap()
+        else {
+            panic!("expected COUNT result")
+        };
+        assert_eq!(result.rows, vec![vec![Value::Int(200)]]);
+    };
+    let initial = heap_reads();
+    count();
+    assert_eq!(heap_reads(), initial, "partial scan must not train reuse");
+    let before = db.storage_status();
+    count();
+    let warm = heap_reads();
+    assert_eq!(warm - initial, pages - 1, "second full scan warms the heap");
+    let after = db.storage_status();
+    assert!(
+        after.buffer_pool_batch_read_pages - before.buffer_pool_batch_read_pages > (pages - 1) / 2
+    );
+    if cfg!(unix) {
+        assert!(
+            after.buffer_pool_read_syscalls - before.buffer_pool_read_syscalls < (pages - 1) / 2
+        );
+    }
+    count();
+    assert_eq!(heap_reads(), warm, "third full scan hits the buffer pool");
 }
 
 #[test]
@@ -31399,4 +31470,25 @@ fn voided_commit_scn_is_not_published_before_its_wal_proof() {
         "a concurrent publisher crossed an unlogged void completion"
     );
     assert_eq!(db.visible_scn(), base + 2);
+}
+
+#[test]
+fn replication_visibility_proof_uses_wal_pressure_emergency_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    let before_lsn = db.log.lock().last_lsn();
+    let budget = &db.capture.budget;
+    budget.pending.store(1, Ordering::Release);
+    budget.limit.store(1, Ordering::Release);
+    budget.enabled.store(true, Ordering::Release);
+    assert!(budget.check(1).is_err());
+    let proof = db.log_replication_visibility();
+    budget.enabled.store(false, Ordering::Release);
+    proof.expect("visibility proofs must drain admitted work under WAL pressure");
+    assert!(db.log.lock().last_lsn() > before_lsn);
+    assert!(
+        budget.pending.load(Ordering::Acquire) > 1,
+        "emergency control records must still count towards retained WAL"
+    );
+    db.ensure_operational().unwrap();
 }

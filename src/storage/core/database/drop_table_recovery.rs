@@ -277,6 +277,11 @@ impl Database {
             if self.retirement_is_live(&intent) {
                 continue;
             }
+            let _disk_budget = match self.admit_disk_cleanup(Some(&intent), 0, false) {
+                Ok(budget) => budget,
+                Err(err) if err.is(crate::error::catalog::ER_DISK_FULL_NOWAIT) => continue,
+                Err(err) => return Err(err),
+            };
             let cleaned = if self.physical_replica_mode() {
                 intent
                     .files

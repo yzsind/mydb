@@ -148,15 +148,7 @@ fn expression_column_source_for_expr(
 ) -> crate::types::ColumnSource {
     let mut source = expression_column_source(unsigned);
     source.dynamic_parameter = matches!(expr, Expr::Placeholder(_));
-    source.round_decimal_result = crate::parser::visit::any_expr(expr, |node| {
-        matches!(
-            node,
-            Expr::Binary {
-                op: crate::parser::BinaryOp::Div,
-                ..
-            }
-        )
-    });
+    source.round_decimal_result = crate::engine::expr::decimal_result_needs_shaping(expr);
     // A standalone computed field has no original catalog column. Set
     // operations fill the first branch's expression label later, where MySQL
     // exposes it as aggregate UNION metadata; doing so here would incorrectly
@@ -3564,16 +3556,7 @@ pub(super) fn execute_select(
                 let SelectItem::Expr { expr, .. } = item else {
                     return None;
                 };
-                crate::parser::visit::any_expr(expr, |node| {
-                    matches!(
-                        node,
-                        Expr::Binary {
-                            op: crate::parser::BinaryOp::Div,
-                            ..
-                        }
-                    )
-                })
-                .then_some(index)
+                crate::engine::expr::decimal_result_needs_shaping(expr).then_some(index)
             })
             .collect()
     } else {

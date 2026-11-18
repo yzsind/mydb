@@ -321,9 +321,11 @@ impl<'a> InsertCursor<'a> {
                         break;
                     }
                 }
-                std::str::from_utf8(&self.source.as_bytes()[start..self.i])
-                    .ok()
-                    .map(|s| s.to_string())
+                let name = self.source.get(start..self.i)?;
+                if super::function_names::reserved_identifier(name, self.source, start, self.i) {
+                    return None;
+                }
+                Some(name.to_owned())
             }
             _ => None,
         }
@@ -5825,6 +5827,11 @@ fn parse_routine_object_name(sql: &str, idx: usize) -> Result<(String, usize), P
                     && part.parse::<f64>().is_ok())
             {
                 return Err(parse_error_at_zero("expected object name"));
+            }
+            if super::function_names::reserved_identifier(part, sql, start, idx) {
+                return Err(parse_error_at_zero(format!(
+                    "reserved identifier {part} must be quoted"
+                )));
             }
             part.to_owned()
         };

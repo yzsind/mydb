@@ -100,10 +100,9 @@ pub(crate) fn register(reg: &mut Registry) {
         },
     ));
 
-    // sql_log_off — SESSION only; off means the general log doesn't
-    // record this session's queries.
-    reg.register(SysVar::settable(
-        SysVarDef::new("sql_log_off", Scope::Session, DataType::Bool)
+    // sql_log_off suppresses this session's general log entries.
+    reg.register(SysVar::session_backed(
+        SysVarDef::new("sql_log_off", Scope::Both, DataType::Bool)
             .with_access(Access::SuperReadWrite)
             .with_doc("Suppress this session from the general query log."),
         |ctx| match ctx.session {

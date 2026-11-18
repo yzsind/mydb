@@ -291,6 +291,7 @@ impl Database {
         self.sequences.active_writes.fetch_add(1, Ordering::SeqCst);
         let lease = SequenceWriteLease(self);
         self.ensure_operational()?;
+        self.check_disk_write()?;
         self.ensure_writable()?;
         if self.physical_replica_mode() {
             return Err(error(

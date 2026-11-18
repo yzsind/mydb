@@ -3,6 +3,11 @@ use crate::engine::api::SessionContext;
 use crate::engine::executor::vec::schema::BatchField;
 
 fn compile(sql: &str, kind: ColumnType) -> (ExprProgram, Arc<BatchSchema>) {
+    let ast = crate::parser::parse_expr_fragment(sql).unwrap();
+    compile_ast(&ast, kind)
+}
+
+fn compile_ast(ast: &crate::parser::Expr, kind: ColumnType) -> (ExprProgram, Arc<BatchSchema>) {
     let schema = Arc::new(BatchSchema::new(vec![BatchField {
         table: "t".into(),
         alias: None,
@@ -13,12 +18,11 @@ fn compile(sql: &str, kind: ColumnType) -> (ExprProgram, Arc<BatchSchema>) {
             ..Default::default()
         },
     }]));
-    let ast = crate::parser::parse_expr_fragment(sql).unwrap();
     let program = ExprCompiler::compile(
-        &ast,
+        ast,
         &crate::engine::executor::vec::expr_batch::batch_schema_to_input(&schema),
     )
-    .unwrap_or_else(|error| panic!("compile {sql}: {error:?}"));
+    .unwrap_or_else(|error| panic!("compile {ast:?}: {error:?}"));
     (program, schema)
 }
 fn oracle(program: &ExprProgram, batch: &Batch) -> Result<Vec<Value>, QueryError> {
@@ -2453,7 +2457,16 @@ fn decimal_character_columns_keep_scale_full_coefficients_nulls_and_selection() 
 
 #[test]
 fn statement_temporal_columns_rebind_clock_zone_precision_and_keep_invalid_fallback() {
-    let programs = [
+    use crate::parser::{Expr, Literal};
+
+    // Exercise internal bound precision expressions directly. SQL only
+    // accepts an integer literal in this argument position.
+    let clock = |name: &str, precision| Expr::Function {
+        name: name.into(),
+        args: vec![precision],
+        distinct: false,
+    };
+    let mut programs: Vec<_> = [
         "CURDATE()",
         "CURRENT_DATE()",
         "NOW(6)",
@@ -2462,11 +2475,14 @@ fn statement_temporal_columns_rebind_clock_zone_precision_and_keep_invalid_fallb
         "UTC_TIMESTAMP(5)",
         "UTC_DATE()",
         "UTC_TIME(4)",
-        "NOW(?)",
     ]
     .into_iter()
     .map(|sql| (sql, compile(sql, ColumnType::LongLong)))
-    .collect::<Vec<_>>();
+    .collect();
+    programs.push((
+        "bound NOW precision",
+        compile_ast(&clock("NOW", Expr::Placeholder(0)), ColumnType::LongLong),
+    ));
     let mut session = SessionContext::default();
     for timestamp in [1609459199.123456, 1710053999.654321, 1730613599.999999] {
         session.sysvars.timestamp_override = timestamp;
@@ -2496,15 +2512,15 @@ fn statement_temporal_columns_rebind_clock_zone_precision_and_keep_invalid_fallb
             }
         }
     }
-    for sql in [
-        "NOW(7)",
-        "CURTIME(-1)",
-        "UTC_TIME('invalid')",
-        "NOW(x)",
-        "SYSDATE()",
+    for ast in [
+        clock("NOW", Expr::Literal(Literal::Int(7))),
+        clock("CURTIME", Expr::Literal(Literal::Int(-1))),
+        clock("UTC_TIME", Expr::Literal(Literal::String("invalid".into()))),
+        clock("NOW", Expr::Identifier("x".into())),
+        crate::parser::parse_expr_fragment("SYSDATE()").unwrap(),
     ] {
-        let (program, schema) = compile(sql, ColumnType::LongLong);
-        assert!(!program.has_column_contract(&schema), "{sql}");
+        let (program, schema) = compile_ast(&ast, ColumnType::LongLong);
+        assert!(!program.has_column_contract(&schema), "{ast:?}");
     }
     session.sysvars.timestamp_override = 253402290000.0;
     session.sysvars.time_zone = "+14:00".into();

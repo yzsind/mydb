@@ -12,7 +12,7 @@ use crate::engine::api::{
 use crate::engine::sysvar::backend::SysVar;
 use crate::engine::sysvar::ctx::WriteCtx;
 use crate::engine::sysvar::errors::wrong_value_for_var;
-use crate::engine::sysvar::meta::{Access, DataType, Scope, SysVarDef};
+use crate::engine::sysvar::meta::{Access, DataType, Scope, SelectType, SysVarDef};
 use crate::engine::sysvar::registry::Registry;
 use crate::engine::sysvar::value::SysVarValue;
 use crate::types::QueryError;
@@ -528,22 +528,23 @@ pub(crate) fn register(reg: &mut Registry) {
             Ok(())
         },
     ));
-    register_settable_uint(
-        reg,
-        "optimizer_trace_offset",
-        Scope::Both,
-        -1,
-        i64::MAX,
-        "Offset into trace ring buffer (kept for compat).",
-    );
-    register_settable_uint(
-        reg,
-        "optimizer_trace_limit",
-        Scope::Both,
-        1,
-        1_000_000,
-        "Trace ring buffer capacity (kept for compat).",
-    );
+    for (name, min, doc) in [
+        (
+            "optimizer_trace_offset",
+            i64::MIN,
+            "Offset into trace ring buffer (kept for compat).",
+        ),
+        (
+            "optimizer_trace_limit",
+            0,
+            "Trace ring buffer capacity (kept for compat).",
+        ),
+    ] {
+        register_advisory_integer(
+            reg,
+            SysVarDef::new(name, Scope::Both, DataType::Int { min, max: i64::MAX }).with_doc(doc),
+        );
+    }
     register_settable_uint(
         reg,
         "optimizer_trace_max_mem_size",
@@ -552,13 +553,18 @@ pub(crate) fn register(reg: &mut Registry) {
         i64::MAX,
         "Maximum memory the optimizer trace may use.",
     );
-    register_settable_uint(
+    register_advisory_integer(
         reg,
-        "optimizer_trace_features",
-        Scope::Both,
-        -1,
-        i64::MAX,
-        "Bitmap of optimizer trace features.",
+        SysVarDef::new(
+            "optimizer_trace_features",
+            Scope::Both,
+            DataType::UInt {
+                min: 0,
+                max: u64::MAX,
+            },
+        )
+        .with_select_type(SelectType::Text)
+        .with_doc("Bitmap of optimizer trace features."),
     );
 
     // explain_format — Both. Atomic for global; per-session field for SESSION.
@@ -890,14 +896,15 @@ pub(crate) fn register(reg: &mut Registry) {
         true,
         "Default storage engine for tmp tables (mydb has one engine).",
     );
-    reg.register(SysVar::settable(
+    reg.register(SysVar::session_backed(
         SysVarDef::new(
             "internal_tmp_mem_storage_engine",
-            Scope::Session,
+            Scope::Both,
             DataType::Enum {
                 values: &["TempTable", "MEMORY"],
             },
         )
+        .with_scope_access(Access::SessionAdmin, Access::ReadWrite)
         .with_doc("Storage implementation requested for internal in-memory temporary tables."),
         |ctx| {
             SysVarValue::String(
@@ -1320,7 +1327,8 @@ fn register_settable_uint(
     _max: i64,
     doc: &'static str,
 ) {
-    reg.register(SysVar::session_backed(
+    register_advisory_integer(
+        reg,
         SysVarDef::new(
             name,
             scope,
@@ -1330,21 +1338,16 @@ fn register_settable_uint(
             },
         )
         .with_doc(doc),
-        move |ctx| {
-            SysVarValue::UInt(
-                ctx.session
-                    .and_then(|s| s.sysvars.advisory_uints.get(name).copied())
-                    .unwrap_or(0),
-            )
-        },
-        move |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            ctx.session
-                .sysvars
-                .advisory_uints
-                .insert(name, v.as_u64().unwrap_or(0));
-            Ok(())
-        },
-    ));
+    );
+}
+
+fn register_advisory_integer(reg: &mut Registry, def: SysVarDef) {
+    let default = if matches!(def.data_type, DataType::Int { .. }) {
+        SysVarValue::Int(0)
+    } else {
+        SysVarValue::UInt(0)
+    };
+    reg.register(SysVar::session_advisory(def, default));
 }
 
 fn register_storage_engine(

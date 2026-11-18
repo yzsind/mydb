@@ -681,7 +681,15 @@ impl SpillCharger {
         let (volume_bytes, detected_limit) = if let Some(space) =
             space.filter(|_| override_limit.is_none())
         {
-            let headroom = space.headroom(reserve_pct);
+            let protection = self
+                .inner
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.reclaim_database())
+                .map_or(0, |db| db.disk_spill_floor(&self.inner.data_dir));
+            let headroom = space
+                .headroom(reserve_pct)
+                .min(space.available.saturating_sub(protection));
             let volume_bytes = space.pending_bytes(write_bytes).unwrap_or(u64::MAX);
             if volume_bytes > headroom.saturating_sub(*pending) {
                 return Err(quota_error(
