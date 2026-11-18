@@ -692,6 +692,16 @@ static OPTION_SPECS: &[OptionSpec] = &[
         sensitive: false,
     },
     spec!(
+        "disk_recovery_reserve_bytes",
+        "MYDB_DISK_RECOVERY_RESERVE_BYTES",
+        OptionKind::Bytes
+    ),
+    spec!(
+        "disk_write_min_free_bytes",
+        "MYDB_DISK_WRITE_MIN_FREE_BYTES",
+        OptionKind::Bytes
+    ),
+    spec!(
         "checkpoint_interval_ms",
         "MYDB_CHECKPOINT_INTERVAL_MS",
         OptionKind::U64

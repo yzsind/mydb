@@ -175,6 +175,54 @@ private key paths. On Unix, mydb refuses to start if the config file allows grou
 or other writes; it is recommended to be owned by the service account with mode
 `0600`.
 
+### Low Disk Space
+
+Disk pressure protection is enabled by default for persistent read-write
+instances on Linux and macOS. `disk_recovery_reserve_bytes`
+(`MYDB_DISK_RECOVERY_RESERVE_BYTES`) defaults to 1 GiB (`1073741824` bytes).
+Set a positive byte count to override the reserve size, or set it to `0` to
+disable protection and release any existing reserve at startup. The data and
+WAL directories must share a filesystem that supports physical file allocation.
+`disk_write_min_free_bytes` (`MYDB_DISK_WRITE_MIN_FREE_BYTES`) defaults to
+two WAL segments plus 32 MiB. An explicit value must cover at least one
+WAL segment plus 32 MiB.
+
+The write gate considers free blocks, free inodes, and pending dirty pages.
+Ordinary writes receive a disk pressure error before admission. Consistent
+table reads and completion of admitted transactions remain available while
+storage is healthy. On-volume query spills respect the write headroom.
+Writing resumes above the low watermark by an additional one eighth
+of the watermark, with a minimum gap of 4 MiB.
+
+An idle administrator session can purge a single recycle-bin entry or
+permanently drop a single table with `SET SESSION mydb_recyclebin = OFF`.
+Existing privileges and locks apply.
+The cleanup must fit in the available space after accounting for dirty pages.
+Wait for active writers to finish before retrying a rejected cleanup.
+Permanent drops with foreign keys, triggers, or vector directory cleanup
+require ordinary write headroom. Check the file system after asynchronous
+cleanup to confirm how much space was returned.
+
+For a binlogged DROP, the cleanup budget also covers the event, possible
+rotation, and binary log index and manifest staging on their filesystem.
+The server synchronizes this statement's binlog before committing the WAL
+record that references it. It publishes the catalog change and then
+retires the table's files. Binlogged cleanup requires persistent WAL. At
+startup, the durable binlog index determines whether to finish or roll back an
+interrupted rotation before WAL-based binlog recovery. Rotation for this cleanup
+leaves time- and size-based binlog retention to the background worker.
+
+The recovery reserve is a physical allocation in
+`system/disk-recovery.reserve`. Startup may release it under the data directory
+lock before WAL recovery. Ordinary writes stay paused until the reserve can
+be rebuilt. Size it for extra space needed during REDO, UNDO, log rotation,
+and index rebuilding. Concurrent external writes, filesystem quotas that the
+available-space probe cannot observe, and allocations that outgrow the
+configured headroom can still exhaust the disk. Existing fail-stop and WAL
+recovery rules apply to storage failures. Inspect
+`Mydb_disk_write_limited`, `Mydb_disk_available_bytes`, and
+`Mydb_disk_recovery_reserve_armed` with `SHOW GLOBAL STATUS`.
+
 ### Shutdown, Corruption Recovery, and Replication Initialization
 
 `KILL CONNECTION` closes a connection even while it is waiting for LOCAL INFILE
@@ -187,10 +235,15 @@ can close immediately.
 
 - `SIGINT`, `SIGTERM`, SQL `SHUTDOWN`, and `RESTART` all perform a controlled
   shutdown; `SIGHUP` logs that configuration reload is unsupported and does not
-  trigger shutdown. If the final checkpoint fails, the
-  process exits non-zero and `RESTART` does not exec a new image. An SQL OK only
-  means the shutdown request was accepted; the final on-disk outcome is
-  determined by the process status and the logs.
+  trigger shutdown. A failed final checkpoint cancels the restart and causes a
+  non-zero exit. An SQL OK acknowledges the request. Check the process status
+  and logs for the outcome.
+- A fail-stopped instance continues to accept authorized `KILL`, `SHUTDOWN`,
+  and `RESTART` commands. Once connections and writers have drained, it skips
+  the final checkpoint and leaves the existing recovery point intact. A halt
+  exits non-zero to report that startup recovery is required. `RESTART`
+  relaunches the server and runs normal WAL recovery. After a disk-full failure,
+  make enough space available for recovery before requesting `RESTART`.
 - After shutdown begins, `SIGINT`/`SIGTERM` keep being listened on: repeated
   signals only log a single "shutting down" notice and do not interrupt
   connection draining or the final checkpoint. If these signals arrive after SQL

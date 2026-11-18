@@ -1185,7 +1185,7 @@ impl OverflowFile {
         // Clamp to the file's high-water mark to avoid out-of-range page ids.
         let end = start.saturating_add(n_pages).min(self.page_count);
         if end > start {
-            self.buffer_pool.prefetch_range(&self.file_key, start, end);
+            self.buffer_pool.prefetch_range(&self.file_key, start, end, None);
         }
     }
 
@@ -1416,7 +1416,7 @@ impl OverflowFile {
                     .saturating_add(last_pg + 1)
                     .min(self.page_count);
                 if pe > ps {
-                    self.buffer_pool.prefetch_range(&self.file_key, ps, pe);
+                    self.buffer_pool.prefetch_range(&self.file_key, ps, pe, None);
                 }
             }
         }

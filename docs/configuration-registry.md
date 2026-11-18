@@ -56,6 +56,8 @@ See [interface stability](configuration.md#interface-stability).
 | `checkpoint_wal_bytes` | `MYDB_CHECKPOINT_WAL_BYTES` | `Byte size` | mydb_checkpoint_wal_bytes | No |
 | `data_dir` | `MYDB_DATA_DIR` | `Nonempty string` | datadir | Yes |
 | `default_auth_plugin` | `MYDB_DEFAULT_AUTH_PLUGIN` | `One of: caching_sha2_password, mysql_native_password, sha256_password` | — | No |
+| `disk_recovery_reserve_bytes` | `MYDB_DISK_RECOVERY_RESERVE_BYTES` | `Byte size` | — | No |
+| `disk_write_min_free_bytes` | `MYDB_DISK_WRITE_MIN_FREE_BYTES` | `Byte size` | — | No |
 | `durability` | `MYDB_DURABILITY` | `One of: strict, relaxed, memory` | — | No |
 | `event_workers` | `MYDB_EVENT_WORKERS` | `Integer 1..32` | — | No |
 | `executor_memory_pct` | `MYDB_EXECUTOR_MEMORY_PCT` | `Integer 1..100` | — | No |

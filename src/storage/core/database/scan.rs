@@ -10,7 +10,57 @@ pub(crate) struct VisibleRootScanScratch {
     charge: crate::engine::executor::mem_budget::ScopedCharge,
 }
 
+/// One execution's full-heap scan decision, shared by its range workers.
+pub(crate) struct FullHeapScan {
+    last_completed_us: Arc<AtomicU64>,
+    pages: u64,
+    remaining: AtomicU64,
+    buffered: bool,
+}
+
 impl Database {
+    pub(crate) fn eligible_for_full_heap_scan_reuse(&self, pages: u64, multiple_heaps: bool) -> bool {
+        let pool = &self.buffer_pool;
+        let other_pages = pool
+            .used_pages
+            .load(Ordering::Relaxed)
+            .saturating_sub(pool.scan_origin_count.load(Ordering::Relaxed));
+        let available = pool.capacity_pages().saturating_sub(other_pages);
+        // An oversized single heap can recycle its own scan frames. A
+        // multi-heap scan needs room for all its heaps to avoid inter-file
+        // FIFO churn. Prefer direct I/O if even half a single heap cannot fit.
+        let reusable_limit = if multiple_heaps {
+            available
+        } else {
+            available.saturating_mul(2)
+        };
+        pool.durability != DurabilityMode::Memory
+            && pool.scan_cache_policy(pages) == ScanCachePolicy::Bulk
+            && pages <= reusable_limit
+    }
+
+    pub(crate) fn start_full_heap_scan(
+        &self,
+        storage_id: u64,
+        pages: u64,
+    ) -> Result<Option<FullHeapScan>, QueryError> {
+        const REUSE_WINDOW_US: u64 = 60_000_000;
+        self.with_heap_read(storage_id, |heap| {
+            if heap.page_count_relaxed() != pages || pages == 0 {
+                return Ok(None);
+            }
+            let last_completed_us = &heap.last_full_payload_scan_us;
+            let last = last_completed_us.load(Ordering::Acquire);
+            let now = self.buffer_pool.now_us().saturating_add(1);
+            Ok(Some(FullHeapScan {
+                last_completed_us: Arc::clone(last_completed_us),
+                pages,
+                remaining: AtomicU64::new(pages),
+                buffered: last != 0 && now.saturating_sub(last) <= REUSE_WINDOW_US,
+            }))
+        })
+    }
+
     pub(crate) fn visible_root_scan_scratch(
         &self, table:&TableSchema, txn:TxnView,
     ) -> Result<VisibleRootScanScratch,QueryError> {
@@ -631,6 +681,7 @@ impl Database {
         columns: &[usize],
         page_lo: u64,
         page_hi: u64,
+        full_scan: Option<&FullHeapScan>,
         scratch: &mut DirectScanScratch,
         on_payload: &mut F,
     ) -> Result<(), QueryError>
@@ -642,7 +693,12 @@ impl Database {
         let mut deferred: Vec<RowId> = Vec::new();
         let mut visit_err: Option<QueryError> = None;
         let mut vis_cache = ScanVisibilityCache::new();
-        self.with_heap_read(storage_id, |heap| {
+        let completed_range = self.with_heap_read(storage_id, |heap| {
+            let full_scan = full_scan.filter(|scan| {
+                Arc::ptr_eq(&scan.last_completed_us, &heap.last_full_payload_scan_us)
+                    && scan.pages == heap.page_count_relaxed()
+                    && page_hi <= scan.pages
+            });
             let mut scan = |row: PayloadMvccStoredRow<'_>| {
                 if visit_err.is_some() {
                     return Ok(true);
@@ -668,7 +724,7 @@ impl Database {
                 }
                 Ok(false)
             };
-            if scan_policy == ScanCachePolicy::Bulk {
+            if scan_policy == ScanCachePolicy::Bulk && !full_scan.is_some_and(|scan| scan.buffered) {
                 heap.scan_mvcc_payloads_direct_range_reusing_until(
                     columns, page_lo, page_hi, scratch, &mut scan,
                 )
@@ -680,7 +736,8 @@ impl Database {
                     scan_policy,
                     &mut scan,
                 )
-            }
+            }?;
+            Ok(full_scan)
         })?;
         if let Some(e) = visit_err {
             return Err(e);
@@ -690,6 +747,15 @@ impl Database {
                 self.read_row_columns_at(storage_id, table_schema, row_id, txn, columns)?
             {
                 on_payload(PayloadStreamHit::Values(&values))?;
+            }
+        }
+        if let Some(full_scan) = completed_range {
+            let pages = page_hi.saturating_sub(page_lo);
+            if full_scan.remaining.fetch_sub(pages, Ordering::AcqRel) == pages {
+                full_scan.last_completed_us.fetch_max(
+                    self.buffer_pool.now_us().saturating_add(1),
+                    Ordering::Release,
+                );
             }
         }
         Ok(())

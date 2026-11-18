@@ -58,7 +58,7 @@ fn update_heap_meta_with_key(
     debug_assert_eq!(key.page_id, 0);
     let _pinned = pool.pin_page(key.clone())?;
     let _publication = pool.page_wal_publish_gate.read();
-    pool.try_replace_resident_logged_page(&key, |before, _, _| {
+    pool.try_replace_resident_logged_page(&key, AccessIntent::Normal, |before, _, _| {
         decode_heap_meta(before, &key.file.owner)?;
         let mut after = before.to_vec();
         change(&mut after)?;

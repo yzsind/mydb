@@ -3035,7 +3035,6 @@ impl StorageQueryEngine {
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
-        self.db.ensure_operational()?;
         let _redo_scope = crate::storage::RedoScopeGuard::new(session.redo_enabled);
         let trace_enabled = crate::engine::cbo::trace::optimizer_trace_setting_enabled(
             &session.sysvars.optimizer_trace,
@@ -3619,10 +3618,12 @@ impl StorageQueryEngine {
         }
         let result = match statement {
             Statement::AlterSystemCheckpoint => authorize_statement(&self.db, session, statement)
+                .and_then(|_| self.db.check_disk_write())
                 .and_then(|_| self.db.checkpoint())
                 .map(|()| QueryResponse::Ok),
             Statement::AlterSystemFlushDataCache => {
                 authorize_statement(&self.db, session, statement)
+                    .and_then(|_| self.db.check_disk_write())
                     .and_then(|_| self.db.flush_data_cache())
                     .map(|()| QueryResponse::Ok)
             }
@@ -3772,6 +3773,25 @@ impl QueryEngine for StorageQueryEngine {
         session: &mut SessionContext,
         sql: &str,
     ) -> Result<QueryResponse, QueryError> {
+        if let Err(fail_stop) = self.db.ensure_operational() {
+            session.check_cancelled()?;
+            let _mode = crate::parser::ParserSqlModeGuard::activate_effective_session(
+                crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode),
+            );
+            // Avoid parsing rejected bulk writes. The parsed statement still
+            // has to pass the normal dispatcher and privilege checks. An
+            // executable comment may hide the keyword from this pre-scan.
+            let (keyword, len) = crate::parser::extract_first_keyword(sql);
+            if len != 0 && !matches!(&keyword[..len], b"KILL" | b"SHUTDOWN" | b"RESTART") {
+                return Err(fail_stop);
+            }
+            match parse_statement(sql) {
+                Ok(statement) if dispatch::allowed_during_fail_stop(&statement) => {
+                    return self.execute_parsed(session, sql, Arc::new(statement));
+                }
+                _ => return Err(fail_stop),
+            }
+        }
         self.execute_with_operation(session, sql, true, |session| {
             self.execute_with_log_metadata(session, sql)
         })
@@ -3810,6 +3830,9 @@ impl QueryEngine for StorageQueryEngine {
         let batch = self.prepare_text_dml_batch(session, sql, shape, &params)?;
         let mut statements = Vec::with_capacity(batch.plans.len());
         let result = self.execute_with_operation(session, sql, false, |session| {
+            if let Err(err) = self.db.ensure_operational() {
+                return (Err(err), QueryLogMetadata::default());
+            }
             self.execute_text_prepared_dml_batch(session, sql, params, batch, Some(&mut statements))
         });
         if result.is_err() {

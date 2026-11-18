@@ -818,6 +818,7 @@ fn worker_projected_distinct_topk_typed(
         projection,
         page_lo,
         page_hi,
+        None,
         &mut crate::storage::DirectScanScratch::default(),
         &mut on_payload,
     )?;

@@ -242,6 +242,7 @@ pub(crate) enum InternalErrorKind {
     ReplicaApplyFailure,
     ReplicaSnapshotBlocked,
     ReplicaHandshakeRejected,
+    ShutdownRecoveryRequired,
 }
 
 /// Error returned through the query engine and MySQL protocol.

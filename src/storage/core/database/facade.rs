@@ -372,6 +372,14 @@ impl Database {
             // `Database` drops (or the process exits / re-execs).
         }
         let dir_lock = crate::storage::dir_lock::DataDirLock::acquire(&data_dir)?;
+        let disk_pressure = if context.mode == DatabaseOpenMode::ReadWrite
+            && !snapshot_read_only
+            && config.durability != DurabilityMode::Memory
+        {
+            crate::storage::disk_pressure::DiskPressure::open(&data_dir, config.wal_segment_bytes)?
+        } else {
+            None
+        };
         if snapshot_read_only {
             crate::storage::control::Control::load(&data_dir)?.ok_or_else(|| {
                 error(
@@ -719,6 +727,7 @@ impl Database {
             _image_repository_lease: image_repository_lease,
             capture,
             services: Default::default(),
+            disk_pressure,
             open_mode: if snapshot_read_only {
                 DatabaseOpenMode::ReadOnlyImage
             } else {
@@ -1313,6 +1322,9 @@ impl Database {
         #[cfg(test)]
         if let Some(fixture_sync) = fixture_sync {
             fixture_sync.finish().map_err(io_err)?;
+        }
+        if let Some(pressure) = &db.disk_pressure {
+            pressure.start();
         }
         Ok(db)
     }

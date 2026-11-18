@@ -760,6 +760,7 @@ impl Database {
             return Ok(());
         }
         self.check_dml_allowed(txn)?;
+        self.check_disk_write()?;
         Ok(())
     }
 
@@ -1075,6 +1076,12 @@ impl Database {
             || self.config.durability == DurabilityMode::Memory
         {
             return Ok(());
+        }
+        // Private dictionary replacements are part of the admitted DDL or
+        // retirement transaction. In particular, recording a durable DROP
+        // or PURGE decision may insert a dictionary row under pressure.
+        if !crate::storage::data_dictionary::is_dd_table_id(table_id) {
+            self.check_disk_write()?;
         }
         // The common admission check changes no state. Publication rechecks
         // the limits under the write latch, just as after the old preflight.

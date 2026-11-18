@@ -847,6 +847,7 @@ impl HeapFile {
             update_reserve_bytes: update_reserve_bytes.min(MAX_HEAP_UPDATE_RESERVE_BYTES),
             pending_shrinks: None,
             page_count: std::sync::atomic::AtomicU64::new(page_count),
+            last_full_payload_scan_us: Arc::new(AtomicU64::new(0)),
             file_key,
             buffer_pool,
             row_migrations: std::sync::atomic::AtomicU64::new(0),
@@ -3681,7 +3682,7 @@ impl HeapFile {
         F: FnMut(MvccStoredRow) -> Result<bool, QueryError>,
     {
         let page_count = self.page_count()?;
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
         for page_id in HeapPageScan::new(page_count, page_ids) {
             if page_ids.is_none() {
                 self.prefetch_after(page_id, page_count, &mut prefetch_horizon);
@@ -3735,7 +3736,7 @@ impl HeapFile {
     {
         let page_count = self.page_count()?;
         let scan_end = page_hi.min(page_count);
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let pinned = self
@@ -3800,7 +3801,7 @@ impl HeapFile {
     {
         let page_count = self.page_count()?;
         let scan_end = page_hi.min(page_count);
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let pinned = self
@@ -3859,7 +3860,7 @@ impl HeapFile {
     {
         let page_count = self.page_count()?;
         let scan_end = page_hi.min(page_count);
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let pinned = self
@@ -4088,7 +4089,7 @@ impl HeapFile {
         let page_count = self.page_count()?;
         let mut forwarding = Vec::new();
         let mut charge = crate::engine::executor::mem_budget::ScopedCharge::for_budget(None);
-        let mut horizon = 0;
+        let mut horizon = HeapReadAhead::default();
         let scan_end = page_hi.min(page_count);
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             if page_hi.saturating_sub(page_lo) > 1 {
@@ -4173,7 +4174,7 @@ impl HeapFile {
         let scan_end = page_hi.min(page_count);
         let mut value_buf: Vec<Value> = Vec::with_capacity(columns.len());
         let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let _table_id = self.table_id;
@@ -4321,11 +4322,11 @@ impl HeapFile {
         let page_count = self.page_count()?;
         let scan_end = page_hi.min(page_count);
         let plan = RowDecodePlan::compile_with_codec(columns, &self.codec);
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
+        let mut loaded = Vec::new();
         let mut forwarding = Vec::new();
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
-            self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
-            let stop = self.with_scan_page(page_id, page_count, policy, |page| {
+            let mut scan_page = |page: HeapPageRead<'_>| {
                 for slot_id in 0..page.slot_count() {
                     let Some(payload) = page.payload(slot_id)? else {
                         continue;
@@ -4365,7 +4366,22 @@ impl HeapFile {
                     }
                 }
                 Ok(false)
-            })?;
+            };
+            let stop = if policy == ScanCachePolicy::Bulk {
+                let pinned = self.buffer_pool.pin_batched_scan_page(
+                    self.page_key_ref(page_id),
+                    scan_end,
+                    AccessIntent::Scan,
+                    &mut loaded,
+                )?;
+                pinned.with_heap_raw_bytes_cached(
+                    self.verified_direct_checksums.as_ref(),
+                    |page| scan_page(HeapPageRead::Raw(page)),
+                )?
+            } else {
+                self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
+                self.with_scan_page(page_id, page_count, policy, scan_page)?
+            };
             if stop {
                 return Ok(());
             }
@@ -4766,7 +4782,7 @@ impl HeapFile {
         // `decode_heap_payload_columns_into` would rebuild them on every row.
         let pred_plan = RowDecodePlan::compile_with_codec(predicate_columns, &self.codec);
         let missing_plan = RowDecodePlan::compile_with_codec(missing_columns, &self.codec);
-        let mut prefetch_horizon = 0u64;
+        let mut prefetch_horizon = HeapReadAhead::default();
         for page_id in HeapPageScan::from_range(page_count, page_lo, page_hi) {
             self.prefetch_after(page_id, scan_end, &mut prefetch_horizon);
             let _table_id = self.table_id;
@@ -5042,7 +5058,7 @@ impl HeapFile {
         })
     }
 
-    /// Incremental sequential-scan read-ahead. `horizon` is per-scan
+    /// Incremental sequential-scan read-ahead. `read_ahead.horizon` is per-scan
     /// state owned by the caller's loop: the first page id beyond
     /// everything already submitted to the prefetcher. The first call
     /// submits the whole read-ahead window; each later call submits
@@ -5057,19 +5073,26 @@ impl HeapFile {
     /// re-submitted: the scan reads them synchronously on arrival,
     /// which is the same load-shedding outcome the windowed form
     /// converged to under pressure.
-    fn prefetch_after(&self, page_id: u64, page_count: u64, horizon: &mut u64) {
+    fn prefetch_after(&self, page_id: u64, page_count: u64, read_ahead: &mut HeapReadAhead) {
         let Some(start) = page_id.checked_add(1) else {
             return;
         };
+        if let Some(progress) = &read_ahead.progress {
+            progress.store(start, Ordering::Release);
+        }
         let end = start
             .saturating_add(self.buffer_pool.effective_prefetch_window() as u64)
             .min(page_count);
-        let from = start.max(*horizon);
+        let from = start.max(read_ahead.horizon);
         if from >= end {
             return;
         }
-        *horizon = end;
-        self.buffer_pool.prefetch_range(&self.file_key, from, end);
+        read_ahead.horizon = end;
+        let progress = read_ahead
+            .progress
+            .get_or_insert_with(|| Arc::new(AtomicU64::new(start)));
+        self.buffer_pool
+            .prefetch_range(&self.file_key, from, end, Some(progress));
     }
 
     /// Queue a single heap page for asynchronous prefetch. Used by
@@ -6759,6 +6782,21 @@ mod raw_page_view_tests {
         encoded[PAGE_SIZE - 1] ^= 1;
         let err = HeapPageView::new(&encoded).unwrap_err();
         assert!(err.message().contains("checksum"));
+    }
+}
+
+#[derive(Default)]
+struct HeapReadAhead {
+    horizon: u64,
+    /// The first page whose speculative read can still help this cursor.
+    progress: Option<Arc<AtomicU64>>,
+}
+
+impl Drop for HeapReadAhead {
+    fn drop(&mut self) {
+        if let Some(progress) = &self.progress {
+            progress.store(u64::MAX, Ordering::Release);
+        }
     }
 }
 

@@ -28,6 +28,7 @@ pub use crate::mysql::connection_manager::{
 use crate::mysql::packet::write_packet_direct_unflushed;
 use crate::mysql::protocol::pre_handshake_err_packet;
 use crate::mysql::session::Session;
+use crate::mysql::shutdown::ShutdownIntent;
 use crate::util::logging::log_message;
 
 const ACCEPT_FD_PRESSURE_BACKOFF: Duration = Duration::from_millis(50);
@@ -301,11 +302,9 @@ where
 
     /// Controlled-shutdown sequence shared by SIGINT/SIGTERM, SQL
     /// `SHUTDOWN`/`RESTART`, and `COM_SHUTDOWN`: drain live connections
-    /// (bounded), take the final checkpoint, flush logs, then either
-    /// return (caller exits) or re-exec for `RESTART`.
+    /// (bounded), checkpoint or leave the last recovery point intact, flush
+    /// logs, then either return (caller exits) or re-exec for `RESTART`.
     async fn graceful_shutdown(&self) -> std::io::Result<()> {
-        use crate::mysql::shutdown::{intent, ShutdownIntent};
-
         log_message(format_args!(
             "shutdown in progress (source: {})",
             crate::mysql::shutdown::source_description()
@@ -349,7 +348,8 @@ where
 
         // Thread joins and checkpoint I/O must not block the signal watcher,
         // including on a single-worker runtime. All writers must finish before
-        // the checkpoint; an unsuccessful stop cancels RESTART.
+        // checkpointing or handing off to startup recovery.
+        let intent = crate::mysql::shutdown::intent();
         let engine = Arc::clone(&self.engine);
         tokio::task::spawn_blocking(move || {
             let result = (|| {
@@ -359,12 +359,12 @@ where
                 crate::binlog::shutdown_retention();
                 engine.shutdown()
             })();
-            finish_shutdown(result)
+            finish_shutdown(result, intent)
         })
         .await
         .map_err(|err| std::io::Error::other(format!("shutdown worker failed: {err}")))??;
 
-        match intent() {
+        match intent {
             ShutdownIntent::Halt => {
                 log_message("shutdown complete");
                 Ok(())
@@ -379,8 +379,11 @@ where
 
 // Flush observability logs on success AND failure. Preserve the storage error
 // if flushing fails too; a successful checkpoint must not hide a log failure.
-fn finish_shutdown(result: Result<(), crate::types::QueryError>) -> std::io::Result<()> {
-    finish_shutdown_with_flush(result, || {
+fn finish_shutdown(
+    result: Result<(), crate::types::QueryError>,
+    intent: ShutdownIntent,
+) -> std::io::Result<()> {
+    finish_shutdown_with_flush(result, intent, || {
         if let Some(service) = crate::engine::logging::active_service() {
             if let Err(err) = service.flush(crate::engine::logging::FlushLogKind::All) {
                 log_message(format_args!("shutdown log flush failed: {err:?}"));
@@ -391,21 +394,38 @@ fn finish_shutdown(result: Result<(), crate::types::QueryError>) -> std::io::Res
 
 fn finish_shutdown_with_flush(
     result: Result<(), crate::types::QueryError>,
+    intent: ShutdownIntent,
     flush: impl FnOnce(),
 ) -> std::io::Result<()> {
     flush();
-    result.map_err(|err| {
-        log_message(format_args!(
-            "shutdown failed: {} ({})",
-            err.message(),
-            err.sql_state()
-        ));
-        std::io::Error::other(format!(
-            "shutdown failed; restart cancelled: {} {:?}",
-            err.message(),
-            err.diagnostic_detail()
-        ))
-    })
+    let Err(err) = result else {
+        return Ok(());
+    };
+    if err.is_internal(crate::error::InternalErrorKind::ShutdownRecoveryRequired) {
+        if intent == ShutdownIntent::Restart {
+            log_message(format_args!(
+                "RESTART: final checkpoint skipped; starting WAL recovery: {}",
+                err.message()
+            ));
+            return Ok(());
+        }
+        let message = format!(
+            "final checkpoint skipped; WAL recovery required: {}",
+            err.message()
+        );
+        log_message(&message);
+        return Err(std::io::Error::other(message));
+    }
+    log_message(format_args!(
+        "shutdown failed: {} ({})",
+        err.message(),
+        err.sql_state()
+    ));
+    Err(std::io::Error::other(format!(
+        "shutdown failed; restart cancelled: {} {:?}",
+        err.message(),
+        err.diagnostic_detail()
+    )))
 }
 
 #[cfg(test)]
@@ -417,6 +437,7 @@ fn shutdown_flushes_logs_when_checkpoint_fails() {
             crate::error::catalog::ER_GET_ERRNO,
             "injected checkpoint failure",
         )),
+        ShutdownIntent::Restart,
         || flushed = true,
     );
     assert!(flushed);
@@ -424,6 +445,32 @@ fn shutdown_flushes_logs_when_checkpoint_fails() {
         .unwrap_err()
         .to_string()
         .contains("injected checkpoint failure"));
+}
+
+#[cfg(test)]
+#[test]
+fn shutdown_allows_restart_after_a_fail_stopped_checkpoint_is_skipped() {
+    use crate::error::{catalog::ER_SERVER_SHUTDOWN, InternalErrorKind};
+    use crate::types::QueryError;
+
+    let skipped = QueryError::internal_control(
+        InternalErrorKind::ShutdownRecoveryRequired,
+        ER_SERVER_SHUTDOWN,
+        "injected fail-stop",
+    );
+    let mut flushed = false;
+    finish_shutdown_with_flush(Err(skipped.clone()), ShutdownIntent::Restart, || {
+        flushed = true;
+    })
+    .unwrap();
+    assert!(flushed);
+    assert!(finish_shutdown_with_flush(Err(skipped), ShutdownIntent::Halt, || {}).is_err());
+    assert!(finish_shutdown_with_flush(
+        Err(ER_SERVER_SHUTDOWN.error("other shutdown failure")),
+        ShutdownIntent::Restart,
+        || {},
+    )
+    .is_err());
 }
 
 /// Long-lived OS-signal watcher, created ONCE before the accept loop.

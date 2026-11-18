@@ -1138,6 +1138,7 @@ impl Database {
     /// Reject explicit persistent statistics writes before changing live state.
     fn ensure_statistics_writable(&self) -> Result<(), QueryError> {
         self.ensure_operational()?;
+        self.check_disk_write()?;
         self.ensure_writable()?;
         if self.physical_replica_mode() {
             return Err(error(
