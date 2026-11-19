@@ -99,6 +99,9 @@ pub struct State<E: QueryEngine> {
     completed_requests: Arc<Mutex<VecDeque<Weak<RequestState<E>>>>>,
     pub inflight: Arc<Semaphore>,
     pub slots: Arc<Semaphore>,
+    /// Bounds concurrent metrics collection so scrapes cannot queue
+    /// unbounded blocking work behind a slow status snapshot.
+    pub scrape: Arc<Semaphore>,
     pub used: Arc<AtomicUsize>,
     pub executed: AtomicU64,
     pub failed: AtomicU64,
@@ -112,6 +115,7 @@ impl<E: QueryEngine> State<E> {
         Arc::new(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
             slots: Arc::new(Semaphore::new(config.max_sessions)),
+            scrape: Arc::new(Semaphore::new(4)),
             config,
             engine,
             registry,

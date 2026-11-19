@@ -6,6 +6,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct RestConfig {
     pub enabled: bool,
+    pub metrics_enabled: bool,
     pub addr: SocketAddr,
     pub loopback_http_addr: Option<SocketAddr>,
     pub tls: bool,
@@ -40,6 +41,10 @@ impl RestConfig {
         };
         let enabled = matches!(
             get("ENABLED", "OFF").to_ascii_lowercase().as_str(),
+            "on" | "true" | "1"
+        );
+        let metrics_enabled = matches!(
+            get("METRICS_ENABLED", "OFF").to_ascii_lowercase().as_str(),
             "on" | "true" | "1"
         );
         let host = get("HOST", "127.0.0.1")
@@ -95,6 +100,7 @@ impl RestConfig {
         }
         Ok(Self {
             enabled,
+            metrics_enabled,
             addr: SocketAddr::new(host, port),
             loopback_http_addr,
             tls,

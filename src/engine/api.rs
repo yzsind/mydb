@@ -1948,6 +1948,13 @@ pub trait QueryEngine: Send + Sync + 'static {
         None
     }
 
+    /// Stable process-level metrics for external monitoring. The default is
+    /// `None` for engines without a storage runtime; the REST `/metrics`
+    /// endpoint still reports transport and process metrics in that case.
+    fn metrics_snapshot(&self) -> Option<crate::engine::metrics::MetricsSnapshot> {
+        None
+    }
+
     /// Record a MySQL general-log command event. Engines without a SQL log
     /// surface can ignore this; storage-backed execution writes to the
     /// configured FILE/TABLE destinations.

@@ -4018,6 +4018,10 @@ impl QueryEngine for StorageQueryEngine {
         Some(self.statement_cache.stats())
     }
 
+    fn metrics_snapshot(&self) -> Option<crate::engine::metrics::MetricsSnapshot> {
+        Some(crate::engine::metrics::collect(&self.db, &self.registry))
+    }
+
     fn log_general_event(&self, session: &SessionContext, command_type: &str, argument: &str) {
         self.sql_log.record_general(session, command_type, argument);
     }

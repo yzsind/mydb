@@ -5,6 +5,7 @@ use crate::{
 };
 use runtime::*;
 use serde_json::Value;
+use tower::ServiceExt;
 fn engine() -> (tempfile::TempDir, Arc<StorageQueryEngine>) {
     std::fs::create_dir_all("/tmp/mydb/rest").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb/rest").unwrap();
@@ -205,7 +206,9 @@ async fn rest_protocol_busy_cancellation_and_revocation() {
         .unwrap()
         .unwrap()
         .unwrap();
-    let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
     let result: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(result["error"].is_object());
     let mut root = SessionContext::default();
@@ -897,4 +900,191 @@ async fn rest_audit_no_implicit_database_and_sequential_batch_sql_mode() {
     assert!(result["error"].is_null(), "{result}");
     assert_eq!(result["results"][1]["rows"], json!([["7"]]));
     session.close().await;
+}
+
+fn peer(host: &str) -> Peer {
+    Peer {
+        host: host.into(),
+        cipher: None,
+        version: None,
+        subject: None,
+        issuer: None,
+    }
+}
+
+fn admin_exec(engine: &StorageQueryEngine, sql: &str) {
+    let mut session = SessionContext::default();
+    session.mysql_authenticated = true;
+    session.ssl_cipher = Some("TLS_AES_256_GCM_SHA384".into());
+    engine.execute_with_session(&mut session, sql).unwrap();
+}
+
+async fn metrics_request(
+    app: &Router,
+    token: Option<&str>,
+    uri: &str,
+    peer: Peer,
+) -> axum::response::Response {
+    let mut builder = Request::builder().method("GET").uri(uri).extension(peer);
+    if let Some(token) = token {
+        builder = builder.header("authorization", format!("Bearer {token}"));
+    }
+    app.clone()
+        .oneshot(builder.body(Body::empty()).unwrap())
+        .await
+        .unwrap()
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_require_authentication_and_render_text_exposition() {
+    let (_dir, engine) = engine();
+    let token = test_key(&engine, "CREATE API KEY 'metrics'");
+    let mut config = RestConfig::from_startup().unwrap();
+    // Metrics must work independently of the REST SQL routes.
+    config.enabled = false;
+    config.metrics_enabled = true;
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    let app = server.router();
+
+    let response = metrics_request(&app, None, "/metrics", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let response = metrics_request(&app, Some(&token), "/metrics?since=1", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(response.headers()["cache-control"], "no-store");
+    assert_eq!(
+        response.headers()["content-type"],
+        "text/plain; version=0.0.4; charset=utf-8"
+    );
+    let bytes = to_bytes(response.into_body(), 4 * 1024 * 1024)
+        .await
+        .unwrap();
+    let response = metrics_request(&app, Some(&token), "/api/v1/status", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    let text = String::from_utf8(bytes.to_vec()).unwrap();
+    assert!(text.contains("mydb_up 1\n"), "{text}");
+    assert!(text.contains("mydb_ready 1\n"), "{text}");
+    assert!(text.contains("mydb_engine_metrics_available 1\n"), "{text}");
+    assert!(text.contains("mydb_build_info{"), "{text}");
+    assert!(
+        text.contains("mydb_checkpoint_last_phase_seconds{phase=\"flush\"}"),
+        "{text}"
+    );
+    assert!(text.contains("mydb_wal_syncs_total"), "{text}");
+    assert!(text.contains("mydb_http_sessions"), "{text}");
+    assert!(
+        text.contains("mydb_replication_seconds_behind_source_max NaN\n"),
+        "{text}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_require_process_privilege() {
+    let (_dir, engine) = engine();
+    admin_exec(
+        &engine,
+        "CREATE USER 'metrics_reader'@'127.0.0.1' IDENTIFIED BY 'pw'",
+    );
+    admin_exec(
+        &engine,
+        "GRANT SELECT ON *.* TO 'metrics_reader'@'127.0.0.1'",
+    );
+    let token = test_key(
+        &engine,
+        "CREATE API KEY 'metrics-reader' FOR 'metrics_reader'@'127.0.0.1'",
+    );
+    let mut config = RestConfig::from_startup().unwrap();
+    config.enabled = false;
+    config.metrics_enabled = true;
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    let app = server.router();
+
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    admin_exec(
+        &engine,
+        "GRANT PROCESS ON *.* TO 'metrics_reader'@'127.0.0.1'",
+    );
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_reject_non_loopback_plaintext_peers() {
+    let (_dir, engine) = engine();
+    admin_exec(
+        &engine,
+        "CREATE USER 'metrics_remote'@'%' IDENTIFIED BY 'pw'",
+    );
+    admin_exec(&engine, "GRANT PROCESS ON *.* TO 'metrics_remote'@'%'");
+    let token = test_key(
+        &engine,
+        "CREATE API KEY 'metrics-remote' FOR 'metrics_remote'@'%'",
+    );
+    let mut config = RestConfig::from_startup().unwrap();
+    config.enabled = false;
+    config.metrics_enabled = true;
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    let app = server.router();
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("192.0.2.10")).await;
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let mut tls_peer = peer("192.0.2.10");
+    tls_peer.cipher = Some("TLS_AES_256_GCM_SHA384".into());
+    let response = metrics_request(&app, Some(&token), "/metrics", tls_peer).await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("::ffff:127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::OK);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_reject_excess_concurrent_scrapes() {
+    let (_dir, engine) = engine();
+    let token = test_key(&engine, "CREATE API KEY 'metrics-capacity'");
+    let mut config = RestConfig::from_startup().unwrap();
+    config.enabled = false;
+    config.metrics_enabled = true;
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    let mut permits = Vec::new();
+    for _ in 0..4 {
+        permits.push(server.state.scrape.clone().try_acquire_owned().unwrap());
+    }
+    let app = server.router();
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(response.headers()["retry-after"], "1");
+    drop(permits);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn prometheus_metrics_route_is_absent_when_disabled() {
+    let (_dir, engine) = engine();
+    let token = test_key(&engine, "CREATE API KEY 'metrics-disabled'");
+    let mut config = RestConfig::from_startup().unwrap();
+    config.metrics_enabled = false;
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    let app = server.router();
+    let response = metrics_request(&app, Some(&token), "/metrics", peer("127.0.0.1")).await;
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn prometheus_metrics_only_plaintext_non_loopback_listener_is_rejected() {
+    let (_dir, engine) = engine();
+    let mut config = RestConfig::from_startup().unwrap();
+    config.enabled = false;
+    config.metrics_enabled = true;
+    config.tls = false;
+    config.cert = None;
+    config.key = None;
+    config.loopback_http_addr = None;
+    let listener = TcpListener::bind("0.0.0.0:0").await.unwrap();
+    let server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    let error = server.run_with_listener(listener).await.unwrap_err();
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
 }
