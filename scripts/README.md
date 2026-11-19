@@ -55,6 +55,7 @@ archive; native execution checks remain enabled by default.
 | Local pagination performance comparison | `pagination_query_bench.py --directory /tmp/mydb/pagination-run`; isolated mydb and MySQL 8.0, result checks, plans, and latency samples |
 | Storage format documentation, MTR import, and TSAN | `render_storage_format_versions.sh`, `mtr_import.sh`, `run_tsan_btree.sh` |
 | SQL oracle inputs and result checks | `tpch/`, `tpcds/`, `clickbench/`, `*_check_results.py`, `clickbench_results.py` |
+| Bulk-load stall reproduction and maintenance timeline analysis | `issue7_bulk_load_churn.py --binary target/release/mydb --workdir /tmp/mydb/issue7 --cgroup`; optional cgroup v2 `io.max`, co-tenant CPU/memory, `strace`, forced small WAL segments, and client/server crash churn. Summarize with `issue7_analyze.py --workdir /tmp/mydb/issue7`; requires PyMySQL and passwordless sudo only for `--cgroup` |
 
 ## Retained regressions and fixtures
 
