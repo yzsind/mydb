@@ -406,9 +406,12 @@ impl CatalogManager {
     fn install_descriptor(&self, key: String, table: Arc<TableSchema>) {
         // Cache installation is optional. Never wait behind a durable logical
         // publication while holding cache/header latches or a reactor permit.
-        let Some(_publication) = self.publication.try_lock() else {
+        let publication = self.publication.try_lock();
+        if publication.is_none()
+            && self.pending.load().as_ref().is_none_or(|pending| pending.id == table.id)
+        {
             return;
-        };
+        }
         let bytes = Self::descriptor_bytes(&table);
         let limit = self.cache_limit_bytes();
         let Ok(mut headers) = self.table_headers.write() else {
@@ -425,11 +428,22 @@ impl CatalogManager {
         let Ok(mut catalog) = self.live.write() else {
             return;
         };
+        // The reservation is global, but a durable statistics update owns just
+        // one descriptor. The live latch serializes this check with the start
+        // of a new publication and with the final descriptor swap.
+        let pending = self.pending.load();
+        let pending_id = pending.as_ref().map(|table| table.id);
+        let current = catalog.tables.get(&key);
+        if publication.is_none()
+            && (pending_id.is_none() || pending_id == Some(table.id) || current.is_none())
+        {
+            return;
+        }
         // A read-compatible DDL can publish while a cold reader decodes the
         // previous DD row outside the catalog latch. That reader may retain
         // its old immutable descriptor, but must never reinstall it over a
         // newer capture/public definition (which would lose index maintenance).
-        if catalog.tables.get(&key).is_some_and(|current| {
+        if current.is_some_and(|current| {
             current.id != table.id || current.schema_version > table.schema_version
         }) {
             return;
@@ -455,6 +469,7 @@ impl CatalogManager {
             catalog.tables.insert(key, table);
             return;
         }
+        let mut pending_victim = None;
         while cache.bytes.saturating_add(bytes) > limit {
             let Some((victim_key, generation)) = cache.order.pop_front() else {
                 break;
@@ -465,12 +480,14 @@ impl CatalogManager {
             if generation != entry.generation {
                 continue;
             }
-            if catalog
-                .tables
-                .get(&victim_key)
-                .is_some_and(|t| self.descriptor_is_pinned(t.id))
-            {
-                continue;
+            if let Some(victim) = catalog.tables.get(&victim_key) {
+                if pending_id == Some(victim.id) {
+                    pending_victim = Some((victim_key, generation));
+                    continue;
+                }
+                if self.descriptor_is_pinned(victim.id) {
+                    continue;
+                }
             }
             let victim = cache.entries.remove(&victim_key).expect("entry checked");
             cache.bytes = cache.bytes.saturating_sub(victim.bytes);
@@ -480,6 +497,9 @@ impl CatalogManager {
             if let Some(header) = headers.get(&victim_key).cloned() {
                 catalog.tables.insert(victim_key, header);
             }
+        }
+        if let Some(entry) = pending_victim {
+            cache.order.push_front(entry);
         }
         if bytes > limit || cache.bytes.saturating_add(bytes) > limit {
             if let Some(header) = headers.get(&key).cloned() {
@@ -2027,8 +2047,8 @@ impl Database {
                 );
             }
         }
-        // The writer reservation excludes DDL, rollback and cache publication
-        // throughout the durable transaction without excluding catalog reads.
+        // The reservation excludes logical writers and cache changes to this
+        // descriptor throughout the durable transaction.
         catalog.tables.insert(key.clone(), Arc::new(candidate));
         if let Some(publication) = security_publication { publication.publish(); }
         drop(catalog);

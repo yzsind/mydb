@@ -606,6 +606,36 @@ fn object_stats_cold_read_keeps_stable_revision_after_durable_commit_before_publ
 }
 
 #[test]
+fn object_stats_publication_keeps_unrelated_descriptor_cache_usable() {
+    let dir = stats_test_directory();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    create_checkpoint_test_table(&db);
+    db.create_table("u", vec![checkpoint_test_pk_column()], vec!["id".into()], vec![]).unwrap();
+    db.set_catalog_cache_mb(64);
+    let before = db.table("test.t").unwrap();
+    db.force_cold_online_descriptor_for_test("test.u");
+    let hook = Arc::new(DdlBackfillTestHook::new());
+    let worker = {
+        let db = db.clone();
+        let hook = hook.clone();
+        std::thread::spawn(move || {
+            STATS_PUBLICATION_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+            let mut candidate = before.as_ref().clone();
+            candidate.stats.analyze_revision += 1;
+            db.publish_stats_candidate_checked(&before, candidate, true).unwrap();
+        })
+    };
+    assert!(hook.wait_until_reached(Duration::from_secs(10)));
+    let first = db.table("test.u").unwrap();
+    let cached = !db.catalog_read().unwrap().tables["test.u"].columns.is_empty();
+    let second = db.table("test.u").unwrap();
+    let reused = Arc::ptr_eq(&first, &second);
+    hook.release();
+    worker.join().unwrap();
+    assert!(cached && reused, "unrelated descriptor was decoded repeatedly during t's statistics I/O: cached={cached}, reused={reused}");
+}
+
+#[test]
 fn object_stats_skips_pinned_ddl_and_rejects_stale_revision_before_dictionary_write() {
     let dir = stats_test_directory();
     let db = open_relaxed_test_db(dir.path());

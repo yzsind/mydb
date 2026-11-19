@@ -1305,7 +1305,7 @@ where
 {
     // First, make sure we have at least 4 bytes of decompressed payload
     // for the inner MySQL frame header.
-    if !ensure_decompressed_bytes(reader, state, 4, limit).await? {
+    if !ensure_decompressed_bytes(reader, state, 4).await? {
         return Ok(None);
     }
     let mut header = [0u8; 4];
@@ -1336,7 +1336,7 @@ where
         // slice past `inflate_buf` and panic (matches the plaintext
         // `read_exact_with_timeout` behaviour). `ensure_decompressed_bytes`
         // returns `Ok(false)` only on a clean EOF with nothing buffered.
-        if !ensure_decompressed_bytes(reader, state, frame_len, limit).await? {
+        if !ensure_decompressed_bytes(reader, state, frame_len).await? {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "compressed stream ended mid-frame",
@@ -1349,7 +1349,7 @@ where
         // Continuation frame's own 4-byte header follows. Same reasoning:
         // a clean EOF here means the client promised more (>16 MiB) frames
         // but disappeared — that is a truncated packet, not a clean close.
-        if !ensure_decompressed_bytes(reader, state, 4, limit).await? {
+        if !ensure_decompressed_bytes(reader, state, 4).await? {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "compressed stream ended before continuation frame header",
@@ -1391,13 +1391,12 @@ async fn ensure_decompressed_bytes<R>(
     reader: &mut R,
     state: &mut CompressionState,
     need: usize,
-    limit: usize,
 ) -> io::Result<bool>
 where
     R: AsyncRead + Unpin,
 {
     while state.available() < need {
-        match read_one_compressed_packet(reader, state, limit).await? {
+        match read_one_compressed_packet(reader, state).await? {
             true => {}
             false => {
                 if state.available() == 0 && need > 0 {
@@ -1420,7 +1419,6 @@ where
 async fn read_one_compressed_packet<R>(
     reader: &mut R,
     state: &mut CompressionState,
-    limit: usize,
 ) -> io::Result<bool>
 where
     R: AsyncRead + Unpin,
@@ -1437,26 +1435,6 @@ where
     let comp_seq = hdr[3];
     state.next_out_compressed_seq = Some(comp_seq.wrapping_add(1));
     let uncomp_len = (hdr[4] as usize) | ((hdr[5] as usize) << 8) | ((hdr[6] as usize) << 16);
-    // The declared decompressed size is attacker controlled and sizes the
-    // inflate buffer before any data is produced. Bound it (together with the
-    // bytes still buffered) by the logical packet limit plus one inner header,
-    // like the network buffer growth limit of the plaintext protocol.
-    let declared = if uncomp_len == 0 {
-        comp_len
-    } else {
-        uncomp_len
-    };
-    let pending = state.available().saturating_add(declared);
-    if pending > limit.saturating_add(4) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            PacketTooLarge {
-                response_sequence_id: comp_seq.wrapping_add(1),
-                bytes: pending,
-                limit,
-            },
-        ));
-    }
     // Request and response share the outer counter; inner frame sequence
     // numbers cannot identify compressed packet boundaries.
 
@@ -1468,10 +1446,10 @@ where
             ),
         ));
     }
-    // An outer chunk includes inner frame headers and may contain multiple
-    // logical packets. Its 24-bit length bounds decompression; the logical
-    // payload limit is checked by read_packet_compressed after reading the
-    // inner header, which also supplies the correct response sequence id.
+    // An outer chunk can carry parts of several logical messages. Its 24-bit
+    // length bounds each decode, and both scratch and output buffers grow only
+    // after protocol memory admission. The inner headers enforce the logical
+    // packet limit before allocating the assembled payload.
 
     // Bound the inflate buffer: re-shape now that we know the next chunk
     // size; this also makes the `extend_from_slice` below the single
@@ -2259,12 +2237,9 @@ mod tests {
                     .unwrap()
                     .downcast_ref::<PacketTooLarge>()
                     .unwrap();
-                // The declared decompressed size (inner header + payload) is
-                // rejected before any inflate buffer is sized from it.
-                assert_eq!(too_large.response_sequence_id, 43);
-                assert_eq!(too_large.bytes, size + 4);
+                assert_eq!(too_large.response_sequence_id, 8);
+                assert_eq!(too_large.bytes, size);
                 assert_eq!(too_large.limit, limit);
-                assert!(state.inflate_buf.is_empty());
             } else {
                 assert_eq!(result.unwrap().unwrap().payload, vec![b'x'; size]);
             }
@@ -2272,29 +2247,65 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn compressed_declared_size_is_bounded_before_inflating() {
-        // A tiny zlib stream that declares (and would inflate to) far more
-        // than max_allowed_packet must be refused without allocating.
-        let inner = vec![0u8; 8 * 1024 * 1024];
-        let mut compressor = flate2::Compress::new(flate2::Compression::best(), true);
-        let mut compressed = Vec::new();
-        compressor
-            .compress_vec(&inner, &mut compressed, flate2::FlushCompress::Finish)
-            .unwrap();
-        assert!(compressed.len() < 16 * 1024);
-        let mut wire = vec![0; 7];
-        wire[..3].copy_from_slice(&(compressed.len() as u32).to_le_bytes()[..3]);
-        wire[4..7].copy_from_slice(&(inner.len() as u32).to_le_bytes()[..3]);
-        wire.extend_from_slice(&compressed);
+    async fn compressed_chunk_can_exceed_the_limit_of_an_individual_message() {
+        let limit = 16;
+        let mut raw = Vec::new();
+        for (seq, size) in [(7, limit), (8, limit), (9, limit + 1)] {
+            write_packet_frame_into(seq, &vec![b'x'; size], &mut raw).unwrap();
+        }
+        use std::io::Write;
+        let mut encoder =
+            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+        encoder.write_all(&raw).unwrap();
+        let zlib = encoder.finish().unwrap();
+        let chunks = [
+            (raw.clone(), 0, CompressionState::new_zlib()),
+            (zlib, raw.len(), CompressionState::new_zlib()),
+            #[cfg(feature = "zstd-compression")]
+            (
+                zstd::bulk::compress(&raw, 3).unwrap(),
+                raw.len(),
+                CompressionState::new_zstd(3).unwrap(),
+            ),
+        ];
+        for (payload, unpacked_len, mut state) in chunks {
+            let mut wire = vec![0; COMPRESSED_HEADER_LEN];
+            wire[..3].copy_from_slice(&(payload.len() as u32).to_le_bytes()[..3]);
+            wire[4..7].copy_from_slice(&(unpacked_len as u32).to_le_bytes()[..3]);
+            wire.extend_from_slice(&payload);
+            let mut input = wire.as_slice();
+            for seq in [7, 8] {
+                let packet = read_packet_compressed(&mut input, &mut state, limit)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(packet.sequence_id, seq);
+                assert_eq!(packet.payload, vec![b'x'; limit]);
+            }
+            let err = read_packet_compressed(&mut input, &mut state, limit)
+                .await
+                .unwrap_err();
+            let too_large = err
+                .get_ref()
+                .unwrap()
+                .downcast_ref::<PacketTooLarge>()
+                .unwrap();
+            assert_eq!(too_large.bytes, limit + 1);
+            assert_eq!(too_large.response_sequence_id, 10);
+        }
+    }
+
+    #[tokio::test]
+    async fn compressed_chunk_does_not_allocate_output_for_a_truncated_body() {
+        let mut wire = [0; COMPRESSED_HEADER_LEN];
+        wire[0] = 1;
+        wire[4..7].copy_from_slice(&(8u32 * 1024 * 1024).to_le_bytes()[..3]);
         let mut state = CompressionState::new_zlib();
-        let err = read_packet_compressed(&mut wire.as_slice(), &mut state, 64 * 1024)
+        let err = read_packet_compressed(&mut wire.as_slice(), &mut state, 16)
             .await
             .unwrap_err();
-        assert!(err
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<PacketTooLarge>())
-            .is_some_and(|too_large| too_large.bytes == inner.len()));
-        assert!(state.inflate_buf.capacity() < 1024 * 1024);
+        assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(state.inflate_buf.capacity(), 0);
     }
 
     #[tokio::test]
