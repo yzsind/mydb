@@ -145,14 +145,8 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
     use crate::engine::expr::ValueKey;
     let group_by_len = group_by.len();
     let mut out = RollupEmitTarget::new(group_by, group_by_len, slots);
+    // Empty input has no groups to roll up: MySQL emits no grand-total row.
     if finest.groups.is_empty() {
-        let state = RollupGroupState {
-            prefix_len: 0,
-            key_values: Vec::new(),
-            sample_fields: Vec::new(),
-            accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
-        };
-        emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
         return Ok(out.into_rows());
     }
     let field = crate::engine::executor::sort::SortField {
@@ -1330,19 +1324,9 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_rows(
     let mut group_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     let mut out = RollupEmitTarget::new(group_by, group_by_len, slots);
 
-    // ROLLUP always includes the `()` grouping set (the grand total). Over an
-    // empty input MySQL still emits that single super-aggregate row (e.g.
-    // `NULL … NULL 0`); the per-row loop never runs, so seed it explicitly.
-    // Partial-prefix groups (prefix_len >= 1) correctly stay absent: there are
-    // no key values to roll up.
+    // The grand-total row is derived from at least one group; an empty input
+    // has none, so ROLLUP produces no rows (unlike an ungrouped aggregate).
     if input_rows.is_empty() {
-        let state = RollupGroupState {
-            prefix_len: 0,
-            key_values: Vec::new(),
-            sample_fields: Vec::new(),
-            accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
-        };
-        emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
         return Ok(out.into_rows());
     }
 
@@ -1543,17 +1527,6 @@ fn aggregate_rollup_plan_rows_per_row(
     > = hashbrown::HashMap::with_hasher(ahash::RandomState::new());
     let per_group_bytes = 64 + slots.len() * 32;
     let mut group_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
-    if input_rows.is_empty() {
-        groups.insert(
-            (0, Vec::new()),
-            RollupGroupState {
-                prefix_len: 0,
-                key_values: Vec::new(),
-                sample_fields: Vec::new(),
-                accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
-            },
-        );
-    }
     for row in &input_rows {
         crate::engine::cancel::check_cancelled()?;
         let full_values = group_by
@@ -1948,15 +1921,6 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_stream_sorted(
             }
             emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
         }
-    }
-    if prev_full.is_none() {
-        let state = RollupGroupState {
-            prefix_len: 0,
-            key_values: Vec::new(),
-            sample_fields: Vec::new(),
-            accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
-        };
-        emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
     }
     Ok(out.into_rows())
 }

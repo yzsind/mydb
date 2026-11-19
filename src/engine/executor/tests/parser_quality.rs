@@ -1282,11 +1282,7 @@ fn quality_parameter_identity_covers_dynamic_like_and_manual_tails() {
             &mut session,
             "EXECUTE parameter_mix USING @n,@d,@s,@p,@esc,@last"
         ),
-        vec![vec![
-            Value::String("2026-10-05".into()),
-            Value::Int(1),
-            Value::Int(17)
-        ]]
+        vec![vec![Value::Date(20731), Value::Int(1), Value::Int(17)]]
     );
     run(
         &engine,

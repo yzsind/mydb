@@ -38,11 +38,13 @@ fn transaction_audit_xa_consumes_one_shot_access_in_both_directions() {
     run(&engine, &mut s, "SET TRANSACTION READ ONLY");
     run(&engine, &mut s, "XA START 'ro'");
     reject(&engine, &mut s, "INSERT INTO t VALUES(1)", 1792);
+    run(&engine, &mut s, "XA END 'ro'");
     run(&engine, &mut s, "XA ROLLBACK 'ro'");
     run(&engine, &mut s, "SET SESSION TRANSACTION READ ONLY");
     run(&engine, &mut s, "SET TRANSACTION READ WRITE");
     run(&engine, &mut s, "XA START 'rw'");
     run(&engine, &mut s, "INSERT INTO t VALUES(1)");
+    run(&engine, &mut s, "XA END 'rw'");
     run(&engine, &mut s, "XA ROLLBACK 'rw'");
     reject(&engine, &mut s, "INSERT INTO t VALUES(1)", 1792);
 }

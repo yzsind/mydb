@@ -3158,6 +3158,16 @@ impl Database {
     }
 
     pub fn commit_txn(&self, txn_id: u64) -> Result<u64, QueryError> {
+        self.commit_txn_with_unlock_hook(txn_id, || {})
+    }
+
+    /// Run the admission handoff after MVCC publication and row-lock release.
+    /// The deferred token still owns the durability and post-commit work.
+    pub(crate) fn commit_txn_with_unlock_hook(
+        &self,
+        txn_id: u64,
+        after_unlock: impl FnOnce(),
+    ) -> Result<u64, QueryError> {
         let _trace = crate::util::lock_diagnostics::Span::enter(
             crate::util::lock_diagnostics::COMMIT_BEGIN,
             crate::util::lock_diagnostics::COMMIT_END,
@@ -3167,6 +3177,7 @@ impl Database {
         );
         let mut deferred = self.commit_txn_deferred(txn_id)?;
         let commit_scn = deferred.commit_scn;
+        after_unlock();
         self.finish_deferred_commits(&mut [&mut deferred])?;
         Ok(commit_scn)
     }
@@ -6533,6 +6544,16 @@ impl Database {
     }
 
     pub fn rollback_txn(&self, txn_id: u64) -> Result<(), QueryError> {
+        self.rollback_txn_with_unlock_hook(txn_id, || {})
+    }
+
+    /// A rollback with undo can hand off admission once compensation is
+    /// applied and the row waiters have been woken, before syncing EndTxn.
+    pub(crate) fn rollback_txn_with_unlock_hook(
+        &self,
+        txn_id: u64,
+        after_unlock: impl FnOnce(),
+    ) -> Result<(), QueryError> {
         let head = {
             let txns = self.txns_read()?;
             match txns.slot(txn_id) {
@@ -6555,7 +6576,7 @@ impl Database {
             return Ok(());
         }
         let result = crate::engine::executor::mem_budget::with_critical_memory_reservations(|| {
-            self.rollback_txn_inner(txn_id)
+            self.rollback_txn_inner(txn_id, after_unlock)
         });
         match result {
             Ok(()) => Ok(()),
@@ -6575,7 +6596,11 @@ impl Database {
         }
     }
 
-    fn rollback_txn_inner(&self, txn_id: u64) -> Result<(), QueryError> {
+    fn rollback_txn_inner(
+        &self,
+        txn_id: u64,
+        after_unlock: impl FnOnce(),
+    ) -> Result<(), QueryError> {
         self.pending_heap_shrinks.remove(txn_id);
         // Handler_rollback: single funnel for every rollback path.
         crate::engine::status_counters::record_handler_rollback();
@@ -6652,6 +6677,7 @@ impl Database {
             released.extend(self.row_locks_sharded.release_txn(txn_id));
         }
         self.notify_lock_waiters_for_rows(released);
+        after_unlock();
         self.flush_touched_indexes(&touched_tables)?;
         let end_lsn = self.append_wal(txn_id, WalPayload::EndTxn)?;
         match self.config.durability {

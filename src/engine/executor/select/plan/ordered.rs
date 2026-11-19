@@ -1460,17 +1460,7 @@ pub(in crate::engine::executor::select) fn execute_streaming_rollup_aggregate(
         }
         prev_keys = Some(keys);
     }
-    if prev_keys.is_none() {
-        // Empty input: ROLLUP still emits the single `()` grand-total row
-        // (MySQL parity, e.g. `NULL … NULL 0`). The loop above never seeded
-        // `active[0]`, so do it here before the final flush.
-        active[0] = Some(RollupGroupState {
-            prefix_len: 0,
-            key_values: Vec::new(),
-            sample_fields: Vec::new(),
-            accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
-        });
-    }
+    // Empty input has no group to roll up, so nothing is emitted (MySQL).
     for prefix_len in (0..=group_by_len).rev() {
         if let Some(state) = active[prefix_len].take() {
             emit_rollup_group_state(&mut out, &slots, group_by_len, state, having)?;

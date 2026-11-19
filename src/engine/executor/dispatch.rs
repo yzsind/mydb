@@ -3630,7 +3630,43 @@ fn auth_query_required_privileges<'q>(
         .collect()
 }
 
+/// `KEYRING_*` functions operate on one process-wide key store with no
+/// per-account ownership, so any statement invoking them needs the global
+/// EXECUTE privilege (the MySQL keyring UDF requirement).
+fn statement_calls_keyring_function(statement: &Statement) -> bool {
+    struct Find(bool);
+    impl crate::parser::visit::AstVisitor for Find {
+        fn enter_expr(&mut self, expr: &Expr) {
+            if let Expr::Function { name, .. } = expr {
+                self.0 |= name
+                    .get(..8)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("KEYRING_"));
+            }
+        }
+        fn continue_expr_walk(&self) -> bool {
+            !self.0
+        }
+    }
+    let mut find = Find(false);
+    crate::parser::visit::visit_statement(&mut find, statement);
+    find.0
+}
+
 fn auth_required_privileges(
+    session: &SessionContext,
+    statement: &Statement,
+) -> Vec<RequiredPrivilege> {
+    let mut required = auth_statement_privileges(session, statement);
+    if statement_calls_keyring_function(statement) {
+        required.push(RequiredPrivilege {
+            privilege: Privilege::Execute,
+            scope: PrivilegeScope::Global,
+        });
+    }
+    required
+}
+
+fn auth_statement_privileges(
     session: &SessionContext,
     statement: &Statement,
 ) -> Vec<RequiredPrivilege> {
@@ -8187,13 +8223,23 @@ pub(super) fn execute_qualified_statement(
             crate::engine::cache::flush_global_sql_caches();
             Ok(QueryResponse::Ok)
         }
-        Statement::ReplicationAdmin { sql } => crate::replication::handle_admin_sql(&sql),
+        Statement::ReplicationAdmin { sql } => {
+            implicit_commit_for_ddl(db, session)?;
+            crate::replication::handle_admin_sql(&sql)
+        }
         Statement::MydbReplicationAdmin { sql } => {
             crate::repl::handle_admin_sql_with_session(&sql, session)
         }
         Statement::RecycleBin(command) => execute_recyclebin(db, session, command),
         Statement::BackupAdmin { command } => crate::backup::sql::execute(db, &command),
         Statement::BinlogAdmin { sql } => {
+            if sql
+                .trim_start()
+                .get(..5)
+                .is_some_and(|s| s.eq_ignore_ascii_case("RESET"))
+            {
+                implicit_commit_for_ddl(db, session)?;
+            }
             if sql
                 .trim()
                 .trim_end_matches(';')
@@ -10225,7 +10271,7 @@ pub(super) fn execute_qualified_statement(
                     renames.iter().map(|(from, _)| account_key(from)).collect();
                 let targets: std::collections::BTreeSet<_> =
                     renames.iter().map(|(_, to)| account_key(to)).collect();
-                ensure_system_account_access(auth, session, sources.iter())?;
+                ensure_system_account_access(auth, session, sources.iter().chain(targets.iter()))?;
                 if sources.len() != renames.len() || targets.len() != renames.len() {
                     return Err(error(
                         crate::error::catalog::ER_CANNOT_USER,
@@ -10378,6 +10424,8 @@ pub(super) fn execute_qualified_statement(
             // (matches the spirit of MySQL FLUSH PRIVILEGES, post-changes).
             db.mutate_auth_catalog(|_| Ok(()))?;
             crate::engine::auth::auth_cache_clear();
+            // MySQL 8.0 resets the failed-login budget when the account
+            // cache is reloaded (verified against 8.0.46).
             crate::engine::auth::flush_all_failed_logins();
             Ok(QueryResponse::Ok)
         }
@@ -10388,12 +10436,8 @@ pub(super) fn execute_qualified_statement(
         // (helpers below)
         Statement::FlushHosts => {
             implicit_commit_for_ddl(db, session)?;
-            // mydb does not maintain a host-resolution cache; the
-            // equivalent state in MySQL — blocked-host tracking after
-            // repeated handshake failures — lives on the per-account
-            // `failed_login_count` for mydb. Resetting those gives FLUSH
-            // HOSTS a meaningful effect parallel to MySQL.
-            crate::engine::auth::flush_all_failed_login_counts(db)?;
+            // mydb keeps no host cache. MySQL 8.0 leaves account password
+            // locks untouched on FLUSH HOSTS, so this is a pure no-op.
             Ok(QueryResponse::Ok)
         }
         Statement::FlushStatus => {

@@ -387,6 +387,8 @@ where
         "IF" => Some(unify_branch_types(args, 1, &mut type_of)),
         // NULLIF(a,b): the result is always `a` (or NULL), so it takes a's type.
         "NULLIF" => Some(args.first().map(type_of).unwrap_or(ColumnType::VarString)),
+        // `@v := expr` yields the assigned value, so it has the value's type.
+        "__SET_USER_VAR" => Some(args.get(1).map(type_of).unwrap_or(ColumnType::VarString)),
         "ABS" => Some(
             match args.first().map(type_of).unwrap_or(ColumnType::Double) {
                 ColumnType::Date

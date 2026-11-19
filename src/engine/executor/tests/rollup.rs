@@ -314,17 +314,15 @@ fn rollup_distinct_aggregates_merge_across_prefixes() {
 }
 
 #[test]
-fn grouped_empty_input_with_rollup_emits_grand_total_row_in_mysql80_shape() {
+fn grouped_empty_input_with_rollup_emits_no_rows_in_mysql80_shape() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE empty_sales (region INT, amount INT)")
         .unwrap();
 
-    // ROLLUP always includes the `()` grouping set; over an empty input MySQL
-    // 8.0 still emits that single grand-total row (verified against MySQL 9.6:
-    // `region=NULL, COUNT(*)=0, SUM(amount)=NULL, GROUPING(region)=1`), rather
-    // than returning no rows.
+    // Over an empty input there is no group to roll up, so MySQL 8.0.46 returns
+    // no rows at all (no `()` grand-total row), unlike an ungrouped aggregate.
     let rows = query_rows(
         &engine,
         "SELECT region, COUNT(*), SUM(amount), GROUPING(region) \
@@ -332,10 +330,7 @@ fn grouped_empty_input_with_rollup_emits_grand_total_row_in_mysql80_shape() {
          GROUP BY region WITH ROLLUP",
     );
 
-    assert_eq!(
-        rows,
-        vec![vec![Value::Null, Value::Int(0), Value::Null, Value::Int(1)]]
-    );
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 #[test]

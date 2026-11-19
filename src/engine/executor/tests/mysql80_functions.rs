@@ -794,9 +794,9 @@ fn date_add_supports_mysql_composite_interval_units() {
             DATE_ADD('2026-01-01', INTERVAL '1-2' YEAR_MONTH), \
             DATE_SUB('2026-01-02 03:04:05', INTERVAL '1:02' HOUR_MINUTE)",
     );
-    assert_eq!(row[0], Value::String("2026-01-02 02:03:04".into()));
-    assert_eq!(row[1], Value::String("2027-03-01".into()));
-    assert_eq!(row[2], Value::String("2026-01-02 02:02:05".into()));
+    assert_eq!(row[0].to_display_string(), "2026-01-02 02:03:04");
+    assert_eq!(row[1].to_display_string(), "2027-03-01");
+    assert_eq!(row[2].to_display_string(), "2026-01-02 02:02:05");
 }
 
 #[test]

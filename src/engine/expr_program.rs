@@ -10482,14 +10482,14 @@ mod cache_tests {
         let prog =
             compile_session_function("DATE_ADD", vec![lit_s("2024-01-31"), interval(1, "MONTH")]);
         assert_eq!(
-            eval_no_row(&prog).unwrap(),
-            Value::String("2024-02-29".into())
+            eval_no_row(&prog).unwrap().to_display_string(),
+            "2024-02-29"
         );
         let prog =
             compile_session_function("DATE_SUB", vec![lit_s("2024-03-01"), interval(1, "DAY")]);
         assert_eq!(
-            eval_no_row(&prog).unwrap(),
-            Value::String("2024-02-29".into())
+            eval_no_row(&prog).unwrap().to_display_string(),
+            "2024-02-29"
         );
         let prog =
             compile_session_function("DATE_ADD", vec![lit_s("0000-00-00"), interval(1, "DAY")]);

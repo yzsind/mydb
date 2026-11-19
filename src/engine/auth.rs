@@ -588,14 +588,14 @@ mod failed_login {
         }
     }
 
-    /// `FLUSH HOSTS` — reset every account's failed-login budget.
+    /// `FLUSH PRIVILEGES` reloads the account cache, which MySQL 8.0 answers
+    /// by resetting every account's failed-login budget and temporary lock.
+    /// `FLUSH HOSTS` only clears the host cache and must not call this.
     pub fn flush_all() {
-        {
-            let mut map = table()
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            map.clear();
-        }
+        let mut map = table()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        map.clear();
     }
 }
 
@@ -604,19 +604,6 @@ pub use failed_login::{
     flush_all as flush_all_failed_logins, record_failure as failed_login_record,
     rename as failed_login_rename,
 };
-
-/// `FLUSH HOSTS` — MySQL clears its `host_cache` (which records per-host
-/// handshake failures and blocks hosts after `max_connect_errors` consecutive
-/// aborts). mydb does not maintain that cache; the equivalent state is the
-/// in-memory failed-login tracker. Resetting it gives FLUSH HOSTS a meaningful
-/// effect parallel to MySQL: any account temporarily locked by a run of bad
-/// passwords gets a fresh budget.
-pub fn flush_all_failed_login_counts(
-    _db: &crate::storage::Database,
-) -> Result<(), crate::engine::QueryError> {
-    flush_all_failed_logins();
-    Ok(())
-}
 
 /// N1/N2/N6: server-side RSA keypair for `caching_sha2_password` /
 /// `sha256_password` full-authentication when the client can't or won't
@@ -2901,6 +2888,7 @@ pub fn account_id(key: &AccountKey) -> String {
 pub fn privilege_denied(privilege: &Privilege, scope: &PrivilegeScope) -> QueryError {
     let specific_admin = match privilege {
         Privilege::Process
+        | Privilege::Execute
         | Privilege::CreateUser
         | Privilege::CreateRole
         | Privilege::DropRole => true,

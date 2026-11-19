@@ -99,6 +99,11 @@ fn xa_error(spec: crate::error::ErrorSpec, message: impl Into<String>) -> QueryE
 pub enum XaBranchState {
     Active,
     Idle,
+    /// The branch's storage transaction was rolled back by the server (for
+    /// example as a deadlock victim). The XID stays bound to the session until
+    /// the transaction manager ends it with `XA ROLLBACK` (or a failing
+    /// `XA COMMIT`), matching MySQL's `ROLLBACK ONLY` state.
+    RollbackOnly,
 }
 
 impl XaBranchState {
@@ -106,6 +111,7 @@ impl XaBranchState {
         match self {
             XaBranchState::Active => "ACTIVE",
             XaBranchState::Idle => "IDLE",
+            XaBranchState::RollbackOnly => "ROLLBACK ONLY",
         }
     }
 }

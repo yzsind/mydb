@@ -510,8 +510,45 @@ impl<'a> InsertCursor<'a> {
                     None // identifier / function / DEFAULT / expression — bail
                 }
             }
+            b'_' => self.parse_binary_introducer_hex(),
             _ => None,
         }
+    }
+
+    /// `_binary X'ABCD'`: the canonical parser keeps the introducer as a
+    /// `CONVERT_USING` marker (a binary *string*, not a numeric hex literal),
+    /// so this fast path must produce the identical node.
+    fn parse_binary_introducer_hex(&mut self) -> Option<Expr> {
+        let bytes = self.source.as_bytes();
+        let start = self.i;
+        if bytes.get(start) != Some(&b'_')
+            || !bytes
+                .get(start + 1..start + 7)
+                .is_some_and(|name| name.eq_ignore_ascii_case(b"binary"))
+        {
+            return None;
+        }
+        let charset = self.source.get(start + 1..start + 7)?.to_owned();
+        self.i = start + 7;
+        // The introducer must be a separate token followed by whitespace.
+        if !self.peek().is_some_and(|c| c.is_ascii_whitespace()) {
+            self.i = start;
+            return None;
+        }
+        self.skip_ws();
+        let Some(hex) = self.parse_x_hex_literal() else {
+            self.i = start;
+            return None;
+        };
+        Some(Expr::Function {
+            name: "CONVERT_USING".to_string(),
+            args: vec![
+                Expr::Literal(Literal::HexBytes(hex)),
+                Expr::Literal(Literal::String(charset)),
+                Expr::Literal(Literal::Bool(true)),
+            ],
+            distinct: false,
+        })
     }
 
     /// Parse MySQL's binary-string hex literal `X'ABCD'` without routing a

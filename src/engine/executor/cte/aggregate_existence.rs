@@ -544,7 +544,17 @@ fn candidate(
         SelectItem::Expr { expr, alias } => alias.clone().or_else(|| expr_output_name(expr))?,
         _ => unreachable!(),
     };
-    consumer.projection = vec![projected(id(value), &alias)];
+    // An ungrouped MAX over the single `()` row keeps the scalar-aggregate
+    // contract: one row (NULL) even when the shared input is empty, in which
+    // case ROLLUP itself emits no grand-total row.
+    consumer.projection = vec![projected(
+        Expr::Function {
+            name: "MAX".into(),
+            args: vec![id(value)],
+            distinct: false,
+        },
+        &alias,
+    )];
     consumer.selection = Some(eq(id(global), integer(1)));
     let mut existence = exists.clone();
     let set = match location {

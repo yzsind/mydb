@@ -4186,15 +4186,142 @@ fn convert_data_type_with_unsigned(
 
 // Numeric/boolean contexts interpret literal bytes as their encoded integer.
 // Resolve provenance before compilation; ordinary binary columns remain strings.
+// A hex literal is an unsigned integer in arithmetic, while a bit literal is a
+// signed one (`b'1010' - 127` is -117 but `0x0A - 127` overflows BIGINT
+// UNSIGNED), so only values beyond the signed range become unsigned.
 fn numeric_literal_operand(expr: &mut Expr) {
-    if let Expr::Literal(Literal::HexBytes(bytes) | Literal::BitBytes(bytes)) = expr {
-        if bytes.len() <= 8 {
-            let value = bytes
-                .iter()
-                .fold(0u64, |n, byte| (n << 8) | u64::from(*byte));
-            *expr = Expr::Literal(Literal::UInt(value));
+    let literal = match expr {
+        Expr::Literal(Literal::HexBytes(bytes)) if bytes.len() <= 8 => {
+            Literal::UInt(literal_bytes_to_u64(bytes))
+        }
+        Expr::Literal(Literal::BitBytes(bytes)) if bytes.len() <= 8 => {
+            let value = literal_bytes_to_u64(bytes);
+            i64::try_from(value).map_or(Literal::UInt(value), Literal::Int)
+        }
+        _ => return,
+    };
+    *expr = Expr::Literal(literal);
+}
+
+fn literal_bytes_to_u64(bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(0u64, |value, byte| (value << 8) | u64::from(*byte))
+}
+
+fn is_hexbit_literal(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_))
+    )
+}
+
+/// A plain numeric constant, optionally negated (`-1` is `Unary(Neg, 1)`).
+fn is_numeric_constant_literal(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(
+            Literal::Int(_) | Literal::UInt(_) | Literal::Float(_) | Literal::Decimal(_),
+        ) => true,
+        Expr::Unary {
+            op: UnaryOp::Neg,
+            expr,
+        } => is_numeric_constant_literal(expr),
+        _ => false,
+    }
+}
+
+/// Comparison operands that are all literals and include a number compare in
+/// numeric context, so hex/bit literals among them contribute their integer
+/// value (`0xFF IN (255)`, `CASE 65 WHEN 0x41 ...`). Groups containing a
+/// string, column or other expression keep the runtime comparison rules.
+/// `NULLIF` operands that are only numbers and hex/bit literals, with at least
+/// one of each, compare in numeric context.
+fn nullif_compares_numerically(args: &[Expr]) -> bool {
+    args.iter()
+        .all(|arg| is_numeric_constant_literal(arg) || is_hexbit_literal(arg))
+        && args.iter().any(is_hexbit_literal)
+        && args.iter().any(is_numeric_constant_literal)
+}
+
+fn numeric_literal_comparison_group(mut operands: Vec<&mut Expr>) {
+    let mut has_number = false;
+    for operand in &operands {
+        if is_numeric_constant_literal(operand) {
+            has_number = true;
+        } else if !is_hexbit_literal(operand) {
+            return;
         }
     }
+    if has_number {
+        for operand in &mut operands {
+            numeric_literal_operand(operand);
+        }
+    }
+}
+
+/// Whether argument `index` of builtin `name` is read as a number. Functions
+/// whose arguments are all numeric are listed in `numeric_literal_function`.
+fn function_numeric_arg(name: &str, index: usize) -> bool {
+    let mut buffer = [0u8; 24];
+    let upper = match buffer.get_mut(..name.len()) {
+        Some(slot) if name.is_ascii() => {
+            slot.copy_from_slice(name.as_bytes());
+            slot.make_ascii_uppercase();
+            std::str::from_utf8(slot).expect("ASCII bytes are UTF-8")
+        }
+        // Builtin names are short ASCII; anything else is not one of them.
+        _ => return false,
+    };
+    if numeric_literal_function(upper) {
+        return true;
+    }
+    match upper {
+        "ELT" | "MAKE_SET" | "IF" | "__INTERVAL" | "FROM_UNIXTIME" | "SEC_TO_TIME"
+        | "FROM_DAYS" => index == 0,
+        "SUBSTRING" | "SUBSTR" | "MID" | "CONV" => index >= 1,
+        "LEFT" | "RIGHT" | "REPEAT" | "LPAD" | "RPAD" | "TIMESTAMPADD" => index == 1,
+        "INSERT" => matches!(index, 1 | 2),
+        "LOCATE" | "SUBSTRING_INDEX" => index == 2,
+        "FORMAT" => index <= 1,
+        "EXPORT_SET" => index == 0 || index == 4,
+        _ => false,
+    }
+}
+
+fn numeric_literal_function(upper_name: &str) -> bool {
+    matches!(
+        upper_name,
+        "ABS"
+            | "SIGN"
+            | "CEIL"
+            | "CEILING"
+            | "FLOOR"
+            | "ROUND"
+            | "TRUNCATE"
+            | "MOD"
+            | "LOG"
+            | "LOG2"
+            | "LOG10"
+            | "LN"
+            | "EXP"
+            | "SQRT"
+            | "POW"
+            | "POWER"
+            | "SIN"
+            | "COS"
+            | "TAN"
+            | "ASIN"
+            | "ACOS"
+            | "ATAN"
+            | "ATAN2"
+            | "COT"
+            | "RADIANS"
+            | "DEGREES"
+            | "SPACE"
+            | "CHAR"
+            | "__IS_TRUE"
+            | "__IS_FALSE"
+    )
 }
 
 // sqlparser bounds parser recursion, but left-associated binary trees can
@@ -4216,41 +4343,33 @@ pub(super) fn convert_expr(mut expr: &SqlExpr) -> Result<Expr, ParseError> {
 pub(super) fn has_numeric_literal_children(expr: &Expr) -> bool {
     match expr {
         Expr::Unary { .. }
+        | Expr::InList { .. }
+        | Expr::Between { .. }
+        | Expr::Case { .. }
         | Expr::Binary {
-            op: BinaryOp::And | BinaryOp::Or | BinaryOp::Xor,
+            op:
+                BinaryOp::And
+                | BinaryOp::Or
+                | BinaryOp::Xor
+                | BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::IntDiv
+                | BinaryOp::Mod
+                | BinaryOp::Eq
+                | BinaryOp::NotEq
+                | BinaryOp::Lt
+                | BinaryOp::LtEq
+                | BinaryOp::Gt
+                | BinaryOp::GtEq
+                | BinaryOp::NullSafeEq,
             ..
         } => true,
-        Expr::Function { name, .. } => matches!(
-            name.to_ascii_uppercase().as_str(),
-            "ABS"
-                | "SIGN"
-                | "CEIL"
-                | "CEILING"
-                | "FLOOR"
-                | "ROUND"
-                | "TRUNCATE"
-                | "LOG"
-                | "LOG2"
-                | "LOG10"
-                | "LN"
-                | "EXP"
-                | "SQRT"
-                | "POW"
-                | "POWER"
-                | "SIN"
-                | "COS"
-                | "TAN"
-                | "ASIN"
-                | "ACOS"
-                | "ATAN"
-                | "ATAN2"
-                | "COT"
-                | "RADIANS"
-                | "DEGREES"
-                | "SPACE"
-                | "CHAR"
-                | "__IS_TRUE"
-        ),
+        Expr::Function { name, args, .. } => {
+            name.eq_ignore_ascii_case("NULLIF")
+                || (0..args.len()).any(|index| function_numeric_arg(name, index))
+        }
         _ => false,
     }
 }
@@ -4258,18 +4377,101 @@ pub(super) fn has_numeric_literal_children(expr: &Expr) -> bool {
 #[inline(never)]
 fn convert_expr_checked(expr: &SqlExpr) -> Result<Expr, ParseError> {
     let mut converted = convert_expr_inner(expr)?;
+    if matches!(&converted, Expr::Function { name, args, .. }
+        if name.eq_ignore_ascii_case("NULLIF") && args.len() == 2 && nullif_compares_numerically(args))
+    {
+        // `NULLIF(0xFF, 255)` compares numerically yet still returns its first
+        // operand unchanged, which is exactly `CASE WHEN a = b THEN NULL ELSE a END`.
+        let Expr::Function { args, .. } = converted else {
+            unreachable!("matched a function above");
+        };
+        let mut operands = args.into_iter();
+        let (first, mut second) = (operands.next().unwrap(), operands.next().unwrap());
+        let mut compared = first.clone();
+        numeric_literal_comparison_group(vec![&mut compared, &mut second]);
+        return Ok(Expr::Case {
+            operand: None,
+            conditions: Box::new([Expr::Binary {
+                left: Box::new(compared),
+                op: BinaryOp::Eq,
+                right: Box::new(second),
+            }]),
+            results: vec![Expr::Literal(Literal::Null)],
+            else_result: Some(Box::new(first)),
+        });
+    }
     if has_numeric_literal_children(&converted) {
         match &mut converted {
             Expr::Unary { expr, .. } => numeric_literal_operand(expr),
-            Expr::Binary { left, right, .. } => {
-                numeric_literal_operand(left);
-                numeric_literal_operand(right);
-            }
-            Expr::Function { args, .. } => {
-                for arg in args {
-                    numeric_literal_operand(arg);
+            Expr::Binary { left, op, right } => {
+                // Hex literals already evaluate numerically in arithmetic and
+                // keep their byte width for result typing (`0x9999 + 0` is
+                // INT UNSIGNED); only the signed bit-literal semantics need
+                // resolving up front.
+                let arithmetic = matches!(
+                    op,
+                    BinaryOp::Add
+                        | BinaryOp::Sub
+                        | BinaryOp::Mul
+                        | BinaryOp::Div
+                        | BinaryOp::IntDiv
+                        | BinaryOp::Mod
+                );
+                if matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::NotEq
+                        | BinaryOp::Lt
+                        | BinaryOp::LtEq
+                        | BinaryOp::Gt
+                        | BinaryOp::GtEq
+                        | BinaryOp::NullSafeEq
+                ) {
+                    numeric_literal_comparison_group(vec![&mut **left, &mut **right]);
+                    return Ok(converted);
+                }
+                let division = matches!(op, BinaryOp::Div | BinaryOp::IntDiv);
+                for operand in [left, right] {
+                    if !arithmetic
+                        || division
+                        || matches!(&**operand, Expr::Literal(Literal::BitBytes(_)))
+                    {
+                        numeric_literal_operand(operand);
+                    }
                 }
             }
+            Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("NULLIF") => {
+                numeric_literal_comparison_group(args.iter_mut().collect());
+            }
+            Expr::Function { name, args, .. } => {
+                for (index, arg) in args.iter_mut().enumerate() {
+                    if function_numeric_arg(name, index) {
+                        numeric_literal_operand(arg);
+                    }
+                }
+            }
+            Expr::InList { expr, list, .. } => {
+                numeric_literal_comparison_group(
+                    std::iter::once(&mut **expr)
+                        .chain(list.iter_mut())
+                        .collect(),
+                );
+            }
+            Expr::Between {
+                expr, low, high, ..
+            } => numeric_literal_comparison_group(vec![&mut **expr, &mut **low, &mut **high]),
+            Expr::Case {
+                operand,
+                conditions,
+                ..
+            } => match operand {
+                Some(operand) => numeric_literal_comparison_group(
+                    std::iter::once(&mut **operand)
+                        .chain(conditions.iter_mut())
+                        .collect(),
+                ),
+                None => conditions.iter_mut().for_each(numeric_literal_operand),
+            },
             _ => unreachable!("numeric literal context must have scalar children"),
         }
     }
@@ -8420,9 +8622,13 @@ fn match_against_column(name: &sqlparser::ast::ObjectName) -> Result<Expr, Parse
 }
 
 fn truth_test_expr(name: &str, expr: &SqlExpr) -> Result<Expr, ParseError> {
+    // `IS NOT TRUE/FALSE` wraps this node, so resolve the operand's numeric
+    // literal provenance here rather than relying on the generic post-pass.
+    let mut operand = convert_expr(expr)?;
+    numeric_literal_operand(&mut operand);
     Ok(Expr::Function {
         name: name.to_string(),
-        args: vec![convert_expr(expr)?],
+        args: vec![operand],
         distinct: false,
     })
 }

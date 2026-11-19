@@ -57,7 +57,8 @@ file.
 
 `tokio_workers` (`MYDB_TOKIO_WORKERS`) sets the number of connection reactors
 at startup, in the range 1..1024. It is a config/environment option, not a CLI
-flag. On Linux, `tokio_affinity=auto` (`MYDB_TOKIO_AFFINITY`, the default) assigns
+flag. Linux defaults to one reactor per available CPU, with a minimum of two.
+On Linux, `tokio_affinity=auto` (`MYDB_TOKIO_AFFINITY`, the default) assigns
 one allowed CPU to each reactor when the reactor count fits the calling
 thread's effective CPU affinity mask and CPU quota. Sparse CPU masks and cgroup restrictions
 are respected. Oversubscribed pools and other platforms retain scheduler-managed
@@ -67,6 +68,12 @@ Lazy pool sizing on bound reactors uses the server parallelism captured before
 binding, including the startup CPU quota, rather than the single assigned CPU.
 Both settings require a restart; they do not set query execution parallelism or
 reserve CPUs exclusively for the database.
+
+With automatic transaction admission, a prepared transaction finishing on a
+blocking worker can return its execution permit after releasing its row locks.
+It first reserves a completion slot from the remaining blocking worker budget.
+The combined budget leaves capacity for a lock-releasing worker. An explicit
+`MYDB_TXN_ADMISSION` limit applies through transaction completion.
 
 ## TLS
 
