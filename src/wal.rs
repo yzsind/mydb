@@ -856,6 +856,11 @@ pub struct WalStats {
     pub rotation_count: u64,
     pub rotation_critical_total_us: u64,
     pub rotation_critical_max_us: u64,
+    /// Rotations that had to create/reserve the successor synchronously
+    /// under the WAL mutex because the background preparer had no ready
+    /// segment. These are the rotations that can block committers on file
+    /// allocation; see `MYDB_WAL_SEGMENT_PREP`.
+    pub rotation_fallback_count: u64,
 }
 
 /// M4.1 - WAL segment metadata. Each WAL segment is an independent file
@@ -2250,10 +2255,10 @@ impl LogManager {
         // here would stall every committer behind the WAL mutex. The
         // background preparer replaces such a segment early (see
         // `ensure_next_segment`).
-        let (file, fill) = match self.next_segment.take() {
+        let (file, fill, prepared) = match self.next_segment.take() {
             Some(prep) if prep.segment_id == next_id => {
                 fs::rename(&prep.tmp_path, &path).map_err(io_err)?;
-                (prep.file, prep.fill)
+                (prep.file, prep.fill, true)
             }
             stale => {
                 if let Some(prep) = stale {
@@ -2265,7 +2270,7 @@ impl LogManager {
                     .write(true)
                     .open(&path)
                     .map_err(io_err)?;
-                (Arc::new(file), SegmentFill::Reserve)
+                (Arc::new(file), SegmentFill::Reserve, false)
             }
         };
         // Preparing the successor can fail. Until it succeeds, the current
@@ -2303,12 +2308,31 @@ impl LogManager {
         self.active_fill = fill;
         self.pending_publications.push(next_id);
         let rotation_us = elapsed_us(rotation_started);
+        if !prepared {
+            self.stats.rotation_fallback_count =
+                self.stats.rotation_fallback_count.saturating_add(1);
+        }
         self.stats.rotation_count = self.stats.rotation_count.saturating_add(1);
         self.stats.rotation_critical_total_us = self
             .stats
             .rotation_critical_total_us
             .saturating_add(rotation_us);
         self.stats.rotation_critical_max_us = self.stats.rotation_critical_max_us.max(rotation_us);
+        if crate::util::env::slow_maintenance(rotation_us) {
+            // Issue #7 diagnostics: rotation is the only path that can hold
+            // the WAL mutex across file allocation when the background
+            // preparer did not produce a successor in time.
+            crate::util::logging::log_message(format_args!(
+                "slow WAL rotation: rotation_ms={:.3} prepared={} fill={:?} \
+                 segment_bytes={} pending_sealed_sync={} next_segment_id={}",
+                rotation_us as f64 / 1000.0,
+                prepared,
+                fill,
+                self.max_segment_bytes,
+                self.pending_sealed_sync.len(),
+                next_id,
+            ));
+        }
         Ok(next_id)
     }
 
@@ -2459,6 +2483,7 @@ impl LogManager {
             return Ok(());
         };
         // Slow file create + zero fill + sync, all outside the mutex.
+        let build_started = Instant::now();
         let built = (|| -> Result<Arc<File>, QueryError> {
             initialize_segment(&tmp_path, next_id, prealloc, fill)?;
             let file = OpenOptions::new()
@@ -2468,6 +2493,17 @@ impl LogManager {
                 .map_err(io_err)?;
             Ok(Arc::new(file))
         })();
+        let build_us = elapsed_us(build_started);
+        if crate::util::env::slow_maintenance(build_us) {
+            crate::util::logging::log_message(format_args!(
+                "slow WAL segment preparation: build_ms={:.3} segment_id={} fill={:?} \
+                 preallocate_bytes={}",
+                build_us as f64 / 1000.0,
+                next_id,
+                fill,
+                prealloc,
+            ));
+        }
         let mut guard = log.lock();
         match built {
             Ok(file) => guard.install_prepared_segment(next_id, tmp_path, file, fill),
@@ -10293,6 +10329,11 @@ mod tests {
                 g.prepared_segment_id(),
                 None,
                 "rotation must have consumed the prepared segment"
+            );
+            assert_eq!(
+                g.stats().rotation_fallback_count,
+                0,
+                "a prepared rotation must not count as a synchronous fallback"
             );
         }
         assert!(!tmp.exists(), "temp file must be renamed away on promotion");

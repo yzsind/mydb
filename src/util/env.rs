@@ -69,6 +69,23 @@ pub fn var(key: &str) -> Result<String, VarError> {
     crate::startup_config::var(key)
 }
 
+/// Threshold for logging an unusually slow background-maintenance phase.
+///
+/// `MYDB_SLOW_MAINTENANCE_US` is a microsecond count; `0` disables the
+/// diagnostics. The 1 s default keeps normal checkpoints/rotations quiet while
+/// making multi-second stalls visible in the server log with a phase breakdown.
+pub(crate) fn slow_maintenance_us() -> u64 {
+    var("MYDB_SLOW_MAINTENANCE_US")
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u64>().ok())
+        .unwrap_or(1_000_000)
+}
+
+pub(crate) fn slow_maintenance(elapsed_us: u64) -> bool {
+    let threshold = slow_maintenance_us();
+    threshold != 0 && elapsed_us >= threshold
+}
+
 pub fn var_os(key: &str) -> Option<OsString> {
     #[cfg(any(test, feature = "fuzzing"))]
     {
@@ -188,6 +205,31 @@ pub(crate) fn is_disabled(key: &str) -> bool {
         var(key).unwrap_or_default().to_ascii_lowercase().as_str(),
         "off" | "0" | "false" | "no"
     )
+}
+
+#[cfg(test)]
+mod slow_maintenance_tests {
+    use super::*;
+
+    #[test]
+    fn threshold_defaults_overrides_and_disables() {
+        with_vars(&[("MYDB_SLOW_MAINTENANCE_US", None)], || {
+            assert!(slow_maintenance(1_000_000))
+        });
+        with_vars(&[("MYDB_SLOW_MAINTENANCE_US", Some("250000"))], || {
+            assert!(!slow_maintenance(249_999));
+            assert!(slow_maintenance(250_000));
+        });
+        with_vars(&[("MYDB_SLOW_MAINTENANCE_US", Some("0"))], || {
+            assert!(!slow_maintenance(u64::MAX));
+        });
+        with_vars(
+            &[("MYDB_SLOW_MAINTENANCE_US", Some("not-a-number"))],
+            || {
+                assert!(slow_maintenance(1_000_000));
+            },
+        );
+    }
 }
 
 #[cfg(test)]

@@ -4131,6 +4131,7 @@ pub struct StorageStatus {
     pub wal_rotation_count: u64,
     pub wal_rotation_critical_total_us: u64,
     pub wal_rotation_critical_max_us: u64,
+    pub wal_rotation_fallback_count: u64,
     pub wal_pending_sealed_sync: u64,
     pub checkpoint_lsn: u64,
     pub checkpoint_age_lsn: u64,

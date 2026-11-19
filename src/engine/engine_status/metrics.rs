@@ -166,6 +166,7 @@ pub(super) fn collect(db: &Database) -> Vec<(String, String)> {
         "wal_rotation_count" => status.wal_rotation_count.to_string(),
         "wal_rotation_critical_total_us" => status.wal_rotation_critical_total_us.to_string(),
         "wal_rotation_critical_max_us" => status.wal_rotation_critical_max_us.to_string(),
+        "wal_rotation_fallback_count" => status.wal_rotation_fallback_count.to_string(),
         "wal_pending_sealed_sync" => status.wal_pending_sealed_sync.to_string(),
         "checkpoint_lsn" => status.checkpoint_lsn.to_string(),
         "checkpoint_age_lsn" => status.checkpoint_age_lsn.to_string(),

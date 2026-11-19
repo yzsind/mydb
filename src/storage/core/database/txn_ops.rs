@@ -5021,6 +5021,36 @@ impl Database {
             .fetch_add(duration_us, Ordering::Relaxed);
         self.checkpoint_duration_max_us_atomic
             .fetch_max(duration_us, Ordering::Relaxed);
+        if crate::util::env::slow_maintenance(duration_us) {
+            // Issue #7 diagnostics: a multi-second checkpoint is the prime
+            // suspect for bulk-load stalls. Log the phase split so the slow
+            // component is identifiable from the server log without a
+            // profiler: purge/sequence persistence sit in the unattributed
+            // remainder, while snapshot/flush/sync/compact are measured.
+            crate::util::logging::log_message(format_args!(
+                "slow checkpoint: trigger={} kind={} total_ms={:.3} snapshot_ms={:.3} \
+                 flush_ms={:.3} sync_ms={:.3} compact_ms={:.3} unattributed_ms={:.3} \
+                 dirty_pages={} wal_before={} wal_after={} redo_lsn={}",
+                checkpoint_trigger_name(trigger),
+                checkpoint_kind_name(kind),
+                duration_us as f64 / 1000.0,
+                snapshot_us as f64 / 1000.0,
+                flush_us as f64 / 1000.0,
+                sync_us as f64 / 1000.0,
+                compact_us as f64 / 1000.0,
+                duration_us.saturating_sub(
+                    snapshot_us
+                        .saturating_add(flush_us)
+                        .saturating_add(sync_us)
+                        .saturating_add(compact_us),
+                ) as f64
+                    / 1000.0,
+                dirty_pages,
+                wal_bytes_before,
+                wal_bytes_after,
+                redo_lsn,
+            ));
+        }
     }
 
     fn sync_replica_restartpoint_files(&self) -> Result<(), QueryError> {
@@ -5470,6 +5500,7 @@ impl Database {
             wal_rotation_count: wal_stats.rotation_count,
             wal_rotation_critical_total_us: wal_stats.rotation_critical_total_us,
             wal_rotation_critical_max_us: wal_stats.rotation_critical_max_us,
+            wal_rotation_fallback_count: wal_stats.rotation_fallback_count,
             wal_pending_sealed_sync,
             checkpoint_lsn: checkpoint.last_checkpoint_lsn,
             checkpoint_age_lsn: current_lsn.saturating_sub(checkpoint.last_checkpoint_lsn),
@@ -5893,6 +5924,20 @@ impl Database {
     /// shrink a backlog that is still growing — so it is gated off the
     /// write-load hot path here.
     pub(crate) fn purge_obsolete_undo(&self) -> bool {
+        let started = Instant::now();
+        let more_work = self.purge_obsolete_undo_inner();
+        let elapsed = elapsed_us(started);
+        if crate::util::env::slow_maintenance(elapsed) {
+            crate::util::logging::log_message(format_args!(
+                "slow undo purge: elapsed_ms={:.3} more_work={}",
+                elapsed as f64 / 1000.0,
+                more_work,
+            ));
+        }
+        more_work
+    }
+
+    fn purge_obsolete_undo_inner(&self) -> bool {
         let maintenance = self.backup_maintenance_gate.read();
         if self.capture.active.load(Ordering::Acquire) {
             return false;

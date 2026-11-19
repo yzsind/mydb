@@ -4130,6 +4130,30 @@ fn show_engine_status_exposes_connection_management_metrics() {
 }
 
 #[test]
+fn show_engine_status_exposes_wal_rotation_metrics() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+
+    let QueryResponse::ResultSet(status) = engine.execute("SELECT 'mydb' AS Type, METRIC_NAME AS Name, METRIC_VALUE AS Status FROM information_schema.MYDB_ENGINE_STATUS").unwrap()
+    else {
+        panic!("expected status result set");
+    };
+    for metric in [
+        "wal_rotation_count",
+        "wal_rotation_critical_max_us",
+        "wal_rotation_fallback_count",
+    ] {
+        assert!(
+            status
+                .rows
+                .iter()
+                .any(|row| row[1] == Value::String(metric.into())),
+            "information_schema.MYDB_ENGINE_STATUS should expose {metric}"
+        );
+    }
+}
+
+#[test]
 fn spatial_index_requires_a_geometry_column() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
