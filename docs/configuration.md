@@ -57,7 +57,8 @@ file.
 
 `tokio_workers` (`MYDB_TOKIO_WORKERS`) sets the number of connection reactors
 at startup, in the range 1..1024. It is a config/environment option, not a CLI
-flag. Linux defaults to one reactor per available CPU, with a minimum of two.
+flag. By default, the reactor count is four times the available CPU parallelism,
+with a minimum of 16.
 On Linux, `tokio_affinity=auto` (`MYDB_TOKIO_AFFINITY`, the default) assigns
 one allowed CPU to each reactor when the reactor count fits the calling
 thread's effective CPU affinity mask and CPU quota. Sparse CPU masks and cgroup restrictions

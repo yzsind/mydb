@@ -101,13 +101,7 @@ fn main() -> std::io::Result<()> {
             let n = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(4);
-            // Linux binds a reactor to each available CPU when the pool fits.
-            // Blocking storage work has its own funded worker pool.
-            if cfg!(target_os = "linux") {
-                n.max(2)
-            } else {
-                n.saturating_mul(4).max(16)
-            }
+            n.saturating_mul(4).max(16)
         });
     #[cfg(unix)]
     let runtime = tokio::runtime::Builder::new_current_thread()
