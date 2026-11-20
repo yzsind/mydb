@@ -588,19 +588,24 @@ mod tests {
     #[test]
     fn streamed_prefix_candidates_match_composite_lookup_and_decline_repairs() {
         use crate::engine::StorageQueryEngine;
-        let dir = tempfile::tempdir().unwrap();
-        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            crate::storage::StorageConfig::from_env(),
+        )
+        .unwrap();
         let db = engine.db_for_tests();
-        // The first probe requires retired keys. Default zero retention lets
-        // background GC remove them before the assertion on a busy host.
-        db.set_undo_retention_ms(60_000).unwrap();
+        db.set_undo_retention_ms(0).unwrap();
         engine
             .execute("CREATE TABLE visit_candidates (a INT,b INT, INDEX ab(a,b))")
             .unwrap();
         engine.execute("INSERT INTO visit_candidates SELECT MOD(n,10),MOD(n,7) FROM generate_series(1,1000) g(n)").unwrap();
+        // Keep the retired key available to a pre-update reader across the first GC pass.
+        let snapshot_guard = db.register_statement_snapshot(db.visible_scn());
         engine
             .execute("UPDATE visit_candidates SET b=b+100 WHERE a=1 AND b=1 LIMIT 1")
             .unwrap();
+        db.gc_committed_txn_slots();
         let schema = db.table("visit_candidates").unwrap();
         let index = schema
             .indexes
@@ -622,7 +627,7 @@ mod tests {
             .unwrap()
             .is_none());
         assert_eq!(calls, 0);
-        db.set_undo_retention_ms(0).unwrap();
+        drop(snapshot_guard);
         db.gc_committed_txn_slots();
         let handle = db.cached_index_handle(schema.id, &index.name).unwrap();
         let expected = db
