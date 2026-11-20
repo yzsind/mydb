@@ -50,7 +50,7 @@ impl Database {
         let mut oldest_ms: u64 = 0;
         for shard in self.active_snapshots.iter() {
             if let Ok(snapshots) = shard.lock() {
-                for snapshot in snapshots.values() {
+                for (_, snapshot) in snapshots.iter() {
                     oldest_scn = Some(match oldest_scn {
                         Some(current) => current.min(snapshot.snapshot_scn),
                         None => snapshot.snapshot_scn,

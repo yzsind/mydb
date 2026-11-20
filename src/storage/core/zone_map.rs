@@ -10005,7 +10005,8 @@ impl Database {
         drop(capture_gate);
         // A read-only transaction slot alone does not pin the purge horizon.
         // Keep one registered view across all parallel scans and publication.
-        let (txn, _snapshot_guard) = self.borrowed_read_only_statement_view();
+        let snapshot = StorageReadSnapshot::with_isolation(self, IsolationLevel::ReadCommitted);
+        let txn = snapshot.txn;
         let build_scn = txn.snapshot_scn;
         #[cfg(test)]
         if let Some(barrier) = ZONE_MAP_REBUILD_SCAN_BARRIER.lock().unwrap().clone() {
@@ -10035,7 +10036,7 @@ impl Database {
             txn,
             build_scn,
             _plan_lease: plan_lease,
-            _snapshot_guard,
+            _snapshot_guard: snapshot,
         }))
     }
 

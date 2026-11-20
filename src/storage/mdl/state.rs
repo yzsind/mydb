@@ -105,8 +105,14 @@ impl<'a> MdlObjects<'a> {
         let index = self.index(key);
         self.guards[index].1.get_mut(key)
     }
-    pub(super) fn contains_key(&self, key: &MdlObjectKey) -> bool {
-        self.get(key).is_some()
+    pub(super) fn get_or_insert(&mut self, key: &MdlObjectKey) -> &mut ObjectLockState {
+        let index = self.index(key);
+        self.guards[index]
+            .1
+            .raw_entry_mut()
+            .from_key(key)
+            .or_insert_with(|| (key.clone(), ObjectLockState::default()))
+            .1
     }
     pub(super) fn entry(
         &mut self,
@@ -126,11 +132,6 @@ impl<'a> MdlObjects<'a> {
         &mut self,
     ) -> impl Iterator<Item = &mut ObjectLockState> + use<'a, '_> {
         self.guards.iter_mut().flat_map(|(_, map)| map.values_mut())
-    }
-    pub(super) fn iter_mut(
-        &mut self,
-    ) -> impl Iterator<Item = (&MdlObjectKey, &mut ObjectLockState)> + use<'a, '_> {
-        self.guards.iter_mut().flat_map(|(_, map)| map.iter_mut())
     }
     pub(super) fn retain(
         &mut self,

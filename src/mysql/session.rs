@@ -353,6 +353,34 @@ fn async_row_lock_retry_enabled() -> bool {
     })
 }
 
+/// Reuse the reactor timer across idle waits on a live connection.
+/// An earlier timer may wake the task once; only the current deadline can expire.
+#[derive(Default)]
+struct CommandIdleTimer {
+    sleep: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
+
+impl CommandIdleTimer {
+    async fn wait(&mut self, timeout: Option<std::time::Duration>) {
+        let Some(timeout) = timeout else {
+            self.sleep = None;
+            return std::future::pending().await;
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        let sleep = self
+            .sleep
+            .get_or_insert_with(|| Box::pin(tokio::time::sleep_until(deadline)));
+        if sleep.deadline() > deadline {
+            sleep.as_mut().reset(deadline);
+        }
+        sleep.as_mut().await;
+        if sleep.deadline() < deadline {
+            sleep.as_mut().reset(deadline);
+            sleep.as_mut().await;
+        }
+    }
+}
+
 fn build_ok_packet_into(
     context: &mut SessionContext,
     client_capabilities: u32,
@@ -1612,7 +1640,15 @@ where
                 // MySQL sends authentication OK first, then rejects the first
                 // command with ER_NEW_ABORTING_CONNECTION and closes. Read via
                 // the negotiated codec, respecting idle timeout, KILL and shutdown.
-                match self.read_command_packet(self.idle_command_timeout()).await {
+                let mut shutdown = std::pin::pin!(crate::mysql::shutdown::shutdown_notified());
+                match self
+                    .read_command_packet(
+                        self.idle_command_timeout(),
+                        shutdown.as_mut(),
+                        &mut CommandIdleTimer::default(),
+                    )
+                    .await
+                {
                     Ok(Some(packet)) => {
                         let aborted = error(
                             crate::error::catalog::ER_NEW_ABORTING_CONNECTION,
@@ -2411,6 +2447,8 @@ where
     }
 
     async fn command_loop(&mut self) -> io::Result<()> {
+        let mut shutdown = std::pin::pin!(crate::mysql::shutdown::shutdown_notified());
+        let mut idle_timer = CommandIdleTimer::default();
         loop {
             // Recompute each iteration so `SET [SESSION] wait_timeout = N`
             // takes effect on this connection's *next* idle wait, matching
@@ -2426,7 +2464,9 @@ where
                 self.context.current_txn.unwrap_or(0),
                 self.context.connection_id as u64,
             );
-            let read_result = self.read_command_packet(idle_timeout).await;
+            let read_result = self
+                .read_command_packet(idle_timeout, shutdown.as_mut(), &mut idle_timer)
+                .await;
             drop(read_span);
             let packet = match read_result {
                 Ok(packet) => packet,
@@ -2833,6 +2873,8 @@ where
     async fn read_command_packet(
         &mut self,
         idle_timeout: Option<std::time::Duration>,
+        mut shutdown: std::pin::Pin<&mut impl std::future::Future<Output = ()>>,
+        idle_timer: &mut CommandIdleTimer,
     ) -> io::Result<Option<Packet>> {
         let Some(handle) = self.handle.as_ref().map(Arc::clone) else {
             return self.codec.read_packet(&mut self.stream).await;
@@ -2847,18 +2889,13 @@ where
             if let std::task::Poll::Ready(result) = first {
                 return result;
             }
-            let deadline = async {
-                match idle_timeout {
-                    Some(dur) => tokio::time::sleep(dur).await,
-                    None => std::future::pending::<()>().await,
-                }
-            };
+            let deadline = idle_timer.wait(idle_timeout);
             tokio::pin!(deadline);
             loop {
                 tokio::select! {
                     result = &mut read => return result,
                     _ = &mut deadline => break true,
-                    _ = crate::mysql::shutdown::shutdown_notified() => return Ok(None),
+                    _ = shutdown.as_mut() => return Ok(None),
                     _ = handle.notified() => {
                         if self.kill_flag.load(Ordering::Acquire) { return Ok(None); }
                         // KILL QUERY while waiting for a command must not drop
@@ -3981,6 +4018,28 @@ where
                 )))
                 .await;
         }
+        if prepared_dml_inline_enabled() {
+            use crate::engine::executor::{classify_simple_txn_control, SimpleTxnControl};
+            if let Some(control) = classify_simple_txn_control(&sql) {
+                self.engine.log_general_event(&self.context, "Query", &sql);
+                // A fresh BEGIN sets up session state lazily. Starting over
+                // during an active transaction can implicitly commit it.
+                let fresh_begin = control == SimpleTxnControl::Begin
+                    && !self.context.in_transaction()
+                    && self.context.explicit_table_locks.is_empty();
+                let result = if fresh_begin
+                    || crate::util::connection_dispatch::can_inline_transaction_control()
+                {
+                    self.engine.execute(&mut self.context, &sql)
+                } else {
+                    self.execute_transaction_control_blocking(sql).await
+                };
+                if self.kill_flag.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                return self.write_query_response(result).await;
+            }
+        }
         // PROCESSLIST is an operational escape hatch. Running this tiny,
         // read-only registry snapshot through the blocking executor pool can
         // make it unobservable precisely when every worker is occupied by a
@@ -4020,27 +4079,14 @@ where
             return self.write_query_response(result).await;
         }
 
-        // A shared reactor must keep driving sibling lock holders while a
-        // COMMIT waits for durability/visibility or a ROLLBACK applies undo.
-        // Sole-connection reactors retain the inline control path.
-        // A plain session-variable SET (e.g. JDBC's per-query
-        // `SET SQL_SELECT_LIMIT`) is bounded the same way: it evaluates no
-        // subquery or function and changes only this session's state.
-        if prepared_dml_inline_enabled()
-            && (crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
-                || is_simple_session_set_sql(sql.as_str()))
-        {
-            let result = if crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
-                && !crate::util::connection_dispatch::can_inline_transaction_control()
-            {
-                self.execute_engine_blocking(sql).await
-            } else {
-                self.engine.execute(&mut self.context, &sql)
-            };
-            if self.kill_flag.load(Ordering::Acquire) {
-                return Ok(());
+        if prepared_dml_inline_enabled() {
+            if is_simple_session_set_sql(&sql) {
+                let result = self.engine.execute(&mut self.context, &sql);
+                if self.kill_flag.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                return self.write_query_response(result).await;
             }
-            return self.write_query_response(result).await;
         }
 
         // Inline scheduling route for non-blocking read-only SELECTs.
@@ -4312,6 +4358,7 @@ where
         // returns `None` before execution for every other shape, which then
         // follows the normal blocking-pool route below.
         if prepared_dml_inline_allowed(&self.context)
+            && !crate::util::connection_dispatch::current_worker_has_sibling_connections()
             && looks_like_large_text_update_candidate(sql.as_str())
         {
             if let Some(result) = self
@@ -5598,9 +5645,7 @@ where
                     )
                 };
                 let (dml_state, dml_result) = if let Some(arc) = parsed_arc {
-                    if prepared_dml_inline_allowed(&self.context)
-                        && prepared_dml_statement_allows_inline_execution(arc.as_ref())
-                    {
+                    if self.admit_inline_autocommit_dml(arc.as_ref()).await {
                         self.try_execute_prepared_dml_inline(
                             &sql,
                             &arc,
@@ -7487,17 +7532,35 @@ where
         if self.txn_admission.is_some() {
             return;
         }
-        if crate::util::exec_permit::global().is_some() {
-            let _waiting = self
-                .handle
-                .as_ref()
-                .map(|handle| handle.enter_stage(ProcessState::WaitingOnCond));
-            // `acquire_owned` only errors when the semaphore is closed, which
-            // never happens here; on that impossible error we run un-admitted.
-            if let Some(permit) = crate::util::exec_permit::acquire().await {
-                self.txn_admission = Some(permit);
+        let mut acquire = std::pin::pin!(crate::util::exec_permit::acquire());
+        let first = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(std::future::Future::poll(acquire.as_mut(), cx))
+        })
+        .await;
+        self.txn_admission = match first {
+            std::task::Poll::Ready(permit) => permit,
+            std::task::Poll::Pending => {
+                let _waiting = self
+                    .handle
+                    .as_ref()
+                    .map(|handle| handle.enter_stage(ProcessState::WaitingOnCond));
+                acquire.await
             }
+        };
+    }
+
+    /// Compiled autocommit writes can keep execution and the response on an
+    /// exclusive reactor while the dispatcher still has a spare reactor.
+    /// Recheck ownership after admission since waiting can let peers in.
+    async fn admit_inline_autocommit_dml(&mut self, statement: &Statement) -> bool {
+        if !is_prepared_write(statement) || !prepared_dml_inline_allowed(&self.context) {
+            return false;
         }
+        if crate::util::connection_dispatch::current_worker_has_sibling_connections() {
+            self.acquire_txn_admission().await;
+            return prepared_dml_inline_allowed(&self.context);
+        }
+        true
     }
 
     /// Release the admission permit once the session no longer has an active
@@ -7515,6 +7578,25 @@ where
         {
             self.txn_admission = None;
         }
+    }
+
+    async fn execute_transaction_control_blocking(
+        &mut self,
+        sql: String,
+    ) -> Result<QueryResponse, QueryError> {
+        // Bare transaction control cannot stream routine results or invoke
+        // HTTP/AI execution. Keep the affine handoff and context recovery.
+        let engine = Arc::clone(&self.engine);
+        let mut context = self.park_context();
+        let (context, result) =
+            crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), move || {
+                let result = engine.execute(&mut context, &sql);
+                (context, result)
+            })
+            .await
+            .map_err(|err| self.recover_join_error(err))?;
+        self.restore_context(context);
+        result
     }
 
     async fn execute_engine_blocking(&mut self, sql: String) -> Result<QueryResponse, QueryError> {
@@ -7705,7 +7787,7 @@ where
         crate::engine::api::PreparedDmlState,
         Option<Result<QueryResponse, QueryError>>,
     ) {
-        if prepared_dml_inline_allowed(&self.context) {
+        if self.admit_inline_autocommit_dml(parsed.as_ref()).await {
             return self.run_text_dml_shape_inline(sql, parsed, dml_state, params, shape_sql);
         }
         if prepared_dml_transactional_inline_retry_allowed(parsed.as_ref())
@@ -8353,20 +8435,14 @@ fn prepared_dml_transactional_inline_retry_allowed(statement: &Statement) -> boo
 }
 
 fn prepared_dml_statement_candidate(statement: &Statement) -> bool {
-    match statement {
-        Statement::Update(_) | Statement::Insert(_) | Statement::Delete(_) => true,
-        Statement::Select(select) => select.for_update || select.lock_clause.is_some(),
-        _ => false,
-    }
+    is_prepared_write(statement)
+        || matches!(statement, Statement::Select(select) if select.for_update || select.lock_clause.is_some())
 }
 
-fn prepared_dml_statement_allows_inline_execution<'q>(
-    statement: impl Into<crate::parser::QueryRef<'q>>,
-) -> bool {
-    let statement = statement.into();
-    !matches!(
+fn is_prepared_write(statement: &Statement) -> bool {
+    matches!(
         statement,
-        crate::parser::QueryRef::Select(select) if select.for_update || select.lock_clause.is_some()
+        Statement::Update(_) | Statement::Insert(_) | Statement::Delete(_)
     )
 }
 
@@ -8388,7 +8464,7 @@ fn prepared_dml_inline_allowed(context: &SessionContext) -> bool {
         && context.autocommit
         && !context.explicit_txn
         && context.current_txn.is_none()
-        && !crate::util::connection_dispatch::current_worker_has_sibling_connections()
+        && crate::util::connection_dispatch::can_inline_transaction_control()
 }
 
 fn prepared_dml_retry_context_allowed(context: &SessionContext) -> bool {
@@ -10924,6 +11000,30 @@ fn bind_sql_params(
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn command_idle_timer_respects_both_shorter_and_later_deadlines() {
+        use std::time::Duration;
+        use tokio::time::{sleep_until, Instant};
+
+        let mut timer = CommandIdleTimer {
+            sleep: Some(Box::pin(sleep_until(
+                Instant::now() + Duration::from_secs(60),
+            ))),
+        };
+        let start = Instant::now();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            timer.wait(Some(Duration::from_millis(5))),
+        )
+        .await
+        .expect("a shortened session timeout applies to the next read");
+        assert!(start.elapsed() >= Duration::from_millis(5));
+
+        let start = Instant::now();
+        timer.wait(Some(Duration::from_millis(10))).await;
+        assert!(start.elapsed() >= Duration::from_millis(10));
+    }
+
     #[test]
     fn contiguous_stream_packets_preserve_empty_and_wide_packets_and_charge_capacity() {
         let packets = vec![Vec::new(), vec![0, 255, 1], vec![42; 70000], vec![7; 4]];
@@ -13150,7 +13250,7 @@ mod tests {
         ] {
             let statement = parse_statement(sql).expect(sql);
             assert!(
-                !prepared_dml_statement_allows_inline_execution(&statement),
+                !is_prepared_write(&statement),
                 "locking prepared SELECT must run once on the blocking pool: {sql}"
             );
         }
@@ -13166,7 +13266,7 @@ mod tests {
         ] {
             let statement = parse_statement(sql).expect(sql);
             assert!(
-                prepared_dml_statement_allows_inline_execution(&statement),
+                is_prepared_write(&statement),
                 "transactional DML should retain the uncontended inline fast path: {sql}"
             );
             assert!(

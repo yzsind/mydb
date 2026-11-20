@@ -448,18 +448,19 @@ fn current_parameter_signature_matches(
     )
 }
 
-/// The lowered operator already proved an exact, residual-free unique probe.
-/// Individual columns of a composite key may be highly skewed, but changing
-/// their values cannot turn this probe into a broad scan. Keep domain and
-/// LIMIT/OFFSET guards, without re-estimating those marginal frequencies on
-/// every EXECUTE. Other operators retain parameter-sensitive costing.
+/// A unique probe or a residual-free range with a fixed ordered row goal
+/// already bounds the useful work. Keep the parameter-domain and LIMIT/OFFSET
+/// guards while reusing the chosen access path across selectivity tiers.
 fn has_parameter_independent_cardinality(
     compiled: &crate::engine::cache::CompiledSelectPlan,
 ) -> bool {
     matches!(
         compiled.executable.as_ref(),
         crate::engine::cache::CompiledOperator::ProjectedUniquePointLookup(_)
-    )
+    ) || compiled
+        .compact_range
+        .as_ref()
+        .is_some_and(|recipe| recipe.stable_row_goal)
 }
 
 fn memo_catalog_is_valid(db: &Database, rp: &PreparedSelectMemo, current_epoch: u64) -> bool {

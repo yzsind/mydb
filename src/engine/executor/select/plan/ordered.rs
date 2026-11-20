@@ -603,22 +603,15 @@ fn try_execute_loose_index_distinct_topk(
     let projector = IndexEntryProjector::new(table, index, projection_columns);
     let mut low = low.clone();
     let mut high = high.clone();
-    let open = || -> Result<AnyRangeCursor, QueryError> {
-        if reverse {
-            db.range_index_snapshot_reverse_cursor(
-                &table.schema,
-                index,
-                low.clone(),
-                high.clone(),
-                txn,
-            )
-            .map(AnyRangeCursor::Reverse)
-        } else {
-            db.range_index_snapshot_cursor(&table.schema, index, low.clone(), high.clone(), txn)
-                .map(AnyRangeCursor::Forward)
-        }
-    };
-    let mut cursor = open()?;
+    let mut cursor = AnyRangeCursor::open(
+        db,
+        txn,
+        &table.schema,
+        index,
+        low.clone(),
+        high.clone(),
+        reverse,
+    )?;
     let mut rows = Vec::new();
     let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
     let mut eval_ctx = EvalQueryContext::default();
@@ -726,23 +719,15 @@ fn try_execute_loose_index_distinct_topk(
             } else {
                 low = Some(bound);
             }
-            cursor = if reverse {
-                AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
-                    &table.schema,
-                    index,
-                    low.clone(),
-                    high.clone(),
-                    txn,
-                )?)
-            } else {
-                AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
-                    &table.schema,
-                    index,
-                    low.clone(),
-                    high.clone(),
-                    txn,
-                )?)
-            };
+            cursor = AnyRangeCursor::open(
+                db,
+                txn,
+                &table.schema,
+                index,
+                low.clone(),
+                high.clone(),
+                reverse,
+            )?;
             chunk_size = 1;
         } else {
             chunk_size = 128;
@@ -872,23 +857,15 @@ fn try_execute_ordered_index_distinct_window(
         .as_deref()
         .map(|columns| columns.as_slice());
     let projector = IndexEntryProjector::new(table, index, projection_columns);
-    let mut cursor = if reverse {
-        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
-            &table.schema,
-            index,
-            low.clone(),
-            high.clone(),
-            txn,
-        )?)
-    } else {
-        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
-            &table.schema,
-            index,
-            low.clone(),
-            high.clone(),
-            txn,
-        )?)
-    };
+    let mut cursor = AnyRangeCursor::open(
+        db,
+        txn,
+        &table.schema,
+        index,
+        low.clone(),
+        high.clone(),
+        reverse,
+    )?;
     let mut seen_row_ids = (!index.unique).then(std::collections::HashSet::new);
     let mut eval_ctx = EvalQueryContext::default();
     let mut compiled_filter = None;

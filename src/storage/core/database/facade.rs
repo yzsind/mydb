@@ -741,7 +741,6 @@ impl Database {
             primary_definition_highwater: AtomicU64::new(0),
             read_definition_highwater: AtomicU64::new(0),
             visibility_cache_id: NEXT_VISIBILITY_CACHE_ID.fetch_add(1, Ordering::Relaxed),
-            next_snapshot_id: AtomicU64::new(1),
             mvcc_quarantined: AtomicBool::new(false),
             mvcc_quarantine_reason: RwLock::new(None),
             commit_hlc_unix_us: source_clock,
@@ -768,7 +767,7 @@ impl Database {
             undo_append_next_shard: AtomicU64::new(0),
             undo_concurrent_append_eligible,
             active_snapshots: (0..ACTIVE_SNAPSHOT_SHARDS)
-                .map(|_| Mutex::new(Default::default()))
+                .map(|_| CachePadded::new(Mutex::new(slab::Slab::new())))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             auto_increment: AutoIncrementManager::new(),

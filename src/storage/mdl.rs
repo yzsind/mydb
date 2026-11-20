@@ -366,13 +366,24 @@ fn blocks_fast_grants(lock_type: MdlLockType) -> bool {
     fast_blocker_mask(lock_type) != 0
 }
 
-fn count_fast_blockers(object: &ObjectLockState) -> u64 {
-    object
-        .granted
-        .iter()
-        .chain(object.waiting.iter())
-        .filter(|ticket| blocks_fast_grants(ticket.lock_type))
-        .count() as u64
+impl ObjectLockState {
+    /// Report changes while removing tickets, before pruning the object.
+    /// Only a removed incompatible ticket can change the fast-grant mask.
+    fn release(&mut self, mut matches: impl FnMut(&MdlTicket) -> bool) -> (bool, bool) {
+        let mut released = false;
+        let mut blockers_changed = false;
+        let mut keep = |ticket: &MdlTicket| {
+            if !matches(ticket) {
+                return true;
+            }
+            released = true;
+            blockers_changed |= blocks_fast_grants(ticket.lock_type);
+            false
+        };
+        self.granted.retain(&mut keep);
+        self.waiting.retain(keep);
+        (released, blockers_changed)
+    }
 }
 
 type FastSlotMap = hashbrown::HashMap<MdlObjectKey, Arc<MdlFastSlot>, ahash::RandomState>;
@@ -806,23 +817,14 @@ impl MdlManager {
         let mut released = false;
         for request in requests {
             let key = &request.key;
-            let mut remove_object = false;
-            let mut blockers_changed = false;
-            if let Some(object) = state.objects.get_mut(key) {
-                let before = object.granted.len() + object.waiting.len();
-                let blockers_before = count_fast_blockers(object);
-                object
-                    .granted
-                    .retain(|ticket| ticket.owner_id != owner_id || ticket.duration != duration);
-                object
-                    .waiting
-                    .retain(|ticket| ticket.owner_id != owner_id || ticket.duration != duration);
-                remove_object = object.granted.is_empty() && object.waiting.is_empty();
-                blockers_changed =
-                    blockers_before != 0 && count_fast_blockers(object) != blockers_before;
-                released |= before != object.granted.len() + object.waiting.len();
-            }
-            if remove_object {
+            let Some(object) = state.objects.get_mut(key) else {
+                continue;
+            };
+            let (removed, blockers_changed) =
+                object.release(|ticket| ticket.owner_id == owner_id && ticket.duration == duration);
+
+            released |= removed;
+            if object.granted.is_empty() && object.waiting.is_empty() {
                 state.objects.remove(key);
             }
             if blockers_changed {
@@ -1199,20 +1201,7 @@ fn acquire_one_ticketed(
     source: &str,
     fast_slot: Option<&MdlFastSlot>,
 ) -> AcquireOne {
-    // Hot path (a concurrent shared lock already exists on this object,
-    // e.g. every sysbench SELECT on the same table): the object entry is
-    // present, so look it up without cloning the key. `entry(key.clone())`
-    // would allocate the schema+name strings on *every* acquire even
-    // though the clone is only needed on first insert — under the global
-    // state mutex that clone is pure per-statement malloc churn.
-    let object = if state.objects.contains_key(&request.key) {
-        state
-            .objects
-            .get_mut(&request.key)
-            .expect("present after contains_key")
-    } else {
-        state.objects.entry(request.key.clone()).or_default()
-    };
+    let object = state.objects.get_or_insert(&request.key);
     if let Some(pos) = object.granted.iter().position(|ticket| {
         ticket.owner_id == owner_id
             && ticket.duration == duration
@@ -1413,17 +1402,14 @@ where
     // clones only happen when an EXCLUSIVE / SHARED_NO_READ_WRITE ticket
     // was actually removed — DDL-rare, never on the DML/read hot path.
     let mut changed_blockers = Vec::new();
-    for (key, object) in state.objects.iter_mut() {
-        let before = object.granted.len() + object.waiting.len();
-        let blockers_before = count_fast_blockers(object);
-        object.granted.retain(|ticket| !predicate(ticket));
-        object.waiting.retain(|ticket| !predicate(ticket));
-        released |= before != object.granted.len() + object.waiting.len();
-        if blockers_before != 0 && count_fast_blockers(object) != blockers_before {
+    state.objects.retain(|key, object| {
+        let (removed, blockers_changed) = object.release(&mut predicate);
+        released |= removed;
+        if blockers_changed {
             changed_blockers.push(key.clone());
         }
-    }
-    prune_empty_objects(state);
+        !object.granted.is_empty() || !object.waiting.is_empty()
+    });
     (released, changed_blockers)
 }
 

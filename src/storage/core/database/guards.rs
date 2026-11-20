@@ -115,31 +115,23 @@ impl Database {
 /// Register while selecting the frontier, under the same shard latch as purge.
 struct StorageReadSnapshot<'a> {
     db: &'a Database,
-    snapshot_id: u64,
+    key: SnapshotKey,
     txn: TxnView,
 }
 
 impl<'a> StorageReadSnapshot<'a> {
     fn new(db: &'a Database) -> Self {
-        let snapshot_id = db.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let shard = snapshot_id as usize % db.active_snapshots.len();
-        let mut snapshots = db.active_snapshots[shard]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let snapshot_scn = db.visible_scn();
-        snapshots.insert(
-            snapshot_id,
-            ActiveSnapshot {
-                snapshot_scn,
-                started_unix_ms: current_unix_ms(),
-            },
-        );
+        Self::with_isolation(db, IsolationLevel::RepeatableRead)
+    }
+
+    fn with_isolation(db: &'a Database, isolation: IsolationLevel) -> Self {
+        let (key, snapshot_scn) = db.pin_snapshot(None);
         Self {
             db,
-            snapshot_id,
+            key,
             txn: TxnView {
                 snapshot_registered: true,
-                ..TxnView::read_only(snapshot_scn, IsolationLevel::RepeatableRead)
+                ..TxnView::read_only(snapshot_scn, isolation)
             },
         }
     }
@@ -147,11 +139,7 @@ impl<'a> StorageReadSnapshot<'a> {
 
 impl Drop for StorageReadSnapshot<'_> {
     fn drop(&mut self) {
-        let shard = self.snapshot_id as usize % self.db.active_snapshots.len();
-        self.db.active_snapshots[shard]
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&self.snapshot_id);
+        self.db.unpin_snapshot(self.key);
     }
 }
 

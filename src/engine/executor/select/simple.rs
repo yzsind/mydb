@@ -1020,6 +1020,14 @@ fn stream_direct_index_sum_chunks(
 }
 
 pub(crate) fn fused_single_table_shape_supported(stmt: &Select) -> bool {
+    !has_ordered_window(stmt) && fused_single_table_projection_supported(stmt)
+}
+
+fn has_ordered_window(stmt: &Select) -> bool {
+    !stmt.order_by.is_empty() && (stmt.limit.is_some() || stmt.offset.is_some())
+}
+
+fn fused_single_table_projection_supported(stmt: &Select) -> bool {
     stmt.derived.is_none()
         && stmt.joins.is_empty()
         && stmt.from.len() == 1
@@ -1041,7 +1049,6 @@ pub(crate) fn fused_single_table_shape_supported(stmt: &Select) -> bool {
         && !crate::planner::collect_aggregate_calls(stmt)
             .iter()
             .any(|expr| matches!(expr, Expr::Function { distinct: true, .. }))
-        && !(!stmt.order_by.is_empty() && (stmt.limit.is_some() || stmt.offset.is_some()))
         && stmt
             .order_by
             .iter()
@@ -3144,6 +3151,8 @@ mod aggregate_walk_tests {
 
 #[derive(Debug)]
 pub(crate) struct CompactRangeRecipe {
+    pub(super) ordered_limit: bool,
+    pub(crate) stable_row_goal: bool,
     projection: Vec<SelectItem>,
     order_by: Vec<OrderBy>,
     distinct: bool,
@@ -3154,11 +3163,50 @@ pub(crate) struct CompactRangeRecipe {
     _charge: super::super::mem_budget::ControlledMemoryCharge,
 }
 
+const COMPACT_ORDERED_WINDOW_ROWS: usize = 64;
+
+fn stable_ordered_range_row_goal(stmt: &Select, input: &PhysicalPlan) -> bool {
+    let Some(limit) = stmt.limit.as_ref().and_then(LimitValue::as_usize) else {
+        return false;
+    };
+    let offset = match &stmt.offset {
+        None => 0,
+        Some(LimitValue::Rows(offset)) => *offset,
+        _ => return false,
+    };
+    let PhysicalPlan::IndexRangeScan {
+        table,
+        index,
+        low,
+        high,
+        filter: Some(filter),
+        ..
+    } = input
+    else {
+        return false;
+    };
+    // A fully bound ordered primary range and a small fixed row goal make
+    // the cost of the chosen access path independent of the width of the
+    // interval. Keep selectivity-dependent costing if another usable index
+    // could offer a different plan, or if candidates need residual filtering.
+    limit.saturating_add(offset) <= COMPACT_ORDERED_WINDOW_ROWS
+        && index.primary
+        && table.schema.iter_queryable_indexes().take(2).count() == 1
+        && crate::planner::index_residual::all_covered(
+            filter,
+            &table.schema,
+            index,
+            low.as_ref(),
+            high.as_ref(),
+        )
+}
+
 #[derive(Debug)]
 struct CompactRangeInput {
     columns: Vec<usize>,
     schema: Option<TableSchema>,
     predicate: Option<Arc<crate::engine::expr_program::ExprProgram>>,
+    integer_param_cmp: Option<(usize, BinaryOp, usize)>,
     parameter_types: u64,
     decode: Arc<(
         RowDecodePlan,
@@ -3176,11 +3224,25 @@ pub(crate) fn compile_compact_range_recipe(
     stmt: &Select,
     plan: &PhysicalPlan,
 ) -> Option<Arc<CompactRangeRecipe>> {
-    if !fused_single_table_shape_supported(stmt)
+    if !fused_single_table_projection_supported(stmt)
         || select_projection_has_aggregate(&stmt.projection)
     {
         return None;
     }
+    let ordered_range = if has_ordered_window(stmt) {
+        if stmt.limit.is_none()
+            || stmt.distinct
+            || stmt.sql_calc_found_rows
+            || stmt.lock_clause.is_some()
+        {
+            return None;
+        }
+        Some(ordered_range_limit_input(plan)?)
+    } else {
+        None
+    };
+    let ordered_limit = ordered_range.is_some();
+
     fn source(plan: &PhysicalPlan) -> Option<(&PlanTable, Option<&Expr>)> {
         match plan {
             PhysicalPlan::Limit { input, .. }
@@ -3207,6 +3269,7 @@ pub(crate) fn compile_compact_range_recipe(
         stmt: &Select,
         table: &TableSchema,
         filter: Option<&Expr>,
+        ordered_limit: bool,
     ) -> Option<CompactRangeInput> {
         let projection = stmt
             .projection
@@ -3216,8 +3279,8 @@ pub(crate) fn compile_compact_range_recipe(
                 _ => None,
             })
             .collect::<Option<Vec<_>>>()?;
-        let order = stmt
-            .order_by
+        let order_by: &[OrderBy] = if ordered_limit { &[] } else { &stmt.order_by };
+        let order = order_by
             .iter()
             .map(|item| expr_column_index(&item.expr, table))
             .collect::<Option<Vec<_>>>()?;
@@ -3268,9 +3331,20 @@ pub(crate) fn compile_compact_range_recipe(
             .ok()
             .map(Arc::new)
         });
+        let integer_param_cmp = predicate
+            .as_ref()
+            .filter(|_| ordered_limit)
+            .and_then(|program| program.as_column_param_cmp_shape())
+            .and_then(|(slot, op, param, _, _)| {
+                table.columns[columns[slot]]
+                    .data_type
+                    .is_integer()
+                    .then_some((slot, op, param))
+            });
         Some(CompactRangeInput {
             schema,
             predicate,
+            integer_param_cmp,
             parameter_types: crate::engine::expr_type::current_parameter_type_fingerprint(),
             decode: RowDecodePlan::try_compile_cached(&columns, &table.row_codec)?,
             projected: ProjectedReadPlan::new(&columns, table),
@@ -3278,16 +3352,16 @@ pub(crate) fn compile_compact_range_recipe(
                 .iter()
                 .map(|column| columns.iter().position(|c| c == column).unwrap())
                 .collect(),
-            sort_fields: sort_fields_with_schema(&stmt.order_by, table),
+            sort_fields: sort_fields_with_schema(order_by, table),
             columns,
             swaps,
             output_len: projection.len(),
             dedup: stmt.distinct,
         })
     }
-    let without_filter = input(stmt, &table.schema, None)?;
+    let without_filter = input(stmt, &table.schema, None, ordered_limit)?;
     let with_filter = match filter {
-        Some(filter) => Some(input(stmt, &table.schema, Some(filter))?),
+        Some(filter) => Some(input(stmt, &table.schema, Some(filter), ordered_limit)?),
         None => None,
     };
     let columns: Arc<[Column]> =
@@ -3342,6 +3416,13 @@ pub(crate) fn compile_compact_range_recipe(
         bytes,
     )?;
     Some(Arc::new(CompactRangeRecipe {
+        ordered_limit,
+        stable_row_goal: ordered_range.is_some_and(|input| {
+            with_filter
+                .as_ref()
+                .is_some_and(|input| input.integer_param_cmp.is_some())
+                && stable_ordered_range_row_goal(stmt, input)
+        }),
         projection: stmt.projection.clone(),
         order_by: stmt.order_by.clone(),
         distinct: stmt.distinct,
@@ -3351,6 +3432,179 @@ pub(crate) fn compile_compact_range_recipe(
         with_filter,
         _charge: charge,
     }))
+}
+
+// A Sort, filter above the scan, DISTINCT or another cardinality-changing
+// operator prevents the leaf from satisfying the SQL row goal on its own.
+fn ordered_range_limit_input(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
+    let PhysicalPlan::Limit { input, .. } = plan else {
+        return None;
+    };
+    let mut input = input.as_ref();
+    while let PhysicalPlan::Projection {
+        input: next,
+        distinct: false,
+        ..
+    } = input
+    {
+        input = next;
+    }
+    match input {
+        PhysicalPlan::IndexRangeScan {
+            table,
+            index,
+            covering: false,
+            ..
+        } if (index.unique || index.primary)
+            && index.included_columns.is_empty()
+            && !table.schema.is_partitioned() =>
+        {
+            Some(input)
+        }
+        _ => None,
+    }
+}
+
+fn integer_range_operand(value: &Value) -> Option<i128> {
+    match value {
+        Value::Int(value) => Some(i128::from(*value)),
+        Value::UInt(value) => Some(i128::from(*value)),
+        _ => None,
+    }
+}
+
+fn eval_compact_range_predicate(
+    program: &crate::engine::expr_program::ExprProgram,
+    row: &[Value],
+    scratch: &mut crate::engine::expr_program::EvalScratch,
+) -> Result<bool, QueryError> {
+    match program.eval_simple_predicate_source(&row) {
+        Some(result) => result,
+        None => Ok(crate::engine::expr::truthy(
+            &program.eval_source(&row, scratch)?,
+        )),
+    }
+}
+
+fn execute_compact_ordered_limit(
+    db: &Arc<Database>,
+    txn: TxnView,
+    stmt: &Select,
+    plan: &PhysicalPlan,
+    recipe: &CompactRangeRecipe,
+) -> Result<Option<QueryResponse>, QueryError> {
+    // Keep the result and one candidate window small. Broad residuals can
+    // benefit from batched filtering regardless of how few rows they return.
+    let Some(limit) = select_limit(stmt)? else {
+        return Ok(None);
+    };
+    let mut skip = select_offset(stmt)?;
+    if txn.historical || limit.saturating_add(skip) > COMPACT_ORDERED_WINDOW_ROWS {
+        return Ok(None);
+    }
+    let Some(PhysicalPlan::IndexRangeScan {
+        table,
+        index,
+        low,
+        high,
+        filter,
+        reverse,
+        ..
+    }) = ordered_range_limit_input(plan)
+    else {
+        return Ok(None);
+    };
+    let (input, integer_bound) = if let Some(filter) = filter {
+        let Some(input) = recipe
+            .with_filter
+            .as_ref()
+            .filter(|input| input.predicate.is_some())
+        else {
+            return Ok(None);
+        };
+        // An exact integer comparison depends on the value, independently
+        // of the parameter's display width or signedness in result metadata.
+        let integer_bound = input.integer_param_cmp.and_then(|(slot, op, param)| {
+            let value = crate::engine::params::current_param(param)?;
+            Some((slot, op, integer_range_operand(&value)?))
+        });
+        if (integer_bound.is_none()
+            && input.parameter_types
+                != crate::engine::expr_type::current_parameter_type_fingerprint())
+            || !crate::planner::index_residual::all_covered(
+                filter,
+                &table.schema,
+                index,
+                low.as_ref(),
+                high.as_ref(),
+            )
+        {
+            return Ok(None);
+        }
+        (input, integer_bound)
+    } else {
+        (&recipe.without_filter, None)
+    };
+    db.check_index_read_view(&table.schema, index, txn)?;
+    let mut cursor = super::plan::AnyRangeCursor::open(
+        db,
+        txn,
+        &table.schema,
+        index,
+        low.clone(),
+        high.clone(),
+        *reverse,
+    )?;
+    let heap = db.cached_heap_handle(table.schema.id)?;
+    let mut rows = Vec::with_capacity(limit);
+    let mut scratch = crate::engine::expr_program::EvalScratch::default();
+    while rows.len() < limit && !cursor.is_finished() {
+        crate::engine::cancel::check_cancelled()?;
+        let (ids, _) = cursor.next_leaf_chunk_row_ids(skip + limit - rows.len())?;
+        if ids.is_empty() {
+            continue;
+        }
+        let mut pairs = db.read_row_columns_many_with_handle_and_plan(
+            &heap,
+            &table.schema,
+            &ids,
+            txn,
+            &input.columns,
+            Some(&input.decode.0),
+            &input.projected,
+        )?;
+        restore_row_id_order(&mut pairs, &ids, |(id, _)| *id);
+        for (_, values) in pairs {
+            // Keep rechecking the visible heap version, including rows
+            // returned by the retired-key repair feed under concurrent DML.
+            if let Some(predicate) = &input.predicate {
+                let integer_match = integer_bound.and_then(|(slot, op, bound)| {
+                    let value = values.as_slice().get(slot)?;
+                    Some(super::plan::compare_ordering(
+                        op,
+                        integer_range_operand(value)?.cmp(&bound),
+                    ))
+                });
+                let accepted = match integer_match {
+                    Some(accepted) => accepted,
+                    None => eval_compact_range_predicate(predicate, &values, &mut scratch)?,
+                };
+                if !accepted {
+                    continue;
+                }
+            }
+            if skip != 0 {
+                skip -= 1;
+            } else {
+                rows.push(values);
+                // Retirement repair can add rows beyond the physical pull cap.
+                if rows.len() == limit {
+                    break;
+                }
+            }
+        }
+    }
+    compact_range_result(stmt, &table.schema, recipe, input, rows).map(Some)
 }
 
 pub(crate) fn execute_compact_range_recipe(
@@ -3367,6 +3621,9 @@ pub(crate) fn execute_compact_range_recipe(
         || stmt.distinct != recipe.distinct
     {
         return Ok(None);
+    }
+    if recipe.ordered_limit {
+        return execute_compact_ordered_limit(db, txn, stmt, plan, recipe);
     }
     let Some(source) = simple_scan_source(db, txn, plan)? else {
         return Ok(None);
@@ -3413,17 +3670,10 @@ pub(crate) fn execute_compact_range_recipe(
     )?;
     restore_row_id_order(&mut pairs, &ids, |(id, _)| *id);
     let mut rows = Vec::with_capacity(pairs.len());
+    let mut scratch = crate::engine::expr_program::EvalScratch::default();
     for (_, values) in pairs {
         let accepted = if let Some(program) = reusable_filter {
-            match program.eval_simple_predicate_source(&values.as_slice()) {
-                Some(result) => result?,
-                None => {
-                    let mut scratch = crate::engine::expr_program::EvalScratch::default();
-                    crate::engine::expr::truthy(
-                        &program.eval_source(&values.as_slice(), &mut scratch)?,
-                    )
-                }
-            }
+            eval_compact_range_predicate(program, &values, &mut scratch)?
         } else {
             filter
                 .as_ref()
@@ -3463,12 +3713,6 @@ pub(crate) fn execute_compact_range_recipe(
             rows.dedup_by(|a, b| compare(a, b) == std::cmp::Ordering::Equal);
         }
     }
-    for row in &mut rows {
-        for &(a, b) in &input.swaps {
-            row.swap(a, b);
-        }
-        row.truncate(input.output_len);
-    }
     let offset = select_offset(stmt)?.min(rows.len());
     let end = select_limit(stmt)?.map_or(rows.len(), |limit| {
         offset.saturating_add(limit).min(rows.len())
@@ -3477,11 +3721,27 @@ pub(crate) fn execute_compact_range_recipe(
     if offset != 0 {
         rows.drain(..offset);
     }
+    compact_range_result(stmt, &table.schema, recipe, input, rows).map(Some)
+}
+
+fn compact_range_result(
+    stmt: &Select,
+    table: &TableSchema,
+    recipe: &CompactRangeRecipe,
+    input: &CompactRangeInput,
+    mut rows: Vec<Vec<Value>>,
+) -> Result<QueryResponse, QueryError> {
+    for row in &mut rows {
+        for &(a, b) in &input.swaps {
+            row.swap(a, b);
+        }
+        row.truncate(input.output_len);
+    }
     // A shared physical artifact can retain a differently-cased table alias.
     // Column labels were checked above; refresh only source presentation when
     // the current statement's alias differs from the retained wire metadata.
     let table_alias = stmt.from.first().and_then(|from| from.alias.as_deref());
-    let wire_table = table_alias.unwrap_or(&table.schema.name);
+    let wire_table = table_alias.unwrap_or(&table.name);
     let columns = if recipe
         .columns
         .iter()
@@ -3489,11 +3749,11 @@ pub(crate) fn execute_compact_range_recipe(
     {
         Arc::clone(&recipe.columns)
     } else {
-        simple_result_columns(stmt, &table.schema, table_alias)?.into()
+        simple_result_columns(stmt, table, table_alias)?.into()
     };
-    Ok(Some(QueryResponse::SharedResultSet(
+    Ok(QueryResponse::SharedResultSet(
         crate::engine::api::SharedResultSet { columns, rows },
-    )))
+    ))
 }
 
 pub(crate) fn projected_point_result_columns(

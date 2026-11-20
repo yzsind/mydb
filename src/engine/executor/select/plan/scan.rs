@@ -2235,23 +2235,7 @@ pub(super) fn read_plan_table_ids_range_windowed(
     let mut skip = offset;
     let mut page_ids: Vec<RowId> = Vec::with_capacity(limit.min(64));
     let mut seen = (!index.unique).then(std::collections::HashSet::new);
-    let mut cursor = if reverse {
-        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
-            &table.schema,
-            index,
-            low,
-            high,
-            txn,
-        )?)
-    } else {
-        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
-            &table.schema,
-            index,
-            low,
-            high,
-            txn,
-        )?)
-    };
+    let mut cursor = AnyRangeCursor::open(db, txn, &table.schema, index, low, high, reverse)?;
     while page_ids.len() < limit {
         // The MRR grant is an upper bound, not a mandatory fetch size.
         // Ordered pagination without a residual filter needs only the
@@ -2856,13 +2840,31 @@ pub(super) fn read_plan_table_entries_chunked(
     Ok(rows)
 }
 
-/// Direction-agnostic chunk source for LIMIT-bounded covering scans.
-pub(super) enum AnyRangeCursor {
+/// Direction-agnostic chunk source for LIMIT-bounded index scans.
+pub(in crate::engine::executor::select) enum AnyRangeCursor {
     Forward(crate::storage::IndexRangeCursor),
     Reverse(crate::storage::IndexRangeReverseCursor),
 }
 
 impl AnyRangeCursor {
+    pub(in crate::engine::executor::select) fn open(
+        db: &Arc<Database>,
+        txn: TxnView,
+        table: &TableSchema,
+        index: &IndexSchema,
+        low: Option<IndexBound>,
+        high: Option<IndexBound>,
+        reverse: bool,
+    ) -> Result<Self, QueryError> {
+        if reverse {
+            db.range_index_snapshot_reverse_cursor(table, index, low, high, txn)
+                .map(Self::Reverse)
+        } else {
+            db.range_index_snapshot_cursor(table, index, low, high, txn)
+                .map(Self::Forward)
+        }
+    }
+
     pub(super) fn next_leaf_chunk(
         &mut self,
         cap: usize,
@@ -2888,13 +2890,20 @@ impl AnyRangeCursor {
         }
     }
 
-    pub(super) fn next_leaf_chunk_row_ids(
+    pub(in crate::engine::executor::select) fn next_leaf_chunk_row_ids(
         &mut self,
         soft_cap: usize,
     ) -> Result<(Vec<RowId>, u64), QueryError> {
         match self {
             AnyRangeCursor::Forward(cursor) => cursor.next_leaf_chunk_row_ids(soft_cap),
             AnyRangeCursor::Reverse(cursor) => cursor.next_leaf_chunk_row_ids(soft_cap),
+        }
+    }
+
+    pub(in crate::engine::executor::select) fn is_finished(&self) -> bool {
+        match self {
+            Self::Forward(cursor) => cursor.is_finished(),
+            Self::Reverse(cursor) => cursor.is_finished(),
         }
     }
 }
@@ -2918,23 +2927,7 @@ pub(super) fn read_plan_table_entries_chunked_limited(
     // and widen geometrically when invisible or filtered entries fall short.
     let mut chunk = max_rows.saturating_mul(4).clamp(4, MAX_CHUNK);
     let heap = index_scan_heap(db, table)?;
-    let mut cursor = if reverse {
-        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
-            &table.schema,
-            index,
-            low.clone(),
-            high.clone(),
-            txn,
-        )?)
-    } else {
-        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
-            &table.schema,
-            index,
-            low.clone(),
-            high.clone(),
-            txn,
-        )?)
-    };
+    let mut cursor = AnyRangeCursor::open(db, txn, &table.schema, index, low, high, reverse)?;
     while rows.len() < max_rows {
         let remaining = max_rows - rows.len();
         let entries = cursor.next_chunk(remaining.max(chunk).min(MAX_CHUNK))?;
@@ -2990,23 +2983,7 @@ pub(super) fn read_plan_table_entries_windowed(
         CHUNK
     };
     let mut seen = (!index.unique).then(std::collections::HashSet::new);
-    let mut cursor = if reverse {
-        AnyRangeCursor::Reverse(db.range_index_snapshot_reverse_cursor(
-            &table.schema,
-            index,
-            low,
-            high,
-            txn,
-        )?)
-    } else {
-        AnyRangeCursor::Forward(db.range_index_snapshot_cursor(
-            &table.schema,
-            index,
-            low,
-            high,
-            txn,
-        )?)
-    };
+    let mut cursor = AnyRangeCursor::open(db, txn, &table.schema, index, low, high, reverse)?;
     while rows.len() < limit {
         let mut entries = cursor.next_chunk(chunk_rows)?;
         if entries.is_empty() {

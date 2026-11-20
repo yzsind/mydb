@@ -994,9 +994,20 @@ type BufferFileGenerationMap =
     hashbrown::HashMap<BufferPageFileKey, Arc<AtomicU64>, ahash::RandomState>;
 type BufferFileCacheMap =
     hashbrown::HashMap<BufferPageFileKey, Arc<CachedFile>, ahash::RandomState>;
-/// Sharded snapshot table — each shard sees ~1/N of the statement
-/// register / drop traffic, so the hash speedup compounds across shards.
-type ActiveSnapshotMap = hashbrown::HashMap<u64, ActiveSnapshot, ahash::RandomState>;
+/// A live slot is owned by exactly one guard until its release.
+#[derive(Debug, Clone, Copy)]
+struct SnapshotKey {
+    shard: usize,
+    slot: usize,
+}
+
+fn snapshot_shard() -> usize {
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    thread_local! {
+        static SHARD: usize = NEXT.fetch_add(1, Ordering::Relaxed) % ACTIVE_SNAPSHOT_SHARDS;
+    }
+    SHARD.with(|shard| *shard)
+}
 
 #[derive(Debug)]
 pub struct Database {
@@ -1008,7 +1019,6 @@ pub struct Database {
     disk_pressure: Option<super::disk_pressure::DiskPressure>,
     recovery_context: RecoveryContext,
     visibility_cache_id: u64,
-    next_snapshot_id: AtomicU64,
     /// Fail-closed latch for states that cannot be repaired safely online
     /// (partial rollback or a published commit whose durability barrier
     /// failed). The first error wins and every subsequent SQL statement is
@@ -1067,12 +1077,9 @@ pub struct Database {
     /// Disabling is published before changing either gate; enabling is
     /// published after, so runtime changes cannot admit an unsafe fast append.
     undo_concurrent_append_eligible: Arc<AtomicBool>,
-    // Sharded by snapshot_id to spread per-statement snapshot register/drop
-    // contention across many mutexes. The hot SELECT path inserts on
-    // `register_statement_snapshot` and removes on `SnapshotGuard::Drop` —
-    // a single Mutex<HashMap> serialized 4-8 concurrent readers and was a
-    // visible tail-latency contributor.
-    active_snapshots: Box<[Mutex<ActiveSnapshotMap>]>,
+    // Readers register on their thread's shard. Guards carry the slot key
+    // across threads; purge locks all shards when sampling the horizon.
+    active_snapshots: Box<[CachePadded<Mutex<slab::Slab<ActiveSnapshot>>>]>,
     auto_increment: AutoIncrementManager,
     /// Briefly excludes AUTO_INCREMENT redo publication while checkpoint
     /// installs its coverage fence and rotates the dirty epoch.
@@ -3127,7 +3134,7 @@ struct ActiveSnapshot {
 #[derive(Debug)]
 pub struct SnapshotGuard {
     db: Arc<Database>,
-    snapshot_id: u64,
+    snapshot_id: SnapshotKey,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -4667,11 +4674,7 @@ include!("core/config.rs");
 include!("core/buffer.rs");
 impl Drop for SnapshotGuard {
     fn drop(&mut self) {
-        let shard = (self.snapshot_id as usize) % self.db.active_snapshots.len();
-        self.db.active_snapshots[shard]
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .remove(&self.snapshot_id);
+        self.db.unpin_snapshot(self.snapshot_id);
         // A finished reader may unblock superseded vector versions.
         self.db.drain_vector_purges();
     }

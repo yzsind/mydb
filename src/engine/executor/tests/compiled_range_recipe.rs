@@ -13,6 +13,159 @@ fn owned_result(response: QueryResponse) -> crate::engine::api::ResultSet {
 }
 
 #[test]
+fn exact_small_primary_range_reuses_plan_across_range_selectivity_tiers() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE memo_ordered_range (id INT PRIMARY KEY, n INT)")
+        .unwrap();
+    let values = (1..=4096)
+        .map(|id| format!("({id},{})", id * 5))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO memo_ordered_range VALUES {values}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE memo_ordered_range").unwrap();
+    let mut session = SessionContext::default();
+    let sql = "SELECT n FROM memo_ordered_range WHERE id>=? ORDER BY id LIMIT 13 OFFSET 1";
+    let parsed = engine.prepare_cached(&mut session, sql, 1).unwrap();
+    let mut state = PreparedSelectMemoState::default();
+
+    for lower in [7, 4060, 2048, 4090, 33, 5000] {
+        let result = with_shared_result_metadata(|| {
+            engine.execute_prepared_select(
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(lower)],
+            )
+        })
+        .unwrap()
+        .unwrap();
+        assert!(
+            matches!(&result, QueryResponse::SharedResultSet(_)),
+            "integer bind {lower} must keep the compact range path"
+        );
+        assert_eq!(
+            owned_result(result).rows,
+            ((lower + 1)..=(lower + 13).min(4096))
+                .map(|id| vec![Value::Int(id * 5)])
+                .collect::<Vec<_>>(),
+        );
+        let PreparedSelectMemoState::Ready(memo) = &state else {
+            panic!("compiled memo expected");
+        };
+        assert!(memo
+            .compiled
+            .compact_range
+            .as_ref()
+            .is_some_and(|recipe| recipe.stable_row_goal));
+    }
+    let status = engine.db_for_tests().storage_status();
+    assert_eq!(status.prepared_plan_compiles, 1);
+    assert_eq!(status.prepared_plan_reuses, 5);
+
+    // Another usable index restores cost-sensitive planning.
+    engine
+        .execute("ALTER TABLE memo_ordered_range ADD KEY by_n(n)")
+        .unwrap();
+    with_shared_result_metadata(|| {
+        engine.execute_prepared_select(&mut session, &mut state, &parsed, sql, &[Value::Int(7)])
+    })
+    .unwrap()
+    .unwrap();
+    let PreparedSelectMemoState::Ready(memo) = &state else {
+        panic!("compiled memo expected");
+    };
+    assert!(!memo
+        .compiled
+        .compact_range
+        .as_ref()
+        .is_some_and(|recipe| recipe.stable_row_goal));
+}
+
+#[test]
+fn ordered_range_limit_rebinds_and_reads_snapshot_keys_across_leaf_windows() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE ordered_recipe (id INT PRIMARY KEY, label VARCHAR(128), amount DECIMAL(10,2))")
+        .unwrap();
+    let data = (1..=1200)
+        .rev()
+        .map(|i| format!("({i},'r{i}',{i}.25)"))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO ordered_recipe VALUES {data}"))
+        .unwrap();
+    engine.execute("ANALYZE TABLE ordered_recipe").unwrap();
+
+    for (comparison, order, start) in [(">=", "ASC", 599), ("<=", "DESC", 602)] {
+        let sql = format!(
+            "SELECT amount AS a,label FROM ordered_recipe FORCE INDEX(PRIMARY) WHERE id{comparison}? ORDER BY id {order} LIMIT ? OFFSET ?"
+        );
+        let mut reader = SessionContext::default();
+        let parsed = engine.prepare_cached(&mut reader, &sql, 3).unwrap();
+        let mut state = PreparedSelectMemoState::default();
+        let mut execute = |reader: &mut SessionContext, key, n| {
+            with_shared_result_metadata(|| {
+                engine.execute_prepared_select(
+                    reader,
+                    &mut state,
+                    &parsed,
+                    &sql,
+                    &[key, Value::Int(n), Value::Int(1)],
+                )
+            })
+            .unwrap()
+            .unwrap()
+        };
+        let expected = |start, limit| {
+            owned_result(
+                engine
+                    .execute(&format!(
+                        "SELECT amount AS a,label FROM ordered_recipe WHERE id{comparison}{start} ORDER BY id {order} LIMIT {limit} OFFSET 1"
+                    ))
+                    .unwrap(),
+            )
+            .rows
+        };
+        for (start, limit) in [(start, 20), (start + 1, 3), (start, 70)] {
+            let response = execute(&mut reader, Value::Int(start), limit);
+            if limit < 64 {
+                assert!(
+                    matches!(&response, QueryResponse::SharedResultSet(_)),
+                    "{sql}"
+                );
+            }
+            assert_eq!(owned_result(response).rows, expected(start, limit));
+        }
+        assert!(owned_result(execute(&mut reader, Value::Null, 5))
+            .rows
+            .is_empty());
+        let expected = expected(start, 20);
+        let mut writer = SessionContext::default();
+        engine.execute_with_session(&mut writer, "BEGIN").unwrap();
+        engine
+            .execute_with_session(
+                &mut writer,
+                "UPDATE ordered_recipe SET id=1500,label='moved' WHERE id=600",
+            )
+            .unwrap();
+        assert_eq!(
+            owned_result(execute(&mut reader, Value::Int(start), 20)).rows,
+            expected
+        );
+        engine
+            .execute_with_session(&mut writer, "ROLLBACK")
+            .unwrap();
+    }
+}
+
+#[test]
 fn bounded_prepared_parallel_aggregate_uses_compact_range_execution() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

@@ -1099,10 +1099,11 @@ pub(crate) fn execute_compiled_select(
         if !force_batch
             && !super::analyze_stats::is_recording()
             && crate::engine::api::shared_result_metadata_allowed()
-            && super::simple::runtime_unique_range_fits_batch(
-                &compiled.physical,
-                crate::engine::executor::vec::DEFAULT_BATCH_ROWS,
-            )?
+            && (recipe.ordered_limit
+                || super::simple::runtime_unique_range_fits_batch(
+                    &compiled.physical,
+                    crate::engine::executor::vec::DEFAULT_BATCH_ROWS,
+                )?)
         {
             if let Some(result) = super::simple::execute_compact_range_recipe(
                 db,

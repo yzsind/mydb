@@ -3,6 +3,25 @@ use super::*;
 include!("storage_handle_memo_tests.rs");
 
 #[test]
+fn snapshot_slots_preserve_other_readers_across_threads_and_reuse() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = Arc::new(open_memory_test_db(dir.path()));
+    let mut guards = db.register_statement_snapshots_atomic(&[11, 17]);
+    let nested = db.register_statement_snapshot(5);
+    assert_eq!(db.snapshot_visibility_horizon().0, Some(5));
+    std::thread::spawn(move || drop(nested)).join().unwrap();
+    assert_eq!(db.snapshot_visibility_horizon().0, Some(11));
+    let reused = db.register_statement_snapshot(7);
+    let first = guards.remove(0);
+    std::thread::spawn(move || drop(first)).join().unwrap();
+    assert_eq!(db.snapshot_visibility_horizon().0, Some(7));
+    drop(reused);
+    assert_eq!(db.snapshot_visibility_horizon().0, Some(17));
+    drop(guards);
+    assert_eq!(db.snapshot_visibility_horizon().0, None);
+}
+
+#[test]
 fn issue_18_auth_catalog_delta_survives_commit_mdl_retry() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let db = open_relaxed_test_db(dir.path());

@@ -1140,12 +1140,15 @@ impl Database {
         index: &IndexSchema,
         key: IndexKey,
     ) -> Result<Option<RowId>, QueryError> {
+        self.check_primary_read_view(table, txn)?;
+        let (key, unsatisfiable) = resolve_index_key(index, key)?;
+        if unsatisfiable {
+            return Ok(None);
+        }
         let mut candidate = if !table.is_partitioned() && txn.txn_id != 0 {
-            self.check_primary_read_view(table, txn)?;
-            let (resolved, _) = resolve_index_key(index, key.clone())?;
-            self.check_unique_key_lock_blocking(txn.txn_id, table.id, &index.name, &resolved)?;
+            self.check_unique_key_lock_blocking(txn.txn_id, table.id, &index.name, &key)?;
             let (candidate, locked) = self.with_index_read(table.id, &index.name, |file| {
-                let candidate = file.get_unique_one(&resolved)?;
+                let candidate = file.get_unique_one(&key)?;
                 // Never wait under the index latch. A successful try-lock
                 // makes the probed physical key stable before releasing it,
                 // preserving the single-probe uncontended point-write path.
@@ -1168,10 +1171,10 @@ impl Database {
                     txn.txn_id,
                     table.id,
                     &index.name,
-                    &resolved,
+                    &key,
                     || {
                         self.with_index_read(table.id, &index.name, |file| {
-                            file.get_unique_one(&resolved)
+                            file.get_unique_one(&key)
                         })
                     },
                 )?

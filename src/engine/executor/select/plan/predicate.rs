@@ -1999,7 +1999,10 @@ pub(super) fn compare_string_predicate_value(
 }
 
 #[inline]
-pub(super) fn compare_ordering(op: BinaryOp, ordering: std::cmp::Ordering) -> bool {
+pub(in crate::engine::executor::select) fn compare_ordering(
+    op: BinaryOp,
+    ordering: std::cmp::Ordering,
+) -> bool {
     match op {
         BinaryOp::Eq | BinaryOp::NullSafeEq => ordering == std::cmp::Ordering::Equal,
         BinaryOp::NotEq => ordering != std::cmp::Ordering::Equal,

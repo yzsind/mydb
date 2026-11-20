@@ -1697,6 +1697,7 @@ dependencies = [
  "sha1",
  "sha2 0.10.9",
  "simdutf8",
+ "slab",
  "smallvec",
  "sqlparser",
  "stacker",

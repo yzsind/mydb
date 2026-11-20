@@ -41,7 +41,7 @@ use tokio::sync::Semaphore;
 /// A permit representing one admitted (open, lock-holding) transaction. Dropping
 /// it — on commit/rollback or when the session is dropped — frees the slot.
 pub struct AdmissionPermit {
-    _normal: tokio::sync::OwnedSemaphorePermit,
+    _normal: tokio::sync::SemaphorePermit<'static>,
 }
 
 static PARALLEL_READ_PRESSURE: AtomicUsize = AtomicUsize::new(0);
@@ -55,12 +55,11 @@ static MIXED_ADMISSION_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 static PARALLEL_READ_GATE_WAITS: AtomicU64 = AtomicU64::new(0);
 static PARALLEL_READ_GATE_WAIT_NS: AtomicU64 = AtomicU64::new(0);
 
-// Keep a confirmed analytical connection's pressure lease alive across short
-// gaps between its consecutive operators/statements. 250 ms was too short for
-// mixed JDBC workloads: writers burst into the gaps and evicted the next AP
-// scan's cache working set. A two-second lease is still bounded, is renewed
-// only by read-only parallel work, and never changes physical-plan topology.
+// Bridge idle gaps between consecutive analytical statements. Longer periods
+// of continuous parallel work can justify more protection for their working
+// set, up to two seconds. A brief probe only carries a brief grace period.
 const PARALLEL_READ_PRESSURE_GRACE_MS: u64 = 2_000;
+const PARALLEL_READ_GRACE_PER_BUSY_MS: u64 = 8;
 const MIXED_ADMISSION_SHAPING_MS: u64 = 2;
 
 #[cfg(test)]
@@ -130,10 +129,18 @@ fn parallel_read_pressure_active() -> bool {
         || monotonic_millis() < PARALLEL_READ_PRESSURE_UNTIL_MS.load(Ordering::Acquire)
 }
 
+fn parallel_read_grace_end(started_ms: u64, finished_ms: u64) -> u64 {
+    let busy_ms = finished_ms.saturating_sub(started_ms);
+    let grace_ms = busy_ms
+        .saturating_mul(PARALLEL_READ_GRACE_PER_BUSY_MS)
+        .min(PARALLEL_READ_PRESSURE_GRACE_MS);
+    finished_ms.saturating_add(grace_ms)
+}
+
 /// Lifetime marker for a CPU-intensive parallel read. Existing admitted
 /// transactions are never suspended; only new lock-taking transactions are
-/// serialized while at least one marker is live, so commits keep progressing
-/// and pure transactional workloads retain the normal CPU-scaled limit.
+/// shaped during analytical pressure, so commits keep progressing and pure
+/// transactional workloads retain the normal CPU-scaled limit.
 pub struct ParallelReadPressureGuard {
     gate: Arc<ParallelReadGate>,
     query_id: u64,
@@ -145,9 +152,15 @@ struct ParallelReadGate {
     // CTE/UNION pipelines can depend on one another. None may wait for a
     // permit held by the same statement. MemBudget's query_id is inherited
     // by all those paths and is never a reusable connection/thread ID.
-    active: std::sync::Mutex<std::collections::HashMap<u64, usize>>,
+    active: std::sync::Mutex<ActiveParallelReads>,
     available: std::sync::Condvar,
     limit: usize,
+}
+
+#[derive(Default)]
+struct ActiveParallelReads {
+    by_query: std::collections::HashMap<u64, usize>,
+    since_ms: u64,
 }
 
 fn parallel_read_gate() -> &'static Arc<ParallelReadGate> {
@@ -162,7 +175,7 @@ fn parallel_read_gate() -> &'static Arc<ParallelReadGate> {
             .filter(|value| *value > 0)
             .unwrap_or(2);
         Arc::new(ParallelReadGate {
-            active: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active: std::sync::Mutex::new(ActiveParallelReads::default()),
             available: std::sync::Condvar::new(),
             // Bound independent analytical statements. Physical topology
             // and the planned degree of every scan remain unchanged; nested
@@ -174,28 +187,31 @@ fn parallel_read_gate() -> &'static Arc<ParallelReadGate> {
 
 impl Drop for ParallelReadPressureGuard {
     fn drop(&mut self) {
-        if PARALLEL_READ_PRESSURE.fetch_sub(1, Ordering::AcqRel) == 1 {
-            // Avoid opening all waiting writers in the short gaps between
-            // consecutive analytical pipelines/clients. The grace period is
-            // scheduling state only; it cannot affect a physical plan.
-            PARALLEL_READ_PRESSURE_UNTIL_MS.store(
-                monotonic_millis().saturating_add(PARALLEL_READ_PRESSURE_GRACE_MS),
-                Ordering::Release,
-            );
-        }
         let mut active = self
             .gate
             .active
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
-        let leases = active.get_mut(&self.query_id).expect("live scan lease");
+        let leases = active
+            .by_query
+            .get_mut(&self.query_id)
+            .expect("live scan lease");
         *leases -= 1;
         if *leases == 0 {
-            active.remove(&self.query_id);
+            active.by_query.remove(&self.query_id);
+            if active.by_query.is_empty() {
+                // Publish the deadline before dropping the final live marker.
+                // A short read cannot shorten an existing idle grace period.
+                PARALLEL_READ_PRESSURE_UNTIL_MS.fetch_max(
+                    parallel_read_grace_end(active.since_ms, monotonic_millis()),
+                    Ordering::Release,
+                );
+            }
             // Several workers for one waiting statement may be asleep.
             // After admission all of them are eligible to share its slot.
             self.gate.available.notify_all();
         }
+        PARALLEL_READ_PRESSURE.fetch_sub(1, Ordering::Release);
     }
 }
 
@@ -237,7 +253,7 @@ impl ParallelReadGate {
         let mut wait = None;
         loop {
             check_cancelled()?;
-            if active.contains_key(&query_id) || active.len() < self.limit {
+            if active.by_query.contains_key(&query_id) || active.by_query.len() < self.limit {
                 break;
             }
             wait.get_or_insert_with(|| ParallelReadWait(Instant::now()));
@@ -250,15 +266,18 @@ impl ParallelReadGate {
                 .unwrap_or_else(|poison| poison.into_inner())
                 .0;
         }
-        let leases = active.entry(query_id).or_default();
+        if active.by_query.is_empty() {
+            active.since_ms = monotonic_millis();
+        }
+        let leases = active.by_query.entry(query_id).or_default();
         *leases += 1;
         if *leases == 1 {
             // Wake siblings already waiting for this newly admitted statement.
             self.available.notify_all();
         }
+        PARALLEL_READ_PRESSURE.fetch_add(1, Ordering::Release);
         drop(active);
         PARALLEL_READ_PRESSURE_ENTRIES.fetch_add(1, Ordering::Relaxed);
-        PARALLEL_READ_PRESSURE.fetch_add(1, Ordering::AcqRel);
         Ok(ParallelReadPressureGuard {
             gate: Arc::clone(self),
             query_id,
@@ -341,17 +360,15 @@ pub fn global() -> Option<&'static Arc<Semaphore>> {
     .as_ref()
 }
 
-/// Acquire normal admission and, while a parallel read is live, the single
-/// mixed-workload write slot. This runs before the statement takes any lock.
-/// A pressure transition racing the final check can let at most one extra
-/// transaction through; it cannot create a lock-holding waiter.
+/// Acquire normal admission, then shape the transaction start under analytical
+/// pressure. Any wait occurs before the statement takes a database lock.
 pub async fn acquire() -> Option<AdmissionPermit> {
-    let normal_sem = Arc::clone(global()?);
-    let normal = match Arc::clone(&normal_sem).try_acquire_owned() {
+    let normal_sem = global()?;
+    let normal = match normal_sem.try_acquire() {
         Ok(permit) => permit,
         Err(tokio::sync::TryAcquireError::NoPermits) => {
             let started = Instant::now();
-            let permit = normal_sem.acquire_owned().await.ok()?;
+            let permit = normal_sem.acquire().await.ok()?;
             TXN_ADMISSION_WAITS.fetch_add(1, Ordering::Relaxed);
             TXN_ADMISSION_WAIT_NS.fetch_add(saturating_elapsed_ns(started), Ordering::Relaxed);
             permit
@@ -359,25 +376,27 @@ pub async fn acquire() -> Option<AdmissionPermit> {
         Err(tokio::sync::TryAcquireError::Closed) => return None,
     };
     if parallel_read_pressure_active() {
-        // Entering this branch always imposes the shaping delay, so it
-        // is a real admission wait even when the single slot is immediately
-        // available. Normal admission above reads the clock only on actual
-        // semaphore contention; this colder mixed path may time the complete
-        // queue + shaping interval directly.
-        let started = Instant::now();
-        let mixed_sem = Arc::clone(mixed_workload_semaphore());
-        let permit = match Arc::clone(&mixed_sem).try_acquire_owned() {
-            Ok(permit) => permit,
-            Err(tokio::sync::TryAcquireError::NoPermits) => mixed_sem.acquire_owned().await.ok()?,
+        let mixed_sem = mixed_workload_semaphore();
+        let (permit, queued_at) = match mixed_sem.try_acquire() {
+            Ok(permit) => (permit, None),
+            Err(tokio::sync::TryAcquireError::NoPermits) => {
+                let started = Instant::now();
+                (mixed_sem.acquire().await.ok()?, Some(started))
+            }
             Err(tokio::sync::TryAcquireError::Closed) => return None,
         };
-        // Shape the one admitted writer rather than releasing a burst at each
-        // scan boundary. This wait is async and occurs before any row/metadata
-        // lock is acquired, so it consumes neither a blocking worker nor a
-        // database resource. Pure TP workloads never enter this branch.
-        tokio::time::sleep(std::time::Duration::from_millis(MIXED_ADMISSION_SHAPING_MS)).await;
-        MIXED_ADMISSION_WAITS.fetch_add(1, Ordering::Relaxed);
-        MIXED_ADMISSION_WAIT_NS.fetch_add(saturating_elapsed_ns(started), Ordering::Relaxed);
+        // Queued writers may reach the front after the pressure has expired.
+        let wait_started = if parallel_read_pressure_active() {
+            let started = queued_at.unwrap_or_else(Instant::now);
+            tokio::time::sleep(Duration::from_millis(MIXED_ADMISSION_SHAPING_MS)).await;
+            Some(started)
+        } else {
+            queued_at
+        };
+        if let Some(started) = wait_started {
+            MIXED_ADMISSION_WAITS.fetch_add(1, Ordering::Relaxed);
+            MIXED_ADMISSION_WAIT_NS.fetch_add(saturating_elapsed_ns(started), Ordering::Relaxed);
+        }
         // This semaphore shapes transaction *starts*. The normal admission
         // permit below remains transaction-scoped and continues to bound all
         // open lock holders until COMMIT/ROLLBACK. Holding the mixed permit as
@@ -444,7 +463,7 @@ mod tests {
 
     fn single_query_gate() -> std::sync::Arc<super::ParallelReadGate> {
         std::sync::Arc::new(super::ParallelReadGate {
-            active: std::sync::Mutex::new(std::collections::HashMap::new()),
+            active: std::sync::Mutex::new(super::ActiveParallelReads::default()),
             available: std::sync::Condvar::new(),
             limit: 1,
         })
@@ -472,7 +491,7 @@ mod tests {
         let resumed = rx.recv_timeout(Duration::from_secs(1)).is_ok();
         peer.join().unwrap();
         assert!(blocked_with_both && blocked_with_nested && resumed);
-        assert!(gate.active.lock().unwrap().is_empty());
+        assert!(gate.active.lock().unwrap().by_query.is_empty());
     }
 
     #[test]
@@ -523,7 +542,7 @@ mod tests {
                 Some(if mode == "deadline" { 3024 } else { 1317 }),
                 "{mode}"
             );
-            assert!(gate.active.lock().unwrap().is_empty());
+            assert!(gate.active.lock().unwrap().by_query.is_empty());
         }
     }
 
@@ -552,7 +571,7 @@ mod tests {
         let after = super::status_snapshot();
         assert!(after.parallel_read_gate_waits > before.parallel_read_gate_waits);
         assert!(after.parallel_read_gate_wait_us > before.parallel_read_gate_wait_us);
-        assert!(gate.active.lock().unwrap().is_empty());
+        assert!(gate.active.lock().unwrap().by_query.is_empty());
     }
 
     #[test]
@@ -564,7 +583,7 @@ mod tests {
             panic!("operator panicked");
         });
         assert!(result.is_err());
-        assert!(gate.active.lock().unwrap().is_empty());
+        assert!(gate.active.lock().unwrap().by_query.is_empty());
         drop(gate.enter(2, || Ok(())).unwrap());
     }
 
@@ -615,6 +634,16 @@ mod tests {
         assert_eq!(mixed_workload_limit_for(4, 2), 2);
         assert_eq!(mixed_workload_limit_for(10, 4), 6);
         assert_eq!(mixed_workload_limit_for(32, 4), 16);
+    }
+
+    #[test]
+    fn parallel_read_idle_grace_tracks_the_busy_period() {
+        use super::parallel_read_grace_end;
+
+        assert_eq!(parallel_read_grace_end(10_000, 10_000), 10_000);
+        assert_eq!(parallel_read_grace_end(10_000, 10_008), 10_072);
+        assert_eq!(parallel_read_grace_end(10_000, 10_150), 11_350);
+        assert_eq!(parallel_read_grace_end(10_000, 11_250), 13_250);
     }
 
     #[test]

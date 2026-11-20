@@ -1342,7 +1342,7 @@ pub(super) fn execute_prepared_point_update(
         txn,
         &point.table,
         &point.index,
-        point.key.resolve_params()?,
+        point.key.clone(),
     )?;
     let Some(row_id) = row_id else {
         crate::engine::api::set_statement_matched_rows(0);
