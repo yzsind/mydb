@@ -100,7 +100,7 @@ with ss as
  from   ws left join wr
         on  ws.wp_web_page_sk = wr.wp_web_page_sk
  ) x
- group by rollup(channel, id)
+ group by rollup(channel, id) having count(*) > 0
  order by channel
          ,id
  limit 100;

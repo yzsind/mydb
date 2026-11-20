@@ -103,6 +103,24 @@ class ExecutionStatusTest(unittest.TestCase):
         self.assertEqual(result.returncode, 2, result.stderr)
         self.assertEqual(rows[0]['status'], 'invalid_actual')
 
+    def test_builtin_q78_contract_preserves_exact_rounded_ratio(self):
+        fixtures = Path(__file__).parent / 'tpcds' / 'expected-duckdb' / 'sf-1'
+        expected = (fixtures / 'q78.tsv').read_bytes()
+        (self.expected / 'q78.tsv').write_bytes(expected)
+        (self.expected / 'comparison.json').write_bytes((fixtures / 'comparison.json').read_bytes())
+        actual = self.root / 'q78_result.txt'
+        row = b'2002\t129\t108\t26.0\t'
+        self.assertIn(row, expected)
+        actual.write_bytes(expected.replace(row, b'2002\t129\t108\t26.00\t', 1))
+        result, rows = self.check('78')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(rows[0]['expected_hash'], rows[0]['actual_hash'])
+
+        actual.write_bytes(expected.replace(row, b'2002\t129\t108\t26.01\t', 1))
+        result, rows = self.check('78')
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertEqual(rows[0]['status'], 'mismatch')
+
     def test_unsuccessful_execution_never_passes_matching_output(self):
         Path("/tmp/mydb").mkdir(parents=True, exist_ok=True)
         with tempfile.TemporaryDirectory(dir="/tmp/mydb") as directory:

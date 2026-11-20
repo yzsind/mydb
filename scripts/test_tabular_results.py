@@ -6,7 +6,7 @@ import sys
 import tempfile
 import unittest
 
-from _tabular_results import canonicalize, normalize_cell, query_numbers
+from _tabular_results import canonicalize, normalize_cell, query_numbers, results_match
 
 
 class TabularTests(unittest.TestCase):
@@ -81,6 +81,27 @@ class TabularTests(unittest.TestCase):
             with self.subTest(value=value), self.assertRaises(ValueError):
                 self.result(value + '\n', contract=contract)
 
+    def test_float_tolerance_is_relative_and_preserves_other_values_and_row_order(self):
+        contract = {'columns': ['text', 'decimal', 'integer', 'float'],
+                    'float_relative_tolerance': 1e-14, 'null_marker': 'NULL'}
+        expected = self.result('001\t26.00\t3\t39.645413178425954\n'
+                               '002\t2.0\t4\t1e-20\n', contract=contract)
+        first = '001\t26.0\t3\t39.6454131784259567945497\n'
+        second = '002\t2.00\t4\t1.000000000000001e-20\n'
+        actual = self.result(first + second, contract=contract)
+        self.assertTrue(results_match(expected, actual, contract))
+        self.assertNotEqual(expected.digest, actual.digest)
+
+        for changed in (first.replace('001', '1') + second,
+                        first.replace('26.0', '26.01') + second,
+                        first.replace('\t3\t', '\t2\t') + second,
+                        first + second.replace('1.000000000000001e-20', '1.01e-20'),
+                        first + second.replace('1.000000000000001e-20', '0'),
+                        first + second.replace('1.000000000000001e-20', 'NULL'),
+                        second + first, first):
+            with self.subTest(changed=changed):
+                self.assertFalse(results_match(expected, self.result(changed, contract=contract), contract))
+
     def test_lossy_fixture_precision_and_text_trimming_require_explicit_options(self):
         contract = {'columns': ['text', 'decimal', 'integer'],
                     'trim_text': True, 'decimal_places': 4}
@@ -116,6 +137,11 @@ class TabularTests(unittest.TestCase):
                          {'columns': ['decimal'], 'decimal_places': 1.5},
                          {'format': 'typed-json', 'trim_text': True},
                          {'format': 'typed-json', 'decimal_places': 4},
+                         {'columns': ['decimal'], 'float_relative_tolerance': 1e-14},
+                         {'columns': ['float'], 'float_relative_tolerance': True},
+                         {'columns': ['float'], 'float_relative_tolerance': 0},
+                         {'columns': ['float'], 'float_relative_tolerance': float('nan')},
+                         {'columns': ['float'], 'float_relative_tolerance': 1e-14, 'order_keys': [0]},
                          {'result_sets': []}, {'result_sets': 'invalid'},
                          {'result_sets': [None]},
                          {'result_sets': [{'columns': ['text']}]},

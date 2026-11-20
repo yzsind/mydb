@@ -24,7 +24,7 @@ select  i_item_id,
        d_year = 2000 and
        ca_state in ('OK','TX','MS'
                    ,'MO','WI','MI','TN')
- group by rollup(i_item_id, ca_country, ca_state, ca_county)
+ group by rollup(i_item_id, ca_country, ca_state, ca_county) having count(*) > 0
  order by ca_country,
         ca_state,
         ca_county,

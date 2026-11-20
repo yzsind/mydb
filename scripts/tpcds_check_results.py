@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Compare TPC-DS query output against externally-generated expected result sets.
 
-TSV values and row order are exact by default. Explicit per-query comparison
-contracts may normalize declared numeric columns and reorder only ORDER BY ties.
+TSV values and row order are exact by default. Per-query contracts can normalize
+numeric columns, compare approximate values within tolerance, or match ORDER BY ties.
 """
 
 from __future__ import annotations
@@ -14,10 +14,10 @@ from pathlib import Path
 
 
 try:
-    from ._tabular_results import CanonicalResult, comparison_contracts, query_numbers, write_csv
+    from ._tabular_results import CanonicalResult, comparison_contracts, query_numbers, results_match, write_csv
     from ._tabular_results import canonicalize as _canonicalize
 except ImportError:
-    from _tabular_results import CanonicalResult, comparison_contracts, query_numbers, write_csv
+    from _tabular_results import CanonicalResult, comparison_contracts, query_numbers, results_match, write_csv
     from _tabular_results import canonicalize as _canonicalize
 
 
@@ -88,10 +88,9 @@ def main() -> int:
                 except (OSError, ValueError) as error:
                     status = "invalid_actual"
                     message = str(error)
-            if status == "ok":
-                if expected.rows != actual.rows or expected.metadata != actual.metadata:
-                    status = "mismatch"
-                    message = "canonical rows differ"
+            if status == "ok" and not results_match(expected, actual, contract):
+                status = "mismatch"
+                message = "canonical rows differ"
 
         if status != "ok":
             failed = True

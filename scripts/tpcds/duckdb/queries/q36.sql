@@ -20,7 +20,7 @@ select
  and s_store_sk  = ss_store_sk
  and s_state in ('TN','TN','TN','TN',
                  'TN','TN','TN','TN')
- group by rollup(i_category,i_class)
+ group by rollup(i_category,i_class) having count(*) > 0
  order by
    lochierarchy desc
   ,case when (grouping(i_category)+grouping(i_class)) = 0 then i_category end

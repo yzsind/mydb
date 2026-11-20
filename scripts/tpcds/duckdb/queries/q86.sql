@@ -16,7 +16,7 @@ select
     d1.d_month_seq between 1176 and 1176+11
  and d1.d_date_sk = ws_sold_date_sk
  and i_item_sk  = ws_item_sk
- group by rollup(i_category,i_class)
+ group by rollup(i_category,i_class) having count(*) > 0
  order by
    lochierarchy desc,
    case when (grouping(i_category)+grouping(i_class)) = 0 then i_category end,

@@ -13,6 +13,6 @@ select  i_product_name
        group by rollup(i_product_name
                        ,i_brand
                        ,i_class
-                       ,i_category)
+                       ,i_category) having count(*) > 0
 order by qoh, i_product_name, i_brand, i_class, i_category
 limit 100;

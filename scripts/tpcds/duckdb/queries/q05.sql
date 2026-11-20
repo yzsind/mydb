@@ -120,7 +120,7 @@ with ssr as
         , (profit - profit_loss) as profit
  from   wsr
  ) x
- group by rollup(channel, id)
+ group by rollup(channel, id) having count(*) > 0
  order by channel
          ,id
  limit 100;
