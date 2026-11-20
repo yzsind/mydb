@@ -2,6 +2,12 @@
 pub(super) struct CatalogManager {
     row_security: crate::engine::rls::CatalogStore,
     live: RwLock<Catalog>,
+    // Serialize logical writers independently of reader-visible memory.
+    // A durable publication retains this reservation across I/O, but only
+    // takes `admission` and `live` while validating or replacing memory.
+    publication: parking_lot::ReentrantMutex<()>,
+    admission: crate::util::catalog_admission::CatalogAdmission,
+    pending: arc_swap::ArcSwapOption<TableSchema>,
     /// Stable object/storage id -> normalized table key.  This is the small
     /// startup-resident object-header index; child descriptors remain lazy.
     table_keys_by_id: RwLock<HashMap<u64, String>>,
@@ -117,6 +123,9 @@ impl CatalogManager {
             resident_bytes,
         )?;
         Ok(Self {
+            publication: parking_lot::ReentrantMutex::new(()),
+            admission: crate::util::catalog_admission::CatalogAdmission::default(),
+            pending: arc_swap::ArcSwapOption::empty(),
             row_security,
             live: RwLock::new(catalog),
             table_keys_by_id: RwLock::new(table_keys_by_id),
@@ -246,6 +255,8 @@ impl CatalogManager {
 
     fn replace_live(&self, catalog: Catalog) -> Result<(), QueryError> {
         self.row_security.reset(catalog.tables.values())?;
+        let _publication = self.publication.lock();
+        let _admission = self.admission.write();
         let resident_bytes = Self::catalog_header_bytes(&catalog);
         {
             let mut charge = self.resident_charge.lock().map_err(|_| {
@@ -393,6 +404,14 @@ impl CatalogManager {
     }
 
     fn install_descriptor(&self, key: String, table: Arc<TableSchema>) {
+        // Cache installation is optional. Never wait behind a durable logical
+        // publication while holding cache/header latches or a reactor permit.
+        let publication = self.publication.try_lock();
+        if publication.is_none()
+            && self.pending.load().as_ref().is_none_or(|pending| pending.id == table.id)
+        {
+            return;
+        }
         let bytes = Self::descriptor_bytes(&table);
         let limit = self.cache_limit_bytes();
         let Ok(mut headers) = self.table_headers.write() else {
@@ -409,11 +428,22 @@ impl CatalogManager {
         let Ok(mut catalog) = self.live.write() else {
             return;
         };
+        // The reservation is global, but a durable statistics update owns just
+        // one descriptor. The live latch serializes this check with the start
+        // of a new publication and with the final descriptor swap.
+        let pending = self.pending.load();
+        let pending_id = pending.as_ref().map(|table| table.id);
+        let current = catalog.tables.get(&key);
+        if publication.is_none()
+            && (pending_id.is_none() || pending_id == Some(table.id) || current.is_none())
+        {
+            return;
+        }
         // A read-compatible DDL can publish while a cold reader decodes the
         // previous DD row outside the catalog latch. That reader may retain
         // its old immutable descriptor, but must never reinstall it over a
         // newer capture/public definition (which would lose index maintenance).
-        if catalog.tables.get(&key).is_some_and(|current| {
+        if current.is_some_and(|current| {
             current.id != table.id || current.schema_version > table.schema_version
         }) {
             return;
@@ -439,6 +469,7 @@ impl CatalogManager {
             catalog.tables.insert(key, table);
             return;
         }
+        let mut pending_victim = None;
         while cache.bytes.saturating_add(bytes) > limit {
             let Some((victim_key, generation)) = cache.order.pop_front() else {
                 break;
@@ -449,12 +480,14 @@ impl CatalogManager {
             if generation != entry.generation {
                 continue;
             }
-            if catalog
-                .tables
-                .get(&victim_key)
-                .is_some_and(|t| self.descriptor_is_pinned(t.id))
-            {
-                continue;
+            if let Some(victim) = catalog.tables.get(&victim_key) {
+                if pending_id == Some(victim.id) {
+                    pending_victim = Some((victim_key, generation));
+                    continue;
+                }
+                if self.descriptor_is_pinned(victim.id) {
+                    continue;
+                }
             }
             let victim = cache.entries.remove(&victim_key).expect("entry checked");
             cache.bytes = cache.bytes.saturating_sub(victim.bytes);
@@ -464,6 +497,9 @@ impl CatalogManager {
             if let Some(header) = headers.get(&victim_key).cloned() {
                 catalog.tables.insert(victim_key, header);
             }
+        }
+        if let Some(entry) = pending_victim {
+            cache.order.push_front(entry);
         }
         if bytes > limit || cache.bytes.saturating_add(bytes) > limit {
             if let Some(header) = headers.get(&key).cloned() {
@@ -563,8 +599,18 @@ impl CatalogManager {
         self.live.read()
     }
 
-    fn write(&self) -> std::sync::LockResult<RwLockWriteGuard<'_, Catalog>> {
-        self.live.write()
+    fn write(&self) -> std::sync::LockResult<CatalogWriteGuard<'_>> {
+        let publication = self.publication.lock();
+        let admission = self.admission.write();
+        let wrap = |live| CatalogWriteGuard {
+            live,
+            _admission: admission,
+            _publication: publication,
+        };
+        match self.live.write() {
+            Ok(live) => Ok(wrap(live)),
+            Err(err) => Err(std::sync::PoisonError::new(wrap(err.into_inner()))),
+        }
     }
 
     fn publish(&self) {
@@ -586,6 +632,45 @@ impl CatalogManager {
     fn highwater_target(next_id: u64) -> u64 {
         const BLOCK: u64 = 1024;
         next_id.saturating_add(BLOCK - 1) / BLOCK * BLOCK
+    }
+}
+
+struct CatalogWriteGuard<'a> {
+    live: RwLockWriteGuard<'a, Catalog>,
+    _admission: crate::util::catalog_admission::CatalogWritePermit<'a>,
+    _publication: parking_lot::ReentrantMutexGuard<'a, ()>,
+}
+
+/// Clear the old descriptor before releasing the logical writer reservation.
+struct CatalogPendingPublication<'a> {
+    catalog: &'a CatalogManager,
+    _writer: parking_lot::ReentrantMutexGuard<'a, ()>,
+}
+
+impl Drop for CatalogPendingPublication<'_> {
+    fn drop(&mut self) {
+        self.catalog.pending.store(None);
+    }
+}
+
+struct StatisticsPublicationMdl<'a>(&'a Database, u64);
+
+impl Drop for StatisticsPublicationMdl<'_> {
+    fn drop(&mut self) {
+        self.0.release_mdl_owner(self.1);
+    }
+}
+
+impl std::ops::Deref for CatalogWriteGuard<'_> {
+    type Target = Catalog;
+    fn deref(&self) -> &Catalog {
+        &self.live
+    }
+}
+
+impl std::ops::DerefMut for CatalogWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Catalog {
+        &mut self.live
     }
 }
 
@@ -861,6 +946,13 @@ impl<'a> CatalogTxn<'a> {
             for replacement in &self.replacements {
                 let (changed, inserted) =
                     self.db.apply_catalog_row_replacement(txn, replacement)?;
+                #[cfg(test)]
+                if self.defer_table_publication {
+                    let hook = STATS_PUBLICATION_HOOK.with(|slot| slot.borrow_mut().take());
+                    if let Some(hook) = hook {
+                        hook.pause();
+                    }
+                }
                 mutation_rows = mutation_rows.saturating_add(changed as u64);
                 #[cfg(test)]
                 if self.defer_table_publication && STATS_CRASH_POINT.with(|p| p.get()) == 1 {
@@ -958,6 +1050,10 @@ impl<'a> CatalogTxn<'a> {
 }
 
 impl Database {
+    pub(crate) fn catalog_admission(&self) -> &crate::util::catalog_admission::CatalogAdmission {
+        &self.catalog.admission
+    }
+
     pub(crate) fn set_password_validation_component(
         &self,
         installed: bool,
@@ -1765,11 +1861,41 @@ impl Database {
             .map(|_| ())
     }
 
+    fn reserve_stats_publication(
+        &self,
+        key: &str,
+        expected: &TableSchema,
+        skip_pinned: bool,
+    ) -> Result<Option<CatalogPendingPublication<'_>>, QueryError> {
+        let writer = self.catalog.publication.lock();
+        let live = self.catalog_read()?;
+        if skip_pinned && self.catalog.descriptor_is_pinned(expected.id) {
+            return Ok(None);
+        }
+        let current = live.tables.get(key).ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                "table disappeared during ANALYZE",
+            )
+        })?;
+        if current.id != expected.id || current.schema_version != expected.schema_version {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_DEF_CHANGED,
+                "table changed during ANALYZE; retry",
+            ));
+        }
+        self.catalog.pending.store(Some(Arc::new(expected.clone())));
+        Ok(Some(CatalogPendingPublication {
+            catalog: &self.catalog,
+            _writer: writer,
+        }))
+    }
+
     fn publish_stats_candidate_checked(
         &self,
         expected: &TableSchema,
         mut candidate: TableSchema,
-        skip_online: bool,
+        background_analyze: bool,
     ) -> Result<bool, QueryError> {
         use crate::storage::data_dictionary::{
             dd_rows_for_table, validate_persisted_layouts, DD_STATS_TABLES, DD_TABLES,
@@ -1785,8 +1911,33 @@ impl Database {
         let rows = dd_rows_for_table(&candidate)?;
         let previous = dd_rows_for_table(expected)?;
         let _candidate_charge = crate::engine::executor::mem_budget::force_charge_scoped(
-            CatalogManager::descriptor_bytes(&candidate),
+            CatalogManager::descriptor_bytes(&candidate)
+                .saturating_add(CatalogManager::descriptor_bytes(expected)),
         )?;
+        // Background analysis has no SQL statement MDL owner. Reserve the
+        // definition before entering the catalog writer lane, just like SQL
+        // DDL, while remaining compatible with ordinary reads and writes.
+        // Never queue optional maintenance behind an in-flight DDL.
+        let mdl = if background_analyze {
+            let owner = crate::storage::mdl::allocate_internal_owner()?;
+            let guard = StatisticsPublicationMdl(self, owner);
+            match self.acquire_mdl(
+                owner,
+                None,
+                MdlDuration::Statement,
+                vec![MdlRequest {
+                    key: MdlObjectKey::table(&expected.database, &expected.name),
+                    lock_type: MdlLockType::SharedUpgradable,
+                }],
+                "statistics/publication",
+            ) {
+                Ok(()) => Some(guard),
+                Err(err) if is_lock_wait_pending_error(&err) => return Ok(false),
+                Err(err) => return Err(err),
+            }
+        } else {
+            None
+        };
         let security_publication = if candidate.row_security.version != expected.row_security.version {
             self.catalog.row_security.prepare(
                 vec![(candidate.object_id, Some((candidate.id, candidate.row_security.clone())))],
@@ -1797,22 +1948,9 @@ impl Database {
             )?
         } else { None };
         let key = expected.qualified_name();
-        let mut catalog = self.catalog_write()?;
-        if skip_online && self.catalog.online_pinned_ids.read().contains(&expected.id) {
+        let Some(publication) = self.reserve_stats_publication(&key, expected, background_analyze)? else {
             return Ok(false);
-        }
-        let current = catalog.tables.get(&key).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_TABLE_DEF_CHANGED,
-                "table disappeared during ANALYZE",
-            )
-        })?;
-        if current.id != expected.id || current.schema_version != expected.schema_version {
-            return Err(error(
-                crate::error::catalog::ER_TABLE_DEF_CHANGED,
-                "table changed during ANALYZE; retry",
-            ));
-        }
+        };
         #[cfg(test)]
         if DDL_CATALOG_COMMIT_FAILURE.with(|fail| fail.replace(false)) {
             return Err(error(
@@ -1888,6 +2026,13 @@ impl Database {
         if STATS_CRASH_POINT.with(|p| p.get()) == 2 {
             std::process::exit(0);
         }
+        #[cfg(test)]
+        if let Some(hook) = STATS_AFTER_COMMIT_HOOK.with(|slot| slot.borrow_mut().take()) {
+            hook.pause();
+        }
+        // Publish the descriptor and its folded counters under one memory
+        // latch, after durability, while the writer reservation is still held.
+        let mut catalog = self.catalog_write()?;
         if candidate.stats.analyze_revision != expected.stats.analyze_revision {
             if let Some(counter) = self.table_live_row_deltas.read().get(&expected.id) {
                 counter.fetch_sub(
@@ -1902,10 +2047,14 @@ impl Database {
                 );
             }
         }
+        // The reservation excludes logical writers and cache changes to this
+        // descriptor throughout the durable transaction.
         catalog.tables.insert(key.clone(), Arc::new(candidate));
         if let Some(publication) = security_publication { publication.publish(); }
         drop(catalog);
         self.catalog.publish_table_deltas(&[expected.id]);
+        drop(publication);
+        drop(mdl);
         // Commit maintenance may resolve table descriptors, so run it only
         // after releasing the statistics publication latch.
         self.drain_vector_purges();
@@ -2032,6 +2181,13 @@ impl Database {
         &self,
         table_id: u64,
     ) -> Result<Option<Arc<TableSchema>>, QueryError> {
+        // Cold readers must see the same pre-publication revision as hot
+        // readers, even after DD commit and before the memory swap. Recheck
+        // after decoding to cover a publication that began during page-in.
+        let pending = || self.catalog.pending.load_full().filter(|table| table.id == table_id);
+        if let Some(table) = pending() {
+            return Ok(Some(table));
+        }
         if let Some(pin) = self.online_index_descriptors.read().get(&table_id) {
             return Ok(Some(pin.schema.clone()));
         }
@@ -2052,7 +2208,7 @@ impl Database {
             }
         }
         crate::storage::schema::build_fk_runtime(&mut graph);
-        Ok(graph.tables.remove(&parent_key))
+        Ok(pending().or_else(|| graph.tables.remove(&parent_key)))
     }
 
     fn decode_table_descriptor_rows(
@@ -2415,6 +2571,10 @@ thread_local! {
     static CATALOG_MUTATIONS: RefCell<HashSet<CatalogMutation>> = RefCell::new(HashSet::new());
     #[cfg(test)]
     static STATS_FAIL_AFTER_DD_ROWS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    #[cfg(test)]
+    static STATS_PUBLICATION_HOOK: RefCell<Option<Arc<DdlBackfillTestHook>>> = const { RefCell::new(None) };
+    #[cfg(test)]
+    static STATS_AFTER_COMMIT_HOOK: RefCell<Option<Arc<DdlBackfillTestHook>>> = const { RefCell::new(None) };
     #[cfg(test)]
     static STATS_CRASH_POINT: std::cell::Cell<u8> = const { std::cell::Cell::new(0) };
 }

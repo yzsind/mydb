@@ -3,7 +3,7 @@
 //! Previously all four mapped to FlushNoOp and returned Ok(QueryResponse::Ok),
 //! accepting syntax without effects. These tests establish MySQL 8.0-compatible behavior:
 //!
-//! FLUSH HOSTS resets per-account failed_login_count and account locks.
+//! FLUSH HOSTS leaves failed-login locks alone; FLUSH PRIVILEGES resets them.
 //! FLUSH STATUS resets Aborted_connects and Aborted_clients.
 //! FLUSH TABLES invokes db.flush_dirty_data for buffer pool and WAL flush.
 //! FLUSH TABLES t1,t2 validates names; missing tables return 1146.
@@ -41,10 +41,19 @@ fn flush_hosts_resets_failed_login_counts() {
         QueryResponse::Ok
     ));
 
-    // After FLUSH HOSTS, the temporary lock / failure budget is cleared.
+    // MySQL 8.0 FLUSH HOSTS only clears the host cache: account password
+    // locks must survive it, while FLUSH PRIVILEGES resets them.
+    assert!(
+        crate::engine::auth::failed_login_active_lock(&key, now).is_some(),
+        "FLUSH HOSTS must not lift FAILED_LOGIN_ATTEMPTS locks"
+    );
+    assert!(matches!(
+        exec(&engine, &mut session, "FLUSH PRIVILEGES").unwrap(),
+        QueryResponse::Ok
+    ));
     assert!(
         crate::engine::auth::failed_login_active_lock(&key, now).is_none(),
-        "FLUSH HOSTS must reset the failed-login budget"
+        "FLUSH PRIVILEGES reloads accounts and resets the failed-login budget"
     );
 }
 

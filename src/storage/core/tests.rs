@@ -297,6 +297,41 @@ fn engine_monitor_wait_metrics_use_live_row_and_table_shards() {
 }
 
 #[test]
+fn audit_1119_batch_row_lock_grant_clears_resolved_wait_edge() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_memory_test_db(dir.path());
+    let owner = db.begin_txn().unwrap().txn_id;
+    let waiter = db.begin_txn().unwrap().txn_id;
+    let busy = RowId {
+        page_id: 7,
+        slot_id: 0,
+    };
+    let free = RowId {
+        page_id: 7,
+        slot_id: 1,
+    };
+    db.lock_rows_blocking_mode(owner, 77, vec![busy], LockMode::Exclusive)
+        .unwrap();
+    // The waiter conflicts on `busy` and leaves a global wait edge behind.
+    let conflict = if row_lock_sharding_enabled() {
+        db.row_lock_acquire_sharded(waiter, 77, busy, LockMode::Exclusive, true)
+    } else {
+        db.lock_manager()
+            .acquire_row_lock_with_mode(waiter, 77, busy, LockMode::Exclusive, true)
+    };
+    assert_eq!(conflict.unwrap_err().code(), 1205);
+    assert!(db.lock_manager_read().waits_for.contains_key(&waiter));
+    // A later batch grant on unrelated rows resolves that wait. The edge must
+    // not survive, or it can close a phantom deadlock cycle through `owner`.
+    db.lock_rows_blocking_mode(waiter, 77, vec![free], LockMode::Exclusive)
+        .unwrap();
+    assert!(!db.lock_manager_read().waits_for.contains_key(&waiter));
+    for txn in [owner, waiter] {
+        db.rollback_txn(txn).unwrap();
+    }
+}
+
+#[test]
 fn memory_index_mutations_do_not_reencode_resident_leaf_for_each_entry() {
     for kind in 0..8 {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();

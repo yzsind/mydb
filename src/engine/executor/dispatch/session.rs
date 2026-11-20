@@ -23,23 +23,56 @@ pub(in crate::engine::executor) fn ensure_xa_statement_allowed(
     session: &SessionContext,
     statement: &Statement,
 ) -> Result<(), QueryError> {
-    if session
-        .xa_branch
-        .as_ref()
-        .is_some_and(|b| b.state == crate::xa::XaBranchState::Idle)
-        && !matches!(
-            statement,
-            Statement::XaStart { .. }
-                | Statement::XaEnd { .. }
-                | Statement::XaPrepare { .. }
-                | Statement::XaCommit { .. }
-                | Statement::XaRollback { .. }
-                | Statement::XaRecover { .. }
-        )
-    {
+    let Some(branch) = session.xa_branch.as_ref() else {
+        return Ok(());
+    };
+    if branch.state == crate::xa::XaBranchState::Active {
+        return Ok(());
+    }
+    let xa = matches!(
+        statement,
+        Statement::XaStart { .. }
+            | Statement::XaEnd { .. }
+            | Statement::XaPrepare { .. }
+            | Statement::XaCommit { .. }
+            | Statement::XaRollback { .. }
+            | Statement::XaRecover { .. }
+    );
+    let allowed = xa || matches!(statement, Statement::UseDatabase(_)) || {
+        // Walk nested query scopes as well: a table-free outer SELECT may
+        // contain a scalar subquery that opens a transaction.
+        struct TableAccess(bool);
+        impl crate::parser::visit::AstVisitor for TableAccess {
+            fn enter_select(&mut self, select: &crate::parser::Select) {
+                self.0 |=
+                    select.table.is_some() || !select.from.is_empty() || !select.joins.is_empty();
+            }
+        }
+        let mut access = TableAccess(false);
+        crate::parser::visit::visit_statement(&mut access, statement);
+        matches!(statement, Statement::Select(_) | Statement::SetOperation(_)) && !access.0
+    };
+    if !allowed {
+        // A server-rolled-back branch reports its rollback cause for work that
+        // would open tables; transaction control keeps the XAER_RMFAIL contract.
+        if branch.state == crate::xa::XaBranchState::RollbackOnly
+            && !matches!(
+                statement,
+                Statement::Begin { .. }
+                    | Statement::Commit { .. }
+                    | Statement::Rollback { .. }
+                    | Statement::Savepoint(_)
+                    | Statement::RollbackToSavepoint(_)
+                    | Statement::ReleaseSavepoint(_)
+                    | Statement::SetAutocommit(_)
+            )
+        {
+            return Err(crate::error::catalog::ER_XA_RBDEADLOCK
+                .error("Transaction branch was rolled back: deadlock was detected"));
+        }
         return Err(error(
             crate::error::catalog::ER_XAER_RMFAIL,
-            "XAER_RMFAIL: XA branch is IDLE",
+            format!("XAER_RMFAIL: XA branch is {}", branch.state.as_str()),
         ));
     }
     Ok(())

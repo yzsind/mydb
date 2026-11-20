@@ -20,7 +20,7 @@ use crate::types::QueryError;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use serde::Serialize;
@@ -34,6 +34,9 @@ pub struct AuditLogService {
     path: PathBuf,
     file: Mutex<File>,
     enabled: AtomicBool,
+    /// Events that could not be serialized or written. Auditing stays
+    /// fail-open, but the loss is counted and reported instead of silent.
+    dropped: AtomicU64,
 }
 
 impl AuditLogService {
@@ -45,15 +48,23 @@ impl AuditLogService {
             std::fs::create_dir_all(parent)
                 .map_err(|err| crate::util::io_error::map_io_error("audit log open", err))?;
         }
-        let file = OpenOptions::new()
-            .create(true)
-            .append(true)
+        let mut options = OpenOptions::new();
+        options.create(true).append(true);
+        // The stream contains every statement; keep it private to the server
+        // account regardless of the process umask.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options
             .open(&path)
             .map_err(|err| crate::util::io_error::map_io_error("audit log open", err))?;
         Ok(Self {
             path,
             file: Mutex::new(file),
             enabled: AtomicBool::new(true),
+            dropped: AtomicU64::new(0),
         })
     }
 
@@ -61,12 +72,22 @@ impl AuditLogService {
         if !self.enabled.load(Ordering::Acquire) {
             return;
         }
-        let Ok(json) = serde_json::to_string(row) else {
-            return;
-        };
-        if let Ok(mut file) = self.file.lock() {
-            let _ = writeln!(file, "{json}");
+        let written = serde_json::to_string(row).ok().is_some_and(|json| {
+            self.file
+                .lock()
+                .is_ok_and(|mut file| writeln!(file, "{json}").is_ok())
+        });
+        if !written && self.dropped.fetch_add(1, Ordering::Relaxed) == 0 {
+            eprintln!(
+                "audit log: failed to write to {}; further failures are counted silently",
+                self.path.display()
+            );
         }
+    }
+
+    /// Number of audit events lost to serialization or write failures.
+    pub fn dropped_events(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 
     pub fn path(&self) -> &Path {
@@ -198,6 +219,9 @@ pub fn record_statement(
         error_message: err.map(|e| {
             if crate::engine::ai::sql::sql_may_have_ai(sql) || crate::engine::http::sensitive(sql) {
                 crate::engine::http::redaction_marker(sql, true)
+            } else if crate::engine::logging::is_credential_statement(sql) {
+                // Parse errors echo the offending token of a credential clause.
+                "[redacted credential statement error]"
             } else {
                 e.message()
             }

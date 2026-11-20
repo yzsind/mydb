@@ -1,5 +1,6 @@
 pub mod blocking_pool;
 pub mod cache_pad;
+pub mod catalog_admission;
 pub mod coarse_clock;
 pub mod connection_dispatch;
 pub mod decimal;

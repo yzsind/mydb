@@ -1,9 +1,10 @@
 //! Persistent recovery space and live write admission for a data volume.
 
 use crate::error::catalog::{ER_DISK_FULL_NOWAIT, ER_WRONG_VALUE};
+use crate::platform::file::OpenOptions;
 use crate::types::QueryError;
 use parking_lot::{Mutex, MutexGuard};
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};

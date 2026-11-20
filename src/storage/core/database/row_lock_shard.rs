@@ -690,14 +690,16 @@ impl ShardedRowLocks {
     /// grantable (free + un-queued, or already-share-compatible) under one
     /// pass, recording them as a single `Rows` log entry; return the rows that
     /// must fall through to per-row blocking. Mirrors
-    /// `LockManager::lock_rows_batch_nonblocking`.
+    /// `LockManager::lock_rows_batch_nonblocking`. The returned flag is true
+    /// when a grant resolved this txn's earlier wait, so the caller must drop
+    /// the stale global `waits_for` edge (legacy removes it unconditionally).
     pub(crate) fn lock_rows_batch_nonblocking(
         &self,
         txn_id: u64,
         table_id: u64,
         row_ids: &[RowId],
         mode: LockMode,
-    ) -> Vec<RowId> {
+    ) -> (Vec<RowId>, bool) {
         let mut acquired: Vec<RowId> = Vec::with_capacity(row_ids.len());
         let mut deferred: Vec<RowId> = Vec::new();
         for &row_id in row_ids {
@@ -728,17 +730,18 @@ impl ShardedRowLocks {
                 LockOwnerCheck::SelfHolds | LockOwnerCheck::Conflict(_) => deferred.push(row_id),
             }
         }
+        let mut cleared_wait = false;
         if !acquired.is_empty() {
             let stale = {
                 let mut map = self.txn_shard(txn_id).lock();
                 let entry = map.entry(txn_id).or_default();
-                entry.waiting = false;
+                cleared_wait = std::mem::take(&mut entry.waiting);
                 entry.log.push(HeldLock::Rows(table_id, acquired));
                 entry.waiting_on.take()
             };
             self.dequeue_stale_wait(txn_id, stale, None);
         }
-        deferred
+        (deferred, cleared_wait)
     }
 
     /// Snapshot all granted row locks for the `data_locks` view.
@@ -1091,9 +1094,15 @@ impl Database {
                 ));
             }
         }
-        Ok(self
+        let (deferred, cleared_wait) = self
             .row_locks_sharded
-            .lock_rows_batch_nonblocking(txn_id, table_id, row_ids, mode))
+            .lock_rows_batch_nonblocking(txn_id, table_id, row_ids, mode);
+        if cleared_wait {
+            // The batch grant resolved a prior wait: a surviving global edge
+            // could close a phantom cycle through a still-active owner.
+            self.lock_manager().clear_wait(txn_id);
+        }
+        Ok(deferred)
     }
 }
 
@@ -1174,6 +1183,7 @@ mod audit_reinstate_tests {
         let second = RowId::new(1, 2);
         assert!(locks
             .lock_rows_batch_nonblocking(1, 9, &[first, second], LockMode::Shared)
+            .0
             .is_empty());
         assert_eq!(locks.prepared_rows_for_txn(1).len(), 2);
         assert!(locks
@@ -1207,6 +1217,7 @@ mod audit_reinstate_tests {
         ));
         assert!(locks
             .lock_rows_batch_nonblocking(2, 9, &[other], LockMode::Exclusive)
+            .0
             .is_empty());
         locks.release_txn(2);
         locks.release_txn(1);

@@ -326,33 +326,47 @@ pub(crate) fn register(reg: &mut Registry) {
     // mysqldump's default header is `SET @@SESSION.SQL_LOG_BIN=0`; honour
     // it so loading a dump back doesn't re-replicate every row through
     // any downstream replica.
-    reg.register(SysVar::settable(
-        SysVarDef::new("sql_log_bin", Scope::Session, DataType::Bool)
-            .with_access(Access::SuperReadWrite)
-            .with_doc(
-                "Whether this session's row changes are written to the binary log. \
+    reg.register(
+        SysVar::settable(
+            SysVarDef::new("sql_log_bin", Scope::Session, DataType::Bool)
+                .with_access(Access::SuperReadWrite)
+                .with_doc(
+                    "Whether this session's row changes are written to the binary log. \
                  Default ON; set to OFF for bulk loads that should not propagate.",
-            ),
-        |ctx| match (ctx.session, ctx.scope) {
-            (Some(s), crate::engine::sysvar::meta::Scope::Session) => {
-                SysVarValue::Bool(s.sql_log_bin)
-            }
-            _ => SysVarValue::Bool(crate::engine::api::global_sql_log_bin()),
-        },
-        |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
-            let b = v.as_bool().unwrap_or(true);
-            match ctx.scope {
-                crate::engine::sysvar::meta::Scope::Session => {
-                    ctx.session.sql_log_bin = b;
+                ),
+            |ctx| match (ctx.session, ctx.scope) {
+                (Some(s), crate::engine::sysvar::meta::Scope::Session) => {
+                    SysVarValue::Bool(s.sql_log_bin)
                 }
-                crate::engine::sysvar::meta::Scope::Global => {
-                    crate::engine::api::set_global_sql_log_bin(b);
+                _ => SysVarValue::Bool(crate::engine::api::global_sql_log_bin()),
+            },
+            |ctx: &mut WriteCtx<'_>, v: SysVarValue| -> Result<(), QueryError> {
+                let b = v.as_bool().unwrap_or(true);
+                match ctx.scope {
+                    crate::engine::sysvar::meta::Scope::Session => {
+                        ctx.session.sql_log_bin = b;
+                    }
+                    crate::engine::sysvar::meta::Scope::Global => {
+                        crate::engine::api::set_global_sql_log_bin(b);
+                    }
+                    crate::engine::sysvar::meta::Scope::Both => unreachable!(),
                 }
-                crate::engine::sysvar::meta::Scope::Both => unreachable!(),
+                Ok(())
+            },
+        )
+        .with_validation(|ctx, _| {
+            if ctx
+                .session
+                .is_some_and(|s| s.in_transaction() || s.xa_branch.is_some())
+            {
+                return Err(
+                    crate::error::catalog::ER_INSIDE_TRANSACTION_PREVENTS_SWITCH_SQL_LOG_BIN
+                        .error("Cannot modify @@session.sql_log_bin inside a transaction"),
+                );
             }
             Ok(())
-        },
-    ));
+        }),
+    );
 }
 
 fn validate_binlog_set_context(name: &str, ctx: &ReadCtx<'_>) -> Result<(), QueryError> {

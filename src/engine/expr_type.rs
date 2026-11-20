@@ -2907,6 +2907,10 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     result.nullable = true;
                     result
                 }
+                "__SET_USER_VAR" => args
+                    .get(1)
+                    .map(|arg| infer_expr_type(arg, context))
+                    .unwrap_or_else(|| ExprType::new(Unknown, true)),
                 "CAST" => cast_type(
                     args,
                     args.first()

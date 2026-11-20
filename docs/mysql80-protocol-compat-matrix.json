@@ -1,6 +1,6 @@
 {
   "baseline": "MySQL Community Server 8.0.46",
-  "reviewed_at": "2026-11-18",
+  "reviewed_at": "2026-11-20",
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
@@ -52,7 +52,7 @@
     "source_sha256": {
       "src/mysql/protocol.rs": "5a948ad3535e087348a483e2d11d482bbb76488e5013aca6272b4fa9b873ab16",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "babdaf1bef90847da869d8816351a27a3769dd2a84b2cb49b70fcf9a2e23d732",
+      "src/mysql/session.rs": "85de3884aa014bdf80541f18bd006f622dba289e9b067c9f6dc9689edbfa2c30",
       "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023",
       "src/mysql/peer_monitor.rs": "0ea7dc6481c8bdd31dbafcaa86dfe81aa0212cc638cd0e4324843205d80187fc"
     },
@@ -67,7 +67,8 @@
       "src/binlog/audit_tests.rs",
       "src/engine/executor/tests/mysql80_compat_auth.rs",
       "src/mysql/session/disconnect_tests.rs",
-      "src/mysql/peer_monitor.rs"
+      "src/mysql/peer_monitor.rs",
+      "src/mysql/session.rs"
     ],
     "update_policy": "Review changed capability/command behavior, run relevant regressions, then refresh source hashes and reviewed_at together."
   }

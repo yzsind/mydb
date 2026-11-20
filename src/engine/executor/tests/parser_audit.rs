@@ -60,7 +60,7 @@ fn parser_audit_dml_values_and_no_silent_side_effects() {
     );
     assert_eq!(
         rows(&engine, &mut session, "SELECT @v, a FROM ctas"),
-        vec![vec![Value::Int(8), Value::String("8".into())]]
+        vec![vec![Value::Int(8), Value::Int(8)]]
     );
     run(&engine, &mut session, "SET @'a b'=9");
     assert_eq!(

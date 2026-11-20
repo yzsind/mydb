@@ -314,17 +314,15 @@ fn rollup_distinct_aggregates_merge_across_prefixes() {
 }
 
 #[test]
-fn grouped_empty_input_with_rollup_emits_grand_total_row_in_mysql80_shape() {
+fn grouped_empty_input_with_rollup_emits_no_rows_in_mysql80_shape() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     engine
         .execute("CREATE TABLE empty_sales (region INT, amount INT)")
         .unwrap();
 
-    // ROLLUP always includes the `()` grouping set; over an empty input MySQL
-    // 8.0 still emits that single grand-total row (verified against MySQL 9.6:
-    // `region=NULL, COUNT(*)=0, SUM(amount)=NULL, GROUPING(region)=1`), rather
-    // than returning no rows.
+    // Over an empty input there is no group to roll up, so MySQL 8.0.46 returns
+    // no rows at all (no `()` grand-total row), unlike an ungrouped aggregate.
     let rows = query_rows(
         &engine,
         "SELECT region, COUNT(*), SUM(amount), GROUPING(region) \
@@ -332,10 +330,7 @@ fn grouped_empty_input_with_rollup_emits_grand_total_row_in_mysql80_shape() {
          GROUP BY region WITH ROLLUP",
     );
 
-    assert_eq!(
-        rows,
-        vec![vec![Value::Null, Value::Int(0), Value::Null, Value::Int(1)]]
-    );
+    assert!(rows.is_empty(), "{rows:?}");
 }
 
 #[test]
@@ -557,6 +552,56 @@ fn grouping_sets_empty_set_on_empty_input_returns_single_group() {
     );
 
     assert_eq!(rows, vec![vec![Value::Int(0)]]);
+}
+
+#[test]
+fn native_grouping_empty_sets_preserve_totals_and_set_operation_nulls() {
+    use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
+
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE e (e ENUM('a','b'), g INT, v DECIMAL(10,2))")
+        .unwrap();
+    for mode in [VecMode::Off, VecMode::On] {
+        with_vec_mode(mode, || {
+            for grouping in ["ROLLUP(g)", "CUBE(g)", "GROUPING SETS ((g), ())"] {
+                let sql =
+                    format!("SELECT g, COUNT(*), SUM(v), GROUPING(g) FROM e GROUP BY {grouping}");
+                assert_eq!(
+                    query_rows(&engine, &sql),
+                    vec![vec![Value::Null, Value::Int(0), Value::Null, Value::Int(1)]],
+                    "{mode:?}: {sql}"
+                );
+            }
+            for expression in [
+                "LEAD(e) OVER ()",
+                "LAG(e) OVER ()",
+                "LEAST(e, NULL)",
+                "GREATEST(e, NULL)",
+                "IF(e='a', e, NULL)",
+                "COALESCE(e, NULL)",
+            ] {
+                let sql = format!("SELECT {expression} FROM e GROUP BY ROLLUP(e) EXCEPT SELECT 1");
+                assert_eq!(query_rows(&engine, &sql), vec![vec![Value::Null]], "{sql}");
+            }
+            assert_eq!(
+                query_rows(
+                    &engine,
+                    "SELECT COUNT(*) FROM e GROUP BY GROUPING SETS ((g), (), ())"
+                ),
+                vec![vec![Value::Int(0)], vec![Value::Int(0)]]
+            );
+            for sql in [
+                "SELECT g FROM e GROUP BY g, ROLLUP(v)",
+                "SELECT g FROM e GROUP BY GROUPING SETS ((g))",
+                "SELECT g FROM e GROUP BY ROLLUP(g) HAVING COUNT(*) > 0",
+                "SELECT g FROM e GROUP BY g WITH ROLLUP",
+            ] {
+                assert!(query_rows(&engine, sql).is_empty(), "{sql}");
+            }
+        });
+    }
 }
 
 #[test]

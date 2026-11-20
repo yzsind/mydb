@@ -38,6 +38,21 @@ fn oracle(program: &ExprProgram, batch: &Batch) -> Result<Vec<Value>, QueryError
         })
         .collect()
 }
+/// Temporal kernels may emit canonical text where the scalar evaluator keeps a
+/// typed value; both denote the same wire value, so compare their text.
+fn textual(value: Value) -> Value {
+    match value {
+        Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_) | Value::SmallString(_) => {
+            Value::String(crate::engine::expr::string_value(&value))
+        }
+        other => other,
+    }
+}
+
+fn textual_all(values: Vec<Value>) -> Vec<Value> {
+    values.into_iter().map(textual).collect()
+}
+
 fn parity(sql: &str, kind: ColumnType, values: Vec<Value>) {
     let (program, schema) = compile(sql, kind);
     let batch = Batch::new(schema, vec![ColumnVector::from_values(values)]);
@@ -50,7 +65,7 @@ fn parity(sql: &str, kind: ColumnType, values: Vec<Value>) {
         )
     });
     let actual: Vec<_> = (0..batch.num_rows()).map(|r| column.value_at(r)).collect();
-    assert_eq!(actual, expected, "{sql}");
+    assert_eq!(textual_all(actual), textual_all(expected), "{sql}");
 }
 
 #[test]
@@ -4003,8 +4018,8 @@ fn temporal_value_batches_match_scalar_values_nulls_and_selection() {
                 .try_eval_column(&batch)
                 .unwrap_or_else(|| panic!("declined {sql}"));
             assert_eq!(
-                (0..3).map(|row| output.value_at(row)).collect::<Vec<_>>(),
-                expected,
+                textual_all((0..3).map(|row| output.value_at(row)).collect::<Vec<_>>()),
+                textual_all(expected.clone()),
                 "{sql}"
             );
             let selected = batch.with_selection(
@@ -4012,7 +4027,11 @@ fn temporal_value_batches_match_scalar_values_nulls_and_selection() {
             );
             let output = program.try_eval_column(&selected).unwrap();
             for index in [2, 0] {
-                assert_eq!(output.value_at(index), expected[index], "{sql}");
+                assert_eq!(
+                    textual(output.value_at(index)),
+                    textual(expected[index].clone()),
+                    "{sql}"
+                );
             }
         }
     }
@@ -4079,7 +4098,11 @@ fn temporal_value_retained_bounds_admit_full_integer_batches() {
         assert_eq!(column.len(), 32768);
         let expected = oracle(&program, &batch).unwrap();
         for index in [0, 1, 100, 32767] {
-            assert_eq!(column.value_at(index), expected[index], "{sql}");
+            assert_eq!(
+                textual(column.value_at(index)),
+                textual(expected[index].clone()),
+                "{sql}"
+            );
         }
     }
 }

@@ -408,12 +408,29 @@ fn bulk_insert_x_hex_fastpath_matches_sqlparser_and_preserves_bytes() {
         "INSERT INTO t VALUES (X'F')",
         "INSERT INTO t VALUES (X'GG')",
         "INSERT INTO t VALUES (0x1234)",
-        "INSERT INTO t VALUES (_binary X'00')",
     ] {
         assert!(
             try_parse_bulk_insert(unsupported_fast_shape).is_none(),
             "must fall back: {unsupported_fast_shape}"
         );
+    }
+}
+
+#[test]
+fn bulk_insert_binary_introducer_fastpath_matches_sqlparser() {
+    for sql in [
+        "INSERT INTO t VALUES (1, _binary X'00ff')",
+        "INSERT INTO t VALUES (1, _BINARY\tx'6162')",
+    ] {
+        let fast = try_parse_bulk_insert(sql).expect("_binary X'..' should use fast path");
+        let slow = parse_statement_via_sqlparser(sql).expect("canonical parser");
+        assert_eq!(fast, slow, "{sql}");
+    }
+    for sql in [
+        "INSERT INTO t VALUES (_binary'00')",
+        "INSERT INTO t VALUES (_binaryX'00')",
+    ] {
+        assert!(try_parse_bulk_insert(sql).is_none(), "{sql}");
     }
 }
 
@@ -2003,7 +2020,7 @@ fn parses_rollup_cube_and_grouping_sets() {
     else {
         panic!("expected select");
     };
-    assert_eq!(select.group_by_modifier, GroupByModifier::Rollup);
+    assert_eq!(select.group_by_modifier, GroupByModifier::GroupingSets);
     assert_eq!(select.group_by.len(), 2);
     assert_eq!(select.grouping_sets, vec![vec![0, 1], vec![0], vec![]]);
 

@@ -323,13 +323,16 @@ fn final_1107_deadlock_rollback_releases_xa_binding() {
         )
         .unwrap();
     assert!(!engine.db_for_tests().is_txn_active(txn));
-    assert!(s.xa_branch.is_none());
+    // MySQL keeps the branch bound in ROLLBACK_ONLY: XA END reports the
+    // deadlock rollback (1614) and XA ROLLBACK releases the XID.
     assert_eq!(
         exec(&engine, &mut s, "XA END 'deadlock_branch'")
             .unwrap_err()
             .code(),
-        1399
+        1614
     );
+    exec(&engine, &mut s, "XA ROLLBACK 'deadlock_branch'").unwrap();
+    assert!(s.xa_branch.is_none());
     exec(&engine, &mut s, "XA START 'deadlock_branch'").unwrap();
     exec(&engine, &mut s, "XA END 'deadlock_branch'").unwrap();
     exec(&engine, &mut s, "XA ROLLBACK 'deadlock_branch'").unwrap();

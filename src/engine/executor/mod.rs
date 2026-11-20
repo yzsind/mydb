@@ -3738,6 +3738,9 @@ impl StorageQueryEngine {
 }
 
 impl QueryEngine for StorageQueryEngine {
+    fn catalog_admission(&self) -> Option<&crate::util::catalog_admission::CatalogAdmission> {
+        Some(self.db.catalog_admission())
+    }
     fn sql_may_call_http(&self, sql: &str) -> bool {
         crate::engine::http::may_call(&self.db, sql)
     }
@@ -6858,6 +6861,24 @@ impl StorageQueryEngine {
         // statement on the blocking pool.
         if crate::storage::is_lock_would_block_error(err) {
             return Ok(());
+        }
+        if is_transaction_rollback_error(err) {
+            if let Some(branch) = session
+                .xa_branch
+                .clone()
+                .filter(|branch| branch.state == crate::xa::XaBranchState::Active)
+            {
+                // A deadlock victim's storage transaction is rolled back and
+                // its locks released, but the XID stays bound as ROLLBACK ONLY
+                // so the transaction manager can still end it explicitly.
+                session.xa_branch = None;
+                let rolled_back = rollback_session_txn(&self.db, session);
+                session.xa_branch = Some(crate::xa::XaBranch {
+                    state: crate::xa::XaBranchState::RollbackOnly,
+                    ..branch
+                });
+                return rolled_back;
+            }
         }
         let orphaned_autocommit = session.autocommit
             && !session.explicit_txn

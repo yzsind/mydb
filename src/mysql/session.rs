@@ -88,7 +88,7 @@ macro_rules! begin_streaming_result {
     }};
 }
 
-async fn local_infile_cancelled(
+async fn wait_for_statement_cancellation(
     handle: Option<&SessionHandle>,
     token: Option<&crate::engine::cancel::QueryCancelToken>,
 ) {
@@ -1876,10 +1876,12 @@ where
                 // fallback plugin but defer credentials until AuthSwitchRequest.
                 // Do not verify that empty response or charge a failed login.
                 let deferred_auth = auth_response.is_empty() && client_plugin != advertised_plugin;
-                match self
-                    .engine
-                    .auth_plugin_for_user(&handshake.username, &client_host)
-                {
+                let account_plugin = {
+                    let _catalog = self.catalog_read_permit().await.map_err(io::Error::other)?;
+                    self.engine
+                        .auth_plugin_for_user(&handshake.username, &client_host)
+                };
+                match account_plugin {
                     Ok(Some(account_plugin))
                         if account_plugin != client_plugin || deferred_auth =>
                     {
@@ -1994,10 +1996,13 @@ where
                     }
                 }
                 if !database.is_empty() {
-                    if let Err(err) = self
-                        .engine
-                        .init_session_database(&mut self.context, database)
-                    {
+                    let initialized = {
+                        let _catalog =
+                            self.catalog_read_permit().await.map_err(io::Error::other)?;
+                        self.engine
+                            .init_session_database(&mut self.context, database)
+                    };
+                    if let Err(err) = initialized {
                         // Use the *last* client packet's sequence id, not the
                         // initial handshake response's: after an AuthSwitch or
                         // caching_sha2 full-auth round-trip the sequence has
@@ -2133,9 +2138,11 @@ where
         caching_sha2_exchange: bool,
         last_sequence: &mut u8,
     ) -> Result<(crate::engine::auth::AuthOutcome, bool), QueryError> {
-        let result = self
-            .engine
-            .authenticate_request(self.auth_request(username, host, response, plugin));
+        let result = {
+            let _catalog = self.catalog_read_permit().await?;
+            self.engine
+                .authenticate_request(self.auth_request(username, host, response, plugin))
+        };
         match result {
             Ok(outcome) => Ok((outcome, false)),
             Err(err)
@@ -2282,6 +2289,7 @@ where
 
         // 5. Verify via the plaintext path (which charges failed_login
         //    on its own).
+        let _catalog = self.catalog_read_permit().await?;
         let auth_req = self.auth_request(username, client_host, &[], Some("caching_sha2_password"));
         self.engine.authenticate_with_plaintext_password(
             username,
@@ -2344,6 +2352,7 @@ where
         }
         let password =
             String::from_utf8(plain).map_err(|_| access_denied(username, client_host))?;
+        let _catalog = self.catalog_read_permit().await?;
         let request = self.auth_request(username, client_host, &[], Some("sha256_password"));
         self.engine
             .authenticate_with_plaintext_password(username, client_host, &password, &request)
@@ -2389,9 +2398,44 @@ where
         }
     }
 
-    fn sql_may_call_http(&self, sql: &str) -> bool {
+    async fn sql_may_call_http(&mut self, sql: &str) -> Result<bool, QueryError> {
+        let _catalog = self.catalog_read_permit().await?;
+        Ok(self.sql_may_call_http_admitted(sql))
+    }
+
+    fn sql_may_call_http_admitted(&self, sql: &str) -> bool {
         self.engine
             .sql_may_call_http(crate::engine::http::bound_sql(&self.context, sql))
+    }
+
+    fn try_catalog_read_permit(
+        &self,
+    ) -> Result<Option<crate::util::catalog_admission::CatalogReadPermit>, ()> {
+        self.engine
+            .catalog_admission()
+            .map_or(Ok(None), |admission| {
+                admission.try_read().map(Some).ok_or(())
+            })
+    }
+
+    async fn catalog_read_permit(
+        &mut self,
+    ) -> Result<Option<crate::util::catalog_admission::CatalogReadPermit>, QueryError> {
+        let Some(admission) = self.engine.catalog_admission() else {
+            return Ok(None);
+        };
+        if let Some(permit) = admission.try_read() {
+            return Ok(Some(permit));
+        }
+
+        // A blocked command must still release its session on KILL or disconnect.
+        tokio::select! {
+            biased;
+            _ = wait_for_statement_cancellation(self.handle.as_deref(), self.context.current_cancel_token()) => {
+                Err(crate::engine::cancel::interrupted_error())
+            }
+            permit = admission.read() => Ok(Some(permit)),
+        }
     }
 
     fn mark_busy(&self, command: &'static str, info: Option<String>) {
@@ -3154,18 +3198,25 @@ where
         let mut last_client_sequence_id = self.command_response_sequence.wrapping_sub(1);
         let advertised_plugin = crate::engine::auth::default_auth_plugin();
         let client_plugin = auth_plugin_name.as_deref().unwrap_or(&advertised_plugin);
-        match self
-            .engine
-            .auth_plugin_for_user(&request.username, &client_host)
-        {
+        let (account_plugin, has_password) = {
+            let _catalog = match self.catalog_read_permit().await {
+                Ok(permit) => permit,
+                Err(err) => return self.write_query_response(Err(err)).await,
+            };
+            (
+                self.engine
+                    .auth_plugin_for_user(&request.username, &client_host),
+                self.engine
+                    .auth_account_has_password(&request.username, &client_host)
+                    .unwrap_or(true),
+            )
+        };
+        match account_plugin {
             Ok(Some(account_plugin))
                 if account_plugin != client_plugin
                     || (self.client_capabilities() & CLIENT_PLUGIN_AUTH != 0
                         && ((!auth_response.is_empty() && auth_response != [0])
-                            || self
-                                .engine
-                                .auth_account_has_password(&request.username, &client_host)
-                                .unwrap_or(true))) =>
+                            || has_password)) =>
             {
                 if self.client_capabilities() & CLIENT_PLUGIN_AUTH == 0 {
                     let err = command_err_packet_for_spec(
@@ -3230,7 +3281,11 @@ where
 
         context.status = self.context.status.clone();
         if let Some(database) = request.database.as_deref() {
-            if let Err(err) = self.engine.init_session_database(&mut context, database) {
+            let initialized = match self.catalog_read_permit().await {
+                Ok(_permit) => self.engine.init_session_database(&mut context, database),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = initialized {
                 crate::engine::auth::release_connection(&context.authenticated_as);
                 self.write_error_packet(last_client_sequence_id.wrapping_add(1), &err)
                     .await?;
@@ -3469,7 +3524,7 @@ where
                 std::future::pending::<()>().await;
             }
         };
-        let killed = local_infile_cancelled(handle.as_deref(), cancel.as_ref());
+        let killed = wait_for_statement_cancellation(handle.as_deref(), cancel.as_ref());
         let result = tokio::select! {
             biased;
             _ = crate::mysql::shutdown::shutdown_notified() => Ok(()),
@@ -3987,7 +4042,10 @@ where
         // long SLEEP/lock wait. Execute it on the connection task instead;
         // no storage I/O or row scan is involved.
         if is_show_processlist_sql(&sql) {
-            let result = self.engine.execute(&mut self.context, &sql);
+            let result = match self.catalog_read_permit().await {
+                Ok(_permit) => self.engine.execute(&mut self.context, &sql),
+                Err(err) => Err(err),
+            };
             return self.write_query_response(result).await;
         }
         // A replica advertises semi-sync capability by issuing
@@ -4013,10 +4071,20 @@ where
 
         // Catalog-aware dispatch includes HTTP hidden behind views, routines,
         // or triggers before any inline SQL path can block a Tokio worker.
-        if self.sql_may_call_http(sql.as_str())
-            && !looks_like_load_data_local(sql.as_str(), lex_mode)
-        {
-            let result = self.execute_engine_blocking(sql.to_string()).await;
+        // Bare transaction control can release locks needed by other work.
+        // It has no HTTP dependency and should reach a worker even while the
+        // catalog is busy.
+        let control = crate::engine::executor::is_simple_txn_control_sql(&sql);
+        let http = if control {
+            false
+        } else {
+            match self.sql_may_call_http(&sql).await {
+                Ok(http) => http,
+                Err(err) => return self.write_query_response(Err(err)).await,
+            }
+        };
+        if http && !looks_like_load_data_local(&sql, lex_mode) {
+            let result = self.execute_engine_on_worker(sql, http).await;
             return self.write_query_response(result).await;
         }
 
@@ -4026,40 +4094,34 @@ where
         // A plain session-variable SET (e.g. JDBC's per-query
         // `SET SQL_SELECT_LIMIT`) is bounded the same way: it evaluates no
         // subquery or function and changes only this session's state.
-        if prepared_dml_inline_enabled()
-            && (crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
-                || is_simple_session_set_sql(sql.as_str()))
-        {
-            let result = if crate::engine::executor::is_simple_txn_control_sql(sql.as_str())
-                && !crate::util::connection_dispatch::can_inline_transaction_control()
-            {
-                self.execute_engine_blocking(sql).await
-            } else {
-                self.engine.execute(&mut self.context, &sql)
-            };
-            if self.kill_flag.load(Ordering::Acquire) {
-                return Ok(());
+        if prepared_dml_inline_enabled() {
+            if control || is_simple_session_set_sql(&sql) {
+                let result = if control
+                    && (!crate::util::connection_dispatch::can_inline_transaction_control()
+                        || self.try_catalog_read_permit().is_err())
+                {
+                    self.execute_engine_on_worker(sql, http).await
+                } else {
+                    let catalog = if control {
+                        Ok(None)
+                    } else {
+                        self.catalog_read_permit().await
+                    };
+                    match catalog {
+                        Ok(_permit) => self.engine.execute(&mut self.context, &sql),
+                        Err(err) => Err(err),
+                    }
+                };
+                if self.kill_flag.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                return self.write_query_response(result).await;
             }
-            return self.write_query_response(result).await;
         }
 
-        // Inline scheduling route for non-blocking read-only SELECTs.
-        //
-        // The default COM_QUERY path hands every statement to
-        // `tokio::task::spawn_blocking`, which costs a thread-pool task
-        // switch (~5–15µs on macOS) plus a `SessionContext` move dance.
-        // Pure read-only SELECTs never park on the row-lock condvar, so
-        // running them on the current tokio worker is safe and trims
-        // a meaningful slice of the per-query latency for trivial
-        // queries like `SELECT 2`.
-        //
-        // The dispatch below mirrors `execute_prepared_statement_blocking`'s
-        // `statement_is_lock_safe_read` check: a parse + classification
-        // gate blocks anything that could take a row lock (FOR UPDATE,
-        // any DML, DDL, txn control) from the inline path. On a sniff
-        // miss, parse error, or non-lock-safe verdict we fall through
-        // to the blocking-pool route so LOAD DATA LOCAL, multi-statement,
-        // DML kernels and lock-wait semantics remain unchanged.
+        // Row-lock eligibility and catalog admission are separate. An inline
+        // SELECT must pass both before synchronous engine execution. A locking
+        // SELECT uses the blocking pool and transaction admission below.
         let mut needs_txn_admission = false;
         let mut parsed_for_blocking = None;
         if looks_like_inline_select_candidate(sql.as_str())
@@ -4159,6 +4221,10 @@ where
                     && statement_is_lock_safe_read(parsed.as_ref())
                     && context_allows_inline_lock_safe_read(&self.context)
                 {
+                    let catalog = match self.catalog_read_permit().await {
+                        Ok(permit) => permit,
+                        Err(err) => return self.write_query_response(Err(err)).await,
+                    };
                     // Deliberately no `materialize` here: when the engine
                     // returns a `StreamingResultSet`, `write_query_response`
                     // (and onward `write_text_streaming_result_set` /
@@ -4218,6 +4284,7 @@ where
                                 // MDL can block even a pure SELECT. Retry through
                                 // the authoritative dispatcher on a blocking worker,
                                 // choosing a fresh view/plan after the DDL barrier.
+                                drop(catalog);
                                 let result = self
                                     .execute_engine_blocking_parsed(
                                         sql,
@@ -4242,6 +4309,7 @@ where
                             .engine
                             .execute_parsed(&mut self.context, sql.as_str(), parsed),
                     };
+                    drop(catalog);
                     return self.write_query_response(result).await;
                 }
                 // A parsed SELECT that cannot use the non-blocking route may
@@ -4314,10 +4382,13 @@ where
         if prepared_dml_inline_allowed(&self.context)
             && looks_like_large_text_update_candidate(sql.as_str())
         {
-            if let Some(result) = self
-                .engine
-                .execute_large_text_dml_inline(&mut self.context, sql.as_str())
-            {
+            let inline = match self.try_catalog_read_permit() {
+                Ok(_catalog) => self
+                    .engine
+                    .execute_large_text_dml_inline(&mut self.context, sql.as_str()),
+                Err(()) => None,
+            };
+            if let Some(result) = inline {
                 if self.kill_flag.load(Ordering::Acquire) {
                     return Ok(());
                 }
@@ -4381,7 +4452,7 @@ where
                 self.execute_engine_blocking_parsed(sql, parsed, params)
                     .await
             }
-            None => self.execute_engine_blocking(sql).await,
+            None => self.execute_engine_on_worker(sql, http).await,
         };
         if result.is_ok() && selects_database {
             self.process_database = Some(self.context.current_database.clone());
@@ -4634,7 +4705,7 @@ where
             loop {
                 let read = tokio::select! {
                     biased;
-                    _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                    _ = wait_for_statement_cancellation(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
                     packet = self.codec.read_packet_with_timeout(&mut self.stream, crate::mysql::packet::net_read_timeout()) => packet,
                 };
                 match read? {
@@ -4747,7 +4818,7 @@ where
         let last_seq = loop {
             let read = tokio::select! {
                 biased;
-                _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                _ = wait_for_statement_cancellation(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
                 packet = self.codec.read_packet_with_timeout(&mut self.stream, crate::mysql::packet::net_read_timeout()) => packet,
             };
             let packet = match read {
@@ -4769,7 +4840,7 @@ where
                     if pipe_error.is_none() {
                         let write = tokio::select! {
                             biased;
-                            _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
+                            _ = wait_for_statement_cancellation(self.handle.as_deref(), input_cancel.as_ref()) => Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
                             result = writer.write_all(&packet.payload) => result,
                         };
                         if let Err(err) = write {
@@ -4814,7 +4885,7 @@ where
         // A failed/cancelled flush must not let the reader commit a prefix.
         let shutdown = tokio::select! {
             biased;
-            _ = local_infile_cancelled(self.handle.as_deref(), input_cancel.as_ref()) =>
+            _ = wait_for_statement_cancellation(self.handle.as_deref(), input_cancel.as_ref()) =>
                 Err(io::Error::new(io::ErrorKind::Interrupted, "LOAD DATA LOCAL cancelled")),
             result = writer.shutdown() => result,
         };
@@ -4948,11 +5019,15 @@ where
                 .await?;
             return Ok(());
         }
-        let preparation = match self.engine.try_prepare_cached_inline(
-            &mut self.context,
-            &effective_sql,
-            param_count,
-        ) {
+        let inline_preparation = match self.try_catalog_read_permit() {
+            Ok(_catalog) => self.engine.try_prepare_cached_inline(
+                &mut self.context,
+                &effective_sql,
+                param_count,
+            ),
+            Err(()) => None,
+        };
+        let preparation = match inline_preparation {
             Some(result) => result,
             None => {
                 self.prepare_cached_blocking(effective_sql.clone(), param_count)
@@ -5372,28 +5447,15 @@ where
         }
         if has_parsed_template {
             if !cursor_requested && param_count == 0 {
-                let parsed_arc = self
+                let template = self
                     .prepared
                     .get(&statement_id)
                     .and_then(|entry| entry.parsed.clone());
-                if let Some(arc) = parsed_arc.as_ref().filter(|arc| {
-                    matches!(
-                        arc.as_ref(),
-                        Statement::Begin { .. }
-                            | Statement::Commit { .. }
-                            | Statement::Rollback { .. }
-                    )
-                }) {
-                    if let Some(result) = crate::engine::perf_events::with_prepared_statement_texts(
-                        &perf_texts,
-                        || {
-                            self.engine.execute_prepared_statement(
-                                &mut self.context,
-                                &sql,
-                                arc.as_ref().clone(),
-                            )
-                        },
-                    ) {
+                if let Some(statement) = template.filter(|stmt| is_transaction_control(stmt)) {
+                    let result = self
+                        .execute_prepared_control(&sql, &statement, &perf_texts)
+                        .await;
+                    if let Some(result) = result {
                         if self.kill_flag.load(Ordering::Acquire) {
                             return Ok(());
                         }
@@ -5515,20 +5577,25 @@ where
                             Err(err) => compiled_result = Some(Err(self.recover_join_error(err))),
                         }
                     } else {
-                        compiled_result = crate::engine::perf_events::with_prepared_statement_texts(
-                            &perf_texts,
-                            || {
-                                crate::engine::api::with_shared_result_metadata(|| {
-                                    self.engine.execute_prepared_select(
-                                        &mut self.context,
-                                        &mut select_memo_state,
-                                        arc,
-                                        &sql,
-                                        &values,
-                                    )
-                                })
-                            },
-                        );
+                        compiled_result = match self.catalog_read_permit().await {
+                            Ok(_permit) => {
+                                crate::engine::perf_events::with_prepared_statement_texts(
+                                    &perf_texts,
+                                    || {
+                                        crate::engine::api::with_shared_result_metadata(|| {
+                                            self.engine.execute_prepared_select(
+                                                &mut self.context,
+                                                &mut select_memo_state,
+                                                arc,
+                                                &sql,
+                                                &values,
+                                            )
+                                        })
+                                    },
+                                )
+                            }
+                            Err(err) => Some(Err(err)),
+                        };
                     }
                 }
                 if let Some(entry) = self.prepared.get_mut(&statement_id) {
@@ -7330,6 +7397,7 @@ where
         } else {
             &[][..]
         };
+        let wildcard_bytes = wildcard_bytes.split(|&b| b == 0).next().unwrap_or_default();
         let table_name = match decode_session_sql(&self.context, table_bytes) {
             Ok(value) => value,
             Err(err) => {
@@ -7518,6 +7586,15 @@ where
     }
 
     async fn execute_engine_blocking(&mut self, sql: String) -> Result<QueryResponse, QueryError> {
+        let http = self.sql_may_call_http(&sql).await?;
+        self.execute_engine_on_worker(sql, http).await
+    }
+
+    async fn execute_engine_on_worker(
+        &mut self,
+        sql: String,
+        http: bool,
+    ) -> Result<QueryResponse, QueryError> {
         // No `.and_then(QueryResponse::materialize)` here: streaming
         // result sets are consumed by the text/binary streaming writers
         // on the main task. The blocking pool only runs the engine's
@@ -7530,7 +7607,6 @@ where
                 crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode),
             ),
         );
-        let http = self.sql_may_call_http(&sql);
         let _http_session = if http {
             Some(crate::engine::http::admit_session(&self.context).await?)
         } else {
@@ -7577,7 +7653,7 @@ where
         // there is no reason to throw away that authoritative AST and parse
         // the identical COM_QUERY a second time on the worker.
         let ai = crate::engine::ai::sql::statement_has_ai(&statement);
-        let http = self.sql_may_call_http(&sql);
+        let http = self.sql_may_call_http(&sql).await?;
         let _http_session = if http {
             Some(crate::engine::http::admit_session(&self.context).await?)
         } else {
@@ -7744,6 +7820,10 @@ where
         crate::engine::api::PreparedDmlState,
         Option<Result<QueryResponse, QueryError>>,
     ) {
+        let _catalog = match self.try_catalog_read_permit() {
+            Ok(permit) => permit,
+            Err(()) => return (dml_state, None),
+        };
         let engine = Arc::clone(&self.engine);
         let result = crate::engine::perf_events::with_statement_digest_sql_override(
             Arc::clone(shape_sql),
@@ -7939,6 +8019,79 @@ where
         result
     }
 
+    /// A fresh bare BEGIN establishes its read view lazily. Another BEGIN
+    /// inside a transaction can implicitly commit and must follow the same
+    /// scheduling policy as an explicit completion.
+    async fn execute_prepared_control(
+        &mut self,
+        sql: &Arc<str>,
+        statement: &Arc<Statement>,
+        texts: &crate::engine::perf_events::PreparedStatementTexts,
+    ) -> Option<Result<QueryResponse, QueryError>> {
+        let fresh_begin = matches!(statement.as_ref(), Statement::Begin { .. })
+            && !self.context.in_transaction()
+            && sql.trim().eq_ignore_ascii_case("BEGIN");
+        // Completion may itself publish metadata. Only take a catalog read
+        // permit for a fresh BEGIN that shares its reactor with other sessions.
+        let inline = if crate::util::connection_dispatch::can_inline_transaction_control() {
+            Ok(None)
+        } else if fresh_begin {
+            self.try_catalog_read_permit()
+        } else {
+            Err(())
+        };
+        if let Ok(_permit) = inline {
+            return crate::engine::perf_events::with_prepared_statement_texts(texts, || {
+                self.engine.execute_prepared_statement(
+                    &mut self.context,
+                    sql,
+                    (**statement).clone(),
+                )
+            });
+        }
+
+        // Completion must be able to run even when every write admission
+        // permit is held. Return the real session context before sending OK.
+        let engine = self.engine.clone();
+        let mut context = self.park_context();
+        // CHAIN and XA can leave a transaction attached. Keep their original
+        // admission lifetime, including errors and detached XA branches.
+        let handoff = context.xa_branch.is_none()
+            && context.current_txn.is_some()
+            && context.sysvars.completion_type == 0
+            && matches!(
+                statement.as_ref(),
+                Statement::Commit { chain: None, .. } | Statement::Rollback { chain: None, .. }
+            );
+        if handoff {
+            context.completion_admission.permit = self.txn_admission.take();
+        }
+        let sql = Arc::clone(sql);
+        let stmt = Arc::clone(statement);
+        let texts = texts.clone();
+        let job =
+            crate::util::blocking_pool::spawn_affine(self.blocking_affinity.as_ref(), move || {
+                let result =
+                    crate::engine::perf_events::with_prepared_statement_texts(&texts, || {
+                        engine.execute_prepared_statement(&mut context, &sql, (*stmt).clone())
+                    });
+                if context.current_txn.is_none() && context.xa_branch.is_none() {
+                    context.completion_admission.permit.take();
+                }
+                (context, result)
+            });
+        match job.await {
+            Ok((mut context, result)) => {
+                if handoff {
+                    self.txn_admission = context.completion_admission.permit.take();
+                }
+                self.restore_context(context);
+                result
+            }
+            Err(err) => Some(Err(self.recover_join_error(err))),
+        }
+    }
+
     async fn execute_prepared_statement_blocking(
         &mut self,
         sql: Arc<str>,
@@ -7953,22 +8106,8 @@ where
                 "server-side cursors for multi-result prepared statements",
             )));
         }
-        // Statements that may take row locks have to run on the
-        // `spawn_blocking` pool: the executor's row-lock acquire path
-        // parks the OS thread on `Condvar::wait_timeout`. Running such a
-        // query directly on a tokio worker would block one of the (small)
-        // `num_cpus` worker threads — under TPC-C all workers can end up
-        // blocked on locks held by transactions whose own commit task is
-        // queued behind them, producing a distributed deadlock that
-        // surfaces as "lock wait timeout exceeded".
-        //
-        // Pure read-only SELECT (no FOR UPDATE / FOR SHARE) never calls
-        // the blocking lock-wait primitives, so we can run it inline on
-        // the current task and skip the ~10-30µs `spawn_blocking` task
-        // switch. Buffer-pool disk I/O for cold pages can briefly stall
-        // the worker, but that is the same cost a sync syscall would have
-        // and matches existing async storage-server design.
-        //
+        // Use the inline path only for eligible reads with catalog admission.
+        // Row-lock waits and blocking control statements use a worker.
         // `params` is installed in the thread-local parameter context for
         // the duration of execution so any `Expr::Placeholder(idx)` left
         // in the AST resolves to the bound value at eval time. This is
@@ -7981,13 +8120,23 @@ where
         // demand. Materializing up front would defeat server-side cursor
         // fetching (`useCursorFetch=true`) by buffering the full result
         // set in memory before the FETCH loop even starts.
-        let http =
-            self.sql_may_call_http(&sql) || crate::engine::http::statement_has_http(&statement);
+        let http = if crate::engine::http::statement_has_http(&statement) {
+            true
+        } else {
+            match self.sql_may_call_http(&sql).await {
+                Ok(http) => http,
+                Err(err) => return Some(Err(err)),
+            }
+        };
         if !http
             && statement_is_lock_safe_read(&statement)
             && !statement_has_computed_ordering(&statement)
             && context_allows_inline_lock_safe_read(&self.context)
         {
+            let _catalog = match self.catalog_read_permit().await {
+                Ok(permit) => permit,
+                Err(err) => return Some(Err(err)),
+            };
             let engine = Arc::clone(&self.engine);
             let result =
                 crate::engine::perf_events::with_prepared_statement_texts(&perf_texts, || {
@@ -8016,7 +8165,10 @@ where
         // transactions here. No-op when disabled or a permit is already held.
         // HTTP admission and network waits must not consume the transaction
         // gate. Match the text HTTP route; retain any already-owned permit.
+        // Transaction control can finish an already-open transaction. Never
+        // queue its completion behind admission for new lock-taking statements.
         if !http
+            && !is_transaction_control(&statement)
             && (!statement_is_lock_safe_read(&statement)
                 || !context_allows_inline_lock_safe_read(&self.context))
         {
@@ -8176,10 +8328,14 @@ where
         // because it missed an optimization. The general path still applies
         // its own locking/isolation admission checks (including SERIALIZABLE).
         if !prepared_dml_statement_candidate(parsed.as_ref())
-            || self.sql_may_call_http(&sql)
             || crate::engine::http::statement_has_http(&parsed)
         {
             return (dml_state, None, params);
+        }
+        match self.sql_may_call_http(&sql).await {
+            Ok(false) => {}
+            Ok(true) => return (dml_state, None, params),
+            Err(err) => return (dml_state, Some(Err(err)), params),
         }
         self.acquire_txn_admission().await;
         let engine = Arc::clone(&self.engine);
@@ -8231,11 +8387,15 @@ where
         crate::engine::api::PreparedDmlState,
         Option<Result<QueryResponse, QueryError>>,
     ) {
+        let _catalog = match self.try_catalog_read_permit() {
+            Ok(permit) => permit,
+            Err(()) => return (dml_state, None),
+        };
         // Probe with the handle's PREPARE-time text traits installed so the
         // HTTP mention scan is not repeated over the SQL on every EXECUTE.
         if static_has_http
             || crate::engine::perf_events::with_prepared_statement_texts(perf_texts, || {
-                self.sql_may_call_http(sql)
+                self.sql_may_call_http_admitted(sql)
             })
         {
             return (dml_state, None);
@@ -8245,10 +8405,8 @@ where
         // `block_in_place` can compensate for that by starting replacement
         // workers, but doing so for every short autocommit statement creates a
         // second runnable worker population and amplifies scheduler/park-wake
-        // traffic. With the normal worker count (4 * CPU, at least 16), the
-        // connection tasks themselves already provide enough concurrency for
-        // group commit. Keep `block_in_place` as an opt-in escape hatch for
-        // deployments with an unusually small `MYDB_TOKIO_WORKERS` setting.
+        // traffic. Multi-thread runtimes may opt into compensation when the
+        // configured number of network workers is small.
         let use_block_in_place = prepared_dml_block_in_place_enabled()
             && tokio::runtime::Handle::try_current()
                 .map(|handle| handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread)
@@ -8537,14 +8695,10 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                         if concatenating {
                             sql.truncate(pending_hex.expect("adjacent raw literal"));
                         } else {
-                            let trimmed = sql.trim_end();
-                            if trimmed
-                                .as_bytes()
-                                .get(trimmed.len().saturating_sub(7)..)
-                                .is_some_and(|suffix| suffix.eq_ignore_ascii_case(b"_binary"))
-                            {
-                                sql.truncate(trimmed.len() - 7);
-                            }
+                            // Keep `_binary` as written: unlike a bare X'..'
+                            // literal it is a string in numeric context
+                            // (`_binary'12' + 0 = 12`) and a byte-wise operand
+                            // of `&`, `|`, `^`, `~`, `<<` and `>>`.
                             if introducer && !sql.ends_with(char::is_whitespace) {
                                 sql.push(' ');
                             }
@@ -10180,6 +10334,7 @@ fn is_simple_session_set_sql(sql: &str) -> bool {
                 "PASSWORD",
                 "ROLE",
                 "TRANSACTION",
+                "AUTOCOMMIT",
             ]
             .iter()
             .any(|keyword| word.eq_ignore_ascii_case(keyword))
@@ -10683,16 +10838,6 @@ fn ddl_cache_scope(sql: &str, mode: crate::sql_lex::SqlLexMode) -> DdlCacheScope
     }
 }
 
-/// True iff `statement` is a plain SELECT (or SELECT-of-SELECT) that
-/// cannot end up parked on a row-lock condvar. The current executor
-/// blocks on `Condvar::wait_timeout` only when acquiring row/unique-key
-/// locks, which happens via `lock_rows_blocking` from
-/// `SELECT ... FOR UPDATE` / `FOR SHARE`, or from any DML
-/// (INSERT / UPDATE / DELETE) path. Pure MVCC reads walk the undo chain
-/// and never block on locks. Returning true lets the session run the
-/// statement inline on the tokio task and skip the `spawn_blocking`
-/// hand-off; returning false routes through the blocking pool so the
-/// runtime worker is never parked.
 fn statement_contains_fusion<'q>(statement: impl Into<crate::parser::QueryRef<'q>>) -> bool {
     match statement.into() {
         crate::parser::QueryRef::Select(select) => {
@@ -10751,6 +10896,14 @@ fn statement_has_computed_ordering<'q>(statement: impl Into<crate::parser::Query
     }
 }
 
+fn is_transaction_control(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Begin { .. } | Statement::Commit { .. } | Statement::Rollback { .. }
+    )
+}
+
+/// Classify row-lock eligibility; catalog and session checks apply separately.
 pub(crate) fn statement_is_lock_safe_read<'q>(
     statement: impl Into<crate::parser::QueryRef<'q>>,
 ) -> bool {
@@ -10923,6 +11076,206 @@ fn bind_sql_params(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn contended_catalog_does_not_pause_sibling_ping() {
+        use crate::mysql::packet::{read_packet, write_packet};
+        use crate::util::catalog_admission::CatalogAdmission;
+        use std::sync::mpsc;
+        use std::time::{Duration, Instant};
+        struct MetadataEngine {
+            admission: CatalogAdmission,
+            storage: std::sync::Mutex<()>,
+        }
+        impl QueryEngine for MetadataEngine {
+            fn catalog_admission(&self) -> Option<&CatalogAdmission> {
+                Some(&self.admission)
+            }
+            fn execute(
+                &self,
+                _: &mut SessionContext,
+                _: &str,
+            ) -> Result<QueryResponse, QueryError> {
+                let _storage = self.storage.lock().unwrap();
+                Ok(QueryResponse::Ok)
+            }
+        }
+        for sql in ["SELECT 1", "SHOW PROCESSLIST"] {
+            let engine = Arc::new(MetadataEngine {
+                admission: CatalogAdmission::default(),
+                storage: std::sync::Mutex::new(()),
+            });
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut clients = Vec::new();
+            let mut sessions = Vec::new();
+            for id in 1..=2 {
+                let client = TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let (stream, peer) = listener.accept().await.unwrap();
+                let mut session = Session::new(
+                    id,
+                    peer,
+                    stream,
+                    None,
+                    engine.clone(),
+                    Arc::new(SessionRegistry::new()),
+                );
+                session.authenticated = true;
+                clients.push(client);
+                sessions.push(session);
+            }
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let writer = {
+                let engine = Arc::clone(&engine);
+                std::thread::spawn(move || {
+                    let _catalog = engine.admission.write();
+                    let _storage = engine.storage.lock().unwrap();
+                    entered_tx.send(()).unwrap();
+                    // Bound cleanup even when the old synchronous path stalls
+                    // this test's sole runtime thread.
+                    let _ = release_rx.recv_timeout(Duration::from_secs(3));
+                })
+            };
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            let mut ping_session = sessions.pop().unwrap();
+            let ping_server = tokio::spawn(async move { ping_session.command_loop().await });
+            let mut query_session = sessions.pop().unwrap();
+            let started = Instant::now();
+            let query_server =
+                tokio::spawn(async move { query_session.handle_single_query(sql.into()).await });
+            tokio::task::yield_now().await;
+            write_packet(&mut clients[1], 0, &[COM_PING]).await.unwrap();
+            let pong =
+                tokio::time::timeout(Duration::from_millis(500), read_packet(&mut clients[1]))
+                    .await;
+            let elapsed = started.elapsed();
+            let _ = release_tx.send(());
+            writer.join().unwrap();
+            assert!(pong.unwrap().unwrap().unwrap().payload.starts_with(&[0x00]));
+            assert!(
+                elapsed < Duration::from_secs(1),
+                "catalog wait stalled sibling PING for {elapsed:?}: {sql}"
+            );
+            query_server.await.unwrap().unwrap();
+            drop(clients);
+            tokio::time::timeout(Duration::from_secs(5), ping_server)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn catalog_wait_keeps_sql_out_of_http_quota_and_observes_kill() {
+        use crate::mysql::packet::read_packet;
+        use crate::util::catalog_admission::CatalogAdmission;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        #[derive(Default)]
+        struct Engine {
+            catalog: CatalogAdmission,
+            calls: std::sync::atomic::AtomicUsize,
+        }
+        impl QueryEngine for Engine {
+            fn catalog_admission(&self) -> Option<&CatalogAdmission> {
+                Some(&self.catalog)
+            }
+            fn execute(
+                &self,
+                _: &mut SessionContext,
+                _: &str,
+            ) -> Result<QueryResponse, QueryError> {
+                self.calls.fetch_add(1, Ordering::Relaxed);
+                Ok(QueryResponse::Ok)
+            }
+        }
+        for (sql, kill) in [
+            ("SELECT 1", false),
+            ("SELECT 1", true),
+            ("SHOW PROCESSLIST", true),
+        ] {
+            let engine = Arc::new(Engine::default());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let mut client = TcpStream::connect(listener.local_addr().unwrap())
+                .await
+                .unwrap();
+            let (server, peer) = listener.accept().await.unwrap();
+            let registry = Arc::new(SessionRegistry::new());
+            let handle = registry.register(1, "root".into(), "localhost".into(), "test".into());
+            let mut session = Session::new(1, peer, server, None, engine.clone(), registry.clone());
+            session.kill_flag = Arc::clone(handle.kill_flag());
+            session
+                .context
+                .set_cancel_handle(Some(handle.cancel_handle()));
+            session.context.refresh_cancel_generations();
+            session.handle = Some(handle);
+            session.mark_busy("Query", Some(sql.into()));
+
+            // Consume the default per-account HTTP capacity. Keep it occupied
+            // through the response to detect accidental HTTP routing of SQL.
+            let mut http = Vec::new();
+            if !kill {
+                for _ in 0..4 {
+                    http.push(
+                        crate::engine::http::admit_session(&session.context)
+                            .await
+                            .unwrap(),
+                    );
+                }
+            }
+
+            let (entered_tx, entered_rx) = mpsc::channel();
+            let (release_tx, release_rx) = mpsc::channel();
+            let writer = {
+                let engine = engine.clone();
+                std::thread::spawn(move || {
+                    let _write = engine.catalog.write();
+                    entered_tx.send(()).unwrap();
+                    let _ = release_rx.recv_timeout(Duration::from_secs(5));
+                })
+            };
+            entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+
+            // Poll the command into catalog contention before releasing the
+            // writer or canceling the command. No fixed delay is needed.
+            let mut query = std::pin::pin!(session.handle_single_query(sql.into()));
+            let first = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(query.as_mut(), cx))
+            })
+            .await;
+            assert!(first.is_pending());
+            assert_eq!(engine.calls.load(Ordering::Relaxed), 0);
+            if kill {
+                registry.kill_query(1).unwrap();
+            } else {
+                release_tx.send(()).unwrap();
+            }
+            let result = tokio::time::timeout(Duration::from_secs(2), query).await;
+            drop(release_tx);
+            writer.join().unwrap();
+            result.unwrap().unwrap();
+            let packet = tokio::time::timeout(Duration::from_secs(2), read_packet(&mut client))
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if kill {
+                assert_eq!(packet.payload[0], 0xff);
+                assert_eq!(
+                    u16::from_le_bytes([packet.payload[1], packet.payload[2]]),
+                    1317
+                );
+                assert_eq!(engine.calls.load(Ordering::Relaxed), 0);
+            } else {
+                assert_eq!(packet.payload[0], 0);
+                assert_eq!(engine.calls.load(Ordering::Relaxed), 1);
+            }
+            drop(http);
+        }
+    }
 
     #[test]
     fn contiguous_stream_packets_preserve_empty_and_wide_packets_and_charge_capacity() {
@@ -11525,11 +11878,21 @@ mod tests {
             assert!(prepared_dml_retry_context_allowed(&context));
 
             struct Engine {
+                prepared_calls: std::sync::atomic::AtomicUsize,
                 entered: AtomicBool,
                 completed: AtomicBool,
                 release: std::sync::Mutex<std::sync::mpsc::Receiver<()>>,
             }
             impl QueryEngine for Engine {
+                fn execute_prepared_statement(
+                    &self,
+                    session: &mut SessionContext,
+                    sql: &str,
+                    _: Statement,
+                ) -> Option<Result<QueryResponse, QueryError>> {
+                    self.prepared_calls.fetch_add(1, Ordering::Relaxed);
+                    Some(self.execute(session, sql))
+                }
                 fn execute(
                     &self,
                     _: &mut SessionContext,
@@ -11558,6 +11921,7 @@ mod tests {
                 let (stream, peer) = listener.accept().await.unwrap();
                 let (release, receiver) = std::sync::mpsc::channel();
                 let engine = Arc::new(Engine {
+                    prepared_calls: Default::default(),
                     entered: AtomicBool::new(false),
                     completed: AtomicBool::new(false),
                     release: std::sync::Mutex::new(receiver),
@@ -11570,19 +11934,54 @@ mod tests {
                     engine.clone(),
                     Arc::new(SessionRegistry::new()),
                 );
-                let sibling = async {
-                    while !engine.entered.load(Ordering::Acquire) {
-                        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
-                    }
-                    release.send(()).ok();
-                };
-                let (response, ()) =
-                    tokio::join!(session.handle_single_query("COMMIT".into()), sibling);
-                response.unwrap();
-                assert!(
-                    engine.completed.load(Ordering::Acquire),
-                    "the shared reactor stalled its sibling behind COMMIT"
-                );
+                for (sql, prepared) in [
+                    ("COMMIT", false),
+                    ("COMMIT", true),
+                    ("ROLLBACK", true),
+                    ("BEGIN", true),
+                ] {
+                    session.context.explicit_txn = true;
+                    engine.entered.store(false, Ordering::Release);
+                    engine.completed.store(false, Ordering::Release);
+                    let previous = engine.prepared_calls.load(Ordering::Relaxed);
+                    let request = async {
+                        if prepared {
+                            session.handle_stmt_prepare(sql.as_bytes()).await?;
+                            let id = *session.prepared.keys().max().unwrap();
+                            let mut payload = id.to_le_bytes().to_vec();
+                            payload.extend_from_slice(&[0, 1, 0, 0, 0]);
+                            session.handle_stmt_execute(&payload).await
+                        } else {
+                            session.handle_single_query(sql.into()).await
+                        }
+                    };
+                    let sibling = async {
+                        while !engine.entered.load(Ordering::Acquire) {
+                            tokio::task::yield_now().await;
+                        }
+                        release.send(()).unwrap();
+                    };
+                    let (response, ()) =
+                        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                            tokio::join!(request, sibling)
+                        })
+                        .await
+                        .unwrap();
+                    response.unwrap();
+                    assert!(
+                        session.txn_admission.is_none(),
+                        "transaction completion acquired a new write permit"
+                    );
+
+                    assert!(
+                        engine.completed.load(Ordering::Acquire),
+                        "shared reactor stalled on {sql}"
+                    );
+                    assert_eq!(
+                        engine.prepared_calls.load(Ordering::Relaxed) - previous,
+                        usize::from(prepared)
+                    );
+                }
             });
         })
         .join()
@@ -13315,12 +13714,11 @@ mod tests {
     }
 
     #[test]
-    fn simple_session_set_sniff_accepts_only_plain_session_assignments() {
+    fn simple_session_set_sniff_accepts_only_bounded_session_assignments() {
         for sql in [
             "SET SQL_SELECT_LIMIT=1",
             "set sql_select_limit = DEFAULT;",
             "SET NAMES 'utf8mb4'",
-            "SET @@session.autocommit = 0",
             "SET @a = 1, sql_mode = 'ANSI_QUOTES'",
         ] {
             assert!(is_simple_session_set_sql(sql), "{sql}");
@@ -13334,6 +13732,8 @@ mod tests {
             "SET PASSWORD = 'x'",
             "SET DEFAULT ROLE ALL TO u",
             "SET TRANSACTION ISOLATION LEVEL READ COMMITTED",
+            "SET @@session.autocommit = 0",
+            "SET autocommit = 1",
             "SET @a = (SELECT 1)",
             "SET @a = SLEEP(1)",
             "SET @a = 1; SELECT 1",
@@ -15297,7 +15697,7 @@ mod release_audit_sql_tests {
                 "_utf8mb4 X'6162'",
             ),
             ("SELECT _latin1'a' '中'", "_latin1 X'61e4b8ad'"),
-            ("SELECT _binary'a' '\\0'", "X'6100'"),
+            ("SELECT _binary'a' '\\0'", "_binary X'6100'"),
             ("INSERT INTO t VALUES(_utf8mb4'a' 'b')", "_utf8mb4 X'6162'"),
         ] {
             let decoded = decode_session_sql(&session, sql.as_bytes()).unwrap();
@@ -15353,7 +15753,7 @@ mod release_audit_sql_tests {
                 &b"INSERT INTO t VALUES ('\xff\\0\\n\\'\\\\')"[..],
                 "INSERT INTO t VALUES (X'ff000a275c')",
             ),
-            (&b"SELECT _binary'\xff'"[..], "SELECT X'ff'"),
+            (&b"SELECT _binary'\xff'"[..], "SELECT _binary X'ff'"),
             (
                 &b"SELECT /*!80000 '\xff' */"[..],
                 "SELECT /*!80000 X'ff' */",

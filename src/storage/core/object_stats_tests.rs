@@ -382,3 +382,297 @@ fn object_stats_crash_recovery_is_atomic_before_and_after_commit() {
         }
     }
 }
+
+fn object_stats_publication_allows_reads_and_serializes_ddl(
+    fail: bool,
+    drop_table: bool,
+    cold: bool,
+) {
+    use std::sync::mpsc;
+    let dir = stats_test_directory();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    db.set_recyclebin_variable("mydb_recyclebin", 0).unwrap();
+    create_checkpoint_test_table(&db);
+    let before = db.table("test.t").unwrap();
+    if cold {
+        db.set_catalog_cache_mb(0);
+        db.force_cold_online_descriptor_for_test("test.t");
+    }
+    let hook = Arc::new(DdlBackfillTestHook::new());
+    let (published_tx, published_rx) = mpsc::channel();
+    let worker = {
+        let db = Arc::clone(&db);
+        let hook = Arc::clone(&hook);
+        let before = Arc::clone(&before);
+        thread::spawn(move || {
+            STATS_PUBLICATION_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+            STATS_FAIL_AFTER_DD_ROWS.with(|slot| slot.set(fail));
+            let mut candidate = before.as_ref().clone();
+            candidate.stats.analyze_revision += 1;
+            published_tx
+                .send(
+                    db.publish_stats_candidate_checked(&before, candidate, true)
+                        .map(|_| ()),
+                )
+                .unwrap();
+        })
+    };
+    assert!(hook.wait_until_reached(Duration::from_secs(10)));
+    // Never leave the worker paused when an assertion or timeout fails.
+    struct Release(Arc<DdlBackfillTestHook>);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            self.0.release();
+        }
+    }
+    let release = Release(Arc::clone(&hook));
+    let (read_tx, read_rx) = mpsc::channel();
+    let reader = {
+        let db = Arc::clone(&db);
+        let before = Arc::clone(&before);
+        thread::spawn(move || {
+            let table = db.table("test.t").unwrap();
+            read_tx
+                .send((
+                    db.database_exists("test"),
+                    table.schema_version,
+                    table.stats.analyze_revision,
+                    db.catalog.admission.try_read().is_some(),
+                ))
+                .unwrap();
+            assert_eq!(table.id, before.id);
+        })
+    };
+    // A publication reservation must coexist with normal table reads.
+    let reader_owner = crate::storage::mdl::allocate_internal_owner().unwrap();
+    let read_mdl = db.acquire_mdl(
+        reader_owner,
+        None,
+        MdlDuration::Statement,
+        vec![MdlRequest {
+            key: MdlObjectKey::table("test", "t"),
+            lock_type: MdlLockType::SharedRead,
+        }],
+        "test/read-during-statistics",
+    );
+    db.release_mdl_owner(reader_owner);
+    let read = read_rx.recv_timeout(Duration::from_secs(2));
+    let (ddl_tx, ddl_rx) = mpsc::channel();
+    let ddl = {
+        let db = Arc::clone(&db);
+        thread::spawn(move || {
+            let _definition = db.pin_ddl_table("test.t").unwrap();
+            let result = if drop_table {
+                db.drop_table("test.t")
+            } else {
+                db.set_column_comment("test.t", "id", "concurrent publication")
+            };
+            ddl_tx.send(result).unwrap();
+        })
+    };
+    assert!(ddl_rx.recv_timeout(Duration::from_millis(100)).is_err());
+    drop(release);
+    read_mdl.unwrap();
+    assert_eq!(
+        read.unwrap(),
+        (
+            true,
+            before.schema_version,
+            before.stats.analyze_revision,
+            true
+        )
+    );
+    assert_eq!(
+        published_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap()
+            .is_err(),
+        fail
+    );
+    ddl_rx
+        .recv_timeout(Duration::from_secs(10))
+        .unwrap()
+        .unwrap();
+    worker.join().unwrap();
+    reader.join().unwrap();
+    ddl.join().unwrap();
+    if drop_table {
+        assert!(db.table("test.t").is_err());
+        assert!(db
+            .decode_table_descriptor_rows(before.id)
+            .unwrap()
+            .is_none());
+    } else {
+        let table = db.table("test.t").unwrap();
+        let persisted = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+        assert_eq!(table.columns[0].comment, "concurrent publication");
+        assert_eq!(
+            table.stats.analyze_revision,
+            before.stats.analyze_revision + u64::from(!fail)
+        );
+        let live_rows = crate::storage::data_dictionary::dd_rows_for_table(&table).unwrap();
+        let disk_rows = crate::storage::data_dictionary::dd_rows_for_table(&persisted).unwrap();
+        assert_eq!(live_rows.per_table(), disk_rows.per_table());
+    }
+    drop(db);
+    let db = open_relaxed_test_db(dir.path());
+    assert_eq!(db.table("test.t").is_err(), drop_table);
+    if !drop_table {
+        let table = db.table("test.t").unwrap();
+        assert_eq!(table.columns[0].comment, "concurrent publication");
+        assert_eq!(
+            table.stats.analyze_revision,
+            before.stats.analyze_revision + u64::from(!fail)
+        );
+    }
+}
+
+#[test]
+fn object_stats_durable_publication_does_not_block_reads_or_lose_concurrent_ddl() {
+    object_stats_publication_allows_reads_and_serializes_ddl(false, false, false);
+    object_stats_publication_allows_reads_and_serializes_ddl(false, false, true);
+}
+
+#[test]
+fn object_stats_failed_publication_preserves_concurrent_ddl_and_persistent_revision() {
+    object_stats_publication_allows_reads_and_serializes_ddl(true, false, false);
+}
+
+#[test]
+fn object_stats_publication_does_not_resurrect_concurrently_dropped_table() {
+    object_stats_publication_allows_reads_and_serializes_ddl(false, true, false);
+}
+
+#[test]
+fn object_stats_cold_read_keeps_stable_revision_after_durable_commit_before_publication() {
+    let dir = stats_test_directory();
+    let db = Arc::new(
+        Database::open_with_config(
+            dir.path(),
+            test_storage_config(DurabilityMode::Strict, true),
+        )
+        .unwrap(),
+    );
+    create_checkpoint_test_table(&db);
+    let before = db.table("test.t").unwrap();
+    db.set_catalog_cache_mb(0);
+    db.force_cold_online_descriptor_for_test("test.t");
+    let hook = Arc::new(DdlBackfillTestHook::new());
+    let worker = {
+        let db = db.clone();
+        let hook = hook.clone();
+        let before = before.clone();
+        thread::spawn(move || {
+            STATS_AFTER_COMMIT_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+            let mut candidate = before.as_ref().clone();
+            candidate.stats.analyze_revision += 1;
+            db.publish_stats_candidate(&before, candidate).unwrap();
+        })
+    };
+    assert!(hook.wait_until_reached(Duration::from_secs(10)));
+    let (tx, rx) = std::sync::mpsc::channel();
+    let reader = {
+        let db = db.clone();
+        let id = before.id;
+        thread::spawn(move || {
+            tx.send((db.table("test.t"), db.decode_table_descriptor_rows(id)))
+                .unwrap();
+        })
+    };
+    let result = rx.recv_timeout(Duration::from_secs(2));
+    hook.release();
+    worker.join().unwrap();
+    reader.join().unwrap();
+    let (cold, durable) = result.unwrap();
+    assert_eq!(cold.unwrap().schema_version, before.schema_version);
+    assert_eq!(
+        durable.unwrap().unwrap().stats.analyze_revision,
+        before.stats.analyze_revision + 1
+    );
+    assert_eq!(
+        db.table("test.t").unwrap().stats.analyze_revision,
+        before.stats.analyze_revision + 1
+    );
+    drop(db);
+    let reopened = Database::open_with_config(
+        dir.path(),
+        test_storage_config(DurabilityMode::Strict, true),
+    )
+    .unwrap();
+    assert_eq!(
+        reopened.table("test.t").unwrap().stats.analyze_revision,
+        before.stats.analyze_revision + 1
+    );
+}
+
+#[test]
+fn object_stats_publication_keeps_unrelated_descriptor_cache_usable() {
+    let dir = stats_test_directory();
+    let db = Arc::new(open_relaxed_test_db(dir.path()));
+    create_checkpoint_test_table(&db);
+    db.create_table("u", vec![checkpoint_test_pk_column()], vec!["id".into()], vec![]).unwrap();
+    db.set_catalog_cache_mb(64);
+    let before = db.table("test.t").unwrap();
+    db.force_cold_online_descriptor_for_test("test.u");
+    let hook = Arc::new(DdlBackfillTestHook::new());
+    let worker = {
+        let db = db.clone();
+        let hook = hook.clone();
+        std::thread::spawn(move || {
+            STATS_PUBLICATION_HOOK.with(|slot| *slot.borrow_mut() = Some(hook));
+            let mut candidate = before.as_ref().clone();
+            candidate.stats.analyze_revision += 1;
+            db.publish_stats_candidate_checked(&before, candidate, true).unwrap();
+        })
+    };
+    assert!(hook.wait_until_reached(Duration::from_secs(10)));
+    let first = db.table("test.u").unwrap();
+    let cached = !db.catalog_read().unwrap().tables["test.u"].columns.is_empty();
+    let second = db.table("test.u").unwrap();
+    let reused = Arc::ptr_eq(&first, &second);
+    hook.release();
+    worker.join().unwrap();
+    assert!(cached && reused, "unrelated descriptor was decoded repeatedly during t's statistics I/O: cached={cached}, reused={reused}");
+}
+
+#[test]
+fn object_stats_skips_pinned_ddl_and_rejects_stale_revision_before_dictionary_write() {
+    let dir = stats_test_directory();
+    let db = open_relaxed_test_db(dir.path());
+    create_checkpoint_test_table(&db);
+    let before = db.table("test.t").unwrap();
+    let mut candidate = before.as_ref().clone();
+    candidate.stats.analyze_revision += 1;
+    let owner = crate::storage::mdl::allocate_internal_owner().unwrap();
+    let ddl = StatisticsPublicationMdl(&db, owner);
+    db.acquire_mdl(
+        owner,
+        None,
+        MdlDuration::Statement,
+        vec![MdlRequest {
+            key: MdlObjectKey::table("test", "t"),
+            lock_type: MdlLockType::SharedUpgradable,
+        }],
+        "test/ddl-before-statistics",
+    )
+    .unwrap();
+    assert!(!db
+        .publish_stats_candidate_checked(&before, candidate.clone(), true)
+        .unwrap());
+    drop(ddl);
+    let lease = db.pin_ddl_table("test.t").unwrap();
+    assert!(!db
+        .publish_stats_candidate_checked(&before, candidate.clone(), true)
+        .unwrap());
+    drop(lease);
+    db.set_column_comment("test.t", "id", "newer DDL").unwrap();
+    let changed = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+    let err = db.publish_stats_candidate(&before, candidate).unwrap_err();
+    assert!(err.is(crate::error::catalog::ER_TABLE_DEF_CHANGED));
+    let persisted = db.decode_table_descriptor_rows(before.id).unwrap().unwrap();
+    assert_eq!(
+        serde_json::to_value(changed).unwrap(),
+        serde_json::to_value(persisted).unwrap()
+    );
+    assert_eq!(db.table("test.t").unwrap().columns[0].comment, "newer DDL");
+}
