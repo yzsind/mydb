@@ -7239,7 +7239,9 @@ fn convert_group_by(
     ) -> Result<(), ParseError> {
         match expr {
             sqlparser::ast::Expr::Rollup(elements) => {
-                *modifier = GroupByModifier::Rollup;
+                // Native ROLLUP includes the explicit empty grouping set;
+                // MySQL 8.0 WITH ROLLUP has a different empty-input contract.
+                *modifier = GroupByModifier::GroupingSets;
                 let converted = elements
                     .iter()
                     .map(|element| grouping_element_indices(keys, element))
@@ -7268,7 +7270,7 @@ fn convert_group_by(
             sqlparser::ast::Expr::Function(function) => {
                 let name = function_object_name(&function.name)?;
                 if name.eq_ignore_ascii_case("ROLLUP") {
-                    *modifier = GroupByModifier::Rollup;
+                    *modifier = GroupByModifier::GroupingSets;
                     let converted = function_grouping_args(&function.args)?
                         .iter()
                         .map(|element| grouping_element_indices(keys, element))

@@ -555,6 +555,56 @@ fn grouping_sets_empty_set_on_empty_input_returns_single_group() {
 }
 
 #[test]
+fn native_grouping_empty_sets_preserve_totals_and_set_operation_nulls() {
+    use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
+
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE e (e ENUM('a','b'), g INT, v DECIMAL(10,2))")
+        .unwrap();
+    for mode in [VecMode::Off, VecMode::On] {
+        with_vec_mode(mode, || {
+            for grouping in ["ROLLUP(g)", "CUBE(g)", "GROUPING SETS ((g), ())"] {
+                let sql =
+                    format!("SELECT g, COUNT(*), SUM(v), GROUPING(g) FROM e GROUP BY {grouping}");
+                assert_eq!(
+                    query_rows(&engine, &sql),
+                    vec![vec![Value::Null, Value::Int(0), Value::Null, Value::Int(1)]],
+                    "{mode:?}: {sql}"
+                );
+            }
+            for expression in [
+                "LEAD(e) OVER ()",
+                "LAG(e) OVER ()",
+                "LEAST(e, NULL)",
+                "GREATEST(e, NULL)",
+                "IF(e='a', e, NULL)",
+                "COALESCE(e, NULL)",
+            ] {
+                let sql = format!("SELECT {expression} FROM e GROUP BY ROLLUP(e) EXCEPT SELECT 1");
+                assert_eq!(query_rows(&engine, &sql), vec![vec![Value::Null]], "{sql}");
+            }
+            assert_eq!(
+                query_rows(
+                    &engine,
+                    "SELECT COUNT(*) FROM e GROUP BY GROUPING SETS ((g), (), ())"
+                ),
+                vec![vec![Value::Int(0)], vec![Value::Int(0)]]
+            );
+            for sql in [
+                "SELECT g FROM e GROUP BY g, ROLLUP(v)",
+                "SELECT g FROM e GROUP BY GROUPING SETS ((g))",
+                "SELECT g FROM e GROUP BY ROLLUP(g) HAVING COUNT(*) > 0",
+                "SELECT g FROM e GROUP BY g WITH ROLLUP",
+            ] {
+                assert!(query_rows(&engine, sql).is_empty(), "{sql}");
+            }
+        });
+    }
+}
+
+#[test]
 fn grouping_sets_fixed_prefix_and_duplicate_sets() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

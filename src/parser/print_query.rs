@@ -217,7 +217,7 @@ pub(super) fn select_sql(select: &Select) -> String {
         let keys = select.group_by.iter().map(expr).collect::<Vec<_>>();
         let group = match select.group_by_modifier {
             GroupByModifier::None => keys.join(", "),
-            GroupByModifier::Rollup => format!("ROLLUP ({})", keys.join(", ")),
+            GroupByModifier::Rollup => format!("{} WITH ROLLUP", keys.join(", ")),
             GroupByModifier::Cube => format!("CUBE ({})", keys.join(", ")),
             GroupByModifier::GroupingSets => format!(
                 "GROUPING SETS ({})",
@@ -376,6 +376,9 @@ mod tests {
             "tenant IN(SELECT tenant FROM authz WHERE enabled=TRUE ORDER BY tenant DESC LIMIT 3)",
             "tenant=ANY(SELECT tenant FROM authz)",
             "EXISTS(SELECT COUNT(*) FROM authz GROUP BY tenant HAVING COUNT(*)>1)",
+            "EXISTS(SELECT COUNT(*) FROM authz GROUP BY tenant WITH ROLLUP)",
+            "EXISTS(SELECT COUNT(*) FROM authz GROUP BY ROLLUP(tenant))",
+            "EXISTS(SELECT COUNT(*) FROM authz GROUP BY GROUPING SETS ((tenant), ()))",
             "EXISTS(SELECT ROW_NUMBER() OVER(PARTITION BY tenant ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) FROM authz)",
         ] {
             let original = policy_expression(sql);

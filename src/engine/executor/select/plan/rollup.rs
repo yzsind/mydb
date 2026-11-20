@@ -1977,11 +1977,10 @@ fn grouping_sets_emit_from_vec_finest(
 ) -> Result<Vec<PlanRow>, QueryError> {
     use crate::engine::expr::ValueKey;
 
-    // Preserve the established empty-input behavior for GROUPING SETS with
-    // non-empty grouping expressions: no finest groups means no output. Most
-    // importantly, the already-consumed batch input is not reopened.
+    // An explicit () groups the empty input too. Do not reopen the consumed
+    // batch input, and preserve duplicate empty sets and HAVING evaluation.
     if finest.groups.is_empty() {
-        return Ok(Vec::new());
+        return emit_empty_grouping_sets(group_by_len, grouping_sets, having, slots);
     }
     let mut groups: hashbrown::HashMap<Vec<ValueKey>, FinestGroupState, ahash::RandomState> =
         hashbrown::HashMap::with_hasher(ahash::RandomState::new());
@@ -2046,24 +2045,9 @@ pub(in crate::engine::executor::select) fn aggregate_grouping_sets_plan_rows(
     let needs_sample_fields = aggregate_slots_need_sample_fields(slots);
     let per_group_bytes = 64 + slots.len() * 32;
     let mut group_charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
-    let mut out = Vec::new();
 
-    // Empty input (preserve the pre-optimization behavior exactly): only when
-    // there are no GROUP BY columns at all does each grouping set emit its
-    // single super-aggregate `()` row; otherwise nothing is emitted.
     if input_rows.is_empty() {
-        if group_by.is_empty() {
-            for set_indices in grouping_sets.iter() {
-                let state = GroupingSetGroupState {
-                    set_indices: set_indices.clone(),
-                    group_values: Vec::new(),
-                    sample_fields: Vec::new(),
-                    accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
-                };
-                emit_grouping_set_group_state(&mut out, slots, group_by_len, state, having)?;
-            }
-        }
-        return Ok(out);
+        return emit_empty_grouping_sets(group_by_len, grouping_sets, having, slots);
     }
 
     // ---- Phase 1: aggregate the finest grouping (ALL columns), one probe/row.
@@ -2253,6 +2237,25 @@ fn update_finest_accumulators(
         }
     }
     Ok(())
+}
+
+fn emit_empty_grouping_sets(
+    group_by_len: usize,
+    grouping_sets: &[Vec<usize>],
+    having: Option<&Expr>,
+    slots: &[super::aggregate::AggregateSlot],
+) -> Result<Vec<PlanRow>, QueryError> {
+    let mut out = Vec::new();
+    for set_indices in grouping_sets.iter().filter(|set| set.is_empty()) {
+        let state = GroupingSetGroupState {
+            set_indices: set_indices.clone(),
+            group_values: Vec::new(),
+            sample_fields: Vec::new(),
+            accumulators: slots.iter().map(|slot| slot.make_accumulator()).collect(),
+        };
+        emit_grouping_set_group_state(&mut out, slots, group_by_len, state, having)?;
+    }
+    Ok(out)
 }
 
 fn emit_grouping_set_group_state(

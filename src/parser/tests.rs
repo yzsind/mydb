@@ -2020,7 +2020,7 @@ fn parses_rollup_cube_and_grouping_sets() {
     else {
         panic!("expected select");
     };
-    assert_eq!(select.group_by_modifier, GroupByModifier::Rollup);
+    assert_eq!(select.group_by_modifier, GroupByModifier::GroupingSets);
     assert_eq!(select.group_by.len(), 2);
     assert_eq!(select.grouping_sets, vec![vec![0, 1], vec![0], vec![]]);
 
