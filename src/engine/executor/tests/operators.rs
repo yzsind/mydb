@@ -1159,8 +1159,9 @@ fn bit_literal_numeric_in_arithmetic() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
 
-    assert_eq!(scalar(&engine, "SELECT b'1010' + 1"), Value::UInt(11));
-    assert_eq!(scalar(&engine, "SELECT b'1111' * 2"), Value::UInt(30));
+    // A bit literal is a signed integer in arithmetic (`b'1010' - 127` is -117).
+    assert_eq!(scalar(&engine, "SELECT b'1010' + 1"), Value::Int(11));
+    assert_eq!(scalar(&engine, "SELECT b'1111' * 2"), Value::Int(30));
     assert_eq!(
         scalar(&engine, "SELECT b'1010' & b'1100'"),
         Value::UInt(0b1000)

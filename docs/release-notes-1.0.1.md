@@ -1,5 +1,22 @@
 # MyDB 1.0.1 — Public Preview
 
+## Downloads
+
+| Platform | Archive | Native validation environment |
+| --- | --- | --- |
+| macOS Apple Silicon | [`mydb-1.0.1-macos-arm64.tar.gz`](https://github.com/yzsind/mydb/releases/download/v1.0.1/mydb-1.0.1-macos-arm64.tar.gz) | macOS ARM64 |
+| Linux x86_64 (glibc 2.17 baseline) | [`mydb-1.0.1-linux-x86_64.tar.gz`](https://github.com/yzsind/mydb/releases/download/v1.0.1/mydb-1.0.1-linux-x86_64.tar.gz) | Ubuntu 24.04 x86_64 |
+| Windows x64 | [`mydb-1.0.1-windows-x86_64.zip`](https://github.com/yzsind/mydb/releases/download/v1.0.1/mydb-1.0.1-windows-x86_64.zip) | GitHub `windows-2022` x64 runner |
+
+[Download SHA256SUMS](https://github.com/yzsind/mydb/releases/download/v1.0.1/SHA256SUMS) to verify the archives.
+
+Each runtime archive includes `mydb`, `mydb-cli`, `mydb-backup`,
+the Apache-2.0 license, third-party license texts, and required corresponding
+MPL source archives. Windows executables use the `.exe` suffix and require
+compatible Visual C++ and Universal CRT runtimes.
+
+## Overview
+
 MyDB 1.0.1 improves MySQL compatibility, SQL correctness, and replication
 recovery. It adds an optional loopback HTTP listener alongside REST and MCP
 HTTPS, and low disk space protection for persistent instances on Linux and
@@ -9,38 +26,6 @@ writes. These notes cover changes since
 
 **Release maturity** — 1.0.1 is a public preview for feature validation,
 compatibility testing, and evaluation in controlled environments.
-
-**Release status** — Planned. Package availability and validation results will
-be recorded when the release is published.
-
-## Moving from 1.0.0 to 1.0.1
-
-**Use a fresh data directory.** The WAL format advances from 40 to 41 for the
-native replication visibility fix. A 1.0.1 binary cannot open a 1.0.0 data
-directory or restore its physical backups or archived WAL.
-
-- **Native MyDB replication** moves from protocol v3 to v4. Both endpoints
-  require matching protocol and physical formats. Rebuild replicas from the
-  migrated 1.0.1 primary.
-- **MySQL-to-MyDB replication** moves from relay record format v1 to v2. Set up
-  fresh channels and relay logs on 1.0.1. Initialize each channel from a
-  consistent copy with the corresponding source file and position or GTID
-  state. Keep old relay files with the 1.0.0 instance.
-
-Keep the original data directory, keys, and a verified backup with the 1.0.0
-binary. Export schema and data from the old instance, then reload into a fresh
-1.0.1 instance and validate data, indexes, permissions, and representative
-application queries before switching writes. Recreate instance objects such as
-users and grants as needed. Plan rollback before cutover, because writes accepted
-by 1.0.1 cannot be replayed back to 1.0.0 using physical WAL.
-See the [version change guide](changing-versions.md) and
-[storage format registry](storage-format-versions.md).
-
-Review the new disk space requirements before first startup. Check schema
-definitions and driver collation settings for unsupported UCA 9.0 variants
-before importing or connecting. Also check callers that depend on string types
-from `SELECT @@variable`, permissive variable assignments, or whitespace when
-invoking built-in functions.
 
 ## MySQL compatibility
 
@@ -252,35 +237,50 @@ See the [result checker documentation](../scripts/README.md).
 
 ## Release validation
 
-The release is planned from the final `v1.0.1` source tag using Rust 1.95.0,
+The release is built from the `v1.0.1` source tag using Rust 1.95.0,
 locked dependencies, the default server features, and the repository's release
 profile. The release checks cover server and CLI CI, recovery and replication
 safety tests, and native verification of extracted packages. Package checks
 cover file hashes, binary versions and help, required TLS, typed SQL,
 transaction rollback, crash recovery, and secondary index reads. Linux packages
-also require the glibc 2.17 ABI check. The GitHub Release will record the final
+also require the glibc 2.17 ABI check. The
+[GitHub Release](https://github.com/yzsind/mydb/releases/tag/v1.0.1) records the
 source commit and validation results.
-
-## Planned release packages
-
-The GitHub Release is planned to include the following archives and `SHA256SUMS`.
-
-| Platform | Archive | Planned native validation |
-| --- | --- | --- |
-| macOS Apple Silicon | `mydb-1.0.1-macos-arm64.tar.gz` | macOS ARM64 |
-| Linux x86_64 (glibc 2.17 baseline) | `mydb-1.0.1-linux-x86_64.tar.gz` | Ubuntu 24.04 x86_64 |
-| Windows x64 | `mydb-1.0.1-windows-x86_64.zip` | GitHub `windows-2022` x64 runner |
-
-Each runtime archive is planned to include `mydb`, `mydb-cli`, `mydb-backup`,
-the Apache-2.0 license, third-party license texts, and required corresponding
-MPL source archives. Windows executables use the `.exe` suffix and require
-compatible Visual C++ and Universal CRT runtimes.
 
 ## Documentation, feedback, and license
 
 - [Documentation](README.md) and the new [Simplified Chinese project README](../readme_cn.md)
 - [Feature overview](feature-overview.md) and [issue reporting guide](reporting-issues.md)
-- [Source changes since 1.0.0](https://github.com/yzsind/mydb/compare/v1.0.0...4953c70cc1898508d101acb4b4a6930347554016)
+- [Source changes since 1.0.0](https://github.com/yzsind/mydb/compare/v1.0.0...v1.0.1)
 - [Report an issue](https://github.com/yzsind/mydb/issues) with the exact version,
   OS, relevant logs, and reproducible SQL or scripts.
 - [Apache License 2.0](../LICENSE)
+
+## Moving from 1.0.0 to 1.0.1
+
+**Use a fresh data directory.** The WAL format advances from 40 to 41 for the
+native replication visibility fix. A 1.0.1 binary cannot open a 1.0.0 data
+directory or restore its physical backups or archived WAL.
+
+- **Native MyDB replication** moves from protocol v3 to v4. Both endpoints
+  require matching protocol and physical formats. Rebuild replicas from the
+  migrated 1.0.1 primary.
+- **MySQL-to-MyDB replication** moves from relay record format v1 to v2. Set up
+  fresh channels and relay logs on 1.0.1. Initialize each channel from a
+  consistent copy with the corresponding source file and position or GTID
+  state. Keep old relay files with the 1.0.0 instance.
+
+Keep the original data directory, keys, and a verified backup with the 1.0.0
+binary. Export schema and data from the old instance, then reload into a fresh
+1.0.1 instance and validate data, indexes, permissions, and representative
+application queries before switching writes. Recreate instance objects such as
+users and grants as needed. Plan rollback before cutover, because writes accepted
+by 1.0.1 cannot be replayed back to 1.0.0 using physical WAL.
+See the [version change guide](changing-versions.md) and
+[storage format registry](storage-format-versions.md).
+
+Review the new disk space requirements before first startup. Check schema
+definitions and driver collation settings for unsupported UCA 9.0 variants
+before importing or connecting. Also check callers that depend on string types
+from `SELECT @@variable`, permissive variable assignments, or whitespace when
+invoking built-in functions.

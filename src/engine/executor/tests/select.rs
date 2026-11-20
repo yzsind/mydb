@@ -13578,8 +13578,9 @@ fn storage_engine_evaluates_date_arithmetic() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(result.rows[0][0], Value::String("2026-02-15".into()));
-    assert_eq!(result.rows[0][1], Value::String("2026-02-28".into()));
+    assert!(matches!(result.rows[0][0], Value::Date(_)));
+    assert_eq!(result.rows[0][0].to_display_string(), "2026-02-15");
+    assert_eq!(result.rows[0][1].to_display_string(), "2026-02-28");
 
     let QueryResponse::ResultSet(result) = engine
         .execute(
@@ -13614,7 +13615,8 @@ fn storage_engine_evaluates_date_arithmetic() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(result.rows[0][0], Value::String("2026-02-01".into()));
+    assert!(matches!(result.rows[0][0], Value::Date(_)));
+    assert_eq!(result.rows[0][0].to_display_string(), "2026-02-01");
     assert_eq!(result.rows[0][1], Value::Time(37_230_000_000));
     assert_eq!(result.rows[0][2], Value::Time(37_230_000_000));
 }
@@ -13632,12 +13634,10 @@ fn storage_engine_evaluates_date_add_with_various_units() {
     else {
         panic!("expected result set");
     };
-    assert_eq!(
-        result.rows[0][0],
-        Value::String("2026-01-01 01:00:00".into())
-    );
-    assert_eq!(result.rows[0][1], Value::String("2026-01-08".into()));
-    assert_eq!(result.rows[0][2], Value::String("2027-01-01".into()));
+    assert!(matches!(result.rows[0][0], Value::DateTime(_)));
+    assert_eq!(result.rows[0][0].to_display_string(), "2026-01-01 01:00:00");
+    assert_eq!(result.rows[0][1].to_display_string(), "2026-01-08");
+    assert_eq!(result.rows[0][2].to_display_string(), "2027-01-01");
 }
 
 #[test]
@@ -13658,10 +13658,7 @@ fn storage_engine_evaluates_mysql80_date_time_functions() {
     assert_eq!(result.rows[0][1].to_display_string(), "2026-05-07 01:02:03");
     assert!(matches!(result.rows[0][2], Value::Int(_)));
     assert_eq!(result.rows[0][3], Value::String("%Y-%m-%d".into()));
-    assert_eq!(
-        result.rows[0][4],
-        Value::String("2026-01-01 08:00:00".into())
-    );
+    assert_eq!(result.rows[0][4].to_display_string(), "2026-01-01 08:00:00");
 }
 
 #[test]

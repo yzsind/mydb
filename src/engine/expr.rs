@@ -6153,7 +6153,29 @@ where
                 }))
             })
         }
-        "GREATEST" | "LEAST" => eval_greatest_least(name, args, &mut eval_arg, upper == "GREATEST"),
+        "GREATEST" | "LEAST" => {
+            // Row-bound evaluators install the aggregated collation themselves.
+            // Constant-only callers reach here without one, so an explicit
+            // `COLLATE` operand must still select the comparison collation.
+            let greatest = upper == "GREATEST";
+            let explicit = current_compare_collation_id().is_none()
+                && args.iter().any(|arg| derive_coercibility(arg) == 0);
+            let collation = if explicit {
+                aggregate_static_expr_collations(
+                    &args.iter().collect::<Vec<_>>(),
+                    if greatest { "greatest" } else { "least" },
+                )?
+            } else {
+                None
+            };
+            if collation.is_some() {
+                with_compare_collation(collation, || {
+                    eval_greatest_least(name, args, &mut eval_arg, greatest)
+                })
+            } else {
+                eval_greatest_least(name, args, &mut eval_arg, greatest)
+            }
+        }
         "IFNULL" => {
             expect_arg_count(name, args, 2)?;
             let first = eval_arg(&args[0])?;
@@ -6713,6 +6735,14 @@ where
                 return Ok(Value::Null);
             }
             let introducer = matches!(args.get(2), Some(Expr::Literal(Literal::Bool(true))));
+            // `CONVERT(_latin1 X'E9' USING utf8mb4)`: the operand keeps its
+            // introducer's raw octets, which belong to the introducer charset,
+            // not to the conversion target.
+            let value = if introducer {
+                value
+            } else {
+                decode_introducer_operand(value, &args[0])?
+            };
             let value = if introducer && !matches!(value, Value::Bytes(_)) {
                 let client_charset =
                     with_session_view(|view| view.map(|v| v.character_set_client().to_string()))
@@ -7717,16 +7747,20 @@ where
         "WEEK" | "WEEKOFYEAR" => {
             expect_arg_range(name, args, 1, 2)?;
             let values = eval_args(args, &mut eval_arg)?;
-            null_if_any(values, |values| {
-                let mode = if upper == "WEEKOFYEAR" {
-                    Some(3)
-                } else {
-                    // 1-arg WEEK() reads the session default inside the
-                    // shared evaluator (None => default_week_format).
-                    values.get(1).map(int_value).transpose()?
-                };
-                eval_week_value(&values[0], mode)
-            })
+            if values.first().is_none_or(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let mode = if upper == "WEEKOFYEAR" {
+                Some(3)
+            } else {
+                // An omitted or NULL mode reads the session default inside
+                // the shared evaluator (None => default_week_format).
+                match values.get(1) {
+                    None | Some(Value::Null) => None,
+                    Some(mode) => Some(int_value(mode)?),
+                }
+            };
+            eval_week_value(&values[0], mode)
         }
         "QUARTER" => {
             let value = eval_one(name, args, &mut eval_arg)?;
@@ -7822,14 +7856,7 @@ where
                         &Value::String(format!("{year}, {day}")),
                     ));
                 };
-                Ok(Value::String({
-                    let mut buffer = [0; 32];
-                    let days = date.num_days_from_ce() - 719_163;
-                    String::from_utf8(
-                        crate::types::write_date_canonical(days, &mut buffer).to_vec(),
-                    )
-                    .expect("canonical calendar date is ASCII")
-                }))
+                Ok(Value::Date(date.num_days_from_ce() - 719_163))
             })
         }
         "MAKETIME" => {
@@ -8235,7 +8262,7 @@ where
                         );
                         return Ok(Value::Null);
                     };
-                    Ok(Value::String(format_datetime_fsp(result, fsp)))
+                    Ok(typed_textual_temporal_result(result, false, fsp))
                 }
             })
         }
@@ -9188,7 +9215,11 @@ where
                 // Preserve pre-epoch behavior, but extend future conversion
                 // through mydb's full TIMESTAMP domain.
                 if utc_epoch < 0 {
-                    return Ok(Value::String(format_datetime_fsp(dt, text_fsp(&values[0]))));
+                    return Ok(typed_textual_temporal_result(
+                        dt,
+                        false,
+                        text_fsp(&values[0]),
+                    ));
                 }
                 if utc_epoch > crate::types::MAX_TIMESTAMP_SECONDS {
                     return Ok(Value::Null);
@@ -9206,10 +9237,11 @@ where
                     return Ok(Value::Null);
                 }
                 // Echo the input's textual fractional precision.
-                Ok(Value::String(format_datetime_fsp(
+                Ok(typed_textual_temporal_result(
                     out,
+                    false,
                     text_fsp(&values[0]),
-                )))
+                ))
             })
         }
         "__AT_TIME_ZONE" => {
@@ -9588,20 +9620,21 @@ where
         "YEARWEEK" => {
             expect_arg_range(name, args, 1, 2)?;
             let values = eval_args(args, eval_arg)?;
-            null_if_any(values, |values| {
-                let Some(dt) = parse_temporal_function_datetime(&values[0], "date")? else {
-                    return Ok(Value::Null);
-                };
-                let mode = values
-                    .get(1)
-                    .map(int_value)
-                    .transpose()?
-                    .unwrap_or(0)
-                    .rem_euclid(8) as u32
-                    | 2;
-                let (year, week) = mysql_calc_week(dt.date(), mode);
-                Ok(Value::Int(year as i64 * 100 + week as i64))
-            })
+            if values.first().is_none_or(|v| matches!(v, Value::Null)) {
+                return Ok(Value::Null);
+            }
+            let Some(dt) = parse_temporal_function_datetime(&values[0], "date")? else {
+                return Ok(Value::Null);
+            };
+            // An omitted or NULL mode means mode 0.
+            let mode = match values.get(1) {
+                None | Some(Value::Null) => 0,
+                Some(mode) => int_value(mode)?,
+            }
+            .rem_euclid(8) as u32
+                | 2;
+            let (year, week) = mysql_calc_week(dt.date(), mode);
+            Ok(Value::Int(year as i64 * 100 + week as i64))
         }
         "TIME_FORMAT" => {
             expect_arg_count(name, args, 2)?;
@@ -11281,6 +11314,55 @@ where
             };
         }
     }
+    // A DATE/DATETIME/TIMESTAMP argument combined only with character strings
+    // or integers selects MySQL's temporal comparison: every operand is
+    // converted to a datetime, an unconvertible string is skipped with a
+    // warning, and the result keeps the temporal type.
+    let temporal_context = values.iter().any(|value| {
+        matches!(
+            value,
+            Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_)
+        )
+    }) && values.iter().all(|value| {
+        matches!(
+            value,
+            Value::Date(_)
+                | Value::DateTime(_)
+                | Value::Timestamp(_)
+                | Value::String(_)
+                | Value::SmallString(_)
+                | Value::Int(_)
+                | Value::UInt(_)
+                | Value::Null
+        )
+    });
+    if temporal_context {
+        if values.iter().any(|value| matches!(value, Value::Null)) {
+            return Ok(Value::Null);
+        }
+        let date_only = values
+            .iter()
+            .all(|value| !matches!(value, Value::DateTime(_) | Value::Timestamp(_)));
+        let mut best: Option<NaiveDateTime> = None;
+        for value in &values {
+            let Some(candidate) = parse_temporal_function_datetime(value, "date")? else {
+                continue;
+            };
+            best = Some(match best {
+                Some(current)
+                    if (greatest && candidate <= current)
+                        || (!greatest && candidate >= current) =>
+                {
+                    current
+                }
+                _ => candidate,
+            });
+        }
+        return Ok(match best {
+            None => Value::Null,
+            Some(best) => typed_textual_temporal_result(best, date_only, 0),
+        });
+    }
     null_if_any(values, |values| {
         let decimal_scale = values
             .iter()
@@ -12667,6 +12749,30 @@ fn fixed_current_temporal_display_len(expr: &Expr) -> Option<usize> {
     Some(base + usize::from(fsp > 0) + fsp)
 }
 
+/// `CONVERT(_latin1 X'E9' USING utf8mb4)`: an introducer operand keeps its
+/// raw octets, which belong to the introducer charset, not to the conversion
+/// target. Decode them with the introducer's charset first.
+fn decode_introducer_operand(value: Value, operand: &Expr) -> Result<Value, QueryError> {
+    let (Value::Bytes(bytes), Expr::Function { name, args, .. }) = (&value, operand) else {
+        return Ok(value);
+    };
+    if !name.eq_ignore_ascii_case("CONVERT_USING") {
+        return Ok(value);
+    }
+    match args.as_slice() {
+        [_, Expr::Literal(Literal::String(source)), Expr::Literal(Literal::Bool(true))]
+            if !source.eq_ignore_ascii_case("binary") =>
+        {
+            let source = crate::charset::resolve_charset(source)?;
+            Ok(Value::String(crate::charset::decode_bytes(
+                source.name,
+                bytes,
+            )?))
+        }
+        _ => Ok(value),
+    }
+}
+
 fn convert_using_args(expr: &Expr) -> Option<(&Expr, &Expr)> {
     match expr {
         Expr::Function { name, args, .. }
@@ -12696,6 +12802,7 @@ where
     if matches!(value, Value::Null) {
         return Ok(None);
     }
+    let value = decode_introducer_operand(value, inner)?;
     if charset.name == "binary" {
         return Ok(Some(value_bytes(&value)));
     }
@@ -13312,6 +13419,28 @@ pub(crate) fn eval_week_value(v: &Value, mode: Option<i64>) -> Result<Value, Que
 /// `DATE_ADD` / `DATE_SUB` (and the ADDDATE/SUBDATE aliases) on
 /// already-evaluated values. Output shape follows the input: a date-only
 /// argument yields a DATE string.
+/// Typed temporal result for textual temporal-function operands. MySQL's
+/// temporal functions return a value that reads as `YYYYMMDD[HHMMSS]` in numeric
+/// context even when their operand was text, so a whole-second result keeps a
+/// DATE/DATETIME lane instead of an opaque string. Results with a fractional
+/// part retain their canonical text, whose fraction width is data dependent.
+fn typed_textual_temporal_result(result: NaiveDateTime, date_only: bool, fsp: usize) -> Value {
+    if date_only {
+        let epoch = NaiveDate::from_ymd_opt(1970, 1, 1).expect("valid epoch");
+        let days = result.date().signed_duration_since(epoch).num_days();
+        if let Ok(days) = i32::try_from(days) {
+            return Value::Date(days);
+        }
+    } else if fsp == 0 {
+        return Value::DateTime(result.and_utc().timestamp_micros());
+    }
+    Value::String(if date_only {
+        result.date().format("%Y-%m-%d").to_string()
+    } else {
+        format_datetime_fsp(result, fsp)
+    })
+}
+
 pub(crate) fn eval_date_add_values(
     date_val: &Value,
     amount: &Value,
@@ -13486,7 +13615,7 @@ pub(crate) fn eval_date_add_values(
         return Ok(Value::DateTime(result.and_utc().timestamp_micros()));
     }
     if input_is_date_only && !unit_has_time {
-        Ok(Value::String(result.date().format("%Y-%m-%d").to_string()))
+        Ok(typed_textual_temporal_result(result, true, 0))
     } else {
         // Preserve fractional seconds: MySQL's result fsp is the max of the
         // datetime argument's fsp and the interval's (MICROSECOND unit or a
@@ -13499,10 +13628,11 @@ pub(crate) fn eval_date_add_values(
         } else {
             text_fsp(amount)
         };
-        Ok(Value::String(format_datetime_fsp(
+        Ok(typed_textual_temporal_result(
             result,
+            false,
             arg_fsp.max(unit_fsp),
-        )))
+        ))
     }
 }
 
@@ -20365,6 +20495,13 @@ where
     }
 }
 
+fn is_date_lane(value: &Value) -> bool {
+    matches!(
+        value,
+        Value::Date(_) | Value::DateTime(_) | Value::Timestamp(_)
+    )
+}
+
 pub(crate) fn compare_case_values(left: &Value, right: &Value) -> Result<Ordering, QueryError> {
     match (left, right) {
         (Value::Bytes(_), Value::String(_) | Value::SmallString(_)) => {
@@ -20374,6 +20511,22 @@ pub(crate) fn compare_case_values(left: &Value, right: &Value) -> Result<Orderin
         (Value::String(_) | Value::SmallString(_), Value::Bytes(_)) => {
             let right = Value::String(string_value_for_connection(right)?);
             compare_values(left, &right)
+        }
+        (left, right) if is_date_lane(left) != is_date_lane(right) => {
+            match compare_values(left, right) {
+                // A simple CASE whose operand cannot be converted to the other
+                // side's temporal type warns and does not match; only the `=`
+                // operator itself reports ER_WRONG_VALUE.
+                Err(err) if err.is(crate::error::catalog::ER_WRONG_VALUE) => {
+                    crate::engine::api::push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                        "Truncated incorrect date value",
+                    );
+                    Ok(Ordering::Less)
+                }
+                other => other,
+            }
         }
         _ => compare_values(left, right),
     }
@@ -24109,6 +24262,11 @@ pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, Qu
         Value::UInt(v) => *v as i128,
         Value::Float(f) => {
             let r = (*f as f64).round_ties_even();
+            // A negative source converts through BIGINT first, so UNSIGNED
+            // exposes its two's-complement image (`-2` -> 2^64 - 2).
+            if unsigned && (-9_223_372_036_854_775_808.0..0.0).contains(&r) {
+                return Ok(Value::UInt(r as i64 as u64));
+            }
             if !r.is_finite()
                 || if unsigned {
                     !(0.0..18_446_744_073_709_551_616.0).contains(&r)
@@ -24122,7 +24280,7 @@ pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, Qu
                     "Out of range value for CAST to integer",
                 );
                 return Ok(if unsigned {
-                    Value::UInt(if r < 0.0 { 0 } else { u64::MAX })
+                    Value::UInt(if r < 0.0 { i64::MIN as u64 } else { u64::MAX })
                 } else {
                     Value::Int(if r < 0.0 { i64::MIN } else { i64::MAX })
                 });
@@ -24131,6 +24289,11 @@ pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, Qu
         }
         Value::Double(f) => {
             let r = f.round_ties_even();
+            // A negative source converts through BIGINT first, so UNSIGNED
+            // exposes its two's-complement image (`-2` -> 2^64 - 2).
+            if unsigned && (-9_223_372_036_854_775_808.0..0.0).contains(&r) {
+                return Ok(Value::UInt(r as i64 as u64));
+            }
             if !r.is_finite()
                 || if unsigned {
                     !(0.0..18_446_744_073_709_551_616.0).contains(&r)
@@ -24144,7 +24307,7 @@ pub(crate) fn cast_to_integer(value: &Value, unsigned: bool) -> Result<Value, Qu
                     "Out of range value for CAST to integer",
                 );
                 return Ok(if unsigned {
-                    Value::UInt(if r < 0.0 { 0 } else { u64::MAX })
+                    Value::UInt(if r < 0.0 { i64::MIN as u64 } else { u64::MAX })
                 } else {
                     Value::Int(if r < 0.0 { i64::MIN } else { i64::MAX })
                 });
@@ -30687,16 +30850,22 @@ mod interval_overflow_tests {
     fn date_arith_in_range_unchanged() {
         let d = Value::String("2020-01-01".to_string());
         assert_eq!(
-            eval_date_add_values(&d, &Value::Int(1), "DAY", false).unwrap(),
-            Value::String("2020-01-02".to_string())
+            eval_date_add_values(&d, &Value::Int(1), "DAY", false)
+                .unwrap()
+                .to_display_string(),
+            "2020-01-02"
         );
         assert_eq!(
-            eval_date_add_values(&d, &Value::Int(1), "MONTH", true).unwrap(),
-            Value::String("2019-12-01".to_string())
+            eval_date_add_values(&d, &Value::Int(1), "MONTH", true)
+                .unwrap()
+                .to_display_string(),
+            "2019-12-01"
         );
         assert_eq!(
-            eval_date_add_values(&d, &Value::Int(2), "YEAR", false).unwrap(),
-            Value::String("2022-01-01".to_string())
+            eval_date_add_values(&d, &Value::Int(2), "YEAR", false)
+                .unwrap()
+                .to_display_string(),
+            "2022-01-01"
         );
     }
 

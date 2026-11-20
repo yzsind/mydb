@@ -40,8 +40,45 @@ use tokio::sync::Semaphore;
 
 /// A permit representing one admitted (open, lock-holding) transaction. Dropping
 /// it — on commit/rollback or when the session is dropped — frees the slot.
+#[derive(Debug)]
 pub struct AdmissionPermit {
-    _normal: tokio::sync::SemaphorePermit<'static>,
+    _slot: tokio::sync::SemaphorePermit<'static>,
+    on_completion: bool,
+}
+
+/// Only the live session executing a terminal statement owns its permit.
+/// A cloned evaluation context must neither retain nor release that permit.
+#[derive(Debug, Default)]
+pub(crate) struct CompletionAdmission {
+    pub(crate) permit: Option<AdmissionPermit>,
+}
+
+impl Clone for CompletionAdmission {
+    fn clone(&self) -> Self {
+        Self::default()
+    }
+}
+
+impl CompletionAdmission {
+    pub(crate) fn after_row_unlock(&mut self) {
+        let Some(permit) = self.permit.as_mut() else {
+            return;
+        };
+        if let Some(spare) = admission_gates().completion.as_deref() {
+            permit.try_move_to(spare);
+        }
+    }
+}
+
+impl AdmissionPermit {
+    fn try_move_to(&mut self, spare: &'static Semaphore) {
+        if !self.on_completion {
+            if let Ok(slot) = spare.try_acquire() {
+                self._slot = slot;
+                self.on_completion = true;
+            }
+        }
+    }
 }
 
 static PARALLEL_READ_PRESSURE: AtomicUsize = AtomicUsize::new(0);
@@ -340,24 +377,43 @@ fn configured_limit(raw: Option<&str>, automatic: usize, blocking_workers: usize
     requested.min(worker_safe_limit)
 }
 
-/// The process-wide admission semaphore, or `None` when unconfigured or
-/// explicitly disabled with `MYDB_TXN_ADMISSION=0`.
-pub fn global() -> Option<&'static Arc<Semaphore>> {
-    static SEM: OnceLock<Option<Arc<Semaphore>>> = OnceLock::new();
-    SEM.get_or_init(|| {
-        let raw = crate::util::env::var("MYDB_TXN_ADMISSION").ok();
-        let n = configured_limit(
-            raw.as_deref(),
+struct AdmissionGates {
+    execution: Option<Arc<Semaphore>>,
+    completion: Option<Arc<Semaphore>>,
+}
+
+impl AdmissionGates {
+    fn new(raw: Option<&str>, automatic: usize, workers: usize) -> Self {
+        let execution = configured_limit(raw, automatic, workers);
+        // Explicit limits cover the whole transaction. In automatic mode,
+        // reserve one funded worker to run a lock-releasing statement.
+        let completion = if raw.is_none_or(|value| value.trim().is_empty()) {
+            workers.saturating_sub(execution.saturating_add(1))
+        } else {
+            0
+        };
+        let gate = |slots| (slots > 0).then(|| Arc::new(Semaphore::new(slots)));
+        Self {
+            execution: gate(execution),
+            completion: gate(completion),
+        }
+    }
+}
+
+fn admission_gates() -> &'static AdmissionGates {
+    static GATES: OnceLock<AdmissionGates> = OnceLock::new();
+    GATES.get_or_init(|| {
+        AdmissionGates::new(
+            crate::util::env::var("MYDB_TXN_ADMISSION").ok().as_deref(),
             automatic_limit(),
             crate::util::blocking_pool::configured_max_workers(),
-        );
-        if n == 0 {
-            None
-        } else {
-            Some(Arc::new(Semaphore::new(n)))
-        }
+        )
     })
-    .as_ref()
+}
+
+/// The process-wide execution gate, absent when admission is disabled.
+pub fn global() -> Option<&'static Arc<Semaphore>> {
+    admission_gates().execution.as_ref()
 }
 
 /// Acquire normal admission, then shape the transaction start under analytical
@@ -405,7 +461,10 @@ pub async fn acquire() -> Option<AdmissionPermit> {
         // accidental low concurrency ceiling.
         drop(permit);
     }
-    Some(AdmissionPermit { _normal: normal })
+    Some(AdmissionPermit {
+        _slot: normal,
+        on_completion: false,
+    })
 }
 
 #[cfg(test)]
@@ -414,6 +473,59 @@ mod tests {
         automatic_limit, automatic_limit_for, configured_limit, mixed_workload_limit_for,
         parallel_read_pressure_eligible,
     };
+
+    #[test]
+    fn completion_slots_keep_one_owner_and_never_wait_to_transfer() {
+        use super::{AdmissionPermit, CompletionAdmission};
+        use tokio::sync::Semaphore;
+        static NORMAL: Semaphore = Semaphore::const_new(2);
+        static SPARE: Semaphore = Semaphore::const_new(1);
+        let new = || AdmissionPermit {
+            _slot: NORMAL.try_acquire().unwrap(),
+            on_completion: false,
+        };
+        let mut first = CompletionAdmission {
+            permit: Some(new()),
+        };
+        let mut second = new();
+        assert!(first.clone().permit.is_none());
+        first.permit.as_mut().unwrap().try_move_to(&SPARE);
+        assert_eq!(
+            (NORMAL.available_permits(), SPARE.available_permits()),
+            (1, 0)
+        );
+        second.try_move_to(&SPARE);
+        assert_eq!(NORMAL.available_permits(), 1);
+        drop(first);
+        second.try_move_to(&SPARE);
+        assert_eq!(
+            (NORMAL.available_permits(), SPARE.available_permits()),
+            (2, 0)
+        );
+        drop(second);
+        assert_eq!(SPARE.available_permits(), 1);
+    }
+
+    #[test]
+    fn execution_and_completion_share_the_funded_worker_budget() {
+        for (raw, workers, execution, completion) in [
+            (None, 32, 16, 15),
+            (Some("  "), 16, 15, 0),
+            (None, 1, 1, 0),
+            (Some("8"), 32, 8, 0),
+            (Some("0"), 32, 0, 0),
+        ] {
+            let gates = super::AdmissionGates::new(raw, 16, workers);
+            assert_eq!(
+                gates.execution.map(|s| s.available_permits()),
+                (execution > 0).then_some(execution)
+            );
+            assert_eq!(
+                gates.completion.map(|s| s.available_permits()),
+                (completion > 0).then_some(completion)
+            );
+        }
+    }
 
     fn enter_pressure(eligible: bool) -> Option<super::ParallelReadPressureGuard> {
         let budget = crate::engine::executor::mem_budget::current_budget().unwrap_or_else(|| {

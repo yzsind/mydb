@@ -1887,13 +1887,12 @@ impl LogManager {
                     .extension()
                     .is_some_and(|extension| extension == "pending")
                 {
-                    sync_wal_file(
-                        &OpenOptions::new()
-                            .read(true)
-                            .write(true)
-                            .open(&segment.path)
-                            .map_err(io_err)?,
-                    )?;
+                    let file = OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(&segment.path)
+                        .map_err(io_err)?;
+                    sync_wal_file(&file)?;
                 }
             }
             discovered

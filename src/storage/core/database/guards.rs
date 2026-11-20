@@ -8,7 +8,7 @@ impl Database {
         })
     }
 
-    fn catalog_write(&self) -> Result<RwLockWriteGuard<'_, Catalog>, QueryError> {
+    fn catalog_write(&self) -> Result<CatalogWriteGuard<'_>, QueryError> {
         self.catalog.write().map_err(|_| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,

@@ -1820,6 +1820,11 @@ pub struct DmlStatementResult {
 }
 
 pub trait QueryEngine: Send + Sync + 'static {
+    /// Admission for synchronous metadata work on a connection reactor.
+    /// Engines without a mutable storage catalog need no permit.
+    fn catalog_admission(&self) -> Option<&crate::util::catalog_admission::CatalogAdmission> {
+        None
+    }
     fn authenticate_api_key(
         &self,
         _token: &str,
@@ -2363,6 +2368,7 @@ pub(crate) struct RestSessionIdentity {
 
 #[derive(Debug, Clone)]
 pub struct SessionContext {
+    pub(crate) completion_admission: crate::util::exec_permit::CompletionAdmission,
     pub rls: super::rls::SessionContext,
     pub autocommit: bool,
     pub isolation: IsolationLevel,
@@ -3321,6 +3327,7 @@ impl SessionContext {
             parse_temporal_sql_mode_bits(&sql_mode) | TEMPORAL_MODE_EXPLICIT;
         let sysvars = SessionSysVarState::default();
         Self {
+            completion_admission: Default::default(),
             rls: super::rls::SessionContext::default(),
             autocommit: true,
             isolation: global_transaction_isolation(),

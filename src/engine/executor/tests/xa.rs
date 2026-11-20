@@ -679,10 +679,11 @@ fn audit_idle_xa_rejects_queries() {
     expect_ok(&engine, &mut s, "XA START 'idle'");
     expect_ok(&engine, &mut s, "INSERT INTO t VALUES (1)");
     expect_ok(&engine, &mut s, "XA END 'idle'");
-    for sql in ["INSERT INTO t VALUES (2)", "SELECT * FROM t", "SELECT 1"] {
+    for sql in ["INSERT INTO t VALUES (2)", "SELECT * FROM t"] {
         expect_err_code(&engine, &mut s, sql, 1399);
-        assert!(s.current_txn.is_none());
     }
+    // Table-free queries stay legal in IDLE (MySQL 8.0 behavior).
+    assert_eq!(fetch_int_rows(&engine, &mut s, "SELECT 1"), vec![1]);
     expect_ok(&engine, &mut s, "XA COMMIT 'idle' ONE PHASE");
     assert_eq!(fetch_int_rows(&engine, &mut s, "SELECT id FROM t"), vec![1]);
 }
@@ -702,6 +703,9 @@ fn audit_xa_duplicate_active_and_foreign_completion() {
     for sql in ["XA COMMIT 'other'", "XA ROLLBACK 'other'"] {
         expect_err_code(&engine, &mut s, sql, 1399);
     }
+    // MySQL only rolls back IDLE or PREPARED branches.
+    expect_err_code(&engine, &mut s, "XA ROLLBACK 'dup_active'", 1399);
+    expect_ok(&engine, &mut s, "XA END 'dup_active'");
     expect_ok(&engine, &mut s, "XA ROLLBACK 'dup_active'");
     expect_ok(&engine, &mut s, "XA ROLLBACK 'other'");
 }
@@ -963,11 +967,7 @@ fn audit_prepared_select_respects_idle_xa() {
     expect_ok(&engine, &mut s, "XA START 'prepared_read'");
     expect_ok(&engine, &mut s, "XA END 'prepared_read'");
     let constant = engine.parse_cached_statement(&s, "SELECT 1").unwrap();
-    let err = engine
-        .execute_parsed(&mut s, "SELECT 1", constant)
-        .unwrap_err();
-    assert_eq!(err.code(), 1399);
-    assert!(s.current_txn.is_none());
+    engine.execute_parsed(&mut s, "SELECT 1", constant).unwrap();
     let err = engine
         .execute_prepared_select(&mut s, &mut memo, &parsed, sql, &[Value::Int(1)])
         .unwrap()

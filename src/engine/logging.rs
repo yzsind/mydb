@@ -1017,6 +1017,46 @@ pub(crate) fn redact_sql_for_log_borrowed(sql: &str) -> std::borrow::Cow<'_, str
     if crate::engine::ai::sql::sql_may_have_ai(sql) || crate::engine::http::sensitive(sql) {
         return Cow::Borrowed(crate::engine::http::redaction_marker(sql, false));
     }
+    if is_credential_statement(sql) {
+        return Cow::Borrowed("[redacted credential statement]");
+    }
+    if sql.len() <= MAX_SQL_LOG_BYTES {
+        Cow::Borrowed(sql)
+    } else {
+        Cow::Owned(truncate_sql_for_log(sql))
+    }
+}
+
+/// Skip whitespace and comments that precede a statement keyword. The body of
+/// an executable comment (`/*! ... */`, `/*+ ... */` is a hint and skipped) is
+/// code the server runs, so its opening delimiter and optional version number
+/// are skipped while the contents are kept. Returns the remaining text.
+fn skip_leading_sql_noise(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(rest) = sql.strip_prefix("/*!") {
+            sql = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+        } else if let Some(rest) = sql.strip_prefix("/*") {
+            match rest.find("*/") {
+                Some(end) => sql = &rest[end + 2..],
+                None => return "",
+            }
+        } else if sql.starts_with('#') || sql.starts_with("--") {
+            match sql.find('\n') {
+                Some(end) => sql = &sql[end + 1..],
+                None => return "",
+            }
+        } else {
+            return sql;
+        }
+    }
+}
+
+/// Whether a statement carries credentials that must never reach a log sink
+/// (`ALTER USER`, `CREATE USER`, `SET PASSWORD`, `IDENTIFIED BY`, `PASSWORD(`),
+/// including after leading comments such as a client banner. The same decision
+/// applies to error messages, which can echo the offending token.
+pub(crate) fn is_credential_statement(sql: &str) -> bool {
     fn starts_with_ascii_case_insensitive(haystack: &str, needle: &[u8]) -> bool {
         haystack
             .as_bytes()
@@ -1039,23 +1079,15 @@ pub(crate) fn redact_sql_for_log_borrowed(sql: &str) -> std::borrow::Cow<'_, str
         })
     }
 
-    // Preserve the exact credential-redaction surface while avoiding an owned,
-    // uppercased copy of a multi-megabyte statement. Search for a selective
-    // letter inside each pattern rather than testing every separator space.
-    let trimmed = sql.trim_start();
-    if starts_with_ascii_case_insensitive(trimmed, b"ALTER USER")
-        || starts_with_ascii_case_insensitive(trimmed, b"CREATE USER")
-        || starts_with_ascii_case_insensitive(trimmed, b"SET PASSWORD")
+    // Avoid an owned, uppercased copy of a multi-megabyte statement. Search
+    // for a selective letter inside each pattern rather than testing every
+    // separator space.
+    let head = skip_leading_sql_noise(sql);
+    starts_with_ascii_case_insensitive(head, b"ALTER USER")
+        || starts_with_ascii_case_insensitive(head, b"CREATE USER")
+        || starts_with_ascii_case_insensitive(head, b"SET PASSWORD")
         || contains_ascii_case_insensitive(sql, b" IDENTIFIED BY ", 13)
         || contains_ascii_case_insensitive(sql, b" PASSWORD(", 5)
-    {
-        return Cow::Borrowed("[redacted credential statement]");
-    }
-    if sql.len() <= MAX_SQL_LOG_BYTES {
-        Cow::Borrowed(sql)
-    } else {
-        Cow::Owned(truncate_sql_for_log(sql))
-    }
 }
 
 fn response_rows_sent(result: &Result<QueryResponse, QueryError>) -> u64 {
@@ -1337,6 +1369,32 @@ mod boolean_contract_tests {
                     raw.trim().to_ascii_uppercase()
                 )
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod credential_statement_tests {
+    use super::*;
+
+    #[test]
+    fn credential_statements_are_detected_behind_leading_noise() {
+        for sql in [
+            "ALTER USER u IDENTIFIED BY 'x'",
+            "/* banner */ SET PASSWORD = 'x'",
+            "-- c\n  create user u identified by 'x'",
+            "# c\nSET PASSWORD FOR u = PASSWORD('x')",
+            "/*!80000 ALTER USER u IDENTIFIED BY 'x' */",
+            "SELECT 1 /* IDENTIFIED BY 'x' */ FROM t WHERE c = 'IDENTIFIED BY'",
+        ] {
+            assert!(is_credential_statement(sql), "{sql}");
+        }
+        for sql in [
+            "SELECT 1",
+            "/* c */ SELECT name FROM users",
+            "INSERT INTO t VALUES ('a')",
+        ] {
+            assert!(!is_credential_statement(sql), "{sql}");
         }
     }
 }

@@ -1338,12 +1338,8 @@ pub(super) fn execute_prepared_point_update(
             crate::engine::expr::validate_dml_temporal_functions(selection)?;
         }
     }
-    let row_id = db.lock_unique_index_row_for_write(
-        txn,
-        &point.table,
-        &point.index,
-        point.key.clone(),
-    )?;
+    let row_id =
+        db.lock_unique_index_row_for_write(txn, &point.table, &point.index, point.key.clone())?;
     let Some(row_id) = row_id else {
         crate::engine::api::set_statement_matched_rows(0);
         return Ok(QueryResponse::OkAffected { affected_rows: 0 });

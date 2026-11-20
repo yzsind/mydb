@@ -335,7 +335,9 @@ pub(super) fn commit_session_txn(
 ) -> Result<(), QueryError> {
     if let Some(txn_id) = session.current_txn {
         if db.is_txn_active(txn_id) {
-            match db.commit_txn(txn_id) {
+            match db.commit_txn_with_unlock_hook(txn_id, || {
+                session.completion_admission.after_row_unlock()
+            }) {
                 Ok(_) => {}
                 Err(err) if is_inactive_transaction_error(&err) && !db.is_txn_active(txn_id) => {}
                 Err(err) => return Err(err),
@@ -375,7 +377,9 @@ pub(super) fn rollback_session_txn(
         .filter(|txn_id| Some(*txn_id) != session.current_txn);
     for txn_id in [session.current_txn, detached_xa].into_iter().flatten() {
         if db.is_txn_active(txn_id) {
-            match db.rollback_txn(txn_id) {
+            match db.rollback_txn_with_unlock_hook(txn_id, || {
+                session.completion_admission.after_row_unlock()
+            }) {
                 Ok(()) => {}
                 Err(err) if is_inactive_transaction_error(&err) && !db.is_txn_active(txn_id) => {}
                 Err(err) => return Err(err),
@@ -502,10 +506,15 @@ fn ensure_statement_txn_slot(
     session: &mut SessionContext,
     dml: bool,
 ) -> Result<(u64, IsolationLevel), QueryError> {
-    if session
-        .xa_branch
-        .as_ref()
-        .is_some_and(|b| b.state == XaBranchState::Idle)
+    // Statements that open tables are rejected up front by
+    // `ensure_xa_statement_allowed`; only writes must never reach an IDLE
+    // branch here. Table-free queries are legal in IDLE and just reuse the
+    // branch's transaction.
+    if dml
+        && session
+            .xa_branch
+            .as_ref()
+            .is_some_and(|b| b.state == XaBranchState::Idle)
     {
         return Err(xa_err(
             crate::error::catalog::ER_XAER_RMFAIL,
@@ -1198,6 +1207,12 @@ pub(super) fn xa_end(
             "XAER_NOTA: XID does not match the session's active XA branch",
         ));
     }
+    if branch.state == XaBranchState::RollbackOnly {
+        return Err(xa_err(
+            crate::error::catalog::ER_XA_RBDEADLOCK,
+            "Transaction branch was rolled back: deadlock was detected",
+        ));
+    }
     if branch.state != XaBranchState::Active
         || session.current_txn != Some(branch.txn_id)
         || !db.is_txn_active(branch.txn_id)
@@ -1268,6 +1283,18 @@ pub(super) fn xa_commit(
             "XAER_RMFAIL: another branch is bound to this session",
         ));
     }
+    if session
+        .xa_branch
+        .as_ref()
+        .is_some_and(|branch| branch.state == XaBranchState::RollbackOnly)
+    {
+        // The branch can no longer commit: finish it, then report why.
+        rollback_session_txn(db, session)?;
+        return Err(xa_err(
+            crate::error::catalog::ER_XA_RBDEADLOCK,
+            "Transaction branch was rolled back: deadlock was detected",
+        ));
+    }
     if one_phase {
         if session.xa_branch.is_none() && db.prepared_xa_contains(&xid) {
             return Err(xa_err(
@@ -1321,8 +1348,16 @@ pub(super) fn xa_rollback(
     if let Some(branch) = session.xa_branch.as_ref() {
         if branch.xid == xid {
             let txn_id = branch.txn_id;
-            // Always allow ROLLBACK from ACTIVE or IDLE — re-attach so the
-            // existing rollback path runs.
+            if branch.state == XaBranchState::Active {
+                return Err(xa_err(
+                    crate::error::catalog::ER_XAER_RMFAIL,
+                    "XAER_RMFAIL: XA ROLLBACK requires XA END first",
+                ));
+            }
+            if branch.state == XaBranchState::RollbackOnly {
+                // The storage transaction is already gone; release the XID.
+                return rollback_session_txn(db, session);
+            }
             session.set_current_txn(Some(txn_id));
             let result = rollback_session_txn(db, session);
             if result.is_ok() {

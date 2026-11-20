@@ -17,6 +17,8 @@ mod recyclebin;
 mod release_audit_1013;
 mod release_audit_1014;
 mod release_audit_1022;
+mod release_audit_1119;
+mod release_audit_1119_expr;
 mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;

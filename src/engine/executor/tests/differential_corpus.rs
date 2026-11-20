@@ -1299,6 +1299,7 @@ const KNOWN_EMPTY_ORACLES: &[(&str, &str)] = &[
     ("tpcds", "q23b"),
     ("tpcds", "q24a"),
     ("tpcds", "q24b"),
+    ("tpcds", "q27"),
     ("tpcds", "q30"),
     ("tpcds", "q33"),
     ("tpcds", "q34"),
