@@ -15763,6 +15763,25 @@ pub(crate) fn value_bytes(value: &Value) -> Vec<u8> {
     value_bytes_ref(value).into_owned()
 }
 
+/// Bind a binary comparison operand with its source character-set
+/// provenance. Assignment padding/truncation is deliberately not applied:
+/// comparison constants must retain their complete octet sequence.
+pub(crate) fn binary_comparison_constant(
+    value: &Value,
+    source: &Expr,
+    table: &TableSchema,
+) -> Option<Value> {
+    match value {
+        Value::Bytes(_) | Value::Null => Some(value.clone()),
+        Value::String(_) | Value::SmallString(_) => {
+            let charset =
+                expr_collation(source, table).map_or_else(connection_charset, |c| c.charset);
+            encode_binary_assignment_value(value.clone(), charset).ok()
+        }
+        _ => None,
+    }
+}
+
 fn bind_binary_comparison_value(
     expr: &Expr,
     table: &TableSchema,

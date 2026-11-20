@@ -2664,6 +2664,32 @@ fn trimmed_zero_date_stats_keep_bounded_date_range_estimate() {
 }
 
 #[test]
+fn fractional_datetime_cast_bounds_share_range_estimate() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE fractional_stats(id INT PRIMARY KEY,dt DATETIME(6))")
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO fractional_stats VALUES
+        (1,'2020-01-01 00:00:00.000000'),(2,'2020-01-01 00:00:00.000001'),
+        (3,'2020-01-01 00:00:00.000002'),(4,'2021-01-01 00:00:00.000000')",
+        )
+        .unwrap();
+    engine.execute("ANALYZE TABLE fractional_stats").unwrap();
+    let table = engine.db_for_tests().table("fractional_stats").unwrap();
+    let estimate = |predicate| {
+        let expr = crate::parser::parse_expr_fragment(predicate).unwrap();
+        estimate_filter_rows(&table, &expr, 4.0)
+    };
+    let text = estimate("dt BETWEEN '2020-01-01 00:00:00.000001' AND '2020-01-01 00:00:00.000002'");
+    let cast = estimate("dt BETWEEN CAST('2020-01-01 00:00:00.000001' AS DATETIME(6)) AND CAST('2020-01-01 00:00:00.000002' AS DATETIME(6))");
+    assert!(text > 0.0);
+    assert_eq!(cast, text);
+}
+
+#[test]
 fn timestamp_stats_coerce_folded_date_bounds_into_storage_domain() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

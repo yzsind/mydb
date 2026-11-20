@@ -1184,6 +1184,11 @@ fn integer_in_compilation_does_not_publish_statement_cast_diagnostics() {
     crate::engine::expr::with_session_expr_info(&session, || {
         crate::engine::api::with_statement_warning_sink(warnings.clone(), || {
             let _compiled = CompiledPredicate::compile(&expr, &schema);
+            let write = crate::parser::parse_expr_fragment(
+                "quantity IN (1,2,3,4) AND CAST(RLS_CONTEXT('tenant') AS SIGNED)=2",
+            )
+            .unwrap();
+            assert!(CompiledPredicate::compile_write_membership(&write, &schema).is_none());
             assert!(
                 warnings.lock().is_empty(),
                 "opening an optional IN kernel must not evaluate diagnostic-producing bounds"
@@ -1381,44 +1386,196 @@ fn projected_temporal_comparisons_precoerce_once_and_match_oracle() {
 
 #[test]
 fn typed_scan_predicate_compiles_timestamp_between_without_value_fallback() {
+    let mut session = crate::engine::api::SessionContext::default();
+    session.sysvars.time_zone = "+00:00".into();
+    crate::engine::expr::with_session_expr_info(&session, || {
+        let mut schema = decimal_fact_schema();
+        schema.columns.push(col(
+            "observed_at",
+            DataTypeKind::Timestamp { fsp: 6 },
+            schema.columns.len(),
+        ));
+        schema.build_column_index();
+        let expr = Expr::Between {
+            expr: Box::new(Expr::Identifier("observed_at".to_string())),
+            low: Box::new(Expr::Literal(Literal::String(
+                "2023-11-01 00:00:00".to_string(),
+            ))),
+            high: Box::new(Expr::Literal(Literal::String(
+                "2023-12-31 00:00:00".to_string(),
+            ))),
+            negated: false,
+        };
+        let compiled = CompiledPredicate::compile(&expr, &schema).expect("timestamp BETWEEN");
+        assert!(
+            compiled.supports_typed_eval(),
+            "timestamp range must stay in the predicate-first typed lane"
+        );
+        let (_, low, high) = compiled
+            .inclusive_timestamp_range()
+            .expect("timestamp BETWEEN must expose the direct decode range");
+        assert!(low < high);
+        let instant =
+            crate::engine::expr::parse_datetime(&Value::String("2023-11-15 12:00:00".to_string()))
+                .unwrap()
+                .and_utc()
+                .timestamp_micros();
+        let timestamp =
+            crate::engine::expr::session_local_datetime_to_utc_timestamp_micros(instant).unwrap();
+        let mut typed = vec![
+            crate::engine::executor::vec::scan_bridge::PredicateValue::Null;
+            schema.columns.len()
+        ];
+        typed[schema.column_index("observed_at").unwrap()] =
+            crate::engine::executor::vec::scan_bridge::PredicateValue::Timestamp(timestamp);
+        assert_eq!(compiled.eval_typed(&typed).unwrap(), Some(true));
+    });
+}
+
+#[test]
+fn native_temporal_ranges_bind_casts_and_reversed_bounds() {
+    let mut session = crate::engine::api::SessionContext::default();
+    session.sysvars.time_zone = "+00:00".into();
+    crate::engine::expr::with_session_expr_info(&session, || {
+        let mut schema = decimal_fact_schema();
+        for (name, data_type) in [
+            ("dt", DataTypeKind::DateTime { fsp: 6 }),
+            ("ts", DataTypeKind::Timestamp { fsp: 6 }),
+            ("tm", DataTypeKind::Time { fsp: 6 }),
+        ] {
+            schema
+                .columns
+                .push(col(name, data_type, schema.columns.len()));
+        }
+        schema.build_column_index();
+        for (name, kind, cast, low, high) in [
+            (
+                "dt",
+                NativeTemporalKind::DateTime,
+                "DATETIME",
+                "2020-01-01 00:00:00.000001",
+                "2020-01-01 00:00:00.000002",
+            ),
+            (
+                "ts",
+                NativeTemporalKind::Timestamp,
+                "DATETIME",
+                "2020-01-01 00:00:00.000001",
+                "2020-01-01 00:00:00.000002",
+            ),
+            (
+                "tm",
+                NativeTemporalKind::Time,
+                "TIME",
+                "-00:00:00.000001",
+                "00:00:00.000001",
+            ),
+        ] {
+            for text in [
+                format!("{name} BETWEEN '{low}' AND '{high}'"),
+                format!(
+                    "{name} BETWEEN CAST('{low}' AS {cast}(6)) AND CAST('{high}' AS {cast}(6))"
+                ),
+                format!("'{low}' <= {name} AND {name} <= '{high}'"),
+            ] {
+                let expression = crate::parser::parse_expr_fragment(&text).unwrap();
+                let compiled = CompiledPredicate::compile(&expression, &schema).unwrap();
+                let range = compiled.inclusive_native_temporal_range().expect(&text);
+                assert_eq!(range.column, schema.column_index(name).unwrap(), "{text}");
+                assert_eq!(range.kind, kind, "{text}");
+                assert!(range.low < range.high, "{text}");
+            }
+            let expression =
+                crate::parser::parse_expr_fragment(&format!("{name} BETWEEN ? AND ?")).unwrap();
+            let open = |low: Value, high: Value| {
+                crate::engine::params::with_params_slice(&[low, high], || {
+                    CompiledPredicate::compile(&expression, &schema)
+                        .unwrap()
+                        .inclusive_native_temporal_range()
+                })
+            };
+            let first = open(Value::String(low.into()), Value::String(high.into())).unwrap();
+            let second = open(Value::String(high.into()), Value::String(low.into())).unwrap();
+            assert_eq!((second.low, second.high), (first.high, first.low));
+            assert!(open(Value::Null, Value::String(high.into())).is_none());
+            let cast_params = crate::parser::parse_expr_fragment(&format!(
+                "{name} BETWEEN CAST(? AS {cast}(6)) AND CAST(? AS {cast}(6))"
+            ))
+            .unwrap();
+            let bound = crate::engine::params::with_params_slice(
+                &[Value::String(low.into()), Value::String(high.into())],
+                || {
+                    CompiledPredicate::compile(&cast_params, &schema)
+                        .unwrap()
+                        .inclusive_native_temporal_range()
+                },
+            )
+            .unwrap();
+            assert_eq!((bound.low, bound.high), (first.low, first.high));
+            let mut integral = schema.clone();
+            let column = integral.column_index(name).unwrap();
+            integral.columns[column].data_type = match kind {
+                NativeTemporalKind::DateTime => DataTypeKind::DateTime { fsp: 0 },
+                NativeTemporalKind::Timestamp => DataTypeKind::Timestamp { fsp: 0 },
+                NativeTemporalKind::Time => DataTypeKind::Time { fsp: 0 },
+            };
+            let cast_expr = crate::parser::parse_expr_fragment(&format!(
+                "{name} BETWEEN CAST('{low}' AS {cast}(6)) AND CAST('{high}' AS {cast}(6))"
+            ))
+            .unwrap();
+            let bound = CompiledPredicate::compile(&cast_expr, &integral)
+                .unwrap()
+                .inclusive_native_temporal_range()
+                .unwrap();
+            assert_eq!(
+                (bound.low, bound.high),
+                (first.low, first.high),
+                "comparison must retain RHS fractional precision"
+            );
+            let expression = crate::parser::parse_expr_fragment(&format!(
+                "{name} NOT BETWEEN '{low}' AND '{high}'"
+            ))
+            .unwrap();
+            assert!(CompiledPredicate::compile(&expression, &schema)
+                .unwrap()
+                .inclusive_native_temporal_range()
+                .is_none());
+        }
+    });
+}
+
+#[test]
+fn write_integer_membership_rebinds_once_for_each_execution() {
     let mut schema = decimal_fact_schema();
-    schema.columns.push(col(
-        "observed_at",
-        DataTypeKind::Timestamp { fsp: 6 },
-        schema.columns.len(),
-    ));
-    schema.build_column_index();
-    let expr = Expr::Between {
-        expr: Box::new(Expr::Identifier("observed_at".to_string())),
-        low: Box::new(Expr::Literal(Literal::String(
-            "2023-11-01 00:00:00".to_string(),
-        ))),
-        high: Box::new(Expr::Literal(Literal::String(
-            "2023-12-31 00:00:00".to_string(),
-        ))),
-        negated: false,
+    schema.columns[0].data_type = DataTypeKind::BigInt;
+    let expr = crate::parser::parse_expr_fragment("quantity IN (?, ?, ?, ?, NULL)").unwrap();
+    let open = |values: &[Value]| {
+        crate::engine::params::with_params_slice(values, || {
+            CompiledPredicate::compile_write_membership(&expr, &schema)
+                .expect("captured integer set")
+        })
     };
-    let compiled = CompiledPredicate::compile(&expr, &schema).expect("timestamp BETWEEN");
-    assert!(
-        compiled.supports_typed_eval(),
-        "timestamp range must stay in the predicate-first typed lane"
-    );
-    let (_, low, high) = compiled
-        .inclusive_timestamp_range()
-        .expect("timestamp BETWEEN must expose the direct decode range");
-    assert!(low < high);
-    let instant =
-        crate::engine::expr::parse_datetime(&Value::String("2023-11-15 12:00:00".to_string()))
-            .unwrap()
-            .and_utc()
-            .timestamp_micros();
-    let timestamp =
-        crate::engine::expr::session_local_datetime_to_utc_timestamp_micros(instant).unwrap();
-    let mut typed =
-        vec![crate::engine::executor::vec::scan_bridge::PredicateValue::Null; schema.columns.len()];
-    typed[schema.column_index("observed_at").unwrap()] =
-        crate::engine::executor::vec::scan_bridge::PredicateValue::Timestamp(timestamp);
-    assert_eq!(compiled.eval_typed(&typed).unwrap(), Some(true));
+    let first = open(&[
+        Value::Int(1),
+        Value::Int(2),
+        Value::Int(2),
+        Value::UInt(u64::MAX),
+    ]);
+    let second = open(&[
+        Value::Int(10),
+        Value::Int(11),
+        Value::Int(11),
+        Value::UInt(u64::MAX),
+    ]);
+    let mut row = vec![Value::Null; schema.columns.len()];
+    row[0] = Value::Int(2);
+    assert!(first.eval(&row).unwrap());
+    assert!(!second.eval(&row).unwrap());
+    row[0] = Value::Int(10);
+    assert!(!first.eval(&row).unwrap());
+    assert!(second.eval(&row).unwrap());
+    row[0] = Value::UInt(u64::MAX);
+    assert!(first.eval(&row).unwrap() && second.eval(&row).unwrap());
 }
 
 #[test]

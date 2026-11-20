@@ -332,6 +332,11 @@ impl<'a> AnalyzeZoneAccumulator<'a> {
             return;
         };
         let state = &mut self.running[slot];
+        if !zone_temporal_order_safe(value) {
+            state.mark_unknown();
+            state.order_unsupported = true;
+            return;
+        }
         let scalar = match value {
             Value::Null => return state.observe_null(),
             Value::Int(value) => WorkerScalar::Signed(*value),

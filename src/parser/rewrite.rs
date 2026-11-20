@@ -440,9 +440,9 @@ pub(super) fn strip_fulltext_parsers(
                 };
             }
             if !index_options.parser.is_empty() && index_options.parser != "ngram" {
-                return Err(parse_error_full_span(
-                    sql,
-                    "FULLTEXT WITH PARSER: unsupported parser",
+                return Err(super::entry::parse_error_with_spec_at_zero(
+                    crate::error::catalog::ER_FUNCTION_NOT_DEFINED,
+                    format!("Function '{}' is not defined", index_options.parser),
                 ));
             }
             out.get_or_insert_with(|| sql.as_bytes().to_vec())[start..value.span.end].fill(b' ');

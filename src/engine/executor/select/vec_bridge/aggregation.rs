@@ -2315,6 +2315,7 @@ pub(super) fn scheduler_hash_agg_workers() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| crate::planner::default_parallel_degree() as usize)
+        .min(crate::planner::default_parallel_degree() as usize)
 }
 
 /// C10 - worker count for the scheduler hash_join probe driver.
@@ -2334,6 +2335,7 @@ pub(super) fn scheduler_hash_join_workers() -> usize {
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&n| n >= 1)
         .unwrap_or_else(|| crate::planner::default_parallel_degree() as usize)
+        .min(crate::planner::default_parallel_degree() as usize)
 }
 
 /// Build aggregate metadata before the parallel operator takes ownership.

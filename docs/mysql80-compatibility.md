@@ -1075,7 +1075,7 @@ writes InnoDB tablespaces, redo/undo, or data dictionary formats.
 - **WAL**: segmented, group commit, platform-adaptive sync method (`MYDB_WAL_SYNC_METHOD`: `fsync` by default on macOS, `fdatasync` on Linux; true power-loss resistance requires an explicit `fullfsync`). The redo phase of crash recovery can replay in parallel.
 - **undo**: segmented + two-tier images (in-memory cache + on-disk segments), with `MYDB_UNDO_*` controlling retention/compression; a per-transaction undo cap guards against runaway large transactions.
 - **LOB / overflow**: the inline ↔ overflow threshold is `mydb_lob_inline_max`; up to 4 GiB is supported; optional transparent lz4 compression (`mydb_lob_compression`).
-- **Zone Map**: ➕ enabled by default for persistent user tables; persisted per storage object as **v6 `.zm` paged files**,
+- **Zone Map**: ➕ enabled by default for persistent user tables; persisted per storage object as **v8 `.zm` paged files**,
   with standard page v3 (16 KiB), managed through the shared buffer pool, page checksum/LSN, and physical redo.
   There is no separate summary cache or v5 manifest publication chain. Typed bounds, NULLs, and Exact/Bloom
   membership drive serial/parallel/vectorized pruning, always retaining the heap residual; it falls back conservatively when data is missing, summaries are untrusted,

@@ -330,6 +330,12 @@ fn validate_add_index_definition(
     // not a column name. Functional parts have already passed
     // a stricter check inside `compile_index_key_expressions`.
     validate_mysql_identifier(&index.name)?;
+    if !index.primary && index.name.eq_ignore_ascii_case("PRIMARY") {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+            "Incorrect index name 'PRIMARY'",
+        ));
+    }
     validate_index_column_names(table, index)?;
     if index.primary { validate_primary_generated_columns(&index.columns, &table.columns)?; }
     if index.is_spatial() {
@@ -2492,6 +2498,7 @@ impl Database {
                 format!("duplicate index '{}'", index.name),
             ));
         }
+        implicit_spatial_index(&mut index, &table);
         validate_table_index_count(table.indexes.iter().filter(|i| !i.primary).count() + 1)?;
         validate_index_column_names(&table, &index)?;
         validate_index_prefix_columns(&table, &index, &index.column_prefix_lengths)?;
@@ -2801,6 +2808,15 @@ impl Database {
         internal_key: &str,
         column_name: &str,
     ) -> Result<(), QueryError> {
+        self.drop_temp_column_checked(internal_key, column_name, true)
+    }
+
+    pub(crate) fn drop_temp_column_checked(
+        &self,
+        internal_key: &str,
+        column_name: &str,
+        check_visibility: bool,
+    ) -> Result<(), QueryError> {
         let snapshot = self
             .temp_tables
             .read()
@@ -2832,6 +2848,16 @@ impl Database {
                     format!("unknown column '{column_name}'"),
                 )
             })?;
+        if check_visibility
+            && !snapshot
+                .iter_visible_columns()
+                .any(|(_, c)| !c.invisible && !c.name.eq_ignore_ascii_case(column_name))
+        {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+                "A table must have at least one visible column.",
+            ));
+        }
         self.reject_policy_dependency_column_ddl(&snapshot)?;
         reject_column_referenced_by_check(&snapshot, column_name)?;
         reject_column_referenced_by_generated(&snapshot, column_name)?;
@@ -3792,7 +3818,7 @@ impl Database {
         if actions.iter().any(|action| matches!(action, A::DropColumn(_) | A::RenameColumn { .. } | A::ModifyColumn(_) | A::ChangeColumn { .. })) {
             self.reject_policy_dependency_column_ddl(self.table(table_name)?.as_ref())?;
         }
-        if actions.len() <= 1 {
+        if actions.len() <= 1 && !matches!(actions.first(), Some(A::DropColumn(_))) {
             return Ok(());
         }
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
@@ -4187,6 +4213,15 @@ impl Database {
             // (catalog + row-layout only). A COPY rewrite is irreversible by
             // schema restore.
             A::AddColumn(_) | A::ModifyColumn(_) | A::ChangeColumn { .. } => {
+                if let A::ChangeColumn { old_name, new_def } = action {
+                    if !old_name.eq_ignore_ascii_case(&new_def.name) {
+                        let table = self.table(table_name)?;
+                        if !table.foreign_keys.is_empty() || !table.fk_referenced_by.is_empty() {
+                            // Schema-only rollback cannot restore other tables' FK names.
+                            return Ok(false);
+                        }
+                    }
+                }
                 !self.alter_action_requires_copy(table_name, action)?
                     || self.alter_action_validation_only(table_name, action)?
             }
@@ -5326,6 +5361,16 @@ impl Database {
                 format!("unknown column '{column_name}'"),
             ));
         }
+        if !catalog_txn_batch_deferred()
+            && !snapshot
+                .iter_visible_columns()
+                .any(|(_, c)| !c.invisible && !c.name.eq_ignore_ascii_case(column_name))
+        {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+                "A table must have at least one visible column.",
+            ));
+        }
         self.reject_policy_dependency_column_ddl(&snapshot)?;
         reject_column_referenced_by_check(&snapshot, column_name)?;
         reject_column_referenced_by_generated(&snapshot, column_name)?;
@@ -5360,7 +5405,12 @@ impl Database {
         }
         let pos = candidate.column_index(column_name)?;
         candidate.columns[pos].state = ColumnState::Dropped;
-        candidate.primary_key.retain(|name| !name.eq_ignore_ascii_case(column_name));
+        if !catalog_txn_batch_deferred() {
+            ensure_table_keeps_visible_column(&candidate)?;
+        }
+        candidate
+            .primary_key
+            .retain(|name| !name.eq_ignore_ascii_case(column_name));
         candidate.publish_new_row_layout()?;
         candidate.build_column_index();
         validate_auto_increment_schema(&candidate)?;
@@ -5702,6 +5752,12 @@ impl Database {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), QueryError> {
+        if new_name.eq_ignore_ascii_case("PRIMARY") {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+                "Incorrect index name 'PRIMARY'",
+            ));
+        }
         validate_mysql_identifier(new_name)?;
         let _descriptor = self.pin_ddl_table(table_name)?;
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
@@ -6276,8 +6332,13 @@ impl Database {
                 let check = candidate
                     .check_constraints
                     .iter()
-                    .find(|check| check.name == name)
-                    .unwrap()
+                    .find(|check| check.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_CHECK_CONSTRAINT_NOT_FOUND,
+                            format!("Check constraint '{name}' is not found"),
+                        )
+                    })?
                     .clone();
                 validate_existing_check_constraint_values(self, &candidate, &check)?;
                 self.set_check_constraint_enforced(&key, name, true)
@@ -6473,7 +6534,10 @@ impl Database {
             for (value, pos) in values.iter().zip(&columns) {
                 let column = &candidate.columns[*pos];
                 if !column.nullable && matches!(value, Value::Null) {
-                    return Err(crate::error::messages::bad_null(&column.name));
+                    return Err(error(
+                        crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                        "Invalid use of NULL value",
+                    ));
                 }
                 coerce_column_value_for_schema(value.clone(), column)?;
             }
@@ -6790,6 +6854,21 @@ impl Database {
             return Ok(None);
         }
         let old_table = self.table(table_name)?;
+        for action in actions {
+            if let A::ChangeColumn { old_name, new_def } = action {
+                if !old_name.eq_ignore_ascii_case(&new_def.name) {
+                    if self
+                        .fk_reject_column_referenced(&old_table, old_name)
+                        .is_err()
+                    {
+                        return Err(error(
+                            crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
+                            "physical COPY cannot atomically rename foreign key columns; use a separate metadata ALTER",
+                        ));
+                    }
+                }
+            }
+        }
         let mut candidate = old_table.as_ref().clone();
         let mut changes_row_shape = false;
         for action in actions {
@@ -7219,6 +7298,24 @@ impl Database {
                 &old_col_name,
                 &new_col_name,
             )?;
+            for fk in &mut candidate.foreign_keys {
+                for name in &mut fk.columns {
+                    if name.eq_ignore_ascii_case(&old_col_name) {
+                        *name = new_col_name.clone();
+                    }
+                }
+                if fk
+                    .referenced_database
+                    .eq_ignore_ascii_case(&candidate.database)
+                    && fk.referenced_table.eq_ignore_ascii_case(&candidate.name)
+                {
+                    for name in &mut fk.referenced_columns {
+                        if name.eq_ignore_ascii_case(&old_col_name) {
+                            *name = new_col_name.clone();
+                        }
+                    }
+                }
+            }
             rename_column_expression_references(&mut candidate, &old_col_name, &new_col_name)?;
             // P1-11 — same partition-column propagation as rename_column.
             rename_partition_column_references(&mut candidate, &old_col_name, &new_col_name)?;
@@ -7318,8 +7415,7 @@ impl Database {
         let old = &table.columns[pos];
         let type_changed =
             old.data_type != new_schema.data_type || old.unsigned != new_schema.unsigned;
-        let renamed = !old.name.eq_ignore_ascii_case(&new_schema.name);
-        if !type_changed && !renamed {
+        if !type_changed {
             return Ok(());
         }
         for fk in &table.foreign_keys {
@@ -7359,6 +7455,28 @@ impl Database {
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
         let key = table_key(&database, &table_only);
         let table_id = candidate.id;
+        let source = self.table(table_name)?;
+        let renames: Vec<_> = source
+            .columns
+            .iter()
+            .zip(&candidate.columns)
+            .filter(|(old, new)| old.column_id == new.column_id && old.name != new.name)
+            .map(|(old, new)| (old.name.clone(), new.name.clone()))
+            .collect();
+        let dependent_keys: BTreeSet<_> = if renames.is_empty() {
+            BTreeSet::new()
+        } else {
+            source
+                .fk_referenced_by
+                .iter()
+                .map(|edge| edge.child_table_key.clone())
+                .collect()
+        };
+        let _dependent_definitions = dependent_keys
+            .iter()
+            .map(|name| self.pin_ddl_table(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut changed = Vec::new();
         {
             let mut catalog = self.catalog_write()?;
             let table_arc = catalog
@@ -7366,8 +7484,37 @@ impl Database {
                 .get_mut(&key)
                 .ok_or_else(|| ddl_table_not_found(&table_name))?;
             *Arc::make_mut(table_arc) = candidate;
+            for dependent in &dependent_keys {
+                let Some(other_arc) = catalog.tables.get_mut(dependent) else {
+                    continue;
+                };
+                let other = Arc::make_mut(other_arc);
+                let mut modified = false;
+                for fk in &mut other.foreign_keys {
+                    if fk.referenced_database.eq_ignore_ascii_case(&database)
+                        && fk.referenced_table.eq_ignore_ascii_case(&table_only)
+                    {
+                        for name in &mut fk.referenced_columns {
+                            if let Some((_, new)) = renames
+                                .iter()
+                                .find(|(old, _)| name.eq_ignore_ascii_case(old))
+                            {
+                                *name = new.clone();
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+                if modified {
+                    other.bump_schema_version();
+                    changed.push(other.id);
+                }
+            }
         }
         self.refresh_heap_codec(table_id)?;
+        for id in changed {
+            self.note_catalog_table(id);
+        }
         self.note_catalog_table(table_id);
         self.commit_ddl_catalog_txn()
     }
@@ -9849,7 +9996,10 @@ impl Database {
                 && !column.nullable
                 && matches!(values.get(idx), Some(Value::Null))
             {
-                return Err(crate::error::messages::bad_null(&column.name));
+                return Err(error(
+                    crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                    "Invalid use of NULL value",
+                ));
             }
         }
         Ok(())
@@ -11015,6 +11165,12 @@ fn coerce_row_for_alter_copy_masked(
             Ok(coerced) => *value = coerced,
             Err(err) if !strict => {
                 *value = coerce_column_value_for_alter_copy_lossy(current, column, err, warnings)?;
+            }
+            Err(err) if err.code() == 1048 => {
+                return Err(error(
+                    crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                    "Invalid use of NULL value",
+                ));
             }
             Err(err) => return Err(err),
         }
@@ -13106,6 +13262,15 @@ impl Database {
             return Err(error(
                 crate::error::catalog::ER_PARTITION_EXCHANGE_PART_TABLE,
                 "EXCHANGE PARTITION cannot target a partitioned table",
+            ));
+        }
+        // Different generations require physical relocation that the catalog
+        // storage-id swap alone cannot replay on a replica. Reject before any
+        // catalog mutation until that relocation has a durable WAL contract.
+        if table.active_generation != other_table.active_generation {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "EXCHANGE PARTITION between different physical generations is not supported",
             ));
         }
         // MySQL 8.0 forbids EXCHANGE PARTITION when either table participates

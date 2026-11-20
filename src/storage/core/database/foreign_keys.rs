@@ -310,8 +310,8 @@ fn fk_is_string_type(k: &DataTypeKind) -> bool {
 
 /// Find a Public UNIQUE / PRIMARY index on `parent` whose leftmost
 /// columns are exactly `referenced` (in order). This is the parent-side
-/// index that proves the referenced columns are a key (MySQL 8.0
-/// requirement) and that the child/parent FK probes use.
+/// index that proves the referenced columns are a complete unique key and
+/// that the child/parent FK probes use. Partial-key references are rejected.
 ///
 /// MySQL 8.0 additionally rejects prefix-truncated key parts in the
 /// referenced columns: a prefix index can map several distinct full-string
@@ -326,11 +326,9 @@ fn fk_find_referenced_index<'a>(
     parent.indexes.iter().find(|idx| {
         // The referenced columns must constitute the *complete* key, not a
         // prefix: a prefix of a composite UNIQUE/PRIMARY key is not itself
-        // guaranteed unique, so it can't identify a single parent row and
-        // the FK's referential semantics become ambiguous. InnoDB requires
-        // the referenced columns to exactly match a key's column list; we
-        // mirror that with `==` (previously `>=`, which admitted unsound
-        // prefix references).
+        // guaranteed unique. MySQL 8.0 accepts this as a nonstandard InnoDB
+        // extension, with ambiguous parent UPDATE/DELETE behavior. Require
+        // a complete unique key so referential actions identify one parent.
         (idx.unique || idx.primary)
             && idx.state == IndexState::Public
             && !idx.is_fulltext()

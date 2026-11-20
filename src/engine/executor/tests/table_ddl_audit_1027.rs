@@ -247,7 +247,7 @@ fn ddl_1027_null_validation_reports_data_error_when_budget_is_small() {
         .with_constraint_validation_limit_for_test(128, || {
             engine.execute("ALTER TABLE t MODIFY a INT NOT NULL, LOCK=NONE")
         });
-    assert_eq!(result.unwrap_err().code(), 1048);
+    assert_eq!(result.unwrap_err().code(), 1138);
     assert!(engine.database().table("test.t").unwrap().columns[0].nullable);
     assert_eq!(
         rows(&engine, "SELECT COUNT(*) FROM t"),

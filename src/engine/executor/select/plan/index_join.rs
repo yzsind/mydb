@@ -4843,7 +4843,10 @@ pub(super) fn inlj_index_probe_parallel_degree(key_count: usize) -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(default_inlj_outer_parallel_degree);
-    requested.clamp(1, 8).min(task_count)
+    requested
+        .clamp(1, 8)
+        .min(task_count)
+        .min(crate::planner::default_parallel_degree() as usize)
 }
 
 /// Account an INLJ entry vector returned by storage.  The allocation already
@@ -5084,7 +5087,10 @@ pub(super) fn inlj_probe_parallel_degree(row_count: usize) -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(default_inlj_outer_parallel_degree);
-    requested.clamp(1, 8).min(task_count)
+    requested
+        .clamp(1, 8)
+        .min(task_count)
+        .min(crate::planner::default_parallel_degree() as usize)
 }
 
 pub(super) fn filter_batched_right_row_ids(
@@ -6311,7 +6317,10 @@ pub(super) fn inlj_batch_parallelism(row_count: usize) -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(|| crate::planner::default_parallel_degree() as usize);
-    requested.clamp(1, 8).min(row_count.max(1))
+    requested
+        .clamp(1, 8)
+        .min(row_count.max(1))
+        .min(crate::planner::default_parallel_degree() as usize)
 }
 
 /// Outer parallelism for the batched INLJ. Partitions the left input
@@ -6332,7 +6341,9 @@ pub(super) fn inlj_outer_parallelism(left_rows: usize) -> usize {
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .unwrap_or_else(default_inlj_outer_parallel_degree);
-    requested.clamp(1, 8)
+    requested
+        .clamp(1, 8)
+        .min(crate::planner::default_parallel_degree() as usize)
 }
 
 /// Keep the MRR unit larger than the inner relation's working set whenever

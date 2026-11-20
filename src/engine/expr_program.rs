@@ -2425,6 +2425,54 @@ impl ExprCompiler {
         compiled
     }
 
+    /// Capture a closed deterministic operand for one opened execution.
+    /// Parameters stay late-bound in the cached program. Errors, warnings,
+    /// row dependencies and session side effects retain the runtime oracle.
+    pub(crate) fn capture_execution_constant(expr: &Expr) -> Option<Value> {
+        crate::parser::visit::try_inspect_value_expr::<()>(expr, |node| {
+            let closed = match node {
+                Expr::Literal(_)
+                | Expr::BoundValue(_)
+                | Expr::Placeholder(_)
+                | Expr::Unary { .. }
+                | Expr::Binary { .. }
+                | Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+                | Expr::InList { .. }
+                | Expr::Between { .. }
+                | Expr::Like { .. }
+                | Expr::Case { .. } => true,
+                Expr::Function {
+                    name,
+                    distinct: false,
+                    ..
+                } => !crate::planner::is_aggregate_function(name),
+                _ => false,
+            };
+            if closed {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        })
+        .ok()?;
+        let program = Self::compile_cached(expr, &InputSchema::default()).ok()?;
+        if !program.capability.deterministic
+            || program.capability.legacy_escape
+            || program.column_reference_bound != 0
+        {
+            return None;
+        }
+        let diagnostics = crate::engine::api::StatementWarningSink::default();
+        let empty: &[Value] = &[];
+        let value = crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+            with_eval_scratch(|scratch| program.eval_source(&empty, scratch))
+        })
+        .ok()?;
+        let warning_free = diagnostics.lock().is_empty();
+        warning_free.then_some(value)
+    }
+
     /// Like `compile_cached`, but the caller supplies the schema fingerprint
     /// directly and only materialises the `InputSchema` (via `build_schema`)
     /// on a cache miss. This keeps the hot cache-hit path allocation-free —
@@ -10122,6 +10170,58 @@ mod cache_tests {
             collation_id: None,
         }]);
         ExprCompiler::compile(&expr, &schema).expect("compile")
+    }
+
+    #[test]
+    fn native_temporal_constant_capture_rebinds_without_eager_warnings() {
+        let mut session = crate::engine::api::SessionContext::default();
+        session.sysvars.time_zone = "+00:00".into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            let expr = crate::parser::parse_expr_fragment("CAST(? AS DATETIME(6))").unwrap();
+            let open = |text: &str| {
+                crate::engine::params::with_params_slice(&[Value::String(text.into())], || {
+                    ExprCompiler::capture_execution_constant(&expr)
+                })
+            };
+            let Some(Value::DateTime(first)) = open("2020-01-01 00:00:00.000001") else {
+                panic!("bound temporal constant")
+            };
+            assert_eq!(
+                open("2020-01-01 00:00:00.000002"),
+                Some(Value::DateTime(first + 1))
+            );
+            let diagnostics = crate::engine::api::StatementWarningSink::default();
+            crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                assert!(open("invalid datetime").is_none());
+                for text in ["RAND()", "@capture_value", "unknown_column"] {
+                    let expr = crate::parser::parse_expr_fragment(text).unwrap();
+                    assert!(
+                        ExprCompiler::capture_execution_constant(&expr).is_none(),
+                        "{text}"
+                    );
+                }
+                assert!(ExprCompiler::capture_execution_constant(&Expr::Wildcard).is_none());
+            });
+            assert!(
+                diagnostics.lock().is_empty(),
+                "a failed speculative bind must not publish diagnostics"
+            );
+            let deferred = ExprCompiler::compile(&expr, &InputSchema::default()).unwrap();
+            let invalid =
+                crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                    crate::engine::params::with_params_slice(
+                        &[Value::String("invalid datetime".into())],
+                        || {
+                            let empty: &[Value] = &[];
+                            with_eval_scratch(|scratch| deferred.eval_source(&empty, scratch))
+                        },
+                    )
+                });
+            assert!(
+                invalid.is_err() || !diagnostics.lock().is_empty(),
+                "runtime fallback must retain conversion diagnostics"
+            );
+        });
     }
 
     #[test]

@@ -325,7 +325,24 @@ pub(super) struct FastConst {
     pub(super) numeric: Option<f64>,
     pub(super) date_days: Option<i32>,
     pub(super) timestamp_micros: Option<i64>,
+    pub(super) datetime_micros: Option<i64>,
+    pub(super) time_micros: Option<i64>,
     pub(super) decimal_parts: Option<(i128, u8)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum NativeTemporalKind {
+    Timestamp,
+    DateTime,
+    Time,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NativeTemporalRange {
+    pub column: usize,
+    pub low: i64,
+    pub high: i64,
+    pub kind: NativeTemporalKind,
 }
 
 impl CompiledPredicate {
@@ -378,6 +395,91 @@ impl CompiledPredicate {
         })
     }
 
+    /// Capture an execution's integer IN bindings before entering locked-row
+    /// callbacks. Cached programs retain placeholders, so their generic IN
+    /// interpreter cannot otherwise build a constant set once per execution.
+    pub(crate) fn compile_write_membership(expr: &Expr, schema: &TableSchema) -> Option<Self> {
+        fn constant(expr: &Expr) -> bool {
+            match expr {
+                Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_) => true,
+                Expr::Unary {
+                    op: crate::parser::UnaryOp::Neg,
+                    expr,
+                } => constant(expr),
+                _ => false,
+            }
+        }
+        fn pure(expr: &Expr, schema: &TableSchema) -> bool {
+            let column = |expr| simple_column_index_of(expr, schema).is_some();
+            match expr {
+                Expr::Binary {
+                    left,
+                    op: BinaryOp::And | BinaryOp::Or,
+                    right,
+                } => pure(left, schema) && pure(right, schema),
+                Expr::Binary { left, op, right } if crate::parser::boolean::is_comparison!(*op) => {
+                    (column(left) && (column(right) || constant(right)))
+                        || (column(right) && constant(left))
+                }
+                Expr::InList { expr, list, .. } => column(expr) && list.iter().all(constant),
+                Expr::Between {
+                    expr, low, high, ..
+                } => column(expr) && constant(low) && constant(high),
+                Expr::IsNull(expr) | Expr::IsNotNull(expr) => column(expr),
+                _ => constant(expr),
+            }
+        }
+        fn eligible(expr: &Expr, schema: &TableSchema) -> bool {
+            match expr {
+                Expr::Binary {
+                    left,
+                    op: BinaryOp::And | BinaryOp::Or,
+                    right,
+                } => eligible(left, schema) || eligible(right, schema),
+                Expr::InList { expr, list, .. } if list.len() >= 4 => {
+                    simple_column_index_of(expr, schema).is_some_and(|col| {
+                        matches!(
+                            schema.columns[col].data_type,
+                            DataTypeKind::TinyInt
+                                | DataTypeKind::SmallInt
+                                | DataTypeKind::MediumInt
+                                | DataTypeKind::Int
+                                | DataTypeKind::BigInt
+                                | DataTypeKind::Bool
+                        )
+                    })
+                }
+                _ => false,
+            }
+        }
+        fn compiled(node: &PredicateNode) -> bool {
+            match node {
+                PredicateNode::IntegerIn { .. } => true,
+                PredicateNode::And(left, right) | PredicateNode::Or(left, right) => {
+                    compiled(left) || compiled(right)
+                }
+                _ => false,
+            }
+        }
+        fn closed(node: &PredicateNode) -> bool {
+            match node {
+                PredicateNode::And(left, right) | PredicateNode::Or(left, right) => {
+                    closed(left) && closed(right)
+                }
+                PredicateNode::Program(_) | PredicateNode::TimestampDateIntCmp { .. } => false,
+                _ => true,
+            }
+        }
+        // Truthy-only WHERE leaves may collapse UNKNOWN to false. Keep
+        // diagnostic-producing and session-dependent subtrees on the full
+        // three-valued expression oracle, including short-circuit ordering.
+        if !eligible(expr, schema) || !pure(expr, schema) {
+            return None;
+        }
+        Self::compile(expr, schema)
+            .filter(|predicate| compiled(&predicate.root) && closed(&predicate.root))
+    }
+
     #[inline]
     pub(crate) fn eval(&self, values: &[Value]) -> Result<bool, QueryError> {
         eval_predicate_node(&self.root, values)
@@ -408,12 +510,11 @@ impl CompiledPredicate {
         self.typed_conjunction.is_some()
     }
 
-    /// Exact single-column inclusive TIMESTAMP range suitable for direct
-    /// evaluation by the row-decode sink.  Returning `None` preserves the
-    /// complete typed/ExprProgram oracle for every other predicate shape.
-    pub(in crate::engine::executor::select) fn inclusive_timestamp_range(
+    /// Resolve an exact single-column native range once per opened scan.
+    /// Both bounds must already share the column's comparison domain.
+    pub(in crate::engine::executor::select) fn inclusive_native_temporal_range(
         &self,
-    ) -> Option<(usize, i64, i64)> {
+    ) -> Option<NativeTemporalRange> {
         let terms = self.typed_conjunction.as_deref()?;
         let [first, second] = terms else { return None };
         let bound = |node: &PredicateNode| {
@@ -421,23 +522,57 @@ impl CompiledPredicate {
                 col,
                 op,
                 value,
-                flipped: false,
+                flipped,
             } = node
             else {
                 return None;
             };
-            Some((*col, *op, value.timestamp_micros?))
+            let (kind, micros) = if let Some(value) = value.timestamp_micros {
+                (NativeTemporalKind::Timestamp, value)
+            } else if let Some(value) = value.datetime_micros {
+                (NativeTemporalKind::DateTime, value)
+            } else {
+                (NativeTemporalKind::Time, value.time_micros?)
+            };
+            let op = if *flipped {
+                match op {
+                    BinaryOp::GtEq => BinaryOp::LtEq,
+                    BinaryOp::LtEq => BinaryOp::GtEq,
+                    _ => return None,
+                }
+            } else {
+                *op
+            };
+            Some((*col, op, kind, micros))
         };
-        let (first_col, first_op, first_value) = bound(first)?;
-        let (second_col, second_op, second_value) = bound(second)?;
-        if first_col != second_col {
+        let (first_col, first_op, first_kind, first_value) = bound(first)?;
+        let (second_col, second_op, second_kind, second_value) = bound(second)?;
+        if first_col != second_col || first_kind != second_kind {
             return None;
         }
-        match (first_op, second_op) {
-            (BinaryOp::GtEq, BinaryOp::LtEq) => Some((first_col, first_value, second_value)),
-            (BinaryOp::LtEq, BinaryOp::GtEq) => Some((first_col, second_value, first_value)),
-            _ => None,
-        }
+        let (low, high) = match (first_op, second_op) {
+            (BinaryOp::GtEq, BinaryOp::LtEq) => (first_value, second_value),
+            (BinaryOp::LtEq, BinaryOp::GtEq) => (second_value, first_value),
+            _ => return None,
+        };
+        Some(NativeTemporalRange {
+            column: first_col,
+            low,
+            high,
+            kind: first_kind,
+        })
+    }
+
+    #[cfg(test)]
+    pub(in crate::engine::executor::select) fn inclusive_timestamp_range(
+        &self,
+    ) -> Option<(usize, i64, i64)> {
+        let range = self.inclusive_native_temporal_range()?;
+        (range.kind == NativeTemporalKind::Timestamp).then_some((
+            range.column,
+            range.low,
+            range.high,
+        ))
     }
 }
 
@@ -1589,6 +1724,8 @@ pub(super) fn fast_scalar_predicate_column(schema: &TableSchema, col: usize) -> 
                 | DataTypeKind::Double { .. }
                 | DataTypeKind::Decimal { .. }
                 | DataTypeKind::Date
+                | DataTypeKind::DateTime { .. }
+                | DataTypeKind::Time { .. }
                 | DataTypeKind::Timestamp { .. }
         )
     )
@@ -1945,7 +2082,24 @@ pub(super) fn compare_typed_predicate_values(
         (PredicateValue::U64(left), PredicateValue::I64(right)) => {
             (*left as i128).cmp(&(*right as i128))
         }
-        (PredicateValue::Date(left), PredicateValue::Date(right)) => left.cmp(right),
+        (PredicateValue::Date(left), PredicateValue::Date(right)) => {
+            if crate::types::decode_tagged_date(*left).is_some()
+                || crate::types::decode_tagged_date(*right).is_some()
+            {
+                return Ok(None);
+            }
+            left.cmp(right)
+        }
+        (PredicateValue::DateTime(left), PredicateValue::DateTime(right)) => {
+            if crate::types::decode_tagged_datetime(*left).is_some()
+                || crate::types::decode_tagged_datetime(*right).is_some()
+            {
+                return Ok(None);
+            }
+            left.cmp(right)
+        }
+        (PredicateValue::Time(left), PredicateValue::Time(right))
+        | (PredicateValue::Timestamp(left), PredicateValue::Timestamp(right)) => left.cmp(right),
         (PredicateValue::Year(left), PredicateValue::Year(right)) => left.cmp(right),
         (
             PredicateValue::Decimal(left, left_scale),
@@ -2022,9 +2176,21 @@ pub(super) fn fast_compare_typed_const(
     use crate::engine::executor::vec::scan_bridge::PredicateValue;
 
     if let (PredicateValue::Date(left), Some(right)) = (left, right.date_days) {
+        if crate::types::decode_tagged_date(*left).is_some() {
+            return Ok(None);
+        }
         return Ok(Some(left.cmp(&right)));
     }
     if let (PredicateValue::Timestamp(left), Some(right)) = (left, right.timestamp_micros) {
+        return Ok(Some(left.cmp(&right)));
+    }
+    if let (PredicateValue::DateTime(left), Some(right)) = (left, right.datetime_micros) {
+        if crate::types::decode_tagged_datetime(*left).is_none() {
+            return Ok(Some(left.cmp(&right)));
+        }
+        return Ok(None);
+    }
+    if let (PredicateValue::Time(left), Some(right)) = (left, right.time_micros) {
         return Ok(Some(left.cmp(&right)));
     }
     if let Some((right_magnitude, right_scale)) = right.decimal_parts {
@@ -2126,8 +2292,26 @@ pub(super) fn fast_const_for_column(
     schema: &TableSchema,
     col: usize,
 ) -> Option<FastConst> {
-    let value = const_expr_value(expr)?;
     let data_type = schema.columns.get(col).map(|column| &column.data_type)?;
+    let value = const_expr_value(expr).or_else(|| {
+        if matches!(
+            data_type,
+            DataTypeKind::Date
+                | DataTypeKind::DateTime { .. }
+                | DataTypeKind::Timestamp { .. }
+                | DataTypeKind::Time { .. }
+        ) {
+            ExprCompiler::capture_execution_constant(expr)
+        } else {
+            None
+        }
+    })?;
+    if matches!(data_type, DataTypeKind::Timestamp { .. })
+        && !matches!(value, Value::Timestamp(_) | Value::Null)
+        && !crate::engine::expr::session_timestamp_comparison_has_fixed_offset()
+    {
+        return None;
+    }
     let value = crate::engine::expr::contextual_numeric_literal(value, expr, data_type);
     let value = coerce_filter_constant(value, data_type);
     // DATE's typed lane compares epoch days. If coercion failed, retain the
@@ -2139,6 +2323,20 @@ pub(super) fn fast_const_for_column(
     if matches!(data_type, DataTypeKind::Timestamp { .. })
         && !matches!(value, Value::Timestamp(_) | Value::Null)
     {
+        return None;
+    }
+    if matches!(data_type, DataTypeKind::DateTime { .. })
+        && !matches!(value, Value::DateTime(_) | Value::Null)
+        || matches!(data_type, DataTypeKind::Time { .. })
+            && !matches!(value, Value::Time(_) | Value::Null)
+    {
+        return None;
+    }
+    if matches!(&value, Value::DateTime(micros) if crate::types::decode_tagged_datetime(*micros).is_some())
+    {
+        return None;
+    }
+    if matches!(&value, Value::Date(days) if crate::types::decode_tagged_date(*days).is_some()) {
         return None;
     }
     let decimal_parts = fast_const_decimal_parts(&value);
@@ -2162,6 +2360,14 @@ pub(super) fn fast_const_for_column(
             Value::Timestamp(micros) => Some(*micros),
             _ => None,
         },
+        datetime_micros: match &value {
+            Value::DateTime(micros) => Some(*micros),
+            _ => None,
+        },
+        time_micros: match &value {
+            Value::Time(micros) => Some(*micros),
+            _ => None,
+        },
         // A floating operand must retain approximate comparison semantics.
         // Its decimal display text is not an exact comparison constant.
         decimal_parts,
@@ -2178,9 +2384,26 @@ pub(super) fn fast_compare_value_const(
         return Ok(None);
     }
     if let (Some(l), Some(r)) = (value_to_date_days_fast(left), right.date_days) {
-        return Ok(Some(l.cmp(&r)));
+        return Ok(Some(if crate::types::decode_tagged_date(l).is_some() {
+            crate::types::date_components(l).cmp(&crate::types::date_components(r))
+        } else {
+            l.cmp(&r)
+        }));
     }
     if let (Value::Timestamp(left), Some(right)) = (left, right.timestamp_micros) {
+        return Ok(Some(left.cmp(&right)));
+    }
+    if let (Value::DateTime(left), Some(right)) = (left, right.datetime_micros) {
+        return Ok(Some(
+            if crate::types::decode_tagged_datetime(*left).is_none() {
+                left.cmp(&right)
+            } else {
+                crate::types::datetime_components(*left)
+                    .cmp(&crate::types::datetime_components(right))
+            },
+        ));
+    }
+    if let (Value::Time(left), Some(right)) = (left, right.time_micros) {
         return Ok(Some(left.cmp(&right)));
     }
     if let Some((right_magnitude, right_scale)) = right.decimal_parts {

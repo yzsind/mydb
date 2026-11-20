@@ -351,6 +351,8 @@ impl CacheEpoch {
 /// same exhaustive set instead of growing ad-hoc fingerprint fields.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct PlanSemantics {
+    /// Physical plans must not cross statement execution budgets.
+    pub execution_parallelism: u64,
     pub rls_authorization: Option<Arc<crate::engine::rls::PlanIdentity>>,
     pub sql_mode_fingerprint: u64,
     pub optimizer_switch_fingerprint: u64,
@@ -371,6 +373,7 @@ pub struct PlanSemantics {
 impl Default for PlanSemantics {
     fn default() -> Self {
         Self {
+            execution_parallelism: u64::from(crate::planner::configured_parallel_degree()),
             rls_authorization: None,
             sql_mode_fingerprint: 0,
             optimizer_switch_fingerprint: 0,
@@ -391,6 +394,7 @@ impl Default for PlanSemantics {
 /// precision. Store the remaining settings beside that single snapshot.
 #[derive(Debug)]
 pub(crate) struct PreparedPlanSemantics {
+    execution_parallelism: u64,
     identity: Arc<crate::engine::rls::PlanIdentity>,
     optimizer_switch: Arc<str>,
     sql_select_limit: u64,
@@ -401,6 +405,7 @@ pub(crate) struct PreparedPlanSemantics {
 impl PreparedPlanSemantics {
     pub(crate) fn capture(db: &Database, session: &SessionContext) -> Self {
         Self {
+            execution_parallelism: session.sysvars.mydb_parallel_degree,
             identity: crate::engine::rls::session_signature(db, session),
             optimizer_switch: Arc::from(session.sysvars.optimizer_switch.as_str()),
             sql_select_limit: session.sysvars.sql_select_limit,
@@ -410,7 +415,8 @@ impl PreparedPlanSemantics {
     }
 
     pub(crate) fn matches_session(&self, db: &Database, session: &SessionContext) -> bool {
-        self.identity.matches_session(db, session)
+        self.execution_parallelism == session.sysvars.mydb_parallel_degree
+            && self.identity.matches_session(db, session)
             && self.optimizer_switch.as_ref() == session.sysvars.optimizer_switch
             && self.sql_select_limit == session.sysvars.sql_select_limit
             && self.use_invisible_indexes == session.sysvars.use_invisible_indexes

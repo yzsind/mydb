@@ -2931,10 +2931,11 @@ fn allocate_index_name(
                 .unwrap_or_else(|| "functional_index".to_string());
             let mut name = base.clone();
             let mut suffix = 2;
-            while table
-                .indexes
-                .iter()
-                .any(|index| index.name.eq_ignore_ascii_case(&name))
+            while name.eq_ignore_ascii_case("PRIMARY")
+                || table
+                    .indexes
+                    .iter()
+                    .any(|index| index.name.eq_ignore_ascii_case(&name))
             {
                 name = format!("{base}_{suffix}");
                 suffix += 1;
@@ -3209,6 +3210,7 @@ fn execute_temp_alter_table(
     }
 
     let snapshot = db.snapshot_temp_table(&temp.internal_key)?;
+    let check_drop_visibility = stmt.actions.len() == 1;
     let result = (|| -> Result<(), QueryError> {
         for action in stmt.actions {
             validate_alter_algorithm(stmt.algorithm, &action)?;
@@ -3217,7 +3219,11 @@ fn execute_temp_alter_table(
                     db.add_temp_column(&temp.internal_key, column)?;
                 }
                 AlterAction::DropColumn(column) => {
-                    db.drop_temp_column(&temp.internal_key, &column)?;
+                    db.drop_temp_column_checked(
+                        &temp.internal_key,
+                        &column,
+                        check_drop_visibility,
+                    )?;
                 }
                 AlterAction::MoveColumn { column, position } => {
                     db.move_temp_column_position(&temp.internal_key, &column, position)?;
@@ -3365,6 +3371,17 @@ fn execute_temp_alter_table(
                     ));
                 }
             }
+        }
+        if db
+            .table(&temp.internal_key)?
+            .iter_select_columns()
+            .next()
+            .is_none()
+        {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+                "A table must have at least one visible column.",
+            ));
         }
         Ok(())
     })();
@@ -8554,6 +8571,40 @@ pub(super) fn execute_qualified_statement(
             ensure_base_table(db, &table_name)?;
             let _alter_source = db.table(&table_name)?;
             let _ddl_definition = db.pin_ddl_table(&table_name)?;
+            let mut stmt = stmt;
+            let mut used_names: HashSet<String> = _alter_source
+                .indexes
+                .iter()
+                .map(|i| i.name.to_ascii_lowercase())
+                .collect();
+            for action in &stmt.actions {
+                if let AlterAction::AddIndex(index) = action {
+                    if let Some(name) = &index.name {
+                        used_names.insert(name.to_ascii_lowercase());
+                    }
+                }
+            }
+            for action in &mut stmt.actions {
+                if let AlterAction::AddIndex(index) = action {
+                    if index.name.is_none() {
+                        let base = index
+                            .columns
+                            .first()
+                            .cloned()
+                            .unwrap_or_else(|| "functional_index".to_string());
+                        let mut name = base.clone();
+                        let mut suffix = 2;
+                        while name.eq_ignore_ascii_case("PRIMARY")
+                            || used_names.contains(&name.to_ascii_lowercase())
+                        {
+                            name = format!("{base}_{suffix}");
+                            suffix += 1;
+                        }
+                        used_names.insert(name.to_ascii_lowercase());
+                        index.name = Some(name);
+                    }
+                }
+            }
             db.validate_alter_table_actions(&table_name, &stmt.actions)?;
             let alter_plan = plan_persistent_alter(db, session, &stmt)?;
             validate_alter_algorithm_for_required(stmt.algorithm, alter_plan.required)?;

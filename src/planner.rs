@@ -5462,6 +5462,12 @@ pub(crate) fn freeze_select_wildcards(
             }
         }
     }
+    if projection.is_empty() {
+        return Err(error(
+            crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+            "Wildcard projection has no visible columns",
+        ));
+    }
     select.projection = projection;
     Ok(())
 }
@@ -8285,7 +8291,7 @@ fn apply_parallel_hints(db: &Database, plan: PhysicalPlan, select: &Select) -> P
         let degree = if degree_hint == 0 {
             default_parallel_degree()
         } else {
-            degree_hint
+            degree_hint.min(default_parallel_degree())
         };
         if degree > 1 {
             parallelize_seq_scans(
@@ -8859,10 +8865,21 @@ pub(crate) fn sql_mentions_user_var_assign(sql: &str) -> bool {
 /// Returns 1 while a [`force_serial_scope`] guard is active (sequence
 /// functions must evaluate on the connection thread).
 pub(crate) fn default_parallel_degree() -> u32 {
-    if parallelism_force_disabled() {
+    if parallelism_force_disabled() || parallel_planner_config().disabled {
         return 1;
     }
-    parallel_planner_config().degree
+    crate::engine::executor::tuning::current_parallelism()
+        .unwrap_or_else(configured_parallel_degree)
+}
+
+/// Process default, independent of the currently executing statement.
+pub(crate) fn configured_parallel_degree() -> u32 {
+    let config = parallel_planner_config();
+    if config.disabled {
+        1
+    } else {
+        config.degree
+    }
 }
 
 #[cfg(test)]
@@ -8997,6 +9014,7 @@ mod sequence_force_serial_tests {
 }
 
 pub(crate) fn cpu_bound_parallel_degree(degree: u32) -> u32 {
+    let degree = degree.max(1).min(default_parallel_degree());
     let config = parallel_planner_config();
     if config.use_all_cores {
         return degree.max(1);
@@ -25251,7 +25269,7 @@ pub(crate) fn expr_literal_value(expr: &Expr) -> Option<Value> {
             if name.eq_ignore_ascii_case("CAST")
                 && args.len() >= 2
                 && matches!(
-                    args.last(),
+                    args.get(1),
                     Some(Expr::Literal(crate::parser::Literal::String(target)))
                         if {
                             let target = target.trim().to_ascii_uppercase();

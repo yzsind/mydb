@@ -280,7 +280,7 @@ fn ddl_audit_nonstrict_null_conversion_and_strict_rollback() {
             .execute(&format!("INSERT INTO {name} VALUES(NULL)"))
             .unwrap();
         let ddl = format!("ALTER TABLE {name} MODIFY c {ty} NOT NULL");
-        assert_eq!(engine.execute(&ddl).unwrap_err().code(), 1048);
+        assert_eq!(engine.execute(&ddl).unwrap_err().code(), 1138);
         assert_eq!(
             rows(&engine, &format!("SELECT c FROM {name}")),
             vec![vec![Value::Null]]

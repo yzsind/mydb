@@ -32,6 +32,7 @@ mod subquery_scope_audit;
 mod support;
 mod table_ddl_audit_1012;
 mod table_ddl_audit_1027;
+mod table_ddl_audit_1120;
 mod tablesample;
 mod temporal_comparison_consistency;
 mod txn_acid_audit_1108;
@@ -491,6 +492,7 @@ mod vector_type;
 mod work_area;
 mod xa;
 mod zone_map;
+mod zone_map_optimization;
 
 mod dml_audit_1015;
 mod dml_bugs_audit;

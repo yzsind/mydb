@@ -113,8 +113,8 @@ fn membership_limit_32_survives_analyze_rebuild_and_reload() {
     engine.execute("DELETE FROM t WHERE id=0").unwrap();
     assert_scan_matches(&engine, "c31=127");
 
-    // Reverse the benefit order: selection must follow NDV, not the first
-    // 32 physical columns, while the primary-key leading column stays out.
+    // Equal-width candidates follow marginal benefit, not physical order.
+    // The per-zone byte budget may admit fewer than the 32-column maximum.
     let mut ranked = (*table).clone();
     for i in 0..40 {
         ranked
@@ -129,8 +129,10 @@ fn membership_limit_32_survives_analyze_rebuild_and_reload() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         ranked_ids,
-        ranked.columns[9..=40]
+        ranked.columns[1..]
             .iter()
+            .rev()
+            .take(ranked_ids.len())
             .map(|column| column.column_id)
             .collect()
     );

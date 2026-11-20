@@ -1189,12 +1189,32 @@ mod tests {
             let mut words = vec![u64::MAX; 1024];
             words[..empty_blocks * 8].fill(0);
             let set_bits = words.iter().map(|word| word.count_ones()).sum();
-            summary::encode_membership(Some(&ZoneMembership::Bloom {
+            let raw = summary::encode_membership(Some(&ZoneMembership::Bloom {
                 words,
                 hashes: 4,
                 set_bits,
             }))
-            .unwrap()
+            .unwrap();
+            if empty_blocks == 0 || raw[1] != 2 {
+                return raw;
+            }
+            // Keep this persisted-record split fixture independent of the
+            // encoder's minimum-savings policy. Empty/raw Rice blocks remain
+            // valid even when new writers prefer an uncompressed record.
+            let blocks = 1024 / 8;
+            let mut packed = raw[..8].to_vec();
+            packed[1] = 4;
+            packed.resize(8 + blocks * 2, 0);
+            for block in 0..blocks {
+                let codec = if block < empty_blocks { 0 } else { 7 };
+                if codec == 7 {
+                    packed.extend_from_slice(&raw[8 + block * 64..8 + (block + 1) * 64]);
+                }
+                let end = packed.len() - 8 - blocks * 2;
+                packed[8 + block * 2..8 + block * 2 + 2]
+                    .copy_from_slice(&((end | codec << 13) as u16).to_le_bytes());
+            }
+            packed
         };
         let compressed = bloom(5);
         let dense = bloom(0);

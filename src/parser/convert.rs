@@ -241,6 +241,17 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             let Some(name) = name else {
                 return unsupported("CREATE INDEX without name");
             };
+            if name
+                .0
+                .first()
+                .and_then(|p| p.as_ident())
+                .is_some_and(|i| i.value.eq_ignore_ascii_case("PRIMARY"))
+            {
+                return Err(numeric_spec_error(
+                    crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+                    "Incorrect index name 'PRIMARY'",
+                ));
+            }
             if concurrently {
                 return unsupported("CREATE INDEX CONCURRENTLY");
             }
@@ -1254,7 +1265,7 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
-                    name: constraint.index_name.or(constraint.name).map(ident_value),
+                    name: ordinary_index_name(constraint.index_name.or(constraint.name))?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1284,7 +1295,7 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
-                    name: constraint.name.map(ident_value),
+                    name: ordinary_index_name(constraint.name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1315,7 +1326,7 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
-                    name: constraint.opt_index_name.map(ident_value),
+                    name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1337,7 +1348,7 @@ fn convert_create_table(
                 let columns = convert_index_columns(constraint.columns)?;
                 validate_spatial_index_columns(&columns)?;
                 indexes.push(IndexDef {
-                    name: constraint.opt_index_name.map(ident_value),
+                    name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1629,7 +1640,7 @@ fn convert_alter_table_action(
                     &constraint.index_options,
                 )?;
                 AlterAction::AddIndex(IndexDef {
-                    name: constraint.index_name.or(constraint.name).map(ident_value),
+                    name: ordinary_index_name(constraint.index_name.or(constraint.name))?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1687,7 +1698,7 @@ fn convert_alter_table_action(
                     &constraint.index_options,
                 )?;
                 AlterAction::AddIndex(IndexDef {
-                    name: constraint.name.map(ident_value),
+                    name: ordinary_index_name(constraint.name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1733,7 +1744,7 @@ fn convert_alter_table_action(
                     "SPATIAL"
                 };
                 AlterAction::AddIndex(IndexDef {
-                    name: constraint.opt_index_name.map(ident_value),
+                    name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -7582,6 +7593,13 @@ fn convert_float_number_info(
             Ok(Some((p as u8, 0)))
         }
         ExactNumberInfo::PrecisionAndScale(p, s) => {
+            if p == 0 {
+                return Err(numeric_spec_error(
+                    crate::error::catalog::ER_TOO_BIG_DISPLAYWIDTH,
+                    "Display width must be greater than zero",
+                ));
+            }
+
             if s < 0 {
                 return Err(numeric_spec_error(
                     crate::error::catalog::ER_TOO_BIG_SCALE,
@@ -7901,8 +7919,14 @@ pub(super) fn accept_generic_table_option(
             "REDUNDANT",
             "COMPACT",
         ])?,
-        "KEY_BLOCK_SIZE" | "STATS_SAMPLE_PAGES" | "MAX_ROWS" | "MIN_ROWS" | "AVG_ROW_LENGTH"
-        | "AUTOEXTEND_SIZE" => {
+        "KEY_BLOCK_SIZE" => {
+            let parsed = uint_value()?;
+            if parsed.parse::<u64>().map_or(true, |n| n > 65535) {
+                return Err("KEY_BLOCK_SIZE must be between 0 and 65535".to_string());
+            }
+            parsed
+        }
+        "STATS_SAMPLE_PAGES" | "MAX_ROWS" | "MIN_ROWS" | "AVG_ROW_LENGTH" | "AUTOEXTEND_SIZE" => {
             if key == "STATS_SAMPLE_PAGES" && upper_value == "DEFAULT" {
                 "DEFAULT".to_string()
             } else {
@@ -9744,8 +9768,37 @@ fn validate_name_component(ident: &Ident) -> Result<&str, ParseError> {
     Ok(&ident.value)
 }
 
+fn ordinary_index_name(name: Option<Ident>) -> Result<Option<String>, ParseError> {
+    if name
+        .as_ref()
+        .is_some_and(|n| n.value.eq_ignore_ascii_case("PRIMARY"))
+    {
+        return Err(numeric_spec_error(
+            crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+            "Incorrect index name 'PRIMARY'",
+        ));
+    }
+    Ok(name.map(ident_value))
+}
+
 fn object_name_to_string(name: impl std::borrow::Borrow<ObjectName>) -> Result<String, ParseError> {
     let name = name.borrow();
+    if name.0.is_empty() || name.0.len() > 2 {
+        return Err(parse_error_at_zero("expected [database.]object"));
+    }
+    for (pos, part) in name.0.iter().enumerate() {
+        if part
+            .as_ident()
+            .is_some_and(|i| i.value.is_empty() || i.value.ends_with(' '))
+        {
+            let spec = if name.0.len() == 2 && pos == 0 {
+                crate::error::catalog::ER_WRONG_DB_NAME
+            } else {
+                crate::error::catalog::ER_WRONG_TABLE_NAME
+            };
+            return Err(numeric_spec_error(spec, "Incorrect object name"));
+        }
+    }
     for part in &name.0 {
         if let ObjectNamePart::Identifier(ident) = part {
             validate_identifier(ident)?;

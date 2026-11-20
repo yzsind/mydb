@@ -1964,6 +1964,7 @@ pub(super) fn plan_semantics(
     session: &SessionContext,
 ) -> crate::engine::cache::PlanSemantics {
     crate::engine::cache::PlanSemantics {
+        execution_parallelism: session.sysvars.mydb_parallel_degree,
         rls_authorization: Some(crate::engine::rls::session_signature(db, session)),
         sql_mode_fingerprint: crate::binlog::sql_mode_str_to_bits(&session.sql_mode),
         optimizer_switch_fingerprint: crate::engine::cache::optimizer_switch_fingerprint(

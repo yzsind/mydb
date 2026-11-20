@@ -66,7 +66,11 @@ pub const OVERFLOW_VERSION: u16 = 4;
 /// per-dimension scan code, named by an overflow chain from the meta page.
 pub const PAGED_HNSW_INDEX_VERSION: u32 = 9;
 pub const PAGED_HNSW_PAGE_VERSION: u16 = 4;
-pub const ZONE_MAP_VERSION: u32 = 6;
+/// v7 separates complete binary equality fingerprints from range prefixes,
+/// allows block-multiple Bloom capacities, and adds bounded exact DML deltas.
+/// v8 avalanches Bloom address seeds and checks block-wise occupancy before
+/// folding. Its probe positions are incompatible with the v7 development image.
+pub const ZONE_MAP_VERSION: u32 = 8;
 /// Zone Map v6 uses shared-buffer-pool pages and physical redo. Page v2 adds
 /// mutable directory children, mixed record leaves and root revisions. Page
 /// v3 adds block-Rice membership and compact relative-key record slots.
