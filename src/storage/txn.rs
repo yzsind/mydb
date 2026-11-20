@@ -1883,7 +1883,101 @@ pub(crate) struct GroupCommitCoordinator {
 #[derive(Debug)]
 struct DurabilityWaiter {
     lsn: u64,
-    signal: Arc<CommitWaitSignal>,
+    signal: DurabilitySignal,
+}
+
+#[derive(Clone, Debug)]
+enum DurabilitySignal {
+    #[cfg(target_os = "linux")]
+    Slot(DurabilitySlot),
+    Private(Arc<CommitWaitSignal>),
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct DurabilitySlot {
+    bit: u32,
+    phase: u32,
+}
+
+/// Linux can wake the exact waiters covered by one barrier with a single
+/// syscall. Every outstanding slot owns one bit until its waiter returns.
+#[cfg(target_os = "linux")]
+#[derive(Debug, Default)]
+struct DurabilityWakeSet {
+    occupied: [CachePadded<AtomicBool>; u32::BITS as usize],
+    phases: CachePadded<AtomicU32>,
+}
+
+#[cfg(target_os = "linux")]
+impl DurabilityWakeSet {
+    // The coordinator mutex serializes allocation. A returning waiter only
+    // touches its own slot, which can usually be reused by the same thread.
+    fn reserve(&self) -> Option<DurabilitySlot> {
+        thread_local! {
+            static PREFERRED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+        }
+        PREFERRED.with(|hint| {
+            let start = hint.get();
+            for offset in 0..self.occupied.len() {
+                let index = (start + offset) % self.occupied.len();
+                if !self.occupied[index].load(Ordering::Acquire) {
+                    self.occupied[index].store(true, Ordering::Relaxed);
+                    hint.set(index);
+                    let bit = 1 << index;
+                    return Some(DurabilitySlot {
+                        bit,
+                        phase: self.phases.load(Ordering::Relaxed) & bit,
+                    });
+                }
+            }
+            None
+        })
+    }
+
+    fn wait(&self, slot: DurabilitySlot) {
+        loop {
+            let phases = self.phases.load(Ordering::Acquire);
+            if phases & slot.bit != slot.phase {
+                break;
+            }
+            // The kernel checks the word again before sleeping. Concurrent
+            // completions, signals and spurious wakes all retry the predicate.
+            unsafe {
+                libc::syscall(
+                    libc::SYS_futex,
+                    self.phases.as_ptr(),
+                    libc::FUTEX_WAIT_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                    phases,
+                    std::ptr::null::<libc::timespec>(),
+                    std::ptr::null::<u32>(),
+                    slot.bit,
+                );
+            }
+        }
+        self.occupied[slot.bit.trailing_zeros() as usize].store(false, Ordering::Release);
+    }
+
+    fn notify(&self, mask: u32) {
+        if mask == 0 {
+            return;
+        }
+        // Toggling each slot once avoids clearing a shared completion word
+        // as every runnable waiter resumes. A slot's next owner reads its
+        // current phase only after the previous one has released the bit.
+        self.phases.fetch_xor(mask, Ordering::Release);
+        unsafe {
+            libc::syscall(
+                libc::SYS_futex,
+                self.phases.as_ptr(),
+                libc::FUTEX_WAKE_BITSET | libc::FUTEX_PRIVATE_FLAG,
+                libc::c_int::MAX,
+                std::ptr::null::<libc::timespec>(),
+                std::ptr::null::<u32>(),
+                mask,
+            );
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -1894,18 +1988,18 @@ struct DurabilityState {
     failure: Option<QueryError>,
     window: Duration,
     target: u64,
+    stats: DurabilityWorkerStats,
+    #[cfg(target_os = "linux")]
+    batch_wake: bool,
 }
 
 #[derive(Debug, Default)]
 struct DurabilityShared {
     state: parking_lot::Mutex<DurabilityState>,
     ready: parking_lot::Condvar,
+    #[cfg(target_os = "linux")]
+    wake_set: DurabilityWakeSet,
     durable_lsn: AtomicU64,
-    queue_depth: AtomicU64,
-    queue_depth_peak: AtomicU64,
-    batches: AtomicU64,
-    requests: AtomicU64,
-    batch_max: AtomicU64,
 }
 
 impl DurabilityShared {
@@ -1939,16 +2033,37 @@ impl DurabilityShared {
             }
         }
         let count = batch.len() as u64 + u64::from(foreground);
-        self.queue_depth.fetch_sub(count, Ordering::AcqRel);
+        #[cfg(target_os = "linux")]
+        {
+            // Single-waiter barriers have no wake syscalls to coalesce.
+            // Let recent batches determine whether to share the wait word.
+            state.batch_wake = batch.len() > 1;
+        }
+        state.stats.queue_depth -= count;
         if matches!(&result, Ok((_, true))) {
-            self.batches.fetch_add(1, Ordering::Relaxed);
-            self.batch_max.fetch_max(count, Ordering::Relaxed);
+            state.stats.batches += 1;
+            state.stats.batch_max = state.stats.batch_max.max(count);
         }
         state.syncing = false;
         let wake_worker = foreground && (state.stopping || !state.pending.is_empty());
         drop(state);
+
+        #[cfg(target_os = "linux")]
+        {
+            let mut mask = 0;
+            for waiter in &batch {
+                if let DurabilitySignal::Slot(slot) = waiter.signal {
+                    mask |= slot.bit;
+                }
+            }
+            self.wake_set.notify(mask);
+        }
         for waiter in batch {
-            waiter.signal.notify();
+            match waiter.signal {
+                DurabilitySignal::Private(signal) => signal.notify(),
+                #[cfg(target_os = "linux")]
+                DurabilitySignal::Slot(_) => {}
+            }
         }
         if wake_worker {
             self.ready.notify_one();
@@ -2012,14 +2127,15 @@ impl DurabilityWorker {
                 if state.pending.is_empty() {
                     break;
                 }
-                let deadline = Instant::now() + state.window;
-                while !state.stopping && state.pending.len() < state.target as usize {
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        break;
-                    }
-                    if worker.ready.wait_for(&mut state, remaining).timed_out() {
-                        break;
+                if !state.window.is_zero() {
+                    let deadline = Instant::now() + state.window;
+                    while !state.stopping && state.pending.len() < state.target as usize {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        if remaining.is_zero()
+                            || worker.ready.wait_for(&mut state, remaining).timed_out()
+                        {
+                            break;
+                        }
                     }
                 }
                 let batch = std::mem::take(&mut state.pending);
@@ -2073,11 +2189,9 @@ impl DurabilityWorker {
         if lsn <= durable() {
             return Ok(());
         }
-        self.shared.requests.fetch_add(1, Ordering::Relaxed);
-        let depth = self.shared.queue_depth.fetch_add(1, Ordering::AcqRel) + 1;
-        self.shared
-            .queue_depth_peak
-            .fetch_max(depth, Ordering::Relaxed);
+        state.stats.requests += 1;
+        state.stats.queue_depth += 1;
+        state.stats.queue_depth_peak = state.stats.queue_depth_peak.max(state.stats.queue_depth);
         if !state.syncing && state.pending.is_empty() && window.is_zero() {
             if let Some(log) = &self.log {
                 state.syncing = true;
@@ -2089,18 +2203,40 @@ impl DurabilityWorker {
             state.window = window;
             state.target = target.max(1);
         }
-        let signal = COMMIT_WAIT_SIGNAL.with(Arc::clone);
-        signal.ready.store(false, Ordering::Release);
+        let private_signal = || {
+            let signal = COMMIT_WAIT_SIGNAL.with(Arc::clone);
+            signal.ready.store(false, Ordering::Release);
+            DurabilitySignal::Private(signal)
+        };
+        #[cfg(target_os = "linux")]
+        let signal = if state.batch_wake {
+            self.shared
+                .wake_set
+                .reserve()
+                .map_or_else(private_signal, DurabilitySignal::Slot)
+        } else {
+            private_signal()
+        };
+        #[cfg(not(target_os = "linux"))]
+        let signal = private_signal();
         state.pending.push(DurabilityWaiter {
             lsn,
-            signal: Arc::clone(&signal),
+            signal: signal.clone(),
         });
-        let wake_worker = !state.syncing;
+        // Wake an idle worker on the first request. A worker collecting a
+        // timed batch only needs another notification when its target is met.
+        let depth = state.pending.len() as u64;
+        let wake_worker =
+            !state.syncing && (depth == 1 || (!state.window.is_zero() && depth == state.target));
         drop(state);
         if wake_worker {
             self.shared.ready.notify_one();
         }
-        signal.wait();
+        match signal {
+            DurabilitySignal::Private(signal) => signal.wait(),
+            #[cfg(target_os = "linux")]
+            DurabilitySignal::Slot(slot) => self.shared.wake_set.wait(slot),
+        }
         if lsn <= self.shared.durable_lsn.load(Ordering::Acquire) {
             return Ok(());
         }
@@ -2113,13 +2249,7 @@ impl DurabilityWorker {
     }
 
     pub(crate) fn stats(&self) -> DurabilityWorkerStats {
-        DurabilityWorkerStats {
-            queue_depth: self.shared.queue_depth.load(Ordering::Relaxed),
-            queue_depth_peak: self.shared.queue_depth_peak.load(Ordering::Relaxed),
-            batches: self.shared.batches.load(Ordering::Relaxed),
-            requests: self.shared.requests.load(Ordering::Relaxed),
-            batch_max: self.shared.batch_max.load(Ordering::Relaxed),
-        }
+        self.shared.state.lock().stats
     }
 }
 
@@ -7455,6 +7585,31 @@ mod group_commit_tests {
         let st = coord.state.lock();
         assert!(st.batches >= 1);
         assert!(st.waiters >= 3, "waiters={}", st.waiters);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn durability_wake_slots_are_exclusive_until_the_waiter_returns() {
+        let set = Arc::new(DurabilityWakeSet::default());
+        let slots: Vec<_> = (0..u32::BITS).map(|_| set.reserve().unwrap()).collect();
+        assert!(set.reserve().is_none());
+        let mask = slots.iter().fold(0, |mask, slot| mask | slot.bit);
+        assert_eq!(mask, u32::MAX);
+        set.notify(mask);
+        assert!(set.reserve().is_none());
+        let selected = slots[3];
+        let other = Arc::clone(&set);
+        std::thread::spawn(move || other.wait(selected))
+            .join()
+            .unwrap();
+        let reused = set.reserve().unwrap();
+        assert_eq!(reused.bit, selected.bit);
+        assert_ne!(reused.phase, selected.phase);
+        set.notify(reused.bit);
+        set.wait(reused);
+        for slot in slots.into_iter().filter(|slot| slot.bit != selected.bit) {
+            set.wait(slot);
+        }
     }
 
     #[test]

@@ -2102,16 +2102,16 @@ fn skip_leading_ws_and_comments_for_probe(input: &[u8]) -> &[u8] {
 /// through to the regular sqlparser dispatch path. Returning a `Copy`
 /// enum value keeps the fast path branch-free at the call site.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum SimpleTxnControl {
+pub(crate) enum SimpleTxnControl {
     Begin,
     Commit,
     Rollback,
 }
 
-/// True for the bare `BEGIN` / `COMMIT` / `ROLLBACK` texts that `execute`
+/// Classify the bare `BEGIN` / `COMMIT` / `ROLLBACK` texts that `execute`
 /// dispatches without parsing.
-pub(crate) fn is_simple_txn_control_sql(sql: &str) -> bool {
-    simple_txn_control_kind(sql.trim_matches(|c: char| c.is_whitespace() || c == ';')).is_some()
+pub(crate) fn classify_simple_txn_control(sql: &str) -> Option<SimpleTxnControl> {
+    simple_txn_control_kind(sql.trim_matches(|c: char| c.is_whitespace() || c == ';'))
 }
 
 fn simple_txn_control_kind(trimmed: &str) -> Option<SimpleTxnControl> {
@@ -2942,12 +2942,8 @@ impl UndoPurgeHandle {
     }
 }
 
-/// Background checkpointer. Statements no longer run `maybe_checkpoint`
-/// inline (a triggered checkpoint used to charge its full flush + fsync
-/// latency to whatever user query happened to cross the threshold, and an
-/// idle process never checkpointed at all); this worker polls the
-/// lock-free trigger probe once per second and runs the checkpoint off
-/// the query path.
+/// Checks for a checkpoint once per second. Between checks, WAL growth
+/// can trigger preparation of the next segment on the same worker.
 struct CheckpointerHandle {
     worker: crate::engine::background::BackgroundWorker,
 }
@@ -2966,17 +2962,27 @@ impl CheckpointerHandle {
         let worker = crate::engine::background::BackgroundWorker::spawn(
             "mydb-checkpointer",
             move |worker_shutdown| {
+                let wal = db.log_state_atomics();
+                let mut last_size = wal.wal_bytes();
+                let mut last_checkpoint = Instant::now();
                 while !worker_shutdown.is_requested() {
-                    if worker_shutdown.wait_timeout(Duration::from_millis(1000)) {
+                    if worker_shutdown.wait_timeout(Duration::from_millis(100)) {
                         break;
                     }
-                    if let Err(err) = db.maybe_checkpoint() {
-                        crate::util::logging::log_message(format_args!(
-                            "background checkpoint failed: {} ({})",
-                            err.message(),
-                            err.sql_state()
-                        ));
+                    let size = wal.wal_bytes();
+                    if last_checkpoint.elapsed() >= Duration::from_secs(1) {
+                        if let Err(err) = db.maybe_checkpoint() {
+                            crate::util::logging::log_message(format_args!(
+                                "background checkpoint failed: {} ({})",
+                                err.message(),
+                                err.sql_state()
+                            ));
+                        }
+                        last_checkpoint = Instant::now();
+                    } else if size.saturating_sub(last_size) < crate::wal::WAL_PREP_POLL_BYTES {
+                        continue;
                     }
+                    last_size = size;
                     // Pre-create the next WAL segment off the commit path so
                     // segment rotation is a cheap rename instead of a
                     // mutex-held file create + fsync that stalls committers.

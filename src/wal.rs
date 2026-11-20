@@ -28,6 +28,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 /// `oltp_update_index` pegs ~163K samples on `LogManager::append`'s
 /// mutex.
 pub type LogMutex = parking_lot::Mutex<LogManager>;
+type WalSyncFiles = smallvec::SmallVec<[Arc<File>; 2]>;
 
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
@@ -2311,6 +2312,16 @@ impl LogManager {
         Ok(next_id)
     }
 
+    /// Bound the amount of speculative sequential I/O competing with the
+    /// active WAL on each preparation. Reservation-only segments retain the
+    /// configured ceiling, including the synchronous rollover fallback.
+    fn segment_limit(&self, fill: SegmentFill) -> u64 {
+        match fill {
+            SegmentFill::Reserve => self.max_segment_bytes,
+            SegmentFill::Zero => self.max_segment_bytes.min(ZERO_FILLED_SEGMENT_BYTES),
+        }
+    }
+
     /// Plan a background pre-creation of the next segment, if one is warranted.
     /// Runs under the WAL mutex but does no IO: it only decides *whether* to
     /// prepare and returns the parameters for the (slow) file creation that
@@ -2339,9 +2350,9 @@ impl LogManager {
         // journal commit on most `fdatasync`s; as soon as it shows sustained
         // write traffic, prepare a zero-filled successor to replace it.
         let threshold = if self.active_replaceable_by(fill) {
-            self.max_segment_bytes / 16
+            self.segment_limit(fill) / 16
         } else {
-            self.max_segment_bytes / 2
+            self.segment_limit(self.active_fill) / 2
         };
         if self.active_info.size_bytes < threshold {
             return None;
@@ -2349,7 +2360,7 @@ impl LogManager {
         let next_id = self.active_info.segment_id.checked_add(1)?;
         let tmp_path = self.dir.join(WAL_PREP_TMP_NAME);
         self.next_segment_prep_in_flight = true;
-        Some((next_id, tmp_path, self.max_segment_bytes, fill))
+        Some((next_id, tmp_path, self.segment_limit(fill), fill))
     }
 
     /// Choose the next segment's fill from the WAL bytes per durability sync
@@ -2787,7 +2798,7 @@ impl LogManager {
         accumulate_wal_stats(&mut self.stats, &rec.payload);
         let _ = self.new_lsn_tx.send(lsn);
 
-        if self.active_info.size_bytes >= self.max_segment_bytes {
+        if self.active_info.size_bytes >= self.segment_limit(self.active_fill) {
             rec.retain_large_buffer = false;
             self.rotate_active_internal()?;
         }
@@ -2985,14 +2996,8 @@ impl LogManager {
         Ok(())
     }
 
-    fn recycle_detached_write(&mut self, mut write: DetachedWalWrite) {
-        if write
-            .completion
-            .result
-            .lock()
-            .as_ref()
-            .is_some_and(Result::is_ok)
-        {
+    fn recycle_detached_write(&mut self, mut write: DetachedWalWrite, write_succeeded: bool) {
+        if write_succeeded {
             self.record_physical_write(write.bytes.len());
         }
         write.bytes.clear();
@@ -3007,7 +3012,7 @@ impl LogManager {
         let write = log.lock().detach_pending_write()?;
         if let Some(mut write) = write {
             let result = write.write();
-            log.lock().recycle_detached_write(write);
+            log.lock().recycle_detached_write(write, result.is_ok());
             result?;
         }
         Ok(())
@@ -3281,7 +3286,7 @@ impl LogManager {
 
         // Rotate the active segment if it has grown past the threshold.
         // We rotate AFTER the write so records never cross segments.
-        if self.active_info.size_bytes >= self.max_segment_bytes {
+        if self.active_info.size_bytes >= self.segment_limit(self.active_fill) {
             self.rotate_active_internal()?;
         }
         Ok(lsn)
@@ -3385,7 +3390,7 @@ impl LogManager {
         }
         accumulate_wal_stats(&mut self.stats, &frame.payload);
         let _ = self.new_lsn_tx.send(header.lsn);
-        if self.active_info.size_bytes >= self.max_segment_bytes {
+        if self.active_info.size_bytes >= self.segment_limit(self.active_fill) {
             self.rotate_active_internal()?;
         }
         Ok(())
@@ -3426,7 +3431,7 @@ impl LogManager {
         // storage latency. Once admitted, prepare_sync_to re-checks
         // durable_lsn, collapsing every follower already covered by the
         // leader into a no-op.
-        let sync_gate = {
+        let (sync_gate, write_gate) = {
             let log_guard = log.lock();
             log_guard.validate_sync_target(lsn)?;
             // A page cleaner with an already durable image must not queue
@@ -3434,10 +3439,12 @@ impl LogManager {
             if lsn <= log_guard.durable_lsn && !log_guard.directory_sync_pending {
                 return Ok((log_guard.durable_lsn, false));
             }
-            Arc::clone(&log_guard.sync_gate)
+            (
+                Arc::clone(&log_guard.sync_gate),
+                Arc::clone(&log_guard.write_gate),
+            )
         };
         let _sync_guard = sync_gate.lock();
-        let write_gate = Arc::clone(&log.lock().write_gate);
         let write_guard = write_gate.lock();
         let (mut pending_write, sync_files, high_water) = {
             let mut log_guard = log.lock();
@@ -3449,15 +3456,22 @@ impl LogManager {
                 return Ok((log_guard.durable_lsn, false));
             }
             let write = log_guard.detach_pending_write()?;
-            let (files, high_water) = log_guard.sync_files_and_high_water(lsn);
+            let (files, high_water) = log_guard.sync_files_and_high_water();
             (write, files, high_water)
         };
         let write_result = match pending_write.as_mut() {
             Some(write) => write.write(),
             None => Ok(()),
         };
+        let write_succeeded = write_result.is_ok();
         if let Some(write) = pending_write.take() {
-            log.lock().recycle_detached_write(write);
+            if let Some(mut log_guard) = log.try_lock() {
+                log_guard.recycle_detached_write(write, write_succeeded);
+            } else {
+                // The write is complete. Reclaim its buffer when publishing
+                // the durable prefix instead of delaying fsync for an appender.
+                pending_write = Some(write);
+            }
         }
         drop(write_guard);
         let started = Instant::now();
@@ -3465,6 +3479,9 @@ impl LogManager {
             write_result.and_then(|()| sync_files.iter().try_for_each(|file| sync_wal_file(file)));
         let elapsed_us = elapsed_us(started);
         let mut log_guard = log.lock();
+        if let Some(write) = pending_write {
+            log_guard.recycle_detached_write(write, write_succeeded);
+        }
         // Drop the cloned fd before we publish the durable LSN —
         // makes a leak / partial state easier to spot in profilers,
         // and matches the explicit close that `GroupCommitCoordinator`
@@ -3492,7 +3509,7 @@ impl LogManager {
     pub(crate) fn prepare_sync_to(
         &mut self,
         lsn: u64,
-    ) -> Result<Option<(Vec<Arc<File>>, u64)>, QueryError> {
+    ) -> Result<Option<(WalSyncFiles, u64)>, QueryError> {
         if self.directory_sync_pending {
             self.publish_synced_prefix(self.durable_lsn)?;
         }
@@ -3502,7 +3519,7 @@ impl LogManager {
         }
         self.flush_pending_writes()?;
         self.active_file.flush().map_err(io_err)?;
-        Ok(Some(self.sync_files_and_high_water(lsn)))
+        Ok(Some(self.sync_files_and_high_water()))
     }
 
     fn validate_sync_target(&self, lsn: u64) -> Result<(), QueryError> {
@@ -3521,7 +3538,7 @@ impl LogManager {
         Ok(())
     }
 
-    fn sync_files_and_high_water(&self, _lsn: u64) -> (Vec<Arc<File>>, u64) {
+    fn sync_files_and_high_water(&self) -> (WalSyncFiles, u64) {
         // `last_lsn` is captured under the log mutex right after the flush, so
         // it is a conservative lower bound on what the fsync will persist:
         // records appended *after* this point are not guaranteed flushed and
@@ -3537,7 +3554,7 @@ impl LogManager {
             .pending_sealed_sync
             .iter()
             .map(|sealed| Arc::clone(&sealed.file))
-            .collect::<Vec<_>>();
+            .collect::<WalSyncFiles>();
         // An empty freshly-rotated active segment has no bytes relevant to
         // this barrier. Otherwise sync it after every sealed predecessor.
         if self.active_info.first_lsn <= self.active_info.last_lsn {
@@ -5292,6 +5309,10 @@ const ZERO_FILL_MIN_RESERVE_SYNC_US: u64 = 100;
 /// to workloads that already amortize filesystem metadata across large writes.
 const ZERO_FILL_SMALL_BYTES_PER_SYNC: u64 = 8 * 1024;
 
+const ZERO_FILLED_SEGMENT_BYTES: u64 = 16 * 1024 * 1024;
+/// Recheck preparation between checkpoint ticks when the log grows quickly.
+pub(crate) const WAL_PREP_POLL_BYTES: u64 = ZERO_FILLED_SEGMENT_BYTES / 8;
+
 /// Syncs a poll window needs before its average latency is trusted.
 const ZERO_FILL_MIN_SAMPLE_SYNCS: u64 = 64;
 
@@ -5322,7 +5343,11 @@ fn zero_fill_segment(file: &File, from: u64, to: u64) -> Result<(), QueryError> 
     static ZEROS: [u8; CHUNK] = [0; CHUNK];
     let mut offset = from;
     while offset < to {
-        let len = (to - offset).min(CHUNK as u64) as usize;
+        // End each paced write on a chunk boundary. The segment header
+        // offsets the first write; overlapping filesystem pages would be
+        // dirtied and submitted again by the following writeback.
+        let room = CHUNK as u64 - offset % CHUNK as u64;
+        let len = (to - offset).min(room) as usize;
         write_all_at(file, &ZEROS[..len], offset)?;
         offset += len as u64;
         if offset < to {
@@ -9814,7 +9839,7 @@ mod tests {
         let path = log.lock().active_info.path.clone();
         detached.file = Arc::new(File::open(path).unwrap());
         let failure = detached.write().unwrap_err();
-        log.lock().recycle_detached_write(detached);
+        log.lock().recycle_detached_write(detached, false);
         assert!(LogManager::sync_durable_to(&log, failed).is_err());
         for txn in 3..8 {
             let append = log
@@ -10312,6 +10337,62 @@ mod tests {
         let reopened = LogManager::open(dir.path()).unwrap();
         assert_eq!(reopened.next_lsn(), next_before);
         assert!(reopened.segment_count() >= 2);
+    }
+
+    #[test]
+    fn bounded_zero_fill_rotates_at_the_prepared_size_and_recovers() {
+        std::env::set_var("MYDB_WAL_ZERO_FILL", "1");
+        std::env::set_var("MYDB_WAL_PREALLOCATE", "1");
+        let dir = tempfile::tempdir().unwrap();
+        let cap = 32 * 1024 * 1024;
+        let log = Arc::new(parking_lot::Mutex::new(open_log_with_segment_cap(
+            dir.path(),
+            cap,
+        )));
+        let limit = log.lock().segment_limit(SegmentFill::Zero);
+        assert!(limit < cap);
+        assert_eq!(log.lock().segment_limit(SegmentFill::Reserve), cap);
+        let large_record = || WalPayload::HeapInsertBatch {
+            path: "tables/1.heap".into(),
+            inserts: vec![WalHeapInsert {
+                page_id: 1,
+                slot_id: 0,
+                payload: vec![0x51; 1024 * 1024],
+                undo_lsn: None,
+            }],
+        };
+        log.lock().append(1, large_record()).unwrap();
+        log.lock().zero_fill_min_sync_us = 0;
+        // Establish a fresh observation window after the bulk append.
+        LogManager::ensure_next_segment(&log).unwrap();
+        for _ in 0..ZERO_FILL_MIN_SAMPLE_SYNCS {
+            let lsn = log.lock().append(1, prep_filler_payload()).unwrap();
+            LogManager::sync_durable_to(&log, lsn).unwrap();
+        }
+        LogManager::ensure_next_segment(&log).unwrap();
+        {
+            let guard = log.lock();
+            assert_eq!(guard.active_segment_id(), 2);
+            assert_eq!(guard.active_file.metadata().unwrap().len(), limit);
+        }
+        let count = limit / (1024 * 1024);
+        for _ in 0..count {
+            log.lock().append(2, large_record()).unwrap();
+        }
+        {
+            let mut guard = log.lock();
+            assert_eq!(guard.active_segment_id(), 3);
+            assert_eq!(guard.active_fill, SegmentFill::Reserve);
+            guard.append(3, WalPayload::EndTxn).unwrap();
+            guard.flush().unwrap();
+        }
+        drop(log);
+        let scan = LogManager::scan(dir.path()).unwrap();
+        assert_eq!(
+            scan.records.len() as u64,
+            count + ZERO_FILL_MIN_SAMPLE_SYNCS + 2
+        );
+        assert_eq!(scan.records.last().unwrap().txn_id, 3);
     }
 
     #[test]

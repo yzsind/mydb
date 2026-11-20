@@ -931,20 +931,8 @@ impl Database {
             self.vector_index_paged_path(table, &index.name, storage_id)
         };
         let tmp_path = final_path.clone();
-        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
-        // Build registration precedes this read. Include every decided commit,
-        // including slots ahead of the temporarily lagging public frontier;
-        // later decisions are captured by the registered index delta stream.
-        // The older registered guard still protects all required undo.
-        txn.snapshot_scn = self
-            .next_scn_atomic
-            .load(Ordering::Acquire)
-            .saturating_sub(1);
-        if table.row_generation_txn_id != 0 {
-            txn.txn_id = table.row_generation_txn_id;
-        }
-        self.vector_table_snapshot_floor(table.id)
-            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let snapshot = self.vector_build_snapshot(table);
+        let txn = snapshot.txn;
         let requested = index
             .vector
             .as_ref()
@@ -1159,20 +1147,8 @@ impl Database {
             self.vector_index_paged_path(table, &index.name, storage_id)
         };
         let tmp_path = final_path.clone();
-        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
-        // Build registration precedes this read. Include every decided commit,
-        // including slots ahead of the temporarily lagging public frontier;
-        // later decisions are captured by the registered index delta stream.
-        // The older registered guard still protects all required undo.
-        txn.snapshot_scn = self
-            .next_scn_atomic
-            .load(Ordering::Acquire)
-            .saturating_sub(1);
-        if table.row_generation_txn_id != 0 {
-            txn.txn_id = table.row_generation_txn_id;
-        }
-        self.vector_table_snapshot_floor(table.id)
-            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let snapshot = self.vector_build_snapshot(table);
+        let txn = snapshot.txn;
         let requested = index
             .vector
             .as_ref()
@@ -1871,22 +1847,8 @@ impl Database {
         cols: &[usize],
         paged: &PagedHnsw,
     ) -> Result<(), QueryError> {
-        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
-        // Build registration precedes this read. Include every decided commit,
-        // including slots ahead of the temporarily lagging public frontier;
-        // later decisions are captured by the registered index delta stream.
-        // The older registered guard still protects all required undo.
-        txn.snapshot_scn = self
-            .next_scn_atomic
-            .load(Ordering::Acquire)
-            .saturating_sub(1);
-        // A DDL-owned shadow heap contains the copying transaction's own
-        // rows. Its catalog generation remains protected by the DDL barrier.
-        if table.row_generation_txn_id != 0 {
-            txn.txn_id = table.row_generation_txn_id;
-        }
-        self.vector_table_snapshot_floor(table.id)
-            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let snapshot = self.vector_build_snapshot(table);
+        let txn = snapshot.txn;
 
         paged.file().advance_coverage(txn.snapshot_scn);
         paged.begin_bulk_build();
@@ -2491,22 +2453,8 @@ impl Database {
         #[cfg(test)]
         VECTOR_BUILD_HEAP_SCANS.fetch_add(1, Ordering::Relaxed);
 
-        let (mut txn, _snapshot) = self.borrowed_read_only_statement_view();
-        // Build registration precedes this read. Include every decided commit,
-        // including slots ahead of the temporarily lagging public frontier;
-        // later decisions are captured by the registered index delta stream.
-        // The older registered guard still protects all required undo.
-        txn.snapshot_scn = self
-            .next_scn_atomic
-            .load(Ordering::Acquire)
-            .saturating_sub(1);
-        // A DDL-owned shadow heap contains the copying transaction's own
-        // rows. Its catalog generation remains protected by the DDL barrier.
-        if table.row_generation_txn_id != 0 {
-            txn.txn_id = table.row_generation_txn_id;
-        }
-        self.vector_table_snapshot_floor(table.id)
-            .fetch_max(txn.snapshot_scn, std::sync::atomic::Ordering::AcqRel);
+        let snapshot = self.vector_build_snapshot(table);
+        let txn = snapshot.txn;
 
         // Two-phase cold build vs incremental catch-up. A fresh graph (no nodes
         // yet) takes the fast path: append every row first (cheap, lock-free),
@@ -3460,6 +3408,21 @@ impl Database {
         }
         self.vector_graph_build_and_publish(table, index, storage_id, key, true)?;
         Ok(())
+    }
+
+    fn vector_build_snapshot(&self, table: &TableSchema) -> StorageReadSnapshot<'_> {
+        let mut snapshot = StorageReadSnapshot::with_isolation(self, IsolationLevel::ReadCommitted);
+        // The guard pins the visible frontier for undo retention. The build
+        // includes later decided commits, and its delta stream covers new ones.
+        snapshot.txn.snapshot_scn = self
+            .next_scn_atomic
+            .load(Ordering::Acquire)
+            .saturating_sub(1);
+        // DDL-owned shadow heaps also expose the copying transaction's rows.
+        snapshot.txn.txn_id = table.row_generation_txn_id;
+        self.vector_table_snapshot_floor(table.id)
+            .fetch_max(snapshot.txn.snapshot_scn, Ordering::AcqRel);
+        snapshot
     }
 
     /// Current graph ordering/cold coverage is unsuitable for an older view.

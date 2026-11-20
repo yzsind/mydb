@@ -1403,56 +1403,60 @@ impl Database {
         self.visible_scn()
     }
 
-    pub fn register_statement_snapshot(self: &Arc<Self>, snapshot_scn: u64) -> SnapshotGuard {
-        let snapshot_id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let shard = (snapshot_id as usize) % self.active_snapshots.len();
-        let mut snapshots = self.active_snapshots[shard]
+    // Select the horizon under the registration latch. A guard carries its
+    // original slot so it can be released by a different thread.
+    fn pin_snapshot(&self, scn: Option<u64>) -> (SnapshotKey, u64) {
+        let shard = snapshot_shard();
+        let mut active = self.active_snapshots[shard]
             .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        snapshots.insert(
-            snapshot_id,
-            ActiveSnapshot {
-                snapshot_scn,
-                started_unix_ms: current_unix_ms(),
-            },
-        );
+            .unwrap_or_else(|e| e.into_inner());
+        let snapshot_scn = scn.unwrap_or_else(|| self.fresh_snapshot_horizon());
+        let slot = active.insert(ActiveSnapshot {
+            snapshot_scn,
+            started_unix_ms: current_unix_ms(),
+        });
+        (SnapshotKey { shard, slot }, snapshot_scn)
+    }
+
+    fn unpin_snapshot(&self, key: SnapshotKey) {
+        self.active_snapshots[key.shard]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(key.slot);
+    }
+
+    pub fn register_statement_snapshot(self: &Arc<Self>, snapshot_scn: u64) -> SnapshotGuard {
+        let (snapshot_id, _) = self.pin_snapshot(Some(snapshot_scn));
         SnapshotGuard {
             db: Arc::clone(self),
             snapshot_id,
         }
     }
 
-    /// Register a set of historical snapshots atomically with respect to
-    /// purge's all-shard horizon sampling. Lock order matches purge (ascending
-    /// shard index), so it observes either the complete set or none of it.
+    /// Publish a historical set under one latch. Purge holds every shard
+    /// while sampling its horizon, so it sees the complete set or none of it.
     pub(crate) fn register_statement_snapshots_atomic(
         self: &Arc<Self>,
         snapshot_scns: &[u64],
     ) -> Vec<SnapshotGuard> {
-        let mut shards = self
-            .active_snapshots
+        let shard = snapshot_shard();
+        let mut active = self.active_snapshots[shard]
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let started_unix_ms = current_unix_ms();
+        snapshot_scns
             .iter()
-            .map(|shard| shard.lock().unwrap_or_else(|poison| poison.into_inner()))
-            .collect::<Vec<_>>();
-        let mut guards = Vec::with_capacity(snapshot_scns.len());
-        for &snapshot_scn in snapshot_scns {
-            let snapshot_id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-            let shard = (snapshot_id as usize) % self.active_snapshots.len();
-            if let Some(snapshots) = shards.get_mut(shard) {
-                snapshots.insert(
-                    snapshot_id,
-                    ActiveSnapshot {
-                        snapshot_scn,
-                        started_unix_ms: current_unix_ms(),
-                    },
-                );
-            }
-            guards.push(SnapshotGuard {
-                db: Arc::clone(self),
-                snapshot_id,
-            });
-        }
-        guards
+            .map(|&snapshot_scn| {
+                let slot = active.insert(ActiveSnapshot {
+                    snapshot_scn,
+                    started_unix_ms,
+                });
+                SnapshotGuard {
+                    db: Arc::clone(self),
+                    snapshot_id: SnapshotKey { shard, slot },
+                }
+            })
+            .collect()
     }
 
     /// Create and register a read-only statement view as one operation with
@@ -1466,20 +1470,7 @@ impl Database {
         isolation: IsolationLevel,
         snapshot_scn: Option<u64>,
     ) -> (TxnView, SnapshotGuard) {
-        let snapshot_id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let shard = (snapshot_id as usize) % self.active_snapshots.len();
-        let chosen_scn;
-        let mut snapshots = self.active_snapshots[shard]
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        chosen_scn = snapshot_scn.unwrap_or_else(|| self.fresh_snapshot_horizon());
-        snapshots.insert(
-            snapshot_id,
-            ActiveSnapshot {
-                snapshot_scn: chosen_scn,
-                started_unix_ms: current_unix_ms(),
-            },
-        );
+        let (snapshot_id, chosen_scn) = self.pin_snapshot(snapshot_scn);
         (
             TxnView {
                 snapshot_registered: true,
@@ -1504,20 +1495,7 @@ impl Database {
         snapshot_scn: Option<u64>,
         read_only: bool,
     ) -> (TxnView, SnapshotGuard) {
-        let snapshot_id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let shard = (snapshot_id as usize) % self.active_snapshots.len();
-        let chosen_scn;
-        let mut snapshots = self.active_snapshots[shard]
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        chosen_scn = snapshot_scn.unwrap_or_else(|| self.fresh_snapshot_horizon());
-        snapshots.insert(
-            snapshot_id,
-            ActiveSnapshot {
-                snapshot_scn: chosen_scn,
-                started_unix_ms: current_unix_ms(),
-            },
-        );
+        let (snapshot_id, chosen_scn) = self.pin_snapshot(snapshot_scn);
         (
             TxnView {
                 txn_id,
@@ -1533,48 +1511,6 @@ impl Database {
             },
             SnapshotGuard {
                 db: Arc::clone(self),
-                snapshot_id,
-            },
-        )
-    }
-
-    /// Internal synchronous scans borrow the database instead of owning an
-    /// Arc. Select and register their frontier under the same snapshot shard
-    /// lock as ordinary statement guards, closing the race with undo purge.
-    fn borrowed_read_only_statement_view(&self) -> (TxnView, impl Drop + '_) {
-        struct Guard<'a> {
-            db: &'a Database,
-            snapshot_id: u64,
-        }
-        impl Drop for Guard<'_> {
-            fn drop(&mut self) {
-                let shard = self.snapshot_id as usize % self.db.active_snapshots.len();
-                self.db.active_snapshots[shard]
-                    .lock()
-                    .unwrap_or_else(|poison| poison.into_inner())
-                    .remove(&self.snapshot_id);
-            }
-        }
-        let snapshot_id = self.next_snapshot_id.fetch_add(1, Ordering::Relaxed);
-        let shard = snapshot_id as usize % self.active_snapshots.len();
-        let mut snapshots = self.active_snapshots[shard]
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner());
-        let snapshot_scn = self.fresh_snapshot_horizon();
-        snapshots.insert(
-            snapshot_id,
-            ActiveSnapshot {
-                snapshot_scn,
-                started_unix_ms: current_unix_ms(),
-            },
-        );
-        (
-            TxnView {
-                snapshot_registered: true,
-                ..TxnView::read_only(snapshot_scn, IsolationLevel::ReadCommitted)
-            },
-            Guard {
-                db: self,
                 snapshot_id,
             },
         )
@@ -3736,46 +3672,23 @@ impl Database {
     /// transaction manager to drop slots whose visibility outcome can be
     /// inferred from the watermark alone.
     fn advance_min_retained_txn_id(&self) {
-        // Scan only a bounded rotating window to decide whether there is any
-        // GC-eligible slot. Skipping the write lock and the all-shards
-        // `oldest_active_snapshot_scn` scan when nothing is collectable keeps
-        // maintenance latency stable under long retained histories.
         const SLOT_GC_SCAN_LIMIT: usize = 8192;
-        // Scan a rotating bounded window. This keeps maintenance latency
-        // independent of total retained history while every slot is still
-        // revisited across successive passes.
+        const SLOT_GC_WRITE_BATCH: usize = 256;
+
+        // Wrap at the end of the map so retained slots are revisited.
         let (oldest_active, terminal_candidates, rolled_back_candidates, next_cursor) = {
             let txns = self.txns.read();
             let mut terminal = Vec::new();
             let mut rolled_back = Vec::new();
             let mut last_seen = None;
-            let mut scanned = 0usize;
             let start = txns.slot_gc_cursor;
-            for (id, slot) in txns.slots.range(start..) {
-                if scanned >= SLOT_GC_SCAN_LIMIT {
-                    break;
-                }
-                scanned += 1;
-                last_seen = Some(*id);
+            let slots = txns.slots.range(start..).chain(txns.slots.range(..start));
+            for (&id, slot) in slots.take(SLOT_GC_SCAN_LIMIT) {
+                last_seen = Some(id);
                 if !slot.status.is_in_flight() {
-                    terminal.push(*id);
+                    terminal.push(id);
                     if slot.status == TxnStatus::RolledBack {
-                        rolled_back.push(*id);
-                    }
-                }
-            }
-            if scanned < SLOT_GC_SCAN_LIMIT && start != 0 {
-                for (id, slot) in txns.slots.range(..start) {
-                    if scanned >= SLOT_GC_SCAN_LIMIT {
-                        break;
-                    }
-                    scanned += 1;
-                    last_seen = Some(*id);
-                    if !slot.status.is_in_flight() {
-                        terminal.push(*id);
-                        if slot.status == TxnStatus::RolledBack {
-                            rolled_back.push(*id);
-                        }
+                        rolled_back.push(id);
                     }
                 }
             }
@@ -3799,29 +3712,11 @@ impl Database {
         // version as newer and invisible. Once the gap closes, `visible_scn`
         // advances and the next GC pass may collect it.
         let (oldest_registered_snapshot_scn, visible_scn) = self.snapshot_visibility_horizon();
-        let oldest_snapshot_scn = Some(
-            oldest_registered_snapshot_scn
-                // Slot GC uses a strict `commit_scn < horizon` test below.
-                // With no reader, `visible_scn + 1` therefore collects every
-                // fully published commit (including equality) while retaining
-                // any out-of-order commit still above the frontier.
-                .unwrap_or_else(|| visible_scn.saturating_add(1)),
-        );
-        // BUG-1 (docs/lob-management-audit-2026-07.md) — a rolled-back slot
-        // must survive GC until its undo records drain, so `apply_purge` can
-        // still read its `RolledBack` creator state and skip freeing the
-        // before-image chains rollback handed back to the live row. Only the
-        // rolled-back candidates gathered above need this check, so probe the
-        // undo tablespace for exactly those (rare) ids instead of materializing
-        // the whole retained-writer set. The old `txn_ids_with_undo()` built a
-        // HashSet sized to every writer retained under undo retention (tens to
-        // hundreds of thousands at OLTP rates) on every call, and held the undo
-        // read lock the entire time — blocking every concurrent undo append
-        // (the write-path hot lock) ~160×/s. Read the undo lock BEFORE the txns
-        // write lock (never nested) so there is no lock-order inversion with the
-        // purge path. `drained_rolled_back` holds the candidates confirmed to
-        // have no un-purged undo; a slot that rolls back after pass 1 is simply
-        // not in the set and is conservatively retained until the next cycle.
+        // With no registered reader, include the visible SCN itself.
+        let horizon =
+            oldest_registered_snapshot_scn.unwrap_or_else(|| visible_scn.saturating_add(1));
+        // Rollback slots must survive until purge drains their undo chains.
+        // Check only the sampled rollback IDs, before taking the slot write lock.
         let drained_rolled_back: std::collections::HashSet<u64> =
             if rolled_back_candidates.is_empty() {
                 std::collections::HashSet::new()
@@ -3839,38 +3734,32 @@ impl Database {
             let watermark = oldest_active.unwrap_or(txns.next_txn_id);
             // Drop slots that are committed/rolled back AND whose txn_id is below
             // any active txn AND whose commit_scn is below the oldest snapshot.
-            let to_remove: Vec<u64> = terminal_candidates
-                .iter()
-                .copied()
-                .filter(|id| *id < watermark)
-                .filter(|id| {
-                    let Some(slot) = txns.slots.get(id) else {
-                        return false;
-                    };
-                    match slot.status {
-                        // Neither ACTIVE nor PREPARED is GC-eligible — the
-                        // PREPARED branch still owns its undo chain and
-                        // locks until XA COMMIT / XA ROLLBACK.
-                        TxnStatus::Active | TxnStatus::Prepared => false,
-                        TxnStatus::Committed => slot
-                            .commit_scn
-                            .map(|scn| {
-                                oldest_snapshot_scn
-                                    .map(|min_scn| scn < min_scn)
-                                    .unwrap_or(true)
-                            })
-                            .unwrap_or(false),
-                        // BUG-1 — retain a rolled-back slot until its undo
-                        // records are all purged; only then is dropping it (and
-                        // letting its creator state degrade to `None`) safe. Only
-                        // slots we explicitly confirmed drained above are eligible;
-                        // any that rolled back after pass 1 wait for the next cycle.
-                        TxnStatus::RolledBack => drained_rolled_back.contains(&slot.txn_id),
+            let mut removed = Vec::with_capacity(terminal_candidates.len());
+            for candidates in terminal_candidates.chunks(SLOT_GC_WRITE_BATCH) {
+                for &id in candidates {
+                    if id >= watermark {
+                        continue;
                     }
-                })
-                .collect();
-            for id in &to_remove {
-                txns.slots.remove(id);
+                    let std::collections::btree_map::Entry::Occupied(entry) = txns.slots.entry(id)
+                    else {
+                        continue;
+                    };
+                    let slot = entry.get();
+                    let reclaim = match slot.status {
+                        TxnStatus::Active | TxnStatus::Prepared => false,
+                        TxnStatus::Committed => slot.commit_scn.is_some_and(|scn| scn < horizon),
+                        // Rollback can own before-image chains until its undo drains.
+                        TxnStatus::RolledBack => drained_rolled_back.contains(&id),
+                    };
+                    if reclaim {
+                        entry.remove();
+                        removed.push(id);
+                    }
+                }
+                // Share the write lock with queued transaction starters and
+                // publishers without recomputing the snapshot horizon. Every
+                // slot is rechecked under the lock before it is removed.
+                parking_lot::RwLockWriteGuard::bump(&mut txns);
             }
             // `min_retained_txn_id` is a proof about every transaction id in
             // a prefix, not merely the largest id removed in this pass.
@@ -3880,31 +3769,27 @@ impl Database {
             // missing id above registered_txn_frontier may still be between
             // atomic allocation and slot registration, and is not safe.
             let prior = self.min_retained_txn_id.load(Ordering::Relaxed);
-            let mut new_min = prior;
-            let last_allocated = txns.registered_txn_frontier;
-            while new_min < last_allocated {
-                let next = new_min.saturating_add(1);
-                if let Some(slot) = txns.slots.get(&next) {
-                    if slot.status.is_in_flight() && slot.read_only {
-                        // A declared read-only transaction can never own a
-                        // heap header, so retaining its session snapshot does
-                        // not invalidate this txn-id prefix proof.
-                        new_min = next;
-                        continue;
-                    }
-                    break;
-                }
-                new_min = next;
-            }
+            let frontier = txns.registered_txn_frontier;
+            let new_min = if prior < frontier {
+                // BTreeMap ranges skip gaps left by reclamation. An active
+                // read-only transaction cannot own a heap header.
+                txns.slots
+                    .range((prior + 1)..=frontier)
+                    .find(|(_, slot)| !(slot.read_only && slot.status.is_in_flight()))
+                    .map_or(frontier, |(&id, _)| id - 1)
+            } else {
+                prior
+            };
             // Drop the txns write-lock before touching the slot-status
             // cache so visibility readers that hit the cache during GC
             // don't contend with the lock release.
             drop(txns);
-            for id in &to_remove {
-                self.slot_status_cache.remove(*id);
+            for id in removed {
+                self.slot_status_cache.remove(id);
             }
             if new_min > prior {
-                self.min_retained_txn_id.store(new_min, Ordering::Release);
+                self.min_retained_txn_id
+                    .fetch_max(new_min, Ordering::Release);
             }
         }
     }
@@ -5150,11 +5035,8 @@ impl Database {
         LogManager::sync_allocation_boundary(&self.log)
     }
 
-    #[cfg(test)]
-    /// Lock-free snapshot of the WAL state atomics. Lets tests probe
-    /// the WAL byte/LSN watermark without going through `storage_status`
-    /// (which also touches the buffer pool / checkpoint locks).
-    pub fn log_state_atomics(&self) -> Arc<crate::wal::LogStateAtomics> {
+    /// Share the WAL watermarks without acquiring the log or checkpoint locks.
+    pub(crate) fn log_state_atomics(&self) -> Arc<crate::wal::LogStateAtomics> {
         Arc::clone(&self.log_state_atomics)
     }
 
@@ -6499,7 +6381,7 @@ impl Database {
         let mut min: Option<u64> = None;
         for shard in self.active_snapshots.iter() {
             let snapshots = shard.lock().unwrap_or_else(|poison| poison.into_inner());
-            for snapshot in snapshots.values() {
+            for (_, snapshot) in snapshots.iter() {
                 min = Some(match min {
                     Some(current) => current.min(snapshot.snapshot_scn),
                     None => snapshot.snapshot_scn,
@@ -6520,7 +6402,7 @@ impl Database {
         }
         let oldest_snapshot_scn = locked_shards
             .iter()
-            .flat_map(|snapshots| snapshots.values())
+            .flat_map(|snapshots| snapshots.iter().map(|(_, snapshot)| snapshot))
             .map(|snapshot| snapshot.snapshot_scn)
             .min();
         let visible_scn = self.visible_scn();
