@@ -40,11 +40,11 @@ DuckDB version: `v1.5.4 (Variegata) 08e34c447b`. NULL order: PG-equivalent
 | q11 | ok | 0 | 55 |
 | q12 | ok | 100 | 33 |
 | q13 | ok | 1 | 40 |
-| q14 | ok | 1 | 41 |
+| q14 | ok | 0 | 41 |
 | q15 | ok | 0 | 32 |
 | q16 | ok | 1 | 31 |
 | q17 | ok | 0 | 34 |
-| q18 | ok | 1 | 30 |
+| q18 | ok | 0 | 30 |
 | q19 | ok | 99 | 33 |
 | q20 | ok | 100 | 34 |
 | q21 | ok | 0 | 29 |

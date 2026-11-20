@@ -73,6 +73,7 @@ Results land in `/tmp/mydb/tpcds-results/<timestamp>/` (`query_times.csv`,
 | `TPCDS_DSDGEN` | toolkit dir with `dsdgen` + `tpcds.idx` |
 | `TPCDS_SCALE_FACTOR` | scale in GB (default `1`) |
 | `TPCDS_QUERIES` | subset, e.g. `"1 6 14"` (default `1..99`) |
+| `TPCDS_REPEAT` | timed passes per query (default `1`). Correctness uses the last result. |
 | `TPCDS_FORCE_DSDGEN=1` | regenerate the cached data |
 | `MYDB_DATA_DIR` | mydb data dir (default `/tmp/mydb/tpcds-data`) |
 | `MYDB_PORT` / `MYDB_HOST` | default `3307` / `127.0.0.1` |
@@ -119,24 +120,18 @@ Constructs used as-is because mydb supports them: `INTERSECT` / `EXCEPT`,
 
 ## Correctness checking (optional)
 
-If `scripts/tpcds/expected/sf-<SF>/qNN.tsv` files exist, the driver compares mydb
-output against them with the same canonicalization as the TPC-H checker
-(trim + numeric rounding to 4 dp). None are checked in by default (TPC-DS answer
-sets depend on the substitution parameters / RNG seed). See
-`scripts/tpcds/expected/README.md` to generate one from a reference database.
-Without an expected set the check auto-skips; the run still reports
-OK/FAIL/SKIP per query (i.e. whether each query *executed*).
+The driver uses the checked-in DuckDB results under
+`expected-duckdb/sf-<SF>/` by default. The checker compares exact TSV cells and
+row order unless the scale's `comparison.json` declares numeric types,
+floating-point tolerance, or tied `ORDER BY` keys. Without a reference set,
+the default check mode skips correctness validation and still reports
+each query's execution status. Set `TPCDS_CHECK_CORRECTNESS=1` to require a
+reference set.
 
-Two reference sets are checked in, generated from the *same* cached `.dat` files
-mydb loads and the *same* query files mydb runs:
-
-- `expected/` — **PostgreSQL 18** oracle (`pg/build_and_run_pg.sh`); auto-picked
-  by `run_tpcds.sh`.
-- `expected-duckdb/` — **DuckDB** oracle (`duckdb/build_and_run_duckdb.sh`).
-  DuckDB's `/` is decimal division like MySQL/mydb (PG truncates `int/int`), so
-  it is the more faithful reference for the integer-ratio queries. See
-  `expected-duckdb/README.md` for the per-query DuckDB-vs-PG cross-check and how
-  to point the checker at it.
+Set `TPCDS_EXPECTED_ROOT` to use a different reference directory. Both
+generators load the cached `.dat` files and adapt the checked-in queries for
+their SQL dialect. [DuckDB results](expected-duckdb/README.md) ·
+[PostgreSQL results](expected/README.md)
 
 ## Regenerating the queries
 

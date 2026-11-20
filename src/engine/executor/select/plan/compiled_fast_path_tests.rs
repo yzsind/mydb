@@ -2169,7 +2169,7 @@ fn aliased_inlj_residual_reads_columns_outside_output_projection() {
     // must still perform a separate narrow read of quantity + discount
     // before evaluating the right-only residual.
     assert_eq!(
-        right_only_filter_columns(Some(&residual), &table, &[1, 3]),
+        right_only_filter_columns(Some(&residual), &table, &[1, 3], false),
         Some(vec![0, 2])
     );
 }

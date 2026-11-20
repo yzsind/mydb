@@ -28,7 +28,7 @@ select
                      ) tmp1
                where ranking <= 5
              )
- group by rollup(s_state,s_county)
+ group by rollup(s_state,s_county) having count(*) > 0
  order by
    lochierarchy desc
   ,case when (grouping(s_state)+grouping(s_county)) = 0 then s_state end

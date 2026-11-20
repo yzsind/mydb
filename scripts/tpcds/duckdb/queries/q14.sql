@@ -97,7 +97,7 @@ with  cross_items as
        group by i_brand_id,i_class_id,i_category_id
        having sum(ws_quantity*ws_list_price) > (select average_sales from avg_sales)
  ) y
- group by rollup(channel, i_brand_id,i_class_id,i_category_id)
+ group by rollup(channel, i_brand_id,i_class_id,i_category_id) having count(*) > 0
  order by channel,i_brand_id,i_class_id,i_category_id
  limit 100;
 with  cross_items as

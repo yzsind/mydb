@@ -11,10 +11,11 @@ the SQL mydb runs:
   schema   : drop `CREATE DATABASE`/`USE` (DuckDB has neither); column order and
              types (char/varchar/decimal/integer/date/time) are DuckDB-compatible
              and kept verbatim so the .dat column order matches. DuckDB treats
-             CHAR(n) as VARCHAR (no padding) — harmless because the checker
-             trims every cell before comparing.
+             CHAR(n) as VARCHAR (no padding).
   queries  : `group by ... with rollup`  -> `group by rollup(...)` (reverse mydb's
                                             MySQL-only form; DuckDB uses ROLLUP()).
+             `having count(*) > 0`        -> suppress DuckDB's grand total over empty
+                                            input, matching MySQL's WITH ROLLUP.
              `lochierarchy` used *inside* an ORDER BY expression -> the alias's
                                             `grouping(a)+grouping(b)` definition
                                             (identical row value; avoids any
@@ -39,7 +40,7 @@ DUCK = SUITE / "duckdb"                                  # scripts/tpcds/duckdb
 # has an inner (rollup-less) group by followed by the outer rollup group by,
 # this binds `with rollup` to its own (nearest preceding) group by, not the inner.
 ROLLUP_RE = re.compile(
-    r"group\s+by\s+((?:(?!\bgroup\s+by\b).)*?)\s+with\s+rollup\b",
+    r"group\s+by\s+((?:(?!\bgroup\s+by\b).)*?)\s+with\s+rollup\b(\s+having\b)?",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -87,8 +88,13 @@ def gen_schema() -> None:
 
 
 def transform_query(text: str, qname: str) -> str:
+    def rewrite_rollup(match: re.Match) -> str:
+        if match[2]:
+            raise SystemExit(f"{qname}: merge the ROLLUP empty-input guard into the existing HAVING")
+        return f"group by rollup({match[1]}) having count(*) > 0"
+
     want = len(re.findall(r"\bwith\s+rollup\b", text, re.IGNORECASE))
-    text, got = ROLLUP_RE.subn(lambda m: f"group by rollup({m.group(1)})", text)
+    text, got = ROLLUP_RE.subn(rewrite_rollup, text)
     if got != want:
         raise SystemExit(
             f"{qname}: rewrote {got} rollup clause(s) but found {want} `with rollup` "

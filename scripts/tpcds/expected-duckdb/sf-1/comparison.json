@@ -1,14 +1,49 @@
 {
+  "2": {"columns": ["integer", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal"], "null_marker": "NULL"},
+  "7": {"columns": ["text", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "9": {"columns": ["float", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "12": {"columns": ["text", "text", "text", "text", "decimal", "decimal", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "13": {"columns": ["float", "float", "float", "decimal"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
   "14": {
     "result_sets": [
-      {
-        "row_count": 100,
-        "columns": ["text", "text", "text", "text", "text", "text"]
-      },
-      {
-        "row_count": 100,
-        "columns": ["text", "text", "text", "text", "text", "text", "text", "text", "text", "text", "text", "text"]
-      }
+      {"row_count": 100, "columns": ["text", "text", "text", "text", "text", "text"]},
+      {"row_count": 100, "columns": ["text", "text", "text", "text", "text", "text", "text", "text", "text", "text", "text", "text"]}
     ]
-  }
+  },
+  "17": {"columns": ["text", "text", "text", "integer", "float", "float", "float", "integer", "float", "float", "float", "integer", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "18": {"columns": ["text", "text", "text", "text", "float", "float", "float", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "20": {"columns": ["text", "text", "text", "text", "decimal", "decimal", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "22": {"columns": ["text", "text", "text", "text", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "26": {"columns": ["text", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "27": {"columns": ["text", "text", "integer", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "28": {"columns": ["float", "integer", "integer", "float", "integer", "integer", "float", "integer", "integer", "float", "integer", "integer", "float", "integer", "integer", "float", "integer", "integer"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "31": {"columns": ["text", "integer", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "33": {"columns": ["integer", "decimal"], "null_marker": "NULL", "order_keys": [1]},
+  "35": {"columns": ["text", "text", "text", "integer", "integer", "float", "float", "integer", "integer", "integer", "float", "float", "integer", "integer", "integer", "float", "float", "integer"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "36": {"columns": ["float", "text", "text", "integer", "integer"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "39": {"columns": ["integer", "integer", "integer", "float", "float", "integer", "integer", "integer", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "47": {"columns": ["text", "text", "integer", "integer", "float", "decimal", "decimal", "decimal"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "49": {"columns": ["text", "integer", "float", "integer", "integer"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "53": {"columns": ["integer", "decimal", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "57": {"columns": ["text", "integer", "integer", "float", "decimal", "decimal", "decimal"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "59": {"columns": ["text", "text", "integer", "float", "float", "float", "float", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "63": {"columns": ["integer", "decimal", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "66": {
+    "columns": [
+      "text", "integer", "text", "text", "text", "text", "text", "integer",
+      "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal",
+      "float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float", "float",
+      "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal", "decimal"
+    ],
+    "null_marker": "NULL",
+    "float_relative_tolerance": 1e-14
+  },
+  "71": {"columns": ["integer", "text", "integer", "integer", "decimal"], "null_marker": "NULL", "order_keys": [4, 0]},
+  "77": {"columns": ["text", "integer", "decimal", "decimal", "decimal"], "null_marker": "NULL", "order_keys": [0, 1]},
+  "78": {"columns": ["integer", "integer", "integer", "decimal", "integer", "decimal", "decimal", "integer", "decimal", "decimal"], "null_marker": "NULL"},
+  "83": {"columns": ["text", "integer", "float", "integer", "float", "integer", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "85": {"columns": ["text", "float", "float", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "89": {"columns": ["text", "text", "text", "text", "text", "integer", "decimal", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "90": {"columns": ["float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14},
+  "98": {"columns": ["text", "text", "text", "text", "decimal", "decimal", "float"], "null_marker": "NULL", "float_relative_tolerance": 1e-14}
 }

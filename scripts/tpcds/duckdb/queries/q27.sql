@@ -15,7 +15,7 @@ select  i_item_id,
        cd_education_status = 'Primary' and
        d_year = 1998 and
        s_state in ('TN','TN', 'TN', 'TN', 'TN', 'TN')
- group by rollup(i_item_id, s_state)
+ group by rollup(i_item_id, s_state) having count(*) > 0
  order by i_item_id
          ,s_state
  limit 100;

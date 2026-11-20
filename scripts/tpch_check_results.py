@@ -9,10 +9,10 @@ from pathlib import Path
 
 
 try:
-    from ._tabular_results import CanonicalResult, comparison_contracts, query_numbers, write_csv
+    from ._tabular_results import CanonicalResult, comparison_contracts, query_numbers, results_match, write_csv
     from ._tabular_results import canonicalize as _canonicalize
 except ImportError:
-    from _tabular_results import CanonicalResult, comparison_contracts, query_numbers, write_csv
+    from _tabular_results import CanonicalResult, comparison_contracts, query_numbers, results_match, write_csv
     from _tabular_results import canonicalize as _canonicalize
 
 
@@ -67,9 +67,9 @@ def main() -> int:
             status = "missing_actual"
             message = f"{actual_path} not found"
         else:
-            expected = canonicalize(expected_path, contract=contracts.get(str(query)))
-            actual = canonicalize(actual_path, contract=contracts.get(str(query)))
-            if expected.rows != actual.rows or expected.metadata != actual.metadata:
+            expected = canonicalize(expected_path, contract=contract)
+            actual = canonicalize(actual_path, contract=contract)
+            if not results_match(expected, actual, contract):
                 status = "mismatch"
                 message = "canonical rows differ"
 

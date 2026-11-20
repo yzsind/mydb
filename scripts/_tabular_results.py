@@ -9,6 +9,7 @@ import json
 import math
 import re
 from dataclasses import dataclass
+from fractions import Fraction
 from pathlib import Path
 
 
@@ -63,7 +64,8 @@ def validate_contract(contract: dict) -> None:
             validate_contract({key: value for key, value in spec.items() if key != 'row_count'})
         return
     if not isinstance(contract, dict) or set(contract) - {
-            'columns', 'order_keys', 'unordered', 'null_marker', 'format', 'trim_text', 'decimal_places'}:
+            'columns', 'order_keys', 'unordered', 'null_marker', 'format', 'trim_text',
+            'decimal_places', 'float_relative_tolerance'}:
         raise ValueError('unknown comparison contract fields')
     if contract.get('format', 'tsv') not in ('tsv', 'typed-json'):
         raise ValueError('format must be tsv or typed-json')
@@ -79,6 +81,13 @@ def validate_contract(contract: dict) -> None:
     if 'decimal_places' in contract and (type(contract['decimal_places']) is not int or
                                        contract['decimal_places'] < 0 or columns is None):
         raise ValueError('decimal_places requires explicit columns and a nonnegative integer')
+    if 'float_relative_tolerance' in contract:
+        tolerance = contract['float_relative_tolerance']
+        if type(tolerance) not in (int, float) or not 0 < tolerance < 1:
+            raise ValueError('float_relative_tolerance must be a number between zero and one')
+        if (not columns or 'float' not in columns or contract.get('order_keys')
+                or contract.get('unordered') or 'decimal_places' in contract):
+            raise ValueError('float_relative_tolerance requires ordered TSV with float columns and no rounding')
     keys = contract.get('order_keys')
     if keys is not None and (not isinstance(keys, list) or not keys or
             any(type(key) is not int or key < 0 for key in keys) or len(keys) != len(set(keys))):
@@ -210,6 +219,38 @@ def canonicalize(path: Path, *, contract: dict | None = None) -> CanonicalResult
             rows = _tsv_rows(source, path, contract)
     payload = json.dumps([metadata, rows], ensure_ascii=False, separators=(',', ':'), sort_keys=True).encode()
     return CanonicalResult(rows, hashlib.sha256(payload).hexdigest(), metadata)
+
+
+def _ordered_rows_match(expected: list[tuple], actual: list[tuple], contract: dict) -> bool:
+    if 'float_relative_tolerance' not in contract:
+        return expected == actual
+
+    tolerance = Fraction(str(contract['float_relative_tolerance']))
+    for expected_row, actual_row in zip(expected, actual):
+        for left, right, kind in zip(expected_row, actual_row, contract['columns']):
+            if left == right:
+                continue
+            if kind != 'float' or left is None or right is None:
+                return False
+            a, b = Fraction(decimal.Decimal(left)), Fraction(decimal.Decimal(right))
+            if abs(a - b) > tolerance * max(abs(a), abs(b)):
+                return False
+    return True
+
+
+def results_match(expected: CanonicalResult, actual: CanonicalResult, contract: dict) -> bool:
+    if expected.metadata != actual.metadata or len(expected.rows) != len(actual.rows):
+        return False
+    if 'result_sets' not in contract:
+        return _ordered_rows_match(expected.rows, actual.rows, contract)
+
+    start = 0
+    for spec in contract['result_sets']:
+        end = start + spec['row_count']
+        if not _ordered_rows_match(expected.rows[start:end], actual.rows[start:end], spec):
+            return False
+        start = end
+    return True
 
 
 def query_numbers(value: str, *, maximum: int | None = None) -> list[int]:

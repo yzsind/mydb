@@ -195,6 +195,94 @@ fn one_value_row(table: &str, value: Value) -> PlanRow {
 }
 
 #[test]
+fn noncovering_inlj_applies_residual_with_runtime_key_filter() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+        dir.path(),
+        StorageConfig {
+            durability: DurabilityMode::Memory,
+            ..StorageConfig::from_env()
+        },
+    )
+    .unwrap();
+    engine
+        .execute(
+            "CREATE TABLE r (id INT PRIMARY KEY, k INT, stamp INT, amount DECIMAL(12,2),
+             INDEX join_key (k), INDEX stamp_key (stamp))",
+        )
+        .unwrap();
+    engine
+        .execute("INSERT INTO r VALUES (1,1,10,2.50),(2,1,10,NULL),(3,1,20,3.50),(4,2,10,-1.00)")
+        .unwrap();
+
+    let db = engine.db_for_tests();
+    let txn = TxnView::read_only(db.visible_scn(), IsolationLevel::ReadCommitted);
+    let schema = db.snapshot_table_schema("test.r").unwrap();
+    let right = PlanTable::new(schema.id, schema.clone(), Some("r".into()));
+    let index = schema
+        .indexes
+        .iter()
+        .find(|i| i.name == "join_key")
+        .unwrap();
+    let left_rows = [
+        one_value_row("l", Value::Int(1)),
+        one_value_row("l", Value::Int(2)),
+    ];
+    let residual = expression("r.stamp IS NOT NULL AND r.amount > 0");
+    let condition = expression("r.k = l.v AND r.stamp IS NOT NULL AND r.amount > 0");
+    let lookup = compile_index_lookup_plan(&condition, &right, index).unwrap();
+    let stamp = Value::Int(10);
+    let mut bloom = BloomFilter::new(1);
+    bloom.insert(&[ValueKey::from(&stamp)][..]);
+    let filters = [RuntimeFilter::KeySet {
+        keys: vec![expression("r.stamp")],
+        null_safe: vec![false],
+        values: Arc::new(vec![vec![stamp]]),
+        filter: Arc::new(bloom),
+    }];
+
+    for (mode, projection) in [("off", &[2, 3][..]), ("on", &[2][..])] {
+        for predicate_first in [true, false] {
+            let actual = with_inlj_secondary_intersect_mode(mode, || {
+                crate::util::env::with_vars(
+                    &[(
+                        "MYDB_INLJ_PREDICATE_FIRST_DISABLE",
+                        (!predicate_first).then_some("1"),
+                    )],
+                    || {
+                        execute_batched_inlj_noncovering(
+                            db,
+                            txn,
+                            &left_rows,
+                            &right,
+                            index,
+                            JoinType::Left,
+                            &lookup,
+                            Some(&residual),
+                            None,
+                            Some(projection),
+                            &filters,
+                            false,
+                        )
+                    },
+                )
+            })
+            .unwrap();
+            let expected = if projection.len() == 2 {
+                vec![vec!["1", "10", "2.50"], vec!["2", "NULL", "NULL"]]
+            } else {
+                vec![vec!["1", "10"], vec!["2", "NULL"]]
+            };
+            assert_eq!(
+                values(&actual),
+                expected,
+                "{mode}, predicate_first={predicate_first}"
+            );
+        }
+    }
+}
+
+#[test]
 fn inlj_pair_matching_is_sticky_and_semi_emission_stops_candidates() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let db = Arc::new(Database::open(dir.path()).unwrap());

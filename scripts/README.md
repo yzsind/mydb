@@ -134,8 +134,8 @@ Use `--comparison-manifest FILE` for explicit per-query JSON contracts, for exam
 {"1": {"columns": ["text", "decimal"], "order_keys": [0], "null_marker": "\\N"}}
 ```
 
-Column indices are zero-based. `text` is exact; `integer`, `decimal` and `float`
-normalize numeric spelling without rounding or a global precision tolerance.
+Column indices are zero-based. `text` is exact. `integer`, `decimal` and `float`
+normalize numeric spelling without rounding by default.
 `order_keys` permits permutations only within consecutive equal-key groups;
 the group sequence must match. `unordered: true` is reserved for queries with
 no ordering contract and cannot be combined with `order_keys`. Without an
@@ -147,6 +147,14 @@ is enabled by default or allowed for typed JSON. Both checkers automatically rea
 `EXPECTED_DIR/comparison.json` when present; an explicit `--comparison-manifest`
 overrides it. The checked-in TPC-H contracts describe the historical fixture
 generation policy; they do not establish accuracy beyond that policy.
+
+An ordered TSV contract can set `float_relative_tolerance` for its `float`
+columns. Two finite values match when their absolute difference is at most
+the tolerance times the larger magnitude. This keeps zero exact and compares
+all other column types exactly. The option requires strict row order and
+unrounded cells. Report hashes describe the canonical values, so a passing
+tolerance comparison can have different hashes.
+
 For headerless TSV containing multiple result sets, declare each set's exact
 `row_count` and `columns` in order. Each set can use its own numeric and ordering
 options; reordering never crosses a set boundary. Missing/extra rows and invalid

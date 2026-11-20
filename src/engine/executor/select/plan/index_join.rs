@@ -4328,79 +4328,66 @@ pub(super) fn execute_batched_inlj_noncovering(
         full_projection.as_slice()
     };
 
-    // Compute filter columns upfront — we need them both for the
-    // intersect cost decision below and for the filter_batched path
-    // further down.
-    let right_only_filter_cols =
-        right_only_filter_columns(right_only_residual, right_table, projection);
-    let runtime_filter_cols: Option<Vec<usize>> = if right_runtime_filters.is_empty() {
+    let runtime_intersected_ids = try_inlj_runtime_keyset_intersect(
+        db,
+        txn,
+        right_table,
+        right_index,
+        right_runtime_filters,
+        &sorted_row_ids,
+    )?;
+    // A runtime index probe narrows the candidates. The SQL residual
+    // still needs to be evaluated with all of its referenced columns.
+    let (candidate_ids, right_runtime_filters) = match runtime_intersected_ids.as_deref() {
+        Some(ids) => (ids, &[][..]),
+        None => (sorted_row_ids.as_slice(), right_runtime_filters),
+    };
+    if candidate_ids.is_empty() {
+        return Ok(unmatched_batched_inlj_rows(
+            left_rows,
+            right_table,
+            join_type,
+            right_projected_columns,
+        ));
+    }
+
+    let runtime_filter_cols = if right_runtime_filters.is_empty() {
         None
     } else {
-        let mut cols = std::collections::BTreeSet::new();
-        let mut ok = true;
-        for rf in right_runtime_filters {
-            match runtime_filter_schema_indices(rf, right_table) {
-                Some(indices) => {
-                    for idx in indices {
-                        cols.insert(idx);
-                    }
-                }
-                None => {
-                    ok = false;
-                    break;
-                }
+        let mut columns = Vec::new();
+        for filter in right_runtime_filters {
+            if let Some(indices) = runtime_filter_schema_indices(filter, right_table) {
+                columns.extend(indices);
+            } else {
+                columns.clear();
+                break;
             }
         }
-        if ok && !cols.is_empty() {
-            Some(cols.into_iter().collect())
-        } else {
-            None
-        }
+        (!columns.is_empty()).then_some(columns)
     };
+    let right_only_filter_cols = right_only_filter_columns(
+        right_only_residual,
+        right_table,
+        projection,
+        runtime_filter_cols.is_some(),
+    );
 
-    // Secondary-index intersect shortcut: when the right-only residual
-    // (e.g. `l_shipdate > '1995-03-15'` in TPC-H Q3) is also indexed
-    // by a non-join secondary index, we can scan that index for the
-    // row-ids satisfying the residual and intersect with the join
-    // candidates — avoiding the per-row heap pass currently done by
-    // `filter_batched_right_row_ids*`. Falls back transparently when
-    // the residual doesn't map onto an indexed column, or when the
-    // secondary scan blows past its row-id budget (residual was much
-    // less selective than the join driver).
-    //
-    // Cost model:
-    //   * intersect work ≈ sec_scan + hashtable_build(candidate) +
-    //     hashtable_probe(sec_scan)
-    //   * filter_batched work ≈ heap_read(candidate, filter_cols) +
-    //     compiled_cmp(candidate)
-    //
-    // The hashtable build dominates intersect when `candidate` is
-    // large. Conversely, a single-column heap read is ~50 ns/row in
-    // the warm-cache hot path, so filter_batched scales gracefully
-    // when `filter_cols.len() == 1`. Auto mode therefore:
-    //   * Skips intersect entirely when `filter_cols.len() == 1` —
-    //     the heap-pass filter is essentially always cheaper than
-    //     building a candidate-sized hashtable. (TPC-H Q3:
-    //     filter_cols = [l_shipdate], previously paid ~10 ms on the
-    //     intersect partial scan before bailing on the budget cap.)
-    //   * Uses budget = candidate / 4 for multi-column filters so
-    //     intersect still wins on highly selective residuals where
-    //     the heap pass would have to read several columns per row.
-    //   * `On` mode keeps the unbounded scan for tests / opt-in.
+    // Try a secondary-index intersection for the SQL predicate when its
+    // estimated output justifies the extra scan. A one-column heap filter
+    // is already cheap enough to prefer in auto mode.
     let intersect_mode = inlj_secondary_intersect_mode();
     let intersect_filter_cheap = right_only_filter_cols
         .as_ref()
-        .map(|c| c.len() <= 1)
-        .unwrap_or(false);
+        .is_some_and(|cols| cols.len() <= 1);
     let intersected_read_ids =
-        if intersect_mode != InljSecondaryIntersectMode::Off && right_only_residual.is_some() {
+        if runtime_intersected_ids.is_none() && intersect_mode != InljSecondaryIntersectMode::Off {
             if let Some((sec_idx, low, high)) =
                 pick_secondary_intersect_index(right_table, right_index, right_only_residual)
             {
                 let budget = match intersect_mode {
                     InljSecondaryIntersectMode::On => usize::MAX,
                     InljSecondaryIntersectMode::Auto if intersect_filter_cheap => 0,
-                    InljSecondaryIntersectMode::Auto => sorted_row_ids.len() / 4,
+                    InljSecondaryIntersectMode::Auto => candidate_ids.len() / 4,
                     InljSecondaryIntersectMode::Off => unreachable!(),
                 };
                 if budget == 0 {
@@ -4413,7 +4400,7 @@ pub(super) fn execute_batched_inlj_noncovering(
                         &sec_idx,
                         low,
                         high,
-                        &sorted_row_ids,
+                        candidate_ids,
                         budget,
                     )?
                 }
@@ -4423,183 +4410,87 @@ pub(super) fn execute_batched_inlj_noncovering(
         } else {
             None
         };
-    // `residual_already_satisfied` tracks whether the row-id set we are
-    // about to read has *already* been filtered against
-    // `right_only_residual`. When `try_inl_secondary_intersect` picks
-    // a secondary index that exactly covers the residual (e.g. Q3's
-    // `idx_lineitem_shipdate` for `l_shipdate > '1995-03-15'`) or
-    // `filter_batched_right_row_ids` runs the compiled / legacy
-    // predicate over a narrow read of the filter columns, the
-    // post-read residual loop below would just re-prove a property
-    // already in evidence. Tracking the flag here lets that loop
-    // skip ~1.4M throwaway `PlanRow` allocations + `Value::clone`s +
-    // legacy `eval_plan_bool` calls on Q3-shape INLJs.
-    let runtime_intersected_read_ids = try_inlj_runtime_keyset_intersect(
-        db,
-        txn,
-        right_table,
-        right_index,
-        right_runtime_filters,
-        &sorted_row_ids,
-    )?;
 
-    let mut predicate_first_pairs: Option<Vec<(RowId, Vec<Value>)>> = None;
-    let (read_row_ids, residual_already_satisfied) = if let Some(intersected) =
-        runtime_intersected_read_ids
+    let read_output =
+        |ids: &[RowId]| read_inlj_probe_rows_parallel(db, &heap, right_table, ids, txn, projection);
+    let (mut right_pairs, residual_already_satisfied) = if let Some(intersected) =
+        intersected_read_ids
     {
-        if intersected.is_empty() {
-            return Ok(unmatched_batched_inlj_rows(
-                left_rows,
-                right_table,
-                join_type,
-                right_projected_columns,
-            ));
-        }
-        (intersected, false)
-    } else if let Some(intersected) = intersected_read_ids {
-        if intersected.is_empty() {
-            return Ok(unmatched_batched_inlj_rows(
-                left_rows,
-                right_table,
-                join_type,
-                right_projected_columns,
-            ));
-        }
-        (intersected, true)
-    } else if inlj_predicate_first_enabled()
-        && (right_only_filter_cols.is_some() || runtime_filter_cols.is_some())
-    {
-        // Decode the narrow right-only residual and/or hash-build runtime
-        // filter keys first, then decode the output projection only for
-        // accepted rows while the same heap page is still pinned. Runtime
-        // KeySets are deliberately evaluated here when a secondary-index
-        // intersection is cost-rejected: this keeps work proportional to the
-        // join candidates instead of repeatedly expanding the KeySet across
-        // the whole fact-table index for every outer batch.
-        let mut filter_set = std::collections::BTreeSet::new();
-        if let Some(cols) = right_only_filter_cols.as_ref() {
-            filter_set.extend(cols.iter().copied());
-        }
-        if let Some(cols) = runtime_filter_cols.as_ref() {
-            filter_set.extend(cols.iter().copied());
-        }
-        let filter_columns: Vec<usize> = filter_set.into_iter().collect();
-        let filter_schema = projected_inlj_schema(right_table, &filter_columns);
-        let compiled_filter = right_only_residual
-            .and_then(|residual| compile_projected_row_predicate(residual, &filter_schema));
-        let compiled_runtime_filters: Vec<Option<CompiledRuntimeFilterProbe>> =
-            right_runtime_filters
-                .iter()
-                .map(|rf| {
-                    compile_runtime_filter_probe_projected(rf, &right_table.schema, &filter_columns)
-                })
-                .collect();
-        let pairs = read_inlj_probe_rows_predicate_first_parallel(
-            db,
-            &heap,
-            right_table,
-            &sorted_row_ids,
-            txn,
-            &filter_columns,
-            projection,
-            &filter_schema,
-            right_only_residual,
-            compiled_filter.as_ref(),
-            &compiled_runtime_filters,
-        )?;
-        if pairs.is_empty() {
-            return Ok(unmatched_batched_inlj_rows(
-                left_rows,
-                right_table,
-                join_type,
-                right_projected_columns,
-            ));
-        }
-        let passing = pairs.iter().map(|(row_id, _)| *row_id).collect();
-        record_inlj_predicate_first_rows(sorted_row_ids.len() as u64, pairs.len() as u64);
-        predicate_first_pairs = Some(pairs);
-        (passing, true)
+        (read_output(&intersected)?, true)
     } else if right_only_filter_cols.is_some() || runtime_filter_cols.is_some() {
-        let mut filter_set = std::collections::BTreeSet::new();
-        if let Some(cols) = right_only_filter_cols.as_ref() {
-            filter_set.extend(cols.iter().copied());
-        }
-        if let Some(cols) = runtime_filter_cols.as_ref() {
-            filter_set.extend(cols.iter().copied());
-        }
-        let filter_columns: Vec<usize> = filter_set.into_iter().collect();
+        let filter_residual = right_only_residual.filter(|_| right_only_filter_cols.is_some());
+        let mut filter_columns = right_only_filter_cols.unwrap_or_default();
+        filter_columns.extend(runtime_filter_cols.into_iter().flatten());
+        filter_columns.sort_unstable();
+        filter_columns.dedup();
         let filter_schema = projected_inlj_schema(right_table, &filter_columns);
-        let compiled_filter = right_only_residual
+        let compiled_filter = filter_residual
             .and_then(|residual| compile_projected_row_predicate(residual, &filter_schema));
-        let mut passing = if force_serial_filter {
-            filter_batched_right_row_ids_serial(
+        let compiled_runtime_filters: Vec<_> = right_runtime_filters
+            .iter()
+            .map(|rf| {
+                compile_runtime_filter_probe_projected(rf, &right_table.schema, &filter_columns)
+            })
+            .collect();
+        let pairs = if inlj_predicate_first_enabled() {
+            // Decode the output only for matching rows while the page is pinned.
+            let pairs = read_inlj_probe_rows_predicate_first_parallel(
                 db,
-                right_table,
-                &sorted_row_ids,
-                txn,
-                &filter_columns,
-                &filter_schema,
-                right_only_residual,
-                compiled_filter.as_ref(),
-            )?
-        } else {
-            filter_batched_right_row_ids(
-                db,
-                right_table,
-                &sorted_row_ids,
-                txn,
-                &filter_columns,
-                &filter_schema,
-                right_only_residual,
-                compiled_filter.as_ref(),
-            )?
-        };
-        if !right_runtime_filters.is_empty() {
-            let precomputed: Vec<Option<CompiledRuntimeFilterProbe>> = right_runtime_filters
-                .iter()
-                .map(|rf| {
-                    compile_runtime_filter_probe_projected(rf, &right_table.schema, &filter_columns)
-                })
-                .collect();
-            let heap = db.cached_heap_handle(right_table.schema.id)?;
-            let pairs = db.read_row_columns_many_with_handle(
                 &heap,
-                &right_table.schema,
-                &passing,
+                right_table,
+                candidate_ids,
                 txn,
                 &filter_columns,
+                projection,
+                &filter_schema,
+                filter_residual,
+                compiled_filter.as_ref(),
+                &compiled_runtime_filters,
             )?;
-            let mut keep_by_row: hashbrown::HashSet<RowId, ahash::RandomState> =
-                hashbrown::HashSet::with_capacity_and_hasher(
+            record_inlj_predicate_first_rows(candidate_ids.len() as u64, pairs.len() as u64);
+            pairs
+        } else {
+            let filter_rows = if force_serial_filter {
+                filter_batched_right_row_ids_serial
+            } else {
+                filter_batched_right_row_ids
+            };
+            let mut passing = filter_rows(
+                db,
+                right_table,
+                candidate_ids,
+                txn,
+                &filter_columns,
+                &filter_schema,
+                filter_residual,
+                compiled_filter.as_ref(),
+            )?;
+            if !compiled_runtime_filters.is_empty() {
+                let pairs = db.read_row_columns_many_with_handle(
+                    &heap,
+                    &right_table.schema,
+                    &passing,
+                    txn,
+                    &filter_columns,
+                )?;
+                let mut keep_by_row = hashbrown::HashSet::with_capacity_and_hasher(
                     pairs.len(),
                     ahash::RandomState::new(),
                 );
-            for (row_id, values) in pairs {
-                if runtime_filters_admit_values_indexed(&precomputed, &values) {
-                    keep_by_row.insert(row_id);
+                for (row_id, values) in pairs {
+                    if runtime_filters_admit_values_indexed(&compiled_runtime_filters, &values) {
+                        keep_by_row.insert(row_id);
+                    }
                 }
+                passing.retain(|row_id| keep_by_row.contains(row_id));
             }
-            passing.retain(|row_id| keep_by_row.contains(row_id));
-        }
-        if passing.is_empty() {
-            return Ok(Vec::new());
-        }
-        (passing, true)
+            read_output(&passing)?
+        };
+        (pairs, filter_residual.is_some())
     } else {
-        (sorted_row_ids, false)
+        (read_output(candidate_ids)?, false)
     };
 
-    // Replaces a per-probe `HashMap<RowId, PlanRow>` lookup. `right_pairs`
-    // is sorted by RowId, then each entry resolves its right side via a
-    // binary search on the sorted RowId column. Saves ~17% probe CPU on
-    // TPC-H-shape INLJ probes (no SipHash, no PlanRow build per inner
-    // row, no HashMap rebuild + drop).
-    let mut right_pairs: Vec<(RowId, Vec<Value>)> = match predicate_first_pairs {
-        Some(pairs) => pairs,
-        None => {
-            read_inlj_probe_rows_parallel(db, &heap, right_table, &read_row_ids, txn, projection)?
-        }
-    };
     // Slow path: residual eval still wants a PlanRow shape. Build a
     // throwaway one per row only here, never on the hot probe loop.
     //
@@ -6576,6 +6467,7 @@ pub(super) fn right_only_filter_columns(
     residual: Option<&Expr>,
     right_table: &PlanTable,
     full_projection: &[usize],
+    separate_runtime_filter_read: bool,
 ) -> Option<Vec<usize>> {
     let residual = residual?;
     let mut columns = HashSet::new();
@@ -6583,15 +6475,12 @@ pub(super) fn right_only_filter_columns(
     if columns.is_empty() {
         return None;
     }
-    let full: HashSet<usize> = full_projection.iter().copied().collect();
-    // If the output projection already contains exactly the residual's
-    // columns, evaluating it over that row is both correct and cheaper than
-    // a separate predicate-first read.  A residual column outside the output
-    // projection is different: it MUST be read separately.  Treating that
-    // shape as "not optimizable" made the batched INLJ fall back to evaluating
-    // the residual against an output-only row, producing 1054 for legal SQL
-    // such as TPC-DS Q49 (`ws.ws_net_profit` with a PK-only output projection).
-    if columns.len() >= full_projection.len() && columns.iter().all(|idx| full.contains(idx)) {
+    // A read that evaluates the residual must include every referenced column.
+    // Reuse an identical output projection when there is no runtime filter read.
+    if !separate_runtime_filter_read
+        && columns.len() == full_projection.len()
+        && full_projection.iter().all(|idx| columns.contains(idx))
+    {
         return None;
     }
     let mut out: Vec<usize> = columns.into_iter().collect();
@@ -6969,7 +6858,7 @@ mod constant_residual_tests {
             assert!(prepared.joined.is_none());
             let residual = prepared.right_only.as_ref().unwrap();
             assert_eq!(
-                right_only_filter_columns(Some(residual), &table, &[0, 1]),
+                right_only_filter_columns(Some(residual), &table, &[0, 1], false),
                 Some(vec![1])
             );
             let schema = projected_inlj_schema(&table, &[1]);
