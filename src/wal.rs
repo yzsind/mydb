@@ -3888,11 +3888,10 @@ impl LogManager {
             self.segments.iter().map(|seg| seg.size_bytes).sum(),
             Ordering::Release,
         );
-        let mut stats = WalStats::default();
-        stats.sync_total_us = self.stats.sync_total_us;
-        stats.sync_max_us = self.stats.sync_max_us;
-        accumulate_wal_stats(&mut stats, &record.payload);
-        self.stats = stats;
+        // Stats are process-lifetime cumulative counters exposed through
+        // status and metrics. Collapsing the active segment removes bytes,
+        // not the history of records already written or rotated.
+        accumulate_wal_stats(&mut self.stats, &record.payload);
         let _ = self.new_lsn_tx.send(checkpoint_lsn);
         publication.map_err(io_err)?;
         if !defer_cleanup {

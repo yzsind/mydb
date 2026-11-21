@@ -18,6 +18,7 @@ pub(crate) struct RuntimeMetrics {
     tracked_requests: usize,
     memory_bytes: usize,
     executed: u64,
+    succeeded: u64,
     failed: u64,
     cancelled: u64,
     received_bytes: u64,
@@ -37,6 +38,7 @@ pub(crate) fn runtime_metrics<E: QueryEngine>(
         tracked_requests: state.requests.lock().len(),
         memory_bytes: state.used.load(std::sync::atomic::Ordering::Acquire),
         executed: state.executed.load(std::sync::atomic::Ordering::Acquire),
+        succeeded: state.succeeded.load(std::sync::atomic::Ordering::Acquire),
         failed: state.failed.load(std::sync::atomic::Ordering::Acquire),
         cancelled: state.cancelled.load(std::sync::atomic::Ordering::Acquire),
         received_bytes: state
@@ -378,13 +380,6 @@ pub(crate) fn render(
             "counter",
         );
         sample(&mut out, "mydb_locks_deadlocks_total", &[], locks.deadlocks);
-        family(
-            &mut out,
-            "mydb_latch_waits_total",
-            "Latch waits.",
-            "counter",
-        );
-        sample(&mut out, "mydb_latch_waits_total", &[], locks.latch_waits);
 
         let wal = &snapshot.wal;
         family(
@@ -1015,25 +1010,25 @@ pub(crate) fn render(
         );
         family(
             &mut out,
-            "mydb_buffer_pool_checkpoint_flush_pages_total",
-            "Pages flushed by checkpoints.",
-            "counter",
+            "mydb_buffer_pool_checkpoint_flush_pages",
+            "Pages flushed by the most recent full buffer-pool flush.",
+            "gauge",
         );
         sample(
             &mut out,
-            "mydb_buffer_pool_checkpoint_flush_pages_total",
+            "mydb_buffer_pool_checkpoint_flush_pages",
             &[],
             buffer.checkpoint_flush_pages,
         );
         family(
             &mut out,
-            "mydb_buffer_pool_checkpoint_flush_seconds_total",
-            "Cumulative checkpoint data-file flush time.",
-            "counter",
+            "mydb_buffer_pool_checkpoint_flush_seconds",
+            "Duration of the most recent full buffer-pool flush.",
+            "gauge",
         );
         sample(
             &mut out,
-            "mydb_buffer_pool_checkpoint_flush_seconds_total",
+            "mydb_buffer_pool_checkpoint_flush_seconds",
             &[],
             seconds_us(buffer.checkpoint_flush_us),
         );
@@ -1188,18 +1183,6 @@ pub(crate) fn render(
             "mydb_undo_retention_pressure_total",
             &[],
             undo.retention_pressure,
-        );
-        family(
-            &mut out,
-            "mydb_undo_purge_errors_total",
-            "Undo purge errors.",
-            "counter",
-        );
-        sample(
-            &mut out,
-            "mydb_undo_purge_errors_total",
-            &[],
-            undo.purge_errors,
         );
 
         let spill = &snapshot.spill;
@@ -1407,14 +1390,10 @@ pub(crate) fn render(
     family(
         &mut out,
         "mydb_http_requests_total",
-        "SQL executions on the shared REST/MCP listener, by outcome.",
+        "Completed SQL requests on the shared REST/MCP listener, by outcome.",
         "counter",
     );
-    for (outcome, value) in [
-        ("executed", runtime.executed),
-        ("failed", runtime.failed),
-        ("cancelled", runtime.cancelled),
-    ] {
+    for (outcome, value) in [("succeeded", runtime.succeeded), ("failed", runtime.failed)] {
         sample(
             &mut out,
             "mydb_http_requests_total",
@@ -1422,6 +1401,30 @@ pub(crate) fn render(
             value,
         );
     }
+    family(
+        &mut out,
+        "mydb_http_statements_total",
+        "SQL statements attempted on the shared REST/MCP listener.",
+        "counter",
+    );
+    sample(
+        &mut out,
+        "mydb_http_statements_total",
+        &[],
+        runtime.executed,
+    );
+    family(
+        &mut out,
+        "mydb_http_cancel_requests_total",
+        "Accepted cancellation requests on the shared REST/MCP listener.",
+        "counter",
+    );
+    sample(
+        &mut out,
+        "mydb_http_cancel_requests_total",
+        &[],
+        runtime.cancelled,
+    );
     family(
         &mut out,
         "mydb_http_received_bytes_total",
@@ -1539,12 +1542,29 @@ mod tests {
         snapshot.build.version = "1.0.1".into();
         snapshot.checkpoints.last_flush_us = 2_500_123;
         snapshot.commands = vec![("select".into(), 7)];
-        let text = render(Some(&snapshot), &RuntimeMetrics::default(), false);
+        let mut runtime = RuntimeMetrics::default();
+        runtime.executed = 5;
+        runtime.succeeded = 3;
+        runtime.failed = 2;
+        runtime.cancelled = 1;
+        let text = render(Some(&snapshot), &runtime, false);
         assert!(text.contains("mydb_up 1\n"));
         assert!(text.contains("mydb_ready 1\n"));
         assert!(text.contains("mydb_checkpoint_last_phase_seconds{phase=\"flush\"} 2.500123\n"));
         assert!(text.contains("mydb_commands_total{command=\"select\"} 7\n"));
         assert!(text.contains("# TYPE mydb_wal_syncs_total counter\n"));
+        // Requests and statements are different units and must not share a
+        // family; cancellation is a separate counter as well.
+        assert!(text.contains("mydb_http_requests_total{outcome=\"succeeded\"} 3\n"));
+        assert!(text.contains("mydb_http_requests_total{outcome=\"failed\"} 2\n"));
+        assert!(text.contains("mydb_http_statements_total 5\n"));
+        assert!(text.contains("mydb_http_cancel_requests_total 1\n"));
+        // Per-flush values are gauges, not monotonic counters.
+        assert!(text.contains("# TYPE mydb_buffer_pool_checkpoint_flush_pages gauge\n"));
+        assert!(text.contains("# TYPE mydb_buffer_pool_checkpoint_flush_seconds gauge\n"));
+        // Unimplemented diagnostics must not be exported as healthy zeros.
+        assert!(!text.contains("mydb_latch_waits_total"));
+        assert!(!text.contains("mydb_undo_purge_errors_total"));
     }
 
     #[test]

@@ -2518,12 +2518,14 @@ impl Database {
 
     /// WAL bytes accumulated since the most recent successful checkpoint.
     /// This is the same baseline used by the size-based checkpoint trigger;
-    /// it is not the configured threshold.
+    /// it is not the configured threshold. Failure-driven trigger backoff
+    /// updates a separate atomic, so a failed attempt cannot clear the
+    /// reported backlog.
     pub(crate) fn wal_bytes_since_checkpoint(&self) -> u64 {
         self.log_state_atomics
             .wal_bytes()
             .saturating_sub(
-                self.wal_bytes_after_last_checkpoint_atomic
+                self.wal_bytes_after_last_successful_checkpoint_atomic
                     .load(Ordering::Acquire),
             )
     }
@@ -4809,6 +4811,8 @@ impl Database {
             .store(now_ms, Ordering::Release);
         self.wal_bytes_after_last_checkpoint_atomic
             .store(wal_bytes_now, Ordering::Release);
+        self.wal_bytes_after_last_successful_checkpoint_atomic
+            .store(wal_bytes_now, Ordering::Release);
         // Publish the checkpoint LSN to the buffer pool so the
         // heap-side first-update FPI gate can skip pages already
         // WAL-touched in this checkpoint window.
@@ -4976,6 +4980,8 @@ impl Database {
         self.last_checkpoint_unix_ms_atomic
             .store(now_ms, Ordering::Release);
         self.wal_bytes_after_last_checkpoint_atomic
+            .store(wal_bytes_now, Ordering::Release);
+        self.wal_bytes_after_last_successful_checkpoint_atomic
             .store(wal_bytes_now, Ordering::Release);
         self.restartpoints_total_atomic
             .fetch_add(1, Ordering::Relaxed);

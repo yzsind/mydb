@@ -83,7 +83,6 @@ pub struct LockMetrics {
     pub wait_time_ms: u64,
     pub wait_time_max_ms: u64,
     pub deadlocks: u64,
-    pub latch_waits: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -189,7 +188,6 @@ pub struct UndoMetrics {
     pub records: u64,
     pub peak_bytes: u64,
     pub retention_pressure: u64,
-    pub purge_errors: u64,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -220,6 +218,23 @@ pub struct ReplicationMetrics {
     pub max_seconds_behind_source: Option<u64>,
 }
 
+/// Lag as `SHOW REPLICA STATUS` defines it: unknown while the SQL thread is
+/// stopped, zero once the applier has caught up, otherwise the cached value
+/// last computed when a commit was applied.
+fn reported_replication_lag(replica: &crate::replication::ReplicationStatus) -> Option<u64> {
+    if !replica.sql_running {
+        return None;
+    }
+    if replica.running
+        && !replica.source_log_file.is_empty()
+        && replica.exec_source_log_file == replica.source_log_file
+        && replica.exec_source_log_pos >= replica.source_log_pos
+    {
+        return Some(0);
+    }
+    replica.seconds_behind_source
+}
+
 /// Collect a status snapshot from the storage engine and shared session
 /// registry. Every source is an atomic read or a short metadata lock; no
 /// query planning or disk I/O is performed.
@@ -241,7 +256,7 @@ pub(crate) fn collect(db: &Database, registry: &SessionRegistry) -> MetricsSnaps
             if replica.running {
                 channels_running = channels_running.saturating_add(1);
             }
-            if let Some(lag) = replica.seconds_behind_source {
+            if let Some(lag) = reported_replication_lag(&replica) {
                 max_lag = Some(max_lag.map_or(lag, |current: u64| current.max(lag)));
             }
         }
@@ -295,13 +310,18 @@ pub(crate) fn collect(db: &Database, registry: &SessionRegistry) -> MetricsSnaps
             wait_time_ms: status.lock_wait_time_ms,
             wait_time_max_ms: status.lock_wait_time_max_ms,
             deadlocks: status.deadlocks,
-            latch_waits: status.latch_waits,
         },
         wal: WalMetrics {
             size_bytes: status.wal_bytes,
             current_lsn: status.current_lsn,
             durable_lsn: status.durable_lsn,
-            durable_lag_lsn: status.current_lsn.saturating_sub(status.durable_lsn),
+            // `current_lsn` is the next allocatable LSN, so a fully durable
+            // log has next == durable + 1. Report the appended-but-not-durable
+            // byte distance, which is zero in that state.
+            durable_lag_lsn: status
+                .current_lsn
+                .saturating_sub(status.durable_lsn)
+                .saturating_sub(1),
             syncs: status.wal_syncs,
             sync_total_us: status.wal_sync_total_us,
             sync_max_us: status.wal_sync_max_us,
@@ -391,7 +411,6 @@ pub(crate) fn collect(db: &Database, registry: &SessionRegistry) -> MetricsSnaps
             records: status.undo_records as u64,
             peak_bytes: status.undo_peak_bytes,
             retention_pressure: status.undo_retention_pressure,
-            purge_errors: status.undo_purge_errors,
         },
         spill: SpillMetrics {
             bytes_written: status.spill_bytes_written,

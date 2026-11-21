@@ -858,6 +858,7 @@ impl Database {
             last_checkpoint_lsn_atomic: AtomicU64::new(0),
             last_checkpoint_unix_ms_atomic: AtomicU64::new(0),
             wal_bytes_after_last_checkpoint_atomic: AtomicU64::new(0),
+            wal_bytes_after_last_successful_checkpoint_atomic: AtomicU64::new(0),
             last_auto_checkpoint_unix_ms_atomic: AtomicU64::new(0),
             checkpoints_total_atomic: AtomicU64::new(0),
             checkpoint_failures_total_atomic: AtomicU64::new(0),
@@ -1240,6 +1241,8 @@ impl Database {
             checkpoint.last_checkpoint_unix_ms = Some(armed_ms);
         }
         db.wal_bytes_after_last_checkpoint_atomic
+            .store(db.log_state_atomics.wal_bytes(), Ordering::Release);
+        db.wal_bytes_after_last_successful_checkpoint_atomic
             .store(db.log_state_atomics.wal_bytes(), Ordering::Release);
         // Publish recovered binlog commit boundaries before ANY checkpoint can
         // reclaim their WAL evidence. This also runs when binlogging is disabled
