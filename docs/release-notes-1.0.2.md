@@ -34,6 +34,16 @@ performance optimizations**; fixes and performance improvements can overlap.
 **Release maturity** — 1.0.2 remains a public preview for feature validation,
 compatibility testing, and controlled-environment evaluation.
 
+## Critical availability fix
+
+**HNSW maintenance interrupted by session cancellation.** In earlier versions,
+`KILL`, `KILL QUERY`, or a statement timeout during post-commit HNSW graph/index
+maintenance could put the entire database into a fail-stopped state.
+**The process remained running but rejected subsequent queries; restarting the
+database was required to restore service.** MyDB 1.0.2 isolates required
+post-commit maintenance from statement cancellation and timeouts, preventing
+this outage.
+
 ## MySQL compatibility and SQL correctness
 
 - Hexadecimal and bit literals retain numeric semantics through expressions,
@@ -107,9 +117,8 @@ See [optimizer and execution](optimizer-and-operators.md),
   acknowledgement; OS-crash and power-loss durability still require synchronization.
 - XA state checks, administrative implicit commits, and `sql_log_bin` transaction
   restrictions preserve transaction boundaries.
-- Committed vector maintenance survives statement cancellation. Recovery cleans
-  orphaned vector files, retains retryable purge work, and preserves replication
-  slot retention floors.
+- Recovery cleans orphaned vector files, retains retryable purge work, and
+  preserves replication slot retention floors.
 
 See [MVCC and locking](mvcc-and-locking.md),
 [backup and recovery](backup-and-recovery.md), and
