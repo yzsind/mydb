@@ -495,7 +495,7 @@ fn insert_lock_storage_benchmark() {
                     .collect();
                 barrier.wait();
                 for batch in batches {
-                    index.insert_batch_deferred(0, batch, false).unwrap();
+                    index.insert_batch_deferred(0, batch, false, None).unwrap();
                 }
                 remaining.fetch_sub(1, Ordering::Release);
             })

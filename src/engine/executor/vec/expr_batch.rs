@@ -1688,6 +1688,20 @@ fn try_column_column_cmp_bitmap(program: &ExprProgram, batch: &Batch) -> Option<
     if left_col.len() != batch.num_rows() || right_col.len() != batch.num_rows() {
         return None;
     }
+    for column in [left_col, right_col] {
+        let tagged = match column {
+            ColumnVector::Date32 { data, .. } => batch.visible_indices().any(|row| {
+                !column.is_null(row) && crate::types::decode_tagged_date(data[row]).is_some()
+            }),
+            ColumnVector::DateTime64 { data, .. } => batch.visible_indices().any(|row| {
+                !column.is_null(row) && crate::types::decode_tagged_datetime(data[row]).is_some()
+            }),
+            _ => false,
+        };
+        if tagged {
+            return None;
+        }
+    }
     let mut out = Bitmap::new_all_invalid(batch.num_rows());
     macro_rules! compare_lane {
         ($left:expr, $right:expr) => {{
@@ -1798,6 +1812,32 @@ pub(crate) fn try_column_const_cmp_bitmap_parts(
     // still return `None` and use the scalar oracle, preserving sql_mode,
     // prepared-parameter warning and evaluation-order semantics.
     let column = batch.columns().get(col)?;
+    // Component-preserving dates are not ordered by their reserved epoch
+    // encodings. Keep the complete scalar comparison oracle for this batch.
+    match column {
+        ColumnVector::Date32 { data, .. } => {
+            if data.len() != n
+                || matches!(konst,Value::Date(value) if crate::types::decode_tagged_date(*value).is_some())
+                || batch.visible_indices().any(|row| {
+                    !column.is_null(row) && crate::types::decode_tagged_date(data[row]).is_some()
+                })
+            {
+                return None;
+            }
+        }
+        ColumnVector::DateTime64 { data, .. } => {
+            if data.len() != n
+                || matches!(konst,Value::DateTime(value) if crate::types::decode_tagged_datetime(*value).is_some())
+                || batch.visible_indices().any(|row| {
+                    !column.is_null(row)
+                        && crate::types::decode_tagged_datetime(data[row]).is_some()
+                })
+            {
+                return None;
+            }
+        }
+        _ => {}
+    }
     let nulls = match (column, konst) {
         (ColumnVector::I64 { data, nulls }, Value::Int(rhs)) => {
             if data.len() != n {

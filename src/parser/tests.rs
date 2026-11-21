@@ -5787,8 +5787,8 @@ fn legacy_lob_lengths_choose_smallest_mysql_family() {
         panic!("expected CREATE TABLE");
     };
     assert_eq!(table.columns[0].data_type, DataType::Blob(255));
-    assert_eq!(table.columns[1].data_type, DataType::Text(16_777_215));
-    assert_eq!(table.columns[2].data_type, DataType::Text(u32::MAX));
+    assert_eq!(table.columns[1].data_type, DataType::TextLength(70000));
+    assert_eq!(table.columns[2].data_type, DataType::TextLength(70000000));
 
     let Statement::CreateTable(table) =
         parse_statement("CREATE TABLE quoted_text (a VARCHAR(32) DEFAULT 'TEXT(70000)')").unwrap()
@@ -5796,6 +5796,46 @@ fn legacy_lob_lengths_choose_smallest_mysql_family() {
         panic!("expected CREATE TABLE");
     };
     assert_eq!(table.columns[0].data_type, DataType::VarChar(Some(32)));
+}
+
+#[test]
+fn float_display_width_validation_preserves_mysql_error_precedence() {
+    for data_type in ["FLOAT", "DOUBLE", "DOUBLE PRECISION"] {
+        for modifiers in ["", " UNSIGNED", " ZEROFILL"] {
+            for (width, scale, code) in [
+                (0, 0, 1439),
+                (0, 2, 1427),
+                (0, 30, 1427),
+                (0, 31, 1425),
+                (1, 2, 1427),
+                (255, 31, 1425),
+                (256, 0, 1439),
+            ] {
+                let definition = format!("{data_type}({width},{scale}){modifiers}");
+                for sql in [
+                    format!("CREATE TABLE bad_float (f {definition})"),
+                    format!("ALTER TABLE bad_float ADD COLUMN f {definition}"),
+                    format!("ALTER TABLE bad_float MODIFY COLUMN f {definition}"),
+                ] {
+                    let err = parse_statement(&sql).unwrap_err();
+                    assert_eq!(err.code(), code, "{sql}: {err:?}");
+                    assert_eq!(err.sql_state(), "42000", "{sql}: {err:?}");
+                }
+            }
+        }
+    }
+    for (definition, expected) in [
+        ("FLOAT(1,0)", DataType::Float(Some((1, 0)))),
+        ("FLOAT(2,2)", DataType::Float(Some((2, 2)))),
+        ("DOUBLE(255,30)", DataType::Double(Some((255, 30)))),
+    ] {
+        let Statement::CreateTable(table) =
+            parse_statement(&format!("CREATE TABLE valid_float (f {definition})")).unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(table.columns[0].data_type, expected, "{definition}");
+    }
 }
 
 #[test]

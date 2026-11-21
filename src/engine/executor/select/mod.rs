@@ -2679,6 +2679,16 @@ pub(super) fn execute_analyze_table(
     use crate::parser::HistogramAction;
     let visible_name = super::qualification::qualify_persistent_table_name(session, table_name);
     let temporary = session.has_temp_table(table_name);
+    if !temporary
+        && db
+            .view_definition(&session.current_database, table_name)
+            .is_some()
+    {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_OBJECT,
+            format!("'{visible_name}' is not BASE TABLE"),
+        ));
+    }
     if temporary && histogram.is_some() {
         return Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,

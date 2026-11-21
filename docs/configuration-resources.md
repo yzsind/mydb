@@ -52,7 +52,10 @@ SET GLOBAL mydb_wal_write_buffer_bytes = 4194304;
 A runtime change drains pending WAL writes before resizing the buffer and is
 subject to memory admission. Larger buffers can coalesce more writes but do not
 change commit durability: strict commits still synchronize WAL, while relaxed
-commits drain it to the OS page cache. Frames at least as large as the threshold
+commits drain it to the OS page cache. A successful relaxed commit survives a
+server process crash (including `SIGKILL`), but is not guaranteed to survive an
+OS crash or power loss because it does not require a WAL fsync. Frames at least
+as large as the threshold
 bypass the buffer. Memory durability mode does not enable WAL persistence.
 `SET GLOBAL` changes the running instance; use startup configuration to retain
 the choice after restart. The compatibility stub `innodb_log_buffer_size` does

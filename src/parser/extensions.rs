@@ -21,6 +21,8 @@ pub(super) enum Extension {
     IndexInclude(usize),
     IndexVisibility,
     VectorOptions(usize),
+    TextLength(u32),
+    DerivedAlias,
 }
 
 #[derive(Default)]

@@ -53,7 +53,6 @@ fn fulltext_boolean_rejects_hidden_operators_and_malformed_operands() {
         "++database",
         "+-database",
         "+",
-        "\"database",
     ] {
         let sql =
             format!("SELECT id FROM docs WHERE MATCH(body) AGAINST('{query}' IN BOOLEAN MODE)");
@@ -1903,7 +1902,8 @@ fn fulltext_audit_ddl_rejects_ignored_options() {
             format!("ALTER TABLE docs ADD FULLTEXT KEY ft{option}"),
         ] {
             let err = engine.execute(&sql).unwrap_err();
-            assert!(err.message().contains("FULLTEXT"), "{sql}: {err:?}");
+            assert_eq!(err.code(), 1128, "{sql}: {err:?}");
+            assert!(err.message().contains("bogus"), "{sql}: {err:?}");
         }
     }
     engine

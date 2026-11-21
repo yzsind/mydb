@@ -890,6 +890,16 @@ impl Dialect for MydbDialect {
         &self,
         parser: &mut SqlParser,
     ) -> Option<Result<sqlparser::ast::Expr, ParserError>> {
+        if parser.peek_token_ref().token == Token::LParen
+            && matches!(parser.peek_nth_token_ref(1).token, Token::Word(ref w) if w.keyword == Keyword::VALUES)
+        {
+            parser.next_token();
+            return Some((|| {
+                let query = parser.parse_query()?;
+                parser.expect_token(&Token::RParen)?;
+                Ok(SqlExpr::Subquery(query))
+            })());
+        }
         // Upstream protects query recursion but not all expression-prefix
         // frames. Grow before entering another large frame, including when
         // parsing on a small worker stack or under sanitizer instrumentation.
@@ -1033,7 +1043,10 @@ impl Dialect for MydbDialect {
         // stops at `ON`, which is why only the FROM-less source regressed.)
         // Excluding `ON` here aligns with MySQL and fixes the ODKU parse; the
         // default `is_select_item_alias` routes through this method too.
-        if matches!(kw, Keyword::ON | Keyword::FOR) {
+        if matches!(
+            kw,
+            Keyword::ON | Keyword::FOR | Keyword::DISTINCT | Keyword::ALL
+        ) {
             return false;
         }
         // EXCLUDE is non-reserved in MySQL; the window-frame parser consumes
@@ -1135,7 +1148,7 @@ impl Dialect for MydbDialect {
             }
             let _ = parser.parse_keyword(Keyword::BETWEEN);
             let result = (|| {
-                let low = parser.parse_subexpr(PREC_BETWEEN)?;
+                let low = parser.parse_subexpr(PREC_PREDICATE)?;
                 parser.expect_keyword_is(Keyword::AND)?;
                 // One below BETWEEN admits another predicate at the same
                 // level. Comparison leakage is rotated back out by the
@@ -1176,6 +1189,40 @@ impl Dialect for MydbDialect {
                         right: Box::new(right),
                     }),
             );
+        }
+        if matches!(parser.peek_token_ref().token, Token::Word(ref w) if w.keyword == Keyword::NOT)
+            && matches!(parser.peek_nth_token_ref(1).token, Token::Word(ref w) if w.keyword == Keyword::NULL)
+        {
+            return Some(parser.expected("IS before NOT NULL", parser.peek_token()));
+        }
+        // Finish date arithmetic at the interval unit before consuming the
+        // following multiplication/division. The interval value itself retains
+        // its full expression grammar up to that explicit unit.
+        if matches!(parser.peek_token_ref().token, Token::Plus | Token::Minus)
+            && matches!(parser.peek_nth_token_ref(1).token, Token::Word(ref w) if w.keyword == Keyword::INTERVAL)
+        {
+            let op = if parser.next_token().token == Token::Plus {
+                SqlBinaryOperator::Plus
+            } else {
+                SqlBinaryOperator::Minus
+            };
+            return Some((|| {
+                let mut right = parser.parse_prefix()?;
+                if !matches!(right, SqlExpr::Interval(_)) {
+                    loop {
+                        let next = parser.get_next_precedence()?;
+                        if next <= precedence {
+                            break;
+                        }
+                        right = parser.parse_infix(right, next)?;
+                    }
+                }
+                Ok(SqlExpr::BinaryOp {
+                    left: Box::new(expr.clone()),
+                    op,
+                    right: Box::new(right),
+                })
+            })());
         }
         self.inner.parse_infix(parser, expr, precedence)
     }
@@ -1532,6 +1579,21 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
                 return Ok(statement);
             }
         }
+        if head_is(b"SIGNAL") || head_is(b"RESIGNAL") {
+            let body = parse_routine_body_sql(sql.trim_end().trim_end_matches(';').trim_end())?;
+            let mut statements = body.statements;
+            if statements.len() != 1
+                || !matches!(
+                    statements[0],
+                    RoutineStmt::Signal { .. } | RoutineStmt::Resignal { .. }
+                )
+            {
+                return Err(parse_error_at_zero(
+                    "expected a single SIGNAL or RESIGNAL statement",
+                ));
+            }
+            return Ok(Statement::RaiseCondition(Box::new(statements.remove(0))));
+        }
         if matches!(
             head_kw,
             b"CREATE" | b"ALTER" | b"DROP" | b"CALL" | b"SHOW" | b"DELIMITER"
@@ -1673,9 +1735,6 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
         let sql = rewrite_sql(sql, |sql| {
             strip_index_key_block_size(sql, prescan.has_key_block_size)
         });
-        let sql = rewrite_sql(sql, |sql| {
-            strip_column_format_storage(sql, prescan.has_column_format_or_storage)
-        });
         // Compute the shared inline-index gate only when either feature occurs.
         // Prefix comparisons need no full-SQL uppercase allocation.
         let inline_indexes = (prescan.has_index_visibility || prescan.has_include) && {
@@ -1728,6 +1787,11 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
             try_rewrite_sql_with(sql, |sql| {
                 strip_partition_clauses(sql).map(|(sql, create, alter)| (sql, (create, alter)))
             })?;
+        // Partition STORAGE syntax must be validated before stripping the
+        // unrelated legacy column STORAGE attribute from the remaining DDL.
+        let sql = rewrite_sql(sql, |sql| {
+            strip_column_format_storage(sql, prescan.has_column_format_or_storage)
+        });
         let (sql, fulltext_parsers) =
             try_rewrite_sql_with(sql, |sql| strip_fulltext_parsers(sql, prescan.has_fulltext))?;
         let (sql, create_index_fulltext) = rewrite_sql_with(sql, |sql| {

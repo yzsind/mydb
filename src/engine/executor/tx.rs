@@ -521,6 +521,12 @@ fn ensure_statement_txn_slot(
             "XAER_RMFAIL: XA branch is IDLE",
         ));
     }
+    if dml && db.physical_replica_mode() {
+        return Err(error(
+            crate::error::catalog::ER_CANT_EXECUTE_IN_READ_ONLY_TRANSACTION,
+            "Cannot execute statement on a physical replica.",
+        ));
+    }
     let isolation = session.start_transaction_isolation();
     if dml && session.read_only_txn {
         return Err(error(
@@ -927,7 +933,11 @@ pub(super) fn execute_atomic_routine_statement<T, F>(
 where
     F: FnOnce(&Arc<Database>, &mut SessionContext) -> Result<T, QueryError>,
 {
-    let txn = ensure_statement_dml_txn(db, session)?;
+    let txn = if db.physical_replica_mode() || db.is_snapshot_read_only() {
+        ensure_statement_txn(db, session)?
+    } else {
+        ensure_statement_dml_txn(db, session)?
+    };
     let (txn, _snapshot_guard) = atomically_guard_statement_view(db, session, txn);
     let temp_savepoint = session.temp_table_journal.len();
     let user_transaction = !session.autocommit || session.explicit_txn;

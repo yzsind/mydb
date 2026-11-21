@@ -10374,7 +10374,9 @@ fn large_index_batch_wal_is_split_below_replication_payload_limit() {
             }
         })
         .collect::<Vec<_>>();
-    index.insert_entries_logged(11, entries, true).unwrap();
+    index
+        .insert_entries_logged(11, entries, true, None)
+        .unwrap();
     {
         let mut guard = log.lock();
         guard.rotate_segment().unwrap();
@@ -14313,6 +14315,7 @@ fn consistency_check_detects_dangling_index_entry() {
                 page_id: 99,
                 slot_id: 1,
             },
+            None,
         )
     })
     .unwrap();
@@ -18772,10 +18775,10 @@ fn durable_direct_bulk_builder_matches_memory_buffered_oracle() {
     entries.sort_unstable();
 
     strict
-        .insert_entries_logged(7, entries.clone(), true)
+        .insert_entries_logged(7, entries.clone(), true, None)
         .unwrap();
     memory
-        .insert_entries_logged(7, entries.clone(), true)
+        .insert_entries_logged(7, entries.clone(), true, None)
         .unwrap();
     assert_eq!(
         strict.range(None, None, false).unwrap(),
@@ -18799,10 +18802,10 @@ fn durable_direct_bulk_builder_matches_memory_buffered_oracle() {
         },
     };
     strict
-        .insert_entries_logged(8, vec![extra.clone()], true)
+        .insert_entries_logged(8, vec![extra.clone()], true, None)
         .unwrap();
     memory
-        .insert_entries_logged(8, vec![extra.clone()], true)
+        .insert_entries_logged(8, vec![extra.clone()], true, None)
         .unwrap();
     assert_eq!(
         strict.get(&extra.key, false).unwrap(),
@@ -18849,7 +18852,7 @@ fn direct_bulk_builder_failure_before_meta_restores_empty_usable_index() {
         },
     };
     index
-        .insert_entries_logged(10, vec![replacement.clone()], true)
+        .insert_entries_logged(10, vec![replacement.clone()], true, None)
         .unwrap();
     assert_eq!(
         index.get(&replacement.key, false).unwrap(),
@@ -20444,7 +20447,7 @@ fn sorted_append_demoting_compact_leaf_splits_instead_of_overflowing() {
         row_id: test_row_id(9_999, 128),
     };
     index
-        .insert_entries_logged(2, vec![outlier.clone()], true)
+        .insert_entries_logged(2, vec![outlier.clone()], true, None)
         .unwrap();
 
     assert_eq!(
@@ -26870,7 +26873,12 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
     };
     for id in 1..=3 {
         index
-            .insert_deferred(1, IndexKey::from(vec![KeyPart::Int(id as i64)]), row(id))
+            .insert_deferred(
+                1,
+                IndexKey::from(vec![KeyPart::Int(id as i64)]),
+                row(id),
+                None,
+            )
             .unwrap();
     }
     let count = || {
@@ -26882,7 +26890,7 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
     };
     assert_eq!(count(), 3);
     index
-        .insert_deferred(2, IndexKey::from(vec![KeyPart::Int(4)]), row(4))
+        .insert_deferred(2, IndexKey::from(vec![KeyPart::Int(4)]), row(4), None)
         .unwrap();
     assert_eq!(
         count(),
@@ -26890,7 +26898,7 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
         "a leaf-only insert must invalidate cached cardinality"
     );
     index
-        .delete_deferred(3, IndexKey::from(vec![KeyPart::Int(2)]), row(2))
+        .delete_deferred(3, IndexKey::from(vec![KeyPart::Int(2)]), row(2), None)
         .unwrap();
     assert_eq!(
         count(),
@@ -29485,7 +29493,7 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
                 let entries = index.entries()?;
                 for (key, row) in entries {
                     if key.0.first() == Some(&KeyPart::String("alpha".into())) {
-                        index.delete_deferred(0, key, row)?;
+                        index.delete_deferred(0, key, row, None)?;
                         index.insert_deferred(
                             0,
                             IndexKey::from(vec![
@@ -29493,6 +29501,7 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
                                 KeyPart::Bytes(vec![2, 1]),
                             ]),
                             row,
+                            None,
                         )?;
                     }
                 }
@@ -31579,4 +31588,251 @@ fn replication_visibility_proof_uses_wal_pressure_emergency_path() {
         "emergency control records must still count towards retained WAL"
     );
     db.ensure_operational().unwrap();
+}
+
+#[test]
+fn storage_release1121_buffered_insert_delete_preserves_wal_order() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.create_table(
+        "wal_order",
+        vec![concurrent_index_test_column("id", true)],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    db.insert_rows(
+        seed,
+        "test.wal_order",
+        (1..=50).map(|i| vec![Value::Int(i)]).collect(),
+    )
+    .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let txn = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            txn,
+            "test.wal_order",
+            (101..=110).map(|i| vec![Value::Int(i)]).collect(),
+        )
+        .unwrap();
+    assert!(txn_wal_buffer_len(&db.log, txn.txn_id) > 0);
+    assert_eq!(
+        db.delete_rows(txn, "test.wal_order", Some(ids), |_| Ok(true))
+            .unwrap(),
+        10
+    );
+    db.commit_txn(txn.txn_id).unwrap();
+    db.log.lock().flush().unwrap();
+    let records = crate::wal::LogManager::scan(dir.path()).unwrap().records;
+    let kinds = records
+        .iter()
+        .filter(|r| r.txn_id == txn.txn_id)
+        .flat_map(|r| match &r.payload {
+            WalPayload::IndexBatch { ops, .. } => ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            vec![WalIndexOpKind::Insert; 10],
+            vec![WalIndexOpKind::Delete; 10]
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn storage_release1121_eager_index_fallbacks_publish_the_parked_prefix() {
+    for mode in [
+        "single_insert",
+        "batch_insert",
+        "partial_insert",
+        "single_delete",
+        "two_op",
+    ] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = open_relaxed_test_db(dir.path());
+        db.create_table(
+            "fallbacks",
+            vec![concurrent_index_test_column("id", true)],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let table = db.table("test.fallbacks").unwrap();
+        let seed: Vec<_> = (1..=50)
+            .map(|id| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(id)]),
+                row_id: RowId::new(1, id as u16),
+            })
+            .collect();
+        db.with_index_dml(table.id, "PRIMARY", |file| {
+            file.bulk_load_sorted(0, seed.clone())
+        })
+        .unwrap();
+        let txn = db.begin_dml_txn().unwrap();
+        let entry = |id: i64| {
+            (
+                IndexKey::from(vec![KeyPart::Int(id)]),
+                RowId::new(1, id as u16),
+            )
+        };
+        db.with_index_dml(table.id, "PRIMARY", |file| {
+            let (key, row) = entry(101);
+            file.insert_deferred(txn.txn_id, key, row, Some(&db))?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(txn_wal_buffer_len(&db.log, txn.txn_id) > 0, "{mode}");
+        let used = db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire);
+        let reservation = if matches!(mode, "single_insert" | "batch_insert" | "single_delete") {
+            Some(
+                db.buffer_pool
+                    .reserve_deferred_wal_pages(
+                        (db.buffer_pool.capacity_pages() / 8 - used) as usize,
+                    )
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        db.with_index_dml(table.id, "PRIMARY", |file| match mode {
+            "single_insert" => {
+                let (key, row) = entry(200);
+                file.insert_deferred(txn.txn_id, key, row, Some(&db))
+            }
+            "batch_insert" => file.insert_batch_deferred(
+                txn.txn_id,
+                (200..210).map(entry).collect(),
+                false,
+                Some(&db),
+            ),
+            "partial_insert" => file.insert_batch_deferred(
+                txn.txn_id,
+                (200..4200).map(entry).collect(),
+                false,
+                Some(&db),
+            ),
+            "single_delete" => {
+                let (key, row) = entry(101);
+                file.delete_deferred(txn.txn_id, key, row, Some(&db))
+            }
+            "two_op" => {
+                // Different RowIds require the generic mixed-batch oracle.
+                let (old, old_row) = entry(101);
+                let (new, new_row) = entry(200);
+                let batch = smallvec::smallvec![
+                    IndexBatchEntry {
+                        kind: WalIndexOpKind::Delete,
+                        key: old,
+                        row_id: old_row
+                    },
+                    IndexBatchEntry {
+                        kind: WalIndexOpKind::Insert,
+                        key: new,
+                        row_id: new_row
+                    },
+                ];
+                let payload = file.preencode_mixed_index_batch_wal(txn.txn_id, &batch)?;
+                file.apply_preencoded_batch_deferred(txn.txn_id, batch, payload, Some(&db))
+            }
+            _ => unreachable!(),
+        })
+        .unwrap();
+        drop(reservation);
+        db.commit_txn(txn.txn_id).unwrap();
+        db.log.lock().flush().unwrap();
+        let scan = crate::wal::LogManager::scan(dir.path()).unwrap();
+        let mut expected: BTreeSet<_> = seed.into_iter().map(|e| (e.key, e.row_id)).collect();
+        let mut ops = Vec::new();
+        for record in scan.records.iter().filter(|r| r.txn_id == txn.txn_id) {
+            if let WalPayload::IndexBatch { ops: batch, .. } = &record.payload {
+                ops.extend(batch);
+            }
+        }
+        assert_eq!(
+            decode_wal_index_key(&ops[0].key).unwrap(),
+            entry(101).0,
+            "{mode}: eager WAL overtook the prefix"
+        );
+        for op in ops {
+            let item = (
+                decode_wal_index_key(&op.key).unwrap(),
+                wal_row_id_to_row_id(op.row_id),
+            );
+            match op.kind {
+                WalIndexOpKind::Insert => {
+                    expected.insert(item);
+                }
+                WalIndexOpKind::Delete => {
+                    expected.remove(&item);
+                }
+            }
+        }
+        let actual = db
+            .with_index_mut(table.id, "PRIMARY", |file| file.entries())
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "{mode}: logical replay must match the live tree"
+        );
+        assert_eq!(
+            db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire),
+            0,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn storage_release1121_empty_replication_registry_allows_recovery_checkpoint() {
+    for persisted_slot in [false, true] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        {
+            let db = open_relaxed_test_db(dir.path());
+            create_checkpoint_test_table(&db);
+            insert_checkpoint_test_row(&db, 7);
+            let mut slots = crate::repl::master::slot::SlotRegistry::open(dir.path()).unwrap();
+            if persisted_slot {
+                slots.create_or_get("retained", 0);
+                slots.persist_all().unwrap();
+            }
+            db.buffer_pool.shutdown_flusher();
+        }
+        let before = crate::wal::LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .len();
+        let db = open_relaxed_test_db(dir.path());
+        assert!(db.last_recovery.redone_records > 0);
+        let after = crate::wal::LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .len();
+        if persisted_slot {
+            assert!(
+                after >= before,
+                "unregistered durable slot floors must retain WAL"
+            );
+        } else {
+            assert!(
+                after < before,
+                "an empty registry must allow recovery WAL reclamation: {before} -> {after}"
+            );
+        }
+        assert_eq!(
+            db.scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+            )
+            .unwrap()[0]
+                .values,
+            vec![Value::Int(7)]
+        );
+    }
 }

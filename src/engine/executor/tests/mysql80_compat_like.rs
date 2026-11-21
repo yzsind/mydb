@@ -762,7 +762,7 @@ fn b5_escape_multi_char_is_1210() {
     let err = exec(&engine, &mut session, "SELECT 'x' LIKE 'x' ESCAPE 'ab'").unwrap_err();
     assert_eq!(
         err.code(),
-        1064,
+        1210,
         "A multicharacter ESCAPE must fail during parsing"
     );
 }

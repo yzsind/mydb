@@ -510,7 +510,7 @@ impl Database {
         for index in &target.indexes {
             for key in target.index_keys(index, &old.values)? {
                 self.with_index_dml(location.storage_id, &index.name, |file| {
-                    file.delete_deferred(txn.txn_id, key, location.row_id)
+                    file.delete_deferred(txn.txn_id, key, location.row_id, Some(self))
                 })?;
             }
         }
@@ -577,7 +577,7 @@ impl Database {
         )?[0];
         for (name, key) in keys {
             self.with_index_dml(storage_id, name, |file| {
-                file.insert_deferred(txn.txn_id, key, row_id)
+                file.insert_deferred(txn.txn_id, key, row_id, Some(self))
             })?;
         }
         let mut journal_values = vec![Value::Null; target.columns.len()];

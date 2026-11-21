@@ -1,5 +1,6 @@
 //! Session statements, transaction settings and access policy.
 use super::*;
+use crate::engine::sysvar;
 
 pub(super) fn parser_isolation_to_storage(
     isolation: crate::parser::TransactionIsolation,
@@ -600,13 +601,10 @@ pub(super) fn execute_set_names_statement(
 
 /// `SET CHARACTER SET cs` / `SET CHARSET cs` / `SET CHARACTER SET DEFAULT`.
 ///
-/// Differs from SET NAMES on `character_set_connection`: the connection
-/// charset tracks the current database (mydb does not store per-database
-/// charsets in the catalog yet, so it falls back to `character_set_database`
-/// from the sysvar layer, which is currently the session value or the
-/// session client charset — close enough to MySQL behaviour to satisfy
-/// the protocol surface).
+/// The connection charset/collation follow the current database, independently
+/// of the requested client/results charset.
 pub(super) fn execute_set_character_set_statement(
+    db: &Database,
     session: &mut SessionContext,
     charset: Option<&str>,
 ) -> Result<QueryResponse, QueryError> {
@@ -614,11 +612,26 @@ pub(super) fn execute_set_character_set_statement(
         Some(charset) => crate::charset::resolve_client_charset(charset)?,
         None => crate::charset::resolve_client_charset(crate::charset::DEFAULT_CHARSET)?,
     };
+    let connection_charset = sysvar::registry()
+        .read(
+            "character_set_database",
+            sysvar::Scope::Session,
+            Some(session),
+            Some(db),
+        )?
+        .to_display_string();
+    let connection_collation = sysvar::registry()
+        .read(
+            "collation_database",
+            sysvar::Scope::Session,
+            Some(session),
+            Some(db),
+        )?
+        .to_display_string();
     session.character_set_client = charset_info.name.to_string();
     session.character_set_results = Some(charset_info.name.to_string());
-    // MySQL: character_set_connection follows character_set_database; we
-    // keep it on the previous value rather than resetting, matching the
-    // documented difference vs `SET NAMES`.
+    session.character_set_connection = connection_charset;
+    session.collation_connection = connection_collation;
     Ok(QueryResponse::Ok)
 }
 

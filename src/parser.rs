@@ -53,6 +53,7 @@ pub(crate) mod visit;
 pub use ast::*;
 use budget::*;
 pub(crate) use convert::parse_catalog_expr;
+pub(crate) use convert::validate_query_table_names;
 use convert::*;
 pub use convert::{is_aggregate_function, parse_expr_fragment, render_table_option};
 #[cfg(test)]
@@ -99,6 +100,8 @@ mod quality_tests;
 
 #[cfg(test)]
 mod audit_fixes;
+#[cfg(test)]
+mod release_1121_tests;
 
 #[cfg(feature = "fuzzing")]
 pub(crate) fn fuzz_fast_path_differential(sql: &str, bits: u16) {

@@ -73,8 +73,12 @@ operands retain union semantics. The built-in stopword table exposes 35 distinct
 words. The identifier `fulltext` requires backticks when used as a column name.
 
 Grouping `()`, weights `> < ~`, and proximity `@` return error 1235.
-Malformed operands, repeated leading signs, and unclosed double quotes return
-error 1064. `WITH QUERY EXPANSION` is not supported and returns a parse error.
+Signs may be separated from their operand by whitespace. An internal `*`
+terminates a prefix operand (`data*base` is `data* base`); an unclosed quoted
+phrase extends to the end of the search string, matching MySQL's tolerance.
+Malformed operands and repeated leading signs return error 1064. `WITH QUERY EXPANSION` is not supported and returns a parse error.
+`AGAINST` accepts a string literal or prepared parameter; arbitrary SQL
+expressions and implicit numeric/NULL coercions are explicitly rejected.
 
 ## Ngram search
 
@@ -117,7 +121,15 @@ terms, phrases, and wildcard prefixes share the same normalization rules.
 The `MYDB_FT_MIN_TOKEN_SIZE`, `MYDB_FT_MAX_TOKEN_SIZE`, `MYDB_FT_NGRAM_SIZE`,
 `MYDB_FT_STOPWORDS`, `MYDB_FT_POSITIONS`, and `MYDB_FT_POSITION_GAP` process
 defaults are captured in each new index. Later process-default changes do not
-change that index's key encoding or tokenizer. The inter-column position gap
+change that index's key encoding or tokenizer. Read-only global variables
+`innodb_ft_min_token_size`, `innodb_ft_max_token_size`,
+`innodb_ft_enable_stopword`, and `ngram_token_size` expose the defaults used
+by new indexes. `ft_min_word_len` and `ft_max_word_len` are aliases for the
+same defaults; they do not describe a separate MyISAM tokenizer. `IGNORE INDEX`
+does not hide the FULLTEXT index required by a natural-language `MATCH`.
+Boolean mode honors JOIN-scope index hints and reports 1191 when they exclude
+the required index; GROUP BY/ORDER BY hints do not exclude it.
+The inter-column position gap
 is at least one. Filtered stopwords and out-of-range words retain their original
 word offsets. Phrases with internal filtered words also verify the original
 words against the visible heap row; filtering never makes separated words adjacent. Indexes without stored positions verify phrases against
@@ -141,7 +153,9 @@ text and build query-local postings. This preserves partition identity and
 historical membership and computes their corpus statistics from visible
 documents. These paths cost a corpus scan and can require more memory than
 an ordinary inverted-index lookup. `EXPLAIN` identifies the heap oracle path;
-memory admission failures return an explicit error.
+memory admission failures return an explicit error. Partitioned indexes also
+maintain per-partition postings on writes, so applications should account for
+that write cost even when searches use the visible-text heap oracle.
 
 `MATCH` supports UPDATE/DELETE filtering and ordering, including transactional
 rollback, and ordinary JOIN filtering, score projection, and ordering. Aggregated
@@ -150,6 +164,10 @@ MATCH in HAVING remains unsupported and returns an explicit error.
 Single-table `FOR UPDATE` and `FOR SHARE` reads support MATCH filtering and
 score projection through the same full-text runtime. MATCH in a locking JOIN
 query remains unsupported and returns error 1235.
+
+Offline ADD FULLTEXT builds hold an exclusive table barrier for the build.
+Concurrent readers and writers may wait or receive a lock timeout; this path
+does not promise MySQL's concurrent-reader behavior during an InnoDB FTS build.
 
 Online `OPTIMIZE TABLE` for partitioned tables with `FULLTEXT` indexes remains
 unsupported and returns an explicit error. Immutable backup queries support

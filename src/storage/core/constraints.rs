@@ -644,6 +644,65 @@ fn validate_check_expr_supported(table: &TableSchema, expr: &Expr) -> Result<(),
 
 fn validate_and_prepare_generated_columns(table: &mut TableSchema) -> Result<(), QueryError> {
     validate_primary_generated_columns(&table.primary_key, &table.columns)?;
+    for index in &table.indexes {
+        validate_index_prefix_columns(table, index, &index.column_prefix_lengths)?;
+    }
+    if table
+        .columns
+        .iter()
+        .any(|c| c.state != ColumnState::Dropped && c.default_expr.is_some())
+    {
+        let columns: HashMap<_, _> = table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.state != ColumnState::Dropped)
+            .map(|(pos, c)| (c.name.to_ascii_lowercase(), (pos, c)))
+            .collect();
+        for (pos, column) in table
+            .columns
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| c.state != ColumnState::Dropped)
+        {
+            let Some(sql) = &column.default_expr else {
+                continue;
+            };
+            let expr = crate::parser::parse_catalog_expr(sql)
+                .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))?;
+            crate::parser::visit::try_for_each_expr(&expr, |expr| {
+                let name = match expr {
+                    Expr::Identifier(name) => Some(name),
+                    Expr::CompoundIdentifier(parts) => parts.last(),
+                    Expr::Subquery(_)
+                    | Expr::Exists { .. }
+                    | Expr::InSubquery { .. }
+                    | Expr::QuantifiedComparison { .. }
+                    | Expr::WindowFunction { .. }
+                    | Expr::Grouping(_)
+                    | Expr::GroupKeyRef { .. } => return Ok(false),
+                    _ => None,
+                };
+                if let Some((other_pos, other)) =
+                    name.and_then(|name| columns.get(&name.to_ascii_lowercase()))
+                {
+                    // CREATE may still have zero logical positions. Match the
+                    // physical-position tie break used by iter_visible_columns.
+                    if *other_pos == pos
+                        || ((other.logical_pos, *other_pos) >= (column.logical_pos, pos)
+                            && (other.default_expr.is_some() || other.generated_expr.is_some()))
+                    {
+                        return Err(error(
+                            crate::error::catalog::ER_DEFAULT_VAL_GENERATED_NON_PRIOR,
+                            format!("Default expression for '{}' refers to a non-prior expression column", column.name),
+                        ));
+                    }
+                }
+                Ok(true)
+            })?;
+        }
+    }
+
     let generated_exprs = table
         .columns
         .iter()
@@ -4553,6 +4612,19 @@ fn validate_index_key_parts(
                 format!("key column '{column_name}' does not exist"),
             ));
         };
+        let declared = match column.data_type {
+            DataTypeKind::Char { len } | DataTypeKind::Binary { len } => Some(len.unwrap_or(1)),
+            DataTypeKind::VarChar { len } | DataTypeKind::VarBinary { len } => {
+                Some(len.unwrap_or(255))
+            }
+            _ => None,
+        };
+        if declared.is_some_and(|width| *prefix_len > width) {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_SUB_KEY,
+                format!("index prefix exceeds declared width of '{column_name}'"),
+            ));
+        }
         if !matches!(
             column.data_type,
             DataTypeKind::Char { .. }
@@ -4895,7 +4967,21 @@ fn apply_legacy_first_timestamp_defaults(columns: &mut [ColumnSchema]) {
     }
 }
 
-fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
+fn column_def_to_schema_in_table(column: ColumnDef, table: &TableSchema, old_name: Option<&str>) -> Result<ColumnSchema, QueryError> {
+    let charset = old_name.and_then(|name| table.column_index(name).ok())
+        .and_then(|index| table.columns[index].charset.as_deref()).unwrap_or(&table.charset);
+    column_def_to_schema(column, charset)
+}
+
+fn column_def_to_schema(mut column: ColumnDef, default_charset: &str) -> Result<ColumnSchema, QueryError> {
+    if let crate::parser::DataType::TextLength(length) = column.data_type {
+        let collation_charset = column.collation.as_deref()
+            .filter(|name| *name != crate::parser::BINARY_ATTRIBUTE_COLLATION)
+            .map(crate::charset::resolve_collation).transpose()?.map(|c| c.charset);
+        let charset = column.charset.as_deref().or(collation_charset).unwrap_or(default_charset);
+        let width = crate::charset::resolve_charset(charset)?.max_len;
+        column.data_type = crate::parser::DataType::Text(crate::storage::schema::text_length_byte_cap(length, width));
+    }
     validate_mysql_identifier(&column.name)?;
     if column.generated.is_some() {
         if column.default.is_some() {

@@ -313,7 +313,10 @@ impl OnlineConstraintValidation {
                 .get(if projected { ordinal } else { position })
                 .unwrap_or(&Value::Null);
             let violation = if !column.nullable && matches!(value, Value::Null) {
-                Some(crate::error::messages::bad_null(&column.name))
+                Some(error(
+                    crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                    "Invalid use of NULL value",
+                ))
             } else {
                 coerce_column_value_for_schema(value.clone(), column).err()
             };
@@ -589,7 +592,7 @@ impl Database {
                         _ => &def.name,
                     };
                     let position = candidate.column_index(name)?;
-                    let mut column = column_def_to_schema(def.clone())?;
+                    let mut column = column_def_to_schema_in_table(def.clone(), &candidate, Some(name))?;
                     preserve_primary_key_not_null(&candidate, position, &mut column);
                     apply_column_charset_for_alter(
                         &mut column,
@@ -629,7 +632,7 @@ impl Database {
                     let check = candidate
                         .check_constraints
                         .iter_mut()
-                        .find(|c| c.name == *name)
+                        .find(|c| c.name.eq_ignore_ascii_case(name))
                         .ok_or_else(|| {
                             error(
                                 crate::error::catalog::ER_CONSTRAINT_NOT_FOUND,
@@ -649,7 +652,7 @@ impl Database {
                     if let Some(pos) = candidate
                         .check_constraints
                         .iter()
-                        .position(|c| c.name == *name)
+                        .position(|c| c.name.eq_ignore_ascii_case(name))
                     {
                         candidate.check_constraints.remove(pos);
                     } else if let Some(pos) = candidate

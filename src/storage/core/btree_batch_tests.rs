@@ -546,7 +546,9 @@ fn buffered_sorted_insert_validates_order_once_across_leaves() {
             )
         })
         .collect::<Vec<_>>();
-    index.insert_entries_logged(0, seed.clone(), true).unwrap();
+    index
+        .insert_entries_logged(0, seed.clone(), true, None)
+        .unwrap();
     let incoming = seed.iter().step_by(5).cloned().collect::<Vec<_>>();
     index
         .apply_batch_deferred(
@@ -559,12 +561,13 @@ fn buffered_sorted_insert_validates_order_once_across_leaves() {
                     row_id: e.row_id,
                 })
                 .collect(),
+            None,
         )
         .unwrap();
     begin_txn_wal_buffering(&log, 73, 0, true);
     SORTED_RUN_COMPARISONS.with(|count| count.set(0));
     let outcome = index
-        .try_insert_entries_buffered(73, &incoming)
+        .try_insert_entries_buffered(73, &incoming, None)
         .unwrap()
         .unwrap();
     assert!(
@@ -651,7 +654,7 @@ fn buffered_insert_fallback_resumes_after_applied_prefix() {
         let txn_id = 71;
         begin_txn_wal_buffering(&log, txn_id, 0, true);
         let outcome = index
-            .try_insert_entries_buffered(txn_id, &incoming)
+            .try_insert_entries_buffered(txn_id, &incoming, None)
             .unwrap()
             .expect("bounded batch must be eligible");
         let BufferedIndexInsert::Remaining { consumed, lsn } = outcome else {
@@ -1126,7 +1129,7 @@ fn audit1109_buffered_single_insert_records_online_build_log() {
     begin_txn_wal_buffering(&log, 71, 0, true);
     let item = entry(vec![KeyPart::Int(7)], 7);
     index
-        .insert_deferred(71, item.key.clone(), item.row_id)
+        .insert_deferred(71, item.key.clone(), item.row_id, None)
         .unwrap();
     assert!(index.entries().unwrap().is_empty());
     let changes = build_log.take().unwrap();

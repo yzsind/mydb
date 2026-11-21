@@ -353,7 +353,7 @@ fn audit_20260926_wal_precedes_single_apply() {
                     WalIndexOpKind::Insert => index.insert_entry_concurrent(41, entry),
                     WalIndexOpKind::Delete => index.delete_entry_concurrent(41, entry),
                 }
-            })
+            }, None)
             .unwrap();
         assert!(btree_logical_wal::current().is_none());
     }
@@ -484,7 +484,7 @@ fn audit_20260926_structural_write_failure_fences_split_and_merge() {
                 assert!(err.message().contains("requires rebuild"));
                 assert!(index.get(&wide_key(10), false).is_err());
                 assert!(index
-                    .insert_deferred(42, wide_key(400), leaf_entry(400, 400).row_id)
+                    .insert_deferred(42, wide_key(400), leaf_entry(400, 400).row_id, None)
                     .is_err());
                 assert!(IndexFile::quick_validate(index.path.clone()).is_err());
                 assert!(
@@ -504,7 +504,7 @@ fn audit_20260926_structural_write_failure_fences_split_and_merge() {
 fn audit_20260926_last_entry_excludes_structural_writer() {
     let (_dir, index) = audit_index_raw("last.idx");
     index
-        .insert_deferred(0, wide_key(1), leaf_entry(1, 1).row_id)
+        .insert_deferred(0, wide_key(1), leaf_entry(1, 1).row_id, None)
         .unwrap();
     std::thread::scope(|scope| {
         let guard = index.structure_lock.write();
@@ -535,6 +535,7 @@ fn audit_20260926_unsorted_empty_batch_and_nested_wal_scope() {
         0,
         entries.iter().map(|e| (e.key.clone(), e.row_id)).collect(),
         true,
+        None,
     );
     let outer = btree_logical_wal::current();
     btree_logical_wal::set(None);
@@ -646,7 +647,7 @@ fn audit_20260926_persistent_write_failure_rejects_reads_writes_and_reopen() {
     assert!(result.unwrap_err().message().contains("requires rebuild"));
     assert!(index.get(&wide_key(1), false).is_err());
     assert!(index
-        .insert_deferred(10, wide_key(400), leaf_entry(400, 400).row_id)
+        .insert_deferred(10, wide_key(400), leaf_entry(400, 400).row_id, None)
         .is_err());
     assert!(IndexFile::quick_validate(index.path.clone()).is_err());
     assert!(IndexFile::open_with_durability(
@@ -808,7 +809,7 @@ fn audit_20260926_single_insert_split_failure_requires_rebuild() {
             )
             .unwrap();
         INDEX_FAIL_WRITE_AFTER.with(|fail| fail.set(Some(nth)));
-        let result = index.insert_deferred(77, wide_key(999), leaf_entry(999, 999).row_id);
+        let result = index.insert_deferred(77, wide_key(999), leaf_entry(999, 999).row_id, None);
         INDEX_FAIL_WRITE_AFTER.with(|fail| fail.set(None));
         assert!(result.unwrap_err().message().contains("requires rebuild"));
         assert!(index.get(&wide_key(1), false).is_err());

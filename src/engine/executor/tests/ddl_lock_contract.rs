@@ -888,7 +888,7 @@ fn online_column_validation_failure_preserves_concurrent_source_commits() {
     hook.release();
     let result = ddl.join().unwrap();
     write.unwrap();
-    assert_eq!(result.unwrap_err().code(), 1048);
+    assert_eq!(result.unwrap_err().code(), 1138);
     assert!(engine.database().table("test.t").unwrap().columns[1].nullable);
     let QueryResponse::ResultSet(rows) = engine.execute("SELECT id,v FROM t ORDER BY id").unwrap()
     else {

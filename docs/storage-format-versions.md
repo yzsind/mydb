@@ -16,7 +16,7 @@ The current development format is incompatible with earlier versions. If version
 | undo binary / tablespace | 15 / 3 |
 | overflow | 4 |
 | paged vector container (HNSW / IVF) index / page | 9 / 4 |
-| Zone Map file / page | 6 / 3 |
+| Zone Map file / page | 8 / 3 |
 | legacy in-memory HNSW snapshot | 3 |
 | spatial R-tree page | 2 |
 | vector state envelope | 1 |

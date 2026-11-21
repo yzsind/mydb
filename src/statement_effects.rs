@@ -260,6 +260,8 @@ pub(crate) fn statement_effects(statement: &Statement) -> StatementEffects {
         | S::ShowStatus { .. }
         | S::ShowDiagnostics { .. }
         | S::GetDiagnostics { .. }
+        | S::RaiseCondition(_)
+        | S::SetCharsetOptions(_)
         | S::ShowCountDiagnostics { .. }
         | S::ShowEngines
         | S::ShowEngineMydbStatus
@@ -428,6 +430,7 @@ pub(crate) fn is_read_only_transaction_forbidden(statement: &Statement) -> bool 
         | Statement::XaPrepare { .. }
         | Statement::XaCommit { .. }
         | Statement::XaRollback { .. } => false,
+        Statement::SetDefaultRole(_) => false,
         Statement::Select(_) | Statement::SetOperation(_) | Statement::WithCte(_) => {
             query_read_only_transaction_forbidden(statement.into())
         }

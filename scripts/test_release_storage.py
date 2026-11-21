@@ -20,7 +20,7 @@ class StorageServers(Servers):
     def connect(self, port):
         # This is a functional recovery gate, not a 30-second debug-build SLA.
         connection = pymysql.connect(host='127.0.0.1', port=port, user='root', password='root',
-                                     database='test', autocommit=True,
+                                     database='test', autocommit=True, binary_prefix=True,
                                      read_timeout=self.client_timeout, write_timeout=self.client_timeout)
         self.connections.append(connection)
         return connection

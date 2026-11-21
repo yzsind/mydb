@@ -154,7 +154,7 @@ fn read_compatible_failed_not_null_keeps_schema_and_write_binding_valid() {
     engine
         .execute_with_session(&mut reader, "ROLLBACK")
         .unwrap();
-    assert_eq!(err.code(), 1048);
+    assert_eq!(err.code(), 1138);
     assert!(engine.database().table("test.t").unwrap().columns[1].nullable);
     engine.execute("INSERT INTO t VALUES(4,NULL)").unwrap();
     engine.execute("UPDATE t SET v=40 WHERE id=4").unwrap();

@@ -7,6 +7,8 @@ const BLOCK_BITS: usize = BLOCK_WORDS * 64;
 const OFFSET_MASK: usize = (1 << 13) - 1;
 const RAW_BLOCK: usize = 7;
 const RICE_KIND: u8 = 4;
+const DELTA_KIND: u8 = 5;
+const DELTA_LIMIT: usize = ZONE_MEMBERSHIP_DELTA_LIMIT;
 
 pub(in crate::storage::core) fn encode_membership(
     value: Option<&ZoneMembership>,
@@ -60,9 +62,10 @@ pub(in crate::storage::core) fn encode_membership(
                     (end | (codec << 13)) as u16,
                 );
             }
-            // No compressed representation may be larger than the raw one.
-            // Dense filters stay directly borrowable and pay no Rice decode.
-            if packed.len() < raw_len {
+            // Marginal savings do not cover the directory validation and
+            // bitstream decode on every probe. Keep dense filters directly
+            // borrowable; reserve Rice for a material reduction in I/O/cache.
+            if packed.len().saturating_mul(8) <= raw_len.saturating_mul(7) {
                 return Ok(packed);
             }
             bytes = Vec::with_capacity(raw_len);
@@ -242,19 +245,60 @@ pub(in crate::storage::core) fn merge_membership_record(
     merge_membership_owned(original, incoming)
 }
 
-/// Foreground (DML) form of `merge_membership_record`. First publications,
-/// exact fingerprint sets and saturation are applied as usual, but growing a
-/// Bloom filter (or promoting an exact set to one) drops the record instead.
-/// Without it the zone merely cannot prove a value absent, which is always
-/// conservative. A zone being filled with distinct values would otherwise
-/// rewrite and log up to 8 KiB of filter for nearly every row under its merge
-/// latch; dropping costs one small write per zone, after which DML on that
-/// column is a no-op until background maintenance rebuilds the quiet zone.
+/// Keep an immutable Bloom baseline with a bounded exact DML delta. Once
+/// the delta fills, revoke membership conservatively until maintenance.
 pub(in crate::storage::core) fn merge_membership_record_foreground(
     bytes: Option<&[u8]>,
     destination: &ZoneColumnSummary,
     source: &ZoneColumnSummary,
 ) -> Result<Option<Vec<u8>>, QueryError> {
+    if let (Some(original), Some(ZoneMembership::Exact { hashes, .. })) =
+        (bytes, source.membership.as_ref())
+    {
+        let view = MembershipView::open(original)?;
+        if matches!(view.kind, 2 | RICE_KIND | DELTA_KIND)
+            && destination.state != ZoneMapState::Unknown
+            && source.state != ZoneMapState::Unknown
+        {
+            let (base, prior) = if view.kind == DELTA_KIND {
+                view.delta_parts()
+                    .ok_or_else(|| corrupt("invalid membership delta"))?
+            } else {
+                (original, &[][..])
+            };
+            let mut delta = prior
+                .chunks_exact(8)
+                .map(|v| u64::from_le_bytes(v.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            let mut changed = false;
+            for &hash in hashes {
+                match view.probe(hash) {
+                    Some(true) => continue,
+                    None => return Err(corrupt("invalid membership delta baseline")),
+                    Some(false) => {}
+                }
+                if let Err(position) = delta.binary_search(&hash) {
+                    if delta.len() == DELTA_LIMIT {
+                        return encode_membership(None).map(Some);
+                    }
+                    delta.insert(position, hash);
+                    changed = true;
+                }
+            }
+            if !changed {
+                return Ok(None);
+            }
+            let mut result = vec![RECORD_VERSION, DELTA_KIND, view.hashes, 0, 0, 0, 0, 0];
+            write_u16(&mut result, 4, view.count as u16);
+            write_u16(&mut result, 6, delta.len() as u16);
+            result.extend_from_slice(&(base.len() as u16).to_le_bytes());
+            result.extend_from_slice(base);
+            for hash in delta {
+                result.extend_from_slice(&hash.to_le_bytes());
+            }
+            return Ok(Some(result));
+        }
+    }
     let Some(merged) = merge_membership_record(bytes, destination, source)? else {
         return Ok(None);
     };
@@ -262,7 +306,15 @@ pub(in crate::storage::core) fn merge_membership_record_foreground(
         Some(bytes) => MembershipView::open(bytes)?.kind != 0,
         None => false,
     };
-    if grows_existing && matches!(MembershipView::open(&merged)?.kind, 2 | RICE_KIND) {
+    // A foreground layout mismatch/saturation is repairable debt. A full
+    // rebuild may deliberately publish Saturated; do not confuse the two.
+    if grows_existing && MembershipView::open(&merged)?.kind == 3 {
+        return encode_membership(None).map(Some);
+    }
+    if grows_existing
+        && merged.len() > 512
+        && matches!(MembershipView::open(&merged)?.kind, 2 | RICE_KIND)
+    {
         return encode_membership(None).map(Some);
     }
     Ok(Some(merged))
@@ -331,7 +383,7 @@ impl BitsWriter<'_> {
 /// validation. A compressed record can expand to a complete 8 KiB bitmap.
 pub(in crate::storage::core) fn membership_owned_bytes(bytes: &[u8]) -> Result<usize, QueryError> {
     let view = MembershipView::open(bytes)?;
-    Ok(if matches!(view.kind, 1 | 2 | RICE_KIND) {
+    Ok(if matches!(view.kind, 1 | 2 | RICE_KIND | DELTA_KIND) {
         view.count * std::mem::size_of::<u64>()
     } else {
         0
@@ -369,6 +421,17 @@ pub(in crate::storage::core) fn decode_membership(
                 })
             }
         }
+        DELTA_KIND => {
+            let (base, delta) = view
+                .delta_parts()
+                .ok_or_else(|| corrupt("invalid membership delta"))?;
+            let mut membership =
+                decode_membership(base)?.ok_or_else(|| corrupt("missing membership baseline"))?;
+            for hash in delta.chunks_exact(8) {
+                membership.insert_hash(u64::from_le_bytes(hash.try_into().unwrap()));
+            }
+            Some(membership)
+        }
         _ => Some(ZoneMembership::Saturated),
     })
 }
@@ -399,6 +462,28 @@ impl<'a> MembershipView<'a> {
             hashes,
             count,
         };
+        if kind == DELTA_KIND {
+            let (base, delta) = view
+                .delta_parts()
+                .ok_or_else(|| corrupt("invalid membership delta length"))?;
+            if words == 0
+                || words > DELTA_LIMIT
+                || delta.len() != words * 8
+                || !matches!(base.get(1).copied(), Some(2) | Some(RICE_KIND))
+            {
+                return Err(corrupt("invalid membership delta layout"));
+            }
+            // Nested deltas are rejected before recursion, bounding stack
+            // depth and making corrupt lengths incapable of driving loops.
+            let baseline = MembershipView::open(base)?;
+            if count != baseline.count
+                || hashes != baseline.hashes
+                || (1..words).any(|i| read_u64(delta, (i - 1) * 8) >= read_u64(delta, i * 8))
+            {
+                return Err(corrupt("invalid membership delta identity"));
+            }
+            return Ok(view);
+        }
         if kind == RICE_KIND {
             if count != words
                 || !ZoneMembership::valid_layout(words, hashes)
@@ -448,6 +533,14 @@ impl<'a> MembershipView<'a> {
 
     fn word(&self, index: usize) -> u64 {
         read_u64(self.bytes, index * 8)
+    }
+
+    fn delta_parts(&self) -> Option<(&'a [u8], &'a [u8])> {
+        let length = u16::from_le_bytes(self.bytes.get(..2)?.try_into().ok()?) as usize;
+        Some((
+            self.bytes.get(2..2 + length)?,
+            self.bytes.get(2 + length..)?,
+        ))
     }
 
     fn encoded_block(&self, block: usize) -> Result<(usize, &[u8]), QueryError> {
@@ -547,6 +640,22 @@ impl<'a> MembershipView<'a> {
                         .chain(positions)
                         .all(|bit| block[(bit / 64) % BLOCK_WORDS] & (1u64 << (bit % 64)) != 0),
                 )
+            }
+            DELTA_KIND => {
+                let (base, delta) = self.delta_parts()?;
+                if MembershipView::open(base).ok()?.probe(hash)? {
+                    return Some(true);
+                }
+                let (mut low, mut high) = (0, delta.len() / 8);
+                while low < high {
+                    let middle = low + (high - low) / 2;
+                    match read_u64(delta, middle * 8).cmp(&hash) {
+                        std::cmp::Ordering::Equal => return Some(true),
+                        std::cmp::Ordering::Less => low = middle + 1,
+                        std::cmp::Ordering::Greater => high = middle,
+                    }
+                }
+                Some(false)
             }
             _ => Some(true),
         }
@@ -775,6 +884,22 @@ mod tests {
         }
     }
 
+    #[test]
+    fn zone_map_page_marginal_rice_savings_keep_direct_borrowed_probes() {
+        // One zero block saves 64 bytes, but the 32-byte directory offsets
+        // most of it. Paying a bitstream decoder for that difference is not
+        // worthwhile; all membership answers must remain identical.
+        let mut words = vec![u64::MAX; 128];
+        words[..8].fill(0);
+        let source = bloom(words, 5);
+        let bytes = encode_membership(Some(&source)).unwrap();
+        assert_eq!(bytes[1], 2);
+        let borrowed = MembershipView::open(&bytes).unwrap();
+        for hash in 0..10000 {
+            assert_eq!(borrowed.probe(hash), Some(source.may_contain_hash(hash)));
+        }
+    }
+
     fn one_block(codec: usize, payload: &[u8]) -> Vec<u8> {
         let mut bytes = vec![0; MEMBERSHIP_HEADER + 32];
         bytes[0] = RECORD_VERSION;
@@ -861,5 +986,139 @@ mod tests {
         }
         let valid = one_block(6, &terminal);
         assert!(decode_membership(&valid).is_ok());
+    }
+    #[test]
+    fn foreground_delta_keeps_baseline_and_bounds_growth() {
+        let layout = ZoneMembershipLayout {
+            words: 1016,
+            hashes: 5,
+        };
+        let mut state = 0x517cc1b727220a95;
+        let old = (0..256).map(|_| next(&mut state)).collect::<Vec<_>>();
+        let mut membership = ZoneMembership::empty_with_layout(layout);
+        for &hash in &old {
+            membership.insert_hash(hash);
+        }
+        let baseline = encode_membership(Some(&membership)).unwrap();
+        let destination = ZoneColumnSummary {
+            state: ZoneMapState::Ready,
+            has_non_null: true,
+            ..Default::default()
+        };
+        let mut bytes = baseline.clone();
+        let mut added = Vec::new();
+        for index in 0..=DELTA_LIMIT {
+            let hash = loop {
+                let hash = next(&mut state);
+                if MembershipView::open(&bytes).unwrap().probe(hash) == Some(false) {
+                    break hash;
+                }
+            };
+            let mut incoming = ZoneMembership::empty_with_layout(layout);
+            incoming.insert_hash(hash);
+            let source = ZoneColumnSummary {
+                state: ZoneMapState::Ready,
+                has_non_null: true,
+                membership: Some(incoming),
+                ..Default::default()
+            };
+            bytes = merge_membership_record_foreground(Some(&bytes), &destination, &source)
+                .unwrap()
+                .unwrap();
+            if index == DELTA_LIMIT {
+                assert_eq!(
+                    bytes[1], 0,
+                    "overflow must conservatively revoke membership"
+                );
+                break;
+            }
+            added.push(hash);
+            let view = MembershipView::open(&bytes).unwrap();
+            assert_eq!(view.kind, DELTA_KIND);
+            assert_eq!(view.delta_parts().unwrap().0, baseline);
+            let decoded = decode_membership(&bytes).unwrap().unwrap();
+            for &hash in old.iter().chain(&added) {
+                assert_eq!(view.probe(hash), Some(true));
+                assert!(decoded.may_contain_hash(hash));
+            }
+            assert!(
+                merge_membership_record_foreground(Some(&bytes), &destination, &source)
+                    .unwrap()
+                    .is_none()
+            );
+            if index == 0 {
+                for cut in 0..bytes.len() {
+                    assert!(MembershipView::open(&bytes[..cut]).is_err());
+                }
+                let mut nested = bytes.clone();
+                nested[MEMBERSHIP_HEADER + 3] = DELTA_KIND;
+                assert!(MembershipView::open(&nested).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn page_fit_bloom_layouts_keep_all_inserted_values() {
+        assert!(
+            zone_map_page::HEADER
+                + 2 * (zone_map_page::SLOT
+                    + MEMBERSHIP_HEADER
+                    + ZONE_MEMBERSHIP_PAGE_FIT_WORDS * 8
+                    + 10
+                    + DELTA_LIMIT * 8)
+                <= PAGE_SIZE
+        );
+        assert!(
+            zone_map_page::HEADER
+                + 2 * (zone_map_page::SLOT
+                    + MEMBERSHIP_HEADER
+                    + ZONE_MEMBERSHIP_PAGE_FIT_WORDS * 8)
+                <= PAGE_SIZE
+        );
+        let mut seed = 0x517cc1b727220a95;
+        for words in [8, 16, 24, 128, 256, 912, 1016, 1024] {
+            let values = (0..(words / 2).max(40))
+                .map(|_| next(&mut seed))
+                .collect::<Vec<_>>();
+            let mut membership =
+                ZoneMembership::empty_with_layout(ZoneMembershipLayout { words, hashes: 5 });
+            for &hash in &values {
+                membership.insert_hash(hash);
+            }
+            membership.compact_observed_layout();
+            let bytes = encode_membership(Some(&membership)).unwrap();
+            let view = MembershipView::open(&bytes).unwrap();
+            for hash in values {
+                assert_eq!(view.probe(hash), Some(true), "words={words}");
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_layout_mismatch_is_repairable_not_permanent_saturation() {
+        let make = |words| {
+            let mut membership =
+                ZoneMembership::empty_with_layout(ZoneMembershipLayout { words, hashes: 5 });
+            for value in 0..100 {
+                membership.insert_hash(value);
+            }
+            membership
+        };
+        let baseline = encode_membership(Some(&make(128))).unwrap();
+        let destination = ZoneColumnSummary {
+            state: ZoneMapState::Ready,
+            has_non_null: true,
+            ..Default::default()
+        };
+        let source = ZoneColumnSummary {
+            state: ZoneMapState::Ready,
+            has_non_null: true,
+            membership: Some(make(64)),
+            ..Default::default()
+        };
+        let merged = merge_membership_record_foreground(Some(&baseline), &destination, &source)
+            .unwrap()
+            .unwrap();
+        assert!(decode_membership(&merged).unwrap().is_none());
     }
 }

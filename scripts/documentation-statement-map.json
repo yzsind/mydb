@@ -424,6 +424,13 @@
     ],
     "kind": "statement"
   },
+  "RaiseCondition": {
+    "references": [
+      "docs/statement/programmatic/signal.md",
+      "docs/statement/programmatic/resignal.md"
+    ],
+    "kind": "statement-family"
+  },
   "ShowCreateRoutine": {
     "references": [
       "docs/statement/metadata/show-create-routine.md"
@@ -735,6 +742,13 @@
       "docs/statement/transaction/set-character-set.md"
     ],
     "kind": "statement"
+  },
+  "SetCharsetOptions": {
+    "references": [
+      "docs/statement/transaction/set-names.md",
+      "docs/statement/transaction/set-character-set.md"
+    ],
+    "kind": "statement-family"
   },
   "Set": {
     "references": [

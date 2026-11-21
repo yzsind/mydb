@@ -502,14 +502,6 @@ fn txn_wal_buffer_len(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> usize {
         .map_or(0, |buf| buf.entries.len())
 }
 
-fn txn_wal_has_deferred_pages(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> bool {
-    let key = txn_wal_buffer_key(log, txn_id);
-    txn_wal_buffer_shard(key)
-        .lock()
-        .get(&key)
-        .is_some_and(|buffer| buffer.entries.iter().any(|(_, keys)| !keys.is_empty()))
-}
-
 /// Take the currently-buffered entries, leaving buffering active with an empty
 /// buffer (mid-transaction flush). Returns empty when inactive.
 fn take_txn_wal_entries(log: &Arc<crate::wal::LogMutex>, txn_id: u64) -> TxnWalBuffer {
@@ -1051,7 +1043,7 @@ impl Database {
 
 impl Database {
     pub fn begin_txn(&self) -> Result<TxnView, QueryError> {
-        if self.is_snapshot_read_only() {
+        if self.is_snapshot_read_only() || self.physical_replica_mode() {
             return self.begin_read_only_txn();
         }
         if !current_redo_enabled()
@@ -4103,9 +4095,9 @@ impl Database {
         Ok(())
     }
 
-    fn publish_wal_before_eager_heap_write(&self, txn_id: u64) -> Result<(), QueryError> {
+    fn publish_wal_before_eager_write(&self, txn_id: u64) -> Result<(), QueryError> {
         if self.config.durability != DurabilityMode::Memory
-            && txn_wal_has_deferred_pages(&self.log, txn_id)
+            && txn_wal_buffer_len(&self.log, txn_id) > 0
         {
             self.flush_txn_wal_buffer(txn_id, None)?;
         }

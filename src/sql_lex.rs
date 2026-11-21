@@ -212,6 +212,14 @@ impl Iterator for SqlSegments<'_> {
         if dash_starts_comment(self.bytes, start) || hash_starts_comment(self.bytes, start) {
             self.pos += if b == b'#' { 1 } else { 2 };
             while self.pos < self.bytes.len() && self.bytes[self.pos] != b'\n' {
+                if self.bytes[self.pos] == 0 {
+                    let offset = self.pos;
+                    self.pos = self.bytes.len();
+                    return Some(Err(SqlLexError {
+                        offset,
+                        message: "NUL is not allowed in an SQL line comment",
+                    }));
+                }
                 self.pos += 1;
             }
             if self.pos < self.bytes.len() {

@@ -735,6 +735,14 @@ fn validate_routine_def(def: &RoutineDef) -> Result<(), QueryError> {
         }
     }
     validate_routine_structure(&def.body.statements, &mut Vec::new(), &BTreeMap::new())?;
+    validate_cursor_bindings(
+        &def.body.statements,
+        &def.params
+            .iter()
+            .map(|p| normalize_local(&p.name))
+            .collect(),
+        &BTreeSet::new(),
+    )?;
     compile_static_statements(&def.body)?;
     if def.kind == RoutineKind::Function {
         if def.return_type.is_none() {
@@ -745,7 +753,7 @@ fn validate_routine_def(def: &RoutineDef) -> Result<(), QueryError> {
         }
         if !def.body.statements.iter().any(routine_stmt_has_return) {
             return Err(error(
-                crate::error::catalog::ER_SP_NO_RETSET,
+                crate::error::catalog::ER_SP_NORETURN,
                 "CREATE FUNCTION requires at least one RETURN",
             ));
         }
@@ -757,6 +765,74 @@ fn validate_routine_def(def: &RoutineDef) -> Result<(), QueryError> {
             crate::error::catalog::ER_SP_BADRETURN,
             "RETURN is only allowed in a FUNCTION",
         ));
+    }
+    Ok(())
+}
+
+/// Cursor names and FETCH l-values are lexical declarations, not runtime
+/// conditions. Validate even unreachable branches and empty result sets.
+fn validate_cursor_bindings(
+    statements: &[RoutineStmt],
+    inherited_variables: &BTreeSet<String>,
+    inherited_cursors: &BTreeSet<String>,
+) -> Result<(), QueryError> {
+    let mut variables = inherited_variables.clone();
+    let mut cursors = inherited_cursors.clone();
+    for stmt in statements {
+        match stmt {
+            RoutineStmt::DeclareVar { names, .. } => {
+                variables.extend(names.iter().map(|n| normalize_local(n)))
+            }
+            RoutineStmt::DeclareCursor { name, .. } => {
+                cursors.insert(normalize_local(name));
+            }
+            RoutineStmt::Open(name)
+            | RoutineStmt::Close(name)
+            | RoutineStmt::Fetch { cursor: name, .. } => {
+                if !cursors.contains(&normalize_local(name)) {
+                    return Err(error(
+                        crate::error::catalog::ER_SP_CURSOR_MISMATCH,
+                        format!("Undefined CURSOR: {name}"),
+                    ));
+                }
+                if let RoutineStmt::Fetch { targets, .. } = stmt {
+                    for target in targets {
+                        if let RoutineTarget::Local(name) = target {
+                            if !variables.contains(&normalize_local(name)) {
+                                return Err(error(
+                                    crate::error::catalog::ER_SP_UNDECLARED_VAR,
+                                    format!("Undeclared variable: {name}"),
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            RoutineStmt::Block { statements, .. }
+            | RoutineStmt::Loop { statements, .. }
+            | RoutineStmt::While { statements, .. }
+            | RoutineStmt::Repeat { statements, .. } => {
+                validate_cursor_bindings(statements, &variables, &cursors)?;
+            }
+            RoutineStmt::If {
+                branches,
+                else_branch,
+            }
+            | RoutineStmt::Case {
+                branches,
+                else_branch,
+                ..
+            } => {
+                for (_, branch) in branches {
+                    validate_cursor_bindings(branch, &variables, &cursors)?;
+                }
+                validate_cursor_bindings(else_branch, &variables, &cursors)?;
+            }
+            RoutineStmt::DeclareHandler { statement, .. } => {
+                validate_cursor_bindings(std::slice::from_ref(statement), &variables, &cursors)?;
+            }
+            _ => {}
+        }
     }
     Ok(())
 }
@@ -792,8 +868,12 @@ fn validate_routine_structure(
         };
         if phase < declaration_phase {
             return Err(error(
-                crate::error::catalog::ER_SP_VARCOND_AFTER_CURSHNDLR,
-                "Variable or condition declaration after cursor or handler declaration",
+                if phase == 1 {
+                    crate::error::catalog::ER_SP_CURSOR_AFTER_HANDLER
+                } else {
+                    crate::error::catalog::ER_SP_VARCOND_AFTER_CURSHNDLR
+                },
+                "Declaration is not allowed after this cursor or handler declaration",
             ));
         }
         declaration_phase = declaration_phase.max(phase);
@@ -1867,6 +1947,7 @@ impl RoutineCapabilities {
 struct CursorState {
     select_sql: String,
     cursor: Option<Box<dyn crate::engine::api::ResultCursor>>,
+    column_count: usize,
 }
 
 #[derive(Debug)]
@@ -2430,9 +2511,15 @@ fn execute_routine_inner(
     for (param, arg) in routine.params.iter().zip(args.iter()) {
         let prepared = match param.mode {
             RoutineParamModeSchema::In => {
-                let value = match caller_locals.as_deref() {
-                    Some(caller) => eval_routine_expr(session, caller, arg)?,
-                    None => eval_routine_expr(session, &frame.locals, arg)?,
+                let locals = caller_locals.as_deref().unwrap_or(&frame.locals);
+                let value = if routine_expr_contains_subquery(arg) {
+                    let (txn, _snapshot_guard) =
+                        super::tx::prepared_select_read_view(db, session, false)?;
+                    super::select::eval::with_subquery_context(db, txn, || {
+                        eval_routine_expr(session, locals, arg)
+                    })?
+                } else {
+                    eval_routine_expr(session, locals, arg)?
                 };
                 (Some(value), None)
             }
@@ -2556,6 +2643,14 @@ fn execute_routine_inner(
             prepared_out_params.push((param_name, column_type, value));
         } else {
             binding.write(session, caller_locals.as_deref_mut(), value)?;
+        }
+    }
+    if !frame.handled_warning_ranges.is_empty() {
+        let warnings = crate::engine::api::take_statement_warnings();
+        for (index, warning) in warnings.into_iter().enumerate() {
+            if !frame.warning_was_handled(index) {
+                crate::engine::api::push_sql_warning(warning);
+            }
         }
     }
     Ok(RoutineResult {
@@ -3121,10 +3216,16 @@ fn exec_block_inner(
                             && condition.sql_state().as_str() == query.sql_state()
                     })
                 {
-                    frame.diag_conditions = vec![crate::engine::api::SqlWarning::from_error(
+                    let query = err.query_error();
+                    let mut conditions = crate::engine::api::statement_warnings_snapshot()
+                        .into_iter()
+                        .skip(warning_start)
+                        .collect::<Vec<_>>();
+                    conditions.push(crate::engine::api::SqlWarning::from_error(
                         crate::error::ConditionLevel::Error,
-                        &err.query_error(),
-                    )];
+                        &query,
+                    ));
+                    frame.diag_conditions = conditions;
                 }
                 if let Some(handler) = find_matching_handler(frame, &handlers, &err).filter(|_| {
                     frame
@@ -3411,6 +3512,7 @@ fn exec_stmt(
             }
         }
         RoutineStmt::DeclareVar { names, default, .. } => {
+            let _assignment = crate::engine::expr::DmlExpressionGuard::new();
             let value = match default {
                 Some(expr) => eval_routine_expr(session, &frame.locals, expr)?,
                 None => Value::Null,
@@ -3447,6 +3549,7 @@ fn exec_stmt(
                 CursorState {
                     select_sql: select_sql.clone(),
                     cursor: None,
+                    column_count: 0,
                 },
             );
             Ok(RoutineControl::None)
@@ -3457,6 +3560,8 @@ fn exec_stmt(
             for (target, expr) in assignments {
                 let mut expr = expr.clone();
                 bind_routine_string_function_types(&mut expr, &frame.locals, &frame.local_types);
+                let _assignment = matches!(target, RoutineTarget::Local(name) if frame.local_types.contains_key(&normalize_local(name)))
+                    .then(crate::engine::expr::DmlExpressionGuard::new);
                 let value = eval_routine_expr(session, &frame.locals, &expr)?;
                 // SET resolves declared locals first, then unqualified system
                 // variables. Row qualifiers must retain the trigger checks.
@@ -3470,19 +3575,26 @@ fn exec_stmt(
                                 "Explicit or implicit commit is not allowed in stored function or trigger",
                             ).into());
                         }
+                        let mut retry_statement =
+                            || -> Result<crate::parser::Statement, QueryError> {
+                                Ok(crate::parser::Statement::Set(vec![
+                                    crate::parser::SetAssignment {
+                                        scope: None,
+                                        name: name.clone(),
+                                        value: Expr::BoundValue(value.clone()),
+                                    },
+                                ]))
+                            };
                         execute_parsed_statement_in_routine(
                             db,
                             session,
                             registry,
-                            crate::parser::Statement::Set(vec![crate::parser::SetAssignment {
-                                scope: None,
-                                name: name.clone(),
-                                value: Expr::BoundValue(value),
-                            }]),
+                            retry_statement()?,
                             &[],
                             usize::MAX,
                             frame.forbid_transaction_control,
                             frame.trigger_table.as_deref(),
+                            &mut retry_statement,
                         )?;
                         session.last_row_count = incoming_row_count;
                         continue;
@@ -3689,6 +3801,11 @@ fn exec_stmt(
                 frame.forbid_transaction_control,
                 frame.trigger_table.as_deref(),
             )?;
+            cursor.column_count = match &response {
+                QueryResponse::ResultSet(result) => result.columns.len(),
+                QueryResponse::StreamingResultSet(result) => result.columns.len(),
+                _ => 0,
+            };
             let result_cursor: Box<dyn crate::engine::api::ResultCursor> = match response {
                 QueryResponse::ResultSet(result) => {
                     Box::new(crate::engine::api::VecResultCursor::new(result.rows))
@@ -3706,6 +3823,17 @@ fn exec_stmt(
             Ok(RoutineControl::None)
         }
         RoutineStmt::Fetch { cursor, targets } => {
+            for target in targets {
+                if let RoutineTarget::Local(name) = target {
+                    if !frame.locals.contains_key(&normalize_local(name)) {
+                        return Err(error(
+                            crate::error::catalog::ER_SP_UNDECLARED_VAR,
+                            format!("Undeclared variable: {name}"),
+                        )
+                        .into());
+                    }
+                }
+            }
             let key = normalize_local(cursor);
             let Some(cursor_state) = frame.cursors.get_mut(&key) else {
                 return Err(error(
@@ -3721,6 +3849,13 @@ fn exec_stmt(
                 )
                 .into());
             };
+            if cursor_state.column_count != targets.len() {
+                return Err(error(
+                    crate::error::catalog::ER_SP_WRONG_NO_OF_FETCH_ARGS,
+                    "FETCH target count mismatch",
+                )
+                .into());
+            }
             let Some(row) = result_cursor.next_row()? else {
                 return Err(error(crate::error::catalog::ER_SP_FETCH_NO_DATA, "No data").into());
             };
@@ -3786,7 +3921,10 @@ fn exec_stmt(
                 session,
                 &frame.locals,
                 information,
-                BTreeMap::new(),
+                BTreeMap::from([
+                    ("CLASS_ORIGIN", String::new()),
+                    ("SUBCLASS_ORIGIN", String::new()),
+                ]),
             )?);
             Err(RoutineExecError::Condition(resolved_condition, err))
         }
@@ -3841,6 +3979,18 @@ fn exec_stmt(
                 information,
                 active_error.condition_information(),
             )?);
+            if resolved.is_some() {
+                let original = crate::engine::api::SqlWarning::from_error(
+                    crate::error::ConditionLevel::Error,
+                    &active_error,
+                );
+                let raised = crate::engine::api::SqlWarning::from_error(
+                    crate::error::ConditionLevel::Error,
+                    &err,
+                );
+                frame.diag_conditions = vec![original.clone(), raised];
+                crate::engine::api::push_sql_warning(original);
+            }
             let retain_warning =
                 resolved.is_none() && matches!(active, RoutineExecError::Warning(_, _));
             let condition = resolved
@@ -3872,7 +4022,6 @@ fn exec_stmt(
             Ok(RoutineControl::None)
         }
         RoutineStmt::Prepare { name, source } => {
-            let prepare_started = std::time::Instant::now();
             if !frame.allow_dynamic_sql {
                 return Err(error(
                     crate::error::catalog::ER_STMT_NOT_ALLOWED_IN_SF_OR_TRG,
@@ -3880,92 +4029,16 @@ fn exec_stmt(
                 )
                 .into());
             }
-            if !matches!(source, Expr::Literal(_) | Expr::UserVariable(_)) {
-                return Err(error(
-                    crate::error::catalog::ER_PARSE_ERROR,
-                    "PREPARE source must be a string literal or user variable",
-                )
-                .into());
-            }
-            let source_value = eval_routine_expr(session, &frame.locals, source)?;
-            if matches!(source_value, Value::Null) {
-                return Err(error(
-                    crate::error::catalog::ER_PARSE_ERROR,
-                    "PREPARE source may not be NULL",
-                )
-                .into());
-            }
-            let sql = crate::storage::value_to_string(&source_value);
-            let key = normalize_local(name);
-            // MySQL implicitly drops an existing statement with this name
-            // before attempting the replacement; a failed PREPARE therefore
-            // must not leave the old statement executable.
-            session.remove_sql_prepared_statement(&key);
-            let _mode = crate::parser::ParserSqlModeGuard::activate(session.temporal_sql_mode_bits);
-            let mut statement = parse_statement(&sql)
-                .map_err(|err| RoutineExecError::Query(err.spec.error(err.message)))?;
-            if matches!(statement, crate::parser::Statement::MultiStatement { .. }) {
-                return Err(error(
-                    crate::error::catalog::ER_PARSE_ERROR,
-                    "PREPARE does not support multiple statements",
-                )
-                .into());
-            }
-            if matches!(
-                statement,
-                crate::parser::Statement::Unsupported { .. }
-                    | crate::parser::Statement::LoadData(_)
-            ) {
-                return Err(error(
-                    crate::error::catalog::ER_UNSUPPORTED_PS,
-                    "This command is not supported in the prepared statement protocol yet",
-                )
-                .into());
-            }
-            let mut next_placeholder = 0;
-            crate::parser::number_statement_placeholders(&mut statement, &mut next_placeholder);
-            let retained_capacity = key
-                .capacity()
-                .saturating_add(sql.capacity().saturating_mul(16))
-                .saturating_add(session.current_database.capacity())
-                .saturating_add(4096);
-            let memory_charge = Arc::new(
-                crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
-                    crate::engine::executor::mem_budget::ControlledMemoryCategory::DerivedCache,
-                    retained_capacity,
-                )
-                .map_err(RoutineExecError::Query)?,
-            );
-            session
-                .insert_sql_prepared_statement(
-                    key,
-                    crate::engine::api::SessionSqlPreparedStatement {
-                        xml_parameter_types: crate::engine::expr::xml::parameter_history(
-                            &sql,
-                            next_placeholder,
-                            &session.collation_connection,
-                        ),
-                        pfs: crate::engine::session_registry::PreparedStatementSnapshot::sql(
-                            name.clone(),
-                            Arc::from(sql.as_str()),
-                            session.connection_id as u64,
-                            retained_capacity as u64,
-                            prepare_started.elapsed(),
-                        ),
-                        original_sql: Arc::from(sql.as_str()),
-                        parser_sql_mode_bits: session.temporal_sql_mode_bits,
-                        statement: Arc::new(statement),
-                        database: session.current_database.clone(),
-                        parameter_count: next_placeholder,
-                        result_columns: Arc::from([]),
-                        result_catalog_epoch: db.catalog_publication_epoch(),
-                        routine_result_metadata: false,
-                        memory_charge,
-                    },
-                )
-                .map_err(RoutineExecError::Query)?;
+            super::dispatch::execute_sql_prepare(
+                db,
+                session,
+                name.clone(),
+                source.clone(),
+                registry,
+            )?;
             Ok(RoutineControl::None)
         }
+
         RoutineStmt::Execute { name, using } => {
             if !frame.allow_dynamic_sql {
                 return Err(error(
@@ -4008,6 +4081,7 @@ fn exec_stmt(
             let saved_database =
                 std::mem::replace(&mut session.current_database, prepared.database);
             let overflow_context = routine_overflow_context(&prepared.statement);
+            let mut retry_statement = || Ok((*prepared.statement).clone());
             let mut execute = || {
                 execute_parsed_statement_in_routine(
                     db,
@@ -4018,6 +4092,7 @@ fn exec_stmt(
                     usize::MAX,
                     frame.forbid_transaction_control,
                     frame.trigger_table.as_deref(),
+                    &mut retry_statement,
                 )
             };
             let response = match overflow_context {
@@ -4052,7 +4127,7 @@ fn exec_stmt(
             Ok(RoutineControl::None)
         }
         RoutineStmt::Sql(sql) => {
-            let response = match execute_sql_in_routine(
+            let mut response = match execute_sql_in_routine(
                 db,
                 session,
                 registry,
@@ -4093,6 +4168,32 @@ fn exec_stmt(
                     return Err(err);
                 }
             };
+            if let Some(compiled) = frame.static_statements.get(sql) {
+                if let crate::parser::Statement::Select(select) = compiled.statement.as_ref() {
+                    let columns = match &mut response {
+                        QueryResponse::ResultSet(result) => Some(&mut result.columns),
+                        QueryResponse::StreamingResultSet(result) => Some(&mut result.columns),
+                        _ => None,
+                    };
+                    if let Some(columns) = columns {
+                        if columns.len() == select.projection.len() {
+                            for (item, column) in select.projection.iter().zip(columns) {
+                                if let crate::parser::SelectItem::Expr {
+                                    expr: Expr::Identifier(name),
+                                    ..
+                                } = item
+                                {
+                                    if let Some((kind @ DataTypeKind::Bit { .. }, _)) =
+                                        frame.local_types.get(&normalize_local(name))
+                                    {
+                                        column.column_type = kind.column_type();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             frame.diag_row_count = response_row_count(&response);
             collect_routine_response(session, frame, response)?;
             Ok(RoutineControl::None)
@@ -4164,6 +4265,31 @@ fn select_into_single_row(
     super::dispatch::take_single_into_row(response)?.ok_or_else(not_found_condition)
 }
 
+/// Execute a top-level SIGNAL/RESIGNAL through the routine condition kernel.
+pub(super) fn execute_raise_condition(
+    db: &Arc<Database>,
+    session: &mut SessionContext,
+    registry: &SessionRegistry,
+    statement: &RoutineStmt,
+) -> Result<QueryResponse, QueryError> {
+    let mut frame = RoutineFrame::default();
+    match exec_stmt(db, session, &mut frame, registry, statement) {
+        Ok(_) => Ok(QueryResponse::Ok),
+        Err(err) => {
+            let err = err.query_error();
+            if err.sql_state().starts_with("01") {
+                crate::engine::api::push_statement_condition(
+                    crate::error::ConditionLevel::Warning,
+                    &err,
+                );
+                Ok(QueryResponse::Ok)
+            } else {
+                Err(err)
+            }
+        }
+    }
+}
+
 /// Execute `GET [CURRENT|STACKED] DIAGNOSTICS`. Statement-area items
 /// (`ROW_COUNT`, `NUMBER`) read the current frame's diagnostics; condition-area
 /// items read the condition currently being handled (`active_handler_error`),
@@ -4212,16 +4338,23 @@ fn exec_get_diagnostics(
     };
     let selected = if let Some(cond_expr) = condition {
         let number = crate::storage::to_i64(eval_routine_expr(session, &frame.locals, cond_expr)?)?;
-        let index = usize::try_from(number)
+        let Some(index) = usize::try_from(number)
             .ok()
-            .and_then(|number| number.checked_sub(1))
+            .and_then(|n| n.checked_sub(1))
             .filter(|index| *index < conditions.len())
-            .ok_or_else(|| {
-                RoutineExecError::Query(error(
-                    crate::error::catalog::ER_DA_INVALID_CONDITION_NUMBER,
-                    "Invalid condition number",
-                ))
-            })?;
+        else {
+            let err = error(
+                crate::error::catalog::ER_DA_INVALID_CONDITION_NUMBER,
+                "Invalid condition number",
+            );
+            let warning = crate::engine::api::SqlWarning::from_error(
+                crate::error::ConditionLevel::Error,
+                &err,
+            );
+            frame.diag_conditions.push(warning.clone());
+            crate::engine::api::push_sql_warning(warning);
+            return Ok(RoutineControl::None);
+        };
         Some(conditions[index].clone())
     } else {
         None
@@ -4251,9 +4384,10 @@ fn exec_get_diagnostics(
                 ),
                 DiagItem::ClassOrigin | DiagItem::SubclassOrigin => {
                     Value::String(selected.as_ref().map_or_else(String::new, |e| {
-                        if e.sql_state().as_str().starts_with("01")
-                            || e.sql_state().as_str().starts_with("02")
-                        {
+                        let sql_state = e.sql_state();
+                        let state = sql_state.as_str().as_bytes();
+                        let standard = matches!(state[0], b'0'..=b'4' | b'A'..=b'H');
+                        if standard {
                             "ISO 9075".to_string()
                         } else {
                             "MySQL".to_string()
@@ -4305,7 +4439,8 @@ fn execute_sql_in_routine(
     let source_overflow_context = static_statements
         .get(sql)
         .and_then(|compiled| routine_overflow_context(&compiled.statement));
-    let mut statement = if let Some(compiled) = static_statements.get(sql) {
+    let parsed_statement;
+    let source_statement = if let Some(compiled) = static_statements.get(sql) {
         let slot_names = compiled
             .identifiers
             .iter()
@@ -4322,9 +4457,9 @@ fn execute_sql_in_routine(
                 .map(|name| locals.get(name).cloned().unwrap_or(Value::Null))
                 .collect();
             used_parameterized_template = true;
-            (*template.statement).clone()
+            template.statement.as_ref()
         } else {
-            (*compiled.statement).clone()
+            compiled.statement.as_ref()
         }
     } else {
         let _mode = crate::parser::ParserSqlModeGuard::activate(session.temporal_sql_mode_bits);
@@ -4336,12 +4471,19 @@ fn execute_sql_in_routine(
         })?;
         let mut next_placeholder = 0;
         crate::parser::number_statement_placeholders(&mut statement, &mut next_placeholder);
-        statement
+        parsed_statement = statement;
+        &parsed_statement
     };
+    let bind_locals = !used_parameterized_template || locals.keys().any(|name| name.contains('.'));
+    let mut retry_statement = || {
+        let mut statement = source_statement.clone();
+        if bind_locals {
+            bind_statement_locals(&mut statement, locals)?;
+        }
+        Ok(statement)
+    };
+    let statement = retry_statement().map_err(RoutineExecError::Query)?;
     let overflow_context = source_overflow_context.or_else(|| routine_overflow_context(&statement));
-    if !used_parameterized_template || locals.keys().any(|name| name.contains('.')) {
-        bind_statement_locals(&mut statement, locals).map_err(RoutineExecError::Query)?;
-    }
     let execute = || {
         execute_parsed_statement_in_routine(
             db,
@@ -4356,6 +4498,7 @@ fn execute_sql_in_routine(
             },
             forbid_transaction_control,
             trigger_table,
+            &mut retry_statement,
         )
     };
     match overflow_context {
@@ -4423,6 +4566,7 @@ fn execute_parsed_statement_in_routine(
     internal_param_start: usize,
     forbid_transaction_control: bool,
     trigger_table: Option<&str>,
+    retry_statement: &mut dyn FnMut() -> Result<crate::parser::Statement, QueryError>,
 ) -> Result<QueryResponse, RoutineExecError> {
     if forbid_transaction_control {
         reject_restricted_sql_statement(session, &statement, trigger_table)?;
@@ -4445,7 +4589,48 @@ fn execute_parsed_statement_in_routine(
         crate::engine::expr::with_session_expr_info_raw(session_ptr, || {
             params::with_parameter_scope(internal_param_start, || {
                 params::with_params(params.to_vec(), || {
-                    super::dispatch::execute_statement(db, session, statement, registry)
+                    let started = std::time::Instant::now();
+                    let mut stats = super::LockWaitStats::default();
+                    let mut waited = false;
+                    let mut next_statement = Some(statement);
+                    // Child SQL owns its statement savepoint. Keep the
+                    // interpreter frame and completed CALL effects intact.
+                    loop {
+                        let statement = match next_statement.take() {
+                            Some(statement) => statement,
+                            None => match retry_statement() {
+                                Ok(statement) => statement,
+                                Err(err) => {
+                                    super::clear_session_lock_wait(db, session);
+                                    break Err(err);
+                                }
+                            },
+                        };
+                        match super::dispatch::execute_statement(db, session, statement, registry) {
+                            Err(err) if super::is_lock_wait_pending(&err) => {
+                                waited = true;
+                                if crate::engine::http::sent() {
+                                    super::clear_session_lock_wait(db, session);
+                                    break Err(crate::engine::http::error(
+                                        "ER_HTTP_REPLAY_FORBIDDEN",
+                                        "lock wait requires replay after an HTTP send",
+                                    ));
+                                }
+                                if let Err(err) = super::wait_for_lock_signal_or_cancel(
+                                    db, session, started, &mut stats,
+                                ) {
+                                    super::clear_session_lock_wait(db, session);
+                                    break Err(err);
+                                }
+                            }
+                            result => {
+                                if waited {
+                                    super::clear_session_lock_wait(db, session);
+                                }
+                                break result;
+                            }
+                        }
+                    }
                 })
             })
         })
@@ -5526,7 +5711,27 @@ fn eval_routine_expr(
             let v = eval_routine_expr(session, locals, expr)?;
             let lo = eval_routine_expr(session, locals, low)?;
             let hi = eval_routine_expr(session, locals, high)?;
-            crate::engine::expr::eval_between(&v, &lo, &hi, *negated)
+            crate::engine::expr::eval_between_with_provenance(
+                &v,
+                &lo,
+                &hi,
+                *negated,
+                [
+                    crate::engine::expr::ComparisonProvenance::from_exprs(expr, low)
+                        .with_hexbit_literals(expr, low)
+                        .with_between_domain(crate::engine::expr::between_comparison_domain(
+                            [expr, low, high],
+                            |e| {
+                                crate::engine::expr_type::column_type::schema_expr_result_type(
+                                    e,
+                                    &mut |_| crate::types::ColumnType::Json,
+                                )
+                            },
+                        )),
+                    crate::engine::expr::ComparisonProvenance::from_exprs(expr, high)
+                        .with_hexbit_literals(expr, high),
+                ],
+            )
         }
         Expr::InList {
             expr,
@@ -5616,7 +5821,14 @@ fn signal_message_value(
                 "MESSAGE_TEXT cannot be NULL",
             ));
         }
-        Ok(crate::storage::value_to_string(&value))
+        let text = crate::storage::value_to_string(&value);
+        if text.chars().count() > 512 {
+            return Err(error(
+                crate::error::catalog::ER_COND_ITEM_TOO_LONG,
+                "Data too long for condition item 'MESSAGE_TEXT'",
+            ));
+        }
+        Ok(text)
     })
     .transpose()
 }

@@ -1342,7 +1342,7 @@ fn function_restrictions_reject_missing_return_and_dynamic_sql() {
         "CREATE FUNCTION no_return() RETURNS INT BEGIN SET @x = 1; END",
     )
     .unwrap_err();
-    assert_eq!(err.code(), 1415);
+    assert_eq!(err.code(), 1320);
 
     let err = exec(
         &engine,
@@ -2651,12 +2651,14 @@ fn sqlwarning_handlers_and_diagnostics_areas_follow_mysql_semantics() {
          GET CURRENT DIAGNOSTICS CONDITION 0 @e = MYSQL_ERRNO",
     )
     .unwrap();
-    assert_eq!(
-        exec(&engine, &mut session, "CALL invalid_condition_number()")
-            .unwrap_err()
-            .code(),
-        1758
-    );
+    exec(&engine, &mut session, "SET @e = 99").unwrap();
+    exec(&engine, &mut session, "CALL invalid_condition_number()").unwrap();
+    assert_eq!(session.user_variable("e"), Some(&Value::Int(99)));
+    let QueryResponse::ResultSet(warnings) = exec(&engine, &mut session, "SHOW WARNINGS").unwrap()
+    else {
+        panic!("expected diagnostics result");
+    };
+    assert_eq!(warnings.rows[0][1], Value::Int(1758));
 }
 
 #[test]

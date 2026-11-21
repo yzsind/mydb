@@ -364,16 +364,7 @@ impl Database {
         if !has_forced_external && Self::row_lobs_stay_inline(codec, values) {
             return Ok((Vec::new(), Vec::new()));
         }
-        let is_lob_col = |i: usize| {
-            matches!(
-                codec.columns[i].kind,
-                ColumnKind::VarString
-                    | ColumnKind::VarBytes
-                    | ColumnKind::Json
-                    | ColumnKind::Geometry
-                    | ColumnKind::Vector { .. }
-            )
-        };
+        let is_lob_col = |i: usize| column_kind_can_externalize(&codec.columns[i].kind);
         let lob_byte_len = |i: usize| match &values[i] {
             Value::Bytes(b) => b.len(),
             Value::String(s) => s.len(),
@@ -2890,7 +2881,7 @@ impl Database {
                 heap.try_write_mvcc_tombstone(txn.txn_id, row_id, header)
             })?;
             if !patched {
-                self.publish_wal_before_eager_heap_write(txn.txn_id)?;
+                self.publish_wal_before_eager_write(txn.txn_id)?;
                 self.with_heap_mut(storage_id, |heap| {
                     heap.write_mvcc(txn.txn_id, row_id, header, &stored_values)
                 })?;
@@ -3952,7 +3943,7 @@ impl Database {
                     &reuse_mask,
                 )?;
                 let write_result = self
-                    .publish_wal_before_eager_heap_write(txn.txn_id)
+                    .publish_wal_before_eager_write(txn.txn_id)
                     .and_then(|_| {
                         self.with_heap_mut(storage_id, |heap| {
                             heap.write_mvcc_ext(
@@ -4386,7 +4377,7 @@ impl Database {
             effective_changed_columns,
         )?;
         let write_result = self
-            .publish_wal_before_eager_heap_write(txn.txn_id)
+            .publish_wal_before_eager_write(txn.txn_id)
             .and_then(|_| {
                 self.with_heap_mut(storage_id, |heap| {
                     heap.write_mvcc_ext(
@@ -4791,21 +4782,11 @@ impl Database {
     }
 }
 
-/// M6 — does the table declare a column whose type is always externalized
-/// off-page (TEXT/BLOB/JSON/GEOMETRY family, or a variable-length VECTOR)?
-/// Used to decide whether CHECK TABLE runs the (heavier) row-driven LOB
-/// chain walk. `VECTOR(n)` (fixed dim) lives inline and is excluded.
+/// Match the row encoder's externalization eligibility, including VARCHAR,
+/// VARBINARY and fixed-dimension vectors. Keep DDL file publication and CHECK
+/// TABLE in sync with the persisted row codec, including historical layouts.
 fn table_has_externalizable_column(table: &TableSchema) -> bool {
-    table.columns.iter().any(|c| {
-        matches!(
-            c.data_type,
-            DataTypeKind::Text { .. }
-                | DataTypeKind::Blob { .. }
-                | DataTypeKind::Json
-                | DataTypeKind::Geometry { .. }
-                | DataTypeKind::Vector { dim: None, .. }
-        )
-    })
+    codec_has_externalizable_columns(&table.row_codec)
 }
 
 // ===========================================================================

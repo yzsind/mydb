@@ -57,6 +57,7 @@ pub(super) fn emit(
     session: &mut SessionContext,
     response: QueryResponse,
 ) -> Result<Option<QueryResponse>, QueryError> {
+    let response = response.localize_timestamps(&session.sysvars.time_zone)?;
     SINK.with(|slot| match slot.borrow_mut().as_mut() {
         Some(sink) => sink(session, response).map(|()| None),
         None => Ok(Some(response)),

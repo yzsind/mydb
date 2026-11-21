@@ -2425,6 +2425,54 @@ impl ExprCompiler {
         compiled
     }
 
+    /// Capture a closed deterministic operand for one opened execution.
+    /// Parameters stay late-bound in the cached program. Errors, warnings,
+    /// row dependencies and session side effects retain the runtime oracle.
+    pub(crate) fn capture_execution_constant(expr: &Expr) -> Option<Value> {
+        crate::parser::visit::try_inspect_value_expr::<()>(expr, |node| {
+            let closed = match node {
+                Expr::Literal(_)
+                | Expr::BoundValue(_)
+                | Expr::Placeholder(_)
+                | Expr::Unary { .. }
+                | Expr::Binary { .. }
+                | Expr::IsNull(_)
+                | Expr::IsNotNull(_)
+                | Expr::InList { .. }
+                | Expr::Between { .. }
+                | Expr::Like { .. }
+                | Expr::Case { .. } => true,
+                Expr::Function {
+                    name,
+                    distinct: false,
+                    ..
+                } => !crate::planner::is_aggregate_function(name),
+                _ => false,
+            };
+            if closed {
+                Ok(true)
+            } else {
+                Err(())
+            }
+        })
+        .ok()?;
+        let program = Self::compile_cached(expr, &InputSchema::default()).ok()?;
+        if !program.capability.deterministic
+            || program.capability.legacy_escape
+            || program.column_reference_bound != 0
+        {
+            return None;
+        }
+        let diagnostics = crate::engine::api::StatementWarningSink::default();
+        let empty: &[Value] = &[];
+        let value = crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+            with_eval_scratch(|scratch| program.eval_source(&empty, scratch))
+        })
+        .ok()?;
+        let warning_free = diagnostics.lock().is_empty();
+        warning_free.then_some(value)
+    }
+
     /// Like `compile_cached`, but the caller supplies the schema fingerprint
     /// directly and only materialises the `InputSchema` (via `build_schema`)
     /// on a cache miss. This keeps the hot cache-hit path allocation-free —
@@ -3521,6 +3569,8 @@ enum ExprNode {
         /// BETWEEN must not fall back to the connection default when its
         /// tested value comes from a PAD SPACE or binary-collated column.
         collation_id: Option<u16>,
+        numeric_literals: [bool; 3],
+        domain: crate::engine::expr::BetweenComparisonDomain,
     },
     Like {
         expr: Box<ExprNode>,
@@ -5949,6 +5999,21 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             } else {
                 compile_node(right, schema)?
             };
+            // Conditional literal results need runtime provenance. Keep them
+            // on the scalar oracle when the compiled child is not constant;
+            // rewriting a general BLOB result into an integer would be wrong.
+            if (expr_is_numeric_hexbit_literal(left)
+                && !matches!(lnode, ExprNode::Const(_))
+                && (coerces_hexbit_to_numeric
+                    || (is_cmp && operand_numeric_class(right, schema) == NumericClass::Numeric)))
+                || (expr_is_numeric_hexbit_literal(right)
+                    && !matches!(rnode, ExprNode::Const(_))
+                    && (coerces_hexbit_to_numeric
+                        || (is_cmp
+                            && operand_numeric_class(left, schema) == NumericClass::Numeric)))
+            {
+                return Err(CompileError::Unsupported);
+            }
             if is_cmp {
                 // Resolve deterministic temporal constants once per compiled
                 // program.  This also exposes column/constant comparisons to
@@ -6227,12 +6292,33 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             ) {
                 return Err(CompileError::Unsupported);
             }
+            let sources = [expr.as_ref(), low.as_ref(), high.as_ref()];
+            let numeric_literals = sources.map(expr_is_numeric_hexbit_literal);
+            let domain = crate::engine::expr::between_comparison_domain(sources, |source| {
+                input_expr_result_type(source, schema)
+            });
+            let mut nodes = [
+                compile_comparison_value(expr, schema)?,
+                compile_node(low, schema)?,
+                compile_node(high, schema)?,
+            ];
+            for (node, literal) in nodes.iter_mut().zip(numeric_literals) {
+                if literal && domain == crate::engine::expr::BetweenComparisonDomain::Numeric {
+                    *node = coerce_hexbit_const_node(std::mem::replace(
+                        node,
+                        ExprNode::Const(Value::Null),
+                    ));
+                }
+            }
+            let [expr, low, high] = nodes;
             Ok(ExprNode::Between {
-                expr: Box::new(compile_comparison_value(expr, schema)?),
-                low: Box::new(compile_node(low, schema)?),
-                high: Box::new(compile_node(high, schema)?),
+                expr: Box::new(expr),
+                low: Box::new(low),
+                high: Box::new(high),
                 negated: *negated,
                 collation_id,
+                numeric_literals,
+                domain,
             })
         }
         Expr::Like {
@@ -7029,10 +7115,23 @@ fn fold_constants(node: ExprNode) -> ExprNode {
             high,
             negated,
             collation_id,
+            numeric_literals,
+            domain,
         } => {
-            let expr = Box::new(fold_constants(*expr));
-            let low = Box::new(fold_constants(*low));
-            let high = Box::new(fold_constants(*high));
+            let mut nodes = [
+                fold_constants(*expr),
+                fold_constants(*low),
+                fold_constants(*high),
+            ];
+            for (node, literal) in nodes.iter_mut().zip(numeric_literals) {
+                if literal && domain == crate::engine::expr::BetweenComparisonDomain::Numeric {
+                    *node = coerce_hexbit_const_node(std::mem::replace(
+                        node,
+                        ExprNode::Const(Value::Null),
+                    ));
+                }
+            }
+            let [expr, low, high] = nodes.map(Box::new);
             let all_const = is_const_node(&expr) && is_const_node(&low) && is_const_node(&high);
             let node = ExprNode::Between {
                 expr,
@@ -7040,6 +7139,8 @@ fn fold_constants(node: ExprNode) -> ExprNode {
                 high,
                 negated,
                 collation_id,
+                numeric_literals,
+                domain,
             };
             if all_const {
                 if let Some(v) = try_eval_const_node(&node) {
@@ -7395,7 +7496,19 @@ impl ExprNode {
                 high,
                 negated,
                 collation_id,
-            } => eval_between_node(expr, low, high, *negated, *collation_id, row, scratch),
+                numeric_literals,
+                domain,
+            } => eval_between_node(
+                expr,
+                low,
+                high,
+                *negated,
+                *collation_id,
+                *numeric_literals,
+                *domain,
+                row,
+                scratch,
+            ),
             ExprNode::Like {
                 expr,
                 pattern,
@@ -7780,22 +7893,28 @@ fn eval_between_node(
     high: &ExprNode,
     negated: bool,
     collation_id: Option<u16>,
+    numeric_literals: [bool; 3],
+    domain: crate::engine::expr::BetweenComparisonDomain,
     row: &dyn RowSource,
     scratch: &mut EvalScratch,
 ) -> Result<Value, QueryError> {
     let value = expr.eval_ref(row, scratch)?;
     let low_val = low.eval_ref(row, scratch)?;
     let high_val = high.eval_ref(row, scratch)?;
+    let mut provenance = [
+        node_comparison_provenance(expr, low),
+        node_comparison_provenance(expr, high),
+    ];
+    provenance[0].set_between_domain(domain);
+    provenance[0].set_between_literals(numeric_literals[0], numeric_literals[1]);
+    provenance[1].set_between_literals(numeric_literals[0], numeric_literals[2]);
     crate::engine::expr::with_compare_collation(collation_id, || {
         crate::engine::expr::eval_between_with_provenance(
             value.as_value(),
             low_val.as_value(),
             high_val.as_value(),
             negated,
-            [
-                node_comparison_provenance(expr, low),
-                node_comparison_provenance(expr, high),
-            ],
+            provenance,
         )
     })
 }
@@ -10122,6 +10241,58 @@ mod cache_tests {
             collation_id: None,
         }]);
         ExprCompiler::compile(&expr, &schema).expect("compile")
+    }
+
+    #[test]
+    fn native_temporal_constant_capture_rebinds_without_eager_warnings() {
+        let mut session = crate::engine::api::SessionContext::default();
+        session.sysvars.time_zone = "+00:00".into();
+        crate::engine::expr::with_session_expr_info(&session, || {
+            let expr = crate::parser::parse_expr_fragment("CAST(? AS DATETIME(6))").unwrap();
+            let open = |text: &str| {
+                crate::engine::params::with_params_slice(&[Value::String(text.into())], || {
+                    ExprCompiler::capture_execution_constant(&expr)
+                })
+            };
+            let Some(Value::DateTime(first)) = open("2020-01-01 00:00:00.000001") else {
+                panic!("bound temporal constant")
+            };
+            assert_eq!(
+                open("2020-01-01 00:00:00.000002"),
+                Some(Value::DateTime(first + 1))
+            );
+            let diagnostics = crate::engine::api::StatementWarningSink::default();
+            crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                assert!(open("invalid datetime").is_none());
+                for text in ["RAND()", "@capture_value", "unknown_column"] {
+                    let expr = crate::parser::parse_expr_fragment(text).unwrap();
+                    assert!(
+                        ExprCompiler::capture_execution_constant(&expr).is_none(),
+                        "{text}"
+                    );
+                }
+                assert!(ExprCompiler::capture_execution_constant(&Expr::Wildcard).is_none());
+            });
+            assert!(
+                diagnostics.lock().is_empty(),
+                "a failed speculative bind must not publish diagnostics"
+            );
+            let deferred = ExprCompiler::compile(&expr, &InputSchema::default()).unwrap();
+            let invalid =
+                crate::engine::api::with_statement_warning_sink(diagnostics.clone(), || {
+                    crate::engine::params::with_params_slice(
+                        &[Value::String("invalid datetime".into())],
+                        || {
+                            let empty: &[Value] = &[];
+                            with_eval_scratch(|scratch| deferred.eval_source(&empty, scratch))
+                        },
+                    )
+                });
+            assert!(
+                invalid.is_err() || !diagnostics.lock().is_empty(),
+                "runtime fallback must retain conversion diagnostics"
+            );
+        });
     }
 
     #[test]

@@ -99,26 +99,22 @@ pub fn parse_boolean_query(
             }
             _ => Occur::Should,
         };
-        if occur != Occur::Should
-            && chars
-                .peek()
-                .is_none_or(|c| c.is_whitespace() || matches!(c, '+' | '-'))
-        {
-            return Err(malformed());
+        if occur != Occur::Should {
+            while chars.peek().is_some_and(|c| c.is_whitespace()) {
+                chars.next();
+            }
+            if chars.peek().is_none_or(|c| matches!(c, '+' | '-')) {
+                return Err(malformed());
+            }
         }
         if matches!(chars.peek(), Some('"')) {
             chars.next(); // opening quote
             let mut phrase = String::new();
-            let mut closed = false;
             for c in chars.by_ref() {
                 if c == '"' {
-                    closed = true;
                     break;
                 }
                 phrase.push(c);
-            }
-            if !closed {
-                return Err(malformed());
             }
             let (positioned, _) = tokenizer.positioned_tokens(&phrase);
             let tokens: Vec<_> = positioned.iter().map(|(t, _)| t.clone()).collect();
@@ -153,11 +149,7 @@ pub fn parse_boolean_query(
             word.push(c);
             chars.next();
             if c == '*' {
-                if word.len() == 1
-                    || chars.peek().is_some_and(|next| {
-                        !next.is_whitespace() && !matches!(next, '"' | '+' | '-')
-                    })
-                {
+                if word.len() == 1 {
                     return Err(unsupported_op('*'));
                 }
                 break;
@@ -260,7 +252,7 @@ mod tests {
 
     #[test]
     fn audit_invalid_truncation() {
-        for query in ["*mysql", "+*mysql", "data*base*", "mysql**", "*"] {
+        for query in ["*mysql", "+*mysql", "mysql**", "*"] {
             assert_eq!(
                 parse_boolean_query(query, default_tok().as_ref())
                     .unwrap_err()
@@ -325,10 +317,11 @@ mod tests {
 
     #[test]
     fn operator_char_in_word_still_parses() {
-        // Only top-level operator characters are rejected; embedded ones fall
-        // through to the tokenizer's normal splitting.
+        // A mid-word minus starts an excluded operand, just as in InnoDB.
         let c = parse_boolean_query("foo-bar", default_tok().as_ref()).unwrap();
-        assert!(!c.is_empty(), "foo-bar should tokenise into foo/bar");
+        assert_eq!(c.len(), 2);
+        assert_eq!(c[0].occur, Occur::Should);
+        assert_eq!(c[1].occur, Occur::MustNot);
     }
 
     #[test]

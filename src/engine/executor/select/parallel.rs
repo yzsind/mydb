@@ -1748,6 +1748,7 @@ fn index_multi_lookup_parallelism() -> u32 {
         .and_then(|s| s.parse::<u32>().ok())
         .unwrap_or_else(crate::planner::default_parallel_degree)
         .max(1)
+        .min(crate::planner::default_parallel_degree())
 }
 
 /// Minimum keys × estimated rows/key before the parallel fan-out is
@@ -2146,12 +2147,18 @@ fn run_one_worker_storage(
 /// with no pages to scan) and at the global parallelism budget. Returns
 /// `1` for degenerate cases so the caller takes the inline path.
 pub(super) fn effective_degree_for_pages(requested: u32, page_count: u64) -> u32 {
-    let cap_pages = page_count.max(1) as u32;
-    requested.max(1).min(cap_pages).max(1)
+    let cap_pages = page_count.clamp(1, u32::MAX as u64) as u32;
+    requested
+        .max(1)
+        .min(cap_pages)
+        .min(crate::planner::default_parallel_degree())
 }
 
 fn effective_degree_for_items(requested: u32, item_count: usize) -> u32 {
-    requested.max(1).min(item_count.max(1) as u32).max(1)
+    requested
+        .max(1)
+        .min(item_count.clamp(1, u32::MAX as usize) as u32)
+        .min(crate::planner::default_parallel_degree())
 }
 
 fn item_partition(item_count: usize, degree: u32) -> Vec<(usize, usize)> {
@@ -3795,11 +3802,19 @@ mod tests {
 
     #[test]
     fn effective_degree_caps_at_page_count() {
+        let _budget = crate::engine::executor::tuning::enter(
+            crate::engine::executor::tuning::ExecutorTuningSnapshot::capture_for_session(8),
+        );
         assert_eq!(effective_degree_for_pages(8, 0), 1);
         assert_eq!(effective_degree_for_pages(8, 1), 1);
         assert_eq!(effective_degree_for_pages(8, 5), 5);
         assert_eq!(effective_degree_for_pages(8, 100), 8);
         assert_eq!(effective_degree_for_pages(0, 100), 1);
+        let _serial = crate::engine::executor::tuning::enter(
+            crate::engine::executor::tuning::ExecutorTuningSnapshot::capture_for_session(1),
+        );
+        assert_eq!(effective_degree_for_pages(8, u64::MAX), 1);
+        assert_eq!(effective_degree_for_items(8, usize::MAX), 1);
     }
 }
 

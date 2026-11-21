@@ -1603,7 +1603,7 @@ impl LoadDataIndexBuilders {
                         )?;
                     }
                 }
-                file.insert_batch_deferred(txn_id, owned, true)
+                file.insert_batch_deferred(txn_id, owned, true, Some(db))
             })
         };
         match sorted {
@@ -2690,7 +2690,7 @@ impl Database {
         for index in &table.indexes {
             for key in table.index_keys(index, values)? {
                 self.with_index_dml(storage_id, &index.name, |index_file| {
-                    index_file.insert_deferred(txn_id, key, row_id)
+                    index_file.insert_deferred(txn_id, key, row_id, Some(self))
                 })?;
             }
         }
@@ -2860,7 +2860,7 @@ impl Database {
         if writes.iter().all(|write| !write.header.is_deleted()) {
             // Preserve one prefix publication and one heap-handle lookup for
             // an ordinary UPDATE batch, including resizing/LOB rewrites.
-            self.publish_wal_before_eager_heap_write(txn_id)?;
+            self.publish_wal_before_eager_write(txn_id)?;
             return self.with_heap_mut(table_id, |heap| {
                 for write in writes {
                     #[cfg(test)]
@@ -2900,7 +2900,7 @@ impl Database {
                 *written += 1;
                 continue;
             }
-            self.publish_wal_before_eager_heap_write(txn_id)?;
+            self.publish_wal_before_eager_write(txn_id)?;
             self.with_heap_mut(table_id, |heap| {
                 heap.write_mvcc_ext(
                     txn_id,
@@ -3105,7 +3105,7 @@ impl Database {
             // Shared (read) handle lock: concurrent DML / SELECT may be
             // navigating this index, so the destructive empty-tree bulk-load
             // reset is unsafe here. Build incrementally.
-            index_file.insert_batch_deferred(txn_id, entries, false)
+            index_file.insert_batch_deferred(txn_id, entries, false, Some(self))
         })
     }
 
@@ -3165,7 +3165,7 @@ impl Database {
                             .get(key)
                             .is_some_and(|stored| stored.same_stored_value(key))
                         {
-                            index_file.delete_deferred(txn_id, key.clone(), row_id)?;
+                            index_file.delete_deferred(txn_id, key.clone(), row_id, Some(self))?;
                         }
                     }
                     for key in &new_keys {
@@ -3173,7 +3173,7 @@ impl Database {
                             .get(key)
                             .is_some_and(|stored| stored.same_stored_value(key))
                         {
-                            index_file.insert_deferred(txn_id, key.clone(), row_id)?;
+                            index_file.insert_deferred(txn_id, key.clone(), row_id, Some(self))?;
                         }
                     }
                     Ok(())
@@ -3221,7 +3221,7 @@ impl Database {
             ];
             self.with_index_dml(storage_id, &index.name, |index_file| {
                 let preencoded = index_file.preencode_mixed_index_batch_wal(txn_id, &entries)?;
-                index_file.apply_preencoded_batch_deferred(txn_id, entries, preencoded)
+                index_file.apply_preencoded_batch_deferred(txn_id, entries, preencoded, Some(self))
             })?;
         }
         // Txn-buffering: bound how many heap records (and thus deferred-pinned,
@@ -3259,11 +3259,12 @@ impl Database {
                                     txn_id_for_ddl(),
                                     key,
                                     physical_row_id,
+                                    Some(self),
                                 )?;
                             }
                         }
                         for key in &new_keys {
-                            index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id)?;
+                            index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id, Some(self))?;
                         }
                         Ok(())
                     })?;
@@ -3278,7 +3279,7 @@ impl Database {
                         .get(key)
                         .is_some_and(|stored| stored.same_stored_value(key))
                     {
-                        index_file.delete_deferred(txn_id_for_ddl(), key.clone(), row_id)?;
+                        index_file.delete_deferred(txn_id_for_ddl(), key.clone(), row_id, Some(self))?;
                     }
                 }
                 for key in &new_keys {
@@ -3286,7 +3287,7 @@ impl Database {
                         .get(key)
                         .is_some_and(|stored| stored.same_stored_value(key))
                     {
-                        index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id)?;
+                        index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id, Some(self))?;
                     }
                 }
                 Ok(())
@@ -4265,7 +4266,7 @@ impl Database {
         // a concurrent snapshot can probe the gap before its repair exists.
         for (index, key) in deletes {
             self.with_index_dml(storage_id, &index.name, |index_file| {
-                index_file.delete_deferred(txn_id, key, row_id)
+                index_file.delete_deferred(txn_id, key, row_id, Some(self))
             })?;
         }
         Ok(())
@@ -4340,7 +4341,7 @@ impl Database {
                 continue;
             }
             self.with_index_dml(storage_id, &index.name, |index_file| {
-                index_file.apply_batch_deferred(txn_id, entries)
+                index_file.apply_batch_deferred(txn_id, entries, Some(self))
             })?;
         }
         Ok(())
@@ -4441,7 +4442,7 @@ impl Database {
                         // Exclusive (write) handle lock per chunk excludes
                         // every concurrent navigator, so the empty-tree
                         // bulk-load reset on the first chunk is safe.
-                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true)
+                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true, Some(self))
                     })?;
                     if chunk_no % 64 == 63 {
                         crate::engine::memory_reclaimer::reclaim_bulk_operation_pressure();
@@ -4465,7 +4466,7 @@ impl Database {
                     self.with_index_mut(table.id, &index.name, |index_file| {
                         // Exclusive (write) handle lock per chunk: safe to
                         // take the empty-tree bulk-load reset fast path.
-                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true)
+                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true, Some(self))
                     })?;
                     chunk_no = chunk_no.saturating_add(1);
                     if chunk_no % 64 == 0 {
