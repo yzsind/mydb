@@ -307,16 +307,6 @@ impl VectorGraph {
         }
     }
 
-    /// No live nodes.
-    pub(crate) fn is_empty(&self) -> bool {
-        match self {
-            VectorGraph::NativeHnsw(g) => g.len() == 0,
-            VectorGraph::NativeIvf(g) => g.len() == 0,
-            VectorGraph::Memory(g) => g.is_empty(),
-            VectorGraph::Paged(p) => p.node_count() == 0,
-        }
-    }
-
     /// Fixed vector dimension (0 until the first vector fixes it, for the
     /// memory backend).
     pub(crate) fn dim(&self) -> usize {

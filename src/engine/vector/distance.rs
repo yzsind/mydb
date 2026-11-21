@@ -846,18 +846,36 @@ pub(crate) fn prefetch_read(p: *const i8) {
 }
 
 /// Integer squared-distance `Σ (a_i − b_i)²` between two int8 code vectors.
-/// `a`/`b` are scored over `min(len)` elements. Returns `i32` — exact (no
-/// rounding); safe from overflow for any realistic dimension (worst case
-/// `254² · dim`, so `dim ≤ ~33k` stays within `i32`).
+/// Score over the common prefix using the SIMD kernels in i32-sized blocks.
+const I8_SSD_BLOCK: usize = (i32::MAX as usize) / (255 * 255);
+
+/// Integer squared distance over the common prefix of two code vectors.
 #[inline]
-pub(crate) fn l2_ssd_i8(a: &[i8], b: &[i8]) -> i32 {
+pub(crate) fn l2_ssd_i8(a: &[i8], b: &[i8]) -> i64 {
     let n = a.len().min(b.len());
-    // SAFETY: `n` ≤ both lengths; the kernels do unaligned byte reads.
-    unsafe { l2_ssd_i8_ptr(a.as_ptr(), b.as_ptr(), n) }
+    if n <= I8_SSD_BLOCK {
+        // SAFETY: n fits both slices and the i32 accumulator.
+        return i64::from(unsafe { l2_ssd_i8_ptr(a.as_ptr(), b.as_ptr(), n) });
+    }
+    a[..n]
+        .chunks(I8_SSD_BLOCK)
+        .zip(b[..n].chunks(I8_SSD_BLOCK))
+        .map(|(a, b)| {
+            // SAFETY: equal, i32-safe block lengths.
+            i64::from(unsafe { l2_ssd_i8_ptr(a.as_ptr(), b.as_ptr(), a.len()) })
+        })
+        .sum()
+}
+
+/// Squared distance from the norms and dot product of signed SQ8 codes.
+#[inline]
+pub(crate) fn sq8_ssd_from_dot(a_norm: i32, b_norm: i32, dot: i32) -> i64 {
+    i64::from(a_norm) + i64::from(b_norm) - 2 * i64::from(dot)
 }
 
 /// # Safety
 /// `pa`/`pb` valid for `n` consecutive `i8` reads (unaligned ok).
+/// `n` must be at most `I8_SSD_BLOCK`.
 #[inline]
 unsafe fn l2_ssd_i8_ptr(pa: *const i8, pb: *const i8, n: usize) -> i32 {
     #[cfg(target_arch = "aarch64")]
@@ -908,7 +926,7 @@ unsafe fn l2_ssd_i8_neon(pa: *const i8, pb: *const i8, n: usize) -> i32 {
     while i + 16 <= n {
         let a = vld1q_s8(pa.add(i));
         let b = vld1q_s8(pb.add(i));
-        // Widening subtract → i16 differences (no overflow: i8 − i8 ∈ ±254).
+        // Widening subtract → i16 differences (no overflow: i8 − i8 ∈ ±255).
         let dlo = vsubl_s8(vget_low_s8(a), vget_low_s8(b)); // int16x8
         let dhi = vsubl_s8(vget_high_s8(a), vget_high_s8(b));
         // Square (i16·i16 → i32) and accumulate.
@@ -2653,12 +2671,26 @@ mod tests {
     /// arithmetic, so no tolerance), across every length residue class —
     /// including ramps that exercise the saturating `±127` clamp.
     #[test]
+    fn release_audit_sq8_distance_handles_wide_vectors() {
+        for dim in [32_989, 33_287, 65_532] {
+            let a = vec![-127_i8; dim];
+            let b = vec![127_i8; dim];
+            let want = dim as i64 * 254 * 254;
+            assert_eq!(l2_ssd_i8(&a, &b), want);
+            assert_eq!(
+                sq8_ssd_from_dot(ssq_i8(&a), ssq_i8(&b), dot_i8(&a, &b)),
+                want
+            );
+        }
+    }
+
+    #[test]
     fn ssd_i8_matches_scalar_oracle() {
         // SAFETY helper: scalar reference over slices.
-        fn ssd_scalar(a: &[i8], b: &[i8]) -> i32 {
+        fn ssd_scalar(a: &[i8], b: &[i8]) -> i64 {
             a.iter()
                 .zip(b)
-                .map(|(&x, &y)| (x as i32 - y as i32).pow(2))
+                .map(|(&x, &y)| (i64::from(x) - i64::from(y)).pow(2))
                 .sum()
         }
         for &dim in &[
@@ -2678,7 +2710,7 @@ mod tests {
             assert_eq!(l2_ssd_i8(&qa, &qa), 0, "ssd self dim={dim}");
             // Norm-decomposed SSD (sdot path) must be bit-identical: the very
             // identity probe_dist relies on, `‖a‖²+‖b‖²−2·a·b == Σ(a−b)²`.
-            let decomposed = ssq_i8(&qa) + ssq_i8(&qb) - 2 * dot_i8(&qa, &qb);
+            let decomposed = sq8_ssd_from_dot(ssq_i8(&qa), ssq_i8(&qb), dot_i8(&qa, &qb));
             assert_eq!(decomposed, want, "norm-decomposed ssd dim={dim}");
             // Dot kernel itself matches the scalar reference.
             let dot_ref: i32 = qa.iter().zip(&qb).map(|(&x, &y)| x as i32 * y as i32).sum();
@@ -2699,7 +2731,7 @@ mod tests {
         let query = pseudo(dim, 1);
         let mut qq = vec![0i8; dim];
         quantize_into(&query, 0.0, 127.0, &mut qq);
-        let mut best_i8 = (i32::MAX, usize::MAX);
+        let mut best_i8 = (i64::MAX, usize::MAX);
         let mut best_f32 = (f32::INFINITY, usize::MAX);
         for cand in 0..50usize {
             let v = pseudo(dim, 100 + cand as u64);

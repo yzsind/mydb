@@ -3525,14 +3525,15 @@ impl Database {
     ) -> Result<crate::engine::vector::VectorSearchResult, QueryError> {
         let _lease = self.acquire_vector_read(table.id)?;
         let graph = self.vector_graph_get_or_build_for_partition(table, index, storage_id)?;
-        if !graph.is_empty() && graph.dim() != query.dimension as usize {
+        let dim = graph.dim();
+        if dim != 0 && dim != query.dimension as usize {
             return Err(error(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                 format!(
                     "query vector has {} dimensions but index '{}' is {}-dimensional",
                     query.len(),
                     index.name,
-                    graph.dim()
+                    dim
                 ),
             ));
         }
@@ -4173,22 +4174,29 @@ impl Database {
     /// Called after each commit publishes visibility and before checkpoint
     /// compaction; with nothing queued it costs one atomic load.
     pub(crate) fn drain_vector_purges(&self) -> usize {
+        self.try_drain_vector_purges().unwrap_or_else(|err| {
+            log_message(format!("persistent vector retirement failed: {err:?}"));
+            0
+        })
+    }
+
+    fn try_drain_vector_purges(&self) -> Result<usize, QueryError> {
         if self.physical_replica_mode()
             || self.mvcc_quarantined.load(Ordering::Acquire)
             || self.is_snapshot_read_only()
             || self.open_mode == DatabaseOpenMode::SealBaseline
             || self.vector_purges_pending.load(Ordering::Acquire) == 0
         {
-            return 0;
+            return Ok(0);
         }
         let Some(_maintenance) = self.backup_maintenance_gate.try_read() else {
-            return 0;
+            return Ok(0);
         };
         if self.capture.active.load(Ordering::Acquire) {
-            return 0;
+            return Ok(0);
         }
         let Some(_drain) = self.vector_purge_drain_gate.try_lock() else {
-            return 0;
+            return Ok(0);
         };
         let _snapshot = self.vector_purge_snapshot_gate.read();
         let horizon = self.vector_purge_horizon();
@@ -4259,9 +4267,8 @@ impl Database {
             })();
             let mut queue = self.vector_purge_queue.lock();
             if let Err(err) = result {
-                log_message(format!("persistent vector retirement failed: {err:?}"));
                 queue.insert(purge);
-                break;
+                return Err(err);
             }
             queue.remove_completed(&identity, &purge.rows);
             self.vector_purges_pending
@@ -4272,7 +4279,7 @@ impl Database {
         if queue.is_empty() {
             self.vector_purge_recovery_charge.lock().take();
         }
-        completed
+        Ok(completed)
     }
 
     pub(crate) fn discard_pending_vector_deletes(&self, txn_id: u64) -> Result<u64, QueryError> {

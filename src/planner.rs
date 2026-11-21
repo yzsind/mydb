@@ -6314,32 +6314,6 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
     } else {
         Vec::new()
     };
-    // Multi-table KNN: when the ORDER BY belongs to the leftmost table, keep
-    // its vector scan as the join driver. The ordered NLJ path below preserves
-    // that driver's order; hash/reordered joins are deliberately suppressed.
-    let join_knn = if tables.len() > 1
-        && !select
-            .query_hints
-            .iter()
-            .any(|h| matches!(h, QueryHint::HashJoin { .. }))
-    {
-        try_knn_vector_scan(
-            db,
-            &tables[0],
-            select,
-            base_predicates[0].clone(),
-            tables[0]
-                .schema
-                .indexes
-                .iter()
-                .map(|index| index.name.clone())
-                .collect(),
-        )
-        .filter(|plan| matches!(plan, PhysicalPlan::VectorIndexScan { .. }))
-    } else {
-        None
-    };
-    let knn_join_driver = join_knn.is_some();
     let mut scans = if tables.len() == 1 {
         // KNN fast path: `ORDER BY DISTANCE(col, const) LIMIT k` over an HNSW
         // index drives a VectorIndexScan (ordered candidates from the graph,
@@ -6375,11 +6349,6 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
             .zip(base_predicates.iter())
             .enumerate()
             .map(|(idx, ((table, source_ref), predicate))| {
-                if idx == 0 {
-                    if let Some(plan) = join_knn.clone() {
-                        return Ok(plan);
-                    }
-                }
                 let (table_index_hints, tname) = if idx == 0 {
                     (base_index_hints, base_table_name)
                 } else {
@@ -6432,24 +6401,16 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         return finish_plan(db, &cbo_ctx, select, plan);
     }
 
-    let has_ordered = knn_join_driver
-        || select.straight_join
+    let has_ordered = select.straight_join
         || select
             .query_hints
             .iter()
             .any(|h| matches!(h, QueryHint::Ordered));
-    let mut join_hints = select.query_hints.clone();
-    if knn_join_driver {
-        // Empty table list applies to this join edge; put it first so an
-        // order-destroying hash join cannot override the KNN driver's contract.
-        join_hints.insert(0, QueryHint::NlJoin { tables: Vec::new() });
-    }
-
     let all_inner = select
         .joins
         .iter()
         .all(|join| matches!(join.join_type, JoinType::Inner | JoinType::Cross));
-    if all_inner && select.straight_join && !knn_join_driver {
+    if all_inner && select.straight_join {
         // MySQL evaluates a full-key unique lookup as a const table before
         // the remaining join order, even under SELECT STRAIGHT_JOIN.
         scans.sort_by_key(|scan| !is_mysql_const_scan(scan));
@@ -6483,7 +6444,7 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
         }
         cross_preds.extend(drain_join_predicates(&mut residual_predicates, &tables));
         let (plan, leftover) =
-            plan_straight_inner_joins(&cbo_ctx, scans, cross_preds, select, &join_hints);
+            plan_straight_inner_joins(&cbo_ctx, scans, cross_preds, select, &select.query_hints);
         residual_predicates.extend(leftover);
         plan
     } else if all_inner && !has_ordered {
@@ -6555,7 +6516,7 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
                     right,
                     JoinType::Inner,
                     cond,
-                    &join_hints,
+                    &select.query_hints,
                 );
             }
             for pred in remaining_preds {
@@ -6590,8 +6551,14 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
             remaining_preds = still;
             plan_tables.extend(right_tables);
             let cond = combine_conjuncts(join_parts);
-            head =
-                choose_join_with_hints(&cbo_ctx, head, right, JoinType::Inner, cond, &join_hints);
+            head = choose_join_with_hints(
+                &cbo_ctx,
+                head,
+                right,
+                JoinType::Inner,
+                cond,
+                &select.query_hints,
+            );
         }
         for pred in remaining_preds {
             residual_predicates.push(pred);
@@ -6631,7 +6598,7 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
                     right,
                     join_type,
                     condition,
-                    &join_hints,
+                    &select.query_hints,
                 );
             }
             head
@@ -6652,7 +6619,14 @@ fn build_physical_plan(db: &Database, select: &Select) -> Result<PhysicalPlan, Q
             );
             let condition = combine_optional_exprs(join_conditions[idx].take(), residual_condition);
             let join_type = inner_join_type_for_extracted_condition(join.join_type, &condition);
-            head = choose_join_with_hints(&cbo_ctx, head, right, join_type, condition, &join_hints);
+            head = choose_join_with_hints(
+                &cbo_ctx,
+                head,
+                right,
+                join_type,
+                condition,
+                &select.query_hints,
+            );
         }
         head
     };

@@ -171,6 +171,10 @@ impl VectorIndexFile {
             .is_some_and(|mut view| view.take().is_some())
     }
 
+    pub(crate) fn navigation_write_pending(&self) -> bool {
+        self.navigation_writers.load(Ordering::Acquire) != 0
+    }
+
     fn navigation_write(&self) -> VectorNavigationWrite<'_> {
         self.navigation_writers.fetch_add(1, Ordering::AcqRel);
         self.navigation_revision.fetch_add(1, Ordering::AcqRel);

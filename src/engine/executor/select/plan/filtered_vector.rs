@@ -219,7 +219,9 @@ pub(super) fn execute_filtered_vector_topk(
                 &mut stats,
             )
             .or_else(|err| {
-                if err.code() == crate::error::catalog::ER_OUTOFMEMORY.code() {
+                if err.is(crate::error::catalog::ER_OUTOFMEMORY)
+                    || crate::engine::vector::persistence::is_maintenance_pending(&err)
+                {
                     Ok(false)
                 } else {
                     Err(err)

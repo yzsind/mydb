@@ -374,7 +374,20 @@ fn quota_error(requested: u64, scope: QuotaScope, used: u64, limit: u64) -> Quer
              quota is the constraint."
         )
     };
-    crate::storage::error(crate::error::catalog::ER_OUT_OF_RESOURCES, message)
+    temp_disk_full(message)
+}
+
+const TEMP_DISK_FULL: &str = "MYDB-DIAG-TEMP-DISK-FULL";
+
+fn temp_disk_full(message: String) -> QueryError {
+    crate::error::catalog::ER_OUT_OF_RESOURCES
+        .error(message)
+        .with_diagnostic(TEMP_DISK_FULL, "temporary spill storage is exhausted")
+}
+
+pub(crate) fn is_temp_disk_full(err: &QueryError) -> bool {
+    err.is(crate::error::catalog::ER_OUT_OF_RESOURCES)
+        && err.diagnostic_id() == Some(TEMP_DISK_FULL)
 }
 
 /// Per-spill-directory charger. Cloned cheaply into every writer under a
@@ -827,10 +840,9 @@ pub(crate) fn query_error_from_io(error: &io::Error) -> Option<QueryError> {
                     format!("spill allocation: {error}"),
                 ))
             }
-            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => Some(
-                crate::error::catalog::ER_OUT_OF_RESOURCES
-                    .error(format!("out of temp disk space: {error}")),
-            ),
+            io::ErrorKind::StorageFull | io::ErrorKind::QuotaExceeded => {
+                Some(temp_disk_full(format!("out of temp disk space: {error}")))
+            }
             _ => None,
         })
 }
@@ -1808,6 +1820,15 @@ pub fn cte_spill_count() -> u64 {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn release_audit_temp_disk_error_classification() {
+        let storage_full = io::Error::from(io::ErrorKind::StorageFull);
+        let err = query_error_from_io(&storage_full).unwrap();
+        assert!(is_temp_disk_full(&err.map_message(|_| "spill is full".to_owned())));
+        let unrelated = crate::error::catalog::ER_OUT_OF_RESOURCES.error("out of temp disk space:");
+        assert!(!is_temp_disk_full(&unrelated));
+    }
 
     #[test]
     fn pressure_writeback_skips_locked_manifests_and_does_not_pin_the_query() {

@@ -12,13 +12,20 @@ pub(crate) fn corrupt() -> QueryError {
     )
 }
 
+const MAINTENANCE_PENDING: &str = "MYDB-DIAG-VECTOR-MAINTENANCE-PENDING";
+
+pub(crate) fn is_maintenance_pending(err: &QueryError) -> bool {
+    err.is(crate::error::catalog::ER_INDEX_CORRUPT)
+        && err.diagnostic_id() == Some(MAINTENANCE_PENDING)
+}
+
 pub(crate) fn unfinished_maintenance() -> QueryError {
     crate::storage::error(
         crate::error::catalog::ER_INDEX_CORRUPT,
         "persistent vector index has unfinished maintenance",
     )
     .with_diagnostic(
-        "MYDB-DIAG-VECTOR-MAINTENANCE-PENDING",
+        MAINTENANCE_PENDING,
         "the graph has not published its query-ready boundary",
     )
 }

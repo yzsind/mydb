@@ -5,6 +5,9 @@ use crate::util::fast_hash::{ah_hash_set, AhHashSet};
 use crate::{storage::RowId, types::QueryError, vector::VectorValue};
 use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 
+// Larger exhaustive passes use the executor's bounded exact Top-K.
+pub(super) const EXHAUSTIVE_HNSW_CURSOR_LIMIT: usize = 4096;
+
 pub(crate) struct CursorWork {
     pub(crate) visited: u64,
     pub(crate) distances: u64,
@@ -294,12 +297,12 @@ impl VectorSearchCursor {
         selection: Option<Arc<RowSelection>>,
     ) -> Result<Self, QueryError> {
         graph.ensure_valid()?;
-        if !graph.is_empty() && graph.dim() != query.dimension as usize {
+        let dim = graph.dim();
+        if dim != 0 && dim != query.dimension as usize {
             return Err(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH.error(format!(
                     "query vector has {} dimensions but index has {}",
-                    query.dimension,
-                    graph.dim()
+                    query.dimension, dim
                 )),
             );
         }
@@ -415,6 +418,36 @@ mod tests {
     use crate::engine::vector::{
         hnsw::HnswIndex, ivf::IvfParams, native_hnsw::NativeHnsw, native_ivf::NativeIvf, Metric,
     };
+
+    #[test]
+    fn release_audit_tombstoned_graph_still_checks_query_dimension() {
+        let graph = HnswIndex::new(Metric::L2, 4, 32);
+        let row = RowId::new(1, 0);
+        graph.insert(row, vec![1.0, 2.0]).unwrap();
+        assert_eq!(graph.mark_deleted_by_row_id(row), 1);
+        let graph = Arc::new(VectorGraph::Memory(graph));
+        let query = crate::engine::vector::codec::from_f32(&[1.0]);
+        let err = VectorSearchCursor::new(graph, &query, 1, None)
+            .err()
+            .unwrap();
+        assert!(err.is(crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH));
+    }
+
+    #[test]
+    fn release_audit_large_exhaustive_cursor_requests_heap_completion() {
+        let graph = HnswIndex::new(Metric::L2, 4, 32);
+        let count = EXHAUSTIVE_HNSW_CURSOR_LIMIT + 1;
+        for id in 0..count as u32 {
+            graph
+                .append_node(RowId::new(id, 0), vec![id as f32])
+                .unwrap();
+        }
+        let graph = Arc::new(VectorGraph::Memory(graph));
+        let query = crate::engine::vector::codec::from_f32(&[1.0]);
+        let mut cursor = VectorSearchCursor::new(graph, &query, 1, None).unwrap();
+        assert!(cursor.next_batch(count, 4, false).unwrap().is_none());
+        assert_eq!(cursor.work.visited, 0);
+    }
 
     #[test]
     fn filtered_frontier_waits_for_ties_and_incomplete_batches() {

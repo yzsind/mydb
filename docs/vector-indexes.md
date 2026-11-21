@@ -170,7 +170,7 @@ on all distance evaluations or physical page reads.
 | `mydb_hnsw_ef_dynamic_factor` | 2 | Initial effective ef is `max(base ef, factor*k, k)`; 0 disables scaling |
 | `mydb_ivf_nprobe` | 8 | IVF lists to probe, clamped to `1..nlist` at execution |
 | `mydb_hnsw_rerank_mult`, `mydb_ivf_rerank_mult` | 4 | Candidate multiplier; explicit SET overrides index `rerank_mult`, range 1..1024 |
-| `mydb_hnsw_iterative_scan`, `mydb_ivf_iterative_scan` | strict_order | `off`, `relaxed_order`, or `strict_order`; controls candidate widening after filters or visibility checks remove rows |
+| `mydb_hnsw_iterative_scan`, `mydb_ivf_iterative_scan` | strict_order | `off`, `relaxed_order`, or `strict_order`. Controls candidate widening after filters or visibility checks remove rows. SQL output follows `ORDER BY` in every mode |
 | `mydb_hnsw_max_scan_tuples`, `mydb_ivf_max_scan_tuples` | 20000 | Iterative candidate budget; 0 disables this configured cap |
 | `mydb_hnsw_brute_threshold` | 10000 | Small-table threshold for automatic exact scanning |
 | `mydb_hnsw_brute_filter_rows` | 1000 | Legacy filtered ANN row threshold; eligible `FilteredVectorTopK` queries use the adaptive cost model |

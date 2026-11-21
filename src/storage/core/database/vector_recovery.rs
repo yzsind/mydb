@@ -71,6 +71,22 @@ impl VectorRecoveryMutation {
 }
 
 impl Database {
+    fn drain_recovered_vector_purges(&self) -> Result<(), QueryError> {
+        while self.vector_purges_pending.load(Ordering::Acquire) != 0 {
+            let completed = self.try_drain_vector_purges()?;
+            self.ensure_operational()?;
+            if completed == 0 {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "vector recovery could not drain outstanding version retirements",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Database {
     fn log_pending_vector_recovery(&self, txn_id: u64) -> Result<(), QueryError> {
         if self.durability_mode() == DurabilityMode::Memory {
             return Ok(());
@@ -348,13 +364,7 @@ impl Database {
             }
             // Retirement-only crashes may have no retained mutation batch.
             // Their cold paged files still need the controlled counter pass.
-            while self.vector_purges_pending.load(Ordering::Acquire) != 0 {
-                let completed = self.drain_vector_purges();
-                self.ensure_operational()?;
-                if completed == 0 {
-                    return Err(vector::persistence::corrupt());
-                }
-            }
+            self.drain_recovered_vector_purges()?;
             let graphs = self.vector_indexes.read();
             for graph in graphs.values() {
                 match graph.as_ref() {

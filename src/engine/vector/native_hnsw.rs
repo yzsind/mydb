@@ -2160,6 +2160,11 @@ impl NativeHnsw {
         if cursor.initialized && cursor.epoch != state.cursor_epoch {
             return Ok(false);
         }
+        if effort >= state.groups.len()
+            && state.groups.len() > super::cursor::EXHAUSTIVE_HNSW_CURSOR_LIMIT
+        {
+            return Ok(false);
+        }
         let score_node = |id| {
             self.navigation_score(
                 &state,

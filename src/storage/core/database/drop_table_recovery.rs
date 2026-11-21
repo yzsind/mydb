@@ -464,13 +464,21 @@ impl Database {
                     return Err(vector::persistence::corrupt());
                 }
                 match fs::read_dir(self.data_dir.join(directory)) {
-                    Ok(entries) => for entry in entries {
-                        if should_stop() { return Err(error(crate::error::catalog::ER_QUERY_INTERRUPTED, "retired-file cleanup interrupted; retry pending")); }
-                        let entry = entry.map_err(io_err)?;
-                        if !entry.file_type().map_err(io_err)?.is_file() { return Err(vector::persistence::corrupt()); }
-                        vector_files.insert(self.relative_path(&entry.path()));
-                    },
-                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {},
+                    Ok(entries) => {
+                        for entry in entries {
+                            if should_stop() {
+                                return Err(error(
+                                    crate::error::catalog::ER_QUERY_INTERRUPTED,
+                                    "retired-file cleanup interrupted; retry pending",
+                                ));
+                            }
+                            let entry = entry.map_err(io_err)?;
+                            if entry.file_type().map_err(io_err)?.is_file() {
+                                vector_files.insert(self.relative_path(&entry.path()));
+                            }
+                        }
+                    }
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                     Err(err) => return Err(io_err(err)),
                 }
             }

@@ -208,3 +208,59 @@ fn vector_release_duplicate_cluster_survives_member_deletion() {
         );
     }
 }
+
+#[test]
+fn vector_release_relaxed_ann_orders_transaction_local_vectors() {
+    let _env = HnswEnv::set(&[("MYDB_HNSW_BRUTE_THRESHOLD", "0")]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for sql in [
+        "CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL,INDEX ix(v) USING HNSW)",
+        "INSERT INTO t VALUES(1,'[1,0]'),(2,'[2,0]'),(3,'[3,0]')",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let mut session = SessionContext::default();
+    for sql in [
+        "SET mydb_hnsw_iterative_scan='relaxed_order'",
+        "BEGIN",
+        "INSERT INTO t VALUES(4,'[100,0]')",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    let sql = "SELECT /*+ HNSW_EF(64) */ id FROM t ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 2";
+    let QueryResponse::ResultSet(result) = engine.execute_with_session(&mut session, sql).unwrap()
+    else {
+        panic!("expected rows");
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int(1)], vec![Value::Int(2)]]);
+}
+
+#[test]
+fn vector_release_filtered_ann_falls_back_for_unfinished_index() {
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+        ("MYDB_HNSW_BRUTE_THRESHOLD", "0"),
+        ("MYDB_HNSW_BRUTE_FILTER_ROWS", "0"),
+    ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_strict_test_engine(dir.path());
+    engine.execute("CREATE TABLE t(id INT PRIMARY KEY,flag INT,v VECTOR(2) NOT NULL,INDEX ix(v) USING HNSW)").unwrap();
+    engine
+        .execute("INSERT INTO t VALUES(1,0,'[0,0]'),(2,1,'[1,0]'),(3,1,'[2,0]')")
+        .unwrap();
+    let sql =
+        "SELECT /*+ HNSW_EF(64) */ id FROM t WHERE flag=1 ORDER BY L2_DISTANCE(v,'[0,0]') LIMIT 1";
+    let plan = explain_analyze_tree(&engine, sql);
+    assert!(
+        plan.contains("Filtered vector Top-K") && !plan.contains("strategy: exact"),
+        "{plan}"
+    );
+    engine.database().invalidate_paged_vector_for_test("test.t");
+    assert_eq!(
+        query_rows(&engine, &sql.replace("WHERE flag=1", "")),
+        vec![vec![Value::Int(1)]]
+    );
+    assert_eq!(query_rows(&engine, sql), vec![vec![Value::Int(2)]]);
+}
