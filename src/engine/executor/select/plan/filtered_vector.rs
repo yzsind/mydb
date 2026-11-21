@@ -57,6 +57,7 @@ pub(super) fn execute_filtered_vector_topk(
         parallel_degree,
         exact_cost,
         predicate_cost,
+        order_by,
         ..
     } = plan
     else {
@@ -67,6 +68,11 @@ pub(super) fn execute_filtered_vector_topk(
     let query = resolve_knn_query_vector(table, *column_index, query_vector, query_vector_expr)?;
     let metric = crate::engine::vector::Metric::parse(metric).unwrap_or_default();
     validate_knn_query_vector(&query, metric)?;
+    let null_score = if order_by[0].nulls_first_effective() {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
     if k == 0 {
         return Ok(Vec::new());
     }
@@ -114,6 +120,7 @@ pub(super) fn execute_filtered_vector_topk(
             *column_index,
             &query,
             metric,
+            null_score,
             k,
             parallel_degree,
             &mut best,
@@ -194,6 +201,7 @@ pub(super) fn execute_filtered_vector_topk(
                 *column_index,
                 &query,
                 metric,
+                null_score,
                 k,
                 effort,
                 filter,
@@ -229,6 +237,7 @@ pub(super) fn execute_filtered_vector_topk(
                 *column_index,
                 &query,
                 metric,
+                null_score,
                 k,
                 &mut best,
                 &mut charge,
@@ -251,6 +260,7 @@ pub(super) fn execute_filtered_vector_topk(
                     *column_index,
                     &query,
                     metric,
+                    null_score,
                     k,
                     parallel_degree,
                     &mut charge,
@@ -304,6 +314,7 @@ pub(super) fn execute_filtered_vector_topk(
                                 *column_index,
                                 &query,
                                 metric,
+                                null_score,
                                 k,
                                 &mut best,
                                 &mut charge,
@@ -347,6 +358,7 @@ pub(super) fn execute_filtered_vector_topk(
                     *column_index,
                     &query,
                     metric,
+                    null_score,
                     k,
                     &mut best,
                     &mut charge,
@@ -394,6 +406,16 @@ pub(super) fn execute_filtered_vector_topk(
     Ok(out)
 }
 
+fn score_key(distance: f64, null_score: f64) -> f64 {
+    // Native cosine scoring returns NaN for zero operands, which SQL exposes
+    // as NULL. Represent that rank explicitly before comparing heap keys.
+    if distance.is_nan() {
+        null_score
+    } else {
+        distance
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn score_filtered_ids(
     db: &Arc<Database>,
@@ -404,12 +426,13 @@ fn score_filtered_ids(
     column: usize,
     query: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
+    null_score: f64,
     k: usize,
     best: &mut BinaryHeap<Scored<(u64, RowId)>>,
     charge: &mut VectorQueryCharge,
 ) -> Result<usize, QueryError> {
     score_filtered_ids_progress(
-        db, txn, table, sid, ids, column, query, metric, k, best, charge,
+        db, txn, table, sid, ids, column, query, metric, null_score, k, best, charge,
     )
     .map(|(count, _)| count)
 }
@@ -424,6 +447,7 @@ fn score_filtered_ids_progress(
     column: usize,
     query: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
+    null_score: f64,
     k: usize,
     best: &mut BinaryHeap<Scored<(u64, RowId)>>,
     charge: &mut VectorQueryCharge,
@@ -443,7 +467,7 @@ fn score_filtered_ids_progress(
     let mut changes = 0;
     for (row, distance, _) in scores {
         let item = Scored {
-            dist: distance,
+            dist: score_key(distance, null_score),
             id: (sid, row),
         };
         if best.len() < k {
@@ -475,6 +499,7 @@ fn search_filtered_ann(
     column: usize,
     query: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
+    null_score: f64,
     k: usize,
     base_effort: usize,
     filter: &Option<Expr>,
@@ -599,7 +624,7 @@ fn search_filtered_ann(
             };
             stats.reranks += ids.len() as u64;
             let (accepted, changes) = score_filtered_ids_progress(
-                db, txn, table, sid, &ids, column, query, metric, k, best, charge,
+                db, txn, table, sid, &ids, column, query, metric, null_score, k, best, charge,
             )?;
             let checks = budget.checks();
             budget.observe(examined, accepted, changes);
@@ -828,6 +853,7 @@ fn score_selection_parallel(
     column: usize,
     query: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
+    null_score: f64,
     k: usize,
     degree: usize,
     charge: &mut VectorQueryCharge,
@@ -857,6 +883,7 @@ fn score_selection_parallel(
                                 column,
                                 query,
                                 metric,
+                                null_score,
                                 k,
                                 &mut local,
                                 &mut local_charge,

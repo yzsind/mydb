@@ -11594,8 +11594,31 @@ fn try_knn_vector_scan(
         return None;
     }
     let order_expr = resolve_order_alias(&select.order_by[0].expr, &select.projection);
+    let filtered_topk = filter.is_some() && select.order_by.len() == 1;
+    // On a sole ordering key, a constant minus cosine distance is monotone
+    // in the opposite direction. Keep this rewrite on the indexed exact
+    // path so it preserves the SQL query's NULL ordering and exact results.
+    let reversed_cosine = match order_expr {
+        Expr::Binary {
+            left,
+            op: BinaryOp::Sub,
+            right,
+        } if filtered_topk
+            && !select.order_by[0].asc
+            && matches!(
+                left.as_ref(),
+                Expr::Literal(crate::parser::Literal::Int(_) | crate::parser::Literal::UInt(_))
+            ) =>
+        {
+            match_distance_call(right)
+                .filter(|(_, _, metric)| *metric == crate::engine::vector::Metric::Cosine)
+        }
+        _ => None,
+    };
     let matched = if select.order_by[0].asc {
         match_distance_call(order_expr)
+    } else if reversed_cosine.is_some() {
+        reversed_cosine
     } else if let Some(dot) = match_dot_similarity_call(order_expr) {
         Some(dot)
     } else {
@@ -11622,7 +11645,8 @@ fn try_knn_vector_scan(
                     .is_some_and(|name| name.eq_ignore_ascii_case(&column.name))
                 && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
         });
-    if !select.order_by[0].nulls_first_effective()
+    if !filtered_topk
+        && !select.order_by[0].nulls_first_effective()
         && (column.nullable || (metric == crate::engine::vector::Metric::Cosine && !cosine_nonzero))
     {
         return None;
@@ -11867,7 +11891,7 @@ fn try_knn_vector_scan(
     {
         return None;
     }
-    if filter.is_some() && select.order_by.len() == 1 {
+    if filtered_topk {
         return filtered_vector::plan_filtered_vector(
             db,
             table,
@@ -11882,7 +11906,7 @@ fn try_knn_vector_scan(
             offset,
             total_rows,
             filtered_rows,
-            index.filter(|_| !no_vector_index_hint),
+            index.filter(|_| !no_vector_index_hint && reversed_cosine.is_none()),
             hint_ef,
         );
     }

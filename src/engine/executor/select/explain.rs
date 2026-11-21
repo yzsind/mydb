@@ -4311,6 +4311,7 @@ fn format_plan_tree_nodes(
         planner::PhysicalPlan::FilteredVectorTopK {
             table,
             strategy,
+            scalar_access,
             metric,
             k,
             filter,
@@ -4323,6 +4324,11 @@ fn format_plan_tree_nodes(
                 ("metric", metric.clone()),
                 ("k", k.to_string()),
             ];
+            if *strategy == planner::FilteredVectorStrategy::Exact {
+                if let Some(access) = IndexAccess::from_plan(scalar_access) {
+                    details.push(("scalar index", access.index.name.clone()));
+                }
+            }
             push_partition_tree_detail(&mut details, table, filter.as_ref());
             push_scan_filter_and_hint(&mut details, filter.as_ref(), None);
             append_tree_details(&mut line, details);
@@ -5921,6 +5927,7 @@ fn format_plan_json_node(
         planner::PhysicalPlan::FilteredVectorTopK {
             table,
             strategy,
+            scalar_access,
             metric,
             k,
             filter,
@@ -5929,8 +5936,25 @@ fn format_plan_json_node(
             ..
         } => {
             let name = table_display_name(table);
-            json_table_header(out, &indent, "table", &name, table, filter.as_ref(), "ALL");
+            let scalar_index = (*strategy == planner::FilteredVectorStrategy::Exact)
+                .then(|| IndexAccess::from_plan(scalar_access))
+                .flatten();
+            let access_type = scalar_index
+                .as_ref()
+                .map_or("ALL", |access| access.access_type());
+            json_table_header(
+                out,
+                &indent,
+                "table",
+                &name,
+                table,
+                filter.as_ref(),
+                access_type,
+            );
             json_possible_keys(out, possible_keys, &indent);
+            if let Some(access) = scalar_index {
+                json_string_field(out, &indent, "key", &access.index.name);
+            }
             json_scan_estimates(out, &indent, table, filter, *access_rows, *estimated_rows);
             json_attached_condition(out, &indent, filter.as_ref());
             out.push_str(&format!("{indent}  \"filtered_vector_top_k\": {{\"strategy\": \"{}\", \"metric\": \"{metric}\", \"k\": {k}}},\n", strategy.as_str()));

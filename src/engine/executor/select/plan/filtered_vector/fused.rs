@@ -113,6 +113,7 @@ pub(super) fn try_score(
     column: usize,
     query: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
+    null_score: f64,
     k: usize,
     degree: usize,
     best: &mut BinaryHeap<Scored<(u64, RowId)>>,
@@ -251,7 +252,7 @@ pub(super) fn try_score(
                     &mut local,
                     Scored {
                         id: (*sid, row),
-                        dist,
+                        dist: score_key(dist, null_score),
                     },
                     k,
                 );

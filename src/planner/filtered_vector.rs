@@ -156,16 +156,27 @@ pub(super) fn plan_filtered_vector(
         return None;
     }
     let column_index = table.schema.column_index(col).ok()?;
-    let crate::storage::DataTypeKind::Vector { dim: Some(dim), .. } =
-        table.schema.columns[column_index].data_type
+    let crate::storage::DataTypeKind::Vector {
+        datatype,
+        dim: Some(dim),
+    } = table.schema.columns[column_index].data_type
     else {
         return None;
     };
-    // NULL/zero-cosine rankings use the relational oracle, which has the full
-    // SQL NULL placement contract rather than the ANN non-null contract.
-    if table.schema.columns[column_index].nullable
-        || (metric == crate::engine::vector::Metric::Cosine && index.is_none())
-        || select.order_by.len() != 1
+    if table.schema.columns[column_index].nullable || select.order_by.len() != 1 {
+        return None;
+    }
+    let exact_cosine = metric == crate::engine::vector::Metric::Cosine && index.is_none();
+    // Without an ANN index, a SQL cosine probe may be NULL, zero or invalid.
+    // Only specialize a validated, fixed probe. Keep ordinary SQL expression
+    // evaluation for parameters and for historical tables on this path.
+    if exact_cosine
+        && (query_vector_expr.is_some()
+            || table.system_time.is_some()
+            || query_vector.dimension != dim
+            || datatype == crate::vector::VectorDataType::Binary
+            || query_vector.datatype == crate::vector::VectorDataType::Binary
+            || crate::engine::vector::distance::typed_is_zero(&query_vector))
     {
         return None;
     }
@@ -184,18 +195,27 @@ pub(super) fn plan_filtered_vector(
         ..ScanHints::none()
     };
     let scalar_access = choose_scan(db, table, filter.clone(), &hints).ok()?;
-    // This leaf owns its own bounded RowId source. Unsupported scalar access
-    // shapes remain on the ordinary relational path.
-    if !matches!(
-        scalar_access,
+    let indexed_rows = match &scalar_access {
+        PhysicalPlan::IndexLookup { access_rows, .. }
+        | PhysicalPlan::IndexMultiLookup { access_rows, .. }
+        | PhysicalPlan::IndexRangeScan { access_rows, .. }
+        | PhysicalPlan::IndexFastScan {
+            access_rows,
+            low: Some(_),
+            ..
+        }
+        | PhysicalPlan::IndexFastScan {
+            access_rows,
+            high: Some(_),
+            ..
+        }
+        | PhysicalPlan::IndexMerge { access_rows, .. } => Some(*access_rows),
         PhysicalPlan::SeqScan { .. }
-            | PhysicalPlan::ZoneMapScan { .. }
-            | PhysicalPlan::IndexLookup { .. }
-            | PhysicalPlan::IndexMultiLookup { .. }
-            | PhysicalPlan::IndexRangeScan { .. }
-            | PhysicalPlan::IndexFastScan { .. }
-            | PhysicalPlan::IndexMerge { .. }
-    ) {
+        | PhysicalPlan::ZoneMapScan { .. }
+        | PhysicalPlan::IndexFastScan { .. } => None,
+        _ => return None,
+    };
+    if exact_cosine && indexed_rows.is_none() {
         return None;
     }
     let cfg = crate::engine::vector::session::current_config();
@@ -219,7 +239,12 @@ pub(super) fn plan_filtered_vector(
     let scalar = plan_cost(&scalar_access);
     let consts = crate::engine::cbo::cbo_consts();
     let distance = (f64::from(dim) / 8.0).max(1.0) * consts.cpu_operator_cost();
-    let survivors = filtered_rows.clamp(0.0, total_rows.max(0.0));
+    // Bound the vector scoring work by the rows the selected scalar access
+    // can deliver. Composite key and range estimates can be much tighter
+    // than multiplying independent predicate selectivities.
+    let survivors = filtered_rows
+        .min(indexed_rows.unwrap_or(total_rows))
+        .clamp(0.0, total_rows.max(0.0));
     let context = crate::engine::cbo::CboContext::from_db(db);
     let heap_pages = if table.schema.stats.heap_page_count > 0 {
         table.schema.stats.heap_page_count as f64
@@ -405,6 +430,11 @@ pub(super) fn plan_filtered_vector(
         cost.mem_bytes += survivors * 8.0 + parallel_degree as f64 * k as f64 * 32.0;
     }
     cost.startup = cost.total;
+    let access_rows = if strategy == FilteredVectorStrategy::Exact {
+        indexed_rows.unwrap_or(total_rows)
+    } else {
+        total_rows
+    };
     let mut planned_table = table.clone();
     planned_table.partition_pruning = build_partition_pruning_plan(&table.schema, filter.as_ref());
     Some(PhysicalPlan::FilteredVectorTopK {
@@ -427,7 +457,7 @@ pub(super) fn plan_filtered_vector(
         order_by: select.order_by.clone(),
         filter,
         estimated_rows: (k as f64).min(survivors),
-        access_rows: total_rows,
+        access_rows,
         cost,
         possible_keys,
         projected_columns: None,
