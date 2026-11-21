@@ -389,7 +389,9 @@ fn storage_release1121_alter_copy_preserves_external_varchar_varbinary() {
             assert_eq!(after, before, "{kind}");
             engine
                 .execute("ALTER TABLE lob_copy CHANGE COLUMN k changed DECIMAL(20,0)")
-                .unwrap_or_else(|err| panic!("{kind}, async={asynchronous}, partitioned={partitioned}: {err:?}"));
+                .unwrap_or_else(|err| {
+                    panic!("{kind}, async={asynchronous}, partitioned={partitioned}: {err:?}")
+                });
             let after = rows(engine.execute("SELECT id,CAST(changed AS SIGNED),note,mandatory,LENGTH(big),MD5(big) FROM lob_copy ORDER BY id").unwrap());
             assert_eq!(after, before, "{kind} CHANGE");
             engine.execute("DROP TABLE lob_copy").unwrap();
@@ -403,13 +405,20 @@ fn storage_release1121_online_inline_copy_replays_new_external_values() {
         let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         let engine = std::sync::Arc::new(open_relaxed_test_engine(dir.path()));
         engine.database().set_async_ddl(true);
-        engine.execute(&format!("CREATE TABLE online_lob (id INT PRIMARY KEY,k INT,note VARCHAR(100),big {kind})")).unwrap();
-        engine.execute("INSERT INTO online_lob VALUES (1,10,'old','inline'),(2,20,'other','small')").unwrap();
+        engine
+            .execute(&format!(
+                "CREATE TABLE online_lob (id INT PRIMARY KEY,k INT,note VARCHAR(100),big {kind})"
+            ))
+            .unwrap();
+        engine
+            .execute("INSERT INTO online_lob VALUES (1,10,'old','inline'),(2,20,'other','small')")
+            .unwrap();
         let hook = engine.database().install_ddl_backfill_test_hook();
         let worker = std::sync::Arc::clone(&engine);
-        let ddl = std::thread::spawn(move || worker.execute(
-            "ALTER TABLE online_lob MODIFY COLUMN k BIGINT, ALGORITHM=COPY, LOCK=NONE",
-        ));
+        let ddl = std::thread::spawn(move || {
+            worker
+                .execute("ALTER TABLE online_lob MODIFY COLUMN k BIGINT, ALGORITHM=COPY, LOCK=NONE")
+        });
         let reached = hook.wait_until_reached(std::time::Duration::from_secs(5));
         let big = if kind.starts_with("VARBINARY") {
             "REPEAT(UNHEX('00FF'),7500)"
@@ -417,21 +426,43 @@ fn storage_release1121_online_inline_copy_replays_new_external_values() {
             "REPEAT('Z',15000)"
         };
         let written = if reached {
-            engine.execute(&format!("UPDATE online_lob SET note='new',big={big} WHERE id=1"))
+            engine.execute(&format!(
+                "UPDATE online_lob SET note='new',big={big} WHERE id=1"
+            ))
         } else {
             engine.execute("SELECT 1")
         };
         hook.release();
         let result = ddl.join().unwrap();
-        assert!(reached, "COPY did not reach the fixed-snapshot scan barrier: {result:?}");
+        assert!(
+            reached,
+            "COPY did not reach the fixed-snapshot scan barrier: {result:?}"
+        );
         written.unwrap();
         result.unwrap();
-        let expected = rows(engine.execute(&format!("SELECT LENGTH({big}),MD5({big})")).unwrap());
-        let actual = rows(engine.execute("SELECT LENGTH(big),MD5(big) FROM online_lob WHERE id=1 AND note='new'").unwrap());
+        let expected = rows(
+            engine
+                .execute(&format!("SELECT LENGTH({big}),MD5({big})"))
+                .unwrap(),
+        );
+        let actual = rows(
+            engine
+                .execute("SELECT LENGTH(big),MD5(big) FROM online_lob WHERE id=1 AND note='new'")
+                .unwrap(),
+        );
         assert_eq!(actual, expected, "{kind}");
-        let before = rows(engine.execute("SELECT id,k,note,LENGTH(big),MD5(big) FROM online_lob ORDER BY id").unwrap());
-        engine.execute("ALTER TABLE online_lob MODIFY COLUMN k DECIMAL(20,0)").unwrap();
+        let before = rows(
+            engine
+                .execute("SELECT id,k,note,LENGTH(big),MD5(big) FROM online_lob ORDER BY id")
+                .unwrap(),
+        );
+        engine
+            .execute("ALTER TABLE online_lob MODIFY COLUMN k DECIMAL(20,0)")
+            .unwrap();
         let after = rows(engine.execute("SELECT id,CAST(k AS SIGNED),note,LENGTH(big),MD5(big) FROM online_lob ORDER BY id").unwrap());
-        assert_eq!(after, before, "{kind}: repeated COPY must retain replayed LOBs");
+        assert_eq!(
+            after, before,
+            "{kind}: repeated COPY must retain replayed LOBs"
+        );
     }
 }

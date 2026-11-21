@@ -48,7 +48,8 @@ class Servers:
 
     def connect(self, port):
         connection = pymysql.connect(host="127.0.0.1", port=port, user="root", password="root",
-                                     database="test", autocommit=True, read_timeout=30, write_timeout=30)
+                                     database="test", autocommit=True, binary_prefix=True,
+                                     read_timeout=30, write_timeout=30)
         self.connections.append(connection)
         return connection
 

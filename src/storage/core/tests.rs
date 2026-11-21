@@ -10374,7 +10374,9 @@ fn large_index_batch_wal_is_split_below_replication_payload_limit() {
             }
         })
         .collect::<Vec<_>>();
-    index.insert_entries_logged(11, entries, true, None).unwrap();
+    index
+        .insert_entries_logged(11, entries, true, None)
+        .unwrap();
     {
         let mut guard = log.lock();
         guard.rotate_segment().unwrap();
@@ -26871,7 +26873,12 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
     };
     for id in 1..=3 {
         index
-            .insert_deferred(1, IndexKey::from(vec![KeyPart::Int(id as i64)]), row(id), None)
+            .insert_deferred(
+                1,
+                IndexKey::from(vec![KeyPart::Int(id as i64)]),
+                row(id),
+                None,
+            )
             .unwrap();
     }
     let count = || {

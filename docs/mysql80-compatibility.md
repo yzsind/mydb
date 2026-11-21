@@ -301,6 +301,8 @@ alias for the native mydb engine.
   silently becoming binary values or dropping invalid bytes. Use `_binary`
   literals or hex literals for raw octets. Inert comments do not require valid
   client-charset encoding. NUL in a line comment is a syntax error.
+  PyMySQL text-protocol callers should enable `binary_prefix=True` when binding
+  `bytes` or `bytearray` parameters so the driver emits `_binary` literals.
 - `CAST`/typed `CONVERT` reject column-only target types such as `TEXT`,
   `VARCHAR`, `VARBINARY`, and `BLOB`; use `SIGNED`, `CHAR`, or `BINARY` as
   appropriate. `INT`, `INTEGER`, and `BIGINT` remain native aliases of the

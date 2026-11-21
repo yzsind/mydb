@@ -292,7 +292,9 @@ fn cached_insert_intervals_revalidate_parent_epochs_and_replaced_frames() {
     };
     let mut initial: Vec<_> = (0..4000).step_by(2).map(wide_entry).collect();
     initial.sort();
-    index.insert_entries_logged(1, initial, false, None).unwrap();
+    index
+        .insert_entries_logged(1, initial, false, None)
+        .unwrap();
     let mut probes: Vec<_> = (0..4500).map(wide_entry).collect();
     probes.sort();
     let mut path = smallvec::SmallVec::<[InsertRouteFrame; 4]>::new();

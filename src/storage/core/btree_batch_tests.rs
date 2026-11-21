@@ -546,7 +546,9 @@ fn buffered_sorted_insert_validates_order_once_across_leaves() {
             )
         })
         .collect::<Vec<_>>();
-    index.insert_entries_logged(0, seed.clone(), true, None).unwrap();
+    index
+        .insert_entries_logged(0, seed.clone(), true, None)
+        .unwrap();
     let incoming = seed.iter().step_by(5).cloned().collect::<Vec<_>>();
     index
         .apply_batch_deferred(
