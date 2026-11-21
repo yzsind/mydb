@@ -4101,6 +4101,18 @@ fn convert_data_type_with_unsigned(
             } else if name_str.eq_ignore_ascii_case("YEAR") {
                 validate_year_display_width(&modifiers, sql)?;
                 DataType::Year
+            } else if name_str.eq_ignore_ascii_case("UUID") {
+                if !modifiers.is_empty() {
+                    return Err(ParseError::unsupported_at(
+                        sql,
+                        Span {
+                            start: 0,
+                            end: sql.len(),
+                        },
+                        "UUID does not accept a length or precision",
+                    ));
+                }
+                DataType::Uuid
             } else {
                 match geometry_subtype_from_name(&name_str) {
                     Some(subtype) => DataType::Geometry(subtype, None),
@@ -4170,6 +4182,9 @@ fn convert_data_type_with_unsigned(
         }
         SqlDataType::Set(values) => DataType::Set(values),
         SqlDataType::Bit(len) => DataType::Bit(len.map(|v| v as usize)),
+        // mydb extension. MySQL has no UUID column type; sqlparser still
+        // recognizes the name because other dialects do.
+        SqlDataType::Uuid => DataType::Uuid,
         _ => {
             return Err(ParseError::unsupported_at(
                 sql,
@@ -5993,6 +6008,7 @@ fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>)
         | SqlDataType::MediumBlob
         | SqlDataType::LongBlob => ("BINARY".to_string(), vec![]),
         SqlDataType::JSON | SqlDataType::JSONB => ("JSON".to_string(), vec![]),
+        SqlDataType::Uuid => ("UUID".to_string(), vec![]),
         // MySQL 8.0 has no `CAST(x AS BOOLEAN)` target — it must raise the
         // canonical "unsupported CAST target type" error, not silently degrade
         // to CHAR via the catch-all below (project rule: no silent no-op).

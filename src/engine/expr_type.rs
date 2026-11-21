@@ -383,6 +383,9 @@ impl ExprType {
                 subtype: GeometrySubtype::Geometry,
                 srid: None,
             },
+            ColumnType::Uuid => ExprTypeKind::String {
+                kind: StringKind::Character,
+            },
             ColumnType::Vector => {
                 let (datatype, dim) = source
                     .vector_type
@@ -506,6 +509,11 @@ impl ExprType {
             DataTypeKind::Vector { dim, datatype } => ExprTypeKind::Vector {
                 dim: *dim,
                 datatype: *datatype,
+            },
+            // Expression functions see the canonical text. The stored value
+            // stays `Value::Uuid` until a string function materializes it.
+            DataTypeKind::Uuid => ExprTypeKind::String {
+                kind: StringKind::Character,
             },
             DataTypeKind::Enum { .. } => ExprTypeKind::String {
                 kind: StringKind::Enum,

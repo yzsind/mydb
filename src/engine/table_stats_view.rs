@@ -343,6 +343,7 @@ pub(crate) fn estimate_column_width(data_type: &DataTypeKind) -> u64 {
         DataTypeKind::Enum { values } => values.iter().map(|v| v.len()).max().unwrap_or(0) as u64,
         DataTypeKind::Set { values } => values.iter().map(|v| v.len() + 1).sum::<usize>() as u64,
         DataTypeKind::Bit { len } => len.unwrap_or(1).div_ceil(8) as u64,
+        DataTypeKind::Uuid => 16,
     }
 }
 

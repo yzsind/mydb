@@ -570,6 +570,12 @@ fn mysql_key_field_bytes(
         | DataTypeKind::Json
         | DataTypeKind::Geometry { .. }
         | DataTypeKind::Vector { .. } => Vec::new(),
+        DataTypeKind::Uuid => match value {
+            Value::Uuid(bytes) => bytes.to_vec(),
+            _ => crate::engine::uuid::identity(value)
+                .map(|bytes| bytes.to_vec())
+                .unwrap_or_default(),
+        },
     }
 }
 
@@ -924,6 +930,7 @@ fn append_list_runtime_value(out: &mut Vec<u8>, value: &Value, collation: Option
         }
         Value::Json(value) | Value::Geometry(value) => (11, value.clone()),
         Value::Vector(value) => (11, value.encode()),
+        Value::Uuid(bytes) => (12, bytes.to_vec()),
     };
     out.push(tag);
     out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
@@ -1065,6 +1072,7 @@ fn value_diag(v: &Value) -> String {
         Value::Json(b) => format!("json({})", crate::engine::json::to_text(b)),
         Value::Geometry(b) => format!("geometry({})", crate::engine::geo::to_text(b)),
         Value::Vector(b) => format!("vector({})", crate::engine::vector::to_text(b)),
+        Value::Uuid(bytes) => format!("'{}'", crate::engine::uuid::format_text(bytes)),
     }
 }
 

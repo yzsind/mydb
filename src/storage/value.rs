@@ -93,6 +93,7 @@ pub(crate) fn to_i64(value: Value) -> Result<i64, QueryError> {
         Value::Json(b) => Ok(crate::engine::json::coerce_i64(&b)),
         Value::Geometry(_) => Ok(0),
         Value::Vector(_) => Ok(0),
+        Value::Uuid(_) => Ok(0),
         Value::Null => Ok(0),
     }
 }
@@ -208,6 +209,7 @@ pub(crate) fn to_u64(value: Value) -> Result<u64, QueryError> {
         Value::Json(b) => Ok(crate::engine::json::coerce_i64(&b).max(0) as u64),
         Value::Geometry(_) => Ok(0),
         Value::Vector(_) => Ok(0),
+        Value::Uuid(_) => Ok(0),
         Value::Null => Ok(0),
     }
 }
@@ -265,6 +267,7 @@ pub(crate) fn to_f64(value: Value) -> Result<f64, QueryError> {
         Value::Json(b) => Ok(crate::engine::json::coerce_f64(&b)),
         Value::Geometry(_) => Ok(0.0),
         Value::Vector(_) => Ok(0.0),
+        Value::Uuid(_) => Ok(0.0),
         Value::Null => Ok(0.0),
     }
 }

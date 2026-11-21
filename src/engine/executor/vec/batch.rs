@@ -2738,6 +2738,11 @@ impl ColumnAccumulator {
             // gives up per-column vectorisation for BIT (a rare column type)
             // but keeps vec == row-wise for the full unsigned range.
             ColumnType::Bit { .. } => Self::u64(capacity),
+            // Keep the 16-byte identity intact. A UTF-8 lane would turn the
+            // value into canonical text and lose UUID equality.
+            ColumnType::Uuid => ColumnAccumulator::Generic {
+                values: Vec::with_capacity(capacity),
+            },
         }
     }
 

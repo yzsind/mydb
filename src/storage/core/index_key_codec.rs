@@ -319,7 +319,10 @@ fn decode_part_memcmp(
         ParamTarget::LikePattern { .. } => {
             return Err("search-only LIKE parameter target cannot decode persisted keys")
         }
-        ParamTarget::Bytes | ParamTarget::JsonScalar | ParamTarget::Vector { .. } => {
+        ParamTarget::Bytes
+        | ParamTarget::JsonScalar
+        | ParamTarget::Vector { .. }
+        | ParamTarget::Uuid => {
             let payload = decode_varlen_payload(bytes, cursor)?;
             KeyPart::Bytes(payload)
         }

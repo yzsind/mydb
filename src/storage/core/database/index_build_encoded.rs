@@ -5793,7 +5793,8 @@ fn fixed_key_op_for_column(column: &ColumnSchema) -> Option<FixedKeyOp> {
         | Geometry { .. }
         | Vector { .. }
         | Enum { .. }
-        | Set { .. } => return None,
+        | Set { .. }
+        | Uuid => return None,
     })
 }
 

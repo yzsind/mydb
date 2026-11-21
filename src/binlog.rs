@@ -5576,6 +5576,9 @@ fn column_binlog_type(data_type: &DataTypeKind) -> (u8, Vec<u8>) {
             (MYSQL_TYPE_BLOB, vec![width])
         }
         DataTypeKind::Json => (MYSQL_TYPE_JSON, vec![4]),
+        // MySQL has no UUID column type. Replicate the canonical 36-character
+        // text as VARCHAR so a MySQL replica can store the value as a string.
+        DataTypeKind::Uuid => (MYSQL_TYPE_VARCHAR, 36u16.to_le_bytes().to_vec()),
         DataTypeKind::Geometry { .. } => (MYSQL_TYPE_GEOMETRY, vec![4]),
         DataTypeKind::Date => (MYSQL_TYPE_DATE, vec![]),
         DataTypeKind::Time { fsp } => (MYSQL_TYPE_TIME2, vec![(*fsp).min(6)]),
@@ -6514,6 +6517,7 @@ fn value_i64(value: &Value) -> Result<i64, QueryError> {
         Value::Json(b) => Ok(crate::engine::json::coerce_i64(b)),
         Value::Geometry(_) => Ok(0),
         Value::Vector(_) => Ok(0),
+        Value::Uuid(_) => Ok(0),
         Value::Null => Ok(0),
     }
 }
@@ -6687,6 +6691,7 @@ fn value_f64(value: &Value) -> Result<f64, QueryError> {
         Value::Json(b) => Ok(crate::engine::json::coerce_f64(b)),
         Value::Geometry(_) => Ok(0.0),
         Value::Vector(_) => Ok(0.0),
+        Value::Uuid(_) => Ok(0.0),
         Value::Null => Ok(0.0),
     }
 }

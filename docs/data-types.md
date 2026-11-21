@@ -21,6 +21,7 @@ compatibility across versions is tracked in the
 | Semi-structured | `JSON` | binary JSON documents, path queries, and multi-valued indexes |
 | Spatial | `GEOMETRY` plus seven concrete subtypes | SRID/WKB geometries, spatial functions, and spatial indexes |
 | Vector | `VECTOR(n[, datatype])`, bare `VECTOR` | native numeric/BINARY vectors, exact KNN, and HNSW/IVF retrieval |
+| UUID | `UUID` | mydb extension for 128-bit identifiers; not a MySQL column type |
 
 `NULL` is not a standalone column type. Every type can store SQL `NULL` except for columns
 declared `NOT NULL`; SQL `NULL` and the `null` inside a JSON document are two distinct values.
@@ -49,7 +50,7 @@ Data types can be combined with the following column attributes:
 In strict mode, out-of-range values, invalid formats, and significant truncation usually
 return the corresponding MySQL errno directly; non-strict mode may downgrade some problems to
 warnings/notes and store saturated, zero, or truncated values. See
-[Section 12](#12-type-conversion-and-sql_mode).
+[Section 13](#13-type-conversion-and-sql_mode).
 
 ## 3. Integer Types
 
@@ -366,7 +367,56 @@ Both vectors of a single distance computation must have the same dimension. Vect
 natural total order suitable for business sorting; queries should order by the distance
 function rather than rely on the internal byte order of the raw column.
 
-## 11. Indexes and Type Selection
+## 11. `UUID`
+
+`UUID` is a mydb extension. MySQL 8.0 has no native UUID column type, and mydb
+does not claim one. The column stores the same 16-byte identity that
+`UUID_TO_BIN(expr)` returns when the swap flag is zero or omitted. Reads,
+`SHOW CREATE TABLE`, and the text protocol render the canonical lowercase
+form `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`.
+
+Accepted assignments use the same text grammar as `IS_UUID` and `UUID_TO_BIN`:
+
+- `8-4-4-4-12` hexadecimal text, in either case;
+- 32 hexadecimal digits with no hyphens;
+- the canonical form wrapped in `{}`;
+- a 16-byte binary value, including `UUID_TO_BIN(expr)` with swap flag 0.
+
+Surrounding spaces, a swapped `UUID_TO_BIN(expr, 1)` payload, and any other
+shape are rejected. Invalid input returns error 1411 (`ER_WRONG_VALUE_FOR_TYPE`)
+in both strict and non-strict `sql_mode`; there is no zero UUID and no
+truncation. `NULL` is still a normal SQL null when the column is nullable.
+
+Equality, `PRIMARY KEY`, `UNIQUE`, `DISTINCT`, and `GROUP BY` use the 16-byte
+identity, so the spellings above are one key. Ordering is unsigned byte order
+of that identity. A comparison operand that is not a UUID is ordered against
+the canonical text and does not match. `UUID()`, `UUID_TO_BIN()`,
+`BIN_TO_UUID()`, and `IS_UUID()` keep their existing function behavior;
+`BIN_TO_UUID(uuid_column)` and `HEX(uuid_column)` see the 16 stored bytes,
+while `CHAR_LENGTH(uuid_column)` counts the 36-character canonical text.
+
+The column does not take a length, character set, collation, `UNSIGNED`,
+`ZEROFILL`, or `AUTO_INCREMENT`. It has no implicit default. A literal
+`DEFAULT` must be a valid UUID and is stored in canonical form. Plain BTREE
+primary and unique keys are supported; prefix lengths are rejected. The MySQL
+protocol advertises the column as `VARCHAR`/`VAR_STRING` of 36 characters
+because there is no UUID type code, and both the text and binary protocols
+send the canonical text. Row-based binlog uses the same 36-character text as
+`VARCHAR(36)` so a MySQL replica can store the value as a string. That wire
+shape is not native MySQL UUID-column compatibility.
+
+```sql
+CREATE TABLE sessions (
+    id    UUID PRIMARY KEY,
+    label VARCHAR(32) NOT NULL
+);
+
+INSERT INTO sessions VALUES
+    ('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11', 'canonical'),
+    (UUID_TO_BIN('6ccd780c-baba-1026-9564-5b8c656024db'), 'from-bin');
+```
+
+## 12. Indexes and Type Selection
 
 | Data shape | Recommended type | Indexing advice |
 | --- | --- | --- |
@@ -381,12 +431,13 @@ function rather than rely on the internal byte order of the raw column.
 | Documents | `JSON` | generated columns, functional indexes, or MVI; do not index JSONB directly |
 | Coordinates and shapes | a concrete geometry subtype + `SRID` | single-column SPATIAL index |
 | embedding | fixed-dimension `VECTOR(n) NOT NULL` | exact scan for small data, HNSW/IVF for large data |
+| 128-bit identifier | `UUID` | BTREE primary or unique key on the 16-byte identity |
 
 The type, character set, collation, unsigned attribute, and declared precision of an index key
 are all SQL semantics. Changing these attributes affects comparison order, uniqueness, or
 index encoding and cannot be treated as a pure metadata change.
 
-## 12. Type Conversion and `sql_mode`
+## 13. Type Conversion and `sql_mode`
 
 Column writes, `CAST`, prepared statement parameters, `LOAD DATA`, default backfill, and
 ALTER COPY share the same core conversion rules. The main behaviors:
@@ -429,7 +480,7 @@ such as precision/scale, `UNSIGNED`, `ZEROFILL`, ENUM/SET members, and vector di
 Clients also receive the corresponding wire type, length, decimals, collation, and flags
 through the MySQL column definition packet.
 
-## 13. Complete Example
+## 14. Complete Example
 
 ```sql
 CREATE TABLE products (

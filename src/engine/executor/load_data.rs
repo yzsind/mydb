@@ -6013,7 +6013,7 @@ fn build_coercion_plan(table: &TableSchema, column_indexes: &[usize]) -> Vec<Coe
                     column: col.name.clone(),
                     charset: col.charset.clone(),
                 },
-                DataTypeKind::Json => CoercionOp::PassThroughString,
+                DataTypeKind::Json | DataTypeKind::Uuid => CoercionOp::PassThroughString,
                 // Geometry is loaded as raw text (WKT) or bytes (WKB/internal)
                 // and coerced to internal form by the column constraint path.
                 DataTypeKind::Geometry { .. } => CoercionOp::PassThroughString,

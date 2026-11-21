@@ -259,7 +259,8 @@ fn value_to_literal(v: &Value) -> crate::parser::Literal {
         | Value::Time(_)
         | Value::DateTime(_)
         | Value::Timestamp(_)
-        | Value::Year(_) => Literal::String(v.to_display_string()),
+        | Value::Year(_)
+        | Value::Uuid(_) => Literal::String(v.to_display_string()),
         // JSON is opaque to the selectivity estimator; route to L3.
         Value::Json(_) => Literal::Null,
     }

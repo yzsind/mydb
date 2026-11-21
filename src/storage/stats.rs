@@ -2005,6 +2005,10 @@ pub(crate) fn stats_hash_value(value: &Value) -> u64 {
             hasher.write_u8(11);
             hasher.write_u8(*value);
         }
+        Value::Uuid(bytes) => {
+            hasher.write_u8(12);
+            hasher.write_bytes(bytes);
+        }
     }
     hasher.finish()
 }
@@ -2259,6 +2263,7 @@ fn estimated_value_width(value: &Value) -> u64 {
         Value::SmallString(value) => value.len() as u64,
         Value::Bytes(value) | Value::Json(value) | Value::Geometry(value) => value.len() as u64,
         Value::Vector(value) => value.len() as u64 * std::mem::size_of::<f32>() as u64,
+        Value::Uuid(_) => 16,
     }
 }
 

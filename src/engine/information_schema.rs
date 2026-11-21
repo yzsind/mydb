@@ -6008,6 +6008,9 @@ fn innodb_column_mtype(data_type: &DataTypeKind) -> i64 {
         DataTypeKind::Double { .. } => 10,
         DataTypeKind::Decimal { .. } => 11,
         DataTypeKind::Geometry { .. } | DataTypeKind::Vector { .. } => 14,
+        // Not an InnoDB type. Report the binary family so catalog length
+        // math stays on the 16-byte identity.
+        DataTypeKind::Uuid => 3,
     }
 }
 

@@ -1413,6 +1413,7 @@ fn ctas_data_type_from_kind(
         K::DateTime { fsp } => DataType::DateTime { fsp: *fsp },
         K::Timestamp { fsp } => DataType::Timestamp { fsp: *fsp },
         K::Year => DataType::Year,
+        K::Uuid => DataType::Uuid,
         K::Json => DataType::Json,
         K::Geometry { subtype, srid } => DataType::Geometry(*subtype, *srid),
         K::Vector { dim, datatype } => DataType::Vector(*dim, *datatype),
@@ -3446,6 +3447,7 @@ fn column_type_to_data_type(
         ColumnType::Timestamp => DataType::Timestamp { fsp },
         ColumnType::Blob => DataType::Blob(lob_max()),
         ColumnType::Json => DataType::Json,
+        ColumnType::Uuid => DataType::Uuid,
         ColumnType::Geometry => {
             DataType::Geometry(crate::storage::schema::GeometrySubtype::Geometry, None)
         }

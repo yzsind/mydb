@@ -482,6 +482,7 @@ mod triggers;
 mod tx;
 mod union_derived_pushdown;
 mod update_delta;
+mod uuid_column;
 mod vec_routing;
 mod vector_bench;
 mod vector_datatypes;

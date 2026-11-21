@@ -3361,6 +3361,7 @@ fn coerce_value_with_unsigned(
                 Value::Json(b) => crate::engine::json::unquote_text(&b),
                 Value::Geometry(b) => crate::engine::geo::to_text(&b),
                 Value::Vector(b) => crate::engine::vector::to_text(&b),
+                Value::Uuid(bytes) => crate::engine::uuid::format_text(&bytes),
                 Value::Null => return Ok(Value::Null),
                 // Other binary variants: re-emit canonical ASCII so
                 // the precision validator sees a stable shape. The
@@ -3451,6 +3452,7 @@ fn coerce_value_with_unsigned(
         DataTypeKind::Vector { dim, datatype } => Ok(Value::Vector(
             crate::engine::vector::codec::coerce_value(value, *datatype, *dim)?,
         )),
+        DataTypeKind::Uuid => crate::engine::uuid::coerce_assignment(value, column),
         DataTypeKind::Blob { max_len } => {
             let mut bytes = match value {
                 Value::Bytes(v) => v,
@@ -4507,6 +4509,7 @@ fn index_key_part_max_bytes(column: &ColumnSchema, prefix_len: Option<usize>) ->
             12 + datatype.payload_len(dim.unwrap_or(datatype.max_dimension())) as u64
         }
         DataTypeKind::Json | DataTypeKind::Geometry { .. } => 0,
+        DataTypeKind::Uuid => 16,
     }
 }
 
@@ -5311,6 +5314,17 @@ fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
                 }
             }
         }
+    }
+    if matches!(data_type, DataTypeKind::Uuid)
+        && (column.unsigned || column.zerofill || column.auto_increment)
+    {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_FIELD_SPEC,
+            format!(
+                "UUID column '{}' cannot be UNSIGNED, ZEROFILL, or AUTO_INCREMENT",
+                column.name
+            ),
+        ));
     }
     let mut schema = ColumnSchema {
         not_null_from_scn: 0,

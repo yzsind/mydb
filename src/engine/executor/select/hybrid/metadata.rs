@@ -251,6 +251,7 @@ pub(super) fn ordered_json(value: &Value) -> serde_json::Value {
         Value::Json(_) => "JSON",
         Value::Geometry(_) => "GEOMETRY",
         Value::Vector(_) => "VECTOR",
+        Value::Uuid(_) => "UUID",
     };
     let encoded = match value {
         Value::Decimal(_)

@@ -236,7 +236,7 @@ pub(crate) fn implicit_default_for_type(kind: &crate::storage::DataTypeKind) -> 
         }
         K::Time { .. } => Value::String("00:00:00".to_string()),
         K::Enum { values } => Value::String(values.first().cloned().unwrap_or_default()),
-        K::Json | K::Geometry { .. } | K::Vector { .. } => return None,
+        K::Json | K::Geometry { .. } | K::Vector { .. } | K::Uuid => return None,
     })
 }
 

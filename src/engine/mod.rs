@@ -93,6 +93,7 @@ pub mod sysvar;
 pub(crate) mod table_stats_view;
 pub(crate) mod time_locale;
 pub(crate) mod tz;
+pub(crate) mod uuid;
 pub(crate) mod vector;
 
 pub use crate::types::{Column, ColumnType, QueryError, Value};

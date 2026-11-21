@@ -1066,6 +1066,7 @@ fn fnv_hash_value(value: &Value) -> u64 {
         Value::Json(b) => fnv_hash_bytes(b),
         Value::Geometry(b) => fnv_hash_bytes(b),
         Value::Vector(b) => fnv_hash_bytes(b),
+        Value::Uuid(bytes) => fnv_hash_bytes(bytes),
     }
 }
 

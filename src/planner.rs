@@ -15699,7 +15699,9 @@ fn numeric_stat_value_opt(value: &Value) -> Option<f64> {
             Some(*micros as f64 / 1_000_000.0)
         }
         Value::Year(b) => Some(1900.0 + *b as f64),
-        Value::Json(_) | Value::Geometry(_) | Value::Vector(_) | Value::Null => None,
+        Value::Json(_) | Value::Geometry(_) | Value::Vector(_) | Value::Uuid(_) | Value::Null => {
+            None
+        }
     }
 }
 
@@ -15741,6 +15743,7 @@ fn numeric_stat_value(value: &Value) -> f64 {
         Value::Json(b) => crate::engine::json::coerce_f64(b),
         Value::Geometry(_) => 0.0,
         Value::Vector(_) => 0.0,
+        Value::Uuid(_) => 0.0,
         Value::Null => 0.0,
     })
 }
@@ -16727,6 +16730,7 @@ fn index_in_lookup_preserves_comparison(
             | crate::storage::ParamTarget::Time
             | crate::storage::ParamTarget::DateTime
             | crate::storage::ParamTarget::Timestamp
+            | crate::storage::ParamTarget::Uuid
     ) {
         return values.iter().all(|v| match v {
             PlanConstraintValue::Concrete(v) => KeyPart::for_target(v.clone(), target).is_ok(),

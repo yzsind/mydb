@@ -686,6 +686,7 @@ fn encode_mvcc_row(
             Value::Bytes(b) => b.len() + 5,
             Value::Json(b) | Value::Geometry(b) => b.len() + 5,
             Value::Vector(b) => b.len() + 17,
+            Value::Uuid(_) => 17,
         };
     }
     let estimated = mvcc_header_len(&header) + 3 + value_bytes_est;
@@ -1199,6 +1200,7 @@ const TAG_VECTOR: u8 = 15;
 const TAG_TIMESTAMP: u8 = 16;
 const TAG_DECIMAL128: u8 = 17;
 const TAG_DECIMAL_WIDE: u8 = 18;
+const TAG_UUID: u8 = 19;
 // NOTE: off-page (externalized) BLOB/TEXT does NOT add a Phase A tag.
 // The undo log stores externalized columns as `Value::Null` in this
 // self-describing value section and carries their `LobRef` descriptors
@@ -1289,6 +1291,10 @@ pub(crate) fn encode_row_into(values: &[Value], out: &mut Vec<u8>) -> Result<(),
             Value::Json(b) => write_var_bytes(out, TAG_JSON, b)?,
             Value::Geometry(b) => write_var_bytes(out, TAG_GEOMETRY, b)?,
             Value::Vector(b) => write_var_bytes(out, TAG_VECTOR, &b.encode())?,
+            Value::Uuid(bytes) => {
+                out.push(TAG_UUID);
+                out.extend_from_slice(bytes);
+            }
         }
     }
     Ok(())
@@ -1327,6 +1333,7 @@ pub(crate) fn encoded_row_len(values: &[Value]) -> Result<usize, QueryError> {
             Value::Json(b) => checked_var_value_len(b.len())?,
             Value::Geometry(b) => checked_var_value_len(b.len())?,
             Value::Vector(b) => checked_var_value_len(b.len() + 12)?,
+            Value::Uuid(_) => 1 + 16,
         };
         len = len.checked_add(added).ok_or_else(|| {
             error(
@@ -1594,6 +1601,12 @@ fn read_value_by_tag(input: &[u8], pos: &mut usize, tag: u8) -> Result<Value, Qu
         TAG_VECTOR => Ok(Value::Vector(crate::engine::vector::codec::decode_value(
             &read_var_bytes(input, pos)?,
         )?)),
+        TAG_UUID => {
+            let bytes = read_exact(input, pos, 16)?;
+            let mut uuid = [0u8; 16];
+            uuid.copy_from_slice(bytes);
+            Ok(Value::Uuid(uuid))
+        }
         _ => Err(error(
             crate::error::catalog::ER_GET_ERRNO,
             "unknown row value tag",
@@ -1613,6 +1626,10 @@ fn skip_value_by_tag(input: &[u8], pos: &mut usize, tag: u8) -> Result<(), Query
         }
         TAG_FLOAT | TAG_DATE => {
             read_exact(input, pos, 4)?;
+            Ok(())
+        }
+        TAG_UUID => {
+            read_exact(input, pos, 16)?;
             Ok(())
         }
         TAG_DECIMAL | TAG_BYTES | TAG_STRING | TAG_JSON | TAG_GEOMETRY | TAG_VECTOR => {
@@ -1956,6 +1973,10 @@ pub(crate) enum ColumnKind {
     Timestamp { fsp: u8 },
     #[serde(rename = "21")]
     Year,
+    /// Fixed 16-byte UUID identity. Distinct from `FixedBytes` so reads
+    /// rebuild [`Value::Uuid`] rather than an untyped binary string.
+    #[serde(rename = "22")]
+    Uuid,
 }
 
 /// Cached encode/decode plan for one table. The `columns` vector is keyed
@@ -2273,6 +2294,7 @@ fn column_kind_for(ty: &DataTypeKind, unsigned: bool) -> ColumnKind {
         DataTypeKind::DateTime { fsp } => ColumnKind::DateTime { fsp: *fsp },
         DataTypeKind::Timestamp { fsp } => ColumnKind::Timestamp { fsp: *fsp },
         DataTypeKind::Year => ColumnKind::Year,
+        DataTypeKind::Uuid => ColumnKind::Uuid,
     }
 }
 
@@ -2415,6 +2437,7 @@ fn fixed_width_for_kind(kind: &ColumnKind) -> Option<usize> {
         ColumnKind::Time { fsp } => temporal_width(*fsp, 3),
         ColumnKind::DateTime { fsp } | ColumnKind::Timestamp { fsp } => temporal_width(*fsp, 5),
         ColumnKind::Year => 1,
+        ColumnKind::Uuid => 16,
         ColumnKind::FixedBytes { width } => *width,
         ColumnKind::Bit { width } => *width,
         ColumnKind::VectorFixed { dim, datatype } => datatype.payload_len(*dim),
@@ -4303,7 +4326,9 @@ fn fast_op_for_kind(kind: &ColumnKind) -> (u8, u8, u8) {
             };
             (op, width as u8, *fsp)
         }
-        ColumnKind::Enum { .. } | ColumnKind::Set { .. } => (OP_FALLBACK, 0, 0),
+        ColumnKind::Enum { .. } | ColumnKind::Set { .. } | ColumnKind::Uuid => {
+            (OP_FALLBACK, 0, 0)
+        }
         ColumnKind::Decimal { scale } => (OP_VAR_DECIMAL, 0, *scale),
         ColumnKind::DecimalWide { scale } => (OP_VAR_DECIMAL_WIDE, 0, *scale),
         ColumnKind::VarString => (OP_VAR_STRING, 0, 0),
@@ -4753,6 +4778,15 @@ fn encode_fixed_for_kind(
                 _ => 0,
             };
         }
+        ColumnKind::Uuid => {
+            let bytes = crate::engine::uuid::identity(value).ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
+                    "incorrect uuid value",
+                )
+            })?;
+            out.copy_from_slice(&bytes);
+        }
         ColumnKind::FixedBytes { width } => {
             // Borrowed-byte fast path. Profile of LOAD DATA lineitem
             // showed `value_to_bytes` as the heaviest memmove source
@@ -4880,6 +4914,15 @@ fn decode_fixed_for_kind(kind: &ColumnKind, input: &[u8]) -> Result<Value, Query
         ColumnKind::DateTime { fsp } => Ok(Value::DateTime(decode_datetime_micros(input, *fsp)?)),
         ColumnKind::Timestamp { fsp } => Ok(Value::Timestamp(decode_datetime_micros(input, *fsp)?)),
         ColumnKind::Year => Ok(Value::Year(input[0])),
+        ColumnKind::Uuid => {
+            let bytes: [u8; 16] = input.try_into().map_err(|_| {
+                error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "invalid uuid payload",
+                )
+            })?;
+            Ok(Value::Uuid(bytes))
+        }
         ColumnKind::FixedBytes { .. } => Ok(Value::Bytes(input.to_vec())),
         ColumnKind::Bit { .. } => {
             // Reassemble the big-endian bytes into the integer BIT value.
@@ -5472,6 +5515,7 @@ fn value_to_f32(v: &Value) -> f32 {
         Value::Json(b) => crate::engine::json::coerce_f64(b) as f32,
         Value::Geometry(_) => 0.0,
         Value::Vector(_) => 0.0,
+        Value::Uuid(_) => 0.0,
         Value::Null => 0.0,
     }
 }
@@ -5505,6 +5549,7 @@ fn value_to_f64(v: &Value) -> f64 {
         Value::Json(b) => crate::engine::json::coerce_f64(b),
         Value::Geometry(_) => 0.0,
         Value::Vector(_) => 0.0,
+        Value::Uuid(_) => 0.0,
         Value::Null => 0.0,
     }
 }
@@ -5537,7 +5582,8 @@ fn value_to_string_bytes(v: &Value) -> Vec<u8> {
         | Value::Time(_)
         | Value::DateTime(_)
         | Value::Timestamp(_)
-        | Value::Year(_) => v.to_display_string().into_bytes(),
+        | Value::Year(_)
+        | Value::Uuid(_) => v.to_display_string().into_bytes(),
     }
 }
 
@@ -5559,6 +5605,7 @@ fn value_to_bytes(v: &Value) -> Vec<u8> {
         Value::Geometry(b) => b.clone(),
         // Vector flowing into a binary column keeps its internal bytes.
         Value::Vector(b) => b.payload.clone(),
+        Value::Uuid(bytes) => bytes.to_vec(),
         Value::DecimalCompact(..)
         | Value::Decimal128(..)
         | Value::DecimalWide(..)
@@ -5786,6 +5833,7 @@ fn encode_int_bytes(value: &Value, width: u8, signed: bool) -> Result<[u8; 16], 
         Value::Json(b) => crate::engine::json::coerce_i64(b) as i128,
         Value::Geometry(_) => 0,
         Value::Vector(_) => 0,
+        Value::Uuid(_) => 0,
         Value::Null => 0,
     };
     let (lo, hi) = int_range(width, signed);
@@ -5942,6 +5990,7 @@ fn parse_decimal_to_magnitude_from_value(
         }
         Value::Geometry(_) => Ok((false, 0)),
         Value::Vector(_) => Ok((false, 0)),
+        Value::Uuid(_) => Ok((false, 0)),
         Value::Null => Ok((false, 0)),
     }
 }

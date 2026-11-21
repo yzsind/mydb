@@ -33,6 +33,7 @@ const VALUE_INT32: u8 = 21;
 const VALUE_UINT8: u8 = 22;
 const VALUE_UINT16: u8 = 23;
 const VALUE_UINT32: u8 = 24;
+const VALUE_UUID: u8 = 25;
 
 #[inline]
 pub(crate) fn write_int<W: Write>(writer: &mut W, value: i64) -> std::io::Result<()> {
@@ -216,6 +217,7 @@ pub(crate) fn value_tag(v: &Value) -> u8 {
         Value::Json(_) => VALUE_JSON,
         Value::Geometry(_) => VALUE_GEOMETRY,
         Value::Vector(_) => VALUE_VECTOR,
+        Value::Uuid(_) => VALUE_UUID,
     }
 }
 
@@ -251,6 +253,7 @@ pub(crate) fn write_value_payload<W: Write>(w: &mut W, v: &Value) -> std::io::Re
         Value::Json(b) => write_bytes(w, b),
         Value::Geometry(b) => write_bytes(w, b),
         Value::Vector(b) => write_bytes(w, &b.encode()),
+        Value::Uuid(bytes) => w.write_all(bytes),
     }
 }
 
@@ -434,6 +437,11 @@ pub(crate) fn read_payload_limited<R: Read>(
         VALUE_VECTOR => Value::Vector(crate::engine::vector::codec::decode_value(
             &read_bytes_accounted(r, budget.as_deref_mut(), available).map_err(io_err)?,
         )?),
+        VALUE_UUID => {
+            let mut bytes = [0u8; 16];
+            r.read_exact(&mut bytes).map_err(io_err)?;
+            Value::Uuid(bytes)
+        }
         other => {
             return Err(crate::storage::error(
                 crate::error::catalog::ER_UNKNOWN_ERROR,
@@ -517,6 +525,7 @@ mod tests {
             Value::Json(vec![1, 2]),
             Value::Geometry(vec![3, 4]),
             Value::Vector(vec![5, 6, 0, 0].into()),
+            Value::Uuid([0x11; 16]),
         ];
         for value in values {
             let mut encoded = Vec::new();
