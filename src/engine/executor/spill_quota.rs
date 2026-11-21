@@ -1825,7 +1825,9 @@ mod tests {
     fn release_audit_temp_disk_error_classification() {
         let storage_full = io::Error::from(io::ErrorKind::StorageFull);
         let err = query_error_from_io(&storage_full).unwrap();
-        assert!(is_temp_disk_full(&err.map_message(|_| "spill is full".to_owned())));
+        assert!(is_temp_disk_full(
+            &err.map_message(|_| "spill is full".to_owned())
+        ));
         let unrelated = crate::error::catalog::ER_OUT_OF_RESOURCES.error("out of temp disk space:");
         assert!(!is_temp_disk_full(&unrelated));
     }
