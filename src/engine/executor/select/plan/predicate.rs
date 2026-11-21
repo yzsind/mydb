@@ -2243,6 +2243,7 @@ pub(in crate::engine::executor::select) fn value_to_f64_fast(value: &Value) -> O
         Value::Json(b) => Some(crate::engine::json::coerce_f64(b)),
         Value::Geometry(_) => None,
         Value::Vector(_) => None,
+        Value::Uuid(bytes) => crate::util::uuid::format(bytes).parse::<f64>().ok(),
     }
 }
 

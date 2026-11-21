@@ -6814,6 +6814,7 @@ pub(super) fn data_type_kind_for_column_type(column_type: ColumnType) -> DataTyp
             max_len: crate::storage::schema::DEFAULT_LOB_MAX,
         },
         ColumnType::Json => DataTypeKind::Json,
+        ColumnType::Uuid => DataTypeKind::Uuid,
         ColumnType::Geometry => DataTypeKind::Geometry {
             subtype: crate::storage::schema::GeometrySubtype::Geometry,
             srid: None,

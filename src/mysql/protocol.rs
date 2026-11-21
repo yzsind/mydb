@@ -1287,6 +1287,7 @@ fn estimate_text_value_bytes(value: &Value) -> usize {
         Value::Json(b) => 9 + b.len(),
         Value::Geometry(b) => 9 + b.len(),
         Value::Vector(b) => 9 + b.dimension as usize * 4,
+        Value::Uuid(_) => 9 + 36,
     }
 }
 
@@ -1383,6 +1384,7 @@ fn estimate_binary_value_bytes(value: &Value) -> usize {
         Value::Json(b) => 9 + b.len(),
         Value::Geometry(b) => 9 + b.len(),
         Value::Vector(b) => 9 + b.dimension as usize * 4,
+        Value::Uuid(_) => 9 + 36,
     }
 }
 
@@ -1610,6 +1612,12 @@ pub fn binary_row_packet_into_with_charset(
             Value::Geometry(b) => write_lenenc_string(payload, b),
             // Native VECTOR clients expect little-endian FLOAT32 coordinates.
             Value::Vector(b) => write_lenenc_vector(payload, b),
+            // Canonical text. MySQL has no UUID binary protocol layout.
+            Value::Uuid(bytes) => {
+                let mut buf = Vec::with_capacity(36);
+                crate::util::uuid::append_ascii(bytes, &mut buf);
+                write_lenenc_string(payload, &buf);
+            }
         }
     }
 }
@@ -2835,6 +2843,11 @@ fn write_text_value_inner(
         // the same; clients render via ST_AsText / ST_AsWKB).
         Value::Geometry(b) => write_lenenc_string(payload, b),
         Value::Vector(b) => write_lenenc_vector(payload, b),
+        Value::Uuid(bytes) => {
+            let mut buf = Vec::with_capacity(36);
+            crate::util::uuid::append_ascii(bytes, &mut buf);
+            write_lenenc_string(payload, &buf);
+        }
     }
 }
 
@@ -2903,6 +2916,9 @@ fn column_type_metadata(column_type: ColumnType) -> (u32, u8, u16) {
         // (see the BIT arms in the text/binary row encoders and the
         // binary-charset default below).
         ColumnType::Bit { bits } => (bits as u32, 0, BINARY_FLAG | UNSIGNED_FLAG),
+        // Canonical ASCII text is 36 bytes. This is a mydb extension wire
+        // shape, not a MySQL UUID type code.
+        ColumnType::Uuid => (36, 0, 0),
         ColumnType::VarString => (65_535, 0, 0),
     }
 }
@@ -2989,7 +3005,7 @@ pub fn column_definition_packet_full_into_with_fallback(
         BINARY_COLLATION
     } else {
         source.collation_id.unwrap_or(match column_type {
-            ColumnType::VarString => {
+            ColumnType::VarString | ColumnType::Uuid => {
                 if fallback_collation == 0 {
                     DEFAULT_UTF8MB4_COLLATION
                 } else {
@@ -3067,7 +3083,7 @@ pub fn column_definition_packet_full_into_with_fallback(
         ColumnType::Vector => MYSQL_TYPE_VECTOR,
         ColumnType::Bit { .. } => MYSQL_TYPE_BIT,
         ColumnType::VarString if source.flags & (ENUM_FLAG | SET_FLAG) != 0 => MYSQL_TYPE_STRING,
-        ColumnType::VarString => MYSQL_TYPE_VAR_STRING,
+        ColumnType::VarString | ColumnType::Uuid => MYSQL_TYPE_VAR_STRING,
     }));
     // Source flags take precedence — they carry ENUM_FLAG / SET_FLAG /
     // UNSIGNED_FLAG / NOT_NULL_FLAG / PRI_KEY_FLAG / AUTO_INCREMENT_FLAG

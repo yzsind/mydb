@@ -2149,6 +2149,7 @@ fn row_layout_fixed_len(data_type: &DataTypeKind) -> Option<usize> {
         }
         DataTypeKind::Binary { len } => len.unwrap_or(1),
         DataTypeKind::Bit { len } => len.unwrap_or(1).div_ceil(8),
+        DataTypeKind::Uuid => 16,
         DataTypeKind::Vector {
             dim: Some(dim),
             datatype,
@@ -3106,6 +3107,9 @@ pub enum DataTypeKind {
     Set { values: Vec<String> },
     #[serde(rename = "Bit")]
     Bit { len: Option<usize> },
+    /// mydb `UUID` extension. Fixed 16-byte identity, not a MySQL type.
+    #[serde(rename = "Uuid")]
+    Uuid,
 }
 
 /// Convert result-set metadata back into the in-memory type descriptor used by
@@ -3189,6 +3193,7 @@ fn data_type_kind_for_column_type(
         ColumnType::Bit { bits } => DataTypeKind::Bit {
             len: Some(bits as usize),
         },
+        ColumnType::Uuid => DataTypeKind::Uuid,
         ColumnType::VarString => DataTypeKind::Text {
             max_len: length.unwrap_or(DEFAULT_LOB_MAX),
         },
@@ -3229,6 +3234,9 @@ pub enum ParamTarget {
     DateTime,
     Timestamp,
     Year,
+    /// 16-byte UUID identity. Resolved probes are `KeyPart::Bytes` of that
+    /// identity so they compare with persisted index entries.
+    Uuid,
     /// Search-only deferred LIKE bound. It is resolved by the storage range
     /// boundary (which may remove the bound entirely for an unanchored
     /// pattern), never persisted as an index key part.
@@ -3636,6 +3644,7 @@ impl ParamTarget {
             // `ParamTarget::Bytes` would have produced a `KeyPart::Bytes`
             // (the ASCII text of the number), never matching the stored key.
             DataTypeKind::Bit { .. } => ParamTarget::UInt,
+            DataTypeKind::Uuid => ParamTarget::Uuid,
         }
     }
 }
@@ -3999,6 +4008,15 @@ impl KeyPart {
                 KeyPart::DateTime(micros)
             }
             ParamTarget::Year => KeyPart::Year(value_to_year_byte(&value)),
+            ParamTarget::Uuid => {
+                let bytes = crate::engine::uuid::identity(&value).ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_WRONG_VALUE_FOR_TYPE,
+                        "incorrect uuid value",
+                    )
+                })?;
+                KeyPart::Bytes(bytes.to_vec())
+            }
             ParamTarget::LikePattern { .. } => {
                 return Err(error(
                     crate::error::catalog::ER_GET_ERRNO,
@@ -4061,6 +4079,7 @@ fn value_to_int_lossy(v: &Value) -> i64 {
         Value::Json(b) => crate::engine::json::coerce_i64(b),
         Value::Geometry(_) => 0,
         Value::Vector(_) => 0,
+        Value::Uuid(_) => 0,
         Value::Null => 0,
     }
 }
@@ -4106,6 +4125,7 @@ fn value_to_uint_lossy(v: &Value) -> u64 {
         Value::Json(b) => crate::engine::json::coerce_i64(b).max(0) as u64,
         Value::Geometry(_) => 0,
         Value::Vector(_) => 0,
+        Value::Uuid(_) => 0,
         Value::Null => 0,
     }
 }
@@ -4138,6 +4158,7 @@ fn value_to_f64_lossy(v: &Value) -> f64 {
         Value::Json(b) => crate::engine::json::coerce_f64(b),
         Value::Geometry(_) => 0.0,
         Value::Vector(_) => 0.0,
+        Value::Uuid(_) => 0.0,
         Value::Null => 0.0,
     }
 }
@@ -4312,6 +4333,7 @@ fn decimal_keypart_for_value(v: &Value, precision: u8, scale: u8) -> Result<KeyP
         | Value::Year(_)
         | Value::Geometry(_) => 0,
         Value::Vector(_) => 0,
+        Value::Uuid(_) => 0,
     };
     if precision > 38 {
         Ok(KeyPart::DecimalWide {
@@ -4813,6 +4835,7 @@ impl TableSchema {
             }
             DataTypeKind::Binary { len } | DataTypeKind::VarBinary { len } => len.map(|n| n as u32),
             DataTypeKind::Bit { len } => len.map(|n| n as u32),
+            DataTypeKind::Uuid => Some(36),
             // TEXT/BLOB families already store their declared byte cap in
             // the catalog.  Preserve it in plan-bound protocol metadata so
             // schema-sensitive expressions (for example UNHEX(LONGTEXT)) do
@@ -5509,6 +5532,7 @@ impl DataTypeKind {
             | DataTypeKind::Binary { .. }
             | DataTypeKind::VarBinary { .. } => ColumnType::Blob,
             DataTypeKind::Json => ColumnType::Json,
+            DataTypeKind::Uuid => ColumnType::Uuid,
             DataTypeKind::Geometry { .. } => ColumnType::Geometry,
             DataTypeKind::Vector { .. } => ColumnType::Vector,
             DataTypeKind::Char { .. }
@@ -5578,6 +5602,7 @@ impl DataTypeKind {
             }
             DataTypeKind::Set { values } => ((values.len().max(1) + 7) / 8).min(8),
             DataTypeKind::Bit { len } => (len.unwrap_or(1) + 7) / 8,
+            DataTypeKind::Uuid => 16,
         }
     }
 }
@@ -5641,6 +5666,7 @@ impl From<DataType> for DataTypeKind {
             // means BIT(1). Normalizing zero here made an invalid definition
             // indistinguishable from the valid default form.
             DataType::Bit(len) => Self::Bit { len },
+            DataType::Uuid => Self::Uuid,
         }
     }
 }
@@ -5701,6 +5727,7 @@ impl KeyPart {
             Value::DateTime(dt) => Self::DateTime(*dt),
             Value::Timestamp(dt) => Self::DateTime(*dt),
             Value::Year(y) => Self::Year(*y),
+            Value::Uuid(bytes) => Self::Bytes(bytes.to_vec()),
         }
     }
 
@@ -5738,6 +5765,15 @@ impl KeyPart {
                 }
             };
         }
+        if matches!(data_type, DataTypeKind::Uuid) {
+            return match value {
+                Value::Null => Self::Null,
+                other => match crate::engine::uuid::identity(other) {
+                    Some(bytes) => Self::Bytes(bytes.to_vec()),
+                    None => Self::from_value(other),
+                },
+            };
+        }
         if let DataTypeKind::Decimal { precision, scale } = data_type {
             return decimal_keypart_for_value(value, precision.unwrap_or(10), scale.unwrap_or(0))
                 .unwrap_or_else(|_| Self::from_value(value));
@@ -5772,7 +5808,15 @@ impl KeyPart {
                     scale: *scale,
                 }))
             }
-            KeyPart::Bytes(b) => Value::Bytes(b.clone()),
+            KeyPart::Bytes(b) => {
+                if matches!(data_type, DataTypeKind::Uuid) && b.len() == 16 {
+                    let mut bytes = [0u8; 16];
+                    bytes.copy_from_slice(b);
+                    Value::Uuid(bytes)
+                } else {
+                    Value::Bytes(b.clone())
+                }
+            }
             KeyPart::String(s) => match data_type {
                 DataTypeKind::Decimal { .. } => Value::Decimal(s.clone()),
                 DataTypeKind::Char { len } => {

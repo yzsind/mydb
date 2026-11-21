@@ -88,6 +88,7 @@ impl EncodedBytes for Value {
                 5usize.saturating_add(value.len())
             }
             Value::Vector(value) => 5usize.saturating_add(value.len()),
+            Value::Uuid(_) => 17,
         }
     }
 }

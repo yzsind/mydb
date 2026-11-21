@@ -1820,6 +1820,7 @@ pub(crate) fn estimate_undo_record_bytes(record: &UndoRecord) -> u64 {
                 Value::Date(_) => 1 + 4,
                 Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_) => 1 + 8,
                 Value::Year(_) => 1 + 1,
+                Value::Uuid(_) => 1 + 16,
             };
         }
     }

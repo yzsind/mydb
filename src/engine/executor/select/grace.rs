@@ -66,6 +66,7 @@ fn write_col_type<W: Write>(w: &mut W, ct: ColumnType) -> std::io::Result<()> {
         ColumnType::MediumInt => w.write_all(&[16]),
         ColumnType::Year => w.write_all(&[17]),
         ColumnType::Bit { bits } => w.write_all(&[18, bits]),
+        ColumnType::Uuid => w.write_all(&[19]),
     }
 }
 
@@ -103,6 +104,7 @@ fn read_col_type<R: std::io::Read>(r: &mut R) -> Result<ColumnType, QueryError> 
             r.read_exact(&mut buf).map_err(io_err)?;
             ColumnType::Bit { bits: buf[0] }
         }
+        19 => ColumnType::Uuid,
         other => {
             return Err(crate::storage::error(
                 crate::error::catalog::ER_UNKNOWN_ERROR,
@@ -731,6 +733,7 @@ pub(crate) fn estimate_value_row_bytes(row: &[Value]) -> u64 {
             Value::Date(_) => 4,
             Value::Time(_) | Value::DateTime(_) | Value::Timestamp(_) => 8,
             Value::Year(_) => 1,
+            Value::Uuid(_) => 16,
         });
     }
     bytes

@@ -182,6 +182,11 @@ pub enum ColumnType {
     /// Native VECTOR domain. Datatype and dimension are retained in catalog
     /// and expression metadata; the wire tag remains MYSQL_TYPE_VECTOR.
     Vector,
+    /// mydb `UUID` extension. MySQL has no UUID wire type, so the protocol
+    /// advertises this as a 36-character string (`MYSQL_TYPE_VAR_STRING`)
+    /// carrying the canonical text. The execution value remains
+    /// [`Value::Uuid`].
+    Uuid,
     /// `BIT(M)` — a fixed-width bit field of `M` bits (1..=64). Maps to the
     /// MySQL wire type `MYSQL_TYPE_BIT (0x10)`; the declared bit count is
     /// carried here so the protocol layer can emit the value as a
@@ -272,6 +277,10 @@ pub enum Value {
     /// Heap storage remains compact; the protocol renders canonical array text.
     /// Raw ordering uses the stable typed representation, not similarity.
     Vector(crate::vector::VectorValue),
+    /// 16-byte UUID identity in `UUID_TO_BIN(..., 0)` byte order.
+    /// Display and the text protocol use the canonical lowercase form from
+    /// [`crate::util::uuid::format`].
+    Uuid([u8; 16]),
 }
 
 /// Sentinel value of `Value::Date` for the MySQL zero date `0000-00-00`.
@@ -518,6 +527,7 @@ impl PartialEq for Value {
             (Value::Json(a), Value::Json(b)) => a == b,
             (Value::Geometry(a), Value::Geometry(b)) => a == b,
             (Value::Vector(a), Value::Vector(b)) => a == b,
+            (Value::Uuid(a), Value::Uuid(b)) => a == b,
             _ => false,
         }
     }
@@ -640,6 +650,7 @@ impl Value {
             Value::Json(b) => crate::engine::json::to_text(b),
             Value::Geometry(b) => crate::engine::geo::to_text(b),
             Value::Vector(b) => crate::engine::vector::to_text(b),
+            Value::Uuid(bytes) => crate::util::uuid::format(bytes),
         }
     }
 
@@ -688,6 +699,8 @@ impl Value {
             // Vector is ordered by `vector::compare` (internal-binary order),
             // handled by `compare_values` before this fallback.
             Value::Vector(_) => None,
+            // UUID ordering is the 16-byte identity, handled before this fallback.
+            Value::Uuid(_) => None,
         }
     }
 }

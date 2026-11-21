@@ -3,7 +3,36 @@
 const UNIQUE_SCAN_ENTRIES_PER_KEY: usize = 4;
 
 fn duplicate_entry_error(table: &TableSchema, index: &IndexSchema, key: &IndexKey) -> QueryError {
-    duplicate_entry_error_for_index(&format!("{}.{}", table.name, index.name), key)
+    let rendered = key
+        .0
+        .iter()
+        .enumerate()
+        .map(|(pos, part)| match part {
+            KeyPart::Bytes(bytes) if bytes.len() == 16 && index_part_is_uuid(table, index, pos) => {
+                let mut identity = [0u8; 16];
+                identity.copy_from_slice(bytes);
+                KeyPart::String(crate::engine::uuid::format_text(&identity))
+            }
+            other => other.clone(),
+        })
+        .collect::<Vec<_>>();
+    duplicate_entry_error_for_index(
+        &format!("{}.{}", table.name, index.name),
+        &IndexKey::from(rendered),
+    )
+}
+
+fn index_part_is_uuid(table: &TableSchema, index: &IndexSchema, pos: usize) -> bool {
+    index
+        .columns
+        .get(pos)
+        .and_then(|name| {
+            table
+                .columns
+                .iter()
+                .find(|column| column.name.eq_ignore_ascii_case(name))
+        })
+        .is_some_and(|column| matches!(column.data_type, crate::storage::DataTypeKind::Uuid))
 }
 
 fn duplicate_entry_error_for_index(index_name: &str, key: &IndexKey) -> QueryError {

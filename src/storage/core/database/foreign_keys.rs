@@ -284,6 +284,7 @@ fn fk_types_compatible(
             D::Enum { .. } => 50,
             D::Set { .. } => 51,
             D::Bit { .. } => 60,
+            D::Uuid => 70,
         }
     }
     let is_int = |k: &D| {

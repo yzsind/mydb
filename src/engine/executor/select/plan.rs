@@ -5621,6 +5621,7 @@ pub(super) fn estimate_row_bytes(row: &PlanRow) -> u64 {
             Value::Json(b) => 16 + b.len() as u64,
             Value::Geometry(b) => 16 + b.len() as u64,
             Value::Vector(b) => 16 + b.len() as u64,
+            Value::Uuid(_) => 16,
         });
     }
     bytes

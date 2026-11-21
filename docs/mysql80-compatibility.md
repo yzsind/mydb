@@ -278,6 +278,7 @@ for syntax and operational limits.
 | JSON | ✅/◑ | Binary JSONB, JSON_TABLE/MVI/functions; the internal format is not identical to InnoDB binary JSON |
 | GEOMETRY family | ◑ | SRID+WKB, common functions, and spatial indexes work; see GIS boundaries |
 | VECTOR(n) | ➕ | MySQL 8.0.46 Community Server has no equivalent type |
+| UUID | ➕ | mydb extension; MySQL has no UUID column type. Stored as 16 identity bytes and shown as canonical text. Not a native MySQL UUID column |
 
 The UCA 9.0 collations implemented for SQL use are `utf8mb4_0900_ai_ci` and `utf8mb4_0900_bin`. Other registered `utf8mb4_*0900*` variants, including accent-sensitive and locale-tailored variants, return error 1235 when selected by name or handshake ID and are not marked compiled in collation metadata. They do not silently fall back to approximate Unicode comparisons.
 

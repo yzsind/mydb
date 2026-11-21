@@ -143,6 +143,7 @@ pub(crate) fn compare_value_for_sort(left: &Value, right: &Value, field: SortFie
                     Value::Json(_) => 9,
                     Value::Geometry(_) => 10,
                     Value::Vector(_) => 11,
+                    Value::Uuid(_) => 12,
                 }
             }
             let domains = domain(left).cmp(&domain(right));

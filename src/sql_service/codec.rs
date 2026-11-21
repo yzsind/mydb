@@ -236,6 +236,7 @@ pub fn column(c: &Column) -> Json {
         ColumnType::Vector => ("VECTOR", None, None),
         ColumnType::Bit { .. } => ("BIT", None, None),
         ColumnType::VarString => ("VARCHAR", None, None),
+        ColumnType::Uuid => ("UUID", None, None),
     };
     json!({"name":c.name,"sql_type":kind,"encoding":encoding,"unsigned":c.source.flags&32!=0,"length":c.source.length,"precision":precision,"scale":scale,"decimals":c.source.decimals,"collation_id":c.source.collation_id,"schema":c.source.schema,"table":c.source.table,"org_table":c.source.org_table,"org_name":c.source.org_name,"vector_type":c.source.vector_type.map(|(t,d)|json!({"datatype":t.name(),"dimension":d})),"bits":if let ColumnType::Bit{bits}=c.column_type{Some(bits)}else{None}})
 }

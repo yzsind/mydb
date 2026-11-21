@@ -3377,6 +3377,10 @@ fn hash_value(value: &Value, state: &mut impl Hasher) {
             15_u8.hash(state);
             v.hash(state);
         }
+        Value::Uuid(v) => {
+            16_u8.hash(state);
+            v.hash(state);
+        }
     }
 }
 
@@ -4796,6 +4800,7 @@ pub(crate) fn in_hash_class(value: &Value) -> Option<InHashClass> {
         Value::Geometry(_) => None,
         // Vector IN-membership routes through `compare_values` too.
         Value::Vector(_) => None,
+        Value::Uuid(_) => None,
     }
 }
 

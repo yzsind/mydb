@@ -76,7 +76,7 @@ The implemented types include:
 - Character and binary: CHAR/VARCHAR, BINARY/VARBINARY, four TEXT/BLOB sizes, ENUM, SET, BIT.
 - Temporal: DATE, TIME, DATETIME, TIMESTAMP, YEAR, with support for 0–6 fractional-second digits.
 - Structured types: the JSON and GEOMETRY families.
-- mydb extension: `VECTOR(n)`.
+- mydb extension: `VECTOR(n)` and `UUID` (16-byte identity, canonical text; not a MySQL column type).
 
 Character sets, collations, PAD SPACE/NO PAD, binary strings, and the `BINARY` attribute on column definitions all participate in comparisons, sorting, LIKE, functions, and index encoding. `TIMESTAMP` round-trips through UTC using the session `time_zone`, while DATETIME preserves wall-clock time; MySQL 8's default `explicit_defaults_for_timestamp=ON` can be switched to the legacy OFF mode.
 

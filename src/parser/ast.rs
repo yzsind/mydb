@@ -1849,6 +1849,10 @@ pub enum DataType {
     Enum(Vec<String>),
     Set(Vec<String>),
     Bit(Option<usize>),
+    /// mydb extension. MySQL has no native UUID column type. Stored as the
+    /// 16-byte `UUID_TO_BIN` identity (`swap_flag = 0`) and rendered as
+    /// canonical lowercase `8-4-4-4-12` text.
+    Uuid,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]

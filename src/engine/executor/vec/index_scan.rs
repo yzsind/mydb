@@ -709,7 +709,8 @@ fn runtime_int_key_part(value: i128, target: crate::storage::ParamTarget) -> Opt
         | ParamTarget::CollatedCharString { .. }
         | ParamTarget::String
         | ParamTarget::CollatedString { .. }
-        | ParamTarget::LikePattern { .. } => return None,
+        | ParamTarget::LikePattern { .. }
+        | ParamTarget::Uuid => return None,
     };
     KeyPart::for_target(value, target).ok()
 }

@@ -1963,6 +1963,7 @@ pub(crate) fn mysql_type_name_with_attrs(
         DataTypeKind::DateTime { fsp } => format_temporal_with_fsp("datetime", *fsp),
         DataTypeKind::Timestamp { fsp } => format_temporal_with_fsp("timestamp", *fsp),
         DataTypeKind::Year => "year".to_string(),
+        DataTypeKind::Uuid => "uuid".to_string(),
         DataTypeKind::Json => "json".to_string(),
         DataTypeKind::Geometry { subtype, .. } => subtype.type_name().to_string(),
         DataTypeKind::Vector { dim, datatype } => match dim {
@@ -2104,7 +2105,8 @@ pub(crate) fn default_value_sql(value: &Value) -> String {
         | Value::Time(_)
         | Value::DateTime(_)
         | Value::Timestamp(_)
-        | Value::Vector(_) => escape_sql_string_literal(&value_to_string(value)),
+        | Value::Vector(_)
+        | Value::Uuid(_) => escape_sql_string_literal(&value_to_string(value)),
         other => value_to_string(other),
     }
 }

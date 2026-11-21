@@ -4006,6 +4006,7 @@ impl From<&Value> for ValueKey {
             Value::Date(d) => ValueKey::Int(*d as i128),
             Value::Time(t) | Value::DateTime(t) | Value::Timestamp(t) => ValueKey::Int(*t as i128),
             Value::Year(y) => ValueKey::Int(if *y == 0 { 0 } else { 1900 + *y as i128 }),
+            Value::Uuid(bytes) => ValueKey::Bytes(KeyBytes::from_slice(bytes)),
         }
     }
 }
@@ -4170,6 +4171,7 @@ pub(crate) fn write_value_inline_key(value: &Value, out: &mut InlineKeyBuf) {
         Value::Json(v) => push_bytes(out, &crate::engine::json::equality_key(v)),
         Value::Geometry(v) => push_bytes(out, v),
         Value::Vector(v) => push_bytes(out, &v.encode()),
+        Value::Uuid(bytes) => push_bytes(out, bytes),
         Value::DecimalCompact(mag, scale) => {
             push_exact_decimal(out, num_bigint::BigInt::from(*mag), *scale)
         }
@@ -6676,6 +6678,7 @@ where
                 // their year; bare numbers use the 2-digit expansion
                 // (1-69 → 2001-2069, 70-99 → 1970-1999). Valid range is
                 // 1901-2155 plus the literal 0.
+                "UUID" => crate::engine::uuid::coerce_assignment(value, "CAST"),
                 "YEAR" => {
                     let year = match &value {
                         Value::String(s) => lenient_str_to_i64(s)?,
@@ -11824,6 +11827,7 @@ pub(crate) fn int_value(value: &Value) -> Result<i64, QueryError> {
             crate::error::catalog::ER_WRONG_ARGUMENTS,
             "Incorrect arguments to numeric conversion",
         )),
+        Value::Uuid(bytes) => lenient_str_to_i64(&crate::util::uuid::format(bytes)),
         Value::Null => Ok(0),
     }
 }
@@ -15793,6 +15797,7 @@ pub(crate) fn value_bytes_ref(value: &Value) -> std::borrow::Cow<'_, [u8]> {
         // consumers such as HEX(), CRC32(), CAST AS BINARY and hash
         // functions must observe the binary value.
         Value::Bytes(bytes) | Value::Geometry(bytes) => Cow::Borrowed(bytes),
+        Value::Uuid(bytes) => Cow::Borrowed(bytes),
         _ => match str_value(value) {
             Cow::Borrowed(text) => Cow::Borrowed(text.as_bytes()),
             Cow::Owned(text) => Cow::Owned(text.into_bytes()),
@@ -19209,6 +19214,7 @@ pub(crate) fn expr_type_descriptor(expr: &Expr, table: &TableSchema) -> ExprType
             DataTypeKind::Json => ExprTypeClass::Json,
             DataTypeKind::Geometry { .. } => ExprTypeClass::Geometry,
             DataTypeKind::Vector { .. } => ExprTypeClass::Vector,
+            DataTypeKind::Uuid => ExprTypeClass::Text,
             DataTypeKind::Enum { .. } => ExprTypeClass::Enum,
             DataTypeKind::Set { .. } => ExprTypeClass::Set,
             DataTypeKind::Bit { len } => ExprTypeClass::Bit {
@@ -26836,6 +26842,9 @@ pub(crate) fn compare_values(left: &Value, right: &Value) -> Result<Ordering, Qu
         let rb = crate::engine::vector::codec::coerce_comparison_value(right, datatype)?;
         return Ok(crate::engine::vector::compare(&lb, &rb));
     }
+    if matches!(left, Value::Uuid(_)) || matches!(right, Value::Uuid(_)) {
+        return Ok(crate::engine::uuid::compare(left, right));
+    }
     if matches!(left, Value::Time(_))
         && matches!(
             right,
@@ -27944,6 +27953,7 @@ pub(crate) fn truthy(value: &Value) -> bool {
         // Vector has no boolean coercion; treat as false in a logical
         // context (a bare vector is never a truth value in MySQL).
         Value::Vector(_) => false,
+        Value::Uuid(bytes) => string_truthy(&crate::util::uuid::format(bytes)),
     }
 }
 
@@ -28566,6 +28576,7 @@ pub(crate) fn numeric(value: &Value) -> Result<f64, QueryError> {
             crate::error::catalog::ER_WRONG_ARGUMENTS,
             "Incorrect arguments to numeric conversion",
         )),
+        Value::Uuid(bytes) => lenient_str_to_f64(&crate::util::uuid::format(bytes)),
         Value::Null => Ok(0.0),
     }
 }
@@ -28815,6 +28826,7 @@ pub(crate) fn value_to_json(val: &Value) -> serde_json::Value {
         Value::Geometry(b) => crate::engine::geo::json_value(b),
         // A vector serialises to its text in a JSON context.
         Value::Vector(b) => serde_json::Value::String(crate::engine::vector::to_text(b)),
+        Value::Uuid(bytes) => serde_json::Value::String(crate::engine::uuid::format_text(bytes)),
         // Binary temporal / decimal variants serialise as their
         // canonical ASCII form (matches MySQL behaviour for
         // JSON-emitting expressions like JSON_OBJECT(d) on a DATE).

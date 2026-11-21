@@ -738,6 +738,15 @@ fn with_value_bytes<R>(
                 result
             }
         }
+        Value::Uuid(bytes) => {
+            let text = crate::engine::uuid::format_text(bytes);
+            if is_binary_charset(charset) {
+                consume(text.as_bytes())
+            } else {
+                let encoded = encode_text(charset, &text)?;
+                consume_owned_bytes(encoded, consume)
+            }
+        }
         Value::Vector(bytes) => {
             let text = crate::engine::vector::to_text(bytes);
             let text_charge = ControlledMemoryCharge::try_new(

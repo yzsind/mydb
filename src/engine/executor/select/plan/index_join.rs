@@ -6567,6 +6567,7 @@ pub(in crate::engine::executor::select) fn key_part_for_data_type_with_collation
         // Vector keys on its internal bytes (vector columns are indexed
         // via the HNSW graph, not as a plain b-tree key part).
         DataTypeKind::Vector { .. } => KeyPart::from_value(value),
+        DataTypeKind::Uuid => KeyPart::from_value(value),
         DataTypeKind::VarChar { .. } | DataTypeKind::Text { .. } => {
             let text = value_to_string(value);
             match collation {
