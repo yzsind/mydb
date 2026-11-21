@@ -9413,8 +9413,8 @@ pub(super) fn parse_query_hints(text: &str) -> (Vec<QueryHint>, Vec<String>) {
             "HNSW_EF" => {
                 let ef = match args.first() {
                     Some(s) => match s.trim().parse::<u64>() {
-                        Ok(n) => n,
-                        Err(_) => {
+                        Ok(n) if n > 0 => n,
+                        _ => {
                             warnings.push(format!("HNSW_EF: invalid argument \"{s}\""));
                             0
                         }

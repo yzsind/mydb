@@ -14,7 +14,8 @@ pub(crate) struct MappedVectorNavigation {
     source_revision: u64,
     verified: Vec<AtomicU64>,
     records: Option<MappedRecordCache>,
-    norms: Option<MappedNormCache>,
+    norms: Option<MappedScalarCache>,
+    sq8_biases: Option<MappedScalarCache>,
     cache: crate::engine::vector::hnsw_paged::QueryNavCache,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
@@ -105,15 +106,15 @@ impl MappedRecordCache {
     }
 }
 
-/// Optional row-derived scalars share the mapping generation, not a query
-/// key. Zero means unknown; exceptional norms retain the exact wide scorer.
+/// Optional row-derived scalars are scoped to a mapping generation.
+/// Zero is reserved for an uninitialized cell.
 #[derive(Debug)]
-struct MappedNormCache {
+struct MappedScalarCache {
     values: Vec<AtomicU32>,
     _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
-impl MappedNormCache {
+impl MappedScalarCache {
     fn try_new(count: usize, limit: usize) -> Option<Self> {
         use crate::engine::executor::mem_budget::{
             ControlledMemoryCategory, ControlledMemoryCharge,
@@ -168,6 +169,10 @@ impl VectorIndexFile {
         self.mapped_navigation
             .try_write()
             .is_some_and(|mut view| view.take().is_some())
+    }
+
+    pub(crate) fn navigation_write_pending(&self) -> bool {
+        self.navigation_writers.load(Ordering::Acquire) != 0
     }
 
     fn navigation_write(&self) -> VectorNavigationWrite<'_> {
@@ -328,12 +333,27 @@ impl VectorIndexFile {
                     && meta.dim >= 64
             })
             .and_then(|records| {
-                MappedNormCache::try_new(
+                MappedScalarCache::try_new(
                     records.offsets.len(),
                     (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
                         .min(64 * 1024 * 1024),
                 )
             });
+        let sq8_biases = records.as_ref().and_then(|records| {
+            (meta.nav_quant_valid
+                && meta.nav_exact_nodes == 0
+                && geometry.is_none()
+                && meta.dim >= 128
+                && crate::engine::vector::distance::BiasedSq8Dot::supported())
+            .then(|| {
+                MappedScalarCache::try_new(
+                    records.offsets.len(),
+                    (crate::engine::executor::mem_budget::memory_target_bytes() / 256)
+                        .min(8 * 1024 * 1024),
+                )
+            })
+            .flatten()
+        });
         let mapping = MappedVectorNavigation {
             address: image.as_ptr().cast(),
             _mapping: image,
@@ -344,6 +364,7 @@ impl VectorIndexFile {
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
             records,
             norms,
+            sq8_biases,
             cache: QueryNavCache::with_capacity(QUERY_CACHE_MAX_K, cache_entries),
             _charge: charge,
         };
@@ -367,6 +388,12 @@ impl MappedVectorNavigation {
             && self.meta.nav_exact_nodes == 0
             && native_geometry(self.meta.dim as usize).is_none())
         .then_some((self.meta.dim as usize, self.meta.node_count))
+    }
+
+    pub(crate) fn navigation_slot_geometry(&self) -> Option<(usize, usize)> {
+        self.records
+            .as_ref()
+            .map(|records| (records.slots_per_page, records.offsets.len()))
     }
 
     /// Speculative reads must not validate an unrequested node or dereference
@@ -399,15 +426,98 @@ impl MappedVectorNavigation {
         }
     }
 
+    pub(crate) fn prepare_biased_query(
+        &self,
+        codes: &[i8],
+    ) -> Option<crate::engine::vector::distance::BiasedSq8Dot> {
+        self.sq8_biases.as_ref()?;
+        crate::engine::vector::distance::BiasedSq8Dot::try_new(codes)
+    }
+
+    /// Check layer-zero eligibility without touching a node's code or norm.
+    #[inline]
+    pub(crate) fn live_navigation_row(&self, id: VecId) -> Result<Option<RowId>, QueryError> {
+        let (page, offset) = self.record(id)?;
+        let flags = page[offset] & (REC_FLAG_INITIALIZED | REC_FLAG_TOMBSTONE);
+        Ok((flags == REC_FLAG_INITIALIZED).then(|| vec_unpack_row(read_u64(page, offset + 2))))
+    }
+
     /// Called only while VectorIndexFile retains the mapping read guard.
     pub(crate) fn navigation_node(
         &self,
         vid: VecId,
         query_codes: &[i8],
         query_norm: i32,
+        biased: Option<&crate::engine::vector::distance::BiasedSq8Dot>,
     ) -> Result<Option<(RowId, bool, f64)>, QueryError> {
+        Ok(self.navigation_record(vid)?.map(|(row, deleted, codes, norm)| {
+            let dot = if let Some(biased) = biased {
+                biased.dot([codes])[0] - self.sq8_bias(vid, codes)
+            } else {
+                crate::engine::vector::distance::dot_i8(query_codes, codes)
+            };
+            (row, deleted, self.navigation_distance(query_norm, norm, dot))
+        }))
+    }
+
+    pub(crate) fn navigation_nodes4(
+        &self,
+        vids: [VecId; 4],
+        query_codes: &[i8],
+        query_norm: i32,
+        biased: Option<&crate::engine::vector::distance::BiasedSq8Dot>,
+    ) -> Result<[Option<(RowId, bool, f64)>; 4], QueryError> {
+        use crate::engine::vector::distance::{dot_i8, dot_i8_batch4_ptrs};
+        let rows = [
+            self.navigation_record(vids[0])?,
+            self.navigation_record(vids[1])?,
+            self.navigation_record(vids[2])?,
+            self.navigation_record(vids[3])?,
+        ];
+        let dots = if let [Some(a), Some(b), Some(c), Some(d)] = rows {
+            let codes = [a.2, b.2, c.2, d.2];
+            if let Some(biased) = biased {
+                let dots = biased.dot(codes);
+                std::array::from_fn(|lane| dots[lane] - self.sq8_bias(vids[lane], codes[lane]))
+            } else {
+                dot_i8_batch4_ptrs(query_codes, codes)
+            }
+        } else {
+            rows.map(|node| node.map_or(0, |(_, _, codes, _)| dot_i8(query_codes, codes)))
+        };
+        Ok(std::array::from_fn(|index| {
+            rows[index].map(|(row, deleted, _, norm)| {
+                (row, deleted, self.navigation_distance(query_norm, norm, dots[index]))
+            })
+        }))
+    }
+
+    #[inline]
+    fn sq8_bias(&self, vid: VecId, codes: &[i8]) -> i32 {
+        let cell = self.records.as_ref().and_then(|records| records.position(vid))
+            .and_then(|position| self.sq8_biases.as_ref()?.values.get(position));
+        let cached = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
+        if cached != 0 {
+            return (cached ^ 1) as i32;
+        }
+        let bias = 128 * codes.iter().map(|&value| i32::from(value)).sum::<i32>();
+        if let Some(cell) = cell {
+            // Biases are multiples of 128, leaving bit zero for the marker.
+            cell.store(bias as u32 ^ 1, Ordering::Relaxed);
+        }
+        bias
+    }
+
+    #[inline]
+    fn navigation_distance(&self, query_norm: i32, norm: i32, dot: i32) -> f64 {
+        (query_norm + norm - 2 * dot) as f64 * self.meta.nav_dist_mul as f64
+    }
+
+    #[inline]
+    fn navigation_record(&self, vid: VecId) -> Result<Option<(RowId, bool, &[i8], i32)>, QueryError> {
         let (page, offset) = self.record(vid)?;
-        if page[offset] & REC_FLAG_INITIALIZED == 0 {
+        let flags = page[offset];
+        if flags & REC_FLAG_INITIALIZED == 0 {
             return Ok(None);
         }
         let Some((codes, norm)) = self.codes_in_record(page, offset) else {
@@ -416,14 +526,11 @@ impl MappedVectorNavigation {
                 "inconsistent mapped SQ8 navigation metadata",
             ));
         };
-        let distance = (query_norm + norm
-            - 2 * crate::engine::vector::distance::dot_i8(query_codes, codes))
-            as f64
-            * (self.meta.nav_dist_mul as f64);
         Ok(Some((
             vec_unpack_row(read_u64(page, offset + 2)),
-            page[offset] & REC_FLAG_TOMBSTONE != 0,
-            distance,
+            flags & REC_FLAG_TOMBSTONE != 0,
+            codes,
+            norm,
         )))
     }
 

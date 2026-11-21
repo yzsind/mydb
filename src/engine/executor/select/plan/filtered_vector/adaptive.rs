@@ -43,6 +43,10 @@ impl CandidateBudget {
             )
     }
 
+    pub(super) fn nearing_completion(&self) -> bool {
+        self.accepted >= self.k && (self.fixed.is_some() || self.stable_rounds > 0)
+    }
+
     pub(super) fn checks(&self) -> u64 {
         self.checks
     }
@@ -62,9 +66,11 @@ impl CandidateBudget {
         if single_pass {
             return self.fixed.unwrap_or(self.k).max(1).min(remaining);
         }
-        // Smooth cold/empty batches without assuming table selectivity also
-        // describes the query's vector neighborhood. Every request is bounded.
-        let rate = (self.accepted as f64 + 1.0) / (self.examined as f64 + 2.0);
+        // A visible preselection already filters every candidate, so start
+        // with full survival there. Still account for observed losses such
+        // as duplicate physical identities across graph nodes.
+        let prior = if self.available.is_some() { 1.0 } else { 2.0 };
+        let rate = (self.accepted as f64 + 1.0) / (self.examined as f64 + prior);
         let requested = (self.remaining_qualified() as f64 / rate).ceil() as usize;
         requested.clamp(self.k.clamp(1, 32), 256).min(remaining)
     }
@@ -101,6 +107,7 @@ mod tests {
         let mut budget = CandidateBudget::new(100, 4, false, None);
         budget.observe(200, 100, 0);
         assert!(!budget.done(), "K alone cannot complete validation");
+        assert!(!budget.nearing_completion());
         budget.observe(200, 100, 3);
         budget.observe(400, 200, 1);
         assert!(
@@ -109,6 +116,7 @@ mod tests {
         );
         budget.observe(800, 400, 0);
         assert!(!budget.done(), "one stable round is insufficient");
+        assert!(budget.nearing_completion());
         budget.observe(800, 400, 0);
         assert!(budget.done());
     }
@@ -135,6 +143,7 @@ mod tests {
         explicit.observe(10, 1, 1);
         assert!(explicit.done());
         let mut selected = CandidateBudget::new(100, 4, false, Some(12));
+        assert_eq!(selected.next_batch(1000, false), 12);
         selected.observe(12, 12, 12);
         assert!(selected.done(), "every visible selected row was scored");
         assert!(CandidateBudget::new(100, 4, false, Some(0)).done());

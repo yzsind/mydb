@@ -1,6 +1,85 @@
 //! Native-vector SQL boundary, atomicity and prepared-execution regressions.
 use super::*;
 
+#[test]
+fn selective_cosine_topk_uses_composite_index_without_ann_and_preserves_null_order() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE items(id INT PRIMARY KEY, tenant INT NOT NULL, kind INT NOT NULL, v VECTOR(3) NOT NULL, KEY metadata_ix(tenant,kind))")
+        .unwrap();
+    let mut rows = vec![
+        "(1,7,4,'[1,0,0]')".to_owned(),
+        "(2,7,4,'[0,0,0]')".to_owned(),
+        "(3,7,4,'[0,1,0]')".to_owned(),
+        "(4,7,5,'[1,0,0]')".to_owned(),
+    ];
+    rows.extend((5..1029).map(|id| format!("({id}, {}, {}, '[1,1,0]')", id + 8, id % 8)));
+    engine
+        .execute(&format!("INSERT INTO items VALUES {}", rows.join(",")))
+        .unwrap();
+    engine.execute("ANALYZE TABLE items").unwrap();
+
+    let distance = "COSINE_DISTANCE(v,TO_VECTOR('[1,0,0]'))";
+    let filter = "FROM items WHERE tenant = 7 AND kind = 4";
+    for (projection, order, expected) in [
+        (distance.to_owned(), "score ASC", [2, 1]),
+        (distance.to_owned(), "score ASC NULLS LAST", [1, 3]),
+        (format!("1 - {distance}"), "score DESC", [1, 3]),
+        (format!("1 - {distance}"), "score DESC NULLS FIRST", [2, 1]),
+    ] {
+        let sql = format!("SELECT id, {projection} AS score {filter} ORDER BY {order} LIMIT 2");
+        let tree = explain_analyze_tree(&engine, &sql);
+        assert!(tree.contains("strategy: exact"), "{tree}");
+        assert!(tree.contains("scalar index: metadata_ix"), "{tree}");
+        let rows = query_rows(&engine, &sql);
+        assert_eq!(
+            rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            expected.map(Value::Int)
+        );
+        if expected[0] == 2 {
+            assert_eq!(rows[0][1], Value::Null);
+        }
+        assert_eq!(
+            rows,
+            query_rows(
+                &engine,
+                &format!("SELECT id, {projection} AS score {filter} ORDER BY {order},id LIMIT 2"),
+            )
+        );
+        let traditional = query_rows(&engine, &format!("EXPLAIN {sql}"));
+        assert!(
+            traditional.iter().any(|row| {
+                row[4].to_display_string() == "ref" && row[6].to_display_string() == "metadata_ix"
+            }),
+            "{traditional:?}"
+        );
+    }
+
+    let zero = format!(
+        "SELECT COSINE_DISTANCE(v,TO_VECTOR('[0,0,0]')) AS score {filter} ORDER BY score LIMIT 2"
+    );
+    assert_eq!(query_rows(&engine, &zero), vec![vec![Value::Null]; 2]);
+
+    engine.execute("DELETE FROM items WHERE id=2").unwrap();
+    engine
+        .execute("CREATE INDEX ann ON items(v) USING HNSW WITH(metric=cosine)")
+        .unwrap();
+    engine.execute("ANALYZE TABLE items").unwrap();
+    for (hint, source) in [
+        ("/*+ NO_VECTOR_INDEX */", "items"),
+        ("", "items USE INDEX (metadata_ix)"),
+    ] {
+        let sql = format!(
+            "SELECT {hint} id FROM {source} WHERE tenant=7 AND kind=4 ORDER BY {distance} LIMIT 1"
+        );
+        let tree = explain_analyze_tree(&engine, &sql);
+        assert!(tree.contains("strategy: exact"), "{tree}");
+        assert!(tree.contains("scalar index: metadata_ix"), "{tree}");
+        assert_eq!(query_rows(&engine, &sql), vec![vec![Value::Int(1)]]);
+    }
+}
+
 fn vector_filter_cost_fixture(
     algorithm: &str,
 ) -> (tempfile::TempDir, StorageQueryEngine, SessionContext) {

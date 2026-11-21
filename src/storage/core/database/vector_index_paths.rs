@@ -179,10 +179,11 @@ impl Database {
             Ok(entries) => {
                 for entry in entries {
                     let entry = entry.map_err(io_err)?;
-                    if !entry.file_type().map_err(io_err)?.is_file() {
-                        return Err(vector::persistence::corrupt());
+                    // Only regular private publications are owned here.
+                    // Never descend into foreign entries or follow symlinks.
+                    if entry.file_type().map_err(io_err)?.is_file() {
+                        paths.insert(entry.path());
                     }
-                    paths.insert(entry.path());
                 }
             }
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}

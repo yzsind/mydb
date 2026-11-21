@@ -1157,13 +1157,7 @@ impl Database {
             && !db.physical_replica_mode()
             && db.open_mode != DatabaseOpenMode::SealBaseline
         {
-            while db.vector_purges_pending.load(Ordering::Acquire) != 0 {
-                let completed = db.drain_vector_purges();
-                db.ensure_operational()?;
-                if completed == 0 {
-                    return Err(vector::persistence::corrupt());
-                }
-            }
+            db.drain_recovered_vector_purges()?;
         }
         db.restore_prepared_vector_mutations(&zone_replay)?;
         db.restore_replica_vector_completion(&zone_replay)?;

@@ -1165,7 +1165,7 @@ pub struct Database {
     pending_vector_deletes: Mutex<HashMap<u64, Vec<PendingVectorMutation>>>,
     pending_heap_shrinks: Arc<HeapShrinkRegistry>,
     /// Transactions between `prepare_pending_vector_commit` and the end of
-    /// `apply_pending_vector_deletes`: their rows may already be visible
+    /// `finish_committed_vector_maintenance`: their rows may already be visible
     /// while the shared graph lacks them, so KNN merges exactly these (plus
     /// the reader's own) pending upserts. Never held with the map above.
     vector_commits_publishing: parking_lot::Mutex<HashSet<u64>>,

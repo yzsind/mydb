@@ -6294,15 +6294,7 @@ impl PlanStream for SpatialScanStream {
 /// per-partition candidate lists before re-ranking. Each partition keeps its
 /// own per-storage HNSW graph (RowIds are only unique within one partition,
 /// so a single mixed graph would alias rows across partitions).
-/// How many graph candidates to re-rank with an exact heap `read_row`, given
-/// the final `k` and the exploration breadth `want` (= ef_search). Re-ranking
-/// every explored candidate was the dominant fixed cost of a KNN query (one
-/// random heap read each); the true top-k almost always sits within the
-/// approximate top `k·mult`, so we cap reads there. `MYDB_HNSW_RERANK_MULT`
-/// (default 4) tunes the safety margin; floored at 32 and never above `want`.
-/// IVF scans (`nprobe`) and exact-rerank pool size are independent controls.
-/// Reusing the HNSW helper capped the pool by nprobe, yielding only
-/// `max(k,nprobe)` candidates instead of the documented `k * multiplier`.
+/// Initial IVF exact-rerank pool. The number of inverted lists probed is independent.
 pub(super) fn ivf_rerank_fetch(k: usize, mult: u64) -> usize {
     k.saturating_mul(mult.max(1) as usize).max(k)
 }
@@ -6569,11 +6561,10 @@ pub(super) fn execute_vector_index_scan(
 
     let partition_budget = max_scan / storage_ids.len().max(1);
     // Score the complete ANN pool in place, then decode output columns only
-    // for winners. Filter/secondary-order/relaxed-order paths retain their
-    // existing row oracle, as do transaction-local vector changes.
+    // for winners. Filters, secondary ordering keys and transaction-local
+    // vector changes use the row-wise path.
     let mut late_materialize = filter.is_none()
         && order_by.len() == 1
-        && !matches!(iterative_scan, IterativeScan::RelaxedOrder)
         && storage_ids.iter().all(|sid| {
             db.pending_vector_upsert_row_ids(txn.txn_id, table.schema.id, *sid)
                 .is_empty()
@@ -6658,11 +6649,7 @@ pub(super) fn execute_vector_index_scan(
                 request,
             ) {
                 Ok(result) => result,
-                Err(index_error)
-                    if index_error.is(crate::error::catalog::ER_INDEX_CORRUPT)
-                        && index_error.diagnostic_id()
-                            == Some("MYDB-DIAG-VECTOR-MAINTENANCE-PENDING") =>
-                {
+                Err(index_error) if vector::persistence::is_maintenance_pending(&index_error) => {
                     break 'candidate_search true
                 }
                 Err(index_error) => return Err(index_error),
@@ -7061,12 +7048,8 @@ pub(super) fn execute_vector_index_scan(
         }
         return Ok(rows);
     }
-    // strict_order — keep ascending distance order (default). relaxed_order
-    // skips the final sort and just truncates: callers willing to trade
-    // ordering for latency get the raw insertion order.
-    if !matches!(iterative_scan, IterativeScan::RelaxedOrder) {
-        scored.sort_by(|a, b| a.0.total_cmp(&b.0));
-    }
+    // Candidate widening modes all return exact-score order.
+    scored.sort_by(|a, b| a.0.total_cmp(&b.0));
     scored.truncate(k);
     Ok(scored
         .into_iter()

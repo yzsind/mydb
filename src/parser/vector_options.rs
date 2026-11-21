@@ -38,23 +38,49 @@ pub(super) fn strip_vector_options(
             i += 1;
             continue;
         }
-        if i < 2 || !word(i - 2, "USING") {
+        let mut end = i;
+        let mut algorithm = None;
+        while end > 0 {
+            let len = if end >= 2 && word(end - 2, "USING") {
+                algorithm = Some(end - 1);
+                2
+            } else if end >= 2
+                && word(end - 2, "COMMENT")
+                && tokens[end - 1].kind == SqlTokenKind::String
+            {
+                2
+            } else if word(end - 1, "VISIBLE") || word(end - 1, "INVISIBLE") {
+                1
+            } else if tokens[end - 1].kind == SqlTokenKind::Number {
+                if end >= 3 && word(end - 3, "KEY_BLOCK_SIZE") && symbol(end - 2, b'=') {
+                    3
+                } else if end >= 2 && word(end - 2, "KEY_BLOCK_SIZE") {
+                    2
+                } else {
+                    break;
+                }
+            } else {
+                break;
+            };
+            end -= len;
+        }
+        let Some(algorithm) = algorithm else {
             i += 1;
             continue;
-        }
-        if !word(i - 1, "HNSW") && !word(i - 1, "IVF") {
+        };
+        if !word(algorithm, "HNSW") && !word(algorithm, "IVF") {
             return Err(parse_error_full_span(
                 sql,
                 "WITH vector options require USING HNSW or IVF",
             ));
         }
-        if i < 3 || !symbol(i - 3, b')') {
+        if end == 0 || !symbol(end - 1, b')') {
             return Err(parse_error_full_span(
                 sql,
                 "USING HNSW/IVF WITH must follow the index key list",
             ));
         }
-        let key_close = tokens[i - 3].span.start;
+        let key_close = tokens[end - 1].span.start;
         if !seen.insert(key_close) {
             return Err(parse_error_full_span(sql, "duplicate vector WITH clause"));
         }
@@ -126,7 +152,7 @@ pub(super) fn strip_vector_options(
         // Validate before sqlparser lowers the owning index. Keep type/dimension
         // validation in DDL, where the source column is available.
         crate::storage::vector_config::VectorIndexConfig::from_options(
-            &sql[tokens[i - 1].span.clone()],
+            &sql[tokens[algorithm].span.clone()],
             Some(&options),
             "",
         )
@@ -247,6 +273,32 @@ mod tests {
             }
         }
     }
+    #[test]
+    fn vector_with_after_other_index_options() {
+        for options in [
+            "USING HNSW COMMENT 'x' WITH (m=8)",
+            "COMMENT 'x' USING HNSW WITH (m=8)",
+            "USING HNSW INVISIBLE WITH (m=8)",
+        ] {
+            let sql = format!("CREATE INDEX ix ON t(v) {options}");
+            let Statement::CreateIndex(index) =
+                parse_statement(&sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"))
+            else {
+                panic!("{sql}");
+            };
+            assert_eq!(index.vector_options.unwrap().entries[0].name, "m");
+        }
+    }
+
+    #[test]
+    fn vector_with_zero_ef_emits_hint_warning() {
+        let Statement::Select(select) = parse_statement("SELECT /*+ HNSW_EF(0) */ 1").unwrap()
+        else {
+            panic!("expected SELECT");
+        };
+        assert_eq!(select.hint_warnings, ["HNSW_EF: invalid argument \"0\""]);
+    }
+
     #[test]
     fn vector_with_rejects_invalid_syntax() {
         for options in [

@@ -65,7 +65,7 @@ use parking_lot::{Mutex, RwLock};
 
 use super::distance::{
     dot_i8, dot_i8_batch4_ptrs, l2_ssd_i8, ordering_distance, prefetch_read,
-    quantize_centered_into, quantize_into, Metric,
+    quantize_centered_into, quantize_into, sq8_ssd_from_dot, Metric,
 };
 use super::scan_codes::{ScanCodec, ScanQuery};
 use crate::storage::RowId;
@@ -309,8 +309,8 @@ impl QuantArena {
     }
 
     #[inline]
-    fn ssd_from_query(&self, qcodes: &[i8], qnorm: i32, id: u32) -> i32 {
-        qnorm + self.norm(id) - 2 * dot_i8(qcodes, self.codes_for(id))
+    fn ssd_from_query(&self, qcodes: &[i8], qnorm: i32, id: u32) -> i64 {
+        sq8_ssd_from_dot(qnorm, self.norm(id), dot_i8(qcodes, self.codes_for(id)))
     }
 }
 
@@ -561,12 +561,11 @@ impl CompactHnswBuilder {
         ef_construction: usize,
         charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
     ) -> Option<Self> {
-        if !stats.quantizable() {
+        let (mid, inv_scale, _) = stats.quantization_params()?;
+        let scale_sq = inv_scale.recip().powi(2);
+        if !scale_sq.is_normal() {
             return None;
         }
-        let mid = (stats.vmax + stats.vmin) * 0.5;
-        let inv_scale = 254.0 / (stats.vmax - stats.vmin);
-        let scale = inv_scale.recip();
         stats.rows.checked_mul(stats.dim)?;
         let rows = stats.rows;
         let dim = stats.dim;
@@ -577,7 +576,7 @@ impl CompactHnswBuilder {
             codes: ArenaCodesBuilder::new(dim),
             mid,
             inv_scale,
-            scale_sq: scale * scale,
+            scale_sq,
             normalized: Vec::with_capacity(dim),
         })
     }
@@ -1532,9 +1531,7 @@ impl HnswIndex {
         arena.filter(|_| self.codes_only)
     }
 
-    /// Generation counter — incremented on every `mark_persisted`. Consumed
-    /// by tests and by the M7 observability layer (TBD); kept here as the
-    /// authoritative reader for the atomic.
+    /// Revoke this graph so outstanding handles stop serving it.
     #[allow(dead_code)]
     pub(crate) fn invalidate(&self) {
         self.valid.store(false, Ordering::Release);
@@ -1556,6 +1553,7 @@ impl HnswIndex {
             && dim.is_none_or(|dim| self.dim() == 0 || self.dim() == dim)
     }
 
+    /// Persistence generation reported by index diagnostics.
     pub(crate) fn generation(&self) -> u64 {
         self.generation.load(Ordering::Acquire)
     }
@@ -1578,12 +1576,8 @@ impl HnswIndex {
         self.dirty_count.load(Ordering::Acquire)
     }
 
-    /// Mark the graph as persisted at WAL `lsn`. Bumps the generation,
-    /// stamps the LSN, and *subtracts* `consumed_dirty` from the dirty
-    /// counter — the value captured under the read lock at serialize time,
-    /// which excludes any concurrent inserts that landed between the
-    /// serialize and this stamp. Saturating, so a stale `consumed_dirty`
-    /// can never push the counter negative.
+    /// Record the published snapshot's WAL boundary and adjust the diagnostic
+    /// dirty counter by the caller's observed count.
     pub(crate) fn mark_persisted(&self, lsn: u64, consumed_dirty: u32) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.last_persisted_lsn.store(lsn, Ordering::Release);
@@ -2225,10 +2219,6 @@ impl HnswIndex {
         self.live.load(Ordering::Acquire)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
     /// Total node count including tombstones — used by the dirty-ratio gate
     /// in the checkpoint persist path (`dirty_count / node_count` decides
     /// whether to write `.hnsw`). Also the input to a future staleness-driven
@@ -2682,8 +2672,13 @@ impl HnswIndex {
     ) -> Vec<Scored> {
         // Without tombstones every node is live; skip the per-admission flag
         // load so the common path is unchanged.
-        let explore_ties = live_only
-            && !(self.metric == Metric::Dot && probe.query.iter().all(|value| *value == 0.0));
+        let mut tie_hops = if live_only
+            && !(self.metric == Metric::Dot && probe.query.iter().all(|value| *value == 0.0))
+        {
+            ef.saturating_mul(self.m0)
+        } else {
+            0
+        };
         let live_only = live_only && self.stale_count() > 0;
         let admits = |id: u32| !live_only || !self.nodes.get(id).deleted.load(Ordering::Acquire);
         scratch.begin(self.nodes.len());
@@ -2772,7 +2767,7 @@ impl HnswIndex {
                                 ],
                             );
                             std::array::from_fn(|i| {
-                                (qnorm + arena.norm(group[i]) - 2 * dots[i]) as f64
+                                sq8_ssd_from_dot(qnorm, arena.norm(group[i]), dots[i]) as f64
                                     * (arena.dist_mul as f64)
                             })
                         } else {
@@ -2804,8 +2799,9 @@ impl HnswIndex {
                         if d >= furthest {
                             // Equal-distance hops can lead out of a coincident
                             // coordinate component without entering the ef pool.
-                            if explore_ties && d == furthest {
+                            if tie_hops != 0 && d == furthest {
                                 scratch.frontier.push(Reverse(s));
+                                tie_hops -= 1;
                             }
                             continue;
                         }
@@ -3947,15 +3943,22 @@ impl HnswIndex {
         if cursor.initialized && cursor.epoch != epoch {
             return Ok(false);
         }
+        let node_count = self.nodes.len();
+        if effort >= node_count && node_count > super::cursor::EXHAUSTIVE_HNSW_CURSOR_LIMIT {
+            return Ok(false);
+        }
         let score = |id: u32| {
             self.with_node_vector(id, |v| ordering_distance(&cursor.decoded, v, self.metric))
         };
         if !cursor.initialized {
             cursor.epoch = epoch;
             cursor.initialized = true;
-            let topology = self.topology.lock();
-            if let Some(mut entry) = topology.entry_point {
-                for level in (1..=topology.max_level).rev() {
+            let (entry, max_level) = {
+                let topology = self.topology.lock();
+                (topology.entry_point, topology.max_level)
+            };
+            if let Some(mut entry) = entry {
+                for level in (1..=max_level).rev() {
                     loop {
                         let mut best = entry;
                         let mut best_distance = score(entry);
@@ -3990,7 +3993,6 @@ impl HnswIndex {
                 cursor.work.distances += 1;
             }
         }
-        let node_count = self.nodes.len();
         if effort >= node_count {
             // Claimed slots may still be under construction. A cursor cannot
             // skip a hole and then prove exhaustion: request heap completion
@@ -4086,15 +4088,18 @@ impl HnswIndex {
             return Vec::new();
         }
         let node_count = self.nodes.len();
+        let live = self.len();
+        if live == 0 {
+            return Vec::new();
+        }
         let ef = ef_search.max(k).min(node_count).max(1);
         let cmp =
             |a: &(RowId, f64), b: &(RowId, f64)| a.1.total_cmp(&b.1).then_with(|| a.0.cmp(&b.0));
-        if ef == node_count {
-            // Greedy descent can enter a directed component that cannot reach
-            // every node, even when the cold-build entry can. Exhaustive effort
-            // scores the slab directly, covering such components and avoiding
-            // graph/quantization work without changing bounded ANN searches.
-            let mut out = Vec::with_capacity(node_count);
+        if ef == node_count || live < ef {
+            // Exhaustive effort must cover every component. When too few live
+            // nodes can fill the frontier, a linear pass also avoids costing
+            // tombstones and traversing their edges.
+            let mut out = Vec::with_capacity(live);
             if self.nodes.published_len() < node_count {
                 self.score_initialized_nodes(query, node_count, &mut out);
             } else {
@@ -4666,6 +4671,25 @@ mod tests {
                 let _ = frozen.try_update_in_place(rid(0), &update, 10000.0);
                 let _ = frozen.search(&update, 1, 128);
             }
+        }
+    }
+
+    #[test]
+    fn release_audit_compact_sq8_rejects_extreme_calibration() {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        for (low, high) in [(2.0e38, 2.1e38), (1.0e-34, 2.0e-34)] {
+            let mut stats = CompactHnswStats::new(Metric::L2);
+            stats.observe(&[low]);
+            stats.observe(&[high]);
+            assert!(stats.quantizable());
+            let charge = ControlledMemoryCharge::try_new_recoverable(
+                ControlledMemoryCategory::StorageScratch,
+                0,
+            )
+            .unwrap();
+            assert!(CompactHnswBuilder::new(stats, 4, 32, charge).is_none());
         }
     }
 

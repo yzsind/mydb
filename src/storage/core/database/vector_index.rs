@@ -3504,6 +3504,7 @@ impl Database {
         cursor: &mut crate::engine::vector::cursor::VectorSearchCursor,
         effort: usize,
         limit: usize,
+        bounded_refinement: bool,
     ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
         let _lease = self.acquire_vector_read(table.id)?;
         let current = self.vector_graph_get_or_build_for_partition(table, index, cursor.sid)?;
@@ -3511,7 +3512,7 @@ impl Database {
             return Ok(None);
         }
         drop(_lease);
-        cursor.next_batch(effort, limit)
+        cursor.next_batch(effort, limit, bounded_refinement)
     }
 
     pub(crate) fn vector_index_search_for_partition(
@@ -3524,14 +3525,15 @@ impl Database {
     ) -> Result<crate::engine::vector::VectorSearchResult, QueryError> {
         let _lease = self.acquire_vector_read(table.id)?;
         let graph = self.vector_graph_get_or_build_for_partition(table, index, storage_id)?;
-        if !graph.is_empty() && graph.dim() != query.dimension as usize {
+        let dim = graph.dim();
+        if dim != 0 && dim != query.dimension as usize {
             return Err(error(
                 crate::error::catalog::MYDB_ER_VECTOR_DIMENSION_MISMATCH,
                 format!(
                     "query vector has {} dimensions but index '{}' is {}-dimensional",
                     query.len(),
                     index.name,
-                    graph.dim()
+                    dim
                 ),
             ));
         }
@@ -4051,8 +4053,9 @@ impl Database {
         Ok(())
     }
 
-    /// Apply and remove every still-live deferred DELETE for a committing txn.
-    pub(crate) fn apply_pending_vector_deletes(
+    /// Apply and finalize a transaction's deferred vector index mutations
+    /// after its commit decision has been published.
+    pub(crate) fn finish_committed_vector_maintenance(
         &self,
         txn_id: u64,
         commit_scn: u64,
@@ -4074,6 +4077,9 @@ impl Database {
             }
             return Ok(());
         }
+        // The WAL decision already commits the heap rows. Client cancellation
+        // must not interrupt graph writes, model training or completion WAL.
+        let _cancellation = crate::engine::cancel::suspend_statement_cancellation();
         let mut affected = std::collections::HashSet::new();
         for entry in pending {
             affected.insert((entry.table_id, entry.storage_id));
@@ -4168,26 +4174,37 @@ impl Database {
     /// Called after each commit publishes visibility and before checkpoint
     /// compaction; with nothing queued it costs one atomic load.
     pub(crate) fn drain_vector_purges(&self) -> usize {
+        self.try_drain_vector_purges().unwrap_or_else(|err| {
+            log_message(format!("persistent vector retirement failed: {err:?}"));
+            0
+        })
+    }
+
+    fn try_drain_vector_purges(&self) -> Result<usize, QueryError> {
         if self.physical_replica_mode()
             || self.mvcc_quarantined.load(Ordering::Acquire)
             || self.is_snapshot_read_only()
             || self.open_mode == DatabaseOpenMode::SealBaseline
             || self.vector_purges_pending.load(Ordering::Acquire) == 0
         {
-            return 0;
+            return Ok(0);
         }
         let Some(_maintenance) = self.backup_maintenance_gate.try_read() else {
-            return 0;
+            return Ok(0);
         };
         if self.capture.active.load(Ordering::Acquire) {
-            return 0;
+            return Ok(0);
         }
         let Some(_drain) = self.vector_purge_drain_gate.try_lock() else {
-            return 0;
+            return Ok(0);
         };
         let _snapshot = self.vector_purge_snapshot_gate.read();
         let horizon = self.vector_purge_horizon();
         let ready = self.vector_purge_queue.lock().ready_keys(horizon);
+        // Purging committed versions may run on a foreground SQL thread,
+        // including one whose own statement has already been canceled.
+        let _cancellation =
+            (!ready.is_empty()).then(crate::engine::cancel::suspend_statement_cancellation);
         let mut completed = 0;
         for identity in ready {
             let mut purge = {
@@ -4250,9 +4267,8 @@ impl Database {
             })();
             let mut queue = self.vector_purge_queue.lock();
             if let Err(err) = result {
-                log_message(format!("persistent vector retirement failed: {err:?}"));
                 queue.insert(purge);
-                break;
+                return Err(err);
             }
             queue.remove_completed(&identity, &purge.rows);
             self.vector_purges_pending
@@ -4263,7 +4279,7 @@ impl Database {
         if queue.is_empty() {
             self.vector_purge_recovery_charge.lock().take();
         }
-        completed
+        Ok(completed)
     }
 
     pub(crate) fn discard_pending_vector_deletes(&self, txn_id: u64) -> Result<u64, QueryError> {

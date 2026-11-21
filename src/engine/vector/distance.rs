@@ -846,18 +846,36 @@ pub(crate) fn prefetch_read(p: *const i8) {
 }
 
 /// Integer squared-distance `Σ (a_i − b_i)²` between two int8 code vectors.
-/// `a`/`b` are scored over `min(len)` elements. Returns `i32` — exact (no
-/// rounding); safe from overflow for any realistic dimension (worst case
-/// `254² · dim`, so `dim ≤ ~33k` stays within `i32`).
+/// Score over the common prefix using the SIMD kernels in i32-sized blocks.
+const I8_SSD_BLOCK: usize = (i32::MAX as usize) / (255 * 255);
+
+/// Integer squared distance over the common prefix of two code vectors.
 #[inline]
-pub(crate) fn l2_ssd_i8(a: &[i8], b: &[i8]) -> i32 {
+pub(crate) fn l2_ssd_i8(a: &[i8], b: &[i8]) -> i64 {
     let n = a.len().min(b.len());
-    // SAFETY: `n` ≤ both lengths; the kernels do unaligned byte reads.
-    unsafe { l2_ssd_i8_ptr(a.as_ptr(), b.as_ptr(), n) }
+    if n <= I8_SSD_BLOCK {
+        // SAFETY: n fits both slices and the i32 accumulator.
+        return i64::from(unsafe { l2_ssd_i8_ptr(a.as_ptr(), b.as_ptr(), n) });
+    }
+    a[..n]
+        .chunks(I8_SSD_BLOCK)
+        .zip(b[..n].chunks(I8_SSD_BLOCK))
+        .map(|(a, b)| {
+            // SAFETY: equal, i32-safe block lengths.
+            i64::from(unsafe { l2_ssd_i8_ptr(a.as_ptr(), b.as_ptr(), a.len()) })
+        })
+        .sum()
+}
+
+/// Squared distance from the norms and dot product of signed SQ8 codes.
+#[inline]
+pub(crate) fn sq8_ssd_from_dot(a_norm: i32, b_norm: i32, dot: i32) -> i64 {
+    i64::from(a_norm) + i64::from(b_norm) - 2 * i64::from(dot)
 }
 
 /// # Safety
 /// `pa`/`pb` valid for `n` consecutive `i8` reads (unaligned ok).
+/// `n` must be at most `I8_SSD_BLOCK`.
 #[inline]
 unsafe fn l2_ssd_i8_ptr(pa: *const i8, pb: *const i8, n: usize) -> i32 {
     #[cfg(target_arch = "aarch64")]
@@ -908,7 +926,7 @@ unsafe fn l2_ssd_i8_neon(pa: *const i8, pb: *const i8, n: usize) -> i32 {
     while i + 16 <= n {
         let a = vld1q_s8(pa.add(i));
         let b = vld1q_s8(pb.add(i));
-        // Widening subtract → i16 differences (no overflow: i8 − i8 ∈ ±254).
+        // Widening subtract → i16 differences (no overflow: i8 − i8 ∈ ±255).
         let dlo = vsubl_s8(vget_low_s8(a), vget_low_s8(b)); // int16x8
         let dhi = vsubl_s8(vget_high_s8(a), vget_high_s8(b));
         // Square (i16·i16 → i32) and accumulate.
@@ -995,6 +1013,15 @@ pub(crate) fn dot_i8_batch4_ptrs(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
             dot_i8(query, rows[3]),
         ];
     }
+    #[cfg(target_arch = "x86_64")]
+    if n >= 128
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+    {
+        // SAFETY: all four rows contain at least n bytes and features were checked.
+        return unsafe { dot_i8_batch4_ptrs_vnni(query, rows) };
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let has_dotprod = if cfg!(target_os = "macos") {
@@ -1022,6 +1049,94 @@ pub(crate) fn dot_i8_batch4_ptrs(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
         dot_i8(query, rows[2]),
         dot_i8(query, rows[3]),
     ]
+}
+
+/// VNNI can consume an unsigned query directly once the caller has cached
+/// each row's signed-byte correction. The signed distance remains exact.
+pub(crate) struct BiasedSq8Dot(Vec<u8>);
+
+impl BiasedSq8Dot {
+    pub(crate) fn supported() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni");
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    }
+
+    pub(crate) fn try_new(query: &[i8]) -> Option<Self> {
+        Self::supported().then(|| Self(query.iter().map(|&code| code as u8 ^ 128).collect()))
+    }
+
+    #[inline]
+    pub(crate) fn dot<const N: usize>(&self, rows: [&[i8]; N]) -> [i32; N] {
+        debug_assert!(rows.iter().all(|row| row.len() == self.0.len()));
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: construction is gated on VNNI, and the kernel slices
+            // each row against the query length before unaligned loads.
+            unsafe { dot_u8_i8_vnni(&self.0, rows) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        rows.map(|row| {
+            self.0
+                .iter()
+                .zip(row)
+                .map(|(&q, &r)| i32::from(q) * i32::from(r))
+                .sum()
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_u8_i8_vnni<const N: usize>(query: &[u8], rows: [&[i8]; N]) -> [i32; N] {
+    use std::arch::x86_64::*;
+    let rows = rows.map(|row| &row[..query.len()]);
+    let mut sums = [_mm512_setzero_si512(); N];
+    let end = query.len() & !63;
+    for offset in (0..end).step_by(64) {
+        let q = _mm512_loadu_si512(query.as_ptr().add(offset).cast());
+        for lane in 0..N {
+            let row = _mm512_loadu_si512(rows[lane].as_ptr().add(offset).cast());
+            sums[lane] = _mm512_dpbusd_epi32(sums[lane], q, row);
+        }
+    }
+    std::array::from_fn(|lane| {
+        _mm512_reduce_add_epi32(sums[lane])
+            + query[end..]
+                .iter()
+                .zip(&rows[lane][end..])
+                .map(|(&q, &r)| i32::from(q) * i32::from(r))
+                .sum::<i32>()
+    })
+}
+
+/// Score independent mapped rows with one biased query load per block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_i8_batch4_ptrs_vnni(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
+    use std::arch::x86_64::*;
+    let bias = _mm512_set1_epi8(i8::MIN);
+    let mut sums = [_mm512_setzero_si512(); 4];
+    let mut corrections = sums;
+    let end = query.len() & !63;
+    for position in (0..end).step_by(64) {
+        let q = _mm512_xor_si512(
+            _mm512_loadu_si512(query.as_ptr().add(position).cast()),
+            bias,
+        );
+        for lane in 0..4 {
+            let row = _mm512_loadu_si512(rows[lane].as_ptr().add(position).cast());
+            sums[lane] = _mm512_dpbusd_epi32(sums[lane], q, row);
+            corrections[lane] = _mm512_dpbusd_epi32(corrections[lane], bias, row);
+        }
+    }
+    std::array::from_fn(|lane| {
+        let lanes = _mm512_sub_epi32(sums[lane], corrections[lane]);
+        _mm512_reduce_add_epi32(lanes) + dot_i8(&query[end..], &rows[lane][end..])
+    })
 }
 
 /// Four-row SDOT kernel for independently located rows.
@@ -2556,12 +2671,26 @@ mod tests {
     /// arithmetic, so no tolerance), across every length residue class —
     /// including ramps that exercise the saturating `±127` clamp.
     #[test]
+    fn release_audit_sq8_distance_handles_wide_vectors() {
+        for dim in [32_989, 33_287, 65_532] {
+            let a = vec![-127_i8; dim];
+            let b = vec![127_i8; dim];
+            let want = dim as i64 * 254 * 254;
+            assert_eq!(l2_ssd_i8(&a, &b), want);
+            assert_eq!(
+                sq8_ssd_from_dot(ssq_i8(&a), ssq_i8(&b), dot_i8(&a, &b)),
+                want
+            );
+        }
+    }
+
+    #[test]
     fn ssd_i8_matches_scalar_oracle() {
         // SAFETY helper: scalar reference over slices.
-        fn ssd_scalar(a: &[i8], b: &[i8]) -> i32 {
+        fn ssd_scalar(a: &[i8], b: &[i8]) -> i64 {
             a.iter()
                 .zip(b)
-                .map(|(&x, &y)| (x as i32 - y as i32).pow(2))
+                .map(|(&x, &y)| (i64::from(x) - i64::from(y)).pow(2))
                 .sum()
         }
         for &dim in &[
@@ -2581,7 +2710,7 @@ mod tests {
             assert_eq!(l2_ssd_i8(&qa, &qa), 0, "ssd self dim={dim}");
             // Norm-decomposed SSD (sdot path) must be bit-identical: the very
             // identity probe_dist relies on, `‖a‖²+‖b‖²−2·a·b == Σ(a−b)²`.
-            let decomposed = ssq_i8(&qa) + ssq_i8(&qb) - 2 * dot_i8(&qa, &qb);
+            let decomposed = sq8_ssd_from_dot(ssq_i8(&qa), ssq_i8(&qb), dot_i8(&qa, &qb));
             assert_eq!(decomposed, want, "norm-decomposed ssd dim={dim}");
             // Dot kernel itself matches the scalar reference.
             let dot_ref: i32 = qa.iter().zip(&qb).map(|(&x, &y)| x as i32 * y as i32).sum();
@@ -2602,7 +2731,7 @@ mod tests {
         let query = pseudo(dim, 1);
         let mut qq = vec![0i8; dim];
         quantize_into(&query, 0.0, 127.0, &mut qq);
-        let mut best_i8 = (i32::MAX, usize::MAX);
+        let mut best_i8 = (i64::MAX, usize::MAX);
         let mut best_f32 = (f32::INFINITY, usize::MAX);
         for cand in 0..50usize {
             let v = pseudo(dim, 100 + cand as u64);
@@ -2671,7 +2800,7 @@ mod tests {
 
     #[test]
     fn dot_i8_batch4_ptrs_matches_independent_rows() {
-        for &dim in &[1usize, 31, 32, 33, 128, 768] {
+        for &dim in &[1usize, 31, 32, 33, 128, 129, 513, 768, 1024, 4097] {
             let query_f = pseudo(dim, 0xC001 + dim as u64);
             let mut query = vec![0i8; dim];
             quantize_into(&query_f, 0.0, 127.0, &mut query);
@@ -2691,6 +2820,15 @@ mod tests {
             ];
             let got = dot_i8_batch4_ptrs(&query, [&rows[0], &rows[1], &rows[2], &rows[3]]);
             assert_eq!(got, expected, "pointer batch dot dim={dim}");
+            if let Some(biased) = BiasedSq8Dot::try_new(&query) {
+                let lanes = [&rows[0][..], &rows[1][..], &rows[2][..], &rows[3][..]];
+                let unsigned = biased.dot(lanes);
+                let corrected = std::array::from_fn(|lane| {
+                    unsigned[lane] - 128 * lanes[lane].iter().map(|&v| i32::from(v)).sum::<i32>()
+                });
+                assert_eq!(corrected, expected, "biased pointer dot dim={dim}");
+                assert_eq!(biased.dot([lanes[0]])[0], unsigned[0]);
+            }
         }
     }
 

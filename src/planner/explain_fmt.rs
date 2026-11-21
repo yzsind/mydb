@@ -841,6 +841,7 @@ pub(super) fn collect_explain_rows(
             table,
             strategy,
             index,
+            scalar_access,
             metric,
             k,
             filter,
@@ -861,14 +862,30 @@ pub(super) fn collect_explain_rows(
                 })
             };
             let extra = format!("Filtered vector Top-K ({algorithm}); strategy={} metric={metric} k={k}; late materialization", strategy.as_str());
+            let scalar_index = (*strategy == FilteredVectorStrategy::Exact)
+                .then(|| explain_access::IndexAccess::from_plan(scalar_access))
+                .flatten();
+            let reference = if let PhysicalPlan::IndexLookup { key, .. } = scalar_access.as_ref() {
+                if scalar_index.is_some() {
+                    explain_ref_for_index_key(key)
+                } else {
+                    String::new()
+                }
+            } else {
+                String::new()
+            };
             let mut row = explain_scan_row(
                 rows.len() + 1,
                 table,
-                "ALL",
+                scalar_index
+                    .as_ref()
+                    .map_or("ALL", |access| access.access_type()),
                 possible_keys,
-                "",
-                None,
-                "",
+                scalar_index
+                    .as_ref()
+                    .map_or("", |access| access.index.name.as_str()),
+                scalar_index.as_ref().map(|access| access.key_length()),
+                &reference,
                 *estimated_rows,
                 *access_rows,
                 filter.as_ref(),

@@ -3389,7 +3389,9 @@ impl Database {
         // The durable decision precedes redo-only vector maintenance. Preserve
         // errors until lock and frontier cleanup is complete, and include all
         // required maintenance WAL in the response durability barrier.
-        let mut index_error = self.apply_pending_vector_deletes(txn_id, commit_scn).err();
+        let mut index_error = self
+            .finish_committed_vector_maintenance(txn_id, commit_scn)
+            .err();
         let has_heap_shrinks = match self.finish_pending_heap_shrinks(txn_id) {
             Ok(changed) => changed,
             Err(err) => {

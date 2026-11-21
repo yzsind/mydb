@@ -14,7 +14,7 @@ use crate::engine::expr;
 pub(crate) enum IterativeScan {
     /// Single pass; accept short results.
     Off,
-    /// Widen until k satisfied, do not re-sort by distance order.
+    /// Legacy spelling for iterative widening. SQL output is always ordered.
     RelaxedOrder,
     /// Widen until k satisfied, preserve strict ascending distance order (default).
     StrictOrder,

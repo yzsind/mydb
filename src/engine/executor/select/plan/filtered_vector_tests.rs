@@ -55,7 +55,7 @@ fn filtered_vector_adaptive_rounds_preserve_results_and_explicit_pool_settings()
     let (_dir, engine) = open();
     setup(&engine, "FLOAT32", "HNSW");
     let sql =
-        "SELECT id FROM items WHERE tenant>=8 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+        "SELECT id FROM items WHERE tenant>=8 AND body LIKE 'text-%' ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
     let expected = rows(
         &engine,
         &sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE"),
@@ -104,6 +104,8 @@ fn filtered_vector_adaptive_rounds_preserve_results_and_explicit_pool_settings()
         let checks = work.quality_rounds;
         let fallbacks = work.fallbacks;
         assert_eq!(fallbacks, 0);
+        assert!(work.fused_reranks > 0);
+        assert_eq!(work.fused_reranks, work.reranks);
         if explicit {
             assert_eq!(checks, 0);
         } else {
@@ -352,11 +354,78 @@ fn filtered_vector_keeps_volatile_and_relational_boundaries() {
 }
 
 #[test]
+fn filtered_vector_covering_selection_completes_with_exact_heap_scores() {
+    let (_dir, engine) = open();
+    setup(&engine, "FLOAT32", "HNSW");
+    engine
+        .execute("CREATE INDEX cover_filter ON items(tenant, id)")
+        .unwrap();
+    let sql = "SELECT /*+ HNSW_EF(32) */ id FROM items IGNORE INDEX(it) WHERE tenant=3 AND id BETWEEN 50 AND 500 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+    let expected = rows(
+        &engine,
+        &sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE"),
+    );
+    let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+        unreachable!()
+    };
+    let db = engine.db_for_tests();
+    let plan = crate::planner::plan_select(db, &select).unwrap().physical;
+    let mut leaf = None;
+    plan.walk(|node| {
+        if matches!(node, PhysicalPlan::FilteredVectorTopK { .. }) {
+            leaf = Some(node.clone());
+        }
+    });
+    let mut leaf = leaf.expect("filtered vector leaf");
+    if let PhysicalPlan::FilteredVectorTopK {
+        strategy,
+        ef_hint,
+        index,
+        filter,
+        scalar_access,
+        projected_columns,
+        ..
+    } = &mut leaf
+    {
+        assert!(index.is_some(), "test requires an HNSW index on the plan");
+        assert!(
+            crate::planner::covered_scalar_bounds(scalar_access, filter.as_ref().unwrap())
+                .is_some()
+        );
+        *strategy = crate::planner::FilteredVectorStrategy::PrefilterAnn;
+        *ef_hint = Some(32);
+        *projected_columns = Some(Arc::new(vec![0]));
+    }
+    let mut session = crate::engine::api::SessionContext::default();
+    session.sysvars.mydb_hnsw_max_scan_tuples = 1;
+    let txn = db.begin_read_only_txn().unwrap();
+    let (measured, actual) = crate::engine::expr::with_session_expr_info(&session, || {
+        super::super::analyze_stats::with_collector(|| {
+            filtered_vector::execute_filtered_vector_topk(db, txn, &leaf)
+        })
+    });
+    let actual: Vec<_> = actual
+        .unwrap()
+        .into_iter()
+        .map(|row| vec![row.fields[0].value.clone()])
+        .collect();
+    assert_eq!(actual, expected);
+    let work = measured.get_for_plan(&leaf).unwrap().filtered_vector;
+    assert_eq!(work.predicate_evaluations, 0);
+    assert_eq!(work.fallbacks, 1);
+}
+
+#[test]
 fn filtered_vector_budget_and_frontier_exhaustion_complete_reranking_exactly() {
     for algo in ["HNSW", "IVF"] {
         let (_dir, engine) = open();
         setup(&engine, "FLOAT32", algo);
-        for (predicate, budget) in [("tenant>=0", 16), ("id<10", 0)] {
+        use crate::planner::FilteredVectorStrategy::{IterativeAnn, PrefilterAnn};
+        for (predicate, budget, route) in [
+            ("tenant>=0", 16, IterativeAnn),
+            ("id<10", 0, IterativeAnn),
+            ("tenant>=3 AND tenant<11", 16, PrefilterAnn),
+        ] {
             let sql = format!("SELECT id FROM items WHERE {predicate} ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7");
             let oracle = sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE");
             let expected = rows(&engine, &oracle);
@@ -380,7 +449,7 @@ fn filtered_vector_budget_and_frontier_exhaustion_complete_reranking_exactly() {
                 ..
             } = &mut leaf
             {
-                *strategy = crate::planner::FilteredVectorStrategy::IterativeAnn;
+                *strategy = route;
                 *ef_hint = Some(if algo == "IVF" { 8 } else { 1024 });
                 *projected_columns = Some(Arc::new(vec![0]));
             }
@@ -1063,7 +1132,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
     let mut counts = [0; 4];
     let query = crate::engine::vector::codec::from_f32(&[0.0, 1.0, 2.0]);
     crate::engine::api::clear_statement_warnings();
-    let scores = db
+    let (scores, in_page) = db
         .score_filtered_vector_rows_many_with_handle(
             &db.cached_heap_handle(schema.id).unwrap(),
             &schema,
@@ -1075,6 +1144,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             None,
             &[schema.column_index("id").unwrap()],
+            None,
             |values| {
                 let Value::Int(id) = values[0] else {
                     panic!("integer id")
@@ -1092,6 +1162,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
     assert_eq!(counts, [1, 1, 1, 1]);
     assert_eq!(crate::engine::api::take_statement_warnings().len(), 4);
     assert_eq!(scores.len(), 3);
+    assert!((1..scores.len()).contains(&in_page));
     // Scoring errors must be deferred until after the predicate accepts a
     // row, including when an old-layout window uses the general reader.
     let heap = db.cached_heap_handle(schema.id).unwrap();
@@ -1103,7 +1174,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
         crate::engine::vector::Metric::Cosine,
     );
     let mut counts = [0; 4];
-    let actual = db
+    let (actual, _) = db
         .score_filtered_vector_rows_many_with_handle(
             &heap,
             &schema,
@@ -1115,6 +1186,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             Some(&cosine),
             &columns,
+            None,
             |values| {
                 let Value::Int(id) = values[0] else {
                     panic!("integer id")
@@ -1155,9 +1227,11 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             None,
             &columns,
+            None,
             |_| Ok(false),
         )
         .unwrap()
+        .0
         .is_empty());
     assert!(db
         .score_filtered_vector_rows_many_with_handle(
@@ -1171,6 +1245,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             None,
             &columns,
+            None,
             |_| Ok(true),
         )
         .is_err());

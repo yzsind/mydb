@@ -381,6 +381,17 @@ pub fn enter(token: QueryCancelToken) -> CancelScope {
     CancelScope { prev }
 }
 
+/// Detach obligatory storage work from the initiating statement's token and
+/// deadline. Workers spawned inside this scope inherit neither. Memory budget
+/// checks still apply, and both statement cancellation sources resume on drop.
+pub(crate) fn suspend_statement_cancellation() -> (CancelScope, StatementDeadlineGuard) {
+    let prev = CURRENT_TOKEN.with(RefCell::take);
+    (
+        CancelScope { prev },
+        install_statement_deadline(Duration::ZERO),
+    )
+}
+
 pub struct CancelScope {
     prev: Option<QueryCancelToken>,
 }
@@ -515,6 +526,28 @@ mod tests {
         std::thread::sleep(Duration::from_millis(20));
         let err = check_cancelled().unwrap_err();
         assert_eq!(err.code(), 3024);
+    }
+
+    #[test]
+    fn storage_completion_suspends_and_restores_statement_cancellation() {
+        let token = QueryCancelToken::noop();
+        token.cancel_local();
+        let _token = enter(token);
+        assert_eq!(check_cancelled().unwrap_err().code(), 1317);
+        let _deadline = StatementDeadlineGuard {
+            prev: STATEMENT_DEADLINE.with(|cell| cell.replace(Some(Instant::now()))),
+            prev_installed: STATEMENT_DEADLINE_INSTALLED.with(|cell| cell.replace(true)),
+        };
+        assert_eq!(check_cancelled().unwrap_err().code(), 3024);
+        {
+            let _completion = suspend_statement_cancellation();
+            assert!(check_cancelled().is_ok());
+            assert!(CancellationSnapshot::capture().check().is_ok());
+            assert!(install_query_deadline(Duration::from_secs(1)).is_none());
+        }
+        assert_eq!(check_cancelled().unwrap_err().code(), 3024);
+        drop(_deadline);
+        assert_eq!(check_cancelled().unwrap_err().code(), 1317);
     }
 
     #[test]

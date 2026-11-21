@@ -180,3 +180,137 @@ fn vector_release_transient_maintenance_errors_recover_without_permanent_fence()
             .unwrap();
     }
 }
+
+impl Database {
+    pub(crate) fn invalidate_paged_vector_for_test(&self, table_name: &str) {
+        let table = self.table(table_name).unwrap();
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_vector())
+            .unwrap();
+        let graph = self
+            .vector_graph_get_or_build_for_partition(&table, index, table.id)
+            .unwrap();
+        let VectorGraph::Paged(graph) = graph.as_ref() else {
+            panic!("expected paged HNSW");
+        };
+        graph.file().invalidate_build(0).unwrap();
+        graph.file().flush().unwrap();
+        self.vector_indexes.write().clear();
+        let Err(err) = self.vector_graph_get_or_build_for_partition(&table, index, table.id) else {
+            panic!("expected unfinished vector maintenance");
+        };
+        assert_eq!(
+            err.diagnostic_id(),
+            Some("MYDB-DIAG-VECTOR-MAINTENANCE-PENDING")
+        );
+    }
+}
+
+#[test]
+fn vector_release_startup_removes_orphan_manifest_and_directory() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let (manifest, orphan, live_manifest, live_image) = {
+        let engine = engine(dir.path());
+        engine
+            .execute(
+                "CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL,INDEX ix(v) USING HNSW)",
+            )
+            .unwrap();
+        engine.execute("INSERT INTO t VALUES(1,'[1,2]')").unwrap();
+        engine.checkpoint().unwrap();
+        let db = engine.database();
+        let table = db.table("test.t").unwrap();
+        let index = table
+            .indexes
+            .iter()
+            .find(|index| index.is_vector())
+            .unwrap();
+        let live_manifest = db.vector_manifest_path(&table, index, table.id);
+        let live_image = db
+            .active_native_vector_path(&table, index, table.id)
+            .unwrap()
+            .0;
+        let manifest = live_manifest.with_file_name("999999.vmanifest");
+        let orphan = manifest.with_extension("vector");
+        fs::write(&manifest, b"unpublished manifest").unwrap();
+        fs::create_dir(&orphan).unwrap();
+        (manifest, orphan, live_manifest, live_image)
+    };
+    let reopened = engine(dir.path());
+    assert!(!manifest.exists());
+    assert!(!orphan.exists());
+    assert!(live_manifest.exists() && live_image.exists());
+    reopened
+        .execute("SELECT /*+ HNSW_EF(64) */ id FROM t ORDER BY L2_DISTANCE(v,'[1,2]') LIMIT 1")
+        .unwrap();
+}
+
+#[test]
+fn vector_release_drop_ignores_foreign_directory_entry() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = engine(dir.path());
+    engine
+        .execute("CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL,INDEX ix(v) USING HNSW)")
+        .unwrap();
+    let db = engine.database();
+    let table = db.table("test.t").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    let manifest = db.vector_manifest_path(&table, index, table.id);
+    let foreign = manifest.with_extension("vector").join("foreign");
+    fs::create_dir(&foreign).unwrap();
+    let preserved = foreign.join("keep");
+    fs::write(&preserved, b"foreign").unwrap();
+
+    engine.execute("DROP INDEX ix ON t").unwrap();
+    assert!(db
+        .table("test.t")
+        .unwrap()
+        .indexes
+        .iter()
+        .all(|index| !index.is_vector()));
+    engine.execute("INSERT INTO t VALUES(1,'[1,2]')").unwrap();
+    assert_eq!(fs::read(preserved).unwrap(), b"foreign");
+}
+
+#[test]
+fn vector_release_purge_drain_preserves_oom_and_requeues_work() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = engine(dir.path());
+    engine
+        .execute("CREATE TABLE t(id INT PRIMARY KEY,v VECTOR(2) NOT NULL,INDEX ix(v) USING HNSW)")
+        .unwrap();
+    engine.execute("INSERT INTO t VALUES(1,'[1,2]')").unwrap();
+    let db = engine.database();
+    let snapshot = db.register_statement_snapshot(db.visible_scn());
+    engine.execute("UPDATE t SET v='[3,4]' WHERE id=1").unwrap();
+    let table = db.table("test.t").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|index| index.is_vector())
+        .unwrap();
+    db.vector_indexes.write().clear();
+    db.vector_build_backoff.lock().insert(
+        (
+            table.id,
+            table.id,
+            table.active_generation.max(1),
+            normalize_name(&index.name),
+        ),
+        Instant::now(),
+    );
+    // Suppress the snapshot guard's best-effort drain so recovery's caller
+    // can observe the error directly.
+    let drain = db.vector_purge_drain_gate.lock();
+    drop(snapshot);
+    drop(drain);
+    let err = db.try_drain_vector_purges().unwrap_err();
+    assert!(err.is(crate::error::catalog::ER_OUTOFMEMORY), "{err:?}");
+    assert!(db.vector_purges_pending.load(Ordering::Acquire) > 0);
+}

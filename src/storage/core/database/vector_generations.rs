@@ -892,6 +892,7 @@ impl Database {
         // Resolve authoritative descriptors before deciding file ownership.
         let tables = self.user_table_snapshots()?;
         let mut live = HashSet::new();
+        let mut live_vector_dirs = HashSet::new();
         for table in &tables {
             for index in &table.indexes {
                 for sid in table.storage_ids() {
@@ -900,6 +901,9 @@ impl Database {
             }
             for index in table.indexes.iter().filter(|index| index.is_vector()) {
                 for storage_id in table.storage_ids() {
+                    let manifest_path = self.vector_manifest_path(table, index, storage_id);
+                    live_vector_dirs.insert(manifest_path.with_extension("vector"));
+                    live.insert(manifest_path);
                     let Some(manifest) = self.read_vector_manifest(table, index, storage_id)?
                     else {
                         continue;
@@ -917,6 +921,7 @@ impl Database {
                             generation,
                             physical,
                         );
+                        live_vector_dirs.insert(path.parent().unwrap().to_path_buf());
                         if manifest.resident {
                             path.set_extension("hnsw");
                         }
@@ -932,7 +937,9 @@ impl Database {
         // No source publisher or process-surviving reader exists at this
         // startup boundary. Keep all manifest references, including physical
         // owners moved by COPY/EXCHANGE and retired generations.
-        let mut directories = vec![self.data_dir.join("objects/indexes")];
+        let root = self.data_dir.join("objects/indexes");
+        let mut directories = vec![root.clone()];
+        let mut orphan_vector_dirs = Vec::new();
         while let Some(directory) = directories.pop() {
             let entries = match fs::read_dir(&directory) {
                 Ok(entries) => entries,
@@ -943,7 +950,20 @@ impl Database {
                 let entry = entry.map_err(io_err)?;
                 let kind = entry.file_type().map_err(io_err)?;
                 if kind.is_dir() {
-                    directories.push(entry.path());
+                    let path = entry.path();
+                    let canonical_vector_dir = path.strip_prefix(&root).is_ok_and(|relative| {
+                        relative.components().count() == 3
+                            && relative.extension().is_some_and(|ext| ext == "vector")
+                            && relative.with_extension("").components().all(|part| {
+                                part.as_os_str()
+                                    .to_str()
+                                    .is_some_and(|id| id.parse::<u64>().is_ok())
+                            })
+                    });
+                    if canonical_vector_dir && !live_vector_dirs.contains(&path) {
+                        orphan_vector_dirs.push(path.clone());
+                    }
+                    directories.push(path);
                     continue;
                 }
                 if !kind.is_file() {
@@ -962,12 +982,22 @@ impl Database {
                             id.parse::<u64>().is_ok()
                                 && matches!(suffix, "hvec" | "hnsw" | "hvec.vpub" | "hnsw.vpub")
                         });
-                let orphan_index = path.extension().is_some_and(|ext| ext == "idx")
-                    && path
-                        .file_stem()
-                        .and_then(|id| id.to_str())
-                        .is_some_and(|id| id.parse::<u64>().is_ok());
-                if (!(in_generation_directory && generated) && !orphan_index)
+                let numeric_name = path
+                    .file_stem()
+                    .and_then(|id| id.to_str())
+                    .is_some_and(|id| id.parse::<u64>().is_ok());
+                let orphan_index = numeric_name && path.extension().is_some_and(|ext| ext == "idx");
+                let orphan_manifest = numeric_name
+                    && path.extension().is_some_and(|ext| ext == "vmanifest")
+                    && directory.strip_prefix(&root).is_ok_and(|relative| {
+                        relative.components().count() == 2
+                            && relative.components().all(|part| {
+                                part.as_os_str()
+                                    .to_str()
+                                    .is_some_and(|id| id.parse::<u64>().is_ok())
+                            })
+                    });
+                if (!(in_generation_directory && generated) && !orphan_index && !orphan_manifest)
                     || live.contains(&path)
                 {
                     continue;
@@ -984,6 +1014,19 @@ impl Database {
                 fs::remove_file(&path).map_err(io_err)?;
                 retire_page_owner_proof(&path);
                 crate::platform::fs::sync_path(&directory).map_err(io_err)?;
+            }
+        }
+        for directory in orphan_vector_dirs {
+            match fs::remove_dir(&directory) {
+                Ok(()) => {
+                    crate::platform::fs::sync_path(directory.parent().unwrap()).map_err(io_err)?
+                }
+                Err(err)
+                    if matches!(
+                        err.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::DirectoryNotEmpty
+                    ) => {}
+                Err(err) => return Err(io_err(err)),
             }
         }
         Ok(())

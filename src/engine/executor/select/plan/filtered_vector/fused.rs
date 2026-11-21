@@ -60,6 +60,125 @@ fn value_bound(kind: &DataTypeKind) -> Option<usize> {
     bytes.checked_add(128)
 }
 
+pub(super) fn row_bound(table: &TableSchema) -> Option<usize> {
+    table.columns.iter().try_fold(0usize, |n, column| {
+        n.checked_add(value_bound(&column.data_type)?)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_score_ann_batch(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    sid: u64,
+    ids: &mut [RowId],
+    column: usize,
+    query: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+    predicate_columns: &[usize],
+    predicate: &CompiledPredicate,
+    decoded_predicate: Option<&DecodedPredicateProgram>,
+    row_bound: usize,
+    null_score: f64,
+    k: usize,
+    best: &mut BinaryHeap<Scored<(u64, RowId)>>,
+    charge: &mut VectorQueryCharge,
+    stats: &mut super::super::super::analyze_stats::FilteredVectorStats,
+) -> Result<Option<(usize, usize)>, QueryError> {
+    if ids.is_empty() {
+        return Ok(Some((0, 0)));
+    }
+    let window = ids.len().min(Database::FUSED_VECTOR_READ_WINDOW);
+    // Budget the narrow result list and a bounded MVCC fallback before
+    // evaluating predicates, so admission failure can use the two-pass reader.
+    let reservation = row_bound
+        .saturating_mul(window.saturating_mul(2))
+        .saturating_add(ids.len().saturating_mul(64))
+        .saturating_add(query.dimension as usize * std::mem::size_of::<f32>());
+    let _scratch = match VectorQueryCharge::try_new_recoverable(reservation) {
+        Ok(charge) => charge,
+        Err(err) if err.is(crate::error::catalog::ER_OUTOFMEMORY) => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    ids.sort_unstable();
+    let decoded = prepare_float_query(&table.schema, column, query, metric);
+    let prepared = decoded
+        .as_deref()
+        .map(|values| crate::engine::vector::distance::PreparedF32Distance::new(values, metric));
+    let heap = db.cached_heap_handle(sid)?;
+    let mut truths = smallvec::SmallVec::<[_; 8]>::new();
+    if let Some(program) = decoded_predicate {
+        truths.resize(program.leaf_count(), None);
+    }
+    let mut payload_evaluations = 0;
+    let mut payload_reranks = 0;
+    let mut eval_payload = |hit: crate::storage::PayloadStreamHit<'_>| {
+        let crate::storage::PayloadStreamHit::Payload(payload) = hit else {
+            return Ok(None);
+        };
+        let program = decoded_predicate.expect("borrowed predicate program");
+        let mut sink =
+            super::super::super::parallel::DecodedPredicateSink::new(program, &mut truths);
+        let decoded = crate::storage::decode_row_into_sink_fast(
+            payload.payload,
+            payload.codec,
+            payload.layout_id,
+            payload.plan,
+            &mut sink,
+            payload.has_external,
+        )?;
+        let accepted = decoded.then(|| sink.finish()).flatten();
+        if let Some(accepted) = accepted {
+            payload_evaluations += 1;
+            payload_reranks += u64::from(accepted);
+        }
+        Ok(accepted)
+    };
+    let (scores, in_page) = db.score_filtered_vector_rows_many_with_handle(
+        &heap,
+        &table.schema,
+        ids,
+        txn,
+        column,
+        query,
+        metric,
+        None,
+        prepared.as_ref(),
+        predicate_columns,
+        decoded_predicate.map(|_| &mut eval_payload as &mut _),
+        |values| {
+            stats.predicate_evaluations += 1;
+            let accepted = predicate.eval(values)?;
+            stats.reranks += u64::from(accepted);
+            Ok(accepted)
+        },
+    )?;
+    stats.predicate_evaluations += payload_evaluations;
+    stats.reranks += payload_reranks;
+    stats.fused_reranks += in_page as u64;
+    offer_filtered_scores(sid, scores, null_score, k, best, charge).map(Some)
+}
+
+fn prepare_float_query(
+    table: &TableSchema,
+    column: usize,
+    query: &crate::vector::VectorValue,
+    metric: crate::engine::vector::Metric,
+) -> Option<Vec<f32>> {
+    let DataTypeKind::Vector {
+        datatype: crate::vector::VectorDataType::Float32,
+        dim: Some(dimension),
+    } = table.columns[column].data_type
+    else {
+        return None;
+    };
+    (query.datatype == crate::vector::VectorDataType::Float32
+        && query.dimension == dimension
+        && metric == crate::engine::vector::Metric::Cosine)
+        .then(|| crate::engine::vector::to_f32(query))
+}
+
 fn collect(
     db: &Arc<Database>,
     txn: TxnView,
@@ -113,6 +232,7 @@ pub(super) fn try_score(
     column: usize,
     query: &crate::vector::VectorValue,
     metric: crate::engine::vector::Metric,
+    null_score: f64,
     k: usize,
     degree: usize,
     best: &mut BinaryHeap<Scored<(u64, RowId)>>,
@@ -127,12 +247,7 @@ pub(super) fn try_score(
     }
     // Historical/LOB fallback can decode a full visible row. Bound that work
     // as well as the narrow hot path before choosing this optional pipeline.
-    let Some(row_bound) = table
-        .schema
-        .columns
-        .iter()
-        .try_fold(0usize, |n, c| n.checked_add(value_bound(&c.data_type)?))
-    else {
+    let Some(row_bound) = row_bound(&table.schema) else {
         return Ok(false);
     };
     let candidates = match collect(db, txn, table, access, filter) {
@@ -205,10 +320,7 @@ pub(super) fn try_score(
     };
     let prepared =
         crate::engine::vector::distance::PreparedNativeDistance::try_new(query, datatype, metric);
-    let decoded = (datatype == crate::vector::VectorDataType::Float32
-        && query.datatype == crate::vector::VectorDataType::Float32
-        && metric == crate::engine::vector::Metric::Cosine)
-        .then(|| crate::engine::vector::to_f32(query));
+    let decoded = prepare_float_query(&table.schema, column, query, metric);
     let float_prepared = decoded
         .as_deref()
         .map(|values| crate::engine::vector::distance::PreparedF32Distance::new(values, metric));
@@ -228,7 +340,7 @@ pub(super) fn try_score(
                 current_heap = Some((*sid, db.cached_heap_handle(*sid)?));
             }
             let heap = &current_heap.as_ref().unwrap().1;
-            let scores = db.score_filtered_vector_rows_many_with_handle(
+            let (scores, _) = db.score_filtered_vector_rows_many_with_handle(
                 heap,
                 &table.schema,
                 &rows[lo..hi],
@@ -239,6 +351,7 @@ pub(super) fn try_score(
                 prepared.as_ref(),
                 float_prepared.as_ref(),
                 columns,
+                None,
                 |values| {
                     evaluated += 1;
                     compiled.eval(values)
@@ -251,7 +364,7 @@ pub(super) fn try_score(
                     &mut local,
                     Scored {
                         id: (*sid, row),
-                        dist,
+                        dist: score_key(dist, null_score),
                     },
                     k,
                 );

@@ -2461,6 +2461,65 @@ fn checkpoint_during_committed_vector_batch_never_overstates_snapshot_coverage()
 }
 
 #[test]
+fn committed_vector_maintenance_outlives_statement_cancellation() {
+    use crate::engine::cancel::{self, QueryCancelToken};
+
+    let _env = HnswEnv::set(&[
+        ("MYDB_VECTOR_STORAGE", "paged"),
+        ("MYDB_HNSW_UPDATE_INPLACE", "0"),
+        ("MYDB_HNSW_COMPACT_DISABLE", "1"),
+    ]);
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let check = |engine: &StorageQueryEngine| {
+        let query =
+            "SELECT /*+ HNSW_EF(64) */ id FROM items ORDER BY L2_DISTANCE(v, '[0,0,0,0]') LIMIT 2";
+        assert!(explain_analyze_tree(engine, query).contains("Vector index (HNSW) scan"));
+        assert_eq!(
+            query_rows(engine, query),
+            vec![vec![Value::Int(4)], vec![Value::Int(1)]]
+        );
+        assert_eq!(scalar(engine, "SELECT COUNT(*) FROM items WHERE id=2"), "0");
+    };
+    {
+        let engine = open_strict_test_engine(dir.path());
+        for sql in [
+            "CREATE TABLE items(id INT PRIMARY KEY, v VECTOR(4) NOT NULL)",
+            "INSERT INTO items VALUES (1,'[10,0,0,0]'),(2,'[20,0,0,0]'),(3,'[30,0,0,0]')",
+            "CREATE INDEX vx ON items(v) USING HNSW WITH(m=4,ef_construction=32)",
+        ] {
+            engine.execute(sql).unwrap();
+        }
+        let mut session = SessionContext::default();
+        for sql in [
+            "BEGIN",
+            "DELETE FROM items WHERE id=2",
+            "UPDATE items SET v='[1,0,0,0]' WHERE id=1",
+            "INSERT INTO items VALUES (4,'[0,0,0,0]')",
+        ] {
+            engine.execute_with_session(&mut session, sql).unwrap();
+        }
+        let txn_id = session.current_txn.unwrap();
+        let hook = engine.database().install_vector_apply_test_hook();
+        let token = QueryCancelToken::noop();
+        std::thread::scope(|scope| {
+            let writer = scope.spawn(|| {
+                let _statement = cancel::enter(token.clone());
+                engine.database().commit_txn(txn_id).unwrap();
+                assert_eq!(cancel::check_cancelled().unwrap_err().code(), 1317);
+            });
+            let reached = hook.wait_until_reached(std::time::Duration::from_secs(10));
+            token.cancel_local();
+            hook.release();
+            writer.join().unwrap();
+            assert!(reached, "committed maintenance did not reach its test hook");
+        });
+        check(&engine);
+        engine.checkpoint().unwrap();
+    }
+    check(&open_strict_test_engine(dir.path()));
+}
+
+#[test]
 fn storage_single_insert_uses_durable_deferred_vector_maintenance() {
     for backend in ["memory", "paged"] {
         for (datatype, algorithm) in [("FLOAT32", "HNSW"), ("FLOAT16", "HNSW"), ("INT8", "IVF")] {

@@ -2933,12 +2933,16 @@ impl VectorIndexFile {
     /// caller before this scan via `meta().nav_exact_nodes`.
     pub(crate) fn for_each_navigation_row(
         &self,
+        should_stop: impl Fn() -> bool,
         mut f: impl FnMut(VecId, RowId, bool, &[u8], &[i8], i32, &[NodeId]) -> Result<(), QueryError>,
-    ) -> Result<(), QueryError> {
+    ) -> Result<bool, QueryError> {
         let (dim, m, m0) = (self.dim_fixed, self.m_fixed, self.m0_fixed);
         let next = self.meta_state.lock().meta.node_next_page_id;
         let mut neighbors = Vec::<NodeId>::with_capacity(m0);
         for page_id in 1..next {
+            if should_stop() {
+                return Ok(false);
+            }
             self.buffer_pool
                 .with_raw_page_intent(self.page_key(page_id), AccessIntent::Probe, |bytes| {
                     if read_u32(bytes, 0) != VEC_NODE_MAGIC {
@@ -2990,7 +2994,7 @@ impl VectorIndexFile {
                     Ok(())
                 })?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Read only `vid`'s layer-`level` neighbour list into `out`, borrowing the
