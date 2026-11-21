@@ -4051,8 +4051,9 @@ impl Database {
         Ok(())
     }
 
-    /// Apply and remove every still-live deferred DELETE for a committing txn.
-    pub(crate) fn apply_pending_vector_deletes(
+    /// Apply and finalize a transaction's deferred vector index mutations
+    /// after its commit decision has been published.
+    pub(crate) fn finish_committed_vector_maintenance(
         &self,
         txn_id: u64,
         commit_scn: u64,
@@ -4074,6 +4075,9 @@ impl Database {
             }
             return Ok(());
         }
+        // The WAL decision already commits the heap rows. Client cancellation
+        // must not interrupt graph writes, model training or completion WAL.
+        let _cancellation = crate::engine::cancel::suspend_statement_cancellation();
         let mut affected = std::collections::HashSet::new();
         for entry in pending {
             affected.insert((entry.table_id, entry.storage_id));
@@ -4188,6 +4192,10 @@ impl Database {
         let _snapshot = self.vector_purge_snapshot_gate.read();
         let horizon = self.vector_purge_horizon();
         let ready = self.vector_purge_queue.lock().ready_keys(horizon);
+        // Purging committed versions may run on a foreground SQL thread,
+        // including one whose own statement has already been canceled.
+        let _cancellation =
+            (!ready.is_empty()).then(crate::engine::cancel::suspend_statement_cancellation);
         let mut completed = 0;
         for identity in ready {
             let mut purge = {
