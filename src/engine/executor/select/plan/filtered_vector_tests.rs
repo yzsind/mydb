@@ -55,7 +55,7 @@ fn filtered_vector_adaptive_rounds_preserve_results_and_explicit_pool_settings()
     let (_dir, engine) = open();
     setup(&engine, "FLOAT32", "HNSW");
     let sql =
-        "SELECT id FROM items WHERE tenant>=8 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+        "SELECT id FROM items WHERE tenant>=8 AND body LIKE 'text-%' ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
     let expected = rows(
         &engine,
         &sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE"),
@@ -104,6 +104,8 @@ fn filtered_vector_adaptive_rounds_preserve_results_and_explicit_pool_settings()
         let checks = work.quality_rounds;
         let fallbacks = work.fallbacks;
         assert_eq!(fallbacks, 0);
+        assert!(work.fused_reranks > 0);
+        assert_eq!(work.fused_reranks, work.reranks);
         if explicit {
             assert_eq!(checks, 0);
         } else {
@@ -1063,7 +1065,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
     let mut counts = [0; 4];
     let query = crate::engine::vector::codec::from_f32(&[0.0, 1.0, 2.0]);
     crate::engine::api::clear_statement_warnings();
-    let scores = db
+    let (scores, in_page) = db
         .score_filtered_vector_rows_many_with_handle(
             &db.cached_heap_handle(schema.id).unwrap(),
             &schema,
@@ -1075,6 +1077,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             None,
             &[schema.column_index("id").unwrap()],
+            None,
             |values| {
                 let Value::Int(id) = values[0] else {
                     panic!("integer id")
@@ -1092,6 +1095,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
     assert_eq!(counts, [1, 1, 1, 1]);
     assert_eq!(crate::engine::api::take_statement_warnings().len(), 4);
     assert_eq!(scores.len(), 3);
+    assert!((1..scores.len()).contains(&in_page));
     // Scoring errors must be deferred until after the predicate accepts a
     // row, including when an old-layout window uses the general reader.
     let heap = db.cached_heap_handle(schema.id).unwrap();
@@ -1103,7 +1107,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
         crate::engine::vector::Metric::Cosine,
     );
     let mut counts = [0; 4];
-    let actual = db
+    let (actual, _) = db
         .score_filtered_vector_rows_many_with_handle(
             &heap,
             &schema,
@@ -1115,6 +1119,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             Some(&cosine),
             &columns,
+            None,
             |values| {
                 let Value::Int(id) = values[0] else {
                     panic!("integer id")
@@ -1155,9 +1160,11 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             None,
             &columns,
+            None,
             |_| Ok(false),
         )
         .unwrap()
+        .0
         .is_empty());
     assert!(db
         .score_filtered_vector_rows_many_with_handle(
@@ -1171,6 +1178,7 @@ fn filtered_vector_fused_partial_resident_retry_evaluates_each_row_once() {
             None,
             None,
             &columns,
+            None,
             |_| Ok(true),
         )
         .is_err());

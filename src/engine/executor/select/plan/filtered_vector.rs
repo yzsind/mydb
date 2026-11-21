@@ -463,9 +463,28 @@ fn score_filtered_ids_progress(
         metric,
         None,
     )?;
-    let count = scores.len();
+    offer_filtered_scores(
+        sid,
+        scores.into_iter().map(|(row, score, _)| (row, score)),
+        null_score,
+        k,
+        best,
+        charge,
+    )
+}
+
+fn offer_filtered_scores(
+    sid: u64,
+    scores: impl IntoIterator<Item = (RowId, f64)>,
+    null_score: f64,
+    k: usize,
+    best: &mut BinaryHeap<Scored<(u64, RowId)>>,
+    charge: &mut VectorQueryCharge,
+) -> Result<(usize, usize), QueryError> {
+    let mut count = 0;
     let mut changes = 0;
-    for (row, distance, _) in scores {
+    for (row, distance) in scores {
+        count += 1;
         let item = Scored {
             dist: score_key(distance, null_score),
             id: (sid, row),
@@ -544,6 +563,33 @@ fn search_filtered_ann(
         &[]
     };
     let compiled = &predicate.compiled;
+    let fused_predicate = if !is_ivf && selection.is_none() {
+        compiled
+            .as_ref()
+            .filter(|predicate| predicate.page_latch_safe())
+            .filter(|_| {
+                crate::storage::rowid::query_column_index(&table.schema)
+                    .is_none_or(|rowid| !predicate_columns.contains(&rowid))
+            })
+            .and_then(|compiled| fused::row_bound(&table.schema).map(|bound| (compiled, bound)))
+    } else {
+        None
+    };
+    let decoded_predicate = fused_predicate.and_then(|_| {
+        let filter = filter.as_ref()?;
+        if predicate_columns.iter().any(|&column| {
+            matches!(
+                table.schema.columns[column].data_type,
+                DataTypeKind::Char { .. }
+            )
+        }) {
+            // CHAR comparison uses the normalized projected value.
+            return None;
+        }
+        let schema = projected_schema_view(&table.schema, predicate_columns);
+        DecodedPredicateProgram::compile_for_payload(filter, &schema)
+            .filter(DecodedPredicateProgram::has_borrowed_string_predicate)
+    });
     let eval_ctx = &mut predicate.eval_ctx;
     let mut all_complete = true;
     for sid in db.scan_storage_ids(&table.schema) {
@@ -593,40 +639,70 @@ fn search_filtered_ann(
                 }
             }
             stats.ann_candidates += ids.len() as u64;
-            let ids = if selection.is_some() {
-                ids
-            } else {
-                let heap = db.cached_heap_handle(sid)?;
-                let rows = db.read_row_columns_many_with_handle(
-                    &heap,
-                    &table.schema,
-                    &ids,
+            let fused_progress = if let Some((compiled, row_bound)) = fused_predicate {
+                fused::try_score_ann_batch(
+                    db,
                     txn,
-                    &predicate_columns,
-                )?;
-                let _batch_charge = charge_predicate_rows(&rows)?;
-                let mut kept = Vec::with_capacity(rows.len());
-                for (id, values) in rows {
-                    stats.predicate_evaluations += 1;
-                    let keep = match (filter, compiled.as_ref()) {
-                        (None, _) => true,
-                        (_, Some(p)) => p.eval(&values)?,
-                        (Some(expr), None) => {
-                            let row =
-                                projected_values_to_plan_row(table, &predicate_columns, values)?;
-                            eval_plan_bool_with_db(db, txn, expr, &row, eval_ctx)?
-                        }
-                    };
-                    if keep {
-                        kept.push(id);
-                    }
-                }
-                kept
+                    table,
+                    sid,
+                    &mut ids,
+                    column,
+                    query,
+                    metric,
+                    predicate_columns,
+                    compiled,
+                    decoded_predicate.as_ref(),
+                    row_bound,
+                    null_score,
+                    k,
+                    best,
+                    charge,
+                    stats,
+                )?
+            } else {
+                None
             };
-            stats.reranks += ids.len() as u64;
-            let (accepted, changes) = score_filtered_ids_progress(
-                db, txn, table, sid, &ids, column, query, metric, null_score, k, best, charge,
-            )?;
+            let (accepted, changes) = if let Some(progress) = fused_progress {
+                progress
+            } else {
+                let ids = if selection.is_some() {
+                    ids
+                } else {
+                    let heap = db.cached_heap_handle(sid)?;
+                    let rows = db.read_row_columns_many_with_handle(
+                        &heap,
+                        &table.schema,
+                        &ids,
+                        txn,
+                        &predicate_columns,
+                    )?;
+                    let _batch_charge = charge_predicate_rows(&rows)?;
+                    let mut kept = Vec::with_capacity(rows.len());
+                    for (id, values) in rows {
+                        stats.predicate_evaluations += 1;
+                        let keep = match (filter, compiled.as_ref()) {
+                            (None, _) => true,
+                            (_, Some(p)) => p.eval(&values)?,
+                            (Some(expr), None) => {
+                                let row = projected_values_to_plan_row(
+                                    table,
+                                    &predicate_columns,
+                                    values,
+                                )?;
+                                eval_plan_bool_with_db(db, txn, expr, &row, eval_ctx)?
+                            }
+                        };
+                        if keep {
+                            kept.push(id);
+                        }
+                    }
+                    kept
+                };
+                stats.reranks += ids.len() as u64;
+                score_filtered_ids_progress(
+                    db, txn, table, sid, &ids, column, query, metric, null_score, k, best, charge,
+                )?
+            };
             let checks = budget.checks();
             budget.observe(examined, accepted, changes);
             stats.quality_rounds += budget.checks() - checks;

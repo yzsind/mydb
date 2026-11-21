@@ -23,6 +23,7 @@ pub(crate) struct FilteredVectorStats {
     pub navigation_visits: u64,
     pub navigation_distances: u64,
     pub reranks: u64,
+    pub fused_reranks: u64,
     pub materialized: u64,
     pub batches: u64,
     pub fallbacks: u64,
@@ -43,6 +44,7 @@ pub(super) fn add_filtered_vector_stats(plan: &PhysicalPlan, work: FilteredVecto
                 entry.navigation_visits += work.navigation_visits;
                 entry.navigation_distances += work.navigation_distances;
                 entry.reranks += work.reranks;
+                entry.fused_reranks += work.fused_reranks;
                 entry.materialized += work.materialized;
                 entry.batches += work.batches;
                 entry.fallbacks += work.fallbacks;
@@ -1784,6 +1786,10 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
                         .filtered_vector
                         .reranks
                         .saturating_add(stats.filtered_vector.reranks);
+                    entry.filtered_vector.fused_reranks = entry
+                        .filtered_vector
+                        .fused_reranks
+                        .saturating_add(stats.filtered_vector.fused_reranks);
                     entry.filtered_vector.materialized = entry
                         .filtered_vector
                         .materialized
@@ -2136,6 +2142,7 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                     s.filtered_vector.navigation_distances,
                 ),
                 ("vector_heap_reranks", s.filtered_vector.reranks),
+                ("vector_fused_reranks", s.filtered_vector.fused_reranks),
                 ("vector_ann_candidates", s.filtered_vector.ann_candidates),
                 ("vector_quality_rounds", s.filtered_vector.quality_rounds),
                 ("vector_topk_updates", s.filtered_vector.topk_updates),
