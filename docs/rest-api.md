@@ -251,6 +251,74 @@ finishes execution before reporting `RESULT_TOO_LARGE` with
 `succeeded` confirms execution, including the commit of an atomic batch.
 Later SQL errors in a batch still take precedence and may cause rollback.
 
+## Prometheus metrics
+
+`rest_metrics_enabled=ON` adds an authenticated `GET /metrics` endpoint to
+the shared REST/MCP listener. It is independent of `rest_enabled`: an
+operations deployment can scrape metrics without enabling the SQL API, and
+the listener starts for metrics alone.
+
+```ini
+[mydb]
+rest_metrics_enabled = ON
+rest_host = 127.0.0.1
+rest_port = 8739
+rest_tls_mode = required
+rest_ssl_cert = /etc/mydb/server-cert.pem
+rest_ssl_key = /etc/mydb/server-key.pem
+```
+
+The endpoint uses the same Bearer API-key authentication as REST SQL and
+requires global `PROCESS`. A dedicated monitoring account with `PROCESS` is
+sufficient; `API_KEY_ADMIN` is not required. `PROCESS` also widens that
+account's process-list and engine-status visibility, so do not grant it to a
+general application account. Create the API key from a TLS MySQL session; the
+REST SQL routes can remain disabled while metrics are enabled.
+
+Metrics are only available when the listener is reachable. Plaintext listeners
+must bind a loopback address and `rest_tls_mode=disabled` is rejected for a
+non-loopback host at startup; remote scrapes use HTTPS. The endpoint also
+rejects a plaintext non-loopback peer as defense in depth. Query parameters are
+rejected. Concurrent scrapes are bounded; excess scrapes receive 503 with
+`Retry-After: 1`.
+
+```yaml
+scrape_configs:
+  - job_name: mydb
+    scheme: https
+    static_configs:
+      - targets: ["mydb.example:8739"]
+    authorization:
+      type: Bearer
+      credentials_file: /etc/prometheus/mydb-api-key
+    tls_config:
+      ca_file: /etc/mydb/server-cert.pem
+```
+
+The response is `text/plain; version=0.0.4; charset=utf-8`, contains
+`# HELP`/`# TYPE` metadata, and sends `Cache-Control: no-store`. Metric names use the
+`mydb_` prefix and Prometheus base units (seconds, bytes). Cumulative
+counters end in `_total`; use `rate()` or `increase()` and sample twice
+rather than treating totals as rates.
+
+The exported set is intentionally curated for operations and automated
+agents: connection and query accounting, WAL durability and group-commit
+latency, checkpoint phases and backlog, buffer-pool pressure, row-lock
+waits and deadlocks, undo/spill growth, memory admission, disk pressure,
+recycle-bin pressure, and replication channel/lag gauges. It does not
+include SQL text, database or table names, account names, API keys, or
+`information_schema.MYDB_ENGINE_STATUS`'s complete diagnostic inventory.
+Per-command series are bounded by the fixed protocol command vocabulary.
+Subsystems are read sequentially and may not represent one atomic instant.
+Engine-level families are present only when the engine provides a storage
+snapshot; the always-present `mydb_engine_metrics_available` gauge reports
+`1` for that case and `0` when only process and listener metrics are available.
+Gate engine alerts with that gauge or `absent()`, because zero is a real value
+for counters. Replication lag, the last successful checkpoint timestamp, a buffer-pool
+hit ratio with no accesses, and disk-available bytes without a disk-pressure
+monitor use `NaN` when unknown, so their families stay visible. The full raw counters remain available to `PROCESS`
+holders through SQL.
+
 ## Status, cancellation, and retries
 
 Provide an optional `X-Request-ID` with 16 through 64 ASCII letters, digits,
@@ -262,6 +330,7 @@ an ID. Retained duplicate IDs return 409 without starting SQL.
 | `GET /api/v1/requests/{id}` | Execution state and summary, without result rows |
 | `POST /api/v1/requests/{id}/cancel` | Request cancellation; 202 is not rollback confirmation |
 | `GET /api/v1/status` | Capacity and execution counters; requires `API_KEY_ADMIN` |
+| `GET /metrics` | Prometheus text metrics; requires `PROCESS` and `rest_metrics_enabled` |
 | `GET /health/live` | Unauthenticated process liveness |
 | `GET /health/ready` | Unauthenticated readiness |
 

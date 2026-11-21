@@ -99,12 +99,16 @@ pub struct State<E: QueryEngine> {
     completed_requests: Arc<Mutex<VecDeque<Weak<RequestState<E>>>>>,
     pub inflight: Arc<Semaphore>,
     pub slots: Arc<Semaphore>,
+    /// Bounds concurrent metrics collection so scrapes cannot queue
+    /// unbounded blocking work behind a slow status snapshot.
+    pub scrape: Arc<Semaphore>,
     pub used: Arc<AtomicUsize>,
     pub executed: AtomicU64,
+    pub succeeded: AtomicU64,
     pub failed: AtomicU64,
     pub cancelled: AtomicU64,
     pub received_bytes: AtomicU64,
-    pub sent_bytes: AtomicU64,
+    pub sent_bytes: Arc<AtomicU64>,
     pub elapsed_us: AtomicU64,
 }
 impl<E: QueryEngine> State<E> {
@@ -112,6 +116,7 @@ impl<E: QueryEngine> State<E> {
         Arc::new(Self {
             inflight: Arc::new(Semaphore::new(config.max_inflight)),
             slots: Arc::new(Semaphore::new(config.max_sessions)),
+            scrape: Arc::new(Semaphore::new(4)),
             config,
             engine,
             registry,
@@ -120,10 +125,11 @@ impl<E: QueryEngine> State<E> {
             completed_requests: Arc::new(Mutex::new(VecDeque::new())),
             used: Arc::new(AtomicUsize::new(0)),
             executed: AtomicU64::new(0),
+            succeeded: AtomicU64::new(0),
             failed: AtomicU64::new(0),
             cancelled: AtomicU64::new(0),
             received_bytes: AtomicU64::new(0),
-            sent_bytes: AtomicU64::new(0),
+            sent_bytes: Arc::new(AtomicU64::new(0)),
             elapsed_us: AtomicU64::new(0),
         })
     }
@@ -1331,6 +1337,11 @@ fn perform<E: QueryEngine>(
             &ctx.current_database,
         );
         crate::mysql::connection_manager::record_statement();
+        crate::engine::status_counters::add_session_counter(
+            ctx,
+            crate::engine::status_counters::SessionCounter::Questions,
+            1,
+        );
         state.executed.fetch_add(1, Ordering::Relaxed);
         *started = true;
         let response = state.engine.execute_parsed_with_params(
@@ -1580,7 +1591,10 @@ pub async fn start<E: QueryEngine>(
         }
         let mut final_error = None;
         let mut status = match result {
-            Ok(()) => StatusCode::OK,
+            Ok(()) => {
+                worker_state.succeeded.fetch_add(1, Ordering::Relaxed);
+                StatusCode::OK
+            }
             Err(e) => {
                 let status = e.status;
                 final_error = Some(e);

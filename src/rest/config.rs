@@ -6,6 +6,7 @@ use std::{
 #[derive(Debug, Clone)]
 pub struct RestConfig {
     pub enabled: bool,
+    pub metrics_enabled: bool,
     pub addr: SocketAddr,
     pub loopback_http_addr: Option<SocketAddr>,
     pub tls: bool,
@@ -38,10 +39,13 @@ impl RestConfig {
                     std::io::Error::other(format!("Invalid rest_{}", name.to_ascii_lowercase()))
                 })
         };
-        let enabled = matches!(
-            get("ENABLED", "OFF").to_ascii_lowercase().as_str(),
-            "on" | "true" | "1"
-        );
+        // Startup validation accepts the full boolean spelling set (ON/OFF,
+        // TRUE/FALSE, YES/NO, 1/0) and trims whitespace, but raw environment
+        // values reach this point unnormalized. Parse with the same rules so
+        // an accepted spelling cannot silently disable a route.
+        let enabled = crate::util::env::parse_bool(&get("ENABLED", "OFF")).unwrap_or(false);
+        let metrics_enabled =
+            crate::util::env::parse_bool(&get("METRICS_ENABLED", "OFF")).unwrap_or(false);
         let host = get("HOST", "127.0.0.1")
             .parse::<IpAddr>()
             .map_err(|_| std::io::Error::other("Invalid REST host"))?;
@@ -95,6 +99,7 @@ impl RestConfig {
         }
         Ok(Self {
             enabled,
+            metrics_enabled,
             addr: SocketAddr::new(host, port),
             loopback_http_addr,
             tls,

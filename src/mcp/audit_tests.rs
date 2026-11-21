@@ -202,6 +202,7 @@ async fn audit_unpolled_delivery_expires_and_releases_transaction() {
         supervisor: Mutex::new(None),
         ready_at: Mutex::new(Some(Instant::now())),
         persistent_created: AtomicBool::new(false),
+        sent_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection: None,
     });
     let delivery = Delivery::new(
@@ -878,6 +879,7 @@ async fn audit_completed_delivery_cannot_cancel_a_subsequent_transaction() {
         supervisor: Mutex::new(None),
         ready_at: Mutex::new(Some(Instant::now())),
         persistent_created: AtomicBool::new(false),
+        sent_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection: None,
     });
     let completed_lease = lease.clone();
@@ -976,6 +978,7 @@ async fn audit_eof_with_queued_network_frame_still_expires() {
         supervisor: Mutex::new(None),
         ready_at: Mutex::new(Some(Instant::now())),
         persistent_created: AtomicBool::new(false),
+        sent_bytes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         connection: None,
     });
     let mut delivery = Delivery::new(

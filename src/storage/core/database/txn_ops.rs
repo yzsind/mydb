@@ -1122,6 +1122,13 @@ impl Database {
         })
     }
 
+    /// Whether disk-pressure monitoring is active. Read-only/snapshot and
+    /// memory-durability databases have no monitor, so `disk_pressure_status`
+    /// returns zeros that must not be presented as a full disk.
+    pub(crate) fn disk_pressure_enabled(&self) -> bool {
+        self.disk_pressure.is_some()
+    }
+
     fn admit_disk_cleanup(
         &self,
         intent: Option<&DropTableIntent>,
@@ -2435,6 +2442,20 @@ impl Database {
 
     pub fn checkpoint_wal_bytes(&self) -> u64 {
         self.runtime_config_read().checkpoint_wal_bytes
+    }
+
+    /// WAL bytes accumulated since the most recent successful checkpoint.
+    /// This is the same baseline used by the size-based checkpoint trigger;
+    /// it is not the configured threshold. Failure-driven trigger backoff
+    /// updates a separate atomic, so a failed attempt cannot clear the
+    /// reported backlog.
+    pub(crate) fn wal_bytes_since_checkpoint(&self) -> u64 {
+        self.log_state_atomics
+            .wal_bytes()
+            .saturating_sub(
+                self.wal_bytes_after_last_successful_checkpoint_atomic
+                    .load(Ordering::Acquire),
+            )
     }
 
     pub fn undo_retention_ms(&self) -> u64 {
@@ -4680,6 +4701,8 @@ impl Database {
             .store(now_ms, Ordering::Release);
         self.wal_bytes_after_last_checkpoint_atomic
             .store(wal_bytes_now, Ordering::Release);
+        self.wal_bytes_after_last_successful_checkpoint_atomic
+            .store(wal_bytes_now, Ordering::Release);
         // Publish the checkpoint LSN to the buffer pool so the
         // heap-side first-update FPI gate can skip pages already
         // WAL-touched in this checkpoint window.
@@ -4847,6 +4870,8 @@ impl Database {
         self.last_checkpoint_unix_ms_atomic
             .store(now_ms, Ordering::Release);
         self.wal_bytes_after_last_checkpoint_atomic
+            .store(wal_bytes_now, Ordering::Release);
+        self.wal_bytes_after_last_successful_checkpoint_atomic
             .store(wal_bytes_now, Ordering::Release);
         self.restartpoints_total_atomic
             .fetch_add(1, Ordering::Relaxed);

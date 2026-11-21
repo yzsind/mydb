@@ -163,6 +163,14 @@ static OPTION_SPECS: &[OptionSpec] = &[
         sensitive: false,
     },
     OptionSpec {
+        name: "rest_metrics_enabled",
+        env: "MYDB_REST_METRICS_ENABLED",
+        kind: OptionKind::Bool,
+        aliases: &[],
+        cli: true,
+        sensitive: false,
+    },
+    OptionSpec {
         name: "rest_host",
         env: "MYDB_REST_HOST",
         kind: OptionKind::IpAddr,
