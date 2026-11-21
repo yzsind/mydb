@@ -20,7 +20,7 @@ CONV(number, from_base, to_base)
 
 ## Return Value
 
-Returns an integer representation as a string in the target base. SQL NULL input or a base outside the supported magnitude 2–36 returns NULL. Negative base signs select signed interpretation/output under the conversion rules.
+Returns an integer representation as a string in the target base. SQL NULL input or a base outside the supported magnitude 2–36 returns NULL. Negative base signs select signed interpretation/output under the conversion rules. Non-integer bases follow MySQL's integer conversion: exact DECIMAL values round half away from zero, approximate values round to the nearest even integer, and strings truncate toward zero.
 
 ## Examples
 

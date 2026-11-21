@@ -19,7 +19,7 @@ ROUND(number [, decimals])
 
 ## Return Value
 
-Returns the input rounded to decimals places, default 0. Exact DECIMAL half values round away from zero. Negative decimals round to tens, hundreds, and so on. SQL NULL in either argument returns NULL; the derived type/scale follows the numeric input domain.
+Returns the input rounded to decimals places, default 0. Exact DECIMAL half values round away from zero. Negative decimals round to tens, hundreds, and so on. SQL NULL in either argument returns NULL; the derived type/scale follows the numeric input domain. A non-integer `decimals` follows MySQL's integer conversion: exact DECIMAL values round half away from zero, approximate values round to the nearest even integer, and strings truncate toward zero.
 
 ## Examples
 

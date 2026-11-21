@@ -20,7 +20,7 @@ FORMAT(number, decimals [, locale])
 
 ## Return Value
 
-Returns formatted text with grouping separators and the requested decimal digits. decimals is clamped to 0..30; omitted locale uses en_US. SQL NULL number/decimals returns NULL. An unknown locale uses the fallback locale with a diagnostic.
+Returns formatted text with grouping separators and the requested decimal digits. decimals is clamped to 0..30; a non-integer `decimals` follows MySQL's integer conversion (exact DECIMAL values round half away from zero, approximate values round to the nearest even integer, and strings truncate toward zero). Omitted locale uses en_US. SQL NULL number/decimals returns NULL. An unknown locale uses the fallback locale with a diagnostic.
 
 ## Examples
 
