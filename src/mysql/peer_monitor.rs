@@ -385,7 +385,7 @@ mod tests {
     async fn reset_is_observed_without_consuming_input() {
         let (client, server) = pair().await;
         let monitor = PeerCloseMonitor::new(&server).unwrap();
-        client.set_linger(Some(Duration::ZERO)).unwrap();
+        client.set_zero_linger().unwrap();
         drop(client);
         tokio::time::timeout(Duration::from_secs(2), monitor.closed())
             .await
