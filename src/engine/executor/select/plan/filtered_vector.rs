@@ -132,6 +132,11 @@ pub(super) fn execute_filtered_vector_topk(
             || (*strategy == FilteredVectorStrategy::Exact && parallel_degree > 1))
     {
         let attempt = (|| {
+            if !force_exact {
+                if let Some(rows) = try_covering_selection(db, txn, table, scalar_access, filter)? {
+                    return Ok(Arc::new(rows));
+                }
+            }
             let mut rows = crate::engine::vector::selection::RowSelection::new()?;
             visit_filtered_row_ids(
                 db,
@@ -605,6 +610,7 @@ fn search_filtered_ann(
         let mut cursor =
             db.vector_index_open_cursor(&table.schema, index, sid, query, selection.clone())?;
         cursor.max_navigation = max_scan;
+        cursor.allow_predicate_navigation = mode != IterativeScan::Off && selection.is_some();
         let mut effort = base_effort;
         loop {
             crate::engine::cancel::check_cancelled()?;
@@ -626,6 +632,8 @@ fn search_filtered_ann(
                 // a safety fallback even when iterative widening is disabled.
                 stats.navigation_visits += cursor.work.visited;
                 stats.navigation_distances += cursor.work.distances;
+                stats.navigation_predicate_skips += cursor.work.predicate_skips;
+                stats.navigation_connectors += cursor.work.connectors;
                 return Ok(false);
             };
             stats.batches += 1;
@@ -755,11 +763,59 @@ fn search_filtered_ann(
         }
         stats.navigation_visits += cursor.work.visited;
         stats.navigation_distances += cursor.work.distances;
+        stats.navigation_predicate_skips += cursor.work.predicate_skips;
+        stats.navigation_connectors += cursor.work.connectors;
         if !all_complete {
             break;
         }
     }
     Ok(all_complete || mode == IterativeScan::Off)
+}
+
+fn try_covering_selection(
+    db: &Arc<Database>,
+    txn: TxnView,
+    table: &PlanTable,
+    access: &PhysicalPlan,
+    filter: &Option<Expr>,
+) -> Result<Option<crate::engine::vector::selection::RowSelection>, QueryError> {
+    let Some((index, low, high)) = filter
+        .as_ref()
+        .and_then(|expr| crate::planner::covered_scalar_bounds(access, expr))
+    else {
+        return Ok(None);
+    };
+    if txn.dirty_read
+        || txn.historical
+        || db.has_pending_index_repairs_for(table.schema.id, &index.name)
+    {
+        return Ok(None);
+    }
+    db.check_index_read_view(&table.schema, index, txn)?;
+    let rollback_epoch = db.index_repair_rollback_epoch(table.schema.id, &index.name);
+    let mut cursor = db.range_index_snapshot_cursor(&table.schema, index, low, high, txn)?;
+    let mut rows = crate::engine::vector::selection::RowSelection::new()?;
+    let _scratch = VectorQueryCharge::try_new_recoverable(256 * 2 * std::mem::size_of::<RowId>())?;
+    loop {
+        crate::engine::cancel::check_cancelled()?;
+        let (ids, page_bound) = cursor.next_leaf_chunk_row_ids(256)?;
+        if ids.is_empty() {
+            break;
+        }
+        // A repaired chunk reports an unprovable bound. Any inconclusive
+        // leaf restarts through the repair-aware heap predicate path.
+        if db.has_pending_index_repairs_for(table.schema.id, &index.name)
+            || !db.index_page_all_visible(page_bound, txn)
+        {
+            return Ok(None);
+        }
+        rows.append(table.schema.id, &ids)?;
+    }
+    if db.index_repair_rollback_epoch(table.schema.id, &index.name) != rollback_epoch {
+        return Ok(None);
+    }
+    rows.seal()?;
+    Ok(Some(rows))
 }
 
 /// The internal scalar plan supplies identity, never a vector/LOB projection.
@@ -867,40 +923,64 @@ fn visit_filtered_row_ids(
                                 .capacity()
                                 .saturating_mul(std::mem::size_of::<(u64, u64)>()),
                         )?;
-                        for (lo, hi) in ranges {
-                            for page in lo..hi {
-                                crate::engine::cancel::check_cancelled()?;
-                                let mut ids = Vec::new();
-                                let mut scratch = VectorQueryCharge::try_new_recoverable(0)?;
-                                let scan_columns = if storage_compiled.is_some() {
-                                    columns.as_slice()
-                                } else {
-                                    &[]
-                                };
-                                db.scan_rows_columns_storage_streaming_range_with_ids(
-                                    &table.schema,
-                                    sid,
-                                    txn,
-                                    scan_columns,
-                                    page,
-                                    page + 1,
-                                    |id, values| {
-                                        if let Some(predicate) = storage_compiled {
+                        if let Some(predicate) = storage_compiled {
+                            // Keep one visibility and decode context per
+                            // bounded morsel and publish only identities.
+                            const PAGES: usize = 64;
+                            const ROW_CHUNK: usize = 256;
+                            let mut scratch = VectorQueryCharge::try_new_recoverable(0)?;
+                            let mut ids = Vec::new();
+                            for (lo, hi) in ranges {
+                                for start in (lo..hi).step_by(PAGES) {
+                                    crate::engine::cancel::check_cancelled()?;
+                                    ids.clear();
+                                    db.scan_rows_columns_storage_streaming_range_with_ids(
+                                        &table.schema,
+                                        sid,
+                                        txn,
+                                        columns,
+                                        start,
+                                        start.saturating_add(PAGES as u64).min(hi),
+                                        |id, values| {
                                             evaluated.set(evaluated.get().saturating_add(1));
-                                            if !predicate.eval(values)? {
-                                                return Ok(());
+                                            if predicate.eval(values)? {
+                                                if ids.len() == ids.capacity() {
+                                                    scratch.try_grow_recoverable(
+                                                        ROW_CHUNK * std::mem::size_of::<RowId>(),
+                                                    )?;
+                                                    ids.try_reserve_exact(ROW_CHUNK).map_err(|_| {
+                                                        error(crate::error::catalog::ER_OUTOFMEMORY, "filtered vector selection allocation failed")
+                                                    })?;
+                                                }
+                                                ids.push(id);
                                             }
-                                        }
-                                        scratch.try_grow_recoverable(
-                                            2 * std::mem::size_of::<RowId>(),
-                                        )?;
-                                        ids.push(id);
-                                        Ok(())
-                                    },
-                                )?;
-                                if storage_compiled.is_some() {
+                                            Ok(())
+                                        },
+                                    )?;
                                     (visit.borrow_mut())(sid, &ids)?;
-                                } else {
+                                }
+                            }
+                        } else {
+                            for (lo, hi) in ranges {
+                                for page in lo..hi {
+                                    crate::engine::cancel::check_cancelled()?;
+                                    let mut ids = Vec::new();
+                                    let mut scratch = VectorQueryCharge::try_new_recoverable(0)?;
+                                    db.scan_rows_columns_storage_streaming_range_with_ids(
+                                        &table.schema,
+                                        sid,
+                                        txn,
+                                        &[],
+                                        page,
+                                        page + 1,
+                                        |id, _| {
+                                            scratch.try_grow_recoverable(
+                                                2 * std::mem::size_of::<RowId>(),
+                                            )?;
+                                            ids.push(id);
+                                            Ok(())
+                                        },
+                                    )?;
                                     for window in ids.chunks(64) {
                                         filter_rows(db.read_row_columns_many_with_handle(
                                             &heap,

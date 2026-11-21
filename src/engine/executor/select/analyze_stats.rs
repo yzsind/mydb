@@ -22,6 +22,8 @@ pub(crate) struct FilteredVectorStats {
     pub predicate_evaluations: u64,
     pub navigation_visits: u64,
     pub navigation_distances: u64,
+    pub navigation_predicate_skips: u64,
+    pub navigation_connectors: u64,
     pub reranks: u64,
     pub fused_reranks: u64,
     pub materialized: u64,
@@ -43,6 +45,8 @@ pub(super) fn add_filtered_vector_stats(plan: &PhysicalPlan, work: FilteredVecto
                 entry.predicate_evaluations += work.predicate_evaluations;
                 entry.navigation_visits += work.navigation_visits;
                 entry.navigation_distances += work.navigation_distances;
+                entry.navigation_predicate_skips += work.navigation_predicate_skips;
+                entry.navigation_connectors += work.navigation_connectors;
                 entry.reranks += work.reranks;
                 entry.fused_reranks += work.fused_reranks;
                 entry.materialized += work.materialized;
@@ -1782,6 +1786,14 @@ pub(super) fn mirror_key(from_key: PlanNodeId, to_key: PlanNodeId) {
                         .filtered_vector
                         .navigation_distances
                         .saturating_add(stats.filtered_vector.navigation_distances);
+                    entry.filtered_vector.navigation_predicate_skips = entry
+                        .filtered_vector
+                        .navigation_predicate_skips
+                        .saturating_add(stats.filtered_vector.navigation_predicate_skips);
+                    entry.filtered_vector.navigation_connectors = entry
+                        .filtered_vector
+                        .navigation_connectors
+                        .saturating_add(stats.filtered_vector.navigation_connectors);
                     entry.filtered_vector.reranks = entry
                         .filtered_vector
                         .reranks
@@ -2140,6 +2152,14 @@ pub(super) fn format_tree_suffix(stats: Option<NodeStats>) -> String {
                 (
                     "vector_navigation_distances",
                     s.filtered_vector.navigation_distances,
+                ),
+                (
+                    "vector_navigation_predicate_skips",
+                    s.filtered_vector.navigation_predicate_skips,
+                ),
+                (
+                    "vector_navigation_connectors",
+                    s.filtered_vector.navigation_connectors,
                 ),
                 ("vector_heap_reranks", s.filtered_vector.reranks),
                 ("vector_fused_reranks", s.filtered_vector.fused_reranks),

@@ -354,11 +354,78 @@ fn filtered_vector_keeps_volatile_and_relational_boundaries() {
 }
 
 #[test]
+fn filtered_vector_covering_selection_completes_with_exact_heap_scores() {
+    let (_dir, engine) = open();
+    setup(&engine, "FLOAT32", "HNSW");
+    engine
+        .execute("CREATE INDEX cover_filter ON items(tenant, id)")
+        .unwrap();
+    let sql = "SELECT /*+ HNSW_EF(32) */ id FROM items IGNORE INDEX(it) WHERE tenant=3 AND id BETWEEN 50 AND 500 ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7";
+    let expected = rows(
+        &engine,
+        &sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE"),
+    );
+    let Statement::Select(select) = crate::parser::parse_statement(sql).unwrap() else {
+        unreachable!()
+    };
+    let db = engine.db_for_tests();
+    let plan = crate::planner::plan_select(db, &select).unwrap().physical;
+    let mut leaf = None;
+    plan.walk(|node| {
+        if matches!(node, PhysicalPlan::FilteredVectorTopK { .. }) {
+            leaf = Some(node.clone());
+        }
+    });
+    let mut leaf = leaf.expect("filtered vector leaf");
+    if let PhysicalPlan::FilteredVectorTopK {
+        strategy,
+        ef_hint,
+        index,
+        filter,
+        scalar_access,
+        projected_columns,
+        ..
+    } = &mut leaf
+    {
+        assert!(index.is_some(), "test requires an HNSW index on the plan");
+        assert!(
+            crate::planner::covered_scalar_bounds(scalar_access, filter.as_ref().unwrap())
+                .is_some()
+        );
+        *strategy = crate::planner::FilteredVectorStrategy::PrefilterAnn;
+        *ef_hint = Some(32);
+        *projected_columns = Some(Arc::new(vec![0]));
+    }
+    let mut session = crate::engine::api::SessionContext::default();
+    session.sysvars.mydb_hnsw_max_scan_tuples = 1;
+    let txn = db.begin_read_only_txn().unwrap();
+    let (measured, actual) = crate::engine::expr::with_session_expr_info(&session, || {
+        super::super::analyze_stats::with_collector(|| {
+            filtered_vector::execute_filtered_vector_topk(db, txn, &leaf)
+        })
+    });
+    let actual: Vec<_> = actual
+        .unwrap()
+        .into_iter()
+        .map(|row| vec![row.fields[0].value.clone()])
+        .collect();
+    assert_eq!(actual, expected);
+    let work = measured.get_for_plan(&leaf).unwrap().filtered_vector;
+    assert_eq!(work.predicate_evaluations, 0);
+    assert_eq!(work.fallbacks, 1);
+}
+
+#[test]
 fn filtered_vector_budget_and_frontier_exhaustion_complete_reranking_exactly() {
     for algo in ["HNSW", "IVF"] {
         let (_dir, engine) = open();
         setup(&engine, "FLOAT32", algo);
-        for (predicate, budget) in [("tenant>=0", 16), ("id<10", 0)] {
+        use crate::planner::FilteredVectorStrategy::{IterativeAnn, PrefilterAnn};
+        for (predicate, budget, route) in [
+            ("tenant>=0", 16, IterativeAnn),
+            ("id<10", 0, IterativeAnn),
+            ("tenant>=3 AND tenant<11", 16, PrefilterAnn),
+        ] {
             let sql = format!("SELECT id FROM items WHERE {predicate} ORDER BY L2_DISTANCE(v,'[3.123,1.019,1,2]') LIMIT 7");
             let oracle = sql.replace("ORDER BY L2_DISTANCE", "ORDER BY 0+L2_DISTANCE");
             let expected = rows(&engine, &oracle);
@@ -382,7 +449,7 @@ fn filtered_vector_budget_and_frontier_exhaustion_complete_reranking_exactly() {
                 ..
             } = &mut leaf
             {
-                *strategy = crate::planner::FilteredVectorStrategy::IterativeAnn;
+                *strategy = route;
                 *ef_hint = Some(if algo == "IVF" { 8 } else { 1024 });
                 *projected_columns = Some(Arc::new(vec![0]));
             }

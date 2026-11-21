@@ -17,6 +17,47 @@ impl FilteredVectorStrategy {
     }
 }
 
+pub(crate) fn covered_scalar_bounds<'a>(
+    access: &'a PhysicalPlan,
+    predicate: &Expr,
+) -> Option<(&'a IndexSchema, Option<IndexBound>, Option<IndexBound>)> {
+    let (table, index, low, high) = match access {
+        PhysicalPlan::IndexLookup {
+            table, index, key, ..
+        } => {
+            let bound = Some(IndexBound {
+                key: key.clone(),
+                inclusive: true,
+            });
+            (table, index, bound.clone(), bound)
+        }
+        PhysicalPlan::IndexRangeScan {
+            table,
+            index,
+            low,
+            high,
+            ..
+        }
+        | PhysicalPlan::IndexFastScan {
+            table,
+            index,
+            low,
+            high,
+            ..
+        } => (table, index, low.clone(), high.clone()),
+        _ => return None,
+    };
+    (!table.schema.is_partitioned()
+        && index_residual::all_covered(
+            predicate,
+            &table.schema,
+            index,
+            low.as_ref(),
+            high.as_ref(),
+        ))
+    .then_some((index, low, high))
+}
+
 /// Unique traversal work shared by all batches of a retained cursor. A
 /// larger scalar candidate demand may widen exploration, but never repeats
 /// the whole base traversal once per rejected candidate.
@@ -42,6 +83,38 @@ fn retained_navigation_rows(
             let needed = pool / (population / lists * survival).max(1.0 / population);
             lists + population * ((effort as f64).max(needed) / lists).min(1.0)
         }
+    }
+}
+
+fn predicate_navigation_distances(
+    index: &IndexSchema,
+    datatype: &crate::storage::DataTypeKind,
+    population: f64,
+    survivors: f64,
+    examined: f64,
+    widening: bool,
+) -> f64 {
+    let degree = (index.vector_meta().m as usize).saturating_mul(2);
+    if widening
+        && index.vector_algo() == crate::storage::schema::VectorAlgo::Hnsw
+        && matches!(
+            datatype,
+            crate::storage::DataTypeKind::Vector {
+                datatype: crate::vector::VectorDataType::Float32,
+                ..
+            }
+        )
+        && crate::engine::vector::selection::use_predicate_navigation(
+            survivors.ceil() as usize,
+            population.ceil() as usize,
+            degree,
+        )
+    {
+        // Mapping eligibility checks and connector edges still cost a
+        // graph probe. Only matched payloads pay for a vector distance.
+        examined * (survivors / population.max(1.0)).clamp(0.0, 1.0)
+    } else {
+        examined
     }
 }
 
@@ -123,9 +196,17 @@ pub(crate) fn filtered_vector_remaining_cost(
         population,
         payload + index.vector_meta().m as f64 * 8.0 + 32.0,
     );
+    let scored = predicate_navigation_distances(
+        index,
+        &table.schema.columns[column].data_type,
+        population,
+        survivors,
+        navigation_rows,
+        cfg.iterative_scan != crate::engine::vector::session::IterativeScan::Off,
+    );
     let navigation = operator_cost::index_lookup(&context, 0.0, navigation_rows, graph_pages, 0.0)
         .total
-        + navigation_rows * distance;
+        + scored * distance;
     Ok((heap_work(survivors), navigation + heap_work(pool)))
 }
 
@@ -315,10 +396,22 @@ pub(super) fn plan_filtered_vector(
         graph_pages,
         0.0,
     );
+    let prefilter_distances = index.map_or(0.0, |index| {
+        predicate_navigation_distances(
+            index,
+            &table.schema.columns[column_index].data_type,
+            total_rows,
+            survivors,
+            prefilter_navigation_rows,
+            // A graph-side saving alone should not introduce a scalar
+            // table scan. Let the ordinary cost win on heap scan paths.
+            widening && indexed_rows.is_some(),
+        )
+    });
     let prefilter_navigation = if index.is_none() {
         f64::INFINITY
     } else {
-        prefilter_navigation_fetch.total + prefilter_navigation_rows * distance
+        prefilter_navigation_fetch.total + prefilter_distances * distance
     };
     let pool_rows = (pool as f64).min(survivors);
     let pool_fetch = heap_fetch(pool_rows);
@@ -364,7 +457,7 @@ pub(super) fn plan_filtered_vector(
         ),
         FilteredVectorStrategy::PrefilterAnn => (
             prefilter_navigation_fetch.cpu_units
-                + prefilter_navigation_rows * distance
+                + prefilter_distances * distance
                 + pool_fetch.cpu_units
                 + pool_rows * distance,
             prefilter_navigation_fetch.io_rnd_pages + pool_fetch.io_rnd_pages,

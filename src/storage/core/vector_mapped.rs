@@ -430,6 +430,14 @@ impl MappedVectorNavigation {
         crate::engine::vector::distance::BiasedSq8Dot::try_new(codes)
     }
 
+    /// Check layer-zero eligibility without touching a node's code or norm.
+    #[inline]
+    pub(crate) fn live_navigation_row(&self, id: VecId) -> Result<Option<RowId>, QueryError> {
+        let (page, offset) = self.record(id)?;
+        let flags = page[offset] & (REC_FLAG_INITIALIZED | REC_FLAG_TOMBSTONE);
+        Ok((flags == REC_FLAG_INITIALIZED).then(|| vec_unpack_row(read_u64(page, offset + 2))))
+    }
+
     /// Called only while VectorIndexFile retains the mapping read guard.
     pub(crate) fn navigation_node(
         &self,

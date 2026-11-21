@@ -53,8 +53,8 @@ pub(crate) mod index_residual;
 mod row_security;
 mod tuple_access;
 mod visit;
-pub(crate) use filtered_vector::filtered_vector_remaining_cost;
 pub use filtered_vector::FilteredVectorStrategy;
+pub(crate) use filtered_vector::{covered_scalar_bounds, filtered_vector_remaining_cost};
 pub(crate) use visit::{plan_children, plan_children_mut, PlanChildren, PlanChildrenMut};
 
 use crate::engine::executor::select::bloom::{BloomFilter, ExactIntKeySet};

@@ -205,6 +205,7 @@ pub(crate) struct PagedCursorNavigation {
     qcodes: Vec<i8>,
     qnorm: i32,
     biased_codes: Option<super::distance::BiasedSq8Dot>,
+    predicate_navigation: bool,
 }
 
 #[derive(Debug)]
@@ -4916,9 +4917,24 @@ impl PagedHnsw {
                     if !scratch.qcodes.is_empty() {
                         // The cursor's query reservation includes decoded and
                         // quantized query storage; the shared arena owns its charge.
+                        let predicate_navigation = mapped
+                            && cursor.allow_predicate_navigation
+                            && cursor.selection.as_ref().is_some_and(|selection| {
+                                super::selection::use_predicate_navigation(
+                                    selection.partition_len(cursor.sid),
+                                    self.node_count() as usize,
+                                    self.m0,
+                                )
+                            });
+                        if predicate_navigation {
+                            cursor.hnsw.charge.try_grow_recoverable(
+                                self.m0.saturating_mul(3 * std::mem::size_of::<VecId>()),
+                            )?;
+                        }
                         cursor.paged_navigation = Some(PagedCursorNavigation {
                             arena: if mapped { None } else { arena },
                             mapped,
+                            predicate_navigation,
                             mapping_revision: mapping.map_or(0, |view| view.source_revision()),
                             biased_codes: mapping
                                 .filter(|_| mapped)
@@ -5051,6 +5067,13 @@ impl PagedHnsw {
             mapping.zip(cursor.paged_navigation.as_ref().filter(|nav| nav.mapped))
         {
             let mut neighbors = Vec::new();
+            let mut connector_edges =
+                Vec::with_capacity(if nav.predicate_navigation { self.m0 } else { 0 });
+            let mut matching = Vec::with_capacity(if nav.predicate_navigation {
+                self.m0 * 2
+            } else {
+                0
+            });
             while cursor.hnsw.expanded < end {
                 crate::engine::cancel::check_cancelled()?;
                 let Some(id) = cursor.hnsw.pop_mapped()? else {
@@ -5059,19 +5082,66 @@ impl PagedHnsw {
                 cursor.hnsw.expanded += 1;
                 cursor.work.visited += 1;
                 view.neighbors(id, 0, &mut neighbors)?;
-                neighbors.retain(|&neighbor| cursor.hnsw.visit_mapped(neighbor));
-                for block in neighbors.chunks(8) {
+                let candidates = if nav.predicate_navigation {
+                    matching.clear();
+                    let selection = cursor
+                        .selection
+                        .as_deref()
+                        .expect("predicate cursor has a selection");
+                    let mut connectors = SmallVec::<[VecId; 4]>::new();
+                    let connector_limit = self.m0.div_ceil(8).clamp(1, 4);
+                    let mut consider =
+                        |id, matching: &mut Vec<VecId>| -> Result<bool, QueryError> {
+                            if !cursor.hnsw.visit_mapped(id) {
+                                return Ok(false);
+                            }
+                            if !retired.0.contains(&id)
+                                && view
+                                    .live_navigation_row(id)?
+                                    .is_some_and(|row| selection.contains(cursor.sid, row))
+                            {
+                                matching.push(id);
+                                return Ok(false);
+                            }
+                            cursor.work.predicate_skips += 1;
+                            Ok(true)
+                        };
+                    for &id in &neighbors {
+                        if consider(id, &mut matching)? && connectors.len() < connector_limit {
+                            connectors.push(id);
+                        }
+                    }
+                    // Consume only a bounded number of nonmembers' layer-zero
+                    // edges. A connector is never assigned a distance or put
+                    // in traversal order, and its rejected neighbors stop here.
+                    for id in connectors {
+                        if matching.len() >= self.m0 {
+                            break;
+                        }
+                        view.neighbors(id, 0, &mut connector_edges)?;
+                        cursor.work.connectors += 1;
+                        for &neighbor in &connector_edges {
+                            consider(neighbor, &mut matching)?;
+                        }
+                    }
+                    &matching
+                } else {
+                    neighbors.retain(|&neighbor| cursor.hnsw.visit_mapped(neighbor));
+                    &neighbors
+                };
+                for block in candidates.chunks(8) {
                     for &id in block {
                         view.prefetch_navigation_node(id);
                     }
                     let mut admit = |id, node: Option<(RowId, bool, f64)>| {
                         if let Some((row, deleted, distance)) = node {
-                            let eligible = !deleted
-                                && !retired.0.contains(&id)
-                                && cursor
-                                    .selection
-                                    .as_ref()
-                                    .is_none_or(|s| s.contains(cursor.sid, row));
+                            let eligible = nav.predicate_navigation
+                                || (!deleted
+                                    && !retired.0.contains(&id)
+                                    && cursor
+                                        .selection
+                                        .as_ref()
+                                        .is_none_or(|s| s.contains(cursor.sid, row)));
                             cursor
                                 .hnsw
                                 .discover_mapped(id, distance, eligible.then_some(row))?;
@@ -6087,6 +6157,29 @@ mod source_audit_tests {
         assert!(first
             .iter()
             .all(|(id, _)| second.iter().all(|(other, _)| id != other)));
+        let mut selection = super::super::selection::RowSelection::new().unwrap();
+        selection
+            .append(7, &(0..512).step_by(3).map(row).collect::<Vec<_>>())
+            .unwrap();
+        selection.seal().unwrap();
+        let selection = Arc::new(selection);
+        let mut filtered =
+            VectorSearchCursor::new(Arc::clone(&graph), &query, 7, Some(Arc::clone(&selection)))
+                .unwrap();
+        filtered.allow_predicate_navigation = true;
+        let candidates = filtered.next_batch(32, 16, false).unwrap().unwrap();
+        assert!(
+            filtered
+                .paged_navigation
+                .as_ref()
+                .unwrap()
+                .predicate_navigation
+        );
+        assert_eq!(candidates.len(), 16);
+        assert!(candidates.iter().all(|(id, _)| selection.contains(7, *id)));
+        assert!(filtered.work.predicate_skips > 0);
+        assert!(filtered.work.connectors > 0);
+        assert!(filtered.work.distances < cursor.work.distances);
         // A recreated view is not necessarily the same source generation.
         // Low-level page writers revoke the mapping without changing this
         // PagedHnsw wrapper's epoch, so pin the view's source revision too.
@@ -6094,6 +6187,7 @@ mod source_audit_tests {
         paged.file.write_vector(0, entry, &[3.0, 4.0]).unwrap();
         assert!(paged.file.prepare_navigation_mapping().unwrap());
         assert!(cursor.next_batch(32, 16, false).unwrap().is_none());
+        assert!(filtered.next_batch(32, 16, false).unwrap().is_none());
         // Revocation and writes must complete while an idle cursor exists.
         paged.file.disable_navigation_mapping();
         assert!(cursor.next_batch(32, 16, false).unwrap().is_none());

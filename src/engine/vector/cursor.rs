@@ -8,6 +8,8 @@ use std::{cmp::Reverse, collections::BinaryHeap, sync::Arc};
 pub(crate) struct CursorWork {
     pub(crate) visited: u64,
     pub(crate) distances: u64,
+    pub(crate) predicate_skips: u64,
+    pub(crate) connectors: u64,
 }
 /// Mapped SQ8 node addresses are immutable for the lifetime of a cursor.
 struct MappedFrontier {
@@ -281,6 +283,7 @@ pub(crate) struct VectorSearchCursor {
     pub(crate) initialized: bool,
     pub(crate) sid: u64,
     pub(crate) selection: Option<Arc<RowSelection>>,
+    pub(crate) allow_predicate_navigation: bool,
     pub(crate) work: CursorWork,
 }
 impl VectorSearchCursor {
@@ -333,9 +336,12 @@ impl VectorSearchCursor {
             initialized: false,
             sid,
             selection,
+            allow_predicate_navigation: false,
             work: CursorWork {
                 visited: 0,
                 distances: 0,
+                predicate_skips: 0,
+                connectors: 0,
             },
         })
     }

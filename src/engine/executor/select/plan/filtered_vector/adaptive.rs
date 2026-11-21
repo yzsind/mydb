@@ -66,9 +66,11 @@ impl CandidateBudget {
         if single_pass {
             return self.fixed.unwrap_or(self.k).max(1).min(remaining);
         }
-        // Smooth cold/empty batches without assuming table selectivity also
-        // describes the query's vector neighborhood. Every request is bounded.
-        let rate = (self.accepted as f64 + 1.0) / (self.examined as f64 + 2.0);
+        // A visible preselection already filters every candidate, so start
+        // with full survival there. Still account for observed losses such
+        // as duplicate physical identities across graph nodes.
+        let prior = if self.available.is_some() { 1.0 } else { 2.0 };
+        let rate = (self.accepted as f64 + 1.0) / (self.examined as f64 + prior);
         let requested = (self.remaining_qualified() as f64 / rate).ceil() as usize;
         requested.clamp(self.k.clamp(1, 32), 256).min(remaining)
     }
@@ -141,6 +143,7 @@ mod tests {
         explicit.observe(10, 1, 1);
         assert!(explicit.done());
         let mut selected = CandidateBudget::new(100, 4, false, Some(12));
+        assert_eq!(selected.next_batch(1000, false), 12);
         selected.observe(12, 12, 12);
         assert!(selected.done(), "every visible selected row was scored");
         assert!(CandidateBudget::new(100, 4, false, Some(0)).done());
