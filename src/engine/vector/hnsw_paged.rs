@@ -6009,10 +6009,10 @@ mod source_audit_tests {
         };
         let query = super::super::codec::from_f32(&[3.123, 4.567]);
         let mut cursor = VectorSearchCursor::new(Arc::clone(&graph), &query, 7, None).unwrap();
-        let first = cursor.next_batch(32, 16).unwrap().unwrap();
+        let first = cursor.next_batch(32, 16, false).unwrap().unwrap();
         assert!(cursor.paged_navigation.as_ref().unwrap().mapped);
         let qcodes = cursor.paged_navigation.as_ref().unwrap().qcodes.clone();
-        let second = cursor.next_batch(32, 16).unwrap().unwrap();
+        let second = cursor.next_batch(32, 16, false).unwrap().unwrap();
         assert_eq!(cursor.paged_navigation.as_ref().unwrap().qcodes, qcodes);
         assert!(first
             .iter()
@@ -6023,10 +6023,10 @@ mod source_audit_tests {
         let entry = paged.file.entry_with_level().unwrap().0;
         paged.file.write_vector(0, entry, &[3.0, 4.0]).unwrap();
         assert!(paged.file.prepare_navigation_mapping().unwrap());
-        assert!(cursor.next_batch(32, 16).unwrap().is_none());
+        assert!(cursor.next_batch(32, 16, false).unwrap().is_none());
         // Revocation and writes must complete while an idle cursor exists.
         paged.file.disable_navigation_mapping();
-        assert!(cursor.next_batch(32, 16).unwrap().is_none());
+        assert!(cursor.next_batch(32, 16, false).unwrap().is_none());
         paged.mark_deleted_by_row_id(row(0)).unwrap();
     }
 
@@ -6077,7 +6077,7 @@ mod source_audit_tests {
         let mut cursor =
             VectorSearchCursor::new(Arc::clone(&graph), &query, 7, Some(Arc::clone(&selection)))
                 .unwrap();
-        let first = cursor.next_batch(32, 16).unwrap().unwrap();
+        let first = cursor.next_batch(32, 16, false).unwrap().unwrap();
         let nav = cursor
             .paged_navigation
             .as_ref()
@@ -6088,7 +6088,7 @@ mod source_audit_tests {
         paged
             .query_nav_rebuild_requested
             .store(false, Ordering::Release);
-        let second = cursor.next_batch(32, 16).unwrap().unwrap();
+        let second = cursor.next_batch(32, 16, false).unwrap().unwrap();
         assert!(Arc::ptr_eq(
             cursor
                 .paged_navigation
@@ -6109,21 +6109,28 @@ mod source_audit_tests {
             .all(|(id, _)| second.iter().all(|(other, _)| id != other)));
         // Exhaustive effort asks the executor to complete on visible heap
         // vectors, rather than mixing exact and SQ8 distance scales.
-        assert!(cursor.next_batch(1024, 16).unwrap().is_some());
+        assert!(cursor.next_batch(1024, 16, false).unwrap().is_some());
         assert!(cursor.navigation_incomplete);
         *paged.query_nav.write() = Some(held);
         let outside = super::super::codec::from_f32(&[1e8, 1e8]);
         let mut exact_nav = VectorSearchCursor::new(Arc::clone(&graph), &outside, 7, None).unwrap();
-        assert!(!exact_nav.next_batch(32, 16).unwrap().unwrap().is_empty());
+        assert!(!exact_nav
+            .next_batch(32, 16, false)
+            .unwrap()
+            .unwrap()
+            .is_empty());
         assert!(
             exact_nav.paged_navigation.is_none(),
             "unrepresentable queries need exact navigation"
         );
         let mut full = VectorSearchCursor::new(Arc::clone(&graph), &query, 7, None).unwrap();
-        assert_eq!(full.next_batch(1024, 1024).unwrap().unwrap().len(), 1024);
+        assert_eq!(
+            full.next_batch(1024, 1024, false).unwrap().unwrap().len(),
+            1024
+        );
         assert!(full.paged_navigation.is_none());
         paged.mark_deleted_by_row_id(row(0)).unwrap();
-        assert!(cursor.next_batch(32, 16).unwrap().is_none());
+        assert!(cursor.next_batch(32, 16, false).unwrap().is_none());
     }
 
     #[test]
@@ -6202,7 +6209,7 @@ mod source_audit_tests {
                             )
                             .unwrap();
                             cursor.raw_navigation = !accelerated;
-                            let mut found = cursor.next_batch(128, 80).unwrap().unwrap();
+                            let mut found = cursor.next_batch(128, 80, false).unwrap().unwrap();
                             // Production reranks this candidate pool on visible heap vectors.
                             for (id, distance) in &mut found {
                                 *distance = ordering_distance(

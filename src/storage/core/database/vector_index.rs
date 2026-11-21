@@ -3504,6 +3504,7 @@ impl Database {
         cursor: &mut crate::engine::vector::cursor::VectorSearchCursor,
         effort: usize,
         limit: usize,
+        bounded_refinement: bool,
     ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
         let _lease = self.acquire_vector_read(table.id)?;
         let current = self.vector_graph_get_or_build_for_partition(table, index, cursor.sid)?;
@@ -3511,7 +3512,7 @@ impl Database {
             return Ok(None);
         }
         drop(_lease);
-        cursor.next_batch(effort, limit)
+        cursor.next_batch(effort, limit, bounded_refinement)
     }
 
     pub(crate) fn vector_index_search_for_partition(

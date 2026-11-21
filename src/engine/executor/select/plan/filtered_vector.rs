@@ -573,6 +573,7 @@ fn search_filtered_ann(
                 &mut cursor,
                 effort.min(max_scan),
                 budget.next_batch(remaining, mode == IterativeScan::Off),
+                budget.nearing_completion(),
             )?
             else {
                 // Invalidation or a backend's request for heap completion is
@@ -646,7 +647,9 @@ fn search_filtered_ann(
                 all_complete = false;
                 break;
             }
-            if cursor.hnsw.pending.is_empty() {
+            // Let the HNSW cursor refine its retained frontier incrementally
+            // when the next validation batch can end candidate collection.
+            if (is_ivf || !budget.nearing_completion()) && cursor.hnsw.pending.is_empty() {
                 if effort >= max_scan {
                     all_complete = false;
                     break;

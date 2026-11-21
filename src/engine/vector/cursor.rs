@@ -85,6 +85,23 @@ impl HnswCursorState {
         }
         out
     }
+
+    /// Count candidates strictly closer than the frontier. Ties can still
+    /// change the emitted batch. Stop counting as soon as it is covered.
+    fn covers_frontier(&self, limit: usize) -> bool {
+        let Some(Reverse(next)) = self.frontier.peek() else {
+            return true;
+        };
+        self.pending.len() >= limit
+            && (next.dist.is_nan()
+                || self
+                    .pending
+                    .iter()
+                    .filter(|score| score.0.dist < next.dist)
+                    .take(limit)
+                    .count()
+                    == limit)
+    }
 }
 
 pub(crate) struct VectorSearchCursor {
@@ -172,6 +189,7 @@ impl VectorSearchCursor {
         &mut self,
         effort: usize,
         limit: usize,
+        bounded_refinement: bool,
     ) -> Result<Option<Vec<(RowId, f64)>>, QueryError> {
         let graph = Arc::clone(&self.graph);
         graph.ensure_valid()?;
@@ -194,8 +212,7 @@ impl VectorSearchCursor {
             }
             if !self.resume_work {
                 if matches!(graph.as_ref(), VectorGraph::NativeIvf(_))
-                    || self.hnsw.frontier.is_empty()
-                    || !self.frontier_can_improve(limit)?
+                    || self.hnsw.covers_frontier(limit)
                 {
                     break true;
                 }
@@ -203,48 +220,22 @@ impl VectorSearchCursor {
                     self.navigation_incomplete = true;
                     break true;
                 }
-                navigation_effort = navigation_effort
-                    .saturating_mul(2)
-                    .max(self.hnsw.expanded.saturating_add(1))
-                    .min(self.max_navigation);
+                navigation_effort = if bounded_refinement {
+                    // Recheck convergence after each short slice when the
+                    // candidate pool is close to completion.
+                    self.hnsw.expanded.saturating_add(64)
+                } else {
+                    navigation_effort
+                        .saturating_mul(2)
+                        .max(self.hnsw.expanded.saturating_add(1))
+                }
+                .min(self.max_navigation);
             }
             // Backend guards have been released before the next work slice.
             std::thread::yield_now();
         };
         graph.ensure_valid()?;
         Ok(valid.then(|| self.hnsw.take(limit)))
-    }
-    /// A count of discovered matches is not a convergence proof. In
-    /// particular a filtered result radius can extend well beyond the
-    /// unfiltered navigation radius. Retain the frontier until it cannot
-    /// improve this batch's candidate pool, or the work budget is reached.
-    fn frontier_can_improve(&self, limit: usize) -> Result<bool, QueryError> {
-        if limit == 0 {
-            return Ok(false);
-        }
-        if self.hnsw.pending.len() < limit {
-            return Ok(true);
-        }
-        let _scratch = VectorQueryCharge::try_new_recoverable(
-            limit.saturating_mul(std::mem::size_of::<Scored<RowId>>()),
-        )?;
-        let mut best = BinaryHeap::with_capacity(limit);
-        for score in &self.hnsw.pending {
-            let score = Scored {
-                id: score.0.id,
-                dist: score.0.dist,
-            };
-            if best.len() < limit {
-                best.push(score);
-            } else if best.peek().is_some_and(|worst| score < *worst) {
-                *best.peek_mut().unwrap() = score;
-            }
-        }
-        Ok(self
-            .hnsw
-            .frontier
-            .peek()
-            .is_some_and(|next| best.peek().is_some_and(|worst| next.0.dist <= worst.dist)))
     }
     pub(crate) fn exhausted(&self) -> bool {
         self.hnsw.frontier.is_empty()
@@ -259,6 +250,23 @@ mod tests {
     use crate::engine::vector::{
         hnsw::HnswIndex, ivf::IvfParams, native_hnsw::NativeHnsw, native_ivf::NativeIvf, Metric,
     };
+
+    #[test]
+    fn filtered_frontier_waits_for_ties_and_incomplete_batches() {
+        let mut state = HnswCursorState::new().unwrap();
+        for (id, distance) in [2.0, 3.0, 0.5, 1.0, 2.0].into_iter().enumerate() {
+            state
+                .push_pending(RowId::new(id as u32, 0), distance)
+                .unwrap();
+        }
+        state.frontier.push(Reverse(Scored { id: 9, dist: 2.0 }));
+        assert!(state.covers_frontier(2));
+        assert!(!state.covers_frontier(3));
+        assert!(!state.covers_frontier(6));
+        state.frontier.clear();
+        assert!(state.covers_frontier(6));
+    }
+
     #[test]
     fn filtered_vector_cursor_reservations_preserve_tight_budgets_and_release() {
         use crate::engine::executor::mem_budget::{with_query_budget, MemBudget};
@@ -376,10 +384,10 @@ mod tests {
             let mut cursor =
                 VectorSearchCursor::new(graph.clone(), &query, 7, Some(selection.clone())).unwrap();
             let effort = if kind == 2 { 4 } else { ROWS as usize };
-            let first = cursor.next_batch(effort, 3).unwrap().unwrap();
+            let first = cursor.next_batch(effort, 3, false).unwrap().unwrap();
             let distances = cursor.work.distances;
             let visits = cursor.work.visited;
-            let second = cursor.next_batch(effort, 3).unwrap().unwrap();
+            let second = cursor.next_batch(effort, 3, false).unwrap().unwrap();
             assert_eq!(cursor.work.distances, distances);
             assert_eq!(cursor.work.visited, visits);
             assert_eq!(first.len(), 3);
@@ -392,7 +400,7 @@ mod tests {
                 .all(|(id, _)| second.iter().all(|(other, _)| id != other)));
             let mut narrow =
                 VectorSearchCursor::new(graph.clone(), &query, 7, Some(selection.clone())).unwrap();
-            let nearest = narrow.next_batch(1, 32).unwrap().unwrap();
+            let nearest = narrow.next_batch(1, 32, true).unwrap().unwrap();
             let mut reranked = nearest.clone();
             for (id, distance) in &mut reranked {
                 *distance = super::super::distance::ordering_distance(
@@ -421,7 +429,7 @@ mod tests {
                 );
             }
             graph.mark_deleted_by_row_id(RowId::new(0, 0)).unwrap();
-            assert!(cursor.next_batch(effort, 3).unwrap().is_none());
+            assert!(cursor.next_batch(effort, 3, false).unwrap().is_none());
         }
     }
 }

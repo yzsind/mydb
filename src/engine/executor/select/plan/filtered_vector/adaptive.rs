@@ -43,6 +43,10 @@ impl CandidateBudget {
             )
     }
 
+    pub(super) fn nearing_completion(&self) -> bool {
+        self.accepted >= self.k && (self.fixed.is_some() || self.stable_rounds > 0)
+    }
+
     pub(super) fn checks(&self) -> u64 {
         self.checks
     }
@@ -101,6 +105,7 @@ mod tests {
         let mut budget = CandidateBudget::new(100, 4, false, None);
         budget.observe(200, 100, 0);
         assert!(!budget.done(), "K alone cannot complete validation");
+        assert!(!budget.nearing_completion());
         budget.observe(200, 100, 3);
         budget.observe(400, 200, 1);
         assert!(
@@ -109,6 +114,7 @@ mod tests {
         );
         budget.observe(800, 400, 0);
         assert!(!budget.done(), "one stable round is insufficient");
+        assert!(budget.nearing_completion());
         budget.observe(800, 400, 0);
         assert!(budget.done());
     }

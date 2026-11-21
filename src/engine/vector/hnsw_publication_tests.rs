@@ -107,11 +107,11 @@ fn exhaustive_cursor_requests_heap_completion_for_publication_holes() {
                 graph.insert(row(prefix + 1), query.clone()).unwrap();
                 let mut cursor =
                     VectorSearchCursor::new(Arc::clone(&graph), &query, 0, None).unwrap();
-                assert!(cursor.next_batch(usize::MAX, 16).unwrap().is_none());
+                assert!(cursor.next_batch(usize::MAX, 16, false).unwrap().is_none());
             });
             let mut cursor = VectorSearchCursor::new(Arc::clone(&graph), &query, 0, None).unwrap();
             assert_rows(
-                cursor.next_batch(usize::MAX, 16).unwrap().unwrap(),
+                cursor.next_batch(usize::MAX, 16, false).unwrap().unwrap(),
                 0..prefix + 2,
             );
             assert!(cursor.exhausted());
@@ -159,7 +159,7 @@ fn exhaustive_cursor_detects_publication_hole_between_work_slices() {
     let mut fresh = VectorSearchCursor::new(Arc::clone(&graph), &query, 0, None).unwrap();
     assert_rows(
         fresh
-            .next_batch(usize::MAX, count as usize + 1)
+            .next_batch(usize::MAX, count as usize + 1, false)
             .unwrap()
             .unwrap(),
         0..count + 1,
