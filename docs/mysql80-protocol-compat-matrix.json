@@ -54,7 +54,7 @@
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
       "src/mysql/session.rs": "07808d19be0d6f0e1fa7ae03df05433bd3986b77a604a25d75929f94fc1b7bf9",
       "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023",
-      "src/mysql/peer_monitor.rs": "0ea7dc6481c8bdd31dbafcaa86dfe81aa0212cc638cd0e4324843205d80187fc"
+      "src/mysql/peer_monitor.rs": "2664258b1e0b97bdd36da7735f24a32826af97f9ffbbd63987d8152fd1e104f6"
     },
     "test_sources": [
       "src/mysql/session/auth_handshake_tests.rs",
