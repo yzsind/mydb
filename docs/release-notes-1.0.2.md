@@ -34,16 +34,6 @@ performance optimizations**; fixes and performance improvements can overlap.
 **Release maturity** — 1.0.2 remains a public preview for feature validation,
 compatibility testing, and controlled-environment evaluation.
 
-## Critical availability fix
-
-**HNSW maintenance interrupted by session cancellation.** In earlier versions,
-`KILL`, `KILL QUERY`, or a statement timeout during post-commit HNSW graph/index
-maintenance could put the entire database into a fail-stopped state.
-**The process remained running but rejected subsequent queries; restarting the
-database was required to restore service.** MyDB 1.0.2 isolates required
-post-commit maintenance from statement cancellation and timeouts, preventing
-this outage.
-
 ## MySQL compatibility and SQL correctness
 
 - Hexadecimal and bit literals retain numeric semantics through expressions,
@@ -186,3 +176,21 @@ replicas from the migrated primary and plan rollback before accepting new writes
 
 See [changing versions](changing-versions.md) and the
 [storage format registry](storage-format-versions.md).
+
+## Critical availability fix
+
+- **HNSW maintenance interrupted by session cancellation.** In earlier versions,
+  `KILL`, `KILL QUERY`, or a statement timeout during post-commit HNSW graph/index
+  maintenance could stop the entire database from serving requests.
+  **The process remained running, but a database restart was required to restore
+  service.** MyDB 1.0.2 isolates required post-commit maintenance from statement
+  cancellation and timeouts. Thanks to [**eSun-ws**](https://github.com/eSun-ws)
+  for reporting this issue.
+- **Slow-disk bulk writes blocking logins and queries.** On very slow disks, a
+  session writing large amounts of data could also block new connection logins
+  and queries from other sessions. **Service recovered only after the blocking
+  disk writes completed.** MyDB 1.0.2 improves catalog locking and network
+  scheduling to prevent these I/O waits from stalling unrelated connections.
+  Writes themselves remain subject to disk performance. Thanks to
+  [**hottotti999-cloud**](https://github.com/hottotti999-cloud) for reporting this
+  issue.
