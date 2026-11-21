@@ -3715,7 +3715,7 @@ pub(super) fn rewrite_legacy_text_lengths(
 
     let bytes = sql.as_bytes();
     let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
-    let mut replacements: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
@@ -3806,13 +3806,8 @@ pub(super) fn rewrite_legacy_text_lengths(
                     i = close + 1;
                     continue;
                 }
-                let concrete = match length {
-                    0..=255 => "TINYTEXT",
-                    256..=65_535 => "TEXT",
-                    65_536..=16_777_215 => "MEDIUMTEXT",
-                    16_777_216..=4_294_967_295 => "LONGTEXT",
-                    _ => unreachable!("u32 length was checked above"),
-                };
+                let concrete =
+                    extensions::register(sql, extensions::Extension::TextLength(length as u32));
                 replacements.push((word_start, close + 1, concrete));
                 i = close + 1;
                 continue;
@@ -3827,7 +3822,7 @@ pub(super) fn rewrite_legacy_text_lengths(
         .iter()
         .map(|(start, end, replacement)| TextEdit {
             range: *start..*end,
-            replacement,
+            replacement: replacement.as_str(),
         })
         .collect::<Vec<_>>();
     rewrite_source_edits(sql, &edits)

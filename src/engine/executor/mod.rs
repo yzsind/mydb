@@ -7266,8 +7266,11 @@ fn parse_error_to_query_error(err: crate::parser::ParseError) -> QueryError {
         // syntax location/expectation details.
         err.spec.error(err.message)
     } else {
-        err.spec
-            .error(format!("{}; expected {:?}", err, err.expected))
+        err.spec.error(if err.expected.is_empty() {
+            err.to_string()
+        } else {
+            format!("{}; expected {:?}", err, err.expected)
+        })
     }
 }
 

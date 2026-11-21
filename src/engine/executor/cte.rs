@@ -3336,36 +3336,6 @@ fn decimal_lane_fits(values: impl Iterator<Item = i128>, precision: u8) -> bool 
     values.into_iter().all(|value| value.unsigned_abs() < limit)
 }
 
-fn visit_cte_result_rows(
-    result: &CteResult,
-    mut visit: impl FnMut(Vec<Value>) -> Result<(), QueryError>,
-) -> Result<(), QueryError> {
-    if let Some(spill) = result.spill.as_ref() {
-        if let Some(mut reader) = spill.open_reader()? {
-            while let Some(row) = reader.next()? {
-                crate::engine::cancel::check_cancelled()?;
-                visit(row)?;
-            }
-        }
-    } else if result.store.is_native() {
-        for index in 0..result.nrows() {
-            crate::engine::cancel::check_cancelled()?;
-            visit(
-                result
-                    .store
-                    .copy_row(index)?
-                    .expect("resident CTE row count is exact"),
-            )?;
-        }
-    } else {
-        for row in result.store.dense_rows()? {
-            crate::engine::cancel::check_cancelled()?;
-            visit(row.clone())?;
-        }
-    }
-    Ok(())
-}
-
 /// Pull cursor over either representation of a materialized CTE. It owns the
 /// result handle, so a spill file and its quota reservation remain alive until
 /// the last consumer finishes. In-memory rows are cloned one at a time; a
@@ -3445,6 +3415,7 @@ pub(super) fn recursive_parts(
         name: &str,
         all: bool,
         parts: &mut Vec<Select>,
+        root: bool,
     ) -> Result<crate::parser::QueryExpr, QueryError> {
         let crate::parser::QueryExpr::SetOp(set) = stmt else {
             return Err(error(
@@ -3461,8 +3432,7 @@ pub(super) fn recursive_parts(
         if set.op != SetOp::Union
             || (all && !set.all)
             || !set.order_by.is_empty()
-            || set.limit.is_some()
-            || set.offset.is_some()
+            || (!root && (set.limit.is_some() || set.offset.is_some()))
         {
             return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 format!("Recursive CTE '{name}' requires UNION branches without global ORDER BY/LIMIT; DISTINCT followed by ALL is not supported")));
@@ -3474,7 +3444,7 @@ pub(super) fn recursive_parts(
                     format!("Recursive CTE '{name}' must have all nonrecursive branches first"),
                 ));
             }
-            split(&set.left, name, all, parts)?
+            split(&set.left, name, all, parts, false)?
         } else {
             set.left.clone()
         };
@@ -3512,7 +3482,7 @@ pub(super) fn recursive_parts(
     }
     let all = matches!( &cte.query, crate::parser::QueryExpr::SetOp(set) if set.all);
     let mut parts = Vec::new();
-    let anchor = split(&cte.query, &cte.name, all, &mut parts)?;
+    let anchor = split(&cte.query, &cte.name, all, &mut parts, true)?;
     Ok((anchor, parts, all))
 }
 
@@ -3649,6 +3619,14 @@ fn materialize_recursive(
     read_view: Option<TxnView>,
 ) -> Result<CteResult, QueryError> {
     let (anchor_stmt, recursive_selects, union_all) = recursive_parts(cte)?;
+    let (limit, offset) = match &cte.query {
+        crate::parser::QueryExpr::SetOp(set) => (
+            super::select::limit_value_or_max(set.limit.as_ref())?,
+            super::select::limit_value_or_zero(set.offset.as_ref())?,
+        ),
+        _ => (usize::MAX, 0),
+    };
+    let row_cap = limit.saturating_add(offset);
     let anchor_stmt = &anchor_stmt;
     // RecursiveUnion owns two explicit spools: `working` (the previous
     // iteration's delta) and `total`. Both use the ordinary spillable CTE
@@ -3739,7 +3717,20 @@ fn materialize_recursive(
     };
     let mut total_builder =
         CteSpillBuilder::new_with_stats(total_columns.clone(), db.data_dir().to_path_buf());
-    visit_cte_result_rows(&working, |row| total_builder.push(row))?;
+    let mut emitted_rows = 0usize;
+    let mut anchor_rows = CteResultRowCursor::open(Arc::clone(&working))?;
+    while emitted_rows < row_cap {
+        let Some(row) = anchor_rows.next_row()? else {
+            break;
+        };
+        if emitted_rows >= offset {
+            total_builder.push(row)?;
+        }
+        emitted_rows += 1;
+    }
+    if emitted_rows >= row_cap {
+        return total_builder.finish();
+    }
     // DISTINCT keeps each already-unique delta as a spillable history segment.
     // Membership is `produced EXCEPT DISTINCT history`; no unbounded process-
     // resident HashSet grows with recursion depth.
@@ -3847,7 +3838,20 @@ fn materialize_recursive(
         .collect::<Result<Vec<_>, QueryError>>()?;
     // Step 2: iterate.
     let mut depth: u32 = 0;
-    while working.estimated_rows > 0.0 {
+    let depth_first = union_all && recursive_selects.len() > 1;
+    let mut pending = Vec::<(Arc<CteResult>, u32, usize)>::new();
+    let mut branch_start = 0usize;
+    loop {
+        crate::engine::cancel::check_cancelled()?;
+        if working.estimated_rows == 0.0 || branch_start == recursive_selects.len() {
+            let Some((parent, parent_depth, next_branch)) = pending.pop() else {
+                break;
+            };
+            working = parent;
+            depth = parent_depth;
+            branch_start = next_branch;
+            continue;
+        }
         if depth >= depth_limit {
             return Err(error(
                 crate::error::catalog::ER_CTE_MAX_RECURSION_DEPTH,
@@ -3869,7 +3873,19 @@ fn materialize_recursive(
             CteSpillBuilder::new(total_columns.clone(), db.data_dir().to_path_buf());
         let mut produced_builder = (!union_all)
             .then(|| CteSpillBuilder::new(total_columns.clone(), db.data_dir().to_path_buf()));
-        for (recursive_select, owned_plan) in recursive_selects.iter().zip(&owned_recursive_plans) {
+        // Finish one branch's descendants before scheduling its siblings.
+        // Breadth-first expansion doubles the delta of an unbounded two-branch
+        // UNION ALL long before its actual recursion limit can be reached.
+        // A stack of spillable deltas preserves depth without a row-count cap.
+        let branch_end = if depth_first {
+            branch_start + 1
+        } else {
+            recursive_selects.len()
+        };
+        for (recursive_select, owned_plan) in recursive_selects[branch_start..branch_end]
+            .iter()
+            .zip(&owned_recursive_plans[branch_start..branch_end])
+        {
             let recursive_plan = supplied_branches
                 .map(|(_, plan)| plan)
                 .or(owned_plan.as_ref());
@@ -3897,15 +3913,22 @@ fn materialize_recursive(
                     "The used SELECT statements have a different number of columns",
                 ));
             }
-            visit_cte_result_rows(&produced, |row| {
+            let mut cursor = CteResultRowCursor::open(Arc::new(produced))?;
+            while let Some(row) = cursor.next_row()? {
                 let row = coerce_row(row)?;
                 if let Some(builder) = produced_builder.as_mut() {
-                    builder.push(row)
+                    builder.push(row)?;
                 } else {
-                    total_builder.push(row.clone())?;
-                    next_builder.push(row)
+                    if emitted_rows >= offset {
+                        total_builder.push(row.clone())?;
+                    }
+                    emitted_rows += 1;
+                    if emitted_rows >= row_cap {
+                        return total_builder.finish();
+                    }
+                    next_builder.push(row)?;
                 }
-            })?;
+            }
         }
         if let Some(produced_builder) = produced_builder {
             let produced = Arc::new(produced_builder.finish()?);
@@ -3929,18 +3952,25 @@ fn materialize_recursive(
                 || prior_rows.next_row(),
             )?;
             while let Some(row) = new_rows.next_row()? {
-                total_builder.push(row.clone())?;
+                if emitted_rows >= offset {
+                    total_builder.push(row.clone())?;
+                }
+                emitted_rows += 1;
+                if emitted_rows >= row_cap {
+                    return total_builder.finish();
+                }
                 next_builder.push(row)?;
             }
         }
         let next = Arc::new(next_builder.finish()?);
-        if next.estimated_rows == 0.0 {
-            break;
+        if depth_first {
+            pending.push((Arc::clone(&working), depth, branch_end));
         }
         if let Some(history) = history.as_mut() {
             history.push(Arc::clone(&next));
         }
         working = next;
+        branch_start = 0;
         depth += 1;
     }
     total_builder.finish()

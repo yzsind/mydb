@@ -12992,7 +12992,10 @@ fn choose_scan(
                 ));
             };
             let Some(ft_index) = find_matching_fulltext_index(&table.schema, &match_columns)
-                .filter(|index| special_index_allowed(index, &table.schema, hints))
+                .filter(|index| {
+                    mode != crate::parser::FtMode::Boolean
+                        || special_index_allowed(index, &table.schema, hints)
+                })
             else {
                 return Err(error(
                     crate::error::catalog::ER_FT_MATCHING_KEY_NOT_FOUND,

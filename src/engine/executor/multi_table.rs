@@ -141,7 +141,9 @@ fn patch_changed_columns(current: &[Value], new_values: &[Value], changed: &[usi
 
 fn build_context(
     db: &Arc<Database>,
-    _txn: TxnView,
+    txn: TxnView,
+    session: &SessionContext,
+    registry: &SessionRegistry,
     primary_table: &str,
     primary_alias: Option<&str>,
     primary_partitions: &[String],
@@ -156,14 +158,58 @@ fn build_context(
                             alias: Option<&str>,
                             partitions: &[String]|
      -> Result<(), QueryError> {
-        let cte = super::cte::lookup_cte(storage_key);
+        let cte_binding = super::cte::lookup_cte(storage_key);
+        let view = if cte_binding.is_none() {
+            db.view_definition(&session.current_database, storage_key)
+        } else {
+            None
+        };
+        let cte = if let Some(cte) = cte_binding {
+            Some(cte)
+        } else if view.is_some() {
+            let mut statement = crate::parser::Statement::Select(crate::parser::Select {
+                table: Some(storage_key.to_string()),
+                from: vec![crate::parser::TableRef {
+                    name: storage_key.to_string(),
+                    alias: None,
+                    system_time: None,
+                    sample: None,
+                    index_hints: Vec::new(),
+                    partitions: Vec::new(),
+                    column_aliases: Vec::new(),
+                    generate_series: None,
+                }],
+                projection: vec![crate::parser::SelectItem::Wildcard],
+                ..crate::parser::Select::default()
+            });
+            super::dispatch::expand_views(db, session, &mut statement, 0)?;
+            super::dispatch::authorize_statement(db, session, &statement)?;
+            super::qualification::qualify_statement_tables(db, session, &mut statement)?;
+            let crate::parser::Statement::Select(select) = statement else {
+                unreachable!()
+            };
+            let response =
+                super::select::execute_select(db, txn, select, registry)?.materialize()?;
+            let QueryResponse::ResultSet(result) = response else {
+                unreachable!()
+            };
+            Some(Arc::new(crate::engine::api::CteResult::materialized(
+                result.columns,
+                result.rows,
+            )))
+        } else {
+            None
+        };
         let schema = match &cte {
             Some(cte) => TableSchema::synthetic_for_planning(storage_key, &cte.columns),
             None => (*db.table(storage_key)?).clone(),
         };
-        let alias_lc = alias
-            .map(|a| a.to_ascii_lowercase())
-            .unwrap_or_else(|| schema.name.to_ascii_lowercase());
+        let alias_lc = alias.map(|a| a.to_ascii_lowercase()).unwrap_or_else(|| {
+            view.as_ref().map_or_else(
+                || schema.name.to_ascii_lowercase(),
+                |view| view.name.to_ascii_lowercase(),
+            )
+        });
         if !seen.insert(alias_lc.clone()) {
             return Err(error(
                 crate::error::catalog::ER_NONUNIQ_TABLE,
@@ -1066,6 +1112,8 @@ pub(super) fn execute_multi_update(
     let mut ctx = build_context(
         db,
         txn,
+        session,
+        registry,
         &stmt.table,
         stmt.primary_alias.as_deref(),
         &stmt.partitions,
@@ -1505,6 +1553,8 @@ pub(super) fn execute_multi_delete(
     let mut ctx = build_context(
         db,
         txn,
+        session,
+        registry,
         &stmt.table,
         stmt.primary_alias.as_deref(),
         &stmt.partitions,

@@ -496,6 +496,7 @@ fn bug4_differential_fuzz_updates_match_model() {
                                 },
                             },
                         ],
+                        None,
                     )
                     .unwrap();
                 assert!(content.remove(&old_entry));
@@ -775,7 +776,7 @@ fn bug6_flush_reopen_roundtrip_matches() {
             .filter(|e| model.insert(e.clone(), ()).is_none())
             .collect();
         index
-            .insert_entries_logged(900 + batch_no, filtered, false)
+            .insert_entries_logged(900 + batch_no, filtered, false, None)
             .unwrap();
         for _ in 0..40 {
             let kv = (rnd() % 20_000) as i64 - 5_000;
@@ -1586,7 +1587,7 @@ fn bug_unsorted_batch_routes_each_validated_run_and_point_lookups_match() {
     expected.dedup();
     index
         .read()
-        .insert_batch_deferred(888, batch, false)
+        .insert_batch_deferred(888, batch, false, None)
         .unwrap();
     let got = IndexRangeCursor::new(Arc::clone(&index), true, None, None)
         .unwrap()

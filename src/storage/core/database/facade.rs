@@ -1259,7 +1259,7 @@ impl Database {
             && !preparing
             // Startup opens storage before replication slots are registered.
             // Retain WAL until the normal checkpoint sees their durable floors.
-            && !db.data_dir().join(crate::repl::master::slot::SLOTS_DIR).exists()
+            && !crate::repl::master::slot::SlotRegistry::has_persisted_slots(db.data_dir())?
             && (db.last_recovery.redone_records > 0 || db.last_recovery.undone_transactions > 0)
         {
             if let Err(err) = db.checkpoint() {

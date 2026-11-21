@@ -834,7 +834,7 @@ fn prepare_create_table_schema(
             ));
         }
         column_checks.extend(column.checks.iter().cloned());
-        let mut schema = column_def_to_schema(column)?;
+        let mut schema = column_def_to_schema(column, &table_charset)?;
         apply_column_charset_defaults(&mut schema, &table_charset, &table_collation)?;
         column_schemas.push(schema);
     }
@@ -2717,13 +2717,7 @@ impl Database {
     /// short rows receive the catalog backfill default without a heap scan.
     pub fn add_temp_column(&self, internal_key: &str, column: ColumnDef) -> Result<(), QueryError> {
         let check_defs = column.checks.clone();
-        let mut new_column = column_def_to_schema(column)?;
-        if new_column.generated_expr.is_some() {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "adding a generated column to a temporary table requires COPY",
-            ));
-        }
+        let mut new_column;
         let table_id;
         {
             let mut tables = self.temp_tables.write().map_err(|_| {
@@ -2736,6 +2730,10 @@ impl Database {
                 .get_mut(internal_key)
                 .ok_or_else(|| ddl_table_not_found(&internal_key))?;
             let table = Arc::make_mut(table_arc);
+            new_column = column_def_to_schema_in_table(column, table, None)?;
+            if new_column.generated_expr.is_some() {
+                return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET, "adding a generated column to a temporary table requires COPY"));
+            }
             apply_column_charset_defaults(&mut new_column, &table.charset, &table.collation)?;
             if table
                 .iter_visible_columns()
@@ -2988,8 +2986,8 @@ impl Database {
                     "temporary table does not exist",
                 )
             })?;
-        let mut schema = column_def_to_schema(column)?;
-        let position = old.column_index(&schema.name)?;
+        let position = old.column_index(&column.name)?;
+        let mut schema = column_def_to_schema_in_table(column, &old, Some(&old.columns[position].name))?;
         preserve_primary_key_not_null(&old, position, &mut schema);
         apply_column_charset_for_alter(
             &mut schema,
@@ -3034,7 +3032,7 @@ impl Database {
                 )
             })?;
         let position = old.column_index(old_name)?;
-        let mut schema = column_def_to_schema(column)?;
+        let mut schema = column_def_to_schema_in_table(column, &old, Some(old_name))?;
         preserve_primary_key_not_null(&old, position, &mut schema);
         apply_column_charset_for_alter(
             &mut schema,
@@ -3843,7 +3841,7 @@ impl Database {
                             format!("duplicate column '{}'", column.name),
                         ));
                     }
-                    let mut schema = column_def_to_schema(column.clone())?;
+                    let mut schema = column_def_to_schema_in_table(column.clone(), &candidate, None)?;
                     apply_column_charset_defaults(
                         &mut schema,
                         &candidate.charset,
@@ -4054,7 +4052,7 @@ impl Database {
                     // definition) is rejected in pre-flight — before any
                     // earlier action in this multi-action ALTER mutates and
                     // flushes the catalog with no rollback.
-                    let mut new_schema = column_def_to_schema(column.clone())?;
+                    let mut new_schema = column_def_to_schema_in_table(column.clone(), &candidate, Some(&column.name))?;
                     preserve_primary_key_not_null(&candidate, idx, &mut new_schema);
                     apply_column_charset_for_alter(
                         &mut new_schema,
@@ -4079,7 +4077,7 @@ impl Database {
                     }
                     // Mirror prepare_change_column_candidate's up-front
                     // validation (see ModifyColumn above for the rationale).
-                    let mut new_schema = column_def_to_schema(new_def.clone())?;
+                    let mut new_schema = column_def_to_schema_in_table(new_def.clone(), &candidate, Some(old_name))?;
                     preserve_primary_key_not_null(&candidate, idx, &mut new_schema);
                     apply_column_charset_for_alter(
                         &mut new_schema,
@@ -5068,7 +5066,7 @@ impl Database {
         check_table_ddl_writable(&database)?;
         let key = table_key(&database, &table_only);
         let check_defs = column.checks.clone();
-        let mut new_column_def = column_def_to_schema(column)?;
+        let mut new_column_def;
         let mut catalog = self.catalog_write()?;
         let schema_check_names = check_constraint_names_in_schema(&catalog, &database, Some(&key));
         let table_arc = catalog
@@ -5080,6 +5078,7 @@ impl Database {
         // column between this helper returning and the executor's rollback.
         let mut candidate = table_arc.as_ref().clone();
         let table = &mut candidate;
+        new_column_def = column_def_to_schema_in_table(column, table, None)?;
         apply_column_charset_defaults(&mut new_column_def, &table.charset, &table.collation)?;
         if table
             .iter_visible_columns()
@@ -5640,11 +5639,10 @@ impl Database {
                     },
                 ),
             ));
-            if dropped_index.is_spatial() {
-                let path = self.index_path_for_table_schema(&table_snapshot, storage_id, &dropped_index.name);
-                for extension in ["rtree.corrupt", "rtree.failed"] {
-                    retired.files.push(self.relative_path(&path.with_extension(extension)));
-                }
+            let path = self.index_path_for_table_schema(&table_snapshot, storage_id, &dropped_index.name);
+            let suffix = if dropped_index.is_spatial() { "rtree" } else { "idx" };
+            for extension in [format!("{suffix}.corrupt"), format!("{suffix}.failed")] {
+                retired.files.push(self.relative_path(&path.with_extension(extension)));
             }
             if dropped_index.is_vector() {
                 retired.vector_directories.push(self.relative_path(&self.vector_index_path_for_parts(storage_id, table_snapshot.active_generation.max(1), dropped_index.index_id, "vmanifest").with_extension("vector")));
@@ -6884,7 +6882,7 @@ impl Database {
                             format!("duplicate column '{}'", column.name),
                         ));
                     }
-                    let mut schema = column_def_to_schema(column.clone())?;
+                    let mut schema = column_def_to_schema_in_table(column.clone(), &candidate, None)?;
                     apply_column_charset_defaults(
                         &mut schema,
                         &candidate.charset,
@@ -6935,7 +6933,7 @@ impl Database {
                     changes_row_shape = true;
                 }
                 A::ModifyColumn(column) => {
-                    let mut schema = column_def_to_schema(column.clone())?;
+                    let mut schema = column_def_to_schema_in_table(column.clone(), &candidate, Some(&column.name))?;
                     let position = candidate.column_index(&schema.name)?;
                     preserve_primary_key_not_null(&candidate, position, &mut schema);
                     apply_column_charset_for_alter(
@@ -6954,7 +6952,7 @@ impl Database {
                 A::ChangeColumn { old_name, new_def } => {
                     let position = candidate.column_index(old_name)?;
                     let old_column = candidate.columns[position].clone();
-                    let mut schema = column_def_to_schema(new_def.clone())?;
+                    let mut schema = column_def_to_schema_in_table(new_def.clone(), &candidate, Some(old_name))?;
                     preserve_primary_key_not_null(&candidate, position, &mut schema);
                     apply_column_charset_for_alter(
                         &mut schema,
@@ -7201,7 +7199,8 @@ impl Database {
     ) -> Result<(Arc<TableSchema>, TableSchema, bool), QueryError> {
         let table = self.table_for_column_change(table_name)?;
         self.reject_policy_dependency_column_ddl(&table)?;
-        let mut new_schema = column_def_to_schema(column)?;
+        let old_name = column.name.clone();
+        let mut new_schema = column_def_to_schema_in_table(column, &table, Some(&old_name))?;
         let pos = table
             .columns
             .iter()
@@ -7238,7 +7237,7 @@ impl Database {
     ) -> Result<(Arc<TableSchema>, TableSchema, bool), QueryError> {
         let table = self.table_for_column_change(table_name)?;
         self.reject_policy_dependency_column_ddl(&table)?;
-        let mut new_schema = column_def_to_schema(column)?;
+        let mut new_schema = column_def_to_schema_in_table(column, &table, Some(old_name))?;
         let pos = table
             .columns
             .iter()
@@ -8040,8 +8039,6 @@ impl Database {
             validate_row_fits_page(&candidate)?;
             let source_rows = self.scan_rows(&old_table.qualified_name(), ddl_txn)?;
             Self::set_alter_copy_job_total(&job, source_rows.len() as u64);
-            #[cfg(test)]
-            self.pause_ddl_backfill_for_test();
             let mut warnings = Vec::new();
             let mut rewritten_rows = Vec::with_capacity(source_rows.len());
             let defaults = AlterCopyDefaults::new(&old_table, &candidate, &job)?;
@@ -8268,8 +8265,13 @@ impl Database {
                 .collect::<Vec<_>>();
             let projection = alter_copy_projection(&old_table, &candidate, &coercion_mask);
             let mut index_elapsed_us = 0_u64;
-            let external = table_has_externalizable_column(&old_table)
-                || table_has_externalizable_column(&candidate);
+            let external = self.alter_copy_requires_external_values(
+                &old_table,
+                &candidate,
+                &coercion_mask,
+            )?;
+            #[cfg(test)]
+            self.pause_ddl_backfill_for_test();
             let configured_pages = if external { 1 } else { ddl_copy_batch_pages() };
             let mut lo = 0_u64;
             crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
@@ -8324,6 +8326,7 @@ impl Database {
                             &index_key_plans,
                             &coercion_mask,
                             projection.as_ref(),
+                            external,
                         )?;
                     let actual_batch_bytes =
                         batch
@@ -8935,6 +8938,42 @@ impl Database {
         Ok(())
     }
 
+    /// Retain projected transcoding when every potentially external column is
+    /// unchanged and the source has no overflow data. The source snapshot is
+    /// already pinned: later external versions take the full MVCC decode path,
+    /// and catch-up uses the externalizing writer. Memory generations cannot
+    /// prove the absence of resident LOBs through filesystem checks.
+    fn alter_copy_requires_external_values(
+        &self,
+        old_table: &TableSchema,
+        candidate: &TableSchema,
+        coercion_mask: &[bool],
+    ) -> Result<bool, QueryError> {
+        if (self.config.durability == DurabilityMode::Memory
+            && (table_has_externalizable_column(old_table)
+                || table_has_externalizable_column(candidate)))
+            || candidate
+                .row_codec
+                .columns
+                .iter()
+                .zip(coercion_mask)
+                .any(|(column, rewrite)| *rewrite && column_kind_can_externalize(&column.kind))
+        {
+            return Ok(true);
+        }
+        if table_has_externalizable_column(old_table) {
+            for storage_id in old_table.storage_ids() {
+                // Overflow stores are created on first write, never on read.
+                // File presence remains a conservative signal after generation
+                // publication, even when allocator metadata is still resident.
+                if self.overflow_path(storage_id).try_exists().map_err(io_err)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn scan_transform_alter_copy_batch_parallel(
         &self,
@@ -8950,6 +8989,7 @@ impl Database {
         index_key_plans: &[DdlCopyIndexKeyPlan],
         coercion_mask: &[bool],
         projection: Option<&AlterCopyProjection>,
+        external: bool,
     ) -> Result<
         (
             Vec<DdlCopyPreparedRow>,
@@ -8960,8 +9000,7 @@ impl Database {
         QueryError,
     > {
         let defaults = AlterCopyDefaults::new(old_table, candidate, job)?;
-        if table_has_externalizable_column(old_table) || table_has_externalizable_column(candidate)
-        {
+        if external {
             let started = Instant::now();
             let source_rows =
                 self.scan_rows_storage_range(old_table, storage_id, txn, page_lo, page_hi)?;

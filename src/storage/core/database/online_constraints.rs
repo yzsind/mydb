@@ -592,7 +592,7 @@ impl Database {
                         _ => &def.name,
                     };
                     let position = candidate.column_index(name)?;
-                    let mut column = column_def_to_schema(def.clone())?;
+                    let mut column = column_def_to_schema_in_table(def.clone(), &candidate, Some(name))?;
                     preserve_primary_key_not_null(&candidate, position, &mut column);
                     apply_column_charset_for_alter(
                         &mut column,

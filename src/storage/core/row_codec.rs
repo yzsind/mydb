@@ -521,7 +521,13 @@ pub(crate) fn transcode_visible_row_payload(
         return encode_visible_row_payload(values, target_codec, txn_id);
     }
     let (source_header, mut source_body_offset, has_external) = read_mvcc_header(source_payload)?;
-    if has_external || source_header.flags & MVCC_FLAG_ROW_PIECE != 0 {
+    if has_external {
+        return Err(error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "ALTER COPY cannot transcode an external row without materializing all columns",
+        ));
+    }
+    if source_header.flags & MVCC_FLAG_ROW_PIECE != 0 {
         return encode_visible_row_payload(values, target_codec, txn_id);
     }
     let source_layout_id = read_varint(source_payload, &mut source_body_offset)? as u32;
@@ -2176,16 +2182,18 @@ pub(crate) fn codec_has_externalizable_columns(codec: &RowCodec) -> bool {
         .layouts
         .iter()
         .flat_map(|layout| layout.columns.iter())
-        .any(|c| {
-            matches!(
-                c.kind,
-                ColumnKind::VarString
-                    | ColumnKind::VarBytes
-                    | ColumnKind::Json
-                    | ColumnKind::Geometry
-                    | ColumnKind::Vector { .. }
-            )
-        })
+        .any(|column| column_kind_can_externalize(&column.kind))
+}
+
+fn column_kind_can_externalize(kind: &ColumnKind) -> bool {
+    matches!(
+        kind,
+        ColumnKind::VarString
+            | ColumnKind::VarBytes
+            | ColumnKind::Json
+            | ColumnKind::Geometry
+            | ColumnKind::Vector { .. }
+    )
 }
 
 fn vector_column_kind(dim: Option<u32>, datatype: crate::vector::VectorDataType) -> ColumnKind {
@@ -8138,6 +8146,27 @@ mod row_codec_tests {
         .unwrap();
         let expected = encode_visible_row_payload(&target_values, &target_codec, 22).unwrap();
         assert_eq!(transcoded, expected);
+    }
+
+    #[test]
+    fn storage_release1121_transcode_rejects_external_projection_values() {
+        let codec = codec(vec![ColumnKind::VarString]);
+        let source = encode_mvcc_row(
+            RowHeader::visible(1),
+            &[Value::Null],
+            &codec,
+            &[Some(LobRef {
+                first_page_id: 1,
+                last_page_id: 1,
+                total_len: 15000,
+                generation: 1,
+            })],
+        )
+        .unwrap();
+        let err =
+            transcode_visible_row_payload(&source, &codec, &codec, &[Value::Null], &[false], 2)
+                .unwrap_err();
+        assert!(err.message().contains("materializing all columns"));
     }
 
     #[test]

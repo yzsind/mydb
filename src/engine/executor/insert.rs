@@ -621,7 +621,11 @@ fn dispatch_insert_chunk(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     let _ignore_coercion = crate::storage::DmlIgnoreCoercionGuard::new(stmt.ignore);
-    if let Some(predicate) = &stmt.view_check_predicate {
+    if let Some(predicate) = stmt
+        .view_check_predicate
+        .as_ref()
+        .filter(|_| !ctx.needs_trigger_path)
+    {
         if stmt.ignore {
             let mut accepted = Vec::with_capacity(rows.len());
             for row in rows {
@@ -665,6 +669,7 @@ fn dispatch_insert_chunk(
             stmt.on_duplicate_key_update.as_deref(),
             stmt.insert_alias.as_ref(),
             stmt.view_check_predicate.as_ref(),
+            stmt.view_replace_predicate.as_ref(),
             stmt.returning.as_ref(),
             stmt.target_alias.as_deref(),
             registry,
@@ -682,6 +687,7 @@ fn dispatch_insert_chunk(
             stmt.on_duplicate_key_update.as_deref(),
             stmt.insert_alias.as_ref(),
             stmt.view_check_predicate.as_ref(),
+            stmt.view_replace_predicate.as_ref(),
             stmt.returning.as_ref(),
             stmt.target_alias.as_deref(),
         );
@@ -2367,6 +2373,7 @@ fn execute_batch_odku(
                 insert_alias,
                 view_check_predicate,
                 None,
+                None,
                 target_alias,
                 true,
                 &mut ids,
@@ -2416,6 +2423,7 @@ fn execute_batch_odku(
                         insert_alias,
                         view_check_predicate,
                         None,
+                        None,
                         target_alias,
                         true,
                         &mut ids,
@@ -2456,6 +2464,7 @@ fn execute_batch_odku(
             insert_alias,
             view_check_predicate,
             None,
+            None,
             target_alias,
             true,
             &mut ids,
@@ -2495,6 +2504,7 @@ pub(super) fn execute_insert_with_conflict(
     on_duplicate: Option<&[crate::parser::Assignment]>,
     insert_alias: Option<&crate::parser::InsertAlias>,
     view_check_predicate: Option<&Expr>,
+    view_replace_predicate: Option<&Expr>,
     returning_clause: Option<&crate::parser::ReturningClause>,
     target_alias: Option<&str>,
 ) -> Result<QueryResponse, QueryError> {
@@ -2546,6 +2556,7 @@ pub(super) fn execute_insert_with_conflict(
         on_duplicate,
         insert_alias,
         view_check_predicate,
+        view_replace_predicate,
         returning_clause,
         target_alias,
         false,
@@ -2566,6 +2577,7 @@ fn execute_insert_with_conflict_legacy(
     on_duplicate: Option<&[crate::parser::Assignment]>,
     insert_alias: Option<&crate::parser::InsertAlias>,
     view_check_predicate: Option<&Expr>,
+    view_replace_predicate: Option<&Expr>,
     returning_clause: Option<&crate::parser::ReturningClause>,
     target_alias: Option<&str>,
     rows_prepared: bool,
@@ -2582,6 +2594,7 @@ fn execute_insert_with_conflict_legacy(
         on_duplicate,
         insert_alias,
         view_check_predicate,
+        view_replace_predicate,
         returning_clause,
         target_alias,
         rows_prepared,
@@ -2606,6 +2619,7 @@ pub(super) fn execute_insert_rows<const TRIGGERS: bool>(
     on_duplicate: Option<&[crate::parser::Assignment]>,
     insert_alias: Option<&crate::parser::InsertAlias>,
     view_check_predicate: Option<&Expr>,
+    view_replace_predicate: Option<&Expr>,
     returning_clause: Option<&crate::parser::ReturningClause>,
     target_alias: Option<&str>,
     rows_prepared: bool,
@@ -2623,6 +2637,7 @@ pub(super) fn execute_insert_rows<const TRIGGERS: bool>(
         on_duplicate,
         insert_alias,
         view_check_predicate,
+        view_replace_predicate,
         returning_clause,
         target_alias,
         rows_prepared,
@@ -2653,6 +2668,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
     on_duplicate: Option<&[crate::parser::Assignment]>,
     insert_alias: Option<&crate::parser::InsertAlias>,
     view_check_predicate: Option<&Expr>,
+    view_replace_predicate: Option<&Expr>,
     returning_clause: Option<&crate::parser::ReturningClause>,
     target_alias: Option<&str>,
     rows_prepared: bool,
@@ -2748,6 +2764,23 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
             db.coerce_row_for_load(&table, &mut values)?;
             db.materialize_generated_columns_for_insert(&table, &mut values)?;
         }
+        if TRIGGERS {
+            if let Some(predicate) = view_check_predicate {
+                db.coerce_row_for_load(&table, &mut values)?;
+                db.materialize_generated_columns_for_insert(&table, &mut values)?;
+                if !super::dml::eval_view_check(db, txn, predicate, &table, &values, None)? {
+                    let err = error(
+                        crate::error::catalog::ER_VIEW_CHECK_FAILED,
+                        "CHECK OPTION failed",
+                    );
+                    if ignore {
+                        record_ignore_warning(db, &err);
+                        continue 'source;
+                    }
+                    return Err(err);
+                }
+            }
+        }
         // Keep the speculative INSERT on triggered ODKU: it participates in
         // AUTO_INCREMENT allocation. The ordinary probe-first optimization stays.
         if !TRIGGERS && on_duplicate.is_some() && !replace && !ignore {
@@ -2787,7 +2820,14 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
             };
             let insertion = if probe_first {
                 replace_insert_row::<TRIGGERS>(
-                    db, &mut hooks, txn, &table, table_name, &values, true,
+                    db,
+                    &mut hooks,
+                    txn,
+                    &table,
+                    table_name,
+                    &values,
+                    true,
+                    view_replace_predicate,
                 )
                 .map(|(inserted, count)| {
                     deleted = count;
@@ -2833,7 +2873,14 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                         continue 'source;
                     } else if replace {
                         let (inserted, count) = replace_insert_row::<TRIGGERS>(
-                            db, &mut hooks, txn, &table, table_name, &values, false,
+                            db,
+                            &mut hooks,
+                            txn,
+                            &table,
+                            table_name,
+                            &values,
+                            false,
+                            view_replace_predicate,
                         )?;
                         deleted = count;
                         inserted
@@ -3071,6 +3118,7 @@ fn replace_insert_row<const TRIGGERS: bool>(
     table_name: &str,
     values: &[Value],
     retry: bool,
+    view_replace_predicate: Option<&Expr>,
 ) -> Result<(crate::storage::InsertRowsResult, u64), QueryError> {
     let _security = crate::engine::rls::StrictOldScope::enter();
     let _partition = replace_partition_guard(table, values)?;
@@ -3080,20 +3128,26 @@ fn replace_insert_row<const TRIGGERS: bool>(
         for row_id in find_all_conflicting_row_ids(db, txn, table, values)? {
             crate::engine::cancel::check_cancelled()?;
             let mut old = None;
-            let removed = if TRIGGERS {
-                let sid = if table.is_partitioned() {
-                    table.route_row_to_partition(values)?.storage_id
-                } else {
-                    table.id
-                };
-                // The storage callback follows lock acquisition and the
-                // caller's old-row RLS check. A hidden row must never reach
-                // a trigger, even if its transactional writes would roll back.
+            let sid = if table.is_partitioned() {
+                table.route_row_to_partition(values)?.storage_id
+            } else {
+                table.id
+            };
+            let removed = if TRIGGERS || view_replace_predicate.is_some() {
+                // Validate the locked current image before exposing it to triggers.
                 db.delete_row_by_id_at_if(txn, table, sid, row_id, |current| {
-                    let hook = hooks.as_mut().expect("trigger context");
-                    let values = current.to_vec();
-                    fire_before_delete(db, hook.session, table, values.clone(), hook.registry)?;
-                    old = Some(values);
+                    if let Some(predicate) = view_replace_predicate {
+                        if !super::dml::eval_view_check(db, txn, predicate, table, current, None)? {
+                            return Err(error(crate::error::catalog::ER_REPLACE_INACCESSIBLE_ROWS,
+                                "REPLACE cannot be executed as it requires deleting rows that are not in the view"));
+                        }
+                    }
+                    if TRIGGERS {
+                        let hook = hooks.as_mut().expect("trigger context");
+                        let values = current.to_vec();
+                        fire_before_delete(db, hook.session, table, values.clone(), hook.registry)?;
+                        old = Some(values);
+                    }
                     Ok(true)
                 })?
             } else {

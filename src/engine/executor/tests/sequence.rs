@@ -336,7 +336,11 @@ fn drop_sequence_then_use_errors() {
     assert_eq!(nextval(&engine, &mut s, "s"), 1);
     exec(&engine, &mut s, "DROP SEQUENCE s").unwrap();
     let err = exec(&engine, &mut s, "SELECT nextval('s')").unwrap_err();
-    assert_eq!(err.code(), 50011, "unknown sequence -> 50011");
+    assert_eq!(
+        err.code(),
+        1146,
+        "unknown sequence uses the MySQL relation lookup error"
+    );
     // DROP IF EXISTS on a missing sequence is a no-op.
     exec(&engine, &mut s, "DROP SEQUENCE IF EXISTS s").unwrap();
 }
@@ -348,7 +352,11 @@ fn if_not_exists_and_duplicate() {
     let mut s = SessionContext::default();
     exec(&engine, &mut s, "CREATE SEQUENCE s").unwrap();
     let err = exec(&engine, &mut s, "CREATE SEQUENCE s").unwrap_err();
-    assert_eq!(err.code(), 50010, "duplicate sequence -> 50010");
+    assert_eq!(
+        err.code(),
+        1050,
+        "duplicate sequence uses the MySQL relation creation error"
+    );
     // IF NOT EXISTS swallows the duplicate.
     exec(&engine, &mut s, "CREATE SEQUENCE IF NOT EXISTS s").unwrap();
 }

@@ -419,19 +419,19 @@ fn slave_exec_mode_is_registered_and_round_trips() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn set_character_set_sets_client_and_results_only() {
+fn set_character_set_uses_database_connection_defaults() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
 
-    let original_conn = session.character_set_connection.clone();
+    exec(&engine, &mut session, "SET NAMES latin1").unwrap();
     exec(&engine, &mut session, "SET CHARACTER SET utf8mb4").unwrap();
     assert_eq!(session.character_set_client, "utf8mb4");
     assert_eq!(session.character_set_results.as_deref(), Some("utf8mb4"));
-    // SET CHARACTER SET (unlike SET NAMES) MUST NOT touch connection.
     assert_eq!(
-        session.character_set_connection, original_conn,
-        "SET CHARACTER SET must leave character_set_connection alone"
+        session.character_set_connection,
+        crate::charset::DEFAULT_CHARSET,
+        "SET CHARACTER SET restores the current database charset"
     );
 }
 

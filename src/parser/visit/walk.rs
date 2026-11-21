@@ -47,6 +47,7 @@ macro_rules! define_walk {
                 Statement::CreateRoutine(def) => walk_routine_body(visitor, & $($mutable)* def.body),
                 Statement::CreateTrigger(def) => walk_routine_body(visitor, & $($mutable)* def.body),
                 Statement::Call(call) => walk_exprs(visitor, & $($mutable)* call.args),
+                Statement::RaiseCondition(statement) => walk_routine_statements(visitor, std::slice::$one(statement)),
                 Statement::GetDiagnostics { condition, .. } => {
                     if let Some(condition) = condition {
                         walk_expr(visitor, condition);
@@ -89,6 +90,7 @@ macro_rules! define_walk {
                 | Statement::ExecutePrepared { .. }
                 | Statement::DeallocatePrepared { .. }
                 | Statement::SetAutocommit(_)
+                | Statement::SetCharsetOptions(_)
                 | Statement::SetTransactionIsolation { .. }
                 | Statement::LockTables(_)
                 | Statement::UnlockTables
@@ -364,6 +366,9 @@ let crate::parser::WindowSpec { partition_by, order_by, frame, .. } = & $($mutab
                     }
                 }
                 InsertSource::Query(query) => walk_query(visitor, query),
+            }
+            if let Some(predicate) = & $($mutable)* insert.view_replace_predicate {
+                walk_expr(visitor, predicate);
             }
             if let Some(predicate) = & $($mutable)* insert.view_check_predicate {
                 walk_expr(visitor, predicate);

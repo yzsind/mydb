@@ -8727,6 +8727,23 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                 let segment = segment
                     .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))?;
                 let raw = &bytes[segment.range.clone()];
+                if matches!(
+                    segment.kind,
+                    crate::sql_lex::SqlSegmentKind::LineComment
+                        | crate::sql_lex::SqlSegmentKind::BlockComment
+                        | crate::sql_lex::SqlSegmentKind::ExecutableComment { active: false, .. }
+                ) {
+                    // Comment bytes have no connection-charset semantics.
+                    // Mask only inert comments, preserving statement boundaries.
+                    for byte in raw {
+                        sql.push(if matches!(byte, b'\r' | b'\n') {
+                            *byte as char
+                        } else {
+                            ' '
+                        });
+                    }
+                    continue;
+                }
                 let string_literal = matches!(segment.kind, crate::sql_lex::SqlSegmentKind::Quoted { quote }
                     if quote == b'\'' || (quote == b'"' && !mode.ansi_quotes));
                 let concatenating = string_literal && pending_hex.is_some();
@@ -8758,6 +8775,12 @@ fn decode_session_sql(session: &SessionContext, bytes: &[u8]) -> Result<String, 
                     if let Ok(text) = decode_client_sql_bytes(session, raw) {
                         sql.push_str(&text);
                         continue;
+                    }
+                    if string_literal
+                        && !session.character_set_client.eq_ignore_ascii_case("binary")
+                    {
+                        return Err(error(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
+                            format!("Invalid string literal for character set '{}'; use an explicit binary literal for raw bytes", session.character_set_client)));
                     }
                 }
                 match segment.kind {
@@ -15854,19 +15877,43 @@ mod release_audit_sql_tests {
         session.character_set_client = "utf8mb4".into();
         for (sql, expected) in [
             (
-                &b"INSERT INTO t VALUES ('\xff\\0\\n\\'\\\\')"[..],
-                "INSERT INTO t VALUES (X'ff000a275c')",
+                &b"INSERT INTO t VALUES (_binary'\xff\\0\\n\\'\\\\')"[..],
+                "INSERT INTO t VALUES (_binary X'ff000a275c')",
             ),
             (&b"SELECT _binary'\xff'"[..], "SELECT _binary X'ff'"),
-            (
-                &b"SELECT /*!80000 '\xff' */"[..],
-                "SELECT /*!80000 X'ff' */",
-            ),
         ] {
             assert_eq!(decode_session_sql(&session, sql).unwrap(), expected);
         }
+        let active = decode_session_sql(&session, b"SELECT /*!80000 _binary'\xff' */").unwrap();
+        assert_eq!(
+            crate::parser::parse_statement(&active).unwrap(),
+            crate::parser::parse_statement("SELECT _binary X'ff'").unwrap()
+        );
         assert!(decode_session_sql(&session, b"SELECT \xff").is_err());
         assert!(decode_session_sql(&session, b"SELECT `\xff`").is_err());
+        assert_eq!(
+            decode_session_sql(&session, b"SELECT '\xff'")
+                .unwrap_err()
+                .code(),
+            1366
+        );
+        assert_eq!(
+            decode_session_sql(&session, b"SELECT /*!80000 '\xff' */")
+                .unwrap_err()
+                .code(),
+            1366
+        );
+        for sql in [
+            &b"-- Host: \xfc\nSELECT 1"[..],
+            &b"/* \xfc */ SELECT 1"[..],
+            &b"/*!99999 \xfc */ SELECT 1"[..],
+        ] {
+            let decoded = decode_session_sql(&session, sql).unwrap();
+            assert!(
+                crate::parser::parse_statement(&decoded).is_ok(),
+                "{decoded}"
+            );
+        }
     }
 }
 

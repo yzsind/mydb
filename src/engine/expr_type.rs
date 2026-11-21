@@ -2201,9 +2201,17 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                 }
                 "COLLATE" if args.len() == 2 => {
                     let mut descriptor = infer_expr_type(&args[0], context);
+                    descriptor.kind = String {
+                        kind: StringKind::Character,
+                    };
                     if let Expr::Literal(Literal::String(name)) = &args[1] {
                         descriptor.collation_id =
                             crate::charset::resolve_collation(name).ok().map(|c| c.id);
+                        if descriptor.collation_id == Some(crate::charset::BINARY_COLLATION_ID) {
+                            descriptor.kind = String {
+                                kind: StringKind::Binary,
+                            };
+                        }
                     }
                     descriptor.coercibility = 0;
                     descriptor

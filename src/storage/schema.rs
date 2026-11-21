@@ -2949,6 +2949,15 @@ impl IndexSchema {
 /// MySQL per-type maximum byte lengths for the TEXT / BLOB families.
 /// A value longer than the column's cap is rejected with error 1406.
 pub const TINY_LOB_MAX: u32 = 255;
+
+pub(crate) fn text_length_byte_cap(characters: u32, max_bytes_per_character: u8) -> u32 {
+    match u64::from(characters) * u64::from(max_bytes_per_character) {
+        0..=255 => TINY_LOB_MAX,
+        256..=65_535 => DEFAULT_LOB_MAX,
+        65_536..=16_777_215 => MEDIUM_LOB_MAX,
+        _ => LONG_LOB_MAX,
+    }
+}
 pub const DEFAULT_LOB_MAX: u32 = 65_535; // plain TEXT / BLOB
 pub const MEDIUM_LOB_MAX: u32 = 16_777_215; // 2^24 - 1
 pub const LONG_LOB_MAX: u32 = 4_294_967_295; // 2^32 - 1
@@ -5625,6 +5634,9 @@ impl From<DataType> for DataTypeKind {
             DataType::Binary(len) => Self::Binary { len },
             DataType::VarBinary(len) => Self::VarBinary { len },
             DataType::Text(max_len) => Self::Text { max_len },
+            DataType::TextLength(length) => Self::Text {
+                max_len: text_length_byte_cap(length, 4),
+            },
             DataType::Blob(max_len) => Self::Blob { max_len },
             DataType::Date => Self::Date,
             DataType::Time { fsp } => Self::Time { fsp },

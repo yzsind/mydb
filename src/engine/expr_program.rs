@@ -3569,6 +3569,8 @@ enum ExprNode {
         /// BETWEEN must not fall back to the connection default when its
         /// tested value comes from a PAD SPACE or binary-collated column.
         collation_id: Option<u16>,
+        numeric_literals: [bool; 3],
+        domain: crate::engine::expr::BetweenComparisonDomain,
     },
     Like {
         expr: Box<ExprNode>,
@@ -5997,6 +5999,21 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             } else {
                 compile_node(right, schema)?
             };
+            // Conditional literal results need runtime provenance. Keep them
+            // on the scalar oracle when the compiled child is not constant;
+            // rewriting a general BLOB result into an integer would be wrong.
+            if (expr_is_numeric_hexbit_literal(left)
+                && !matches!(lnode, ExprNode::Const(_))
+                && (coerces_hexbit_to_numeric
+                    || (is_cmp && operand_numeric_class(right, schema) == NumericClass::Numeric)))
+                || (expr_is_numeric_hexbit_literal(right)
+                    && !matches!(rnode, ExprNode::Const(_))
+                    && (coerces_hexbit_to_numeric
+                        || (is_cmp
+                            && operand_numeric_class(left, schema) == NumericClass::Numeric)))
+            {
+                return Err(CompileError::Unsupported);
+            }
             if is_cmp {
                 // Resolve deterministic temporal constants once per compiled
                 // program.  This also exposes column/constant comparisons to
@@ -6275,12 +6292,33 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             ) {
                 return Err(CompileError::Unsupported);
             }
+            let sources = [expr.as_ref(), low.as_ref(), high.as_ref()];
+            let numeric_literals = sources.map(expr_is_numeric_hexbit_literal);
+            let domain = crate::engine::expr::between_comparison_domain(sources, |source| {
+                input_expr_result_type(source, schema)
+            });
+            let mut nodes = [
+                compile_comparison_value(expr, schema)?,
+                compile_node(low, schema)?,
+                compile_node(high, schema)?,
+            ];
+            for (node, literal) in nodes.iter_mut().zip(numeric_literals) {
+                if literal && domain == crate::engine::expr::BetweenComparisonDomain::Numeric {
+                    *node = coerce_hexbit_const_node(std::mem::replace(
+                        node,
+                        ExprNode::Const(Value::Null),
+                    ));
+                }
+            }
+            let [expr, low, high] = nodes;
             Ok(ExprNode::Between {
-                expr: Box::new(compile_comparison_value(expr, schema)?),
-                low: Box::new(compile_node(low, schema)?),
-                high: Box::new(compile_node(high, schema)?),
+                expr: Box::new(expr),
+                low: Box::new(low),
+                high: Box::new(high),
                 negated: *negated,
                 collation_id,
+                numeric_literals,
+                domain,
             })
         }
         Expr::Like {
@@ -7077,10 +7115,23 @@ fn fold_constants(node: ExprNode) -> ExprNode {
             high,
             negated,
             collation_id,
+            numeric_literals,
+            domain,
         } => {
-            let expr = Box::new(fold_constants(*expr));
-            let low = Box::new(fold_constants(*low));
-            let high = Box::new(fold_constants(*high));
+            let mut nodes = [
+                fold_constants(*expr),
+                fold_constants(*low),
+                fold_constants(*high),
+            ];
+            for (node, literal) in nodes.iter_mut().zip(numeric_literals) {
+                if literal && domain == crate::engine::expr::BetweenComparisonDomain::Numeric {
+                    *node = coerce_hexbit_const_node(std::mem::replace(
+                        node,
+                        ExprNode::Const(Value::Null),
+                    ));
+                }
+            }
+            let [expr, low, high] = nodes.map(Box::new);
             let all_const = is_const_node(&expr) && is_const_node(&low) && is_const_node(&high);
             let node = ExprNode::Between {
                 expr,
@@ -7088,6 +7139,8 @@ fn fold_constants(node: ExprNode) -> ExprNode {
                 high,
                 negated,
                 collation_id,
+                numeric_literals,
+                domain,
             };
             if all_const {
                 if let Some(v) = try_eval_const_node(&node) {
@@ -7443,7 +7496,19 @@ impl ExprNode {
                 high,
                 negated,
                 collation_id,
-            } => eval_between_node(expr, low, high, *negated, *collation_id, row, scratch),
+                numeric_literals,
+                domain,
+            } => eval_between_node(
+                expr,
+                low,
+                high,
+                *negated,
+                *collation_id,
+                *numeric_literals,
+                *domain,
+                row,
+                scratch,
+            ),
             ExprNode::Like {
                 expr,
                 pattern,
@@ -7828,22 +7893,28 @@ fn eval_between_node(
     high: &ExprNode,
     negated: bool,
     collation_id: Option<u16>,
+    numeric_literals: [bool; 3],
+    domain: crate::engine::expr::BetweenComparisonDomain,
     row: &dyn RowSource,
     scratch: &mut EvalScratch,
 ) -> Result<Value, QueryError> {
     let value = expr.eval_ref(row, scratch)?;
     let low_val = low.eval_ref(row, scratch)?;
     let high_val = high.eval_ref(row, scratch)?;
+    let mut provenance = [
+        node_comparison_provenance(expr, low),
+        node_comparison_provenance(expr, high),
+    ];
+    provenance[0].set_between_domain(domain);
+    provenance[0].set_between_literals(numeric_literals[0], numeric_literals[1]);
+    provenance[1].set_between_literals(numeric_literals[0], numeric_literals[2]);
     crate::engine::expr::with_compare_collation(collation_id, || {
         crate::engine::expr::eval_between_with_provenance(
             value.as_value(),
             low_val.as_value(),
             high_val.as_value(),
             negated,
-            [
-                node_comparison_provenance(expr, low),
-                node_comparison_provenance(expr, high),
-            ],
+            provenance,
         )
     })
 }

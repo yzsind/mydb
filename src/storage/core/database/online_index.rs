@@ -1305,7 +1305,7 @@ impl Database {
                 if chunk.is_empty() {
                     break;
                 }
-                file.apply_batch_deferred(txn_id_for_ddl(), chunk)?;
+                file.apply_batch_deferred(txn_id_for_ddl(), chunk, None)?;
             }
             for (key, old) in before {
                 let new = Self::online_index_key_state(target, &key)?;

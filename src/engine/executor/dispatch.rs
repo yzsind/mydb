@@ -2467,6 +2467,7 @@ fn ctas_load_rows(
                             None,
                             None,
                             None,
+                            None,
                         )
                         .map(|response| match response {
                             QueryResponse::OkAffected { affected_rows } => affected_rows,
@@ -4424,6 +4425,7 @@ fn auth_statement_privileges(
         | Statement::ShowStatus { .. }
         | Statement::ShowDiagnostics { .. }
         | Statement::GetDiagnostics { .. }
+        | Statement::RaiseCondition(_)
         | Statement::ShowCountDiagnostics { .. }
         | Statement::ShowEngines
         | Statement::ShowPlugins
@@ -4432,6 +4434,7 @@ fn auth_statement_privileges(
         | Statement::ShowPrivileges
         | Statement::SetRole(_)
         | Statement::SetNames { .. }
+        | Statement::SetCharsetOptions(_)
         | Statement::SetCharacterSet { .. }
         | Statement::SetTransactionCharacteristics { .. }
         | Statement::Noop { .. }
@@ -6032,6 +6035,31 @@ fn execute_table_maintenance_status(
     let mut rows = Vec::with_capacity(tables.len());
     for tbl in tables {
         let (db_name, name) = crate::storage::split_table_name(&session.current_database, tbl);
+        if !session.has_temp_table(tbl)
+            && db.view_definition(&db_name, &name).is_some()
+            && op == "check"
+        {
+            let mut statement = parse_statement(&format!(
+                "SELECT * FROM `{}`.`{}`",
+                db_name.replace('`', "``"),
+                name.replace('`', "``")
+            ))
+            .map_err(parse_error_to_query_error)?;
+            let checked = expand_views(db, session, &mut statement, 0).and_then(|()| {
+                super::select::describe_statement_columns(db, session, &statement).map(|_| ())
+            });
+            let (kind, message) = match checked {
+                Ok(()) => ("status", "OK".to_string()),
+                Err(err) => ("Error", err.message().to_string()),
+            };
+            rows.push(vec![
+                Value::String(format!("{db_name}.{name}")),
+                Value::String(op.to_string()),
+                Value::String(kind.to_string()),
+                Value::String(message),
+            ]);
+            continue;
+        }
         let result = (|| {
             if op == "optimize" && session.has_temp_table(tbl) {
                 return Err(error(
@@ -6042,6 +6070,7 @@ fn execute_table_maintenance_status(
             let resolved = session
                 .resolve_temp_table_name(tbl)
                 .unwrap_or_else(|| qualify_table_name(session, tbl));
+            ensure_base_table(db, &resolved)?;
             let schema = db.table(&resolved)?;
             if op == "optimize" {
                 db.optimize_table_online(&schema.qualified_name(), session.connection_id as u64)?;
@@ -7606,7 +7635,7 @@ fn execute_unlock_tables(
     Ok(QueryResponse::Ok)
 }
 
-fn execute_sql_prepare(
+pub(super) fn execute_sql_prepare(
     db: &Arc<Database>,
     session: &mut SessionContext,
     name: String,
@@ -8207,9 +8236,27 @@ pub(super) fn execute_qualified_statement(
             Ok(response)
         }
         Statement::SetCharacterSet { charset } => {
-            let response = execute_set_character_set_statement(session, charset.as_deref())?;
+            let response = execute_set_character_set_statement(db, session, charset.as_deref())?;
             session.mark_pfs_variables_dirty();
             Ok(response)
+        }
+        Statement::SetCharsetOptions(options) => {
+            for option in options {
+                match option {
+                    crate::parser::CharsetSetting::Names { charset, collation } => {
+                        execute_set_names_statement(
+                            session,
+                            charset.as_deref(),
+                            collation.as_deref(),
+                        )?;
+                    }
+                    crate::parser::CharsetSetting::CharacterSet { charset } => {
+                        execute_set_character_set_statement(db, session, charset.as_deref())?;
+                    }
+                }
+            }
+            session.mark_pfs_variables_dirty();
+            Ok(QueryResponse::Ok)
         }
         Statement::SetTransactionCharacteristics {
             scope,
@@ -10177,6 +10224,9 @@ pub(super) fn execute_qualified_statement(
         Statement::ShowDiagnostics { errors_only, limit } => {
             Ok(show_diagnostics_result(session, errors_only, limit))
         }
+        Statement::RaiseCondition(statement) => {
+            super::routines::execute_raise_condition(db, session, registry, &statement)
+        }
         Statement::GetDiagnostics {
             stacked,
             condition,
@@ -10531,7 +10581,9 @@ pub(super) fn execute_qualified_statement(
                 for tbl in &tables {
                     let (db_name, table_name) =
                         crate::storage::split_table_name(&session.current_database, tbl);
-                    db.table_in_database(&db_name, &table_name)?;
+                    if db.view_definition(&db_name, &table_name).is_none() {
+                        db.table_in_database(&db_name, &table_name)?;
+                    }
                 }
             }
             db.flush_dirty_data()?;
@@ -10845,7 +10897,7 @@ fn execute_select_into_vars(
     for (name, value) in targets.iter().zip(row.into_iter()) {
         session.set_user_variable(name, value)?;
     }
-    Ok(QueryResponse::Ok)
+    Ok(QueryResponse::OkAffected { affected_rows: 1 })
 }
 
 /// Result metadata exists even when the query produces no rows. Check shape

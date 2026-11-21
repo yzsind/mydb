@@ -1425,8 +1425,23 @@ pub(in crate::engine::executor::select) fn compile_cte_row_predicate(
                 high: crate::engine::expr::expr_literal_value(high)?,
                 provenance: [
                     crate::engine::expr::ComparisonProvenance::from_exprs(expr, low)
+                        .with_hexbit_literals(expr, low)
+                        .with_between_domain(crate::engine::expr::between_comparison_domain(
+                            [expr, low, high],
+                            |e| {
+                                crate::engine::expr_type::column_type::schema_expr_result_type(
+                                    e,
+                                    &mut |column| {
+                                        cte_column_index(column, columns)
+                                            .map(|index| columns[index].column_type)
+                                            .unwrap_or(crate::types::ColumnType::VarString)
+                                    },
+                                )
+                            },
+                        ))
                         .with_temporal_constant_context(expr, low),
                     crate::engine::expr::ComparisonProvenance::from_exprs(expr, high)
+                        .with_hexbit_literals(expr, high)
                         .with_temporal_constant_context(expr, high),
                 ],
                 negated: *negated,

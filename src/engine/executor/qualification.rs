@@ -184,6 +184,33 @@ pub(super) fn qualify_select_tables(
     session: &SessionContext,
     stmt: &mut Select,
 ) -> Result<(), QueryError> {
+    fn qualified_source(
+        table: &crate::parser::TableRef,
+        derived: Option<&crate::parser::SubQuery>,
+    ) -> bool {
+        if table.name == "$nested_join_preserve" && table.alias.is_none() {
+            return derived
+                .and_then(crate::parser::SubQuery::leftmost_select)
+                .is_some_and(qualified_block);
+        }
+        derived.is_none() && table.name.contains('.')
+    }
+    fn qualified_block(select: &Select) -> bool {
+        select.from.iter().enumerate().any(|(index, table)| {
+            qualified_source(
+                table,
+                if index == 0 {
+                    select.derived.as_ref()
+                } else {
+                    None
+                },
+            )
+        }) || select
+            .joins
+            .iter()
+            .any(|join| qualified_source(&join.table, join.derived.as_ref()))
+    }
+    let check_bound_names = qualified_block(stmt);
     for table in &mut stmt.from {
         if stmt.derived.is_some() {
             continue;
@@ -213,6 +240,15 @@ pub(super) fn qualify_select_tables(
     let mut qualifier = QueryQualifier::new(db, session, true);
     crate::parser::visit::visit_select_mut(&mut qualifier, stmt);
     qualifier.result?;
+    if check_bound_names {
+        crate::parser::validate_query_table_names(
+            &stmt.from,
+            stmt.derived.as_ref(),
+            &stmt.joins,
+            Some(&session.current_database),
+        )
+        .map_err(|err| err.spec.error(err.message))?;
+    }
     stmt.table = stmt.from.first().map(|table| table.name.clone());
     Ok(())
 }

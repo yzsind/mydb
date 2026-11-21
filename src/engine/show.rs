@@ -1164,13 +1164,11 @@ pub(crate) fn show_routine_status(
     let schema_kind = routine_kind_schema(kind);
     let columns = show_routine_status_columns();
     let mut rows = db
-        .routines_in_database(&session.current_database)
-        .into_iter()
-        .chain(if session.current_database.eq_ignore_ascii_case("sys") {
-            crate::engine::sys_schema::routine_schemas()
-        } else {
-            Vec::new()
-        })
+        .catalog()
+        .routines
+        .values()
+        .map(|routine| routine.as_ref().clone())
+        .chain(crate::engine::sys_schema::routine_schemas())
         .filter(|routine| routine.kind == schema_kind)
         // B3: MySQL only lists routines the caller has some privilege on
         // (its schema, the routine, or globally). Reuse the IS visibility

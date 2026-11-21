@@ -292,7 +292,7 @@ fn cached_insert_intervals_revalidate_parent_epochs_and_replaced_frames() {
     };
     let mut initial: Vec<_> = (0..4000).step_by(2).map(wide_entry).collect();
     initial.sort();
-    index.insert_entries_logged(1, initial, false).unwrap();
+    index.insert_entries_logged(1, initial, false, None).unwrap();
     let mut probes: Vec<_> = (0..4500).map(wide_entry).collect();
     probes.sort();
     let mut path = smallvec::SmallVec::<[InsertRouteFrame; 4]>::new();
@@ -327,7 +327,7 @@ fn cached_insert_intervals_revalidate_parent_epochs_and_replaced_frames() {
     // epoch. This is deliberately done with no topology guard held.
     let mut extra: Vec<_> = (1..9000).step_by(2).map(wide_entry).collect();
     extra.sort();
-    index.insert_entries_logged(2, extra, false).unwrap();
+    index.insert_entries_logged(2, extra, false, None).unwrap();
     assert!(
         path[0].pinned.frame.dirty_epoch.load(Ordering::Acquire) != epoch
             || index.root_page.load(Ordering::Acquire) != root_key.page_id
@@ -461,7 +461,7 @@ fn routed_secondary_batches_preserve_all_key_types_and_reopen() {
             .unwrap();
             expected.sort();
             index
-                .insert_entries_logged(1, expected.clone(), false)
+                .insert_entries_logged(1, expected.clone(), false, None)
                 .unwrap();
             // Delete records before extending repeated keys into non-rightmost
             // gaps. This also covers stale separators and record-body holes.
@@ -480,14 +480,14 @@ fn routed_secondary_batches_preserve_all_key_types_and_reopen() {
             extra.extend(extra.iter().step_by(11).cloned().collect::<Vec<_>>());
             extra.sort();
             index
-                .insert_entries_logged(3, extra.clone(), false)
+                .insert_entries_logged(3, extra.clone(), false, None)
                 .unwrap();
             expected.extend(extra);
             // Nonmonotonic input is decomposed into independently routed
             // sorted prefixes; it must not inherit a preceding run's fence.
             let extra: Vec<_> = (3200..3400).rev().map(make).collect();
             index
-                .insert_entries_logged(4, extra.clone(), false)
+                .insert_entries_logged(4, extra.clone(), false, None)
                 .unwrap();
             expected.extend(extra);
             check(&index, &expected);

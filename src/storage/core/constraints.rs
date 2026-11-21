@@ -4967,7 +4967,21 @@ fn apply_legacy_first_timestamp_defaults(columns: &mut [ColumnSchema]) {
     }
 }
 
-fn column_def_to_schema(column: ColumnDef) -> Result<ColumnSchema, QueryError> {
+fn column_def_to_schema_in_table(column: ColumnDef, table: &TableSchema, old_name: Option<&str>) -> Result<ColumnSchema, QueryError> {
+    let charset = old_name.and_then(|name| table.column_index(name).ok())
+        .and_then(|index| table.columns[index].charset.as_deref()).unwrap_or(&table.charset);
+    column_def_to_schema(column, charset)
+}
+
+fn column_def_to_schema(mut column: ColumnDef, default_charset: &str) -> Result<ColumnSchema, QueryError> {
+    if let crate::parser::DataType::TextLength(length) = column.data_type {
+        let collation_charset = column.collation.as_deref()
+            .filter(|name| *name != crate::parser::BINARY_ATTRIBUTE_COLLATION)
+            .map(crate::charset::resolve_collation).transpose()?.map(|c| c.charset);
+        let charset = column.charset.as_deref().or(collation_charset).unwrap_or(default_charset);
+        let width = crate::charset::resolve_charset(charset)?.max_len;
+        column.data_type = crate::parser::DataType::Text(crate::storage::schema::text_length_byte_cap(length, width));
+    }
     validate_mysql_identifier(&column.name)?;
     if column.generated.is_some() {
         if column.default.is_some() {

@@ -868,20 +868,20 @@ mod session;
 pub use session::SessionSeqState;
 
 // ===========================================================================
-// Errors (MySQL code + PostgreSQL-aligned SQLSTATE / wording)
+// Relation lookup errors use interoperable MySQL protocol error numbers.
 // ===========================================================================
 
 pub fn err_seq_exists(name: &str) -> QueryError {
     error(
-        crate::error::catalog::MYDB_ER_SEQUENCE_EXISTS,
-        format!("relation \"{name}\" already exists"),
+        crate::error::catalog::ER_TABLE_EXISTS_ERROR,
+        format!("Sequence '{name}' already exists"),
     )
 }
 
 pub fn err_unknown_seq(name: &str) -> QueryError {
     error(
-        crate::error::catalog::MYDB_ER_SEQUENCE_NOT_FOUND,
-        format!("relation \"{name}\" does not exist"),
+        crate::error::catalog::ER_NO_SUCH_TABLE,
+        format!("Sequence '{name}' does not exist"),
     )
 }
 
