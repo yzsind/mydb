@@ -725,7 +725,7 @@ fn search_filtered_ann(
             }
             // Let the HNSW cursor refine its retained frontier incrementally
             // when the next validation batch can end candidate collection.
-            if (is_ivf || !budget.nearing_completion()) && cursor.hnsw.pending.is_empty() {
+            if (is_ivf || !budget.nearing_completion()) && cursor.hnsw.pending_len() == 0 {
                 if effort >= max_scan {
                     all_complete = false;
                     break;
@@ -738,7 +738,7 @@ fn search_filtered_ann(
                 let distance =
                     (query.dimension as f64 / 8.0).max(1.0) * constants.cpu_operator_cost();
                 let decode = crate::engine::cbo::operator_cost::per_row_decode_cost(16.0);
-                let navigation = if cursor.hnsw.pending.len() as f64 >= remaining {
+                let navigation = if cursor.hnsw.pending_len() as f64 >= remaining {
                     0.0
                 } else {
                     remaining * cursor.work.distances as f64 / seen.len().max(1) as f64

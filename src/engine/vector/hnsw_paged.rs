@@ -204,6 +204,7 @@ pub(crate) struct PagedCursorNavigation {
     mapping_revision: u64,
     qcodes: Vec<i8>,
     qnorm: i32,
+    biased_codes: Option<super::distance::BiasedSq8Dot>,
 }
 
 #[derive(Debug)]
@@ -4919,11 +4920,22 @@ impl PagedHnsw {
                             arena: if mapped { None } else { arena },
                             mapped,
                             mapping_revision: mapping.map_or(0, |view| view.source_revision()),
+                            biased_codes: mapping
+                                .filter(|_| mapped)
+                                .and_then(|view| view.prepare_biased_query(&scratch.qcodes)),
                             qcodes: scratch.qcodes,
                             qnorm: scratch.qnorm,
                         });
                     }
                 }
+            }
+            if let Some(view) = mapping.filter(|_| {
+                cursor
+                    .paged_navigation
+                    .as_ref()
+                    .is_some_and(|nav| nav.mapped)
+            }) {
+                cursor.hnsw.start_mapped(view.navigation_slot_geometry())?;
             }
             if let Some((mut entry, level)) = self.file.entry_with_level() {
                 for layer in (1..=level as usize).rev() {
@@ -4956,13 +4968,28 @@ impl PagedHnsw {
                     self.cursor_node_distance(cursor, entry, mapping)?
                 {
                     let rows = (!deleted && !retired.0.contains(&entry)).then_some(row);
-                    cursor.hnsw.discover(
-                        entry,
-                        distance,
-                        rows,
-                        cursor.sid,
-                        cursor.selection.as_deref(),
-                    )?;
+                    if cursor
+                        .paged_navigation
+                        .as_ref()
+                        .is_some_and(|nav| nav.mapped)
+                    {
+                        cursor.hnsw.visit_mapped(entry);
+                        let row = rows.filter(|&row| {
+                            cursor
+                                .selection
+                                .as_ref()
+                                .is_none_or(|s| s.contains(cursor.sid, row))
+                        });
+                        cursor.hnsw.discover_mapped(entry, distance, row)?;
+                    } else {
+                        cursor.hnsw.discover(
+                            entry,
+                            distance,
+                            rows,
+                            cursor.sid,
+                            cursor.selection.as_deref(),
+                        )?;
+                    }
                     cursor.work.distances += 1;
                 }
             }
@@ -5019,34 +5046,76 @@ impl PagedHnsw {
             cursor.hnsw.expanded = self.node_count() as usize;
             return Ok(epoch == self.query_nav_epoch.load(Ordering::Acquire));
         }
-        let mut neighbors = Vec::new();
         let end = cursor.hnsw.expanded.saturating_add(1024).min(effort);
-        while cursor.hnsw.expanded < end {
-            crate::engine::cancel::check_cancelled()?;
-            let Some(Reverse(candidate)) = cursor.hnsw.frontier.pop() else {
-                break;
-            };
-            cursor.hnsw.expanded += 1;
-            cursor.work.visited += 1;
-            self.cursor_neighbors_into(cursor, candidate.id, 0, mapping, &mut neighbors)?;
-            // Expose a bounded amount of independent mmap I/O before scalar
-            // scoring. Keep discovery order, duplicate checks and errors on
-            // the original path; prefetching has no observable validation.
-            for block in neighbors.chunks(8) {
-                if cursor
-                    .paged_navigation
-                    .as_ref()
-                    .is_some_and(|nav| nav.mapped)
-                {
-                    if let Some(mapping) = mapping {
-                        for &id in block {
-                            if !cursor.hnsw.visited.contains(&id) {
-                                mapping.prefetch_navigation_node(id);
-                            }
+        if let Some((view, nav)) =
+            mapping.zip(cursor.paged_navigation.as_ref().filter(|nav| nav.mapped))
+        {
+            let mut neighbors = Vec::new();
+            while cursor.hnsw.expanded < end {
+                crate::engine::cancel::check_cancelled()?;
+                let Some(id) = cursor.hnsw.pop_mapped()? else {
+                    break;
+                };
+                cursor.hnsw.expanded += 1;
+                cursor.work.visited += 1;
+                view.neighbors(id, 0, &mut neighbors)?;
+                neighbors.retain(|&neighbor| cursor.hnsw.visit_mapped(neighbor));
+                for block in neighbors.chunks(8) {
+                    for &id in block {
+                        view.prefetch_navigation_node(id);
+                    }
+                    let mut admit = |id, node: Option<(RowId, bool, f64)>| {
+                        if let Some((row, deleted, distance)) = node {
+                            let eligible = !deleted
+                                && !retired.0.contains(&id)
+                                && cursor
+                                    .selection
+                                    .as_ref()
+                                    .is_none_or(|s| s.contains(cursor.sid, row));
+                            cursor
+                                .hnsw
+                                .discover_mapped(id, distance, eligible.then_some(row))?;
+                            cursor.work.distances += 1;
+                        }
+                        Ok::<_, QueryError>(())
+                    };
+                    let mut batches = block.chunks_exact(4);
+                    for batch in &mut batches {
+                        let ids = [batch[0], batch[1], batch[2], batch[3]];
+                        let scores = view.navigation_nodes4(
+                            ids,
+                            &nav.qcodes,
+                            nav.qnorm,
+                            nav.biased_codes.as_ref(),
+                        )?;
+                        for (id, node) in ids.into_iter().zip(scores) {
+                            admit(id, node)?;
                         }
                     }
+                    for &id in batches.remainder() {
+                        admit(
+                            id,
+                            view.navigation_node(
+                                id,
+                                &nav.qcodes,
+                                nav.qnorm,
+                                nav.biased_codes.as_ref(),
+                            )?,
+                        )?;
+                    }
                 }
-                for &id in block {
+            }
+        } else {
+            let mut neighbors = Vec::new();
+            while cursor.hnsw.expanded < end {
+                crate::engine::cancel::check_cancelled()?;
+                let Some(Reverse(candidate)) = cursor.hnsw.frontier.pop() else {
+                    break;
+                };
+                cursor.hnsw.expanded += 1;
+                cursor.work.visited += 1;
+                self.cursor_neighbors_into(cursor, candidate.id, 0, mapping, &mut neighbors)?;
+                for &id in &neighbors {
                     if cursor.hnsw.visited.contains(&id) {
                         continue;
                     }
@@ -5066,7 +5135,8 @@ impl PagedHnsw {
                 }
             }
         }
-        cursor.resume_work = cursor.hnsw.expanded < effort && !cursor.hnsw.frontier.is_empty();
+        cursor.resume_work =
+            cursor.hnsw.expanded < effort && cursor.hnsw.frontier_distance().is_some();
         Ok(epoch == self.query_nav_epoch.load(Ordering::Acquire))
     }
 
@@ -5079,7 +5149,7 @@ impl PagedHnsw {
         if let Some(nav) = &cursor.paged_navigation {
             if nav.mapped {
                 return mapping.map_or(Ok(None), |mapping| {
-                    mapping.navigation_node(vid, &nav.qcodes, nav.qnorm)
+                    mapping.navigation_node(vid, &nav.qcodes, nav.qnorm, nav.biased_codes.as_ref())
                 });
             }
             let arena = nav.arena.as_ref().expect("compact cursor owns its arena");

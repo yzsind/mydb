@@ -995,6 +995,15 @@ pub(crate) fn dot_i8_batch4_ptrs(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
             dot_i8(query, rows[3]),
         ];
     }
+    #[cfg(target_arch = "x86_64")]
+    if n >= 128
+        && std::arch::is_x86_feature_detected!("avx512f")
+        && std::arch::is_x86_feature_detected!("avx512bw")
+        && std::arch::is_x86_feature_detected!("avx512vnni")
+    {
+        // SAFETY: all four rows contain at least n bytes and features were checked.
+        return unsafe { dot_i8_batch4_ptrs_vnni(query, rows) };
+    }
     #[cfg(target_arch = "aarch64")]
     unsafe {
         let has_dotprod = if cfg!(target_os = "macos") {
@@ -1022,6 +1031,94 @@ pub(crate) fn dot_i8_batch4_ptrs(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
         dot_i8(query, rows[2]),
         dot_i8(query, rows[3]),
     ]
+}
+
+/// VNNI can consume an unsigned query directly once the caller has cached
+/// each row's signed-byte correction. The signed distance remains exact.
+pub(crate) struct BiasedSq8Dot(Vec<u8>);
+
+impl BiasedSq8Dot {
+    pub(crate) fn supported() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        return std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512bw")
+            && std::arch::is_x86_feature_detected!("avx512vnni");
+        #[cfg(not(target_arch = "x86_64"))]
+        false
+    }
+
+    pub(crate) fn try_new(query: &[i8]) -> Option<Self> {
+        Self::supported().then(|| Self(query.iter().map(|&code| code as u8 ^ 128).collect()))
+    }
+
+    #[inline]
+    pub(crate) fn dot<const N: usize>(&self, rows: [&[i8]; N]) -> [i32; N] {
+        debug_assert!(rows.iter().all(|row| row.len() == self.0.len()));
+        #[cfg(target_arch = "x86_64")]
+        {
+            // SAFETY: construction is gated on VNNI, and the kernel slices
+            // each row against the query length before unaligned loads.
+            unsafe { dot_u8_i8_vnni(&self.0, rows) }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        rows.map(|row| {
+            self.0
+                .iter()
+                .zip(row)
+                .map(|(&q, &r)| i32::from(q) * i32::from(r))
+                .sum()
+        })
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_u8_i8_vnni<const N: usize>(query: &[u8], rows: [&[i8]; N]) -> [i32; N] {
+    use std::arch::x86_64::*;
+    let rows = rows.map(|row| &row[..query.len()]);
+    let mut sums = [_mm512_setzero_si512(); N];
+    let end = query.len() & !63;
+    for offset in (0..end).step_by(64) {
+        let q = _mm512_loadu_si512(query.as_ptr().add(offset).cast());
+        for lane in 0..N {
+            let row = _mm512_loadu_si512(rows[lane].as_ptr().add(offset).cast());
+            sums[lane] = _mm512_dpbusd_epi32(sums[lane], q, row);
+        }
+    }
+    std::array::from_fn(|lane| {
+        _mm512_reduce_add_epi32(sums[lane])
+            + query[end..]
+                .iter()
+                .zip(&rows[lane][end..])
+                .map(|(&q, &r)| i32::from(q) * i32::from(r))
+                .sum::<i32>()
+    })
+}
+
+/// Score independent mapped rows with one biased query load per block.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+unsafe fn dot_i8_batch4_ptrs_vnni(query: &[i8], rows: [&[i8]; 4]) -> [i32; 4] {
+    use std::arch::x86_64::*;
+    let bias = _mm512_set1_epi8(i8::MIN);
+    let mut sums = [_mm512_setzero_si512(); 4];
+    let mut corrections = sums;
+    let end = query.len() & !63;
+    for position in (0..end).step_by(64) {
+        let q = _mm512_xor_si512(
+            _mm512_loadu_si512(query.as_ptr().add(position).cast()),
+            bias,
+        );
+        for lane in 0..4 {
+            let row = _mm512_loadu_si512(rows[lane].as_ptr().add(position).cast());
+            sums[lane] = _mm512_dpbusd_epi32(sums[lane], q, row);
+            corrections[lane] = _mm512_dpbusd_epi32(corrections[lane], bias, row);
+        }
+    }
+    std::array::from_fn(|lane| {
+        let lanes = _mm512_sub_epi32(sums[lane], corrections[lane]);
+        _mm512_reduce_add_epi32(lanes) + dot_i8(&query[end..], &rows[lane][end..])
+    })
 }
 
 /// Four-row SDOT kernel for independently located rows.
@@ -2671,7 +2768,7 @@ mod tests {
 
     #[test]
     fn dot_i8_batch4_ptrs_matches_independent_rows() {
-        for &dim in &[1usize, 31, 32, 33, 128, 768] {
+        for &dim in &[1usize, 31, 32, 33, 128, 129, 513, 768, 1024, 4097] {
             let query_f = pseudo(dim, 0xC001 + dim as u64);
             let mut query = vec![0i8; dim];
             quantize_into(&query_f, 0.0, 127.0, &mut query);
@@ -2691,6 +2788,15 @@ mod tests {
             ];
             let got = dot_i8_batch4_ptrs(&query, [&rows[0], &rows[1], &rows[2], &rows[3]]);
             assert_eq!(got, expected, "pointer batch dot dim={dim}");
+            if let Some(biased) = BiasedSq8Dot::try_new(&query) {
+                let lanes = [&rows[0][..], &rows[1][..], &rows[2][..], &rows[3][..]];
+                let unsigned = biased.dot(lanes);
+                let corrected = std::array::from_fn(|lane| {
+                    unsigned[lane] - 128 * lanes[lane].iter().map(|&v| i32::from(v)).sum::<i32>()
+                });
+                assert_eq!(corrected, expected, "biased pointer dot dim={dim}");
+                assert_eq!(biased.dot([lanes[0]])[0], unsigned[0]);
+            }
         }
     }
 
