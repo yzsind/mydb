@@ -41,9 +41,10 @@ identity while retaining its physical data and indexes.
 The protected `__mydb_recyclebin__` namespace supports ordinary read-only queries,
 including joins, CTEs and subqueries. A retained table can be the source of
 `INSERT ... SELECT` or CTAS. Direct writes, DDL, locking reads, historical AS OF
-queries, and persistent views referring to retained tables are rejected. An old
-transaction snapshot cannot cross the recycle/restore publication boundary;
-retry that transaction after error 1412.
+queries, and persistent views referring to retained tables are rejected.
+A dropped name reports 1146. Retry after 1412 when an older snapshot cannot use
+a changed table definition; restoring a compatible name can remain readable
+by an older snapshot.
 
 ## Retained contents and dependencies
 
@@ -82,10 +83,12 @@ later DROP DATABASE.
 | `mydb_recyclebin_target_free_pct` | GLOBAL | 15 | Stop pressure reclamation at this percentage; greater than the minimum, at most 90 |
 | `mydb_recyclebin_gc_interval_ms` | GLOBAL | 10000 | Background interval; 1000–3600000 ms |
 
-The corresponding startup options are `recyclebin`,
+The corresponding configuration-file keys (not command-line flags) are `recyclebin`,
 `recyclebin_retention_seconds`, `recyclebin_min_free_pct`,
 `recyclebin_target_free_pct` and `recyclebin_gc_interval_ms`; environment names
 use the `MYDB_` prefix and uppercase spelling. Normal SET PERSIST rules apply.
+Under disk write-headroom pressure, RESTORE and PURGE RECYCLEBIN ALL are
+rejected; purging a single entry remains available for recovery.
 
 ```sql
 SET SESSION mydb_recyclebin = OFF; -- subsequent DROP/TRUNCATE is permanent

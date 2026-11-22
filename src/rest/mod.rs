@@ -28,6 +28,8 @@ pub struct RestServer<E: QueryEngine> {
     state: Arc<runtime::State<E>>,
     tls: Option<tokio_rustls::TlsAcceptor>,
     mcp: Option<crate::mcp::McpConfig>,
+    #[cfg(test)]
+    accept_failure: Option<(std::net::SocketAddr, Arc<tokio::sync::Notify>)>,
 }
 impl<E: QueryEngine> RestServer<E> {
     pub fn new(
@@ -40,6 +42,8 @@ impl<E: QueryEngine> RestServer<E> {
             state: runtime::State::new(config, engine, registry),
             tls,
             mcp: None,
+            #[cfg(test)]
+            accept_failure: None,
         }
     }
     pub fn with_mcp(mut self, config: crate::mcp::McpConfig) -> Self {
@@ -132,28 +136,51 @@ impl<E: QueryEngine> RestServer<E> {
         let mut sweep = tokio::time::interval(Duration::from_millis(100));
         let mut sweeping: Option<tokio::task::JoinHandle<()>> = None;
         let result = {
-            let primary = self.accept_connections(
-                &listener,
-                self.tls.as_ref(),
-                &router,
-                &sockets,
-                control_streams,
-            );
+            let primary = async {
+                let result = self
+                    .accept_connections(
+                        &listener,
+                        self.tls.as_ref(),
+                        &router,
+                        &sockets,
+                        control_streams,
+                    )
+                    .await;
+                drop(listener);
+                result
+            };
             let local = async {
-                match &loopback_http_listener {
+                let result = match &loopback_http_listener {
                     Some(listener) => {
                         self.accept_connections(listener, None, &router, &sockets, control_streams)
                             .await
                     }
                     None => future::pending().await,
-                }
+                };
+                drop(loopback_http_listener);
+                result
             };
+            let mut primary_active = true;
+            let mut local_active = config.loopback_http_addr.is_some();
+            let mut first_error = None;
             tokio::pin!(primary, local);
             loop {
                 tokio::select! {
-                    _ = crate::mysql::shutdown::shutdown_notified() => break Ok(()),
-                    result = &mut primary => break result,
-                    result = &mut local => break result,
+                    _ = crate::mysql::shutdown::shutdown_notified() => break,
+                    result = &mut primary, if primary_active => {
+                        primary_active = false;
+                        if let Err(error) = result {
+                            crate::util::logging::log_message(format_args!("{error}"));
+                            first_error.get_or_insert(error);
+                        }
+                    },
+                    result = &mut local, if local_active => {
+                        local_active = false;
+                        if let Err(error) = result {
+                            crate::util::logging::log_message(format_args!("{error}"));
+                            first_error.get_or_insert(error);
+                        }
+                    },
                     _ = sweep.tick() => {
                         if sweeping.as_ref().is_none_or(|task| task.is_finished()) {
                             let state = self.state.clone();
@@ -161,17 +188,13 @@ impl<E: QueryEngine> RestServer<E> {
                         }
                     }
                 }
+                if !primary_active && !local_active {
+                    break;
+                }
             }
+            first_error.map_or(Ok(()), Err)
         };
-        drop(listener);
-        drop(loopback_http_listener);
-        if let Err(error) = &result {
-            crate::util::logging::log_message(format_args!("{error}"));
-            crate::mysql::shutdown::request_shutdown(
-                crate::mysql::shutdown::ShutdownSource::HttpListener,
-                crate::mysql::shutdown::ShutdownIntent::Halt,
-            );
-        }
+        self.state.begin_close();
         if let Some(task) = sweeping {
             let _ = task.await;
         }
@@ -192,7 +215,23 @@ impl<E: QueryEngine> RestServer<E> {
 
         let local_addr = listener.local_addr()?;
         loop {
-            let (stream, addr) = match listener.accept().await {
+            let accept = listener.accept();
+            #[cfg(test)]
+            let accept = async {
+                tokio::select! {
+                    result = accept => result,
+                    _ = async {
+                        if let Some((addr, failure)) = &self.accept_failure {
+                            if *addr == local_addr {
+                                failure.notified().await;
+                                return;
+                            }
+                        }
+                        future::pending::<()>().await;
+                    } => Err(io::Error::other("injected HTTP listener failure")),
+                }
+            };
+            let (stream, addr) = match accept.await {
                 Ok(accepted) => accepted,
                 Err(error)
                     if matches!(
@@ -222,6 +261,7 @@ impl<E: QueryEngine> RestServer<E> {
             let tls = tls.cloned();
             let app = router.clone();
             let config = self.state.config.clone();
+            let state = self.state.clone();
             if let Err(error) = crate::util::connection_dispatch::spawn(move || async move {
                 let _permit = permit;
                 let _ = stream.set_nodelay(true);
@@ -249,9 +289,9 @@ impl<E: QueryEngine> RestServer<E> {
                             peer.issuer = Some(distinguished_name(cert.issuer()));
                         }
                     }
-                    serve(stream, app.layer(Extension(peer)), config, control_streams).await;
+                    serve(stream, app.layer(Extension(peer)), config, control_streams, state).await;
                 } else {
-                    serve(stream, app.layer(Extension(peer)), config, control_streams).await;
+                    serve(stream, app.layer(Extension(peer)), config, control_streams, state).await;
                 }
             }) {
                 crate::util::logging::log_message(format_args!(
@@ -273,14 +313,23 @@ impl ConnectionAbort {
         self.0.notified().await;
     }
 }
-async fn serve<I>(io: I, app: Router, config: RestConfig, control_streams: usize)
-where
+async fn serve<I, E: QueryEngine>(
+    io: I,
+    app: Router,
+    config: RestConfig,
+    control_streams: usize,
+    state: Arc<runtime::State<E>>,
+) where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
     use tokio::io::AsyncBufReadExt;
     let mut io = tokio::io::BufReader::with_capacity(24, io);
-    if !matches!(tokio::time::timeout(Duration::from_secs(5), io.fill_buf()).await, Ok(Ok(bytes)) if !bytes.is_empty())
-    {
+    let initial = tokio::select! {
+        biased;
+        _ = state.closing_notified() => return,
+        result = tokio::time::timeout(Duration::from_secs(5), io.fill_buf()) => result,
+    };
+    if !matches!(initial, Ok(Ok(bytes)) if !bytes.is_empty()) {
         return;
     }
     let io = hyper_util::rt::TokioIo::new(io);
@@ -308,8 +357,18 @@ where
         .max_header_list_size(config.max_header_bytes.min(u32::MAX as usize) as u32);
     let connection = builder.serve_connection_with_upgrades(io, service);
     tokio::pin!(connection);
-    tokio::select! {_=&mut connection=>{},_=abort.closed()=>{},_=crate::mysql::shutdown::shutdown_notified()=>{connection.as_mut().graceful_shutdown();let _=tokio::time::timeout(crate::mysql::shutdown::shutdown_timeout(),connection).await;}}
+    tokio::select! {
+        biased;
+        _ = state.closing_notified() => {},
+        _ = &mut connection => {},
+        _ = abort.closed() => {},
+        _ = crate::mysql::shutdown::shutdown_notified() => {
+            connection.as_mut().graceful_shutdown();
+            let _ = tokio::time::timeout(crate::mysql::shutdown::shutdown_timeout(), connection).await;
+        }
+    }
 }
+
 async fn endpoint<E: QueryEngine>(
     State(state): State<Arc<runtime::State<E>>>,
     Extension(peer): Extension<Peer>,
@@ -321,13 +380,16 @@ async fn endpoint<E: QueryEngine>(
         return Ok(Json(json!({"status":"live"})).into_response());
     }
     if path == "/health/ready" {
+        let ready = !crate::mysql::shutdown::is_shutting_down()
+            && !state.is_closing()
+            && state.engine.is_ready();
         return Ok((
-            if crate::mysql::shutdown::is_shutting_down() {
-                StatusCode::SERVICE_UNAVAILABLE
-            } else {
+            if ready {
                 StatusCode::OK
+            } else {
+                StatusCode::SERVICE_UNAVAILABLE
             },
-            Json(json!({"ready":!crate::mysql::shutdown::is_shutting_down()})),
+            Json(json!({"ready":ready})),
         )
             .into_response());
     }

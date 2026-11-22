@@ -379,7 +379,7 @@ pub(crate) fn show_variables_result(
         ShowScope::Global => crate::engine::sysvar::Scope::Global,
         ShowScope::Session => crate::engine::sysvar::Scope::Session,
     };
-    let rows = crate::engine::sysvar::snapshot(registry_scope, Some(session), db);
+    let rows = crate::engine::sysvar::snapshot(registry_scope, Some(session), db)?;
     let mut result = variable_result(rows.into_iter().map(|r| (r.name, r.value)).collect());
     apply_show_filter(&mut result.rows, &result.columns, filter, "Variable_name")?;
     Ok(QueryResponse::ResultSet(result))

@@ -265,6 +265,19 @@ an ID. Retained duplicate IDs return 409 without starting SQL.
 | `GET /health/live` | Unauthenticated process liveness |
 | `GET /health/ready` | Unauthenticated readiness |
 
+Readiness returns HTTP 200 with `{"ready":true}` while the engine is operational,
+and HTTP 503 with `{"ready":false}` during server or HTTP service shutdown, or
+after an MVCC fail-stop.
+Liveness continues to report that the process is running; neither probe performs
+a SQL query or a disk scan.
+
+A runtime listener failure closes the affected HTTP listener and is logged.
+Other HTTP listeners and MySQL continue serving. If every HTTP listener fails,
+HTTP sessions are closed and unfinished transactions are rolled back through
+the normal session lifecycle. Existing HTTP connections are also closed, and
+session admission rejects work racing with shutdown. A failed listener is not automatically rebound.
+Startup configuration, bind, and TLS failures still prevent startup.
+
 Finished request summaries remain for up to five minutes in a bounded cache.
 IDs are unique within the creating API key. Restart or eviction can remove them. A 404 does not establish that SQL did not
 execute. Request IDs provide correlation, not durable idempotency.

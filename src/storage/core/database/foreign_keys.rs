@@ -705,6 +705,16 @@ fn fk_constraint_clause(child: &TableSchema, fk: &ForeignKeySchema) -> String {
     )
 }
 
+fn fk_row_has_null_reference(table: &TableSchema, fk: &ForeignKeySchema, values: &[Value]) -> Result<bool, QueryError> {
+    for column in &fk.columns {
+        let index = table.column_index(column)?;
+        if values.get(index).is_none_or(|value| matches!(value, Value::Null)) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 fn fk_child_violation_err(child: &TableSchema, fk: &ForeignKeySchema) -> QueryError {
     error(
         crate::error::catalog::ER_NO_REFERENCED_ROW_2,
@@ -1043,11 +1053,12 @@ impl Database {
                     continue;
                 }
             }
-            // Resolve the parent table + referenced index for this FK, then
-            // enforce the single row. `None` means the parent/index is not
-            // (yet) present — the constraint is treated as satisfied, matching
-            // the deferred-FK contract.
+            // Deferred DDL is allowed with checks disabled. Once enabled,
+            // unresolved non-NULL references must fail just like absent keys.
             let Some((parent, index)) = self.fk_resolve_parent_index(fk)? else {
+                if !fk_row_has_null_reference(table, fk, values)? {
+                    return Err(fk_child_violation_err(table, fk));
+                }
                 continue;
             };
             let index = &parent.indexes[index];
@@ -1092,6 +1103,12 @@ impl Database {
                     .map(|column| parent.column_index(column))
                     .collect::<Result<smallvec::SmallVec<[usize; 4]>, _>>()?;
                 resolved.push((fk, parent, index, referenced_columns));
+            } else {
+                for row in rows {
+                    if !fk_row_has_null_reference(table, fk, row)? {
+                        return Err(fk_child_violation_err(table, fk));
+                    }
+                }
             }
         }
         if resolved.is_empty() {
@@ -1168,8 +1185,8 @@ impl Database {
 
     /// Resolve an FK's parent table (`Arc` clone) and its referenced
     /// UNIQUE/PRIMARY index. Returns `None` when the parent table or a
-    /// suitable index is absent (deferred FK / dangling reference), for which
-    /// the child-side check is a no-op.
+    /// suitable index is absent. Callers reject non-NULL child references
+    /// while checks are enabled.
     /// Returns the referenced index as a position in `parent.indexes`, so the
     /// per-statement resolution borrows it instead of deep-cloning the schema.
     fn fk_resolve_parent_index(

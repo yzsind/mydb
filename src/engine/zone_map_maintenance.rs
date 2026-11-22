@@ -33,6 +33,9 @@ impl ZoneMapMaintenanceHandle {
                 if shutdown.wait_timeout(Duration::from_millis(interval.max(1000))) {
                     break;
                 }
+                let Some(_write) = crate::repl::background_write_permit() else {
+                    continue;
+                };
                 run_maintenance_task("recycle-bin cleanup", || {
                     recycle_db.maintain_recyclebin_until(&|| shutdown.is_requested())
                 });
@@ -49,6 +52,9 @@ impl ZoneMapMaintenanceHandle {
                 if worker_shutdown.wait_timeout(Duration::from_secs(10)) {
                     break;
                 }
+                let Some(_write) = crate::repl::background_write_permit() else {
+                    continue;
+                };
                 run_maintenance_task("partition cleanup", || {
                     db.maintain_partition_cleanup_until(|| worker_shutdown.is_requested())
                 });

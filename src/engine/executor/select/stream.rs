@@ -80,7 +80,21 @@ pub(super) fn collect_plan_stream(
 ) -> Result<Vec<PlanRow>, QueryError> {
     let mut stream = execute_plan_stream(db, txn, plan)?;
     let mut rows = Vec::new();
+    let mut charge = super::super::mem_budget::ScopedCharge::for_budget(Some(
+        super::super::mem_budget::current_budget()
+            .unwrap_or_else(|| Arc::new(super::super::mem_budget::MemBudget::from_env())),
+    ));
     while let Some(row) = stream.next()? {
+        charge.add_force(row.fields.iter().fold(
+            std::mem::size_of::<PlanRow>() * 2,
+            |bytes, field| {
+                bytes
+                    .saturating_add(std::mem::size_of_val(field))
+                    .saturating_add(super::super::mem_budget::estimate_row_bytes(
+                        std::slice::from_ref(&field.value),
+                    ))
+            },
+        ))?;
         rows.push(row);
     }
     Ok(rows)

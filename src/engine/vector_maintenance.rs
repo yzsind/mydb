@@ -73,6 +73,9 @@ impl VectorMaintenanceHandle {
                 if worker_shutdown.wait_timeout(Duration::from_secs(1)) {
                     break;
                 }
+                let Some(_write) = crate::repl::background_write_permit() else {
+                    continue;
+                };
                 let round = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                     db.maintain_vector_indexes(|| worker_shutdown.is_requested())
                 }));

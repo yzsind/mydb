@@ -195,6 +195,18 @@ impl Database {
     where
         F: FnMut(crate::storage::DmlRowRef, &[Value]) -> Result<(), QueryError>,
     {
+        self.scan_rows_ordered_streaming_owned(table_name, txn, |row| visit(row.row_ref, &row.values))
+    }
+
+    pub(crate) fn scan_rows_ordered_streaming_owned<F>(
+        &self,
+        table_name: &str,
+        txn: TxnView,
+        mut visit: F,
+    ) -> Result<(), QueryError>
+    where
+        F: FnMut(crate::storage::DmlStoredRow) -> Result<(), QueryError>,
+    {
         const BATCH_PAGES: u64 = 64;
         let table = self
             .table_by_key(table_name)
@@ -234,7 +246,10 @@ impl Database {
                             visible.values
                         };
                     Self::pad_full_row_to_schema(&mut values, &table);
-                    visit(crate::storage::DmlRowRef { storage_id, row_id }, &values)?;
+                    visit(crate::storage::DmlStoredRow {
+                        row_ref: crate::storage::DmlRowRef { storage_id, row_id },
+                        values,
+                    })?;
                     examined += 1;
                 }
             }

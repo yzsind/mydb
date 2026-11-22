@@ -456,14 +456,34 @@
         "summary": "Readiness",
         "responses": {
           "200": {
-            "description": "Successful operation",
+            "description": "The engine is operational and shutdown has not started.",
             "content": {
               "application/json": {
                 "schema": {
                   "type": "object",
                   "properties": {
                     "ready": {
-                      "type": "boolean"
+                      "type": "boolean",
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "ready"
+                  ]
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The server or HTTP service is shutting down, or the engine is fail-stopped.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "ready": {
+                      "type": "boolean",
+                      "const": false
                     }
                   },
                   "required": [

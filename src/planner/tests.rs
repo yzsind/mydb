@@ -2626,8 +2626,15 @@ fn trimmed_zero_date_stats_keep_bounded_date_range_estimate() {
     engine
         .execute("CREATE TABLE calendar (id INT PRIMARY KEY, d DATE, INDEX idx_d(d))")
         .unwrap();
+    let mut session = crate::engine::SessionContext::default();
     engine
-        .execute("INSERT INTO calendar VALUES (0, '0000-00-00')")
+        .execute_with_session(&mut session, "SET sql_mode='STRICT_TRANS_TABLES'")
+        .unwrap();
+    engine
+        .execute_with_session(
+            &mut session,
+            "INSERT INTO calendar VALUES (0, '0000-00-00')",
+        )
         .unwrap();
     let start = chrono::NaiveDate::from_ymd_opt(1999, 1, 1).unwrap();
     for id in 1..=365 {

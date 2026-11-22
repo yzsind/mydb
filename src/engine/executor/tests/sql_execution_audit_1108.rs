@@ -1942,8 +1942,13 @@ fn audit1108_json_sql_scalar_sources_and_nulls_are_preserved() {
     use crate::engine::executor::vec::config::{with_vec_mode, VecMode};
     let (_dir,engine)=fixture(&[
         "CREATE TABLE json_source_types(id INT PRIMARY KEY,y YEAR,b BIT(8),bi BINARY(3),bl BLOB,vb VARBINARY(3),ts TIMESTAMP(2))",
-        "INSERT INTO json_source_types VALUES(1,2024,b'101','ab','blob','ab','2020-01-02 03:04:05.12'),(2,NULL,NULL,NULL,NULL,NULL,NULL),(3,0,b'0',X'000102',X'00FF',X'61','0000-00-00 00:00:00')",
     ]);
+    let mut session = SessionContext::default();
+    engine
+        .execute_with_session(&mut session, "SET sql_mode='STRICT_TRANS_TABLES'")
+        .unwrap();
+    engine.execute_with_session(&mut session,
+        "INSERT INTO json_source_types VALUES(1,2024,b'101','ab','blob','ab','2020-01-02 03:04:05.12'),(2,NULL,NULL,NULL,NULL,NULL,NULL),(3,0,b'0',X'000102',X'00FF',X'61','0000-00-00 00:00:00')").unwrap();
     for mode in [VecMode::Off, VecMode::On] {
         with_vec_mode(mode, || {
             assert_eq!(

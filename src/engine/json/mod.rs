@@ -289,6 +289,7 @@ fn normalize_integer_negative_zero(text: &str) -> std::borrow::Cow<'_, str> {
         } else if byte == b'"' {
             quoted = true;
         } else if byte == b'-'
+            && (i == 0 || !matches!(bytes[i - 1], b'e' | b'E'))
             && bytes.get(i + 1) == Some(&b'0')
             && bytes
                 .get(i + 2)

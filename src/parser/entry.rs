@@ -609,6 +609,43 @@ fn parse_statement_source(
     let head_is = |keyword: &[u8]| {
         head.is_some_and(|head| head.len() == keyword.len() && head.eq_ignore_ascii_case(keyword))
     };
+    if head_is(b"CANCEL") {
+        let mut cursor = crate::sql_lex::SqlTokenCursor::new(sql, lex_mode, MYSQL_VERSION_ID);
+        if cursor
+            .eat_keyword(b"CANCEL")
+            .map_err(|err| parse_lex_error(sql, err))?
+            && cursor
+                .eat_keyword(b"DDL")
+                .map_err(|err| parse_lex_error(sql, err))?
+        {
+            if !cursor
+                .eat_keyword(b"JOB")
+                .map_err(|err| parse_lex_error(sql, err))?
+            {
+                return Err(parse_error_at_zero(
+                    "CANCEL DDL requires JOB and an unsigned job id",
+                ));
+            }
+            let token = cursor
+                .next()
+                .map_err(|err| parse_lex_error(sql, err))?
+                .ok_or_else(|| parse_error_at_zero("CANCEL DDL JOB requires an unsigned job id"))?;
+            let id = cursor.token_text(&token).parse::<u64>().map_err(|_| {
+                parse_error_at_zero("DDL job id must be an unsigned 64-bit integer")
+            })?;
+            if let Some(token) = cursor.next().map_err(|err| parse_lex_error(sql, err))? {
+                if token.kind != crate::sql_lex::SqlTokenKind::Symbol(b';')
+                    || cursor
+                        .next()
+                        .map_err(|err| parse_lex_error(sql, err))?
+                        .is_some()
+                {
+                    return Err(parse_error_at_zero("unexpected token after DDL job id"));
+                }
+            }
+            return Ok(Statement::CancelDdlJob(id));
+        }
+    }
     if head_is(b"END") {
         return Err(parse_error_at_zero(
             "END is only valid inside a stored-program compound statement",

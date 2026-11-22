@@ -18,6 +18,15 @@ use crate::engine::auth::{Privilege, PrivilegeScope, RequiredPrivilege};
 use crate::storage::Database;
 use crate::types::{QueryError, Value};
 
+// Registered names are fixed at initialization; lookups never insert user keys.
+type NameIndex<V> = HashMap<&'static str, V, ahash::RandomState>;
+
+#[cold]
+#[inline(never)]
+fn unbox_read_error(error: Box<QueryError>) -> QueryError {
+    *error
+}
+
 /// Snapshot row used by `SHOW VARIABLES`, `information_schema.global_variables`,
 /// `performance_schema.global_variables`. Returned by
 /// `Registry::snapshot_for_show`.
@@ -39,9 +48,9 @@ pub(crate) struct VariableProvenance {
 pub struct Registry {
     provenance: parking_lot::RwLock<HashMap<&'static str, VariableProvenance>>,
     /// Lowercase canonical name → entry.
-    by_name: HashMap<&'static str, Arc<SysVar>>,
+    by_name: NameIndex<Arc<SysVar>>,
     /// Alias name → canonical name. Aliases share the same entry.
-    aliases: HashMap<&'static str, &'static str>,
+    aliases: NameIndex<&'static str>,
     /// Stable iteration order for `SHOW VARIABLES`. Sorted by name to
     /// match MySQL's output.
     sorted_names: Vec<&'static str>,
@@ -52,8 +61,8 @@ impl Registry {
     fn new() -> Self {
         let mut reg = Registry {
             provenance: Default::default(),
-            by_name: HashMap::new(),
-            aliases: HashMap::new(),
+            by_name: NameIndex::default(),
+            aliases: NameIndex::default(),
             sorted_names: Vec::new(),
             session_initializers: Vec::new(),
         };
@@ -165,35 +174,34 @@ impl Registry {
         scope: Scope,
         session: Option<&SessionContext>,
         db: Option<&Database>,
-    ) -> Vec<VariableRow> {
+    ) -> Result<Vec<VariableRow>, QueryError> {
         let ctx = ReadCtx::new(session, db, scope);
-        self.iter()
-            .filter(|var| {
-                // Hide Session-only vars in a GLOBAL view, hide Global-only
-                // vars in a SESSION view? MySQL actually returns ALL vars
-                // in both views — Global-only vars return their global value
-                // even in `SHOW SESSION VARIABLES`. Match that.
-                let _ = var; // intentionally no filter
-                true
-            })
-            .map(|var| {
-                let effective_scope = match (scope, var.scope()) {
-                    // Session-scope view of a Global-only var: still return
-                    // the global value (MySQL behaviour).
-                    (Scope::Session, Scope::Global) => Scope::Global,
-                    // Global-scope view of a Session-only var: MySQL also
-                    // returns the (global default) value, which for us is
-                    // whatever the backend gives without a session context.
-                    (Scope::Global, Scope::Session) => Scope::Global,
-                    _ => scope,
-                };
-                let ctx = ReadCtx::new(ctx.session, ctx.db, effective_scope);
-                VariableRow {
-                    name: var.def.name,
-                    value: (var.read)(&ctx).to_display_string(),
-                }
-            })
-            .collect()
+        // Registry entries are immutable after initialization. Snapshotting
+        // needs no ownership, so avoid shared Arc refcounts for every row.
+        let mut rows = Vec::with_capacity(self.sorted_names.len());
+        for var in self
+            .sorted_names
+            .iter()
+            .filter_map(|name| self.by_name.get(name))
+        {
+            let effective_scope = match (scope, var.scope()) {
+                // Session-scope view of a Global-only var: still return
+                // the global value (MySQL behaviour).
+                (Scope::Session, Scope::Global) => Scope::Global,
+                // Global-scope view of a Session-only var: MySQL also
+                // returns the (global default) value, which for us is
+                // whatever the backend gives without a session context.
+                (Scope::Global, Scope::Session) => Scope::Global,
+                _ => scope,
+            };
+            let ctx = ReadCtx::new(ctx.session, ctx.db, effective_scope);
+            let value = (var.read)(&ctx).map_err(unbox_read_error)?;
+            rows.push(VariableRow {
+                name: var.def.name,
+                value: value.to_display_string(),
+            });
+        }
+        Ok(rows)
     }
 
     /// Read a single variable as a SQL value (for `SELECT @@x`).
@@ -252,6 +260,7 @@ impl Registry {
         .and_then(|(var, value)| var.def.select_type().sql_value(var.def.name, value))
     }
 
+    #[inline]
     fn read_with_explicit_session(
         &self,
         name: &str,
@@ -277,7 +286,7 @@ impl Registry {
             _ => scope,
         };
         let ctx = ReadCtx::new(session, db, effective_scope);
-        Ok((var, (var.read)(&ctx)))
+        Ok((var, (var.read)(&ctx).map_err(unbox_read_error)?))
     }
 
     /// Shared scope/access gate. Both preflight and application recheck it;
@@ -298,6 +307,17 @@ impl Registry {
                 Access::ReadOnly
             )
         {
+            if set_scope.requested_scope() == Scope::Session
+                && var.def.scope == Scope::Both
+                && var.def.access_for(Scope::Global) == Access::ReadWrite
+            {
+                return Err(
+                    crate::error::catalog::ER_VARIABLE_IS_READONLY.error(format!(
+                        "SESSION variable '{}' is read-only. Use SET GLOBAL to assign the value",
+                        var.def.name
+                    )),
+                );
+            }
             return Err(super::errors::read_only_variable(var.def.name));
         }
         let effective_scope = set_scope.resolve_for(var.def.name, var.def.scope)?;

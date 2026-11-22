@@ -11,8 +11,10 @@ use super::value::SysVarValue;
 
 /// Read closure signature. Returns the current value for the requested
 /// scope. Most readers ignore the scope (single-storage vars); `Both`-scope
-/// vars dispatch on `ctx.scope`.
-pub type ReadFn = Arc<dyn Fn(&ReadCtx<'_>) -> SysVarValue + Send + Sync + 'static>;
+/// vars dispatch on `ctx.scope`. Error indirection keeps successful dynamic
+/// calls as compact as SysVarValue; only a failed read allocates an error box.
+pub type ReadFn =
+    Arc<dyn Fn(&ReadCtx<'_>) -> Result<SysVarValue, Box<QueryError>> + Send + Sync + 'static>;
 
 /// Write closure signature. The dispatcher has already validated scope
 /// and coerced the value to `def.data_type`.
@@ -55,7 +57,7 @@ impl SysVar {
             validate: None,
             default_provider: None,
             def,
-            read: Arc::new(read),
+            read: Arc::new(move |ctx| Ok(read(ctx))),
             write: write.map(|w| -> WriteFn { Arc::new(w) }),
         }
     }
@@ -69,9 +71,9 @@ impl SysVar {
             ..def
         };
         let val = v.clone();
-        let read: ReadFn = Arc::new(move |_ctx| val.clone());
+        let read: ReadFn = Arc::new(move |_ctx| Ok(val.clone()));
         SysVar {
-            compiled_default: read(&ReadCtx::new(None, None, Scope::Global)),
+            compiled_default: v,
             inherit: None,
             validate: None,
             default_provider: None,
@@ -91,9 +93,10 @@ impl SysVar {
             access: Access::ReadOnly,
             ..def
         };
-        let read: ReadFn = Arc::new(move |_ctx| probe());
+        let compiled_default = probe();
+        let read: ReadFn = Arc::new(move |_ctx| Ok(probe()));
         SysVar {
-            compiled_default: read(&ReadCtx::new(None, None, Scope::Global)),
+            compiled_default,
             inherit: None,
             validate: None,
             default_provider: None,
@@ -118,9 +121,19 @@ impl SysVar {
             validate: None,
             default_provider: None,
             def,
-            read: Arc::new(read),
+            read: Arc::new(move |ctx| Ok(read(ctx))),
             write: Some(Arc::new(write)),
         }
+    }
+
+    /// Replace a reader that may fail, retaining the explicit compiled default.
+    /// Read failures belong to the requesting statement, never global storage state.
+    pub fn with_fallible_read<R>(mut self, read: R) -> Self
+    where
+        R: Fn(&ReadCtx<'_>) -> Result<SysVarValue, QueryError> + Send + Sync + 'static,
+    {
+        self.read = Arc::new(move |ctx| read(ctx).map_err(Box::new));
+        self
     }
 
     /// A session field plus an independent global default. Session reads and

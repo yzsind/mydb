@@ -64,46 +64,43 @@ pub(crate) fn register(reg: &mut Registry) {
     }
 
     for name in ["gtid_executed", "gtid_purged"] {
-        reg.register(SysVar::settable(
-            SysVarDef::new(
-                name,
-                Scope::Global,
-                DataType::StrictString {
-                    max_len: None,
-                    null_as_empty: false,
+        reg.register(
+            SysVar::settable(
+                SysVarDef::new(
+                    name,
+                    Scope::Global,
+                    DataType::StrictString {
+                        max_len: None,
+                        null_as_empty: false,
+                    },
+                )
+                .with_access(if name == "gtid_purged" {
+                    Access::SuperReadWrite
+                } else {
+                    Access::ReadOnly
+                })
+                .without_persistence()
+                .with_doc("Durable executed or purged GTID history."),
+                move |_ctx| snapshot_value(name),
+                move |ctx, value| {
+                    let db = ctx
+                        .db
+                        .ok_or_else(crate::engine::sysvar::errors::persist_requires_database)?;
+                    crate::binlog::set_gtid_purged(db, &value.to_display_string())
                 },
             )
-            .with_access(if name == "gtid_purged" {
-                Access::SuperReadWrite
-            } else {
-                Access::ReadOnly
-            })
-            .without_persistence()
-            .with_doc("Durable executed or purged GTID history."),
-            move |ctx| {
-                if let Some(db) = ctx.db {
-                    match crate::binlog::gtid_snapshot(db) {
-                        Ok((executed, purged)) => SysVarValue::String(if name == "gtid_executed" {
-                            executed
-                        } else {
-                            purged
-                        }),
-                        Err(err) => {
-                            db.quarantine_mvcc(err.message());
-                            snapshot_value(name)
-                        }
-                    }
+            .with_fallible_read(move |ctx| {
+                let Some(db) = ctx.db else {
+                    return Ok(snapshot_value(name));
+                };
+                let (executed, purged) = crate::binlog::gtid_snapshot(db)?;
+                Ok(SysVarValue::String(if name == "gtid_executed" {
+                    executed
                 } else {
-                    snapshot_value(name)
-                }
-            },
-            move |ctx, value| {
-                let db = ctx
-                    .db
-                    .ok_or_else(crate::engine::sysvar::errors::persist_requires_database)?;
-                crate::binlog::set_gtid_purged(db, &value.to_display_string())
-            },
-        ));
+                    purged
+                }))
+            }),
+        );
     }
 
     // The supported value domain is independent of GLOBAL/SESSION scope.

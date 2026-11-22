@@ -1582,13 +1582,18 @@ fn type_derived_ctas_column(
             } else {
                 crate::parser::Literal::Int(0)
             })),
-            // A non-null DATETIME expression materialized by CTAS receives
-            // MySQL's implicit zero DATETIME default. This is metadata on the
-            // generated target definition, not an evaluation of NOW() as a
-            // default expression.
-            crate::parser::DataType::DateTime { .. } => Some(crate::parser::Expr::Literal(
-                crate::parser::Literal::String("0000-00-00 00:00:00".to_string()),
-            )),
+            // Strict CTAS must not synthesize an invalid temporal default.
+            // MySQL supplies the zero default only in permissive modes.
+            crate::parser::DataType::DateTime { .. }
+                if crate::engine::expr::session_temporal_sql_mode_bits()
+                    & (crate::engine::api::TEMPORAL_MODE_STRICT
+                        | crate::engine::api::TEMPORAL_MODE_NO_ZERO_DATE)
+                    == 0 =>
+            {
+                Some(crate::parser::Expr::Literal(
+                    crate::parser::Literal::String("0000-00-00 00:00:00".to_string()),
+                ))
+            }
             _ => None,
         }
     } else {
@@ -2537,7 +2542,10 @@ fn execute_recyclebin(
                 crate::storage::split_table_name(&session.current_database, &target);
             let required = RequiredPrivilege {
                 privilege: Privilege::Create,
-                scope: PrivilegeScope::Table { database, table },
+                scope: PrivilegeScope::Table {
+                    database: database.clone(),
+                    table: table.clone(),
+                },
             };
             if !db.with_auth_catalog(|auth| {
                 auth.account_has_privilege(&session.authorization_context(), &required, false)
@@ -2557,6 +2565,7 @@ fn execute_recyclebin(
                     format!("RESTORE omitted {omitted}"),
                 );
             }
+            revalidate_altered_table_views(db, session, &database, &table)?;
             Ok(QueryResponse::Ok)
         }
         Command::Purge { name } => {
@@ -5024,28 +5033,6 @@ fn update_read_columns(update: &crate::parser::Update, table: &TableRef) -> BTre
         }
         columns.extend(join.using_columns.iter().cloned());
     }
-    // MySQL needs SELECT only for columns read but not modified. UPDATE on
-    // the assigned column also authorizes its old value (SET x=x+1).
-    for assignment in &update.assignments {
-        let matches = assignment.table_qualifier.as_deref().map_or(
-            table.name.eq_ignore_ascii_case(&update.table),
-            |qualifier| {
-                table
-                    .alias
-                    .as_deref()
-                    .is_some_and(|a| a.eq_ignore_ascii_case(qualifier))
-                    || table
-                        .name
-                        .rsplit('.')
-                        .next()
-                        .is_some_and(|n| n.eq_ignore_ascii_case(qualifier))
-                    || table.name.eq_ignore_ascii_case(qualifier)
-            },
-        );
-        if matches {
-            columns.retain(|c| !c.eq_ignore_ascii_case(&assignment.column));
-        }
-    }
     columns
 }
 
@@ -5574,6 +5561,14 @@ fn apply_alter_user(
         return Err(error(
             crate::error::catalog::ER_PARSE_ERROR,
             "RETAIN CURRENT PASSWORD and DISCARD OLD PASSWORD are mutually exclusive",
+        ));
+    }
+    if stmt.discard_old_password
+        && (stmt.password.is_some() || stmt.random_password || stmt.plugin.is_some())
+    {
+        return Err(error(
+            crate::error::catalog::ER_PARSE_ERROR,
+            "DISCARD OLD PASSWORD cannot be combined with an authentication change",
         ));
     }
     if stmt.retain_current_password && stmt.plugin.is_some() {
@@ -6373,8 +6368,8 @@ fn execute_drop_accounts(
     for account in &account_keys {
         validate_account_key(account)?;
     }
-    db.with_auth_catalog(|auth| ensure_system_account_access(auth, session, account_keys.iter()))??;
     db.mutate_auth_catalog(|auth| {
+        ensure_system_account_access(auth, session, account_keys.iter())?;
         if roles_only {
             let mandatory = auth.mandatory_role_keys();
             if let Some(role) = accounts
@@ -7165,6 +7160,15 @@ fn execute_revoke(
                     ));
                 }
                 let targets = valid_targets.clone();
+                for target in &targets {
+                    if !auth.grants.iter().any(|grant| grant.grantee == *target
+                        && matches!(&grant.privilege, Privilege::Dynamic(name) if name == "PROXY")
+                        && matches!(&grant.scope, PrivilegeScope::Proxy { user, host }
+                            if user == &proxied.user && host.eq_ignore_ascii_case(&proxied.host))) {
+                        return Err(error(crate::error::catalog::ER_NONEXISTING_GRANT,
+                            format!("There is no such grant defined for {}", target.display())));
+                    }
+                }
                 auth.grants.retain(|grant| {
                     !(targets.contains(&grant.grantee)
                         && matches!(&grant.privilege, Privilege::Dynamic(name) if name == "PROXY")
@@ -7462,7 +7466,7 @@ fn execute_declare_sql_cursor(
         QueryResponse::ResultSet(rs) => {
             let columns = rs.columns.clone();
             let cursor: Box<dyn crate::engine::api::ResultCursor> =
-                Box::new(crate::engine::api::VecResultCursor::new(rs.rows));
+                Box::new(crate::engine::api::VecResultCursor::new_governed(rs.rows)?);
             (columns, cursor)
         }
         QueryResponse::StreamingResultSet(s) => (s.columns, s.cursor),

@@ -914,6 +914,11 @@ impl Database {
         Ok(())
     }
 
+    #[inline]
+    pub(crate) fn is_operational(&self) -> bool {
+        !self.mvcc_quarantined.load(Ordering::Acquire)
+    }
+
     pub(crate) fn ensure_operational(&self) -> Result<(), QueryError> {
         if !self.mvcc_quarantined.load(Ordering::Acquire) {
             return Ok(());

@@ -429,7 +429,7 @@ pub(crate) fn show_tables(
 ) -> Result<QueryResponse, QueryError> {
     require_show_database(db, database)?;
     let columns = show_tables_columns(database, full);
-    if let Some(rows) = crate::engine::information_schema::show_tables_rows(db, database, full) {
+    if let Some(rows) = crate::engine::information_schema::show_tables_rows(db, database, full)? {
         let mut rows = rows;
         rows.retain(|row| {
             row.first().is_some_and(|name| {
@@ -470,7 +470,7 @@ pub(crate) fn show_tables(
         }
         let mut row = vec![Value::String(table.name.clone())];
         if full {
-            let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+            let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
             row.extend([
                 Value::String("BASE TABLE".to_string()),
                 Value::Int(saturating_i64(stats.rows)),
@@ -574,7 +574,7 @@ pub(crate) fn show_table_status(
             .values()
             .filter(|table| table.database.eq_ignore_ascii_case(database) && visible(&table.name))
         {
-            rows.push(base_table_status_row(db, table));
+            rows.push(base_table_status_row(db, table)?);
         }
         for view in catalog
             .views
@@ -635,11 +635,11 @@ fn show_name_matches_pattern(name: &str, pattern: Option<&str>) -> bool {
         .unwrap_or(true)
 }
 
-fn base_table_status_row(db: &Database, table: &TableSchema) -> Vec<Value> {
+fn base_table_status_row(db: &Database, table: &TableSchema) -> Result<Vec<Value>, QueryError> {
     // SHOW TABLE STATUS and `information_schema.tables` go through the
     // same view so the two queries can never disagree about a table's
     // approximate size — see `engine::table_stats_view::TableStatsView`.
-    let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+    let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
     let create_options = crate::engine::table_stats_view::table_create_options(table);
     let auto_increment = match stats.auto_increment {
         Some(value) => i64::try_from(value)
@@ -647,7 +647,7 @@ fn base_table_status_row(db: &Database, table: &TableSchema) -> Vec<Value> {
             .unwrap_or(Value::UInt(value)),
         None => Value::Null,
     };
-    vec![
+    Ok(vec![
         Value::String(table.name.clone()),
         Value::String(table.engine.clone()),
         Value::Int(10),
@@ -666,7 +666,7 @@ fn base_table_status_row(db: &Database, table: &TableSchema) -> Vec<Value> {
         Value::Null,
         Value::String(create_options),
         Value::String(table.comment.clone()),
-    ]
+    ])
 }
 
 fn view_table_status_row(name: &str) -> Vec<Value> {
@@ -755,7 +755,7 @@ pub(crate) fn show_index(
     }
     let table = db.table(&table_name)?;
     let estimated_rows =
-        crate::engine::table_stats_view::TableStatsView::for_table(db, &table).rows;
+        crate::engine::table_stats_view::effective_row_count(db, &table);
     let mut rows = Vec::new();
     // SHOW INDEX hides Building entries — they aren't queryable yet,
     // so surfacing them would mislead clients into believing the

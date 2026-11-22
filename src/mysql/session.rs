@@ -1051,7 +1051,7 @@ fn heartbeat_interval_from_session(
                 if ns == 0 {
                     return std::time::Duration::from_secs(3600); // effectively off
                 }
-                return std::time::Duration::from_nanos(ns.min(i64::MAX as u64));
+                return std::time::Duration::from_nanos(ns.clamp(1_000_000, i64::MAX as u64));
             }
         }
     }
@@ -1270,11 +1270,17 @@ where
             // unexpected. Retain correctness by falling through to the full
             // snapshot rather than leaving PFS stale.
         }
-        let session_variables = crate::engine::sysvar::snapshot(
+        let session_variables = match crate::engine::sysvar::snapshot(
             crate::engine::sysvar::Scope::Session,
             Some(&self.context),
             None,
-        )
+        ) {
+            Ok(rows) => rows,
+            Err(error) => {
+                log_message(format_args!("session variable snapshot failed: {error}"));
+                return;
+            }
+        }
         .into_iter()
         .map(|row| (row.name.to_string(), row.value))
         .collect();
@@ -3451,6 +3457,46 @@ where
             .await
     }
 
+    fn prepare_dump_registration(
+        &mut self,
+        manager: &Arc<crate::binlog::BinlogSourceManager>,
+        server_id: u32,
+    ) -> Result<(), QueryError> {
+        let uuid = self
+            .context
+            .user_variable("replica_uuid")
+            .or_else(|| self.context.user_variable("slave_uuid"))
+            .and_then(crate::types::value_str)
+            .unwrap_or("")
+            .to_owned();
+        if !uuid.is_empty() && uuid.eq_ignore_ascii_case(manager.source_server_uuid()) {
+            return Err(crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG
+                .error("replica UUID must differ from the source UUID"));
+        }
+        if self.semi_sync_replica_requested
+            && (self.registered_replica_guard.is_none() || self.dump_server_id != Some(server_id))
+        {
+            self.registered_replica_guard.take();
+            self.registered_replica_guard =
+                Some(manager.register_replica(crate::binlog::RegisteredReplica {
+                    server_id,
+                    host: self.peer_addr.ip().to_string(),
+                    port: 0,
+                    user: self.context.user.clone(),
+                    master_id: 0,
+                    replication_rank: 0,
+                    connected_at: std::time::SystemTime::now(),
+                    semi_sync: false,
+                    acked_file: String::new(),
+                    acked_pos: 0,
+                    replica_uuid: uuid,
+                    regid: 0,
+                })?);
+        }
+        self.dump_server_id = Some(server_id);
+        Ok(())
+    }
+
     async fn handle_binlog_dump_gtid(&mut self, payload: &[u8]) -> io::Result<()> {
         if let Err(err) = self
             .engine
@@ -3476,6 +3522,11 @@ where
                 return Ok(());
             }
         };
+        if let Err(err) = self.prepare_dump_registration(&manager, request.slave_server_id) {
+            self.write_error_packet(self.command_response_sequence, &err)
+                .await?;
+            return Ok(());
+        }
         let _dump_lease = manager.lease_dump();
         let start = match manager.position_for_gtid_dump(
             &request.file,
@@ -3525,6 +3576,11 @@ where
             }
         };
 
+        if let Err(err) = self.prepare_dump_registration(&manager, request.slave_server_id) {
+            self.write_error_packet(self.command_response_sequence, &err)
+                .await?;
+            return Ok(());
+        }
         let _dump_lease = manager.lease_dump();
         let non_blocking = request.non_blocking();
         let file = if request.file.is_empty() {
@@ -7337,9 +7393,33 @@ where
             .map(|handle| handle.enter_stage(ProcessState::SendingToClient));
         let mut batch = self.codec.batch_writer(&mut self.stream);
         for packet in encoded {
-            sequence_id = batch.write_packet_seq(sequence_id, packet).await?;
+            sequence_id = match &self.handle {
+                Some(handle) => {
+                    write_cancellable_stream_packet(&mut batch, sequence_id, packet, handle).await?
+                }
+                None => batch.write_packet_seq(sequence_id, packet).await?,
+            };
         }
-        batch.finish().await?;
+        match &self.handle {
+            Some(handle) => {
+                let finish = batch.finish();
+                tokio::pin!(finish);
+                loop {
+                    if handle.kill_flag().load(Ordering::Acquire) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::ConnectionAborted,
+                            "connection killed during cursor fetch",
+                        ));
+                    }
+                    tokio::select! {
+                        biased;
+                        result = &mut finish => { result?; break; }
+                        _ = handle.notified() => {}
+                    }
+                }
+            }
+            None => batch.finish().await?,
+        }
         Ok(sequence_id)
     }
 
@@ -7610,7 +7690,11 @@ where
                     .handle
                     .as_ref()
                     .map(|handle| handle.enter_stage(ProcessState::WaitingOnCond));
-                acquire.await
+                tokio::select! {
+                    biased;
+                    _ = wait_for_statement_cancellation(self.handle.as_deref(), self.context.current_cancel_token()) => None,
+                    permit = acquire => permit,
+                }
             }
         };
     }

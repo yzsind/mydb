@@ -28469,6 +28469,14 @@ fn replica_restart_preserves_active_source_rows_until_source_commit() {
         "replica recovery must not append local abort records"
     );
     let reader = db.begin_read_only_txn().unwrap();
+    let schema = db.table("test.replica_active").unwrap();
+    let index = schema.indexes.iter().find(|index| index.primary).unwrap();
+    assert!(
+        db.try_index_page_max_trx_shortcut_for(schema.id, &index.name, 0, reader, 2)
+            .is_none(),
+        "recovered bulk pages must not expose an active source transaction"
+    );
+    let old_reader = db.begin_read_only_txn().unwrap();
     assert_eq!(
         db.scan_rows("test.replica_active", reader)
             .unwrap()
@@ -28497,6 +28505,19 @@ fn replica_restart_preserves_active_source_rows_until_source_commit() {
         payload,
     })
     .unwrap();
+    assert!(
+        db.try_index_page_max_trx_shortcut_for(schema.id, &index.name, 0, old_reader, 2)
+            .is_none(),
+        "source commit cannot make recovered rows visible to an older snapshot"
+    );
+    let (count, _) = db
+        .count_visible_index_leaf_prefix_page_range(&schema, index, 1, u64::MAX, old_reader)
+        .unwrap();
+    assert_eq!(
+        count, 0,
+        "snapshot-prefix proof must also respect recovered writers"
+    );
+    db.rollback_txn(old_reader.txn_id).unwrap();
     let reader = db.begin_read_only_txn().unwrap();
     assert_eq!(
         db.scan_rows("test.replica_active", reader)
@@ -31866,5 +31887,63 @@ fn storage_release1121_empty_replication_registry_allows_recovery_checkpoint() {
                 .values,
             vec![Value::Int(7)]
         );
+    }
+}
+
+#[test]
+fn audit1122_physical_apply_rejects_unknown_heap_objects() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.set_physical_replica_mode(true).unwrap();
+    let path = crate::storage::naming::table_object_generation_path(dir.path(), 998, 1, "heap");
+    let record = WalRecord {
+        source_time_us: 0,
+        lsn: 100_001,
+        prev_txn_lsn: 0,
+        txn_id: 900_001,
+        payload: WalPayload::HeapInsert {
+            path: db.relative_path(&path),
+            page_id: 0,
+            slot_id: 0,
+            payload: b"unresolvable".to_vec(),
+            undo_lsn: None,
+        },
+    };
+    assert_eq!(db.apply_wal_record(&record).unwrap_err().code(), 1146);
+    assert!(!path.exists());
+    assert_eq!(db.replica_applied_lsn(), 0);
+}
+
+#[test]
+fn audit1122_partial_batch_preserves_the_successful_logical_watermark() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.set_physical_replica_mode(true).unwrap();
+    std::fs::create_dir(dir.path().join("not-a-heap")).unwrap();
+    let record = WalRecord {
+        source_time_us: 0,
+        lsn: 100_003,
+        prev_txn_lsn: 0,
+        txn_id: 900_002,
+        payload: WalPayload::TxnBatch {
+            records: vec![
+                WalPayload::BeginTxn { start_scn: 0 },
+                WalPayload::AutoIncrementAdvance {
+                    table_id: 999,
+                    version: 1,
+                    max_value: 10,
+                },
+                WalPayload::SlotReclaim {
+                    path: "not-a-heap".into(),
+                    page_id: 0,
+                    slot_id: 0,
+                },
+            ],
+        },
+    };
+    for _ in 0..2 {
+        assert!(db.apply_wal_record(&record).is_err());
+        assert_eq!(db.replica_applied_lsn(), 100_002);
+        assert!(db.is_txn_active(900_002));
     }
 }

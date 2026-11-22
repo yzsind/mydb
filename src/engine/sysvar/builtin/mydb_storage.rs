@@ -80,14 +80,14 @@ pub(crate) fn register(reg: &mut Registry) {
             }
         },
     ));
-    for (name, default, max) in [
-        ("mydb_recyclebin_retention_seconds", 604800, 31536000),
-        ("mydb_recyclebin_min_free_pct", 10, 89),
-        ("mydb_recyclebin_target_free_pct", 15, 90),
-        ("mydb_recyclebin_gc_interval_ms", 10000, 3600000),
+    for (name, default, min, max) in [
+        ("mydb_recyclebin_retention_seconds", 604800, 1, 31536000),
+        ("mydb_recyclebin_min_free_pct", 10, 0, 89),
+        ("mydb_recyclebin_target_free_pct", 15, 0, 90),
+        ("mydb_recyclebin_gc_interval_ms", 10000, 1000, 3600000),
     ] {
         reg.register(SysVar::settable(
-            SysVarDef::new(name, Scope::Global, DataType::UInt { min: 0, max })
+            SysVarDef::new(name, Scope::Global, DataType::UInt { min, max })
                 .with_doc("Recycle-bin retention and asynchronous reclamation policy."),
             move |ctx| {
                 SysVarValue::UInt(

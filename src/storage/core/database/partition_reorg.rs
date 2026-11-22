@@ -1000,7 +1000,7 @@ impl Database {
     ) -> Result<(), QueryError> {
         reset_reorg_peak_batch_rows();
         if let Some((owner, timeout, true)) = cutover {
-            let job = self.register_alter_copy_job(table);
+            let job = self.register_ddl_job_with_subject(table, "PARTITION", true, op.to_string());
             let mut target = candidate;
             target.bump_schema_version();
             let result = self.rewrite_partitioned_type_copy(

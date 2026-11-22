@@ -707,6 +707,16 @@ impl Database {
         let next_txn_id_seed = txns.next_txn_id;
         let next_scn_seed = txns.next_scn;
         let active_write_seed = txns.active_write_count;
+        let recovered_index_writer_bound = if physical_replica {
+            txns.slots
+                .values()
+                .filter(|slot| slot.status.is_in_flight())
+                .map(|slot| slot.txn_id)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
         let index_repair_state = Arc::clone(&txns.index_repairs);
         let index_repair_version = Arc::clone(&txns.index_repair_version);
         let index_repair_epochs = Arc::clone(&txns.index_repair_epochs);
@@ -893,6 +903,7 @@ impl Database {
             index_repair_version,
             index_repair_epochs,
             min_retained_txn_id: AtomicU64::new(min_retained_txn_id_seed),
+            recovered_index_writer_bound,
             index_page_max_trx_shortcut_hits: AtomicU64::new(0),
             index_page_max_trx_shortcut_misses: AtomicU64::new(0),
             slot_status_cache: SlotStatusCache::new(),
@@ -1006,6 +1017,11 @@ impl Database {
         // directory is bootstrapped with one incremental catalog transaction.
         let runtime_init_us = runtime_init_started.elapsed().as_micros() as u64;
         let t = Instant::now();
+        if physical_replica && recovery.skipped_index_redo_records != 0 {
+            // Catalog decoding already probes dictionary indexes. Replica
+            // recovery's planned rebuilds must precede those first probes.
+            recovery.repaired_indexes += db.rebuild_failed_dictionary_indexes()?;
+        }
         #[cfg(test)]
         {
             // Only a new clone of the setup script's exact seed may reuse

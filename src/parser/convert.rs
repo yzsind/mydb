@@ -1807,7 +1807,15 @@ fn convert_alter_table_action(
             sqlparser::ast::AlterColumnOperation::SetDefault { value } => {
                 AlterAction::SetColumnDefault {
                     column: ident_value(column_name),
-                    default: Some(convert_expr(&value)?),
+                    default: Some(if let SqlExpr::Nested(inner) = &value {
+                        Expr::Function {
+                            name: DEFAULT_EXPR_SENTINEL.to_string(),
+                            args: vec![convert_expr(inner)?],
+                            distinct: false,
+                        }
+                    } else {
+                        convert_expr(&value)?
+                    }),
                 }
             }
             sqlparser::ast::AlterColumnOperation::DropDefault => AlterAction::SetColumnDefault {

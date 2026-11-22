@@ -1228,6 +1228,7 @@ fn binlog_table_resident_bytes(table: &BinlogTable) -> usize {
                 .saturating_mul(std::mem::size_of::<BinlogColumn>()),
         )
         .saturating_add(columns)
+        .saturating_add(table.extra_metadata.capacity())
 }
 
 /// Owned heap capacity below the operation enum itself. The enclosing pending
@@ -1274,6 +1275,7 @@ struct BinlogTable {
     database: String,
     name: String,
     columns: Vec<BinlogColumn>,
+    extra_metadata: Vec<u8>,
 }
 
 #[derive(Debug, Clone)]
@@ -2237,8 +2239,19 @@ fn show_binlog_events(sql: &str) -> Result<QueryResponse, QueryError> {
         }));
     }
     let requested = req.offset.saturating_add(req.limit.unwrap_or(usize::MAX));
+    let file = if req.file.is_empty() {
+        manager
+            .state
+            .lock()
+            .files
+            .first()
+            .map(|file| file.name.clone())
+            .unwrap_or_default()
+    } else {
+        req.file.clone()
+    };
     let (chunks, more) = manager.show_events_bounded(
-        &req.file,
+        &file,
         req.from,
         requested.min(MAX_SHOW_EVENTS.saturating_add(1)),
         MAX_SHOW_BYTES,
@@ -3151,6 +3164,10 @@ impl BinlogSourceManager {
     }
 
     /// Whether master-side semi-sync is enabled (`rpl_semi_sync_source_enabled`).
+    pub fn source_server_uuid(&self) -> &str {
+        &self.config.server_uuid
+    }
+
     pub fn semi_sync_source_enabled(&self) -> bool {
         self.semi_sync.enabled.load(Ordering::Relaxed)
     }
@@ -3173,7 +3190,9 @@ impl BinlogSourceManager {
             let Some(entry) = reg.entries.get_mut(&server_id) else {
                 return;
             };
-            entry.semi_sync = true;
+            if !entry.semi_sync {
+                return;
+            }
             if binlog_pos_ge((file, pos), (&entry.acked_file, entry.acked_pos)) {
                 entry.acked_file = file.to_string();
                 entry.acked_pos = pos;
@@ -3996,6 +4015,10 @@ impl BinlogSourceManager {
         use chrono::{Local, NaiveDateTime};
         let parsed = NaiveDateTime::parse_from_str(cut_off, "%Y-%m-%d %H:%M:%S")
             .or_else(|_| NaiveDateTime::parse_from_str(cut_off, "%Y-%m-%dT%H:%M:%S"))
+            .or_else(|_| {
+                chrono::NaiveDate::parse_from_str(cut_off, "%Y-%m-%d")
+                    .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
+            })
             .map_err(|err| {
                 error(
                     crate::error::catalog::ER_WRONG_VALUE,
@@ -4830,16 +4853,16 @@ impl BinlogSourceManager {
         // rotate() drained and published earlier transactions before taking
         // this latch. Retention may now safely unlink the old file.
         self.group_sync.state.lock().writer = None;
-        let mut next_file = next_binlog_file_name(&self.config.base_name, &state.active_file);
+        let mut next_file = next_binlog_file_name(&self.config.base_name, &state.active_file)?;
         while self.dir.join(&next_file).exists() {
-            next_file = next_binlog_file_name(&self.config.base_name, &next_file);
+            next_file = next_binlog_file_name(&self.config.base_name, &next_file)?;
         }
         let bootstrap = bootstrap_file_events(&self.config, 4, &state.gtid_executed);
         let next_pos = 4 + bootstrap
             .iter()
             .map(|(_, event)| event.len() as u64)
             .sum::<u64>();
-        let staging = if durable_cleanup {
+        let staging = {
             let staging = cleanup_rotation_manifest(&self.manifest_path);
             write_manifest_file(
                 &staging,
@@ -4851,9 +4874,7 @@ impl BinlogSourceManager {
                 state.next_gno,
                 state.sequence_number,
             )?;
-            Some(staging)
-        } else {
-            None
+            staging
         };
         // MySQL Rotate_log_event payload's position field is the offset of
         // the first real event in the *new* file — always 4 (right after
@@ -4878,15 +4899,18 @@ impl BinlogSourceManager {
         let new_path = self.dir.join(&next_file);
         ensure_binlog_file(&new_path)?;
         append_bytes(&new_path, &concat_event_bytes(&bootstrap))?;
-        if let Some(staging) = &staging {
+        {
+            crate::platform::fs::sync_path(&new_path).map_err(io_error)?;
             // The index is the rotation commit point. The staged manifest is
             // already durable, and recovery can finish installing it.
             write_index_with_tail(&self.index_path, &state.files, Some(&next_file))?;
-            install_cleanup_rotation_manifest(&self.dir, staging, &self.manifest_path)?;
-            for chunk in outgoing {
-                state.push_event(chunk);
+            install_cleanup_rotation_manifest(&self.dir, &staging, &self.manifest_path)?;
+            if durable_cleanup {
+                for chunk in outgoing {
+                    state.push_event(chunk);
+                }
+                state.trim_published_events();
             }
-            state.trim_published_events();
         }
         let mut pos = 4;
         for (event_type, bytes) in bootstrap {
@@ -5144,6 +5168,16 @@ fn show_replicas() -> Result<QueryResponse, QueryError> {
             })
             .collect(),
     }))
+}
+
+pub(crate) fn validate_binlog_identifier(name: &str) -> Result<(), QueryError> {
+    if name.len() > u8::MAX as usize && !should_skip_recording() {
+        return Err(error(
+            crate::error::catalog::ER_TOO_LONG_IDENT,
+            "MySQL binlog identifiers must fit in 255 UTF-8 bytes; use a shorter identifier",
+        ));
+    }
+    Ok(())
 }
 
 fn should_skip_recording() -> bool {
@@ -5417,6 +5451,12 @@ impl Drop for SessionSqlLogBinGuard {
 }
 
 fn binlog_table_from_schema(schema: &TableSchema) -> Result<BinlogTable, QueryError> {
+    if schema.database.len() > u8::MAX as usize || schema.name.len() > u8::MAX as usize {
+        return Err(error(
+            crate::error::catalog::ER_TOO_LONG_IDENT,
+            "MySQL row binlog database/table identifiers must fit in 255 UTF-8 bytes",
+        ));
+    }
     let table_id = schema.object_id.max(schema.id) & 0x0000_ffff_ffff_ffff;
     let columns = schema
         .iter_visible_columns()
@@ -5494,6 +5534,7 @@ fn binlog_table_from_schema(schema: &TableSchema) -> Result<BinlogTable, QueryEr
             })
         })
         .collect::<Result<Vec<_>, QueryError>>()?;
+    let extra_metadata = full_schema_optional_metadata(schema, &columns)?;
     Ok(BinlogTable {
         table_id,
         rows_flags: if crate::storage::fk_checks_enabled() {
@@ -5504,6 +5545,7 @@ fn binlog_table_from_schema(schema: &TableSchema) -> Result<BinlogTable, QueryEr
         database: schema.database.clone(),
         name: schema.name.clone(),
         columns,
+        extra_metadata,
     })
 }
 
@@ -5993,13 +6035,11 @@ fn encode_table_map_payload(table: &BinlogTable) -> Vec<u8> {
     let mut payload = Vec::new();
     write_u48_le(&mut payload, table.table_id);
     payload.extend_from_slice(&0u16.to_le_bytes());
-    payload.push(table.database.len().min(u8::MAX as usize) as u8);
-    payload.extend_from_slice(
-        &table.database.as_bytes()[..table.database.len().min(u8::MAX as usize)],
-    );
+    payload.push(table.database.len() as u8);
+    payload.extend_from_slice(&table.database.as_bytes()[..table.database.len()]);
     payload.push(0);
-    payload.push(table.name.len().min(u8::MAX as usize) as u8);
-    payload.extend_from_slice(&table.name.as_bytes()[..table.name.len().min(u8::MAX as usize)]);
+    payload.push(table.name.len() as u8);
+    payload.extend_from_slice(&table.name.as_bytes()[..table.name.len()]);
     payload.push(0);
     write_lenenc_int(&mut payload, table.columns.len() as u64);
     for column in &table.columns {
@@ -6014,6 +6054,81 @@ fn encode_table_map_payload(table: &BinlogTable) -> Vec<u8> {
     payload.extend_from_slice(&nullable_bitmap(table));
     payload.extend_from_slice(&table_map_optional_metadata(table));
     payload
+}
+
+fn full_schema_optional_metadata(
+    schema: &TableSchema,
+    columns: &[BinlogColumn],
+) -> Result<Vec<u8>, QueryError> {
+    let mut out = Vec::new();
+    for (kind, wire_type) in [(5, MYSQL_TYPE_SET), (6, MYSQL_TYPE_ENUM)] {
+        let mut values = Vec::new();
+        for column in columns
+            .iter()
+            .filter(|column| column.column_type == wire_type)
+        {
+            if let Some(members) = &column.enum_set_values {
+                write_lenenc_int(&mut values, members.len() as u64);
+                for member in members.iter() {
+                    let encoded =
+                        crate::charset::encode_string(column.charset.unwrap_or("binary"), member)?;
+                    write_lenenc_int(&mut values, encoded.len() as u64);
+                    values.extend_from_slice(&encoded);
+                }
+            }
+        }
+        if !values.is_empty() {
+            push_optional_metadata_field(&mut out, kind, &values);
+        }
+    }
+    let mut geometry = Vec::new();
+    for column in columns {
+        if let DataTypeKind::Geometry { subtype, .. } =
+            schema.columns[column.physical_index].data_type
+        {
+            write_lenenc_int(
+                &mut geometry,
+                u64::from(subtype.wkb_type_code().unwrap_or(0)),
+            );
+        }
+    }
+    if !geometry.is_empty() {
+        push_optional_metadata_field(&mut out, 7, &geometry);
+    }
+    if let Some(primary) = schema.indexes.iter().find(|index| index.primary) {
+        let with_prefix =
+            (0..primary.columns.len()).any(|pos| primary.column_prefix_len(pos).is_some());
+        let mut keys = Vec::new();
+        for (pos, name) in primary.columns.iter().enumerate() {
+            let wire_pos = columns
+                .iter()
+                .position(|column| column.name.eq_ignore_ascii_case(name))
+                .ok_or_else(|| {
+                    error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "binlog primary key column is missing",
+                    )
+                })?;
+            write_lenenc_int(&mut keys, wire_pos as u64);
+            if with_prefix {
+                write_lenenc_int(
+                    &mut keys,
+                    primary.column_prefix_len(pos).unwrap_or(0) as u64,
+                );
+            }
+        }
+        if !keys.is_empty() {
+            push_optional_metadata_field(&mut out, if with_prefix { 9 } else { 8 }, &keys);
+        }
+    }
+    let mut visibility = vec![0; columns.len().div_ceil(8)];
+    for (pos, column) in columns.iter().enumerate() {
+        if !schema.columns[column.physical_index].invisible {
+            visibility[pos / 8] |= 1 << (7 - pos % 8);
+        }
+    }
+    push_optional_metadata_field(&mut out, 12, &visibility);
+    Ok(out)
 }
 
 fn nullable_bitmap(table: &BinlogTable) -> Vec<u8> {
@@ -6057,6 +6172,7 @@ fn table_map_optional_metadata(table: &BinlogTable) -> Vec<u8> {
             push_optional_metadata_field(&mut out, kind, &ids);
         }
     }
+    out.extend_from_slice(&table.extra_metadata);
     out
 }
 
@@ -7691,18 +7807,39 @@ fn next_gno_for_uuid(gtid_set: &str, uuid: &str) -> u64 {
         .saturating_add(1)
 }
 
-fn next_binlog_file_name(base_name: &str, active_file: &str) -> String {
+fn next_binlog_file_name(base_name: &str, active_file: &str) -> Result<String, QueryError> {
     let suffix = active_file
         .rsplit_once('.')
         .and_then(|(_, suffix)| suffix.parse::<u32>().ok())
         .unwrap_or(1)
-        .saturating_add(1);
-    format!("{base_name}.{suffix:06}")
+        .checked_add(1)
+        .ok_or_else(|| {
+            error(
+                crate::error::catalog::ER_BINLOG_FATAL_ERROR,
+                "binary log file sequence exhausted",
+            )
+        })?;
+    Ok(format!("{base_name}.{suffix:06}"))
 }
 
 fn unquote_admin_string(sql: &str, prefix: &str) -> Result<String, QueryError> {
     let trimmed = sql.trim().trim_end_matches(';').trim();
-    let value = trimmed.get(prefix.len()..).map(str::trim).ok_or_else(|| {
+    let mut end = 0;
+    for keyword in prefix.split_ascii_whitespace() {
+        let rest = trimmed[end..].trim_start();
+        end = trimmed.len() - rest.len();
+        if !rest
+            .get(..keyword.len())
+            .is_some_and(|word| word.eq_ignore_ascii_case(keyword))
+        {
+            return Err(error(
+                crate::error::catalog::ER_PARSE_ERROR,
+                "invalid PURGE BINARY LOGS statement",
+            ));
+        }
+        end += keyword.len();
+    }
+    let value = trimmed.get(end..).map(str::trim).ok_or_else(|| {
         error(
             crate::error::catalog::ER_PARSE_ERROR,
             "missing binary log file name",
@@ -9155,6 +9292,12 @@ mod tests {
             SemiSyncOutcome::TimedOut
         );
         assert!(start.elapsed() < Duration::from_millis(20));
+        manager.record_semi_sync_ack(9, "binlog.000001", 200);
+        assert!(
+            manager.semi_sync.degraded_at.lock().unwrap().is_some(),
+            "an asynchronous replacement cannot enable itself by sending ACK"
+        );
+        manager.semi_sync_mark_replica(9);
         manager.record_semi_sync_ack(9, "binlog.000001", 200);
         assert!(manager.semi_sync.degraded_at.lock().unwrap().is_none());
         assert_eq!(

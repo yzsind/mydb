@@ -263,6 +263,9 @@ impl BoundAccessRecipe {
                 alias: None,
             });
         }
+        if matches!(statement, Statement::Update(_)) {
+            binder.root_writes.clear();
+        }
         binder.root_bindings = Some(bindings.clone());
         visit_select(&mut binder, &select);
         let written: BTreeSet<_> = binder

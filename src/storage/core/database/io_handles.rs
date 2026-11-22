@@ -2232,24 +2232,22 @@ impl Database {
         table: &TableSchema,
         storage_id: u64,
         index: &IndexSchema,
-    ) -> u64 {
+    ) -> Result<u64, QueryError> {
         if !index.is_vector() {
-            return self
+            return Ok(self
                 .index_page_count(storage_id, &index.name)
-                .saturating_mul(PAGE_SIZE as u64);
+                .saturating_mul(PAGE_SIZE as u64));
         }
-        let paths = match self.owned_vector_files(table, index, storage_id) {
-            Ok(paths) => paths,
-            Err(err) => {
-                self.quarantine_mvcc(format!("vector size accounting failed: {err:?}"));
-                return 0;
+        let paths = self.owned_vector_files(table, index, storage_id)?;
+        let mut bytes = 0u64;
+        for path in paths {
+            match fs::metadata(&path) {
+                Ok(meta) => bytes = bytes.saturating_add(meta.len()),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => return Err(io_err(err)),
             }
-        };
-        paths
-            .iter()
-            .filter_map(|path| fs::metadata(path).ok())
-            .map(|meta| meta.len())
-            .fold(0u64, u64::saturating_add)
+        }
+        Ok(bytes)
     }
 }
 

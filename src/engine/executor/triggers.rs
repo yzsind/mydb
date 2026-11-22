@@ -79,7 +79,13 @@ pub(super) fn execute_drop_trigger(
                 .unwrap_or_else(crate::storage::metadata_wait_timeout),
         )?;
     }
-    db.drop_trigger(&session.current_database, name, if_exists)?;
+    if !db.drop_trigger(&session.current_database, name, if_exists)? {
+        crate::engine::api::push_statement_warning(
+            crate::error::ConditionLevel::Note,
+            crate::error::catalog::ER_TRG_DOES_NOT_EXIST,
+            format!("Trigger '{name}' does not exist"),
+        );
+    }
     super::routines::invalidate_trigger_cache();
     // See `execute_create_trigger`: `drop_trigger` bumps the target table's
     // schema_version, so dependent plans/DML memos invalidate precisely via
@@ -401,7 +407,7 @@ fn validate_trigger_stmt(session: &SessionContext, stmt: &RoutineStmt) -> Result
                     "Not allowed to return a result set from a trigger",
                 ));
             }
-            super::routines::validate_trigger_sql_statement(session, &statement)?;
+            super::routines::validate_trigger_sql_statement(&statement)?;
             Ok(())
         }
         RoutineStmt::DeclareHandler { statement, .. } => validate_trigger_stmt(session, statement),

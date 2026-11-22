@@ -1290,8 +1290,9 @@ fn apply_redo_record_inner(
                 && matches!(action, crate::wal::FileCompensation::Restore(_))
             {
                 state.recovery_indexes.remove(path);
-                IndexFile::persist_planned_rebuild_marker(&data_dir.join(path))?;
-                state.skipped_index_redo_paths.insert(path.clone());
+                if state.skipped_index_redo_paths.insert(path.clone()) {
+                    IndexFile::persist_planned_rebuild_marker(&data_dir.join(path))?;
+                }
             } else {
                 apply_file_compensation(data_dir, path, action)?;
             }
@@ -1495,6 +1496,18 @@ fn apply_redo_record_inner(
         WalPayload::IndexBatch { path, ops }
             if should_redo_record(record, redoable, redo_cutoff) =>
         {
+            if physical_replica {
+                // Replica trees have a local page layout. A crash can persist
+                // only part of a split; replaying source logical operations on
+                // that topology cannot repair its leaf chain. Rebuild from
+                // the recovered heap, including in-flight source versions,
+                // before accepting reads or resuming online apply.
+                if state.skipped_index_redo_paths.insert(path.clone()) {
+                    IndexFile::persist_planned_rebuild_marker(&data_dir.join(path))?;
+                }
+                state.skipped_index_redo_records += 1;
+                return Ok(());
+            }
             if state.skipped_index_redo_paths.contains(path) {
                 state.skipped_index_redo_records += 1;
                 return Ok(());

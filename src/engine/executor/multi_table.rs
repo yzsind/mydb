@@ -60,6 +60,7 @@ struct Participant {
     rls_read_required: bool,
     cte: Option<Arc<crate::engine::api::CteResult>>,
     _cte_spill_charge: Option<Arc<super::mem_budget::OwnedMemCharge>>,
+    row_charge: super::mem_budget::ScopedCharge,
 }
 
 /// `(storage_id, row_id, values)` tuple cloned out of `StoredRow`. Owning
@@ -236,6 +237,7 @@ fn build_context(
             rls_read_required: false,
             cte,
             _cte_spill_charge: None,
+            row_charge: super::mem_budget::ScopedCharge::for_budget(None),
         });
         Ok(())
     };
@@ -510,7 +512,11 @@ impl MultiContext {
         targets: &HashSet<usize>,
         reads: Option<&std::collections::BTreeSet<usize>>,
     ) -> Result<(), QueryError> {
+        let budget = super::mem_budget::current_budget()
+            .unwrap_or_else(|| Arc::new(super::mem_budget::MemBudget::from_env()));
         for (index, participant) in self.participants.iter_mut().enumerate() {
+            participant.row_charge =
+                super::mem_budget::ScopedCharge::for_budget(Some(budget.clone()));
             let write = targets.contains(&index);
             if let Some(cte) = &participant.cte {
                 if write {
@@ -532,12 +538,15 @@ impl MultiContext {
                         .map(stored)
                         .collect()
                 } else {
-                    cte.store
-                        .dense_rows()?
-                        .iter()
-                        .cloned()
-                        .map(stored)
-                        .collect()
+                    let mut rows = Vec::new();
+                    for row in cte.store.dense_rows()?.iter() {
+                        participant.row_charge.add(
+                            super::mem_budget::estimate_row_bytes(row)
+                                .saturating_add(2 * std::mem::size_of::<StoredJoinRow>()),
+                        )?;
+                        rows.push(stored(row.clone()));
+                    }
+                    rows
                 };
                 continue;
             }
@@ -579,12 +588,24 @@ impl MultiContext {
                 &participant.partitions,
             )?;
             let _scope = ids.map(super::partition_router::push_pruned_partitions);
-            let mut rows = db.scan_rows_with_storage(&participant.storage_key, txn)?;
+            let mut rows = Vec::new();
+            db.scan_rows_ordered_streaming_owned(&participant.storage_key, txn, |row| {
+                participant.row_charge.add(
+                    super::mem_budget::estimate_row_bytes(&row.values)
+                        .saturating_add(2 * std::mem::size_of::<StoredJoinRow>()),
+                )?;
+                rows.push(StoredJoinRow {
+                    storage_id: row.row_ref.storage_id,
+                    row_id: row.row_ref.row_id,
+                    values: row.values,
+                });
+                Ok(())
+            })?;
             if participant.enforce_rls {
                 let mut failure = None;
                 // Scanning has released heap/page latches. Policy subqueries
                 // execute here before ON, WHERE, SET or trigger expressions.
-                rows.retain(|(_, row)| {
+                rows.retain(|row| {
                     if failure.is_some() {
                         return false;
                     }
@@ -627,14 +648,7 @@ impl MultiContext {
                     return Err(error);
                 }
             }
-            participant.rows = rows
-                .into_iter()
-                .map(|(storage_id, row)| StoredJoinRow {
-                    storage_id,
-                    row_id: row.row_id,
-                    values: row.values,
-                })
-                .collect();
+            participant.rows = rows;
         }
         Ok(())
     }
@@ -1062,6 +1076,11 @@ pub(super) fn execute_multi_update(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     crate::engine::cancel::check_cancelled()?;
+    if session.sysvars.sql_safe_updates {
+        return Err(crate::error::catalog::ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE
+            .error("Safe update mode rejects multi-table DML that scans participant tables"));
+    }
+
     if stmt.view_check_predicate.is_some() {
         return Err(error(
             crate::error::catalog::ER_VIEW_MULTIUPDATE,
@@ -1130,6 +1149,7 @@ pub(super) fn execute_multi_update(
         };
         let (p_idx, col_idx) = ctx.participant_for_combined(combined_idx);
         let participant = &ctx.participants[p_idx];
+        super::routines::check_trigger_write_target(&participant.storage_key)?;
         if col_idx >= participant.schema.columns.len() {
             return Err(crate::error::catalog::ER_BAD_FIELD_ERROR.error("ROWID is read-only"));
         }
@@ -1374,16 +1394,26 @@ pub(super) fn execute_multi_update(
         }
         matched_rows += 1;
         let on_update = super::dml::on_update_timestamp_columns(&schema, &update.user_columns);
-        super::dml::apply_on_update_timestamps(&schema, &mut new_values, &on_update);
-        let mut write_columns = update.user_columns.clone();
-        write_columns.extend_from_slice(&on_update);
-        let changed = Some(write_columns.as_slice());
-        if participant_has_update_triggers[p_idx] {
+        let has_triggers = participant_has_update_triggers[p_idx];
+        if has_triggers {
             crate::storage::coerce_updated_row(
                 &schema,
                 &mut new_values,
                 Some(&update.user_columns),
             )?;
+        }
+        if !has_triggers
+            || update
+                .user_columns
+                .iter()
+                .any(|&index| !old_values[index].storage_eq(&new_values[index]))
+        {
+            super::dml::apply_on_update_timestamps(&schema, &mut new_values, &on_update);
+        }
+        let mut write_columns = update.user_columns.clone();
+        write_columns.extend_from_slice(&on_update);
+        let changed = Some(write_columns.as_slice());
+        if has_triggers {
             new_values = fire_before_update(
                 db,
                 session,
@@ -1400,15 +1430,13 @@ pub(super) fn execute_multi_update(
             // in the SET list keep the latest committed values instead of
             // being clobbered by our build-context snapshot. Mirrors the
             // FK-cascade `move |old| {...}` pattern.
-            let mut returned_images = None;
-            let updated = match db.update_row_with_optional_images_at(
+            let (updated, returned_images) = match db.update_row_with_images_at(
                 txn,
                 &schema,
                 Some(storage_id),
                 row_id,
                 Some(&trigger_changed),
-                Some(update.user_columns.as_slice()),
-                returning_target == Some(p_idx),
+                Some(&trigger_changed),
                 |current| {
                     Ok(patch_changed_columns(
                         current,
@@ -1417,45 +1445,34 @@ pub(super) fn execute_multi_update(
                     ))
                 },
             ) {
-                Ok((updated, images)) => {
-                    returned_images = images;
-                    updated
-                }
+                Ok(result) => result,
                 Err(err) if stmt.ignore && crate::storage::ignorable_update_error(&err) => {
                     crate::engine::api::push_statement_condition(
                         crate::error::ConditionLevel::Warning,
                         &err,
                     );
-                    false
+                    continue;
                 }
                 Err(err) => return Err(err),
             };
-            if updated || returned_images.is_some() {
+            if let Some(images) = &returned_images {
                 fire_after_update(
                     db,
                     session,
                     &schema,
-                    old_values.clone(),
-                    new_values.clone(),
+                    images.old_values.clone(),
+                    images.new_values.clone(),
                     registry,
                 )?;
                 affected_rows += u64::from(updated);
                 if returning_target == Some(p_idx) {
                     if let Some(collector) = &mut returning {
-                        if let Some(crate::storage::DmlRowImages {
-                            old_values: old,
-                            new_values: new,
-                            old_ref,
-                            new_ref,
-                        }) = &returned_images
-                        {
-                            collector.push_with_refs(
-                                Some(old),
-                                Some(new),
-                                Some(*old_ref),
-                                Some(*new_ref),
-                            )?;
-                        }
+                        collector.push_with_refs(
+                            Some(&images.old_values),
+                            Some(&images.new_values),
+                            Some(images.old_ref),
+                            Some(images.new_ref),
+                        )?;
                     }
                 }
             }
@@ -1527,6 +1544,11 @@ pub(super) fn execute_multi_delete(
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
     crate::engine::cancel::check_cancelled()?;
+    if session.sysvars.sql_safe_updates {
+        return Err(crate::error::catalog::ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE
+            .error("Safe update mode rejects multi-table DML that scans participant tables"));
+    }
+
     if !stmt.order_by.is_empty() || stmt.limit.is_some() {
         return Err(error(
             crate::error::catalog::ER_WRONG_USAGE,
@@ -1586,6 +1608,10 @@ pub(super) fn execute_multi_delete(
                 ));
             }
         }
+    }
+
+    for &index in &target_participants {
+        super::routines::check_trigger_write_target(&ctx.participants[index].storage_key)?;
     }
 
     let join_conditions: Vec<Option<BoundMultiExpr>> = std::iter::once(Ok(None))

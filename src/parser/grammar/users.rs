@@ -310,7 +310,8 @@ pub(in crate::parser) fn parse_user_statement(sql: &str) -> Result<Option<Statem
     let mut masks = Vec::new();
     let mut default_roles = Vec::new();
     loop {
-        let current_user = !create && cursor.keyword(b"CURRENT_USER")?;
+        let current_user =
+            !create && (cursor.keyword(b"CURRENT_USER")? || cursor.keyword(b"USER")?);
         let account = if current_user {
             if cursor.symbol(b'(')? {
                 cursor.expect_symbol(b')')?;

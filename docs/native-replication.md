@@ -123,6 +123,8 @@ Zone Map v8 uses 16 KiB standard pages, and the current physical page version is
 
 A physical replica does not rebuild or allocate Zone Map pages locally; when a summary is missing, untrusted, or corrupted it conservatively scans the heap and waits for the source to replay valid pages. Both queries and cost sampling compare a zone's `rebuild_scn` against the safe-SCN lower bound of registered read views: a rebuild summary newer than that bound must not exclude the corresponding zone, so rows that an older RR snapshot on the replica still needs to read are not missed after a rebuild shrinks on the source. Final row visibility is still decided by MVCC.
 
+If persisted replica progress is missing on startup, a consistent re-seed is required; the receiver does not guess an apply boundary from local data. Crash recovery rebuilds affected physical indexes from the recovered heap when their interrupted page layout cannot safely accept logical index redo. Recovered in-flight source transactions remain invisible to readers; bulk-built index pages retain a conservative writer bound for snapshot visibility checks.
+
 Every file must strictly match its manifest path, contiguous offsets, declared length, EOF, and SHA-256. The replica writes into a staging tree on the same filesystem and replaces the data through a persistent install journal after `fsync` completes; a network interruption, verification failure, or insufficient disk never installs an incomplete backup. Data and replication progress commit together: a crash before the install-complete marker is persisted rolls back to the old directory, while a crash afterwards keeps the new directory and continues cleaning up the old one. Role/TLS/node-local configuration is never overridden from the master.
 
 When the master is temporarily unreachable, bootstrap retries up to the configured attempt limit with exponential backoff (the initial interval is set by `MYDB_REPL_RECONNECT_MS`, clamped to 100 ms–30 s, at most 30 s afterwards). It does not listen for SQL until seeding completes. The backup concurrency permit covers the entire transfer, and the backup freeze is independent of STOP/RESUME MASTER WRITES.
@@ -141,7 +143,7 @@ RESET MYDB REPLICATION;
 
 `SHOW MYDB REPLICAS` separates connection state from WAL retention state: a disconnected slot may still retain WAL but immediately leaves the semi-sync quorum. `Replica_Acked_LSN` is the per-slot watermark maintained by the master; MASTER STATUS additionally lists the number of invalidated and abandoned slots. An invalidated slot regains WAL retention protection at an approved new backup or a valid resume boundary; an ordinary ACK does not unconditionally revive an invalidated slot. An ACK must satisfy `applied ≤ durable ≤ received ≤ highest_sent ≤ source durable/current`, and an ACK that runs ahead causes a disconnect.
 
-After RESET, a node can re-enter replica mode via CHANGE MYDB MASTER TO. Entering replica mode or changing the source always requires re-seeding, preventing locally diverged data from being stitched in. Trigger it explicitly with `START MYDB REPLICATION FORCE_RESYNC`: it requires `SYSTEM_VARIABLES_ADMIN` and `SHUTDOWN`, reuses the RESTART drain/restart flow, disconnects clients, and automatically resumes replication once the backup is installed. Platforms that do not support RESTART return an explicit error; seeding can still be completed by a manual restart.
+RESET removes the source configuration and clears live replication progress. A physical replica remains read-only; RESET does not promote it or enable the event scheduler. Use the explicit promotion procedure to open writes. After RESET, configure its source again via CHANGE MYDB MASTER TO. Entering replica mode or changing the source always requires re-seeding, preventing locally diverged data from being stitched in. Trigger it explicitly with `START MYDB REPLICATION FORCE_RESYNC`: it requires `SYSTEM_VARIABLES_ADMIN` and `SHUTDOWN`, reuses the RESTART drain/restart flow, disconnects clients, and automatically resumes replication once the backup is installed. Platforms that do not support RESTART return an explicit error; seeding can still be completed by a manual restart.
 
 ### Old Read Snapshots and Physical Reclamation
 
@@ -172,6 +174,8 @@ Unplanned promotion only permits `PROMOTE TO MASTER FORCE FENCED`, with `SEQUENC
 
 Before promotion, complete replicated undo frames beyond missing source physical allocation prefixes are persisted at local offsets with durable source-ID aliases. Unlogged allocations lost in a source crash therefore cannot permanently block failover. Transaction undo chains are preserved, and missing logical before-images still fail rollback and prevent promotion.
 
+Promotion reserves the replication listener before changing the durable role. A listener bind failure leaves the node in its previous role.
+
 Native promotion does not yet guarantee GTID or file-position continuity for existing MySQL binlog downstream consumers; the downstream must be reconfigured.
 
 ### Connection Recovery and Wait Cancellation
@@ -180,7 +184,7 @@ Connection failures without progress (including an already-connected identical n
 
 If opening the master-side WAL hits a transient IO error, the connection is dropped and reconnection is allowed without generating a permanent resync marker; a reclaimed position or divergent history still requires a rebuild. Frame reading preserves progress across heartbeats and new-WAL notifications, so brief fragmentation does not break protocol parsing.
 
-`PROMOTE … WAIT` and `STOP MASTER WRITES … WAIT` support cancellation via `KILL QUERY`. Canceling STOP MASTER WRITES does not automatically unfreeze the master, preserving the already-persisted fencing state. `RESET MYDB REPLICATION` also clears the storage engine's physical-replica flag, allowing the event scheduler to resume execution.
+`PROMOTE … WAIT` and `STOP MASTER WRITES … WAIT` support cancellation via `KILL QUERY`. Canceling STOP MASTER WRITES does not automatically unfreeze the master, preserving the already-persisted fencing state. `RESET MYDB REPLICATION` preserves a physical replica's read-only role and keeps background event execution disabled.
 
 ## Logical downstreams and read catch-up
 

@@ -179,6 +179,53 @@ impl ReplConfig {
         }
     }
 
+    pub fn from_env_checked() -> Result<Self, crate::types::QueryError> {
+        let invalid = |name: &str| {
+            crate::error::catalog::ER_WRONG_VALUE_FOR_VAR
+                .error(format!("invalid native replication configuration: {name}"))
+        };
+        for name in ["MYDB_REPL_PORT", "MYDB_REPL_MASTER_PORT"] {
+            parse_env_u16(name).map_err(|_| invalid(name))?;
+        }
+        for name in [
+            "MYDB_REPL_SEMI_SYNC_WAIT_COUNT",
+            "MYDB_REPL_BOOTSTRAP_MAX_ATTEMPTS",
+        ] {
+            parse_env_u32(name).map_err(|_| invalid(name))?;
+        }
+        for name in [
+            "MYDB_REPL_SEMI_SYNC_TIMEOUT_MS",
+            "MYDB_REPL_HEARTBEAT_MS",
+            "MYDB_REPL_RECONNECT_MS",
+            "MYDB_REPL_CHUNK_BYTES",
+            "MYDB_REPL_MAX_INFLIGHT_BYTES",
+            "MYDB_REPL_MAX_RETAINED_BYTES",
+            "MYDB_REPL_SLOT_TIMEOUT_MS",
+            "MYDB_REPL_MAX_CONNECTIONS",
+            "MYDB_REPL_MAX_BASE_BACKUPS",
+            "MYDB_REPL_APPLY_QUEUE_BYTES",
+            "MYDB_REPL_BASE_BACKUP_DISK_RESERVE_PCT",
+        ] {
+            parse_env_u64(name).map_err(|_| invalid(name))?;
+        }
+        if let Ok(value) = crate::util::env::var("MYDB_REPL_MODE") {
+            if ReplMode::parse(&value).is_none() {
+                return Err(invalid("MYDB_REPL_MODE"));
+            }
+        }
+        if let Ok(value) = crate::util::env::var("MYDB_REPL_TLS_MODE") {
+            if ReplTlsMode::parse(&value).is_none() {
+                return Err(invalid("MYDB_REPL_TLS_MODE"));
+            }
+        }
+        if let Ok(value) = crate::util::env::var("MYDB_REPL_AUTO_START") {
+            if crate::util::env::parse_bool_with_short(&value).is_none() {
+                return Err(invalid("MYDB_REPL_AUTO_START"));
+            }
+        }
+        Ok(Self::from_env())
+    }
+
     pub fn from_env() -> Self {
         let mut cfg = Self::default();
         if let Ok(token) = crate::util::env::var("MYDB_REPL_AUTH_TOKEN") {

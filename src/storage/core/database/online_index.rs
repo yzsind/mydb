@@ -428,6 +428,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(",");
         let job = self.register_ddl_job_with_subject(&source, "INDEX", false, subjects);
+        Self::set_alter_copy_job_total(&job, self.index_build_row_count_hint(&source) as u64);
         let _job_cancel_scope = crate::engine::cancel::enter(job.cancel_token.clone());
         Self::set_alter_copy_job_state(&job, "INDEX_BUILD");
         let result: Result<(), QueryError> = (|| {
@@ -519,6 +520,9 @@ impl Database {
             // The snapshot keeps undo and deleted slots alive during scanning
             // and replay; writers still use their ordinary IX/row locks.
             self.build_online_index_targets(&mut targets, options)?;
+            if let Ok(mut progress) = job.progress.lock() {
+                progress.total_rows = Some(progress.copied_rows);
+            }
             Self::set_alter_copy_job_state(&job, "CATCH_UP");
             #[cfg(test)]
             if let Some(hook) = self.online_index_replay_test_hook.lock().unwrap().clone() {
@@ -775,6 +779,11 @@ impl Database {
                 ));
             }
         }
+        let result = result.map_err(|err| {
+            if err.is(crate::error::catalog::ER_QUERY_INTERRUPTED) {
+                Self::check_alter_copy_cancelled(&job).err().unwrap_or(err)
+            } else { err }
+        });
         self.unregister_alter_copy_job(source.id, result.as_ref().err());
         result
     }
@@ -1141,6 +1150,19 @@ impl Database {
                 }
                 Err(err) => return Err(err),
             }
+        }
+    }
+
+    fn report_index_build_progress(&self, storage_id: u64, rows: u64) {
+        if rows == 0 {
+            return;
+        }
+        let job = self.active_alter_copy_job(storage_id).or_else(|| {
+            self.table_by_id(storage_id)
+                .and_then(|table| self.active_alter_copy_job(table.id))
+        });
+        if let Some(job) = job.filter(|job| job.operation == "INDEX") {
+            Self::advance_alter_copy_job_copied_by(&job, rows);
         }
     }
 

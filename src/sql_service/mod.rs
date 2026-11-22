@@ -106,6 +106,8 @@ pub struct State<E: QueryEngine> {
     pub received_bytes: AtomicU64,
     pub sent_bytes: AtomicU64,
     pub elapsed_us: AtomicU64,
+    closing: AtomicBool,
+    closing_notify: tokio::sync::Notify,
 }
 impl<E: QueryEngine> State<E> {
     pub fn new(config: RestConfig, engine: Arc<E>, registry: Arc<SessionRegistry>) -> Arc<Self> {
@@ -125,7 +127,35 @@ impl<E: QueryEngine> State<E> {
             received_bytes: AtomicU64::new(0),
             sent_bytes: AtomicU64::new(0),
             elapsed_us: AtomicU64::new(0),
+            closing: AtomicBool::new(false),
+            closing_notify: tokio::sync::Notify::new(),
         })
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::Acquire)
+    }
+
+    pub fn begin_close(&self) {
+        self.closing.store(true, Ordering::Release);
+        self.closing_notify.notify_waiters();
+    }
+
+    pub async fn closing_notified(&self) {
+        let notified = self.closing_notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if !self.is_closing() {
+            notified.await;
+        }
+    }
+
+    fn ensure_open(&self) -> Result<()> {
+        if self.is_closing() {
+            Err(Failure::unavailable("HTTP SQL service is shutting down"))
+        } else {
+            Ok(())
+        }
     }
     fn try_memory(&self, bytes: usize) -> Result<Memory> {
         self.used
@@ -338,6 +368,7 @@ pub fn authenticate<E: QueryEngine>(
     headers: &axum::http::HeaderMap,
     peer: Peer,
 ) -> Result<Identity> {
+    state.ensure_open()?;
     if crate::mysql::shutdown::is_shutting_down() {
         return Err(Failure::unavailable("Server is shutting down"));
     }
@@ -536,6 +567,7 @@ pub async fn create_session<E: QueryEngine>(
     identity: Identity,
     database: Option<String>,
 ) -> Result<Arc<Session<E>>> {
+    state.ensure_open()?;
     let permit = state
         .slots
         .clone()
@@ -602,7 +634,20 @@ pub async fn create_session<E: QueryEngine>(
             _permit: Mutex::new(Some(permit)), owner_state:Arc::downgrade(&state), _memory: memory,
         });
         *worker_creation.session.lock() = Some(session.clone());
-        state.sessions.lock().insert(session.id.clone(), session.clone());
+        let admitted = {
+            let mut sessions = state.sessions.lock();
+            // Pair admission with close_all's snapshot under the same lock.
+            // A late worker must either be drained or reject its own session.
+            if state.is_closing() {
+                false
+            } else {
+                sessions.insert(session.id.clone(), session.clone());
+                true
+            }
+        };
+        if !admitted {
+            session.begin_close();
+        }
         let mut context = session.context.lock().take().expect("new session owns its context");
         let initialized = if worker_creation.abandoned.load(Ordering::Acquire) || session.closed.load(Ordering::Acquire) {
             Err(Failure::not_found())
@@ -1367,6 +1412,7 @@ pub async fn start<E: QueryEngine>(
     format: OutputFormat,
     request_memory: impl Into<ExecutionResources> + Send,
 ) -> Result<ExecutionStream<E>> {
+    state.ensure_open()?;
     let request_memory = request_memory.into();
     let stream = format.streaming();
     let admitted_at = Instant::now();

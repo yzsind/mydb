@@ -431,6 +431,9 @@ pub(super) fn implicit_commit_for_ddl(
     db: &Arc<Database>,
     session: &mut SessionContext,
 ) -> Result<(), QueryError> {
+    if super::routines::transaction_control_forbidden() {
+        return Err(super::routines::trigger_commit_error());
+    }
     if session.xa_branch.is_some() {
         return Err(xa_err(
             crate::error::catalog::ER_XAER_RMFAIL,

@@ -12557,7 +12557,7 @@ fn definer_updatable_view_uses_definer_privileges_for_base_dml() {
     engine
         .execute_with_session(
             &mut root,
-            "GRANT UPDATE ON test.v_secret_dml TO 'alice'@'%'",
+            "GRANT SELECT,UPDATE ON test.v_secret_dml TO 'alice'@'%'",
         )
         .unwrap();
 
@@ -12602,7 +12602,7 @@ fn invoker_updatable_view_requires_invoker_privileges_for_base_dml() {
     engine
         .execute_with_session(
             &mut root,
-            "GRANT UPDATE ON test.v_secret_dml TO 'alice'@'%'",
+            "GRANT SELECT,UPDATE ON test.v_secret_dml TO 'alice'@'%'",
         )
         .unwrap();
 
@@ -12618,7 +12618,10 @@ fn invoker_updatable_view_requires_invoker_privileges_for_base_dml() {
     assert_eq!(denied.code(), 1356);
 
     engine
-        .execute_with_session(&mut root, "GRANT UPDATE ON test.secret TO 'alice'@'%'")
+        .execute_with_session(
+            &mut root,
+            "GRANT SELECT,UPDATE ON test.secret TO 'alice'@'%'",
+        )
         .unwrap();
     engine
         .execute_with_session(&mut alice, "UPDATE v_secret_dml SET id = 2 WHERE id = 1")

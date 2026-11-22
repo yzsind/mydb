@@ -73,7 +73,8 @@ Progress: `information_schema.MYDB_DDL_JOBS`.
 
 BTREE index jobs expose their index subjects and support `CANCEL DDL JOB`.
 Column-validation and constraint jobs have distinct object kinds. A bounded
-history retains terminal results in memory; a completed job can remain visible
+history retains up to 64 terminal results in memory when metadata memory is
+available; memory pressure may prevent a terminal entry from being retained. A completed job can remain visible
 with `CAN_CANCEL=0`. An acknowledged cancellation before the finalization
 gate prevents publication, including when the final replay batch is empty.
 
@@ -84,3 +85,5 @@ gate prevents publication, including when the final replay batch is empty.
 - `ddl_copy_final_tail_rows`: number of tail records accepted in the final barrier.
 
 The existing `ddl_copy_*` counters for scanning, conversion, indexing, replay, and building remain available. All metrics are process-lifetime cumulative values; for single-run comparisons use before/after deltas and avoid interference from other DDL.
+
+Index-build jobs report scanned-row progress and a row-count estimate; the completed scan replaces that estimate with the observed total. Partition job identity remains stable in terminal history. Completed jobs reject cancellation explicitly.

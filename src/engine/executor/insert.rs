@@ -351,6 +351,7 @@ pub(super) fn execute_insert(
     mut stmt: Insert,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    super::routines::check_trigger_write_target(&stmt.table)?;
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
     if let Some(predicate) = &mut stmt.view_check_predicate {
         let table = db.table(&stmt.table)?;

@@ -1094,7 +1094,65 @@ fn credential_safe_binlog_sql(
     credential_safe_binlog_sql_from_catalog(&db.auth_catalog(), &session.authenticated_as, sql)
 }
 
-fn ddl_binlog_source_sql(sql: &str, statement: &Statement) -> String {
+fn ddl_binlog_source_sql(sql: &str, statement: &Statement, account: &AccountKey) -> String {
+    let (object, definer) = match statement {
+        Statement::CreateView { definer, .. } => (Some("VIEW"), definer.as_ref()),
+        Statement::CreateTrigger(def) => (Some("TRIGGER"), def.definer.as_ref()),
+        Statement::CreateRoutine(def) => (
+            Some(match def.kind {
+                crate::parser::RoutineKind::Procedure => "PROCEDURE",
+                crate::parser::RoutineKind::Function => "FUNCTION",
+            }),
+            def.definer.as_ref(),
+        ),
+        Statement::CreateEvent(def) => (Some("EVENT"), def.definer.as_ref()),
+        _ => (None, None),
+    };
+    let symbolic_definer =
+        definer.is_some_and(|definer| definer.user == "CURRENT_USER()" && definer.host.is_empty());
+    if let Some(object) = object.filter(|_| definer.is_none() || symbolic_definer) {
+        use crate::sql_lex::{SqlLexMode, SqlTokenCursor, SqlTokenKind};
+        let mut tokens = SqlTokenCursor::new(
+            sql,
+            SqlLexMode::from_parser_bits(crate::parser::current_parser_sql_mode_bits()),
+            crate::parser::MYSQL_VERSION_ID,
+        );
+        while let Ok(Some(token)) = tokens.next() {
+            if symbolic_definer
+                && token.kind == SqlTokenKind::Word
+                && tokens
+                    .token_text(&token)
+                    .eq_ignore_ascii_case("CURRENT_USER")
+            {
+                let end = match tokens.next() {
+                    Ok(Some(next)) if next.kind == SqlTokenKind::Symbol(b'(') => tokens
+                        .next()
+                        .ok()
+                        .flatten()
+                        .map_or(token.span.end, |end| end.span.end),
+                    _ => token.span.end,
+                };
+                return normalize_sql(&format!(
+                    "{}{}{}",
+                    &sql[..token.span.start],
+                    account.display(),
+                    &sql[end..]
+                ));
+            }
+            if !symbolic_definer
+                && token.kind == SqlTokenKind::Word
+                && (tokens.token_text(&token).eq_ignore_ascii_case(object)
+                    || (object == "VIEW" && tokens.token_text(&token).eq_ignore_ascii_case("SQL")))
+            {
+                return normalize_sql(&format!(
+                    "{}DEFINER={} {}",
+                    &sql[..token.span.start],
+                    account.display(),
+                    &sql[token.span.start..]
+                ));
+            }
+        }
+    }
     if matches!(
         statement,
         Statement::CreateUser(_)
@@ -1335,7 +1393,36 @@ pub(crate) fn credential_safe_binlog_sql_from_catalog(
                 AccountKey::new(alter.account.user, alter.account.host)
             };
             match account_sql(&account) {
-                Ok(sql) => Ok(sql.replacen("CREATE USER", "ALTER USER", 1)),
+                Ok(sql) => {
+                    let prefix = auth_account_prefix(&sql)?;
+                    let definition = sql.strip_prefix("CREATE USER ").unwrap_or(&sql);
+                    let tail = definition.get(prefix.len()..).ok_or_else(|| {
+                        crate::error::catalog::ER_UNKNOWN_ERROR
+                            .error("Cannot render binary-log account options")
+                    })?;
+                    let mut rendered = format!(
+                        "ALTER USER{} {}",
+                        if alter.if_exists { " IF EXISTS" } else { "" },
+                        if alter.password.is_some()
+                            || alter.random_password
+                            || alter.plugin.is_some()
+                        {
+                            prefix
+                        } else {
+                            account.display()
+                        }
+                    );
+                    // RETAIN/DISCARD belong to the authentication production,
+                    // before REQUIRE/resource/password-policy options.
+                    if alter.retain_current_password {
+                        rendered.push_str(" RETAIN CURRENT PASSWORD");
+                    }
+                    if alter.discard_old_password {
+                        rendered.push_str(" DISCARD OLD PASSWORD");
+                    }
+                    rendered.push_str(tail);
+                    Ok(rendered)
+                }
                 Err(_) if alter.if_exists => {
                     Ok(format!("ALTER USER IF EXISTS {}", account.display()))
                 }
@@ -1348,7 +1435,7 @@ pub(crate) fn credential_safe_binlog_sql_from_catalog(
                 .unwrap_or_else(|| session.authenticated_as.clone());
             Ok(account_sql(&account)?.replacen("CREATE USER", "ALTER USER", 1))
         }
-        _ => Ok(ddl_binlog_source_sql(sql, &statement)),
+        _ => Ok(ddl_binlog_source_sql(sql, &statement, account)),
     }
 }
 
@@ -2970,6 +3057,9 @@ impl CheckpointerHandle {
                     if worker_shutdown.wait_timeout(Duration::from_millis(100)) {
                         break;
                     }
+                    let Some(_write) = crate::repl::background_write_permit() else {
+                        continue;
+                    };
                     let size = wal.wal_bytes();
                     if last_checkpoint.elapsed() >= Duration::from_secs(1) {
                         if let Err(err) = db.maybe_checkpoint() {
@@ -3039,6 +3129,13 @@ impl StorageQueryEngine {
         ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata),
     ) -> Result<QueryResponse, QueryError> {
         self.attach_expression_registry(session);
+        let embedded_handle = session.cancel_handle.as_ref().and_then(|handle| {
+            (!handle.session_handle_ref().statement_is_active())
+                .then(|| handle.session_handle_arc())
+        });
+        let _embedded_activity = embedded_handle
+            .as_ref()
+            .and_then(|handle| handle.enter_embedded_statement());
         let _reclaim_scope = mem_budget::ReclaimDatabaseScope::enter(&self.db);
         let _http_dependent = crate::engine::http::may_call(&self.db, sql);
         session.check_cancelled()?;
@@ -3776,6 +3873,10 @@ impl QueryEngine for StorageQueryEngine {
 
     fn row_lock_async_ready(&self, signal: &crate::engine::api::AsyncRowLockSignal) -> bool {
         self.db.async_row_lock_ready(signal.target)
+    }
+
+    fn is_ready(&self) -> bool {
+        self.db.is_operational()
     }
 
     fn execute(
@@ -6551,7 +6652,7 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &ddl_binlog_source_sql(sql, &statement),
+                    &ddl_binlog_source_sql(sql, &statement, &session.authenticated_as),
                     &ctx,
                     &session.authenticated_as,
                 )
@@ -6621,7 +6722,7 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &ddl_binlog_source_sql(sql, &statement),
+                    &ddl_binlog_source_sql(sql, &statement, &session.authenticated_as),
                     &ctx,
                     &session.authenticated_as,
                 )
@@ -6663,7 +6764,7 @@ impl StorageQueryEngine {
                 let ctx = binlog_ctx_from_session(session);
                 crate::binlog::enter_ddl_txn_context(
                     &session.current_database,
-                    &ddl_binlog_source_sql(sql, &statement),
+                    &ddl_binlog_source_sql(sql, &statement, &session.authenticated_as),
                     &ctx,
                     &session.authenticated_as,
                 )

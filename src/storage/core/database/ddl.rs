@@ -61,6 +61,13 @@ fn apply_column_default(
     default: Option<crate::parser::Expr>,
 ) -> Result<(), QueryError> {
     match default {
+        Some(expr @ Expr::Function { .. }) if matches!(&expr,
+            Expr::Function { name, args, .. } if name == crate::parser::DEFAULT_EXPR_SENTINEL && args.len() == 1) => {
+            validate_column_default_functions(column_name, Some(&expr))?;
+            let Expr::Function { args, .. } = expr else { unreachable!() };
+            table.columns[idx].default = None;
+            table.columns[idx].default_expr = Some(encode_catalog_expr(&args[0])?);
+        }
         Some(expr) if is_current_timestamp_expr(&expr) => {
             let declared = current_timestamp_expr_fsp(&expr).flatten().unwrap_or(0);
             let fsp = match table.columns[idx].data_type {
@@ -708,6 +715,7 @@ const MYSQL_MAX_IDENTIFIER_CHARS: usize = 64;
 const MYSQL_MAX_COLUMNS_PER_TABLE: usize = 1017;
 
 fn validate_mysql_identifier(name: &str) -> Result<(), QueryError> {
+    crate::binlog::validate_binlog_identifier(name)?;
     if name.chars().count() > MYSQL_MAX_IDENTIFIER_CHARS {
         Err(error(
             crate::error::catalog::ER_TOO_LONG_IDENT,
@@ -7893,6 +7901,11 @@ impl Database {
         }
         if self.cancel_partition_ddl_job(job_id)? {
             return Ok(());
+        }
+        if self.alter_copy_job_history.lock().unwrap_or_else(|p| p.into_inner())
+            .iter().any(|entry| entry.snapshot.job_id == job_id) {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                format!("DDL job {job_id} already finished and cannot be cancelled")));
         }
         Err(error(
             crate::error::catalog::ER_NO_SUCH_TABLE,

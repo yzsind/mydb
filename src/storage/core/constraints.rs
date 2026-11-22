@@ -4999,6 +4999,47 @@ fn column_def_to_schema_in_table(column: ColumnDef, table: &TableSchema, old_nam
     column_def_to_schema(column, charset)
 }
 
+fn validate_column_default_functions(column_name: &str, default: Option<&Expr>) -> Result<(), QueryError> {
+    if default.is_some_and(|expr| crate::parser::visit::any_expr(expr, |node| matches!(node, crate::parser::Expr::Function {name,..} if crate::engine::http::is_function(name)))) {
+        return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP calls are forbidden in column defaults"));
+    }
+    if let Some(expr) = default {
+        let mut disallowed = None;
+        crate::parser::visit::any_expr(expr, |node| {
+            if let crate::parser::Expr::Function { name, .. } = node {
+                if name != crate::parser::DEFAULT_EXPR_SENTINEL
+                    && !crate::engine::cbo::function_cost::is_known_builtin_function(name)
+                {
+                    disallowed = Some(name.clone());
+                    return true;
+                }
+            }
+            false
+        });
+        if let Some(name) = disallowed {
+            return Err(error(
+                crate::error::catalog::ER_DEFAULT_VAL_GENERATED_NAMED_FUNCTION_IS_NOT_ALLOWED,
+                format!("Default value expression of column '{}' contains a disallowed function: {name}.", column_name),
+            ));
+        }
+    }
+    if let Some(crate::parser::Expr::Function { name, args, .. }) = default {
+        if name == crate::parser::DEFAULT_EXPR_SENTINEL
+            && args.len() == 1
+            && crate::storage::schema::expr_contains_function_named(&args[0], "LOAD_FILE")
+        {
+            return Err(error(
+                crate::error::catalog::ER_DEFAULT_VAL_GENERATED_NAMED_FUNCTION_IS_NOT_ALLOWED,
+                format!(
+                    "Default value expression of column '{}' contains a disallowed function: load_file.",
+                    column_name
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn column_def_to_schema(mut column: ColumnDef, default_charset: &str) -> Result<ColumnSchema, QueryError> {
     if let crate::parser::DataType::TextLength(length) = column.data_type {
         let collation_charset = column.collation.as_deref()
@@ -5029,43 +5070,7 @@ fn column_def_to_schema(mut column: ColumnDef, default_charset: &str) -> Result<
             ));
         }
     }
-    if column.default.as_ref().is_some_and(|expr| crate::parser::visit::any_expr(expr, |node| matches!(node, crate::parser::Expr::Function {name,..} if crate::engine::http::is_function(name)))) {
-        return Err(crate::engine::http::error("ER_HTTP_UNSUPPORTED_CONTEXT", "HTTP calls are forbidden in column defaults"));
-    }
-    if let Some(expr) = &column.default {
-        let mut disallowed = None;
-        crate::parser::visit::any_expr(expr, |node| {
-            if let crate::parser::Expr::Function { name, .. } = node {
-                if name != crate::parser::DEFAULT_EXPR_SENTINEL
-                    && !crate::engine::cbo::function_cost::is_known_builtin_function(name)
-                {
-                    disallowed = Some(name.clone());
-                    return true;
-                }
-            }
-            false
-        });
-        if let Some(name) = disallowed {
-            return Err(error(
-                crate::error::catalog::ER_DEFAULT_VAL_GENERATED_NAMED_FUNCTION_IS_NOT_ALLOWED,
-                format!("Default value expression of column '{}' contains a disallowed function: {name}.", column.name),
-            ));
-        }
-    }
-    if let Some(crate::parser::Expr::Function { name, args, .. }) = column.default.as_ref() {
-        if name == crate::parser::DEFAULT_EXPR_SENTINEL
-            && args.len() == 1
-            && crate::storage::schema::expr_contains_function_named(&args[0], "LOAD_FILE")
-        {
-            return Err(error(
-                crate::error::catalog::ER_DEFAULT_VAL_GENERATED_NAMED_FUNCTION_IS_NOT_ALLOWED,
-                format!(
-                    "Default value expression of column '{}' contains a disallowed function: load_file.",
-                    column.name
-                ),
-            ));
-        }
-    }
+    validate_column_default_functions(&column.name, column.default.as_ref())?;
     // MySQL 8.0.13+ `DEFAULT (<expr>)` is wrapped by the parser as
     // `Expr::Function { name: __DEFAULT_EXPR, args: [inner] }`. Unwrap it and
     // stash the inner expression's textual SQL on `default_expr` so INSERT /

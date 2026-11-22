@@ -16,6 +16,7 @@ Reads the next row, or the next N rows, from a session-level SQL cursor.
 - With the count omitted, or with NEXT, one row is read; a count gives the maximum number of rows to return.
 - Reaching the end returns an empty result; an unknown or already closed cursor returns an error.
 - Each FETCH continues the original cursor's snapshot and result schema.
+- FETCH batches and retained materialized cursor rows are charged to execution memory. A FETCH error closes the cursor, so a consumed partial batch cannot silently be skipped by a later FETCH.
 
 ## Context, Errors, and Lifecycle
 

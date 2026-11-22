@@ -105,7 +105,7 @@ pub(crate) fn register(reg: &mut Registry) {
                         .to_string()
                 })
                 .unwrap_or_else(detect_tmpdir);
-            SysVarValue::String(directory)
+            Ok(SysVarValue::String(directory))
         }),
         write: None,
     });

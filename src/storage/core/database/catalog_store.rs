@@ -2263,6 +2263,13 @@ impl Database {
         let Some(base) = self.decode_table_descriptor_rows(table_id)? else {
             return Ok(None);
         };
+        // A seeded catalog can contain coverage boundaries newer than the
+        // restored visible frontier. Keep lazy descriptors subject to the
+        // same snapshot filtering as definitions published online.
+        let highwater = base.indexes.iter().map(|index| index.readable_from_scn)
+            .chain(base.columns.iter().map(|column| column.not_null_from_scn))
+            .max().unwrap_or(0);
+        self.read_definition_highwater.fetch_max(highwater, Ordering::Release);
         let mut graph = super::catalog::empty_catalog();
         let parent_key = table_key(&base.database, &base.name);
         graph.tables.insert(parent_key.clone(), base);

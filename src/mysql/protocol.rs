@@ -2984,9 +2984,11 @@ pub fn column_definition_packet_full_into_with_fallback(
     // GEOMETRY wire types report binary so clients keep raw bytes,
     // everything else the connection's utf8mb4 collation.
     let collation = if matches!(column_type, ColumnType::Json) {
-        // MySQL always reports a JSON result column with the binary (63)
-        // collation, regardless of any catalog collation stored for it.
-        BINARY_COLLATION
+        if source.org_table.is_empty() {
+            DEFAULT_UTF8MB4_COLLATION
+        } else {
+            BINARY_COLLATION
+        }
     } else {
         source.collation_id.unwrap_or(match column_type {
             ColumnType::VarString => {

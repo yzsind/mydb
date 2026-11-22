@@ -1178,7 +1178,7 @@ pub(crate) fn rows(
             s(crate::server_version::MYSQL_COMPAT_VERSION),
         ]]),
         "schema_object_overview" => Ok(schema_object_overview_rows(db)),
-        "metrics" => Ok(metrics_rows(db, registry)),
+        "metrics" => metrics_rows(db, registry),
         "processlist" | "x$processlist" => Ok(processlist_rows(db, registry, false)),
         "session" | "x$session" => Ok(processlist_rows(db, registry, true)),
         other
@@ -1850,7 +1850,7 @@ fn schema_object_overview_rows(db: &Database) -> Vec<Vec<Value>> {
         .collect()
 }
 
-fn metrics_rows(db: &Database, registry: &SessionRegistry) -> Vec<Vec<Value>> {
+fn metrics_rows(db: &Database, registry: &SessionRegistry) -> Result<Vec<Vec<Value>>, QueryError> {
     let mut rows = Vec::new();
     let mut status = crate::engine::expr::with_active_session(|session| {
         session
@@ -1872,7 +1872,8 @@ fn metrics_rows(db: &Database, registry: &SessionRegistry) -> Vec<Vec<Value>> {
     for (name, value) in status {
         rows.push(vec![s(&name), s(&value), s("Global Status"), s("YES")]);
     }
-    for row in crate::engine::sysvar::snapshot(crate::engine::sysvar::Scope::Global, None, Some(db))
+    for row in
+        crate::engine::sysvar::snapshot(crate::engine::sysvar::Scope::Global, None, Some(db))?
     {
         rows.push(vec![
             s(row.name),
@@ -1881,7 +1882,7 @@ fn metrics_rows(db: &Database, registry: &SessionRegistry) -> Vec<Vec<Value>> {
             s(""),
         ]);
     }
-    rows
+    Ok(rows)
 }
 
 fn processlist_rows(

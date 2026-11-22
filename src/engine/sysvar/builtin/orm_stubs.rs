@@ -527,21 +527,24 @@ fn register_misc_stubs(reg: &mut Registry) {
         // avoid duplicate registration.
         ("relay_log_purge", true),
         ("relay_log_recovery", false),
-        ("schema_definition_cache", false),
         ("ssl_fips_mode", false),
         ("sync_master_info", false),
         ("sync_relay_log", false),
         ("sync_relay_log_info", false),
         ("tls_ciphersuites_passes", false),
     ];
+    reg.register(SysVar::const_read_only(
+        SysVarDef::new("schema_definition_cache", Scope::Global, DataType::UInt { min: 0, max: u64::MAX })
+            .with_doc("MySQL schema-definition cache is not used; mydb governs catalog descriptors automatically."),
+        SysVarValue::UInt(0),
+    ));
     for &(name, default) in bool_stubs {
         let cell: &'static std::sync::atomic::AtomicBool = leak_atomic_bool(name, default);
         let def = SysVarDef::new(name, Scope::Global, DataType::Bool);
         let def = match name {
-            "schema_definition_cache"
-            | "sync_master_info"
-            | "sync_relay_log"
-            | "sync_relay_log_info" => def.with_select_type(SelectType::UInt),
+            "sync_master_info" | "sync_relay_log" | "sync_relay_log_info" => {
+                def.with_select_type(SelectType::UInt)
+            }
             "ssl_fips_mode" => def.with_select_type(SelectType::Text),
             _ => def,
         };

@@ -304,18 +304,11 @@ pub const TEMPORAL_MODE_NO_ZERO_DATE: u16 = 1 << 1;
 pub const TEMPORAL_MODE_NO_ZERO_IN_DATE: u16 = 1 << 2;
 pub const TEMPORAL_MODE_ALLOW_INVALID_DATES: u16 = 1 << 3;
 pub const TEMPORAL_MODE_TIME_TRUNCATE_FRACTIONAL: u16 = 1 << 4;
-/// Set whenever the session has a non-empty `sql_mode`. mydb's default
-/// (empty) sql_mode keeps the historical strict posture for temporal
-/// writes — invalid dates are errors; MySQL's non-strict
-/// warning-plus-zero-date behaviour applies only when the user
-/// explicitly configured a non-strict sql_mode.
+/// Marks explicitly selected SQL modes, including non-strict modes. The
+/// compiled default is strict and rejects zero/incomplete temporal dates.
 pub const TEMPORAL_MODE_EXPLICIT: u16 = 1 << 5;
-/// Numeric `sql_mode` bits, carried in the same cached byte (the name
-/// `temporal_sql_mode_bits` predates them). `ERROR_FOR_DIVISION_BY_ZERO`
-/// is part of MySQL's default sql_mode, so with mydb's default (empty)
-/// sql_mode the division-by-zero warning fires unless the user explicitly
-/// configures a mode without this flag — same "empty = MySQL default
-/// posture" convention as the temporal strict bit.
+/// Numeric SQL-mode bits share the cached mode word. The default includes
+/// ERROR_FOR_DIVISION_BY_ZERO; an explicitly empty mode disables it.
 pub const SQL_MODE_ERROR_FOR_DIVISION_BY_ZERO: u16 = 1 << 6;
 pub const SQL_MODE_NO_UNSIGNED_SUBTRACTION: u16 = 1 << 7;
 /// `NO_AUTO_VALUE_ON_ZERO`: an explicit `0` in an AUTO_INCREMENT column is
@@ -1203,13 +1196,30 @@ pub trait ResultCursor: Send + std::fmt::Debug {
 #[derive(Debug)]
 pub struct VecResultCursor {
     rows: std::vec::IntoIter<Vec<Value>>,
+    _charge: Option<crate::engine::executor::mem_budget::ScopedCharge>,
 }
 
 impl VecResultCursor {
     pub fn new(rows: Vec<Vec<Value>>) -> Self {
         Self {
             rows: rows.into_iter(),
+            _charge: None,
         }
+    }
+    pub(crate) fn new_governed(rows: Vec<Vec<Value>>) -> Result<Self, QueryError> {
+        use crate::engine::executor::mem_budget;
+        let mut charge =
+            mem_budget::ScopedCharge::for_budget(Some(Arc::new(mem_budget::MemBudget::from_env())));
+        let bytes = rows.iter().fold(
+            rows.capacity()
+                .saturating_mul(std::mem::size_of::<Vec<Value>>()),
+            |bytes, row| bytes.saturating_add(mem_budget::estimate_row_bytes(row)),
+        );
+        charge.add(bytes)?;
+        Ok(Self {
+            rows: rows.into_iter(),
+            _charge: Some(charge),
+        })
     }
 }
 
@@ -1820,6 +1830,11 @@ pub struct DmlStatementResult {
 }
 
 pub trait QueryEngine: Send + Sync + 'static {
+    /// Cheap readiness probe; storage engines must reject fail-stopped state.
+    fn is_ready(&self) -> bool {
+        true
+    }
+
     /// Admission for synchronous metadata work on a connection reactor.
     /// Engines without a mutable storage catalog need no permit.
     fn catalog_admission(&self) -> Option<&crate::util::catalog_admission::CatalogAdmission> {

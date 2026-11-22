@@ -5,6 +5,307 @@ use crate::{
 };
 use runtime::*;
 use serde_json::Value;
+
+#[tokio::test]
+async fn availability_readiness_rejects_fail_stopped_database() {
+    let (_dir, engine) = engine();
+    let state = runtime::State::new(
+        RestConfig::from_startup().unwrap(),
+        engine.clone(),
+        engine.registry().clone(),
+    );
+    let probe = |path: &'static str| {
+        endpoint(
+            State(state.clone()),
+            Extension(Peer {
+                host: "127.0.0.1".into(),
+                cipher: None,
+                version: None,
+                subject: None,
+                issuer: None,
+            }),
+            Request::builder().uri(path).body(Body::empty()).unwrap(),
+        )
+    };
+    assert_eq!(
+        probe("/health/ready").await.unwrap().status(),
+        StatusCode::OK
+    );
+    engine
+        .db_handle()
+        .quarantine_mvcc("injected consistency failure");
+    let response = probe("/health/ready").await.unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let body = to_bytes(response.into_body(), 1024).await.unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&body).unwrap(),
+        json!({"ready":false})
+    );
+    assert_eq!(
+        probe("/health/live").await.unwrap().status(),
+        StatusCode::OK
+    );
+    assert!(engine.execute("SELECT 1").is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_http_listener_failure_keeps_mysql_running() {
+    use mysql::prelude::Queryable;
+    let (_dir, engine) = engine();
+    let mysql_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mysql_addr = mysql_listener.local_addr().unwrap();
+    let mysql_engine = engine.clone();
+    let mysql_task = tokio::spawn(async move {
+        crate::mysql::server::MysqlServer::with_tls(
+            mysql_addr,
+            mysql_engine.clone(),
+            None,
+            mysql_engine.registry().clone(),
+        )
+        .run_with_listener(mysql_listener)
+        .await
+    });
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let failure = Arc::new(tokio::sync::Notify::new());
+    let mut config = RestConfig::from_startup().unwrap();
+    config.tls = false;
+    let mut server = RestServer::new(config, engine.clone(), engine.registry().clone(), None);
+    server.accept_failure = Some((addr, failure.clone()));
+    let late_key = test_key(&engine, "CREATE API KEY 'late'");
+    let state = server.state.clone();
+    let session = create_session(state.clone(), identity(&engine), Some("test".into()))
+        .await
+        .unwrap();
+    state
+        .sessions
+        .lock()
+        .insert(session.id.clone(), session.clone());
+    for sql in [
+        "CREATE TABLE pending_http (id INT PRIMARY KEY)",
+        "BEGIN",
+        "INSERT INTO pending_http VALUES (1)",
+    ] {
+        assert_eq!(
+            query(state.clone(), session.clone(), json!({"sql":sql}), false)
+                .await
+                .0,
+            StatusCode::OK
+        );
+    }
+    let http_task = tokio::spawn(async move { server.run_with_listener(listener).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let health = client
+        .get(format!("http://{addr}/health/live"))
+        .send()
+        .await
+        .unwrap();
+    assert!(health.status().is_success());
+    health.bytes().await.unwrap();
+    failure.notify_one();
+    assert!(tokio::time::timeout(Duration::from_secs(5), http_task)
+        .await
+        .unwrap()
+        .unwrap()
+        .is_err());
+    assert!(
+        !crate::mysql::shutdown::is_shutting_down(),
+        "HTTP failure must not request global shutdown"
+    );
+    assert!(!mysql_task.is_finished());
+    let late = client
+        .post(format!("http://{addr}/api/v1/sessions"))
+        .bearer_auth(&late_key)
+        .json(&json!({}))
+        .send()
+        .await;
+    assert!(
+        match &late {
+            Err(_) => true,
+            Ok(response) => response.status() == StatusCode::SERVICE_UNAVAILABLE,
+        },
+        "a retained HTTP connection admitted a session after listener shutdown"
+    );
+    assert!(session.closed.load(std::sync::atomic::Ordering::Acquire));
+    let crate::engine::api::QueryResponse::ResultSet(rows) =
+        engine.execute("SELECT COUNT(*) FROM pending_http").unwrap()
+    else {
+        panic!("expected rows")
+    };
+    assert_eq!(
+        rows.rows[0][0].to_display_string(),
+        "0",
+        "failed HTTP service must roll back its sessions"
+    );
+    tokio::task::spawn_blocking(move || {
+        let opts = mysql::OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(mysql_addr.port())
+            .user(Some("root"))
+            .pass(Some("root"))
+            .prefer_socket(false);
+        let mut connection = mysql::Conn::new(opts).unwrap();
+        connection
+            .query_drop("CREATE TABLE test.http_failure (id INT PRIMARY KEY)")
+            .unwrap();
+        connection
+            .query_drop("INSERT INTO test.http_failure VALUES (7)")
+            .unwrap();
+        assert_eq!(
+            connection
+                .query_first::<u64, _>("SELECT id FROM test.http_failure")
+                .unwrap(),
+            Some(7)
+        );
+    })
+    .await
+    .unwrap();
+    mysql_task.abort();
+    let _ = mysql_task.await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_dual_listener_failure_preserves_other_listener_and_transaction() {
+    for fail_primary in [true, false] {
+        let (_dir, engine) = engine();
+        let key = test_key(&engine, "CREATE API KEY 'survivor'");
+        let primary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let secondary = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let primary_addr = primary.local_addr().unwrap();
+        let secondary_addr = secondary.local_addr().unwrap();
+        let failed_addr = if fail_primary {
+            primary_addr
+        } else {
+            secondary_addr
+        };
+        let healthy_url = if fail_primary {
+            format!("http://{secondary_addr}")
+        } else {
+            format!("https://{primary_addr}")
+        };
+        let failure = Arc::new(tokio::sync::Notify::new());
+        let mut config = RestConfig::from_startup().unwrap();
+        config.enabled = true;
+        config.tls = true;
+        config.loopback_http_addr = Some(secondary_addr);
+        let tls = crate::mysql::server::load_or_generate_tls_acceptor(None).unwrap();
+        let mut server = RestServer::new(config, engine.clone(), engine.registry().clone(), tls);
+        server.accept_failure = Some((failed_addr, failure.clone()));
+        let task =
+            tokio::spawn(async move { server.run_with_listeners(primary, Some(secondary)).await });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .danger_accept_invalid_certs(true)
+            .pool_max_idle_per_host(0)
+            .timeout(Duration::from_secs(5))
+            .build()
+            .unwrap();
+        let response = client
+            .post(format!("{healthy_url}/api/v1/sessions"))
+            .bearer_auth(&key)
+            .json(&json!({"database":"test"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let session = response.json::<Value>().await.unwrap();
+        let id = session["id"].as_str().unwrap();
+        let sql_url = format!("{healthy_url}/api/v1/sessions/{id}/sql");
+        for sql in [
+            "CREATE TABLE survivor (id INT PRIMARY KEY)",
+            "BEGIN",
+            "INSERT INTO survivor VALUES (9)",
+        ] {
+            let response = client
+                .post(&sql_url)
+                .bearer_auth(&key)
+                .json(&json!({"sql":sql}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{sql}");
+        }
+        failure.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while tokio::net::TcpStream::connect(failed_addr).await.is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed listener socket was not closed");
+        assert!(!task.is_finished());
+        assert!(!crate::mysql::shutdown::is_shutting_down());
+        let response = client
+            .post(&sql_url)
+            .bearer_auth(&key)
+            .json(&json!({"sql":"COMMIT"}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let crate::engine::api::QueryResponse::ResultSet(rows) =
+            engine.execute("SELECT id FROM survivor").unwrap()
+        else {
+            panic!("expected rows")
+        };
+        assert_eq!(rows.rows[0][0], crate::types::Value::Int(9));
+        let response = client
+            .delete(format!("{healthy_url}/api/v1/sessions/{id}"))
+            .bearer_auth(&key)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        task.abort();
+        let _ = task.await;
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn availability_http_shutdown_rejects_racing_session_admission() {
+    let (_dir, engine) = engine();
+    let identity = identity(&engine);
+    let state = runtime::State::new(
+        RestConfig::from_startup().unwrap(),
+        engine.clone(),
+        engine.registry().clone(),
+    );
+    let sessions = state.sessions.lock();
+    let creating = tokio::spawn(create_session(state.clone(), identity.clone(), None));
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while state.registry.snapshot().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("session admission did not reach registration");
+    let closing = {
+        let state = state.clone();
+        tokio::spawn(async move {
+            state.begin_close();
+            state.close_all().await;
+        })
+    };
+    state.closing_notified().await;
+    drop(sessions);
+    assert!(creating.await.unwrap().is_err());
+    closing.await.unwrap();
+    assert!(create_session(state.clone(), identity, None).await.is_err());
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !state.registry.snapshot().is_empty() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late admission leaked its authenticated connection");
+    assert!(state.sessions.lock().is_empty());
+    assert_eq!(state.slots.available_permits(), state.config.max_sessions);
+}
+
 fn engine() -> (tempfile::TempDir, Arc<StorageQueryEngine>) {
     std::fs::create_dir_all("/tmp/mydb/rest").unwrap();
     let dir = tempfile::tempdir_in("/tmp/mydb/rest").unwrap();

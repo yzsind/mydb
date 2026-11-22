@@ -45,7 +45,7 @@ fn parse_call(parser: &mut Parser) -> Result<Expr, ParserError> {
     let returning = if parser.parse_keyword(Keyword::RETURNING) {
         parse_returning_type(parser)?
     } else {
-        "CHAR".to_owned()
+        "CHAR(512)".to_owned()
     };
     let mut on_empty = None;
     let mut on_error = None;

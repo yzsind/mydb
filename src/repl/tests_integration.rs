@@ -2202,7 +2202,7 @@ mod lifecycle_tests {
     }
 
     #[test]
-    fn audit_reset_clears_physical_replica_mode() {
+    fn audit_reset_preserves_physical_replica_read_only_mode() {
         let dir = TempDir::new().unwrap();
         let manager = build_manager("127.0.0.1:1".parse().unwrap(), dir.path().to_path_buf());
         manager
@@ -2213,14 +2213,14 @@ mod lifecycle_tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         manager.install_runtime_handle_for_tests(runtime.handle().clone());
         manager.handle_reset_replication().unwrap();
-        assert_eq!(manager.role(), Role::Standalone);
-        assert!(!manager
+        assert_eq!(manager.role(), Role::Replica);
+        assert!(manager
             .engine
             .database_for_replication()
             .physical_replica_mode());
         assert_eq!(
             crate::repl::role::load(dir.path()).unwrap().unwrap().role,
-            Role::Standalone
+            Role::Replica
         );
     }
 
