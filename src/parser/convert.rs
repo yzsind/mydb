@@ -4724,6 +4724,11 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
     match expr {
         SqlExpr::Nested(expr) => convert_expr(expr),
         SqlExpr::Identifier(ident) => {
+            if ident.value.contains('\0') {
+                return Err(parse_error_at_zero(
+                    "NUL is not allowed in an SQL identifier",
+                ));
+            }
             if ident.quote_style.is_none()
                 && (ident.value.eq_ignore_ascii_case("MOD")
                     || ident.value.eq_ignore_ascii_case("BOTH")

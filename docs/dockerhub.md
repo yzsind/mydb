@@ -4,6 +4,11 @@
 
 Mixed transactional and analytical workloads, with native AI retrieval.
 
+[GitHub repository](https://github.com/yzsind/mydb) ·
+[Documentation](https://github.com/yzsind/mydb/blob/main/docs/README.md) ·
+[Docker deployment guide](https://github.com/yzsind/mydb/blob/main/docs/docker.md) ·
+[Releases](https://github.com/yzsind/mydb/releases)
+
 MyDB is a general-purpose database built in Rust for HTAP (hybrid
 transactional/analytical processing) mixed workloads, AI agents, and MySQL
 compatibility. Transactional reads and writes and analytical queries share
@@ -11,7 +16,7 @@ the same engine and business data. Applications can evolve schemas, combine
 keyword and vector retrieval, and call external generation and embedding
 services through a familiar SQL interface.
 
-MyDB 1.0.1 is a public-preview release for feature validation and evaluation in
+MyDB 1.0.2 is a public-preview release for feature validation and evaluation in
 controlled environments. It is not yet a production-grade MySQL replacement,
 and on-disk formats are not guaranteed to be backward compatible.
 
@@ -27,7 +32,8 @@ and on-disk formats are not guaranteed to be backward compatible.
   core SQL, transactions, and supported ROW/FULL binlog integrations.
 - **Native vector search:** FLOAT32, FLOAT16, BFLOAT16, INT8, and BINARY vectors;
   HNSW and IVF indexes with memory or paged storage; optional quantization; and
-  exact nearest-neighbor scans.
+  exact nearest-neighbor scans. Numeric indexes support SQ8, SQ4, PQ, and BQ
+  quantization.
 - **Online schema evolution:** build regular and unique B-tree indexes and add
   primary keys with concurrent DML. Supported column and constraint changes
   reduce query blocking; some operations still require locks.
@@ -36,7 +42,8 @@ and on-disk formats are not guaranteed to be backward compatible.
 - **SQL extensions:** DML `RETURNING`, sequences, `generate_series()`, window
   functions, recursive CTEs, and `EXPLAIN ANALYZE`.
 - **Operations:** online physical backup, WAL archiving, point-in-time recovery,
-  native primary/replica replication, a recycle bin, and memory diagnostics.
+  direct read-only backup queries, native primary/replica replication, a recycle
+  bin, and memory diagnostics.
 - **Optional agent interfaces:** REST SQL and an MCP server share an optional
   HTTP listener. The quick start below exposes only the MySQL protocol port.
 
@@ -47,23 +54,28 @@ predicates, or persistent schema expressions. RRF is a technical preview.
 
 ## Performance overview
 
-Selected results reported in the project README:
+Selected MyDB vs. MySQL 8.0.46 results measured on November 17, 2026:
 
 | Workload | MyDB | MySQL 8.0 | Advantage |
 | --- | ---: | ---: | ---: |
-| Point queries, 100M rows, 20 clients | 316,968 queries/s | 174,566 queries/s | 1.82x throughput |
-| Read-only transactions, 100M rows, 20 clients | 14,323 transactions/s | 7,294 transactions/s | 1.96x throughput |
-| TPC-H-derived analytics, SF=10, sum of 22 query medians | 57.727 s | 882.784 s | 15.29x speedup |
-| TPC-DS-derived analytics, SF=10, 55 matching query files | 113.968 s | 2,576.552 s | 22.61x speedup |
-| Bulk import, TPC-H SF=10, `LOAD DATA LOCAL INFILE` | 25.708 s | 357.495 s | 13.91x speedup |
+| Point queries, 100M rows, 20 clients | 295,724 queries/s | 184,108 queries/s | 1.61x throughput |
+| Read-only transactions, 100M rows, 20 clients | 13,522 transactions/s | 7,477 transactions/s | 1.81x throughput |
+| TPC-H-derived analytics, SF=10, sum of 22 query medians | 50.636 s | 1,205.299 s | 23.80x speedup |
+| TPC-DS-derived analytics, SF=10, 84/99 matching query files | 92.427 s | 4,468.101 s | 48.34x speedup on that subset |
+| Bulk import, TPC-H SF=10, `LOAD DATA LOCAL INFILE` | 37.281 s | 374.490 s | 10.04x speedup |
 
 These measurements used the same 16-vCPU host, 10 GiB database memory limits,
-and durable commits. They cover different development builds; TPC-derived
-results are unaudited and are not official TPC benchmark results.
+and durable commits. TPC-DS totals cover only matching MyDB/MySQL files; this
+subset differs from the historical three-engine comparison. TPC-derived
+results are unaudited and are not official TPC benchmark results. See the
+[detailed comparison](https://github.com/yzsind/mydb/blob/main/docs/performance-comparison.md)
+for build identities, methodology, result differences, and limitations; these
+historical measurements do not benchmark the current Docker image.
 
-A later single-engine sysbench measurement on the November 16 release-candidate
-build reached **1,327,407 queries/s** point select (P95 0.55 ms) with 100M rows
-and 300 clients on 16 vCPU cores; see the public
+An independent single-engine sysbench measurement on November 16, 2026 reached
+**1,327,407 queries/s** point select (P95 0.55 ms) with 100M rows and 300 clients
+on 16 vCPU cores. It used a separate client host, sysbench's `special` access
+distribution, and one 300-second run; see the public
 [sysbench record](https://github.com/yzsind/mydb/blob/main/docs/sysbench-100m-300clients-2026-11-16.md).
 
 The public [November 14 Cohere HNSW result record](https://github.com/yzsind/mydb/blob/main/docs/vector-cohere-1m-hnsw-benchmark-2026-11-14.md)
@@ -144,6 +156,11 @@ The named volume retains database files across container replacement. Reuse it
 with a compatible image version to reopen the data. `docker stop` requests a
 graceful shutdown through SIGTERM.
 
+The `latest` tag can change. Record `SELECT VERSION()` and pin an image digest
+for repeatable deployments. Before changing images, check physical-format
+compatibility and preserve a verified backup; see
+[changing versions](https://github.com/yzsind/mydb/blob/main/docs/changing-versions.md).
+
 ## Try vector search
 
 Run the following in the `test` database:
@@ -196,6 +213,13 @@ To supply a complete configuration file, make it readable by the container
 user and mount it read-only:
 
 ```bash
+cat > ./mydb.cnf <<'EOF'
+[mydb]
+host = 0.0.0.0
+port = 8738
+data_dir = /var/lib/mydb
+durability = strict
+EOF
 chmod 0644 ./mydb.cnf
 
 docker run -d --name mydb-custom \
@@ -211,6 +235,10 @@ Keep `host = 0.0.0.0`, `port = 8738`, and `data_dir = /var/lib/mydb` in this
 configuration to match the published port and data volume. Configuration
 precedence is config file, then `MYDB_*` environment variables, then CLI
 arguments. Arguments after the image name are passed to the server.
+
+For supported persisted global variables, values saved by `SET PERSIST` are
+loaded after these startup inputs and can override them on an existing volume;
+see [configuration precedence](https://github.com/yzsind/mydb/blob/main/docs/configuration.md#precedence-and-when-settings-take-effect).
 
 Bind-mounted data directories must be writable by UID/GID `10001:10001`.
 On macOS Docker Desktop, use Linux named volumes for database files and backup
@@ -235,11 +263,6 @@ repositories.
 ## License
 
 MyDB is licensed under the Apache License 2.0.
-
-For supported persisted global variables, values saved by `SET PERSIST` are
-loaded after these startup inputs and can override them on an existing volume;
-see [configuration precedence](https://github.com/yzsind/mydb/blob/main/docs/configuration.md#precedence-and-when-settings-take-effect)
-in the full documentation.
 
 This file is the Docker Hub publication copy. Update it together with the project
 README and linked public reports when publishing; the

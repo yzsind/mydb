@@ -676,6 +676,24 @@ impl Database {
         if !index.is_fulltext() {
             return Ok(());
         }
+        // Published corpus counters are authoritative MVCC data, including
+        // an empty corpus with no header rows. Rebuilding postings must not
+        // allocate local transactions in a sealed source transaction domain.
+        if index.state != IndexState::Building {
+            return Ok(());
+        }
+        let definition = fulltext_corpus_definition(table, index)?;
+        let shared_public = table.indexes.iter().any(|other| {
+            other.is_fulltext()
+                && other.state == IndexState::Public
+                && other.fulltext.as_ref().map(|meta| meta.corpus_id)
+                    == index.fulltext.as_ref().map(|meta| meta.corpus_id)
+                && fulltext_corpus_definition(table, other)
+                    .is_ok_and(|other| other == definition)
+        });
+        if shared_public {
+            return Ok(());
+        }
         let counters = self.fulltext_counter_table(table.id)?;
         let txn = if is_temp_table_id(table.id) {
             self.begin_temp_txn()?
@@ -692,37 +710,17 @@ impl Database {
         let result = (|| {
             for storage_id in table.storage_ids() {
                 let prefix = self.fulltext_counter_prefix(table, index, storage_id)?;
-                let mut header = prefix.clone();
-                header.push(Value::Bytes(Vec::new()));
-                let key = Self::dd_selector_key(&counters, &counters.indexes[0], &header)?;
-                let definition = fulltext_corpus_definition(table, index)?;
-                let shared_public = table.indexes.iter().any(|other| {
-                    other.is_fulltext()
-                        && other.state == IndexState::Public
-                        && other.fulltext.as_ref().map(|meta| meta.corpus_id)
-                            == index.fulltext.as_ref().map(|meta| meta.corpus_id)
-                        && fulltext_corpus_definition(table, other)
-                            .is_ok_and(|other| other == definition)
-                });
-                let new_corpus = index.state == IndexState::Building && !shared_public;
-                if new_corpus {
-                    // A crash before index publication can leave committed
-                    // private counters and an unreserved offline index id.
-                    // Reinitialize that unreachable family on every new build.
-                    self.apply_catalog_row_replacement(
-                        txn,
-                        &CatalogRowReplacement {
-                            dd_table_id: counters.id,
-                            selector: CatalogRowSelector::PrefixValues(prefix.clone()),
-                            rows: Vec::new(),
-                        },
-                    )?;
-                } else if !self
-                    .prefix_index(&counters, &counters.indexes[0], key)?
-                    .is_empty()
-                {
-                    continue;
-                }
+                // A crash before index publication can leave committed
+                // private counters and an unreserved offline index id.
+                // Reinitialize that unreachable family on every new build.
+                self.apply_catalog_row_replacement(
+                    txn,
+                    &CatalogRowReplacement {
+                        dd_table_id: counters.id,
+                        selector: CatalogRowSelector::PrefixValues(prefix.clone()),
+                        rows: Vec::new(),
+                    },
+                )?;
                 let mut corpus_table = table.clone();
                 corpus_table.indexes = vec![index.clone()];
                 let pages = self.with_heap_read(storage_id, |heap| heap.page_count())?;

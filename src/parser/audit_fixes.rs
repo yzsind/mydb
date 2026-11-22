@@ -827,3 +827,40 @@ fn fuzz_round1_quoted_user_variable_identity() {
         }
     }
 }
+
+#[test]
+fn fuzz_empty_user_variable_names_roundtrip() {
+    for bits in [
+        0,
+        0x2e49,
+        crate::engine::api::SQL_MODE_ANSI_QUOTES,
+        crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES,
+    ] {
+        let _mode = ParserSqlModeGuard::activate(bits);
+        for sql in ["@``", "@''", "@\"\""] {
+            let Ok(expr) = parse_expr_fragment(sql) else {
+                continue;
+            };
+            assert_eq!(expr, Expr::UserVariable(String::new()));
+            let encoded = try_expr_to_sql(&expr).unwrap();
+            assert_eq!(
+                parse_expr_fragment(&encoded).unwrap(),
+                expr,
+                "{sql:?} encoded as {encoded:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fuzz_nul_compound_identifiers_are_rejected() {
+    for bits in [0, 0x4a46, crate::engine::api::SQL_MODE_ANSI_QUOTES] {
+        let _mode = ParserSqlModeGuard::activate(bits);
+        for sql in ["I@@.@\0@44", "a.@\0", "a.b@\0", "a@\0", "`a\0`.b"] {
+            assert!(
+                parse_expr_fragment(sql).is_err(),
+                "accepted NUL identifier: {sql:?}"
+            );
+        }
+    }
+}
