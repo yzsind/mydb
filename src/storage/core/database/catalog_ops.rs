@@ -1279,6 +1279,12 @@ impl Database {
         order: Option<TriggerOrderSchema>,
     ) -> Result<bool, QueryError> {
         let (database, name) = split_table_name(current_database, &trigger.name);
+        if name.chars().count() > 64 {
+            return Err(error(
+                crate::error::catalog::ER_TOO_LONG_IDENT,
+                format!("Identifier name '{name}' is too long"),
+            ));
+        }
         let (table_database, table_name) = split_table_name(current_database, &trigger.table_name);
         let key = trigger_key(&database, &name);
         let target_key = table_key(&table_database, &table_name);

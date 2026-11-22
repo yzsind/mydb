@@ -999,12 +999,10 @@ impl ReplicationManager {
                 .lock()
                 .map_err(|_| poisoned_lock("replication status lock poisoned"))?;
             let executed = status.executed_gtid_set.clone();
-            let retrieved = status.retrieved_gtid_set.clone();
             *status = ReplicationStatus::from_config(&cfg, &self.data_dir);
             status.executed_gtid_set = format_gtid_interval_map(&parse_gtid_interval_map(
                 &format!("{executed},{global_executed}"),
             ));
-            status.retrieved_gtid_set = retrieved;
         }
         if let (Ok(status), Ok(mut durable)) =
             (runtime.status.lock(), runtime.durable_io_progress.lock())
@@ -1557,13 +1555,11 @@ impl ReplicationManager {
 
     fn ensure_channel(&self, channel: &str) -> Result<Arc<ChannelRuntime>, QueryError> {
         validate_channel_name(channel)?;
-        if let Some(runtime) = self
+        let mut channels = self
             .channels
             .lock()
-            .map_err(|_| poisoned_lock("replication manager lock poisoned"))?
-            .get(channel)
-            .cloned()
-        {
+            .map_err(|_| poisoned_lock("replication manager lock poisoned"))?;
+        if let Some(runtime) = channels.get(channel).cloned() {
             return Ok(runtime);
         }
         let mut persisted = self.load_channel(channel)?;
@@ -1594,10 +1590,7 @@ impl ReplicationManager {
             progress_persist: Mutex::new(ProgressPersistState::default()),
             io_committed_pos: Mutex::new(None),
         });
-        self.channels
-            .lock()
-            .map_err(|_| poisoned_lock("replication manager lock poisoned"))?
-            .insert(channel.to_string(), Arc::clone(&runtime));
+        channels.insert(channel.to_string(), Arc::clone(&runtime));
         Ok(runtime)
     }
 
@@ -2089,6 +2082,10 @@ impl ChannelRunner {
         let mut reader = BufReader::new(file);
         let mut offset = applied;
         let mut txn_records: Vec<RelayRecord> = Vec::new();
+        let mut txn_memory = crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::BinlogTransient,
+            0,
+        )?;
         let mut pending_commits: Vec<PendingRelayCommit> = Vec::new();
         let mut pending_bytes = 0u64;
         let mut txn_bytes = 0u64;
@@ -2153,6 +2150,11 @@ impl ChannelRunner {
                     ));
                 }
             };
+            txn_memory.try_grow(
+                buf.len()
+                    .saturating_mul(2)
+                    .saturating_add(2 * std::mem::size_of::<RelayRecord>()),
+            )?;
             let boundary = matches!(
                 &record.op,
                 RelayOp::TxnCommit { .. }
@@ -2174,6 +2176,7 @@ impl ChannelRunner {
             )?;
             if boundary {
                 txn_bytes = 0;
+                txn_memory.shrink(txn_memory.bytes());
             }
             offset = next_offset;
         }
@@ -2442,13 +2445,14 @@ impl ChannelRunner {
             }
         }
         debug_assert!(!ops.iter().any(|op| matches!(op, RelayOp::Ddl { .. })));
-        let ops = ops
-            .into_iter()
-            .map(|op| self.decode_relay_rows(op))
-            .collect::<Result<Vec<_>, _>>()?;
         let txn = db.begin_txn()?;
         let result = with_replication_applier(|| {
-            apply_ops_to_storage(&self.engine, db, txn, &ops)?;
+            // Decode and apply one event at a time, keeping source transaction
+            // atomicity without retaining a second fully decoded transaction.
+            for op in ops {
+                let op = self.decode_relay_rows(op)?;
+                apply_ops_to_storage(&self.engine, db, txn, std::slice::from_ref(&op))?;
+            }
             write_current_row_receipt(db, txn)
         });
         match result {
@@ -3347,6 +3351,7 @@ impl ChannelRunner {
         .map_err(|err| io_error("decode source column metadata", err))?;
         let mut charsets = meta.iter_charset();
         let mut enum_charsets = meta.iter_enum_and_set_charset();
+        let mut signedness = meta.iter_signedness();
         let source_columns = target
             .iter_visible_columns()
             .map(|(i, _)| i)
@@ -3362,6 +3367,13 @@ impl ChannelRunner {
                     format!("invalid source column type: {err}"),
                 )
             })?;
+            if ty.is_some_and(|ty| ty.is_numeric_type()) {
+                if let Some(unsigned) = signedness.next() {
+                    if target.columns[target_index].unsigned != unsigned {
+                        Arc::make_mut(&mut target).columns[target_index].unsigned = unsigned;
+                    }
+                }
+            }
             let id = match ty {
                 Some(ty) if ty.is_character_type() => charsets.next(),
                 Some(ty) if ty.is_enum_or_set_type() => enum_charsets.next(),
@@ -3370,7 +3382,10 @@ impl ChannelRunner {
             if let Some(id) = id {
                 let id = id.map_err(|err| io_error("decode source charset", err))?;
                 let charset = crate::charset::resolve_collation_id_checked(id)?.charset;
-                Arc::make_mut(&mut target).columns[target_index].charset = Some(charset.to_owned());
+                if target.columns[target_index].charset.as_deref() != Some(charset) {
+                    Arc::make_mut(&mut target).columns[target_index].charset =
+                        Some(charset.to_owned());
+                }
             }
         }
         // TABLE_MAP includes all live columns (including virtual/invisible
@@ -3407,6 +3422,11 @@ impl ChannelRunner {
         let mut writes = Vec::new();
         let mut updates = Vec::new();
         let mut deletes = Vec::new();
+        let mut event_memory =
+            crate::engine::executor::mem_budget::ControlledMemoryCharge::try_new(
+                crate::engine::executor::mem_budget::ControlledMemoryCategory::BinlogTransient,
+                0,
+            )?;
         for row_result in rows.rows(table_map) {
             let (before, after) = row_result.map_err(|err| {
                 error(
@@ -3422,7 +3442,12 @@ impl ChannelRunner {
                             "write rows event has no after image",
                         )
                     })?;
-                    writes.push(convert_binlog_row(&target, &column_indices, row, None)?);
+                    let row = convert_binlog_row(&target, &column_indices, row, None)?;
+                    event_memory.try_grow(
+                        crate::engine::executor::mem_budget::estimate_row_bytes(&row)
+                            .saturating_add(2 * std::mem::size_of::<Vec<Value>>()),
+                    )?;
+                    writes.push(row);
                 }
                 RowsEventData::UpdateRowsEvent(_)
                 | RowsEventData::UpdateRowsEventV1(_)
@@ -3441,6 +3466,13 @@ impl ChannelRunner {
                     })?;
                     let before = convert_binlog_row(&target, &column_indices, before, None)?;
                     let after = convert_binlog_row(&target, &column_indices, after, Some(&before))?;
+                    event_memory.try_grow(
+                        crate::engine::executor::mem_budget::estimate_row_bytes(&before)
+                            .saturating_add(
+                                crate::engine::executor::mem_budget::estimate_row_bytes(&after),
+                            )
+                            .saturating_add(2 * std::mem::size_of::<RowUpdate>()),
+                    )?;
                     updates.push(RowUpdate { before, after });
                 }
                 RowsEventData::DeleteRowsEvent(_) | RowsEventData::DeleteRowsEventV1(_) => {
@@ -3450,7 +3482,12 @@ impl ChannelRunner {
                             "delete rows event has no before image",
                         )
                     })?;
-                    deletes.push(convert_binlog_row(&target, &column_indices, row, None)?);
+                    let row = convert_binlog_row(&target, &column_indices, row, None)?;
+                    event_memory.try_grow(
+                        crate::engine::executor::mem_budget::estimate_row_bytes(&row)
+                            .saturating_add(2 * std::mem::size_of::<Vec<Value>>()),
+                    )?;
+                    deletes.push(row);
                 }
             }
         }
@@ -4243,7 +4280,12 @@ fn apply_update_rows(
     let schema = db.table(&table_name)?;
     // HASH_SCAN for keyless tables: build a one-shot row index so each
     // before-image is an O(1) lookup instead of a full-table rescan.
-    let mut keyless = keyless_matcher(db, txn, &schema)?;
+    let mut keyless = keyless_matcher(
+        db,
+        txn,
+        &schema,
+        rows.iter().map(|row| row.before.as_slice()),
+    )?;
     for update in rows {
         let _partition = replication_partition_guard(&schema, &update.before)?;
         let before_match = match keyless.as_mut() {
@@ -4273,10 +4315,11 @@ fn apply_update_rows(
 /// HASH_SCAN optimisation is enabled (`MYDB_REPL_HASH_MATCH`, default on; `0`
 /// keeps the per-row full-scan `find_matching_row` path as a differential
 /// oracle). Keyed tables return `None` — their index lookup is already fast.
-fn keyless_matcher(
+fn keyless_matcher<'a>(
     db: &Arc<Database>,
     txn: TxnView,
     schema: &TableSchema,
+    images: impl IntoIterator<Item = &'a [Value]>,
 ) -> Result<Option<KeylessRowIndex>, QueryError> {
     if schema.is_partitioned()
         || has_usable_unique_index(schema)
@@ -4284,7 +4327,7 @@ fn keyless_matcher(
     {
         return Ok(None);
     }
-    Ok(Some(KeylessRowIndex::build(db, txn, schema)?))
+    Ok(Some(KeylessRowIndex::build(db, txn, schema, images)?))
 }
 
 fn apply_delete_rows(
@@ -4296,7 +4339,7 @@ fn apply_delete_rows(
 ) -> Result<(), QueryError> {
     let table_name = crate::storage::table_key(database, table);
     let schema = db.table(&table_name)?;
-    let mut keyless = keyless_matcher(db, txn, &schema)?;
+    let mut keyless = keyless_matcher(db, txn, &schema, rows.iter().map(Vec::as_slice))?;
     for row in rows {
         let _partition = replication_partition_guard(&schema, row)?;
         let matched = match keyless.as_mut() {
@@ -4384,11 +4427,14 @@ fn find_matching_row(
             return Ok(None);
         }
     }
-    let rows = db.scan_rows(&table.qualified_name(), txn)?;
-    Ok(rows
-        .into_iter()
-        .find(|row| row_values_match(table, &row.values, image))
-        .map(|row| row.row_id))
+    let mut matched = None;
+    db.dml_candidate_rows_with_origin_streaming_until(table, txn, |row| {
+        if row_values_match(table, &row.values, image) {
+            matched = Some(row.row_ref.row_id);
+        }
+        Ok(matched.is_some())
+    })?;
+    Ok(matched)
 }
 
 fn row_values_match(table: &TableSchema, left: &[Value], right: &[Value]) -> bool {
@@ -4446,19 +4492,53 @@ fn has_usable_unique_index(table: &TableSchema) -> bool {
 struct KeylessRowIndex {
     indices: Vec<usize>,
     map: std::collections::HashMap<Vec<String>, Vec<RowId>>,
+    _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
 }
 
 impl KeylessRowIndex {
-    fn build(db: &Arc<Database>, txn: TxnView, table: &TableSchema) -> Result<Self, QueryError> {
-        let rows = db.scan_rows(&table.qualified_name(), txn)?;
+    fn build<'a>(
+        db: &Arc<Database>,
+        txn: TxnView,
+        table: &TableSchema,
+        images: impl IntoIterator<Item = &'a [Value]>,
+    ) -> Result<Self, QueryError> {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
         let indices = replicated_image_indices(table).collect::<Vec<_>>();
-        let mut map: HashMap<Vec<String>, Vec<RowId>> = HashMap::with_capacity(rows.len());
-        for row in rows {
-            map.entry(Self::image_key(&indices, &row.values))
-                .or_default()
-                .push(row.row_id);
+        let mut charge =
+            ControlledMemoryCharge::try_new(ControlledMemoryCategory::BinlogTransient, 0)?;
+        let mut wanted: HashMap<Vec<String>, usize> = HashMap::new();
+        for image in images {
+            let key = Self::image_key(&indices, image);
+            charge.try_grow(
+                key.iter()
+                    .map(|s| s.capacity() + std::mem::size_of::<String>())
+                    .sum::<usize>()
+                    .saturating_add(128 + 2 * std::mem::size_of::<RowId>()),
+            )?;
+            *wanted.entry(key).or_default() += 1;
         }
-        Ok(Self { indices, map })
+        let mut map = HashMap::<Vec<String>, Vec<RowId>>::new();
+        let mut remaining = wanted.values().copied().sum::<usize>();
+        if remaining != 0 {
+            db.dml_candidate_rows_with_origin_streaming_until(table, txn, |row| {
+                let key = Self::image_key(&indices, &row.values);
+                if let Some(needed) = wanted.get_mut(&key) {
+                    if *needed != 0 {
+                        map.entry(key).or_default().push(row.row_ref.row_id);
+                        *needed -= 1;
+                        remaining -= 1;
+                    }
+                }
+                Ok(remaining == 0)
+            })?;
+        }
+        Ok(Self {
+            indices,
+            map,
+            _charge: charge,
+        })
     }
 
     fn image_key(indices: &[usize], image: &[Value]) -> Vec<String> {
@@ -5493,10 +5573,14 @@ fn parse_until_clause(body: &str) -> Result<UntilCondition, QueryError> {
             }
         }
     }
+    let before = before_gtids.is_some();
     match (file, pos, before_gtids, after_gtids) {
         (Some(f), Some(p), None, None) => Ok(UntilCondition::Position { file: f, pos: p }),
-        (None, None, Some(s), None) => Ok(UntilCondition::SqlBeforeGtids(s)),
-        (None, None, None, Some(s)) => Ok(UntilCondition::SqlAfterGtids(s)),
+        (None, None, Some(s), None) | (None, None, None, Some(s)) => {
+            crate::gtid::validate_set(&s).map_err(|err| error(crate::error::catalog::ER_MALFORMED_GTID_SET_SPECIFICATION, err.message()))?;
+            if before { Ok(UntilCondition::SqlBeforeGtids(s)) }
+            else { Ok(UntilCondition::SqlAfterGtids(s)) }
+        },
         _ => Err(error(crate::error::catalog::ER_PARSE_ERROR,
             "UNTIL requires SOURCE_LOG_FILE+SOURCE_LOG_POS, or SQL_BEFORE_GTIDS, or SQL_AFTER_GTIDS, or SQL_AFTER_MTS_GAPS — not a mix",
         )),
@@ -6961,8 +7045,8 @@ fn show_relaylog_events(sql: &str) -> Result<QueryResponse, QueryError> {
         .clone()
         .unwrap_or_else(|| DEFAULT_CHANNEL.to_string());
     let path = relay_log_path(&manager.data_dir, &channel);
-    let bytes = match fs::read(&path) {
-        Ok(b) => b,
+    let file = match File::open(&path) {
+        Ok(file) => file,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
             return Ok(QueryResponse::ResultSet(ResultSet {
                 columns,
@@ -6994,8 +7078,21 @@ fn show_relaylog_events(sql: &str) -> Result<QueryResponse, QueryError> {
     let mut skipped = 0usize;
     let skip = req.offset;
     let limit = req.limit.unwrap_or(usize::MAX);
-    for line in bytes.split(|&b| b == b'\n') {
-        let line_len = line.len() as u64 + 1; // +1 for the trailing \n
+    let mut reader = BufReader::new(file);
+    let mut line = Vec::new();
+    let mut result_bytes = 0usize;
+    while produced < limit {
+        line.clear();
+        let line_len = reader
+            .read_until(b'\n', &mut line)
+            .map_err(|err| io_error("read relay log", err))? as u64;
+        if line_len == 0 {
+            break;
+        }
+        while matches!(line.last(), Some(b'\n' | b'\r')) {
+            line.pop();
+        }
+
         let start_pos = pos;
         pos = pos.saturating_add(line_len);
         if line.is_empty() {
@@ -7007,7 +7104,7 @@ fn show_relaylog_events(sql: &str) -> Result<QueryResponse, QueryError> {
         let record: RelayRecord = match crate::storage::metadata::decode(
             crate::storage::metadata::RELAY,
             crate::storage::format_versions::MYSQL_RELAY_VERSION,
-            line,
+            &line,
         ) {
             Ok(r) => r,
             // A corrupt tail just terminates the scan — matches MySQL
@@ -7023,6 +7120,13 @@ fn show_relaylog_events(sql: &str) -> Result<QueryResponse, QueryError> {
         }
         let event_type = relay_op_event_type(&record.op, &record.gtid).to_string();
         let info = relay_op_info(&record.op, &record.gtid);
+        result_bytes = result_bytes.saturating_add(info.len()).saturating_add(256);
+        if rows.len() >= 100_000 || result_bytes > 64 * 1024 * 1024 {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "SHOW RELAYLOG EVENTS result exceeds 100000 events or 64 MiB; use LIMIT",
+            ));
+        }
         rows.push(vec![
             Value::String(log_name.clone()),
             Value::UInt(start_pos),
@@ -7954,10 +8058,14 @@ mod tests {
 
     #[test]
     fn parse_start_replica_handles_until_sql_after_gtids() {
-        let (_, until, _) =
-            parse_start_replica("START REPLICA UNTIL SQL_AFTER_GTIDS = 'uuid:1-9'").unwrap();
+        let (_, until, _) = parse_start_replica(
+            "START REPLICA UNTIL SQL_AFTER_GTIDS = '00000000-0000-4000-8000-000000000001:1-9'",
+        )
+        .unwrap();
         match until.unwrap() {
-            UntilCondition::SqlAfterGtids(set) => assert_eq!(set, "uuid:1-9"),
+            UntilCondition::SqlAfterGtids(set) => {
+                assert_eq!(set, "00000000-0000-4000-8000-000000000001:1-9")
+            }
             other => panic!("expected SqlAfterGtids, got {:?}", other),
         }
     }

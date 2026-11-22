@@ -87,7 +87,8 @@ fn trigger_cache() -> &'static Mutex<LruCache<TriggerCacheKey, Arc<RoutineProgra
 
 thread_local! {
     static ROUTINE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-    static TRIGGER_STACK: std::cell::RefCell<Vec<(String, String)>> =
+    // Trigger identity and resolved subject table; outer subjects remain protected.
+    static TRIGGER_STACK: std::cell::RefCell<Vec<(String, String, String)>> =
         const { std::cell::RefCell::new(Vec::new()) };
     /// Active routine invocations on this thread as `(is_function, db, name)`,
     /// used to enforce MySQL recursion rules: procedures may recurse up to
@@ -1292,8 +1293,7 @@ fn validate_function_stmt(stmt: &RoutineStmt) -> Result<(), QueryError> {
                     "Not allowed to return a result set from a function",
                 ));
             }
-            reject_restricted_sql_statement(&SessionContext::default(), &statement, None)
-                .map_err(|err| err.query_error())?;
+            reject_restricted_sql_statement(&statement).map_err(|err| err.query_error())?;
             let upper = sql.trim_start().to_ascii_uppercase();
             if upper.starts_with("START TRANSACTION")
                 || upper.starts_with("BEGIN")
@@ -2674,8 +2674,13 @@ pub(super) fn execute_trigger_body(
         trigger.database.to_ascii_lowercase(),
         trigger.name.to_ascii_lowercase(),
     );
-    if TRIGGER_STACK.with(|stack| stack.borrow().contains(&key)) {
-        return Err(trigger_self_table_error());
+    if TRIGGER_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .any(|(database, name, _)| (database, name) == (&key.0, &key.1))
+    }) {
+        return Err(trigger_self_table_error(&table.name));
     }
     struct TriggerInvocation;
     impl Drop for TriggerInvocation {
@@ -2685,7 +2690,11 @@ pub(super) fn execute_trigger_body(
             });
         }
     }
-    TRIGGER_STACK.with(|stack| stack.borrow_mut().push(key));
+    TRIGGER_STACK.with(|stack| {
+        stack
+            .borrow_mut()
+            .push((key.0, key.1, trigger.table_qualified_name()))
+    });
     let _invocation = TriggerInvocation;
     crate::util::stack::with_stack(
         crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
@@ -4569,7 +4578,7 @@ fn execute_parsed_statement_in_routine(
     retry_statement: &mut dyn FnMut() -> Result<crate::parser::Statement, QueryError>,
 ) -> Result<QueryResponse, RoutineExecError> {
     if forbid_transaction_control {
-        reject_restricted_sql_statement(session, &statement, trigger_table)?;
+        reject_restricted_sql_statement(&statement)?;
     }
     let previous_explicit = session.explicit_txn;
     let held_trigger_transaction = trigger_table.is_some() && session.current_txn.is_some();
@@ -4661,26 +4670,21 @@ fn execute_parsed_statement_in_routine(
 }
 
 pub(super) fn validate_trigger_sql_statement(
-    session: &SessionContext,
     statement: &crate::parser::Statement,
 ) -> Result<(), QueryError> {
     // The table self-write restriction is execution-dependent (1442), while
     // transaction/DDL restrictions can and should be checked at CREATE.
-    reject_restricted_sql_statement(session, statement, None).map_err(|err| err.query_error())
+    reject_restricted_sql_statement(statement).map_err(|err| err.query_error())
 }
 
 fn reject_restricted_sql_statement(
-    session: &SessionContext,
     statement: &crate::parser::Statement,
-    trigger_table: Option<&str>,
 ) -> Result<(), RoutineExecError> {
     use crate::parser::Statement;
-    let commit_error = || {
-        error(
-            crate::error::catalog::ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG,
-            "Explicit or implicit commit is not allowed in stored function or trigger",
-        )
-    };
+    let effects = crate::statement_effects::statement_effects(statement);
+    if effects.requires_implicit_commit || effects.ddl_or_maintenance {
+        return Err(trigger_commit_error().into());
+    }
     match statement {
         Statement::LockTables(_)
         | Statement::UnlockTables
@@ -4705,57 +4709,17 @@ fn reject_restricted_sql_statement(
         | Statement::ReleaseSavepoint(_)
         | Statement::SetAutocommit(_)
         | Statement::SetTransactionIsolation { .. }
-        | Statement::CreateTable(_)
-        | Statement::CreateTableLike { .. }
-        | Statement::AlterTable(_)
-        | Statement::CreateDatabase { .. }
-        | Statement::DropDatabase { .. }
-        | Statement::DropTable { .. }
-        | Statement::TruncateTable { .. }
-        | Statement::CreateIndex(_)
-        | Statement::DropIndex { .. }
-        | Statement::AnalyzeTable { .. }
-        | Statement::CreateView { .. }
-        | Statement::AlterView { .. }
-        | Statement::DropView { .. }
-        | Statement::CreateRoutine(_)
-        | Statement::AlterRoutine { .. }
-        | Statement::DropRoutine { .. }
-        | Statement::CreateTrigger(_)
-        | Statement::DropTrigger { .. }
-        | Statement::CreateUser(_)
-        | Statement::AlterUser(_)
-        | Statement::AlterUsers(_)
-        | Statement::DropUser { .. }
-        | Statement::RenameUser { .. }
-        | Statement::CreateRole { .. }
-        | Statement::DropRole { .. }
-        | Statement::Grant(_)
-        | Statement::Revoke(_)
-        | Statement::SetPassword { .. }
-        | Statement::SetDefaultRole(_)
-        | Statement::LoadData(_) => return Err(commit_error().into()),
-        Statement::Insert(insert)
-            if trigger_table.is_some_and(|trigger_table| {
-                same_table_name(&session.current_database, &insert.table, trigger_table)
-            }) =>
-        {
-            return Err(trigger_self_table_error().into());
-        }
-        Statement::Update(update)
-            if trigger_table.is_some_and(|trigger_table| {
-                same_table_name(&session.current_database, &update.table, trigger_table)
-            }) =>
-        {
-            return Err(trigger_self_table_error().into());
-        }
-        Statement::Delete(delete)
-            if trigger_table.is_some_and(|trigger_table| {
-                same_table_name(&session.current_database, &delete.table, trigger_table)
-            }) =>
-        {
-            return Err(trigger_self_table_error().into());
-        }
+        | Statement::LoadData(_)
+        | Statement::XaStart { .. }
+        | Statement::XaEnd { .. }
+        | Statement::XaPrepare { .. }
+        | Statement::XaCommit { .. }
+        | Statement::XaRollback { .. }
+        | Statement::ReplicationAdmin { .. }
+        | Statement::MydbReplicationAdmin { .. }
+        | Statement::BinlogAdmin { .. }
+        | Statement::Shutdown
+        | Statement::Restart => return Err(trigger_commit_error().into()),
         _ => {}
     }
     Ok(())
@@ -4767,9 +4731,40 @@ fn same_table_name(current_database: &str, left: &str, right: &str) -> bool {
     left_db == right_db && left_table == right_table
 }
 
-fn trigger_self_table_error() -> QueryError {
+pub(super) fn trigger_commit_error() -> QueryError {
+    error(
+        crate::error::catalog::ER_COMMIT_NOT_ALLOWED_IN_SF_OR_TRG,
+        "Explicit or implicit commit is not allowed in stored function or trigger",
+    )
+}
+
+pub(super) fn transaction_control_forbidden() -> bool {
+    TRIGGER_STACK.with(|stack| !stack.borrow().is_empty())
+        || ROUTINE_STACK.with(|stack| {
+            stack
+                .borrow()
+                .iter()
+                .any(|(is_function, _, _)| *is_function)
+        })
+}
+
+/// Called after view expansion and target binding, before reading/writing rows.
+/// Check every active trigger so indirect chains cannot modify an outer table.
+pub(super) fn check_trigger_write_target(table: &str) -> Result<(), QueryError> {
+    if TRIGGER_STACK.with(|stack| {
+        stack
+            .borrow()
+            .iter()
+            .any(|(_, _, target)| same_table_name("", table, target))
+    }) {
+        return Err(trigger_self_table_error(table));
+    }
+    Ok(())
+}
+
+fn trigger_self_table_error(table: &str) -> QueryError {
     error(crate::error::catalog::ER_CANT_UPDATE_USED_TABLE_IN_SF_OR_TRG,
-        "Can't update table in stored function/trigger because it is already used by statement which invoked this trigger",
+        format!("Can't update table '{table}' in stored function/trigger because it is already used by statement which invoked this stored function/trigger"),
     )
 }
 

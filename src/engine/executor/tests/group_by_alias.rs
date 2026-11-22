@@ -33,8 +33,10 @@ fn setup_vt(engine: &StorageQueryEngine) {
     engine
         .execute("CREATE TABLE vt (id INT PRIMARY KEY, d DATE, dt DATETIME(6))")
         .unwrap();
+    let mut session = zero_date_test_session();
     engine
-        .execute(
+        .execute_with_session(
+            &mut session,
             "INSERT INTO vt VALUES \
              (1, '2024-05-31', '2024-05-31 12:34:56.987654'), \
              (2, '1999-12-31', '1999-12-31 23:59:59'), \

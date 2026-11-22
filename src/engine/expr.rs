@@ -1598,7 +1598,7 @@ impl SessionView<'_> {
         sql_mode
             .split(',')
             .map(|m| m.trim())
-            .any(|m| m.eq_ignore_ascii_case("ONLY_FULL_GROUP_BY"))
+            .any(|m| m.eq_ignore_ascii_case("ONLY_FULL_GROUP_BY") || m.eq_ignore_ascii_case("ANSI"))
     }
     fn time_zone(&self) -> &str {
         match self {
@@ -17975,6 +17975,10 @@ where
     let path = crate::engine::func_cache::cached_json_path(&path_text)?;
     let nodes = path.eval(crate::engine::json::JsonbRef::new(&doc)?);
     if nodes.len() > 1 {
+        if on_error.eq_ignore_ascii_case("ERROR") {
+            return Err(crate::error::catalog::ER_MULTIPLE_JSON_VALUES
+                .error("More than one value was found by JSON_VALUE"));
+        }
         if args.len() == 2 {
             return Ok(Value::Null);
         }
@@ -18003,7 +18007,10 @@ where
         Ok(value) => Ok(value),
         Err(err) => {
             if on_error.eq_ignore_ascii_case("ERROR") {
-                return Err(err);
+                return Err(crate::error::catalog::ER_DATA_OUT_OF_RANGE.error(format!(
+                    "JSON_VALUE conversion to {returning} failed: {}",
+                    err.message()
+                )));
             }
             crate::engine::api::push_statement_condition(
                 crate::error::ConditionLevel::Warning,

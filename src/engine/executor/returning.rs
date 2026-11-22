@@ -11,6 +11,7 @@ pub(super) enum DefaultImage {
 pub(super) struct ReturningCollector {
     projector: Option<ReturningProjector>,
     rows: Vec<Vec<Value>>,
+    charge: super::mem_budget::ScopedCharge,
 }
 
 struct ReturningProjector {
@@ -35,12 +36,18 @@ impl ReturningCollector {
             return Ok(Self {
                 projector: None,
                 rows: Vec::new(),
+                charge: super::mem_budget::ScopedCharge::for_budget(None),
             });
         };
+        let charge = super::mem_budget::ScopedCharge::for_budget(Some(
+            super::mem_budget::current_budget()
+                .unwrap_or_else(|| Arc::new(super::mem_budget::MemBudget::from_env())),
+        ));
         let projector = ReturningProjector::new(clause, table, default_image, target_alias)?;
         Ok(Self {
             projector: Some(projector),
             rows: Vec::new(),
+            charge,
         })
     }
 
@@ -70,8 +77,12 @@ impl ReturningCollector {
                     "RETURNING requires the owning DML read view",
                 ));
             }
-            self.rows
-                .push(projector.project(old, new, old_ref, new_ref)?);
+            let row = projector.project(old, new, old_ref, new_ref)?;
+            self.charge.add(
+                super::mem_budget::estimate_row_bytes(&row)
+                    .saturating_add(2 * std::mem::size_of::<Vec<Value>>()),
+            )?;
+            self.rows.push(row);
         }
         Ok(())
     }

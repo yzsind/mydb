@@ -1,4 +1,5 @@
 mod ai;
+mod availability;
 mod bug_report_1107;
 mod collated_constant_in;
 mod critical_audit;
@@ -21,6 +22,7 @@ mod release_audit_1022;
 mod release_audit_1119;
 mod release_audit_1119_expr;
 mod release_audit_1121;
+mod release_audit_1122;
 mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;
@@ -37,6 +39,7 @@ mod table_ddl_audit_1027;
 mod table_ddl_audit_1120;
 mod tablesample;
 mod temporal_comparison_consistency;
+mod trigger_release_1122;
 mod txn_acid_audit_1108;
 mod vaderyang_issues;
 
@@ -61,6 +64,15 @@ pub(super) fn memory_test_storage_config() -> StorageConfig {
         startup_validation: crate::storage::StartupValidationMode::Off,
         startup_validate_indexes: false,
     }
+}
+
+pub(crate) fn zero_date_test_session() -> SessionContext {
+    let mut session = SessionContext::default();
+    session.sql_mode = "STRICT_TRANS_TABLES".to_string();
+    session.temporal_sql_mode_bits =
+        crate::engine::api::parse_temporal_sql_mode_bits(&session.sql_mode)
+            | crate::engine::api::TEMPORAL_MODE_EXPLICIT;
+    session
 }
 
 fn open_test_engine(dir: &std::path::Path) -> StorageQueryEngine {

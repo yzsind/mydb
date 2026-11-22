@@ -406,10 +406,29 @@ where
                 },
             ));
         }
-        let start = payload.len();
-        reserve_packet_payload(&mut payload, &mut memory_charge, new_total)?;
-        payload.resize(new_total, 0);
-        read_exact_with_timeout(reader, &mut payload[start..], read_timeout).await?;
+        // Grow only after receiving the previously admitted prefix. A peer
+        // sending a header alone retains at most one small read quantum.
+        let receive = async {
+            while payload.len() < new_total {
+                let start = payload.len();
+                let end = new_total.min(payload.capacity().saturating_mul(2).max(16 * 1024));
+                reserve_packet_payload(&mut payload, &mut memory_charge, end)?;
+                payload.resize(end, 0);
+                read_exact_with_timeout(reader, &mut payload[start..], None).await?;
+            }
+            Ok::<_, io::Error>(())
+        };
+        match read_timeout {
+            Some(timeout) => timeout_after_first_poll(timeout, receive)
+                .await
+                .map_err(|()| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "net_read_timeout exceeded; client stalled mid-packet",
+                    )
+                })??,
+            None => receive.await?,
+        }
         if frame_len < MAX_PAYLOAD_LEN {
             break;
         }
@@ -2672,5 +2691,29 @@ mod tests {
                 Some(CompressionAlgorithm::Zstd)
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod audit1122_incremental_input {
+    use super::*;
+    #[tokio::test]
+    async fn declared_large_packet_does_not_reserve_its_unsent_tail() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        let baseline = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        writer.write_all(&[0xff, 0xff, 0xff, 0]).await.unwrap();
+        let reading =
+            tokio::spawn(
+                async move { read_packet_with_limit(&mut reader, 32 * 1024 * 1024).await },
+            );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let current = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        assert!(
+            current.saturating_sub(baseline) < 1024 * 1024,
+            "a header-only client reserved {} bytes",
+            current.saturating_sub(baseline)
+        );
+        drop(writer);
+        assert!(reading.await.unwrap().is_err());
     }
 }

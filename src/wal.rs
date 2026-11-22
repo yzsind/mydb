@@ -2758,6 +2758,7 @@ impl LogManager {
             )
         })?;
         let lsn = next_lsn - 1;
+        let previous_next = self.next_lsn;
         self.next_lsn = next_lsn;
         self.state_atomics
             .next_lsn
@@ -2778,6 +2779,10 @@ impl LogManager {
         };
         rec.bytes[44..48].copy_from_slice(&checksum.to_le_bytes());
         if let Err(err) = self.buffer_frame_bytes(&rec.bytes) {
+            self.next_lsn = previous_next;
+            self.state_atomics
+                .next_lsn
+                .store(previous_next, Ordering::Release);
             rec.retain_large_buffer = false;
             return Err(err);
         }
@@ -2936,9 +2941,6 @@ impl LogManager {
         self.state_atomics
             .active_size_bytes
             .store(self.active_info.size_bytes, Ordering::Release);
-        if self.pending_write_bytes.len() >= self.write_buffer_bytes {
-            self.flush_pending_writes()?;
-        }
         Ok(())
     }
 
@@ -2990,9 +2992,6 @@ impl LogManager {
         self.state_atomics
             .active_size_bytes
             .store(self.active_info.size_bytes, Ordering::Release);
-        if self.pending_write_bytes.len() >= self.write_buffer_bytes {
-            self.flush_pending_writes()?;
-        }
         Ok(())
     }
 
@@ -3155,6 +3154,25 @@ impl LogManager {
         txn_id: u64,
         payload: WalPayload,
     ) -> Result<u64, QueryError> {
+        let result = self.append_reserved_inner(lsn, txn_id, payload);
+        // A rejected reservation has no accepted bytes or transaction link.
+        // Reuse it before any later append can publish a hole in the stream.
+        if result.is_err()
+            && self.active_info.last_lsn < lsn
+            && lsn.checked_add(1) == Some(self.next_lsn)
+        {
+            self.next_lsn = lsn;
+            self.state_atomics.next_lsn.store(lsn, Ordering::Release);
+        }
+        result
+    }
+
+    fn append_reserved_inner(
+        &mut self,
+        lsn: u64,
+        txn_id: u64,
+        payload: WalPayload,
+    ) -> Result<u64, QueryError> {
         let next_lsn = lsn.checked_add(1).ok_or_else(|| {
             error(
                 crate::error::catalog::ER_GET_ERRNO,
@@ -3306,15 +3324,6 @@ impl LogManager {
                 _ => false,
             }
         }
-        fn clear_remote_binlog(payload: &mut WalPayload) {
-            match payload {
-                WalPayload::CommitTxn { binlog, .. } => *binlog = None,
-                WalPayload::TxnBatch { records } => {
-                    records.iter_mut().for_each(clear_remote_binlog)
-                }
-                _ => {}
-            }
-        }
         if !has_remote_binlog(&frame.payload) {
             return self.append_replication_frame(bytes, frame);
         }
@@ -3322,7 +3331,7 @@ impl LogManager {
             // Source binlog coordinates describe files owned by the source.
             // Preserve transaction identity/LSNs and strip only those foreign
             // references before persisting the local recovery stream.
-            clear_remote_binlog(&mut frame.payload);
+            clear_remote_binlog_refs(&mut frame.payload);
             let payload = &frame.payload;
             let mut local =
                 Vec::with_capacity(WAL_FRAME_HEADER_LEN + encoded_payload_len(payload)?);
@@ -4062,6 +4071,14 @@ pub struct ReplicationFrame {
     pub header: WalRecordHeader,
     pub payload: WalPayload,
     pub frame_len: usize,
+}
+
+pub(crate) fn clear_remote_binlog_refs(payload: &mut WalPayload) {
+    match payload {
+        WalPayload::CommitTxn { binlog, .. } => *binlog = None,
+        WalPayload::TxnBatch { records } => records.iter_mut().for_each(clear_remote_binlog_refs),
+        _ => {}
+    }
 }
 
 /// v34: source time at [36..44], CRC at [44..48].
@@ -11567,5 +11584,38 @@ mod zero_fill_pacing_contract_tests {
             std::io::ErrorKind::InvalidInput
         );
         pace_segment_zero_fill(&file, u64::MAX, 0).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod audit1122_append_failures {
+    use super::*;
+
+    #[test]
+    fn rejected_os_write_does_not_consume_a_wal_lsn() {
+        for preencoded in [false, true] {
+            let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let mut log = LogManager::open(dir.path()).unwrap();
+            log.set_write_buffer_enabled(false).unwrap();
+            let before = log.next_lsn();
+            let writable = log.active_file.clone();
+            log.active_file = Arc::new(File::open(&log.active_info.path).unwrap());
+            let payload = || WalPayload::FileDelete {
+                path: "unused".into(),
+                before: Vec::new(),
+            };
+            let result = if preencoded {
+                let mut record = LogManager::pre_encode_record(0, payload()).unwrap();
+                log.append_pre_encoded_core(&mut record, false)
+            } else {
+                log.append(0, payload())
+            };
+            assert!(result.is_err(), "a read-only descriptor must reject pwrite");
+            assert_eq!(log.next_lsn(), before);
+            log.active_file = writable;
+            assert_eq!(log.append(0, payload()).unwrap(), before);
+            log.flush().unwrap();
+            assert_eq!(LogManager::scan(dir.path()).unwrap().next_lsn, before + 1);
+        }
     }
 }

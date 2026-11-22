@@ -2016,7 +2016,7 @@ fn ctas_does_not_apply_protocol_collation_to_numeric_or_temporal_expressions() {
             .as_ref()
             .map(crate::storage::value_to_string)
             .as_deref(),
-        Some("0000-00-00 00:00:00")
+        None
     );
     assert!(temporal.columns[0].charset.is_none());
     assert!(temporal.columns[0].collation.is_none());

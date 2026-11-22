@@ -16989,7 +16989,7 @@ fn multi_valued_index_access(
             })?;
     let ast = expr_part.ast.as_ref()?;
     let source = multi_valued_index_source_expr(ast).unwrap_or(ast);
-    let fp = crate::engine::expr_program::expr_fingerprint(source);
+    let fp = crate::engine::expr_program::unqualified_expr_fingerprint(source);
     let values = values_by_expr.get(&fp)?;
 
     let mut prefix = Vec::with_capacity(multi_pos);
@@ -18198,7 +18198,7 @@ fn collect_multi_valued_index_constraints(
             let Some(value) = expr_to_plan_constraint(&args[0]) else {
                 return;
             };
-            let fp = crate::engine::expr_program::expr_fingerprint(&args[1]);
+            let fp = crate::engine::expr_program::unqualified_expr_fingerprint(&args[1]);
             values_by_expr.entry(fp).or_default().push(value);
         }
         Expr::Function { name, args, .. }
@@ -18213,14 +18213,14 @@ fn collect_multi_valued_index_constraints(
                 let Some(value) = expr_to_single_json_array_candidate(&args[1]) else {
                     return;
                 };
-                let fp = crate::engine::expr_program::expr_fingerprint(&source);
+                let fp = crate::engine::expr_program::unqualified_expr_fingerprint(&source);
                 values_by_expr.entry(fp).or_default().push(value);
                 return;
             };
             let Some(value) = expr_to_single_json_array_candidate(value) else {
                 return;
             };
-            let fp = crate::engine::expr_program::expr_fingerprint(source);
+            let fp = crate::engine::expr_program::unqualified_expr_fingerprint(source);
             values_by_expr.entry(fp).or_default().push(value);
         }
         Expr::Function { name, args, .. }
@@ -18233,7 +18233,7 @@ fn collect_multi_valued_index_constraints(
             } else {
                 return;
             };
-            let fp = crate::engine::expr_program::expr_fingerprint(source);
+            let fp = crate::engine::expr_program::unqualified_expr_fingerprint(source);
             values_by_expr.entry(fp).or_default().extend(values);
         }
         _ => {}

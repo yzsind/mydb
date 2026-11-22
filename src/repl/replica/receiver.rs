@@ -186,6 +186,14 @@ impl Receiver {
         {
             Ok(Ok(Message::HandshakeAck(a))) => a,
             Ok(Ok(Message::Close(close))) => {
+                if close.reason.starts_with("replica UUID ")
+                    && close.reason.ends_with(" is already connected")
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
+                        close.reason,
+                    ));
+                }
                 return Err(QueryError::internal_control(
                     crate::error::InternalErrorKind::ReplicaHandshakeRejected,
                     crate::error::catalog::ER_SOURCE_FATAL_ERROR_READING_BINLOG,
@@ -301,7 +309,7 @@ impl Receiver {
         let idle_timeout = self
             .config
             .heartbeat
-            .max(Duration::from_millis(ack.heartbeat_ms.max(1)))
+            .max(Duration::from_millis(ack.heartbeat_ms.clamp(1, 60_000)))
             .saturating_mul(6)
             .max(Duration::from_secs(5));
         let mut idle_check =

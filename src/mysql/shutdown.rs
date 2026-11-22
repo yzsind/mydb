@@ -54,7 +54,6 @@ impl ShutdownIntent {
 #[derive(Debug, Clone)]
 pub enum ShutdownSource {
     Signal(&'static str),
-    HttpListener,
     Sql { conn_id: u32, user: String },
     Com { conn_id: u32 },
     Restart { conn_id: u32, user: String },
@@ -64,7 +63,6 @@ impl ShutdownSource {
     fn describe(&self) -> String {
         match self {
             ShutdownSource::Signal(name) => format!("signal {name}"),
-            ShutdownSource::HttpListener => "HTTP listener failed".into(),
             ShutdownSource::Sql { conn_id, user } => {
                 format!("SQL SHUTDOWN (connection {conn_id}, user {user})")
             }

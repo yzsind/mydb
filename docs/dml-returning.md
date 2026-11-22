@@ -24,7 +24,9 @@ format is unchanged.
 ## Execution and Compatibility Boundaries
 
 The returning projection is evaluated inside the transaction, before commit; a
-projection error rolls back the whole statement. The final row after defaults,
+projection error rolls back the whole statement. Returned rows are materialized
+under the query memory budget. If they exceed admission, error 1037 rolls back the
+whole statement; reduce the statement result size or adjust the budget. The final row after defaults,
 auto-increment, coercion, generated columns, and BEFORE triggers is what goes into
 NEW. INSERT…SELECT continues to be processed in chunks of 4,096 rows and preserves
 output order.

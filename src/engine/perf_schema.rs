@@ -465,7 +465,7 @@ pub(crate) fn rows(
         "memory_summary_global_by_event_name" => Ok(memory_summary_global_rows()),
         "keyring_keys" => Ok(keyring_keys_rows()),
         "keyring_component_status" => Ok(keyring_component_status_rows()),
-        "variables_info" => Ok(variables_info_rows(db)),
+        "variables_info" => Ok(variables_info_rows()),
         "events_transactions_current" => {
             if crate::engine::perf_setup::consumer_enabled("events_transactions_current") {
                 Ok(events_transactions_current_rows(db, registry))
@@ -542,20 +542,16 @@ pub(crate) fn rows(
         "status_by_account" => Ok(status_by_account_rows(registry)),
         "status_by_host" => Ok(status_by_host_rows(registry)),
         "status_by_user" => Ok(status_by_user_rows(registry)),
-        "global_variables" => Ok(
-            crate::engine::information_schema::system_variables_rows_scoped(
-                db,
-                crate::engine::sysvar::Scope::Global,
-            ),
+        "global_variables" => crate::engine::information_schema::system_variables_rows_scoped(
+            db,
+            crate::engine::sysvar::Scope::Global,
         ),
-        "session_variables" => Ok(
-            crate::engine::information_schema::system_variables_rows_scoped(
-                db,
-                crate::engine::sysvar::Scope::Session,
-            ),
+        "session_variables" => crate::engine::information_schema::system_variables_rows_scoped(
+            db,
+            crate::engine::sysvar::Scope::Session,
         ),
         "persisted_variables" => Ok(persisted_variables_rows(db)),
-        "variables_by_thread" => Ok(variables_by_thread_rows(db, registry, request)),
+        "variables_by_thread" => variables_by_thread_rows(db, registry, request),
         "user_variables_by_thread" => Ok(user_variables_by_thread_rows(registry, request)),
         "error_log" => Ok(crate::engine::logging::error_log_rows()),
         "session_connect_attrs" => Ok(session_connect_attrs_rows(registry, false)),
@@ -942,11 +938,11 @@ fn keyring_component_status_rows() -> Vec<Vec<Value>> {
 
 /// System-variable provenance. Runtime SETs and registry-applied startup
 /// settings carry their actual source; untouched defaults have no audit trail.
-fn variables_info_rows(db: &Database) -> Vec<Vec<Value>> {
-    crate::engine::sysvar::snapshot(crate::engine::sysvar::Scope::Global, None, Some(db))
-        .into_iter()
-        .map(|row| {
-            let name = row.name;
+fn variables_info_rows() -> Vec<Vec<Value>> {
+    crate::engine::sysvar::registry()
+        .iter()
+        .map(|var| {
+            let name = var.def.name;
             let provenance = crate::engine::sysvar::registry().provenance(name);
             vec![
                 s(name),                                                 // VARIABLE_NAME
@@ -1001,7 +997,7 @@ fn variables_by_thread_rows(
     db: &Database,
     registry: &crate::engine::session_registry::SessionRegistry,
     request: &crate::engine::information_schema::SystemScanRequest,
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>, QueryError> {
     let wanted_thread = equality_u64(request, "thread_id");
     let wanted_variable = equality_value(request, "variable_name").map(Value::to_display_string);
     let active_thread =
@@ -1013,7 +1009,7 @@ fn variables_by_thread_rows(
                 session,
                 Some(db),
             )
-        });
+        })?;
     let processes = registry.snapshot();
     let mut out = Vec::new();
     // Always emit a row set for the currently-executing thread (the one
@@ -1061,7 +1057,7 @@ fn variables_by_thread_rows(
             }
         }
     }
-    out
+    Ok(out)
 }
 
 fn user_variables_by_thread_rows(

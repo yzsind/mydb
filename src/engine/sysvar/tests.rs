@@ -358,7 +358,9 @@ fn enum_coercion_accepts_case_insensitive() {
 #[test]
 fn snapshot_returns_a_value_for_every_variable() {
     let s = SessionContext::default();
-    let rows = registry().snapshot_for_show(Scope::Session, Some(&s), None);
+    let rows = registry()
+        .snapshot_for_show(Scope::Session, Some(&s), None)
+        .unwrap();
     assert_eq!(rows.len(), registry().len());
     for row in &rows {
         // VALUEs may legitimately be empty (`init_connect`), but must be
@@ -370,7 +372,9 @@ fn snapshot_returns_a_value_for_every_variable() {
 #[test]
 fn snapshot_is_sorted_by_name() {
     let s = SessionContext::default();
-    let rows = registry().snapshot_for_show(Scope::Session, Some(&s), None);
+    let rows = registry()
+        .snapshot_for_show(Scope::Session, Some(&s), None)
+        .unwrap();
     let mut sorted = rows.clone();
     sorted.sort_by(|a, b| a.name.cmp(b.name));
     assert_eq!(
@@ -540,6 +544,7 @@ fn audit_scope_defaults_and_validation() {
             .unwrap();
         assert_eq!(
             r.snapshot_for_show(Scope::Global, Some(&peer), None)
+                .unwrap()
                 .into_iter()
                 .find(|v| v.name == name)
                 .unwrap()
@@ -571,7 +576,7 @@ fn audit_scope_defaults_and_validation() {
             )
             .unwrap_err()
             .code(),
-            1238
+            1621
         );
         assert_eq!(
             r.read(name, Scope::Global, Some(&old), None).unwrap(),

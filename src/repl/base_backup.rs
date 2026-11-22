@@ -881,7 +881,7 @@ pub async fn perform_base_backup_into(
         master_port,
         replica_uuid,
         data_dir,
-        crate::repl::config::ReplConfig::from_env(),
+        crate::repl::config::ReplConfig::from_env_checked()?,
     )
     .await
 }
@@ -1266,8 +1266,8 @@ pub(crate) async fn perform_base_backup_into_with_config(
 }
 
 /// Best-effort wipe of the directories the base backup will rewrite.
-/// Leaves the rest of `data_dir` untouched (e.g. the replica's own
-/// slot registry) — recovery on the next `Database::open` reconciles
+/// Retires source-owned slot state along with the authoritative storage
+/// generation. Recovery on the next `Database::open` reconciles
 /// the freshly-installed pages with the empty WAL.
 const INSTALL_JOURNAL: &str = "system/replication/base_backup_install.json";
 const PREVIOUS_ROOT: &str = ".native-repl-previous";
@@ -1287,6 +1287,7 @@ const INSTALL_TARGETS: &[&str] = &[
     "ddl",
     "system/replication/replica_progress.json",
     "system/replication/role.json",
+    "system/replication/slots",
 ];
 
 struct BackupStagingCleanup {

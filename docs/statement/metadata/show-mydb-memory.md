@@ -64,7 +64,7 @@ LIMIT_BYTES is not necessarily a component-exclusive quota; USED_PCT across rows
 | storage.scratch, partition.dml_batch/ddl/stats, ddl.alter_copy_batch, system.controlled_memory | The same process operational budget |
 | system.process_private_footprint | The process managed budget |
 | buffer_pool.raw_total/raw_active/raw_recycled | The same buffer pool capacity |
-| executor.query_execution | The overall execution memory budget |
+| executor.query_execution | The shared process operational budget; CURRENT_BYTES and PEAK_BYTES cover the same controlled execution category |
 | executor.work_area_reserved/work_area_used | The same work area target |
 | storage.undo_resident | The undo cache upper bound; NULL when not configured |
 | Other controlled categories | No component-exclusive quota; NULL |

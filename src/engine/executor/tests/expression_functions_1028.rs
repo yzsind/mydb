@@ -252,13 +252,13 @@ fn e20_e21_temporal_comparison_diagnostics() {
         };
         assert_eq!(warnings.rows.len(), 1, "{mode:?}: {:?}", warnings.rows);
         for _ in 0..4 {
-            let QueryResponse::ResultSet(result) = engine
-                .execute("SELECT COUNT(*) FROM t WHERE dt='0000-00-00'")
-                .unwrap()
-            else {
-                panic!()
-            };
-            assert_eq!(result.rows, vec![vec![Value::Int(0)]]);
+            assert_eq!(
+                engine
+                    .execute("SELECT COUNT(*) FROM t WHERE dt='0000-00-00'")
+                    .unwrap_err()
+                    .code(),
+                1525
+            );
         }
         engine
             .execute_with_session(

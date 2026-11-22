@@ -29,6 +29,7 @@
 //! when finer per-partition statistics aren't available.
 
 use crate::storage::{DataTypeKind, Database, TableSchema};
+use crate::types::QueryError;
 
 /// Snapshot of the statistics columns shared by `SHOW TABLE STATUS`,
 /// `information_schema.tables`, and `information_schema.partitions`.
@@ -56,10 +57,10 @@ pub(crate) struct TableStatsView {
 impl TableStatsView {
     /// Statistics for the whole table (sum across all partitions when
     /// the table is partitioned).
-    pub(crate) fn for_table(db: &Database, table: &TableSchema) -> Self {
+    pub(crate) fn for_table(db: &Database, table: &TableSchema) -> Result<Self, QueryError> {
         let rows = effective_row_count(db, table);
-        let phys = sum_physical_allocation(db, table, &table.storage_ids());
-        Self::from_rows(db, table, rows, phys)
+        let phys = sum_physical_allocation(db, table, &table.storage_ids())?;
+        Ok(Self::from_rows(db, table, rows, phys))
     }
 
     /// Statistics for one physical partition leaf. Prefer persistent
@@ -75,10 +76,10 @@ impl TableStatsView {
         _partition_count: usize,
         _partition_index: usize,
         partition_storage_id: u64,
-    ) -> Self {
+    ) -> Result<Self, QueryError> {
         let total_rows = effective_row_count(db, table);
         let mut phys =
-            sum_physical_allocation(db, table, std::slice::from_ref(&partition_storage_id));
+            sum_physical_allocation(db, table, std::slice::from_ref(&partition_storage_id))?;
         if phys.heap_pages == 0 {
             if let Some(stats) = table.stats.partition_stats.get(&partition_storage_id) {
                 phys.heap_pages = stats.heap_page_count;
@@ -132,7 +133,7 @@ impl TableStatsView {
                 remaining / count + u64::from((position as u64) < remaining % count)
             }
         };
-        Self::from_rows(db, table, rows, phys)
+        Ok(Self::from_rows(db, table, rows, phys))
     }
 
     fn from_rows(db: &Database, table: &TableSchema, rows: u64, phys: PhysicalAllocation) -> Self {
@@ -210,7 +211,7 @@ fn sum_physical_allocation(
     db: &Database,
     table: &TableSchema,
     storage_ids: &[u64],
-) -> PhysicalAllocation {
+) -> Result<PhysicalAllocation, QueryError> {
     let mut phys = PhysicalAllocation::default();
     for storage_id in storage_ids {
         phys.heap_pages = phys
@@ -221,10 +222,10 @@ fn sum_physical_allocation(
         phys.lob_free_pages = phys.lob_free_pages.saturating_add(lob_free_pages);
     }
     for index in table.iter_public_indexes() {
-        let bytes = storage_ids
-            .iter()
-            .map(|storage_id| db.index_storage_bytes(table, *storage_id, index))
-            .fold(0u64, u64::saturating_add);
+        let mut bytes = 0u64;
+        for storage_id in storage_ids {
+            bytes = bytes.saturating_add(db.index_storage_bytes(table, *storage_id, index)?);
+        }
         if bytes > 0 {
             phys.index_bytes = phys.index_bytes.saturating_add(bytes);
             continue;
@@ -235,7 +236,7 @@ fn sum_physical_allocation(
             .index_fallback_bytes_per_row
             .saturating_add(bytes_per_row);
     }
-    phys
+    Ok(phys)
 }
 
 /// Compute the `CREATE_OPTIONS` string MySQL reports for a table.
@@ -290,7 +291,7 @@ pub(crate) fn table_row_format(table: &TableSchema) -> &'static str {
 ///
 /// We saturate at every step so a buggy or stale counter never wraps
 /// the returned value.
-fn effective_row_count(db: &Database, table: &TableSchema) -> u64 {
+pub(crate) fn effective_row_count(db: &Database, table: &TableSchema) -> u64 {
     (table.stats.row_count as i128 + db.table_live_row_delta(table.id) as i128)
         .clamp(0, u64::MAX as i128) as u64
 }

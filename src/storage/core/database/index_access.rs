@@ -655,6 +655,7 @@ impl Database {
     /// See `doc_old/design/index-page-max-trx-2026-07.md`.
     #[inline]
     pub(crate) fn index_page_all_visible(&self, page_max_trx_id: u64, view: TxnView) -> bool {
+        let page_max_trx_id = page_max_trx_id.max(self.recovered_index_writer_bound);
         // Offline rebuilds contain physical rows of surviving XA branches.
         // Their zero bulk-load bound cannot prove transaction visibility.
         if self.xa_prepared_active.load(Ordering::Acquire) != 0
@@ -2719,7 +2720,7 @@ impl Database {
                 filter_terms,
                 |bound| {
                     index_page_max_trx_shortcut_enabled()
-                        && bound <= prefix
+                        && bound.max(self.recovered_index_writer_bound) <= prefix
                         && !self.retained_deletes_need_heap(txn)
                 },
                 |key, row_id| {
@@ -3366,7 +3367,7 @@ impl Database {
                 // order and allocation/registration holes, without forcing GC.
                 let prefix =
                     *snapshot_prefix.get_or_insert_with(|| self.index_snapshot_writer_prefix(txn));
-                if page_bound <= prefix {
+                if page_bound.max(self.recovered_index_writer_bound) <= prefix {
                     self.record_index_page_max_trx_shortcut_hit();
                     true
                 } else {

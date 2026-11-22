@@ -350,7 +350,7 @@ per-table `.ai` file, and ROLLBACK does not reclaim allocated values.
 
 Closing the loop on MySQL 8.0 semantics:
 
-- **sql_mode-aware numeric/string coercion**: strict out-of-range 1264 / overlong 1406 hard errors; non-strict saturating clamp/truncation + warnings 1264/1265. Numeric, string, and temporal writes follow consistent conversion rules. Session and global default `sql_mode=ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO`; an explicitly empty mode and new sessions inheriting an empty global mode both execute in non-strict mode.
+- **sql_mode-aware numeric/string coercion**: strict out-of-range 1264 / overlong 1406 hard errors; non-strict saturating clamp/truncation + warnings 1264/1265. Numeric, string, and temporal writes follow consistent conversion rules. Session and global default `sql_mode=ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION`; an explicitly empty mode and new sessions inheriting an empty global mode both execute in non-strict mode.
 - **Omitting a NOT NULL column without default**: strict reports 1364; non-strict stores the implicit default + warning 1364 (distinct from 1048 for an explicit NULL).
 - **Explicit NULL into NOT NULL**: strict mode reports 1048; non-strict multi-row INSERT and
   INSERT…SELECT are fixed to store the type's implicit default with warning 1048, while single-row VALUES/SET still reports 1048,
@@ -748,6 +748,9 @@ MEMBER OF distinguishes a JSON DATE from a JSON string with the same text,
 consistently whether using a multi-valued index or a scan;
 it does not follow MySQL's plan-dependent behavior where a DATE multi-valued
 index conflates the two.
+JSON integers beyond the unsigned 64-bit range retain exact decimal precision and
+may report `JSON_TYPE=DECIMAL`, where MySQL uses DOUBLE. Failed writes may consume
+auto-increment reservations; sequence gaps do not imply committed rows.
 Writing to JSON columns requires valid text, explicit JSON, or SQL NULL; numbers
 and temporals should be explicitly `CAST(... AS JSON)`.
 
@@ -873,6 +876,7 @@ Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` 
 - Full row-level coverage: multi-row INSERT / INSERT…SELECT / ODKU / REPLACE / IGNORE / LOAD DATA, single-table + multi-table UPDATE/DELETE, and partitioned tables.
 - NEW is writable only in BEFORE, OLD is never writable (1362); writes to the triggering table are rejected (1442); illegal `OLD` in INSERT / `NEW` in DELETE → 1363; generated columns are readable, assignment → 3105.
 - Non-base-table targets: views → 1347, temporary tables → 1361; DEFINER privilege violation → 1227.
+- Trigger chains have a resource-protection depth limit of 32 by default, including enclosing routine frames. `MYDB_TRIGGER_MAX_DEPTH` overrides this server limit; exceeding it reports 1456 and rolls back the statement. Direct and indirect writes to an active triggering table report 1442 independently of this limit.
 - ❌ Deliberately not done: `FOR EACH STATEMENT` (absent from MySQL 8.0), FK cascades firing no triggers (same as MySQL), `TRUNCATE` firing no triggers.
 
 ### Event Scheduler

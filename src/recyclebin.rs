@@ -217,7 +217,7 @@ pub(crate) fn metadata_row(e: &Entry) -> Vec<Value> {
         Value::String(e.origin_table.clone()),
         Value::String(e.operation.clone()),
         Value::UInt(e.recycled_ms),
-        Value::UInt(e.expires_ms),
+        Value::UInt(if e.purging { 0 } else { e.expires_ms }),
         Value::String(if e.purging { "PURGING" } else { "RECYCLED" }.into()),
         Value::String(e.omitted.join(", ")),
         Value::String(e.last_error.clone()),
@@ -280,6 +280,14 @@ pub(crate) fn parse(sql: &str) -> Result<Option<Command>, QueryError> {
         let pattern = if t.word("LIKE") {
             match t.tokens.get(t.offset).cloned() {
                 Some(Token::SingleQuotedString(s)) => {
+                    t.offset += 1;
+                    Some(s)
+                }
+                Some(Token::DoubleQuotedString(s))
+                    if crate::parser::current_parser_sql_mode_bits()
+                        & crate::engine::api::SQL_MODE_ANSI_QUOTES
+                        == 0 =>
+                {
                     t.offset += 1;
                     Some(s)
                 }

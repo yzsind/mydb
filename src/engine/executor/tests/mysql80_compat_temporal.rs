@@ -708,7 +708,8 @@ fn no_zero_date_strict_errors_non_strict_warns() {
         )
         .unwrap();
 
-    // Default empty sql_mode accepts zero dates silently.
+    // An explicit permissive date mode accepts zero dates silently.
+    s = zero_date_test_session();
     engine
         .execute_with_session(
             &mut s,
@@ -890,8 +891,10 @@ fn zero_date_extraction_yields_zero() {
     let engine = open_test_engine(dir.path());
 
     // MySQL YEAR/MONTH/DAYOFMONTH and time-part functions return zero for zero dates.
-    let row = one_row(
+    let mut session = zero_date_test_session();
+    let row = one_row_s(
         &engine,
+        &mut session,
         "SELECT YEAR('0000-00-00'), MONTH('0000-00-00'), DAY('0000-00-00'), \
          QUARTER('0000-00-00'), HOUR('0000-00-00 00:00:00'), \
          EXTRACT(YEAR FROM '0000-00-00'), EXTRACT(MONTH FROM '0000-00-00')",
@@ -1017,8 +1020,12 @@ fn zero_date_from_stored_column_behaves_like_literal() {
     engine
         .execute("CREATE TABLE zf (id INT PRIMARY KEY, d DATE, dt DATETIME)")
         .unwrap();
+    let mut session = zero_date_test_session();
     engine
-        .execute("INSERT INTO zf VALUES (1, '0000-00-00', '0000-00-00 00:00:00')")
+        .execute_with_session(
+            &mut session,
+            "INSERT INTO zf VALUES (1, '0000-00-00', '0000-00-00 00:00:00')",
+        )
         .unwrap();
 
     let row = one_row(
@@ -1596,9 +1603,14 @@ fn temporal_to_number_cast_and_arithmetic() {
         one_row(&engine, "SELECT CAST(TIME '10:20:30' AS SIGNED)")[0],
         Value::Int(102030)
     );
-    // Zero date converts to 0 rather than i32::MIN.
+    // Zero date converts to 0 rather than i32::MIN in a zero-date mode.
+    let mut zero_session = zero_date_test_session();
     assert_eq!(
-        one_row(&engine, "SELECT CAST(DATE '0000-00-00' AS SIGNED)")[0],
+        one_row_s(
+            &engine,
+            &mut zero_session,
+            "SELECT CAST(DATE '0000-00-00' AS SIGNED)"
+        )[0],
         Value::Int(0)
     );
     // YEAR converts to its year number.
@@ -3648,7 +3660,7 @@ fn complex_group_key_is_evaluated_once_per_row() {
 fn parsed_select_timestamp_output_uses_session_zone() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
-    let mut session = SessionContext::default();
+    let mut session = zero_date_test_session();
     for sql in [
         "SET time_zone = '+08:00'",
         "CREATE TABLE parsed_ts(id INT, ts TIMESTAMP(6), dt DATETIME(6))",

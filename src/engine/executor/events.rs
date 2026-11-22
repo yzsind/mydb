@@ -704,6 +704,12 @@ fn run_event_body_with_tracking(
         })
     });
     if let Some(process) = &process {
+        process
+            .handle()
+            .set_background_event_identity(AccountKey::new(
+                &event.definer_user,
+                &event.definer_host,
+            ));
         session.connection_id = process.id();
         session.set_cancel_handle(Some(process.handle().cancel_handle()));
     }

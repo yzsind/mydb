@@ -419,12 +419,15 @@ pub(super) fn execute_update(
     crate::engine::cancel::check_cancelled()?;
     // `sql_safe_updates`: reject UPDATE that lacks both a WHERE and a
     // LIMIT clause. MySQL error 1175 ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE.
-    // The check stays generous: any WHERE clause counts (MySQL's stricter
-    // form additionally requires the WHERE to reference a KEY column);
-    // matching that requires the optimiser, which already ran by this
-    // point. We keep the practical guard MySQL ships by default.
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     if stmt.joins.is_empty() {
+        super::routines::check_trigger_write_target(&stmt.table)?;
         let table = db.table(&stmt.table)?;
         let read_required = super::rls::update_requires_read(db, session, &stmt, &table);
         stmt.selection = super::rls::dml_filter(
@@ -849,6 +852,9 @@ where
                         err
                     },
                 )?;
+                if stmt.view_check_predicate.is_some() {
+                    db.materialize_generated_columns_for_insert(table, &mut new)?;
+                }
             }
             validate(&new)?;
             Ok(new)
@@ -1070,7 +1076,13 @@ pub(super) fn execute_update_borrowed_simple(
     stmt: &Update,
 ) -> Result<Option<QueryResponse>, QueryError> {
     crate::engine::cancel::check_cancelled()?;
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     if !stmt.partitions.is_empty()
         || stmt.returning.is_some()
         || super::multi_table::is_multi_table_update(stmt)
@@ -1292,7 +1304,13 @@ pub(super) fn execute_prepared_range_update(
     range: &crate::engine::api::PreparedRangeUpdate,
 ) -> Result<QueryResponse, QueryError> {
     crate::engine::cancel::check_cancelled()?;
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     let table = &range.table;
     let update = &range.update;
     let membership = stmt.selection.as_ref().and_then(|expr| {
@@ -1400,7 +1418,13 @@ pub(super) fn execute_prepared_point_update(
     point: &crate::engine::api::PreparedPointWrite,
 ) -> Result<QueryResponse, QueryError> {
     crate::engine::cancel::check_cancelled()?;
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     let crate::engine::api::PreparedPointWriteKind::Update(update) = &point.kind else {
         return Err(crate::error::catalog::ER_UNKNOWN_ERROR
             .error("internal error: UPDATE received non-update prepared point plan"));
@@ -1579,8 +1603,15 @@ pub(super) fn execute_delete(
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
     crate::engine::cancel::check_cancelled()?;
     // `sql_safe_updates` guard — same MySQL semantics as UPDATE.
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     if stmt.joins.is_empty() {
+        super::routines::check_trigger_write_target(&stmt.table)?;
         let table = db.table(&stmt.table)?;
         let read_required = stmt.selection.is_some() || stmt.returning.is_some();
         stmt.selection = super::rls::dml_filter(
@@ -1773,7 +1804,13 @@ pub(super) fn execute_delete_borrowed_simple(
 ) -> Result<Option<QueryResponse>, QueryError> {
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
     crate::engine::cancel::check_cancelled()?;
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     if !stmt.partitions.is_empty()
         || stmt.returning.is_some()
         || super::multi_table::is_multi_table_delete(stmt)
@@ -1975,7 +2012,13 @@ pub(super) fn execute_prepared_point_delete(
 ) -> Result<QueryResponse, QueryError> {
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
     crate::engine::cancel::check_cancelled()?;
-    check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
+    check_safe_updates(
+        db,
+        session,
+        &stmt.table,
+        stmt.selection.as_ref(),
+        stmt.limit.as_ref(),
+    )?;
     if !matches!(
         point.kind,
         crate::engine::api::PreparedPointWriteKind::Delete
@@ -3335,11 +3378,17 @@ fn dml_subquery_registry() -> &'static SessionRegistry {
 
 #[inline]
 fn check_safe_updates(
+    db: &Arc<Database>,
     session: &SessionContext,
+    table_name: &str,
     selection: Option<&Expr>,
     limit: Option<&crate::parser::LimitValue>,
 ) -> Result<(), QueryError> {
-    if session.sysvars.sql_safe_updates && selection.is_none() && limit.is_none() {
+    if !session.sysvars.sql_safe_updates || limit.is_some() {
+        return Ok(());
+    }
+    let table = db.table(table_name)?;
+    if selection.is_none_or(|expr| super::indexes::plan_write_candidates(&table, expr).is_none()) {
         return Err(crate::storage::error(
             crate::error::catalog::ER_UPDATE_WITHOUT_KEY_IN_SAFE_MODE,
             "You are using safe update mode and you tried to update a table without a WHERE that uses a KEY column.",

@@ -12,7 +12,7 @@ use crate::engine::api::{
 use crate::engine::sysvar::backend::SysVar;
 use crate::engine::sysvar::ctx::WriteCtx;
 use crate::engine::sysvar::errors::wrong_value_for_var;
-use crate::engine::sysvar::meta::{Access, DataType, Scope, SelectType, SysVarDef};
+use crate::engine::sysvar::meta::{Access, DataType, Scope, SysVarDef};
 use crate::engine::sysvar::registry::Registry;
 use crate::engine::sysvar::value::SysVarValue;
 use crate::types::QueryError;
@@ -26,7 +26,7 @@ static GLOBAL_SECURE_FILE_PRIV: OnceLock<RwLock<String>> = OnceLock::new();
 
 fn global_sql_mode_cell() -> &'static RwLock<String> {
     GLOBAL_SQL_MODE.get_or_init(|| {
-        RwLock::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,ERROR_FOR_DIVISION_BY_ZERO".to_string())
+        RwLock::new("ONLY_FULL_GROUP_BY,STRICT_TRANS_TABLES,NO_ZERO_IN_DATE,NO_ZERO_DATE,ERROR_FOR_DIVISION_BY_ZERO,NO_ENGINE_SUBSTITUTION".to_string())
     })
 }
 
@@ -553,19 +553,21 @@ pub(crate) fn register(reg: &mut Registry) {
         i64::MAX,
         "Maximum memory the optimizer trace may use.",
     );
-    register_advisory_integer(
-        reg,
+    reg.register(SysVar::const_read_only(
         SysVarDef::new(
             "optimizer_trace_features",
             Scope::Both,
-            DataType::UInt {
-                min: 0,
-                max: u64::MAX,
+            DataType::StrictString {
+                max_len: None,
+                null_as_empty: false,
             },
         )
-        .with_select_type(SelectType::Text)
-        .with_doc("Bitmap of optimizer trace features."),
-    );
+        .with_doc("Trace feature categories; independent category toggles are not supported."),
+        SysVarValue::String(
+            "greedy_search=on,range_optimizer=on,dynamic_range=on,repeated_subselect=on"
+                .to_string(),
+        ),
+    ));
 
     // explain_format — Both. Atomic for global; per-session field for SESSION.
     reg.register(SysVar::settable(

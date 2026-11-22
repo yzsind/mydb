@@ -184,6 +184,9 @@ impl AutoAnalyzeHandle {
                     // catalog diverge even though user SQL is read-only.
                     continue;
                 }
+                let Some(_write) = crate::repl::background_write_permit() else {
+                    continue;
+                };
                 match db.auto_analyze_stale_tables(ratio()) {
                     Ok(n) => record_run(n),
                     Err(err) => {

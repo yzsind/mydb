@@ -2489,10 +2489,10 @@ pub(crate) fn show_tables_rows(
     db: &Database,
     database: &str,
     full: bool,
-) -> Option<Vec<Vec<Value>>> {
+) -> Result<Option<Vec<Vec<Value>>>, QueryError> {
     let schema = database.to_ascii_lowercase();
     if !["information_schema", "mysql", "performance_schema", "sys"].contains(&schema.as_str()) {
-        return None;
+        return Ok(None);
     }
     let mut rows = system_table_definitions()
         .filter(|def| def.schema == schema)
@@ -2529,7 +2529,7 @@ pub(crate) fn show_tables_rows(
         }) {
             let mut row = vec![Value::String(table.name.clone())];
             if full {
-                let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+                let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
                 row.extend([
                     Value::String("BASE TABLE".to_string()),
                     Value::Int(i64::try_from(stats.rows).unwrap_or(i64::MAX)),
@@ -2561,7 +2561,7 @@ pub(crate) fn show_tables_rows(
         }
     }
     rows.sort_by(|a, b| a[0].to_display_string().cmp(&b[0].to_display_string()));
-    Some(rows)
+    Ok(Some(rows))
 }
 
 fn rows(
@@ -2588,7 +2588,7 @@ fn rows(
     }
     match (schema, table) {
         ("information_schema", "schemata") => Ok(schemata_rows(db)),
-        ("information_schema", "tables") => Ok(tables_rows(db, request)),
+        ("information_schema", "tables") => tables_rows(db, request),
         ("information_schema", "columns") => Ok(columns_rows(db, request)),
         ("information_schema", "statistics") => Ok(statistics_rows(db, request)),
         ("information_schema", "table_constraints") => Ok(table_constraints_rows(db)),
@@ -2601,7 +2601,7 @@ fn rows(
         ("information_schema", "view_routine_usage") => Ok(view_routine_usage_rows(db)),
         ("information_schema", "routines") => Ok(routines_rows(db)),
         ("information_schema", "triggers") => Ok(triggers_rows(db)),
-        ("information_schema", "partitions") => Ok(partitions_rows(db)),
+        ("information_schema", "partitions") => partitions_rows(db),
         ("information_schema", "events") => Ok(events_rows(db)),
         ("information_schema", "parameters") => Ok(parameters_rows(db)),
         ("information_schema", "character_sets") => Ok(character_sets_rows()),
@@ -2611,14 +2611,14 @@ fn rows(
         }
         ("information_schema", "engines") => Ok(engines_rows()),
         ("information_schema", "processlist") => Ok(processlist_rows(db, registry)),
-        ("information_schema", "global_variables") => Ok(system_variables_rows_scoped(
+        ("information_schema", "global_variables") => system_variables_rows_scoped(
             db,
             crate::engine::sysvar::Scope::Global,
-        )),
-        ("information_schema", "session_variables") => Ok(system_variables_rows_scoped(
+        ),
+        ("information_schema", "session_variables") => system_variables_rows_scoped(
             db,
             crate::engine::sysvar::Scope::Session,
-        )),
+        ),
         ("information_schema", "user_privileges") => Ok(user_privileges_rows(db)),
         ("information_schema", "schema_privileges") => Ok(schema_privileges_rows(db)),
         ("information_schema", "table_privileges") => Ok(table_privileges_rows(db)),
@@ -2662,11 +2662,11 @@ fn rows(
         ("information_schema", "innodb_fields") => Ok(innodb_fields_rows(db)),
         ("information_schema", "innodb_foreign") => Ok(innodb_foreign_rows(db)),
         ("information_schema", "innodb_foreign_cols") => Ok(innodb_foreign_cols_rows(db)),
-        ("information_schema", "innodb_tablespaces") => Ok(innodb_tablespaces_rows(db)),
+        ("information_schema", "innodb_tablespaces") => innodb_tablespaces_rows(db),
         ("information_schema", "innodb_tablespaces_brief") => Ok(innodb_tablespaces_brief_rows(db)),
         ("information_schema", "innodb_datafiles") => Ok(innodb_datafiles_rows(db)),
-        ("information_schema", "innodb_tablestats") => Ok(innodb_tablestats_rows(db)),
-        ("information_schema", "files") => Ok(files_rows(db)),
+        ("information_schema", "innodb_tablestats") => innodb_tablestats_rows(db),
+        ("information_schema", "files") => files_rows(db),
         ("information_schema", "innodb_buffer_pool_stats") => Ok(innodb_buffer_pool_stats_rows(db)),
         ("information_schema", "innodb_buffer_page") => Ok(innodb_buffer_page_rows(db, false)),
         ("information_schema", "innodb_buffer_page_lru") => {
@@ -3197,22 +3197,23 @@ fn exact_requested_relation(request: &SystemScanRequest) -> Option<(&str, &str)>
 fn visit_requested_tables(
     catalog: &Catalog,
     request: &SystemScanRequest,
-    mut visitor: impl FnMut(&TableSchema),
-) {
+    mut visitor: impl FnMut(&TableSchema) -> Result<(), QueryError>,
+) -> Result<(), QueryError> {
     if let (Some(schema), Some(table)) = (&request.table_schema, &request.table_name) {
         if let Some(table) = catalog
             .tables
             .get(&crate::storage::table_key(schema, table))
         {
-            visitor(table);
+            visitor(table)?;
         }
-        return;
+        return Ok(());
     }
     for table in catalog.tables.values() {
         if scan_request_matches_table(request, &table.database, &table.name) {
-            visitor(table);
+            visitor(table)?;
         }
     }
+    Ok(())
 }
 
 fn visit_requested_table_descriptors(
@@ -3257,14 +3258,14 @@ fn visit_requested_views(
     }
 }
 
-fn tables_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
+fn tables_rows(db: &Database, request: &SystemScanRequest) -> Result<Vec<Vec<Value>>, QueryError> {
     let vis = Visibility::compute(db);
     let mut rows: Vec<Vec<Value>> = Vec::new();
     if let Some((schema, table_name)) = exact_requested_relation(request) {
         let qualified = format!("{schema}.{table_name}");
         if let Ok(table) = db.table(&qualified) {
             if vis.table_visible(&table.database, &table.name) {
-                rows.push(base_table_row(db, &table));
+                rows.push(base_table_row(db, &table)?);
             }
         } else if let Some(view) = db.view_definition(schema, table_name) {
             if vis.table_visible(&view.database, &view.name) {
@@ -3278,14 +3279,15 @@ fn tables_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
         {
             rows.push(system_table_row(def));
         }
-        return rows;
+        return Ok(rows);
     }
     let catalog = db.catalog();
     visit_requested_tables(&catalog, request, |table| {
         if vis.table_visible(&table.database, &table.name) {
-            rows.push(base_table_row(db, table));
+            rows.push(base_table_row(db, table)?);
         }
-    });
+        Ok(())
+    })?;
     visit_requested_views(&catalog, request, |view| {
         if vis.table_visible(&view.database, &view.name) {
             rows.push(view_table_row(&view.database, &view.name, view.created_ms));
@@ -3298,7 +3300,7 @@ fn tables_rows(db: &Database, request: &SystemScanRequest) -> Vec<Vec<Value>> {
     {
         rows.push(system_table_row(def));
     }
-    rows
+    Ok(rows)
 }
 
 pub(crate) fn fast_count_rows(
@@ -3363,11 +3365,11 @@ pub(crate) fn fast_count_rows(
     }
 }
 
-fn base_table_row(db: &Database, table: &TableSchema) -> Vec<Value> {
+fn base_table_row(db: &Database, table: &TableSchema) -> Result<Vec<Value>, QueryError> {
     // Shared with `SHOW TABLE STATUS` via `engine::table_stats_view` —
     // both views now agree on TABLE_ROWS / DATA_LENGTH / INDEX_LENGTH
     // / AVG_ROW_LENGTH / AUTO_INCREMENT for the same table.
-    let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+    let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
     let create_options = crate::engine::table_stats_view::table_create_options(table);
     let auto_increment = match stats.auto_increment {
         Some(value) => i64::try_from(value)
@@ -3375,7 +3377,7 @@ fn base_table_row(db: &Database, table: &TableSchema) -> Vec<Value> {
             .unwrap_or(Value::UInt(value)),
         None => Value::Null,
     };
-    vec![
+    Ok(vec![
         s("def"),
         s(&table.database),
         s(&table.name),
@@ -3397,7 +3399,7 @@ fn base_table_row(db: &Database, table: &TableSchema) -> Vec<Value> {
         Value::Null,
         s(&create_options),
         s(&table.comment),
-    ]
+    ])
 }
 
 fn view_table_row(database: &str, name: &str, created_ms: u64) -> Vec<Value> {
@@ -3865,7 +3867,7 @@ fn append_table_statistics_rows(
     // confuse JDBC metadata and ORMs. We compute a cheap row-count
     // estimate once per table here and reuse it across all index
     // rows for that table.
-    let table_stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+    let table_rows = crate::engine::table_stats_view::effective_row_count(db, table);
     for index in table.iter_public_indexes() {
         let columns_in_index = index.columns.len();
         for (idx, column) in index.columns.iter().enumerate() {
@@ -3922,10 +3924,10 @@ fn append_table_statistics_rows(
                 .filter(|c| *c > 0)
                 .unwrap_or_else(|| {
                     if index.is_fulltext() {
-                        return table_stats.rows;
+                        return table_rows;
                     }
                     crate::engine::table_stats_view::fallback_index_cardinality(
-                        table_stats.rows,
+                        table_rows,
                         index.unique,
                         idx + 1,
                         columns_in_index,
@@ -4318,7 +4320,7 @@ fn event_originator() -> u32 {
     crate::engine::executor::events::current_server_id()
 }
 
-fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
+fn partitions_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     use crate::storage::partitioning::{PartitionBounds, PartitionLiteral, PartitionMethod};
     let mut out: Vec<Vec<Value>> = Vec::new();
     let catalog = db.catalog();
@@ -4338,7 +4340,7 @@ fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
         let Some(part) = table.partitioning.as_ref() else {
             // Unpartitioned tables emit a single NULL-partition row
             // matching MySQL's output for non-partitioned tables.
-            let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+            let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
             out.push(vec![
                 s("def"),
                 s(&table.database),
@@ -4438,7 +4440,7 @@ fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
                         partition.subpartitions.len(),
                         sub_idx,
                         subpartition.storage_id,
-                    );
+                    )?;
                     out.push(vec![
                         s("def"),
                         s(&table.database),
@@ -4475,7 +4477,7 @@ fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
                 partition_count,
                 idx,
                 partition.storage_id,
-            );
+            )?;
             out.push(vec![
                 s("def"),
                 s(&table.database),
@@ -4534,7 +4536,7 @@ fn partitions_rows(db: &Database) -> Vec<Vec<Value>> {
             })
     });
     let _ = PartitionMethod::Range; // silence unused-variant warning
-    out
+    Ok(out)
 }
 
 fn canonical_partition_expression(expression: &str) -> String {
@@ -4944,12 +4946,12 @@ fn processlist_rows(db: &Database, registry: &SessionRegistry) -> Vec<Vec<Value>
 pub(crate) fn system_variables_rows_scoped(
     db: &Database,
     scope: crate::engine::sysvar::Scope,
-) -> Vec<Vec<Value>> {
+) -> Result<Vec<Vec<Value>>, QueryError> {
     crate::engine::expr::with_active_session(|session| {
-        crate::engine::sysvar::snapshot(scope, session, Some(db))
+        Ok(crate::engine::sysvar::snapshot(scope, session, Some(db))?
             .into_iter()
             .map(|row| vec![s(row.name), s(&row.value)])
-            .collect()
+            .collect())
     })
 }
 
@@ -5912,7 +5914,7 @@ fn innodb_physical_stats(
     db: &Database,
     table: &TableSchema,
     object: &InnodbPhysicalObject,
-) -> crate::engine::table_stats_view::TableStatsView {
+) -> Result<crate::engine::table_stats_view::TableStatsView, QueryError> {
     if table.partitioning.is_some() {
         crate::engine::table_stats_view::TableStatsView::for_partition(
             db,
@@ -6179,9 +6181,9 @@ fn innodb_foreign_cols_rows(db: &Database) -> Vec<Vec<Value>> {
 /// Physical byte size of a table's heap (data) and index files, from mydb's own
 /// page accounting. Falls back to the width-based `TableStatsView` estimate when
 /// pages are not yet resident (e.g. memory durability).
-fn innodb_table_sizes(db: &Database, table: &TableSchema) -> (u64, u64) {
-    let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
-    (stats.data_length, stats.index_length)
+fn innodb_table_sizes(db: &Database, table: &TableSchema) -> Result<(u64, u64), QueryError> {
+    let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
+    Ok((stats.data_length, stats.index_length))
 }
 
 /// C3: physical byte size of one partition/subpartition (heap + index),
@@ -6192,18 +6194,18 @@ fn innodb_partition_sizes(
     partition_count: usize,
     partition_index: usize,
     storage_id: u64,
-) -> (u64, u64) {
+) -> Result<(u64, u64), QueryError> {
     let stats = crate::engine::table_stats_view::TableStatsView::for_partition(
         db,
         table,
         partition_count,
         partition_index,
         storage_id,
-    );
-    (stats.data_length, stats.index_length)
+    )?;
+    Ok((stats.data_length, stats.index_length))
 }
 
-fn innodb_tablespaces_rows(db: &Database) -> Vec<Vec<Value>> {
+fn innodb_tablespaces_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     let page_size = crate::storage::PAGE_SIZE as i64;
     let visibility = Visibility::compute(db);
     let mut rows: Vec<Vec<Value>> = Vec::new();
@@ -6234,7 +6236,7 @@ fn innodb_tablespaces_rows(db: &Database) -> Vec<Vec<Value>> {
                             .sum::<usize>()
                             + sub_idx,
                         sub.storage_id,
-                    );
+                    )?;
                     let file_size = saturating_i64(data_len + index_len);
                     rows.push(vec![
                         Value::Int(saturating_i64(sub.storage_id)),
@@ -6259,7 +6261,7 @@ fn innodb_tablespaces_rows(db: &Database) -> Vec<Vec<Value>> {
                 }
                 if partition.subpartitions.is_empty() {
                     let (data_len, index_len) =
-                        innodb_partition_sizes(db, table, n, idx, partition.storage_id);
+                        innodb_partition_sizes(db, table, n, idx, partition.storage_id)?;
                     let file_size = saturating_i64(data_len + index_len);
                     rows.push(vec![
                         Value::Int(saturating_i64(partition.storage_id)),
@@ -6285,7 +6287,7 @@ fn innodb_tablespaces_rows(db: &Database) -> Vec<Vec<Value>> {
             }
             continue;
         }
-        let (data_len, index_len) = innodb_table_sizes(db, table);
+        let (data_len, index_len) = innodb_table_sizes(db, table)?;
         let file_size = saturating_i64(data_len + index_len);
         rows.push(vec![
             Value::Int(saturating_i64(table.id)),
@@ -6306,7 +6308,7 @@ fn innodb_tablespaces_rows(db: &Database) -> Vec<Vec<Value>> {
         ]);
     }
 
-    rows
+    Ok(rows)
 }
 
 fn innodb_tablespaces_brief_rows(db: &Database) -> Vec<Vec<Value>> {
@@ -6425,7 +6427,7 @@ fn innodb_datafiles_rows(db: &Database) -> Vec<Vec<Value>> {
     rows
 }
 
-fn innodb_tablestats_rows(db: &Database) -> Vec<Vec<Value>> {
+fn innodb_tablestats_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     let page_size = crate::storage::PAGE_SIZE as u64;
     let visibility = Visibility::compute(db);
     let catalog = db.catalog();
@@ -6436,7 +6438,7 @@ fn innodb_tablestats_rows(db: &Database) -> Vec<Vec<Value>> {
         .filter(|table| visibility.table_visible(&table.database, &table.name))
     {
         for object in innodb_physical_objects(table) {
-            let stats = innodb_physical_stats(db, table, &object);
+            let stats = innodb_physical_stats(db, table, &object)?;
             let clust_pages = saturating_i64(stats.data_length / page_size);
             let other_pages = saturating_i64(stats.index_length / page_size);
             let autoinc = stats.auto_increment.map(saturating_i64).unwrap_or(0);
@@ -6458,10 +6460,10 @@ fn innodb_tablestats_rows(db: &Database) -> Vec<Vec<Value>> {
             ]);
         }
     }
-    rows
+    Ok(rows)
 }
 
-fn files_rows(db: &Database) -> Vec<Vec<Value>> {
+fn files_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> {
     let visibility = Visibility::compute(db);
     let catalog = db.catalog();
     let mut rows = Vec::new();
@@ -6471,7 +6473,7 @@ fn files_rows(db: &Database) -> Vec<Vec<Value>> {
         .filter(|table| visibility.table_visible(&table.database, &table.name))
     {
         let Some(partitioning) = table.partitioning.as_ref() else {
-            let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table);
+            let stats = crate::engine::table_stats_view::TableStatsView::for_table(db, table)?;
             rows.push(files_row(
                 db,
                 table,
@@ -6495,7 +6497,7 @@ fn files_rows(db: &Database) -> Vec<Vec<Value>> {
                     leaf_count,
                     leaf_index,
                     partition.storage_id,
-                );
+                )?;
                 rows.push(files_row(
                     db,
                     table,
@@ -6512,7 +6514,7 @@ fn files_rows(db: &Database) -> Vec<Vec<Value>> {
                         leaf_count,
                         leaf_index,
                         subpartition.storage_id,
-                    );
+                    )?;
                     rows.push(files_row(
                         db,
                         table,
@@ -6528,7 +6530,7 @@ fn files_rows(db: &Database) -> Vec<Vec<Value>> {
             }
         }
     }
-    rows
+    Ok(rows)
 }
 
 fn files_row(
@@ -7971,6 +7973,8 @@ fn mydb_ddl_jobs_rows(db: &Database) -> Vec<Vec<Value>> {
             s(match job.operation {
                 "INDEX" => "INDEX",
                 "CONSTRAINT" => "CONSTRAINT",
+                "PARTITION" => "PARTITION",
+                "VALIDATE_COLUMN" => "COLUMN",
                 _ => "TABLE",
             }),
             s(&job.object_name),

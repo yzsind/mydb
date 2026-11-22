@@ -31,7 +31,7 @@ fn replica_poison_error(detail: impl Into<String>) -> QueryError {
     QueryError::internal_control(
         crate::error::InternalErrorKind::ReplicaPoisonFrame,
         crate::error::catalog::ER_UNKNOWN_ERROR,
-        "Unknown error",
+        format!("replica WAL stream rejected: {detail}"),
     )
     .with_diagnostic("MYDB-DIAG-REPL-POISON", detail)
 }
@@ -278,9 +278,17 @@ impl Applier {
                     .map_err(overlap_read_error)?
                     .ok_or_else(|| replica_poison_error("missing local WAL overlap"))?;
                 if local.bytes != chunk.bytes[frame_offset..cursor] {
-                    return Err(replica_poison_error(
-                        "conflicting local WAL at the same LSN; rebuild replica",
-                    ));
+                    let local_frame = decode_frame_for_replication(&local.bytes)
+                        .map_err(|err| replica_poison_error(err.message()))?;
+                    let mut local_payload = local_frame.payload;
+                    let mut source_payload = frame.payload.clone();
+                    crate::wal::clear_remote_binlog_refs(&mut local_payload);
+                    crate::wal::clear_remote_binlog_refs(&mut source_payload);
+                    if local_frame.header != frame.header || local_payload != source_payload {
+                        return Err(replica_poison_error(
+                            "conflicting local WAL at the same LSN; rebuild replica",
+                        ));
+                    }
                 }
             }
             if total_frames == 0 {
@@ -913,5 +921,63 @@ mod frame_overlap_tests {
         assert!(applier.apply_chunk(&chunk, "source", 1).is_err());
         assert_eq!(target.lock().last_lsn(), 1);
         assert_eq!(applier.last_applied_lsn(), 0);
+    }
+}
+
+#[cfg(test)]
+mod audit1122_binlog_overlap {
+    use super::*;
+    use crate::wal::{LogManager, WalBinlogRef, WalReader};
+
+    #[test]
+    fn reconnect_accepts_normalized_remote_binlog_references() {
+        for batch in [false, true] {
+            let source_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let target_dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+            let source = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(source_dir.path()).unwrap(),
+            ));
+            let target = Arc::new(parking_lot::Mutex::new(
+                LogManager::open(target_dir.path()).unwrap(),
+            ));
+            let records = vec![
+                WalPayload::BeginTxn { start_scn: 0 },
+                WalPayload::CommitTxn {
+                    commit_scn: 1,
+                    commit_unix_us: 1,
+                    binlog: Some(WalBinlogRef {
+                        file: "source.000001".into(),
+                        start_pos: 4,
+                        end_pos: 100,
+                        gtid: None,
+                    }),
+                },
+            ];
+            if batch {
+                source.lock().append_txn_batch(42, records).unwrap();
+            } else {
+                for record in records {
+                    source.lock().append(42, record).unwrap();
+                }
+            }
+            source.lock().flush().unwrap();
+            let end = source.lock().last_lsn();
+            let chunk = WalReader::open(&source, 1)
+                .unwrap()
+                .next_chunk(end, 1 << 20)
+                .unwrap()
+                .unwrap();
+            let mut first = Applier::new(
+                target_dir.path(),
+                target.clone(),
+                ReplicaProgress::default(),
+            );
+            first.apply_chunk(&chunk, "source", 1).unwrap();
+            first.flush_pending().unwrap();
+            let mut retry = Applier::new(target_dir.path(), target, ReplicaProgress::default());
+            retry.apply_chunk(&chunk, "source", 1).unwrap();
+            retry.flush_pending().unwrap();
+            assert_eq!(retry.last_applied_lsn(), end);
+        }
     }
 }

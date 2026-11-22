@@ -5412,6 +5412,7 @@ fn fail_stopped_kill_and_lifecycle_commands_enforce_privileges() {
         );
     }
     assert_eq!(handle.query_cancel_generation(), 0);
+    handle.mark_busy("Query", None, "test");
     for sql in [
         "/* operator */ KILL QUERY 12345",
         "/*!80000 KILL QUERY 12345 */",
@@ -5468,6 +5469,7 @@ fn audit_kill_checks_matched_account_and_live_grants() {
     engine
         .execute_with_session(&mut root, "GRANT SYSTEM_USER ON *.* TO alice")
         .unwrap();
+    handle.mark_busy("Query", None, "test");
     engine
         .execute_with_session(&mut alice, "KILL QUERY 12345")
         .unwrap();
@@ -5525,6 +5527,7 @@ fn kill_ownership_uses_authenticated_account_and_reports_1095() {
         crate::engine::status_counters::SessionStatus::new_untracked(),
         AccountKey::new("bob", "%"),
     );
+    own.mark_busy("Query", None, "test");
     engine
         .execute_with_session(&mut alice, "KILL QUERY 8801")
         .unwrap();

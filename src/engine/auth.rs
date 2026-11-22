@@ -2623,6 +2623,9 @@ impl AuthCatalog {
     ) -> bool {
         let allows = |principal: &AccountKey| {
             self.metadata_grants_any(principal, schema, table, |grant| {
+                if matches!(grant.privilege, Privilege::Dynamic(_)) {
+                    return false;
+                }
                 // Administrative/routine privileges can expose the schema name,
                 // but do not confer visibility of unrelated table objects.
                 if table.is_some()

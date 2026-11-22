@@ -95,6 +95,6 @@ pub fn snapshot(
     scope: Scope,
     session: Option<&SessionContext>,
     db: Option<&Database>,
-) -> Vec<VariableRow> {
+) -> Result<Vec<VariableRow>, QueryError> {
     registry().snapshot_for_show(scope, session, db)
 }

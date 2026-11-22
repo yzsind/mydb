@@ -224,6 +224,19 @@ impl Database {
     ) -> Result<(), QueryError> {
         let lsn = record.lsn;
         let txn_id = record.txn_id;
+        if self.physical_replica_mode() && txn_id != 0 && matches!(record.payload,
+            WalPayload::HeapInsert { .. } | WalPayload::HeapInsertBatch { .. }
+            | WalPayload::HeapUpdate { .. } | WalPayload::HeapUpdateLogical { .. }
+            | WalPayload::HeapDelete { .. }) {
+            if let Some(storage_id) = replica_payload_path(&record.payload).and_then(Self::parse_heap_table_id) {
+                if self.table_by_id(storage_id).is_none()
+                    && !self.applier_dd_dirty_txns.lock().get(&txn_id).is_some_and(|delta|
+                        delta.dd_touched || delta.invalidate_all || !delta.object_ids.is_empty()) {
+                    return Err(error(crate::error::catalog::ER_NO_SUCH_TABLE,
+                        format!("replicated DML references unknown storage object {storage_id} at LSN {lsn}")));
+                }
+            }
+        }
         let _vector_write = match replica_payload_path(&record.payload) {
             Some(path) if path.ends_with(".hvec") || path.ends_with(".vmanifest") => {
                 self.begin_vector_physical_redo(path)?
@@ -281,6 +294,10 @@ impl Database {
                 let mut logical_prev_lsn = record.prev_txn_lsn;
                 for (idx, payload) in records.iter().enumerate() {
                     let logical_lsn = first_logical_lsn + idx as u64;
+                    if logical_lsn <= self.replica_applied_lsn_atomic.load(Ordering::Acquire) {
+                        logical_prev_lsn = logical_lsn;
+                        continue;
+                    }
                     self.apply_wal_record_inner(
                         &WalRecord {
                             source_time_us: record.source_time_us,
@@ -291,6 +308,7 @@ impl Database {
                         },
                         heap_redo,
                     )?;
+                    self.replica_applied_lsn_atomic.fetch_max(logical_lsn, Ordering::Release);
                     logical_prev_lsn = logical_lsn;
                 }
             }
@@ -555,9 +573,11 @@ impl Database {
                     .map(|patch| (patch.offset as usize, patch.after.to_vec()))
                     .collect();
                 heap_redo.mutate_page(&self.data_dir, path, *page_id as u64, lsn, |page| {
-                    if page.read(*slot_id).is_some() {
-                        let _ = page.try_patch_columns(*slot_id, &owned_patches)?;
+                    if page.read(*slot_id).is_none() {
+                        return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                            "WAL logical heap update target is missing or incompatible"));
                     }
+                    page.try_patch_columns(*slot_id, &owned_patches)?;
                     Ok(true)
                 })?;
                 self.note_dd_touch_if_needed(path, txn_id);

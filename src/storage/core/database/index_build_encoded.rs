@@ -4911,6 +4911,7 @@ impl Database {
                                                     debug_assert_eq!(chunk.len() - start, *stride);
                                                 }
                                                 visible = visible.saturating_add(1);
+                                                if online && visible % 4096 == 0 { self.report_index_build_progress(table.id, 4096); }
                                                 chunk_rows += 1;
                                                 if chunk_rows >= ENCODED_SCAN_CHUNK_ROWS {
                                                     flush(&mut chunks)?;
@@ -4923,6 +4924,7 @@ impl Database {
                                     if chunk_rows != 0 {
                                         flush(&mut chunks)?;
                                     }
+                                    if online { self.report_index_build_progress(table.id, visible % 4096); }
                                     Ok(visible)
                                 })
                                 .map_err(|err| {
@@ -5020,6 +5022,7 @@ impl Database {
                                                     ));
                                                 }
                                                 visible = visible.saturating_add(1);
+                                                if online && visible % 4096 == 0 { self.report_index_build_progress(table.id, 4096); }
                                                 chunk_rows += 1;
                                                 if chunk_rows >= ENCODED_SCAN_CHUNK_ROWS {
                                                     flush(&mut chunks)?;
@@ -5036,6 +5039,7 @@ impl Database {
                                     if chunk_rows != 0 {
                                         flush(&mut chunks)?;
                                     }
+                                    if online { self.report_index_build_progress(table.id, visible % 4096); }
                                     Ok(visible)
                                 })
                                 .map_err(|err| {
@@ -5067,6 +5071,7 @@ impl Database {
                         return Ok(false);
                     }
                     visible_rows = visible_rows.saturating_add(1);
+                    if online && visible_rows % 4096 == 0 { self.report_index_build_progress(table.id, 4096); }
                     for sorter in &mut sorters {
                         sorter.push_row(self.data_dir(), table, &row.values, row.row_id)?;
                     }
@@ -5078,6 +5083,7 @@ impl Database {
                     heap.scan_mvcc_columns_direct_until(&needed_columns, visit)
                 }
             })?;
+            if online { self.report_index_build_progress(table.id, visible_rows % 4096); }
         }
         for sorter in &mut sorters {
             sorter.sort_degree = sorter_degree;

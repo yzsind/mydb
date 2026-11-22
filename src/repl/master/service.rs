@@ -142,7 +142,11 @@ pub fn start_bound(
                     ));
                     break;
                 }
-                Some(_completed) = senders.join_next(), if !senders.is_empty() => {}
+                Some(completed) = senders.join_next(), if !senders.is_empty() => {
+                    if let Err(err) = completed {
+                        log_message(format_args!("mydb-repl sender task failed: {err}"));
+                    }
+                }
                 accept = listener.accept() => {
                     match accept {
                         Ok((stream, peer)) => {

@@ -252,6 +252,7 @@ pub struct SessionHandle {
     notify: Notify,
     entry: Mutex<SessionEntry>,
     _background_memory_charge: Option<crate::engine::executor::mem_budget::ControlledMemoryCharge>,
+    statement_active: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -292,6 +293,7 @@ struct SessionEntry {
     started_at: Instant,
     info: Option<ProcessSqlText>,
     kind: ProcessKind,
+    event_execution: bool,
     base_state: Option<ProcessState>,
     effective_state: Option<ProcessState>,
     active_stages: [u16; ProcessState::COUNT],
@@ -680,6 +682,7 @@ impl SessionRegistry {
             started_at: Instant::now(),
             info: info.map(ProcessSqlText::Owned),
             kind,
+            event_execution: false,
             base_state: state,
             effective_state: state,
             active_stages: [0; ProcessState::COUNT],
@@ -707,6 +710,7 @@ impl SessionRegistry {
             status,
             notify: Notify::new(),
             entry: Mutex::new(entry),
+            statement_active: AtomicBool::new(command != "Sleep"),
             _background_memory_charge: background_memory_charge,
         });
         self.sessions
@@ -987,11 +991,15 @@ impl SessionRegistry {
         })?;
         let entry = handle.entry.lock();
         authorize(&entry.authenticated_as)?;
-        if entry.kind != ProcessKind::Foreground {
+        let event_execution = entry.kind == ProcessKind::Background && entry.event_execution;
+        if entry.kind != ProcessKind::Foreground && !event_execution {
             return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
                 "KILL is not supported for background service threads; use the service's stop command"));
         }
-        if query_only {
+        if query_only && entry.command == "Sleep" && !handle.statement_is_active() {
+            return Ok(());
+        }
+        if query_only || event_execution {
             handle.cancel_query();
             crate::engine::cancel::record_killed_query();
         } else {
@@ -1195,6 +1203,13 @@ impl SessionRegistry {
     }
 }
 
+pub(crate) struct EmbeddedStatementGuard<'a>(&'a AtomicBool);
+impl Drop for EmbeddedStatementGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 impl SessionHandle {
     /// A lost transport must cancel owned work without counting a SQL KILL.
     pub(crate) fn peer_disconnected(&self) {
@@ -1246,6 +1261,17 @@ impl SessionHandle {
         self.notify.notify_one();
     }
 
+    pub(crate) fn statement_is_active(&self) -> bool {
+        self.statement_active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn enter_embedded_statement(&self) -> Option<EmbeddedStatementGuard<'_>> {
+        self.statement_active
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .ok()
+            .map(|_| EmbeddedStatementGuard(&self.statement_active))
+    }
+
     pub(crate) fn cancel_query(&self) {
         self.query_cancel_generation.fetch_add(1, Ordering::AcqRel);
         // Also kick waiters so any blocking I/O `select!` on the session
@@ -1270,6 +1296,7 @@ impl SessionHandle {
     /// `database` matches the cached value.
     pub fn mark_busy(&self, command: &'static str, info: Option<String>, database: &str) {
         let mut entry = self.entry.lock();
+        self.statement_active.store(true, Ordering::Release);
         entry.command = command;
         entry.info = info.map(|sql| {
             ProcessSqlText::Owned(
@@ -1299,6 +1326,7 @@ impl SessionHandle {
     /// the bottom of the session command loop.
     pub fn mark_idle(&self, database: &str) {
         let mut entry = self.entry.lock();
+        self.statement_active.store(false, Ordering::Release);
         entry.command = "Sleep";
         entry.info = None;
         entry.killed = false;
@@ -1530,6 +1558,13 @@ impl SessionHandle {
             .prepared_statements
             .retain(|row| row.statement_name.is_none());
         entry.prepared_statements.extend(prepared);
+    }
+
+    pub(crate) fn set_background_event_identity(&self, account: crate::engine::auth::AccountKey) {
+        let mut entry = self.entry.lock();
+        debug_assert_eq!(entry.kind, ProcessKind::Background);
+        entry.authenticated_as = account;
+        entry.event_execution = true;
     }
 
     pub fn set_identity(

@@ -1,6 +1,6 @@
 {
   "baseline": "MySQL Community Server 8.0.46",
-  "reviewed_at": "2026-11-21",
+  "reviewed_at": "2026-11-23",
   "scope": "classic protocol and MySQL replication source protocol",
   "capabilities": {
     "CLIENT_FOUND_ROWS": "compatible",
@@ -50,10 +50,10 @@
   "evidence": {
     "review_scope": "Source and documentation contract review; focused regression and local protocol rehearsal. This fingerprint is a review trigger, not proof all combinations are supported.",
     "source_sha256": {
-      "src/mysql/protocol.rs": "5a948ad3535e087348a483e2d11d482bbb76488e5013aca6272b4fa9b873ab16",
+      "src/mysql/protocol.rs": "b6ad38173b082ceca2dd9160457405b8d70feb43310c48c43644b1b1fade3854",
       "src/mysql/server.rs": "80499aca67183a4f19e3f04dd5394fefec0dc7167fa703ba359e08a53aee107b",
-      "src/mysql/session.rs": "07808d19be0d6f0e1fa7ae03df05433bd3986b77a604a25d75929f94fc1b7bf9",
-      "src/binlog.rs": "b56a330ad5b2e92788d83ea800cc2319767dc48dd72ccb342ddb7bafed294023",
+      "src/mysql/session.rs": "729d3ffa61a45b291e5d3ad77024c4c0ad89cae49437bea3db5413e49e640542",
+      "src/binlog.rs": "2863a53dbb1393a24cc798b9b87ea351fae5b4e8b00a31c1bc4d61e453241a9f",
       "src/mysql/peer_monitor.rs": "2664258b1e0b97bdd36da7735f24a32826af97f9ffbbd63987d8152fd1e104f6"
     },
     "test_sources": [

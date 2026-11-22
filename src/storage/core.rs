@@ -1369,6 +1369,10 @@ pub struct Database {
     // safely folded away. Every id <= this value is unconditionally visible
     // to current snapshots; sparse slot collection must not jump this prefix.
     min_retained_txn_id: AtomicU64,
+    // Offline physical recovery can bulk-load rows of surviving source
+    // transactions into zero-bound index pages. Preserve their writer bound
+    // until the ordinary MVCC proofs cover those transactions and snapshots.
+    recovered_index_writer_bound: u64,
     // PAGE_MAX_TRX_ID visibility shortcut counters (Phase 2). Each covering
     // scan chunk that resolves visibility via a leaf's `page_max_trx_id`
     // upper bound (InnoDB-style) bumps `hits`; every chunk that had to fall

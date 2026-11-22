@@ -874,36 +874,62 @@ pub fn named_fetch(
         ));
     };
     let columns = entry.columns.clone();
-    let mut state = entry.state.lock();
-    // A FETCH count is an upper bound, not an allocation estimate. In
-    // particular, a one-row cursor must accept even u64::MAX safely.
-    let mut rows: Vec<Vec<Value>> = Vec::new();
-    while (rows.len() as u64) < count {
-        if rows.len() == rows.capacity() && !state.exhausted {
-            let additional = rows.capacity().max(16).min(1024);
-            crate::engine::executor::mem_budget::try_reserve_vec_exact(
-                &mut rows,
-                additional,
-                "named cursor FETCH",
-            )?;
-        }
-        if let Some(row) = state.lookahead.take() {
-            rows.push(row);
-            continue;
-        }
-        if state.exhausted {
-            break;
-        }
-        match state.inner.next_row()? {
-            Some(row) => rows.push(row),
-            None => {
-                state.exhausted = true;
+    let collected = (|| -> Result<_, QueryError> {
+        let mut state = entry.state.lock();
+        // A FETCH count is an upper bound, not an allocation estimate. In
+        // particular, a one-row cursor must accept even u64::MAX safely.
+        let mut rows: Vec<Vec<Value>> = Vec::new();
+        let mut charge = crate::engine::executor::mem_budget::ScopedCharge::for_budget(Some(
+            crate::engine::executor::mem_budget::current_budget().unwrap_or_else(|| {
+                Arc::new(crate::engine::executor::mem_budget::MemBudget::from_env())
+            }),
+        ));
+        while (rows.len() as u64) < count {
+            if rows.len() == rows.capacity() && !state.exhausted {
+                let additional = rows.capacity().max(16).min(1024);
+                crate::engine::executor::mem_budget::try_reserve_vec_exact(
+                    &mut rows,
+                    additional,
+                    "named cursor FETCH",
+                )?;
+            }
+            if let Some(row) = state.lookahead.take() {
+                charge.add(
+                    crate::engine::executor::mem_budget::estimate_row_bytes(&row)
+                        .saturating_add(2 * std::mem::size_of::<Vec<Value>>()),
+                )?;
+                rows.push(row);
+                continue;
+            }
+            if state.exhausted {
                 break;
             }
+            match state.inner.next_row()? {
+                Some(row) => {
+                    charge.add(
+                        crate::engine::executor::mem_budget::estimate_row_bytes(&row)
+                            .saturating_add(2 * std::mem::size_of::<Vec<Value>>()),
+                    )?;
+                    rows.push(row);
+                }
+                None => {
+                    state.exhausted = true;
+                    break;
+                }
+            }
         }
-    }
-    let exhausted = state.exhausted && state.lookahead.is_none();
-    drop(state);
+        let exhausted = state.exhausted && state.lookahead.is_none();
+        Ok((rows, exhausted, charge))
+    })();
+    let (rows, exhausted, _charge) = match collected {
+        Ok(result) => result,
+        Err(err) => {
+            // A failed FETCH has consumed a prefix. Close it explicitly so a
+            // retry cannot silently resume after rows the client never saw.
+            let _ = named_close(connection_id, name);
+            return Err(err);
+        }
+    };
     let now = now_unix_ms();
     entry
         .rows_fetched
@@ -920,7 +946,6 @@ pub fn named_fetch(
         exhausted,
     })
 }
-
 /// Close + drop the named cursor (and any MVCC snapshot / scan state it
 /// pinned). Returns `Err` if the cursor isn't open — matches MySQL's
 /// `ER_SP_CURSOR_NOT_OPEN`.

@@ -5430,7 +5430,7 @@ fn push_json_table_columns(columns: &[JsonTableColumnDef], out: &mut Vec<Column>
                     ..Default::default()
                 },
                 name: name.clone(),
-                column_type: ColumnType::Long,
+                column_type: ColumnType::LongLong,
             }),
             JsonTableColumnDef::Named {
                 name,
@@ -5465,21 +5465,16 @@ fn push_json_table_columns(columns: &[JsonTableColumnDef], out: &mut Vec<Column>
 pub(super) fn json_table_doc_arg(value: &Value) -> Result<Vec<u8>, QueryError> {
     match value {
         Value::Json(bytes) => Ok(bytes.clone()),
-        Value::Bytes(bytes) => {
-            let text = std::str::from_utf8(bytes).map_err(|_| {
-                crate::error::catalog::ER_INVALID_JSON_CHARSET_IN_FUNCTION
-                    .error("Invalid encoding in argument 1 to function json_table.")
-            })?;
-            crate::engine::json::parse_text(text, 1, "json_table")
-        }
-        _ => crate::engine::json::parse_text(&value_to_string(value), 1, "json_table").map_err(
-            |_| {
-                error(
-                    crate::error::catalog::ER_INVALID_JSON_TEXT_IN_PARAM,
-                    "invalid JSON text in argument 1 to function json_table",
-                )
-            },
+        Value::String(text) => crate::engine::json::parse_text(text, 1, "json_table"),
+        Value::SmallString(_) => crate::engine::json::parse_text(
+            crate::types::value_str(value).unwrap(),
+            1,
+            "json_table",
         ),
+        Value::Bytes(_) => Err(crate::error::catalog::ER_INVALID_JSON_CHARSET
+            .error("Cannot create a JSON value from a string with CHARACTER SET 'binary'.")),
+        _ => Err(crate::error::catalog::ER_INVALID_TYPE_FOR_JSON
+            .error("Invalid data type for JSON data in argument 1 to function json_table.")),
     }
 }
 
@@ -5594,6 +5589,9 @@ fn json_table_column_value(
         return json_table_on_response(on_empty, data_type, unsigned, true, None);
     };
     if matches.len() != 1 {
+        if matches!(data_type, crate::parser::DataType::Json) {
+            return Ok(Value::Json(crate::engine::json::build_array(&matches)));
+        }
         return json_table_on_response(on_error, data_type, unsigned, false, None);
     }
     match json_table_jsonb_to_value(first, data_type, unsigned) {

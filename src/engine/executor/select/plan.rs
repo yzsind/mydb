@@ -1933,6 +1933,9 @@ pub(in crate::engine::executor) fn execute_plan_to_columns_and_values(
     plan: &PhysicalPlan,
 ) -> Result<(Vec<Column>, Vec<Vec<Value>>), QueryError> {
     let body = || -> Result<(Vec<Column>, Vec<Vec<Value>>), QueryError> {
+        let mut charge = crate::engine::executor::mem_budget::ScopedCharge::for_budget(
+            crate::engine::executor::mem_budget::current_budget(),
+        );
         if let Some(super::vec_bridge::VecBatchInput {
             mut stream,
             template,
@@ -1951,7 +1954,12 @@ pub(in crate::engine::executor) fn execute_plan_to_columns_and_values(
                 crate::engine::cancel::check_cancelled()?;
                 row_values.reserve(batch.visible_rows());
                 for row_idx in batch.visible_indices() {
-                    row_values.push(batch.row(row_idx));
+                    let row = batch.row(row_idx);
+                    charge.add_force(
+                        crate::engine::executor::mem_budget::estimate_row_bytes(&row)
+                            .saturating_add(2 * std::mem::size_of::<Vec<Value>>()),
+                    )?;
+                    row_values.push(row);
                 }
             }
             return Ok((columns, row_values));
@@ -1976,8 +1984,8 @@ pub(in crate::engine::executor) fn execute_plan_to_columns_and_values(
             Vec::new()
         };
         let row_values: Vec<Vec<Value>> = rows
-            .iter()
-            .map(|r| r.fields.iter().map(|f| (f.value).clone()).collect())
+            .into_iter()
+            .map(|r| r.fields.into_iter().map(|f| f.value).collect())
             .collect();
         Ok((columns, row_values))
     };

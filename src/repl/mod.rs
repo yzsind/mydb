@@ -55,6 +55,21 @@ pub use master::{SlotRegistry, SlotStatus};
 pub use replica::ReplicaProgress;
 pub use role::{Role, RoleState};
 
+static BACKGROUND_WRITE_GATE: parking_lot::RwLock<()> = parking_lot::RwLock::new(());
+
+/// Join local maintenance to the same drain boundary as foreground writes.
+pub(crate) fn background_write_permit() -> Option<parking_lot::RwLockReadGuard<'static, ()>> {
+    let permit = BACKGROUND_WRITE_GATE.read();
+    if GLOBAL.get().is_some_and(|manager| {
+        manager.master_writes_frozen.load(Ordering::SeqCst)
+            || manager.backup_capture_frozen.load(Ordering::SeqCst)
+    }) {
+        None
+    } else {
+        Some(permit)
+    }
+}
+
 pub(crate) fn format_endpoint(host: &str, port: u16) -> String {
     let host = host.trim_matches(['[', ']']);
     if host.contains(':') {
@@ -164,7 +179,7 @@ pub fn init_global(
             format!("mydb-repl: failed to load role.json: {err}"),
         )
     })?;
-    let config = ReplConfig::from_env();
+    let config = ReplConfig::from_env_checked()?;
     let initially_frozen = initial_state.write_fence.is_some();
     let initial_replica_progress = replica::load_progress(&data_dir)
         .ok()
@@ -255,7 +270,7 @@ pub async fn maybe_bootstrap_replica(data_dir: &std::path::Path) -> Result<(), Q
     if !role::physical_replica_on_disk(data_dir) {
         return Ok(());
     }
-    let config = ReplConfig::from_env();
+    let config = ReplConfig::from_env_checked()?;
     // Persist the replica role + endpoint now so the engine's recovery
     // path (and a later `init_global`) see a consistent role file.
     let state = role::load_or_init(data_dir).map_err(|err| {
@@ -270,7 +285,12 @@ pub async fn maybe_bootstrap_replica(data_dir: &std::path::Path) -> Result<(), Q
         (_, Some(ep)) => match ep.rsplit_once(':') {
             Some((h, p)) => (
                 h.trim_matches(['[', ']']).to_string(),
-                p.parse().unwrap_or(config.master_port),
+                p.parse().map_err(|_| {
+                    error(
+                        crate::error::catalog::MYDB_ER_REPLICATION_STATE,
+                        "invalid native replication master endpoint port",
+                    )
+                })?,
             ),
             None => (ep, config.master_port),
         },
@@ -293,7 +313,10 @@ pub async fn maybe_bootstrap_replica(data_dir: &std::path::Path) -> Result<(), Q
             )
         })?;
     }
-    let resync_reason = replica::progress::resync_marker_reason(data_dir);
+    let resync_reason = replica::progress::resync_marker_reason(data_dir).or_else(|| {
+        (!fresh && !replica::progress::progress_path(data_dir).exists())
+            .then(|| "replica progress file is missing; install a consistent seed".to_string())
+    });
     if !fresh && resync_reason.is_none() {
         return Ok(());
     }
@@ -1204,7 +1227,7 @@ impl MydbReplManager {
                     format!("load replica progress: {err}"),
                 )
             })?
-            .unwrap_or_default();
+            .unwrap_or_else(|| self.receiver_progress.lock().clone());
         // Startup recovery is the one authority that may reconcile a
         // throttled progress file with the durable local WAL: it has actually
         // redone the frames into Database state. Never perform this inference
@@ -1245,6 +1268,42 @@ impl MydbReplManager {
     /// Bind the master-side WAL listener if it isn't already running.
     /// Used by boot-time auto-start (role=master) and PROMOTE.
     pub fn start_master_service_if_needed(&self) -> Result<(), QueryError> {
+        self.start_master_service_with_listener(None)
+    }
+
+    fn reserve_master_listener(&self) -> Result<std::net::TcpListener, QueryError> {
+        self.config.auth_token.validate()?;
+        crate::repl::tls::validate_endpoint(&self.config, &self.config.bind_host).map_err(
+            |err| {
+                error(
+                    crate::error::catalog::MYDB_ER_REPLICATION_SECURITY,
+                    err.to_string(),
+                )
+            },
+        )?;
+        if self.runtime_handle.lock().is_none() {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "native replication requires a runtime",
+            ));
+        }
+        let bind = format_endpoint(&self.config.bind_host, self.config.bind_port);
+        let listener = std::net::TcpListener::bind(&bind).map_err(|err| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                format!("mydb-repl bind {bind}: {err}"),
+            )
+        })?;
+        listener
+            .set_nonblocking(true)
+            .map_err(|err| error(crate::error::catalog::ER_GET_ERRNO, err.to_string()))?;
+        Ok(listener)
+    }
+
+    fn start_master_service_with_listener(
+        &self,
+        reserved: Option<std::net::TcpListener>,
+    ) -> Result<(), QueryError> {
         self.config.auth_token.validate()?;
         let runtime_handle = self.runtime_handle.lock().clone().ok_or_else(|| {
             error(
@@ -1280,18 +1339,10 @@ impl MydbReplManager {
             role_state: Some(Arc::clone(&self.role_state)),
         };
         let bind = format!("{}:{}", init.bind_host, init.bind_port);
-        let std_listener = std::net::TcpListener::bind(&bind).map_err(|err| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                format!("mydb-repl bind {bind}: {err}"),
-            )
-        })?;
-        std_listener.set_nonblocking(true).map_err(|err| {
-            error(
-                crate::error::catalog::ER_GET_ERRNO,
-                format!("mydb-repl set_nonblocking {bind}: {err}"),
-            )
-        })?;
+        let std_listener = match reserved {
+            Some(listener) => listener,
+            None => self.reserve_master_listener()?,
+        };
         let _runtime = runtime_handle.enter();
         let listener = tokio::net::TcpListener::from_std(std_listener).map_err(|err| {
             error(
@@ -1400,9 +1451,8 @@ impl MydbReplManager {
     fn handle_reset_replication(&self) -> Result<QueryResponse, QueryError> {
         let _transition = self.transition_guard()?;
         self.ensure_no_pending_promotion()?;
-        // Clear the replica's progress file + force role back to
-        // standalone. Useful for "wipe and start over" after manual
-        // base backup.
+        // Clear the channel and progress while preserving the replica's
+        // write fence. Detachment requires an explicit promotion.
         if self.role() == Role::Master {
             return Err(error(
                 crate::error::catalog::ER_ILLEGAL_HA,
@@ -1421,8 +1471,8 @@ impl MydbReplManager {
         }
         replica::progress::clear_resync_marker(&self.data_dir);
         let mut state = self.role_state.lock().unwrap();
-        state.role = Role::Standalone;
-        self.publish_role_hint(Role::Standalone);
+        let role = state.role;
+        self.publish_role_hint(role);
         state.master_endpoint = None;
         state.epoch = state.epoch.saturating_add(1);
         role::save(&self.data_dir, &state).map_err(|err| {
@@ -1433,7 +1483,9 @@ impl MydbReplManager {
         })?;
         self.engine
             .database_for_replication()
-            .set_physical_replica_mode(false)?;
+            .set_physical_replica_mode(role == Role::Replica)?;
+        *self.receiver_progress.lock() = ReplicaProgress::default();
+        *self.receiver_status.lock() = "stopped: replication reset".to_string();
         Ok(QueryResponse::Ok)
     }
     fn handle_change_sequence_sync(&self, sql: &str) -> Result<QueryResponse, QueryError> {
@@ -1606,6 +1658,7 @@ impl MydbReplManager {
                 ),
             ));
         }
+        let listener = Some(self.reserve_master_listener()?);
         // Stop consuming the old master's stream first.
         self.stop_receiver_if_running()?;
         let db = self.engine.database_for_replication();
@@ -1666,7 +1719,7 @@ impl MydbReplManager {
             })?;
         }
         self.finish_pending_promotion()?;
-        self.start_master_service_if_needed()?;
+        self.start_master_service_with_listener(listener)?;
         Ok(QueryResponse::Ok)
     }
     fn finish_pending_promotion(&self) -> Result<(), QueryError> {
@@ -1684,9 +1737,11 @@ impl MydbReplManager {
         let db = self.engine.database_for_replication();
         if before.role != Role::Master {
             self.reserve_former_source_slot(target)?;
-            db.persist_replicated_undo_for_promotion()?;
-            db.rollback_all_active_replication_txns()?;
-            db.restore_replicated_xa_for_promotion()?;
+            if before.role == Role::Replica {
+                db.persist_replicated_undo_for_promotion()?;
+                db.rollback_all_active_replication_txns()?;
+                db.restore_replicated_xa_for_promotion()?;
+            }
             db.checkpoint()?;
             let mut state = self.role_state.lock().unwrap();
             state.promote_to_master_at(target);
@@ -1868,6 +1923,18 @@ impl MydbReplManager {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
+        let _maintenance = loop {
+            session.check_cancelled()?;
+            if let Some(permit) =
+                BACKGROUND_WRITE_GATE.try_write_for(std::time::Duration::from_millis(10))
+            {
+                break permit;
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(error(crate::error::catalog::MYDB_ER_ROLE_CHANGE_BLOCKED,
+                    "STOP MASTER WRITES timed out draining maintenance; RESUME MASTER WRITES to cancel the fence"));
+            }
+        };
         db.checkpoint()?;
         let fence_lsn = db.wal_log().lock().next_lsn().saturating_sub(1);
         let timeline = {
