@@ -444,6 +444,7 @@ impl Database {
     /// in the common case (no in-flight DDL/DML repairs).
     pub fn has_pending_index_repairs(&self) -> bool {
         self.index_repair_version.load(Ordering::Acquire) & 1 != 0
+            || self.retained_index_deletes.load(Ordering::Acquire) != 0
     }
 
     /// Changes whenever a repair key is registered or purged. A reader that
@@ -457,7 +458,9 @@ impl Database {
     pub(crate) fn has_pending_index_repairs_for(&self, table_id: u64, index_name: &str) -> bool {
         // Lock-free: the per-index scope counts registered keys exactly; a
         // colliding index can only make this conservatively true.
-        self.has_pending_index_repairs() && self.index_repair_epochs.has_keys(table_id, index_name)
+        self.retained_index_deletes.load(Ordering::Acquire) != 0
+            || (self.index_repair_version.load(Ordering::Acquire) & 1 != 0
+                && self.index_repair_epochs.has_keys(table_id, index_name))
     }
 
     /// Run a physical read followed by its repair merge again whenever a
@@ -470,10 +473,13 @@ impl Database {
         index: &IndexSchema,
         mut read: impl FnMut() -> Result<T, QueryError>,
     ) -> Result<T, QueryError> {
+        let rollback = self
+            .index_repair_epochs
+            .rollback_version(table.id, &index.name);
         loop {
-            let epoch = self.index_repair_rollback_epoch(table.id, &index.name);
+            let epoch = rollback.load(Ordering::Acquire);
             let value = read()?;
-            if self.index_repair_rollback_epoch(table.id, &index.name) == epoch {
+            if rollback.load(Ordering::Acquire) == epoch {
                 return Ok(value);
             }
             crate::engine::cancel::check_cancelled()?;
@@ -618,6 +624,12 @@ impl Database {
         Some(vec![true; chunk_len])
     }
 
+    #[inline]
+    fn retained_deletes_need_heap(&self, view: TxnView) -> bool {
+        self.retained_index_deletes.load(Ordering::Acquire) != 0
+            || view.snapshot_scn < self.retained_index_purge_frontier.load(Ordering::Acquire)
+    }
+
     /// InnoDB-style PAGE_MAX_TRX_ID visibility shortcut.
     ///
     /// A leaf whose `page_max_trx_id` is at or below the contiguous GC
@@ -645,7 +657,9 @@ impl Database {
     pub(crate) fn index_page_all_visible(&self, page_max_trx_id: u64, view: TxnView) -> bool {
         // Offline rebuilds contain physical rows of surviving XA branches.
         // Their zero bulk-load bound cannot prove transaction visibility.
-        if self.xa_prepared_active.load(Ordering::Acquire) != 0 {
+        if self.xa_prepared_active.load(Ordering::Acquire) != 0
+            || self.retained_deletes_need_heap(view)
+        {
             return false;
         }
         if view.historical {
@@ -786,12 +800,22 @@ impl Database {
         if unsatisfiable {
             return Ok(Vec::new());
         }
-        let mut ids = self.lookup_index_resolved(table, index, &key)?;
-        let before = ids.len();
-        self.add_exact_index_visibility_repair_ids(table, index, txn, &key, &mut ids)?;
-        if ids.len() != before {
-            dedup_row_ids(&mut ids);
-        }
+        let ids = self.retry_if_rollback_overlapped(table, index, || {
+            let mut ids = self.lookup_index_resolved(table, index, &key)?;
+            #[cfg(test)]
+            if let Some(hook) =
+                crate::storage::txn::index_repair_cleanup_test_hook::AFTER_POINT_PROBE
+                    .with(|hook| hook.borrow_mut().take())
+            {
+                hook();
+            }
+            let before = ids.len();
+            self.add_exact_index_visibility_repair_ids(table, index, txn, &key, &mut ids)?;
+            if ids.len() != before {
+                dedup_row_ids(&mut ids);
+            }
+            Ok(ids)
+        })?;
         if txn.historical {
             let mut visible = Vec::with_capacity(ids.len());
             for id in ids {
@@ -2681,7 +2705,11 @@ impl Database {
                 low.as_ref(),
                 high.as_ref(),
                 filter_terms,
-                |bound| index_page_max_trx_shortcut_enabled() && bound <= prefix,
+                |bound| {
+                    index_page_max_trx_shortcut_enabled()
+                        && bound <= prefix
+                        && !self.retained_deletes_need_heap(txn)
+                },
                 |key, row_id| {
                     if let Some(visible) =
                         self.is_row_id_visible_buffered_in_heap(&heap.read(), row_id, txn)?
@@ -3317,6 +3345,7 @@ impl Database {
                     || txn.dirty_read
                     || !index_page_max_trx_shortcut_enabled()
                     || self.xa_prepared_active.load(Ordering::Acquire) != 0
+                    || self.retained_deletes_need_heap(txn)
                 {
                     return false;
                 }

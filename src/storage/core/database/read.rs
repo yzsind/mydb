@@ -1835,6 +1835,14 @@ impl Database {
         row_id: RowId,
     ) -> Result<Option<MvccStoredRow>, QueryError> {
         let heap = self.heap_handle(table_id)?;
+        Self::read_mvcc_row_with_handle(&heap, row_id)
+    }
+
+    #[inline]
+    fn read_mvcc_row_with_handle(
+        heap: &HeapHandle,
+        row_id: RowId,
+    ) -> Result<Option<MvccStoredRow>, QueryError> {
         let heap_read = heap.read();
         // Try the buffer-pool-cached fast path first; fall back to the
         // full read which fetches the page through the buffer pool. Both

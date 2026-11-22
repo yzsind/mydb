@@ -871,6 +871,16 @@ impl Drop for ForegroundBulkDdlGuard<'_> {
     }
 }
 
+/// These indexes allow several physical owners of a key. Their read paths
+/// already resolve row visibility; the retained mark disables heap-free scans.
+fn index_supports_delete_mark(index: &IndexSchema) -> bool {
+    !index.unique
+        && !index.primary
+        && index.state == crate::storage::schema::IndexState::Public
+        && index.index_type.eq_ignore_ascii_case("BTREE")
+        && !index.has_expression_parts()
+}
+
 impl Database {
     fn enter_foreground_bulk_ddl(&self) -> ForegroundBulkDdlGuard<'_> {
         self.foreground_bulk_ddl_active
@@ -2665,20 +2675,8 @@ impl Database {
         })?))
     }
 
-    fn insert_indexes_deferred(
-        &self,
-        txn_id: u64,
-        table: &TableSchema,
-        values: &[Value],
-        row_id: RowId,
-    ) -> Result<(), QueryError> {
-        self.insert_indexes_deferred_at(txn_id, table.id, table, values, row_id)
-    }
-
-    /// Partition-aware rollback variant of [`Self::insert_indexes_deferred`].
-    /// Undo records are keyed by the physical heap `storage_id`, so index
-    /// compensation must target the indexes beside that heap rather than the
-    /// partitioned table's logical `table.id`.
+    /// Insert into the indexes beside the owning heap. During DELETE rollback,
+    /// retained keys already exist and need no compensation.
     fn insert_indexes_deferred_at(
         &self,
         txn_id: u64,
@@ -2686,8 +2684,12 @@ impl Database {
         table: &TableSchema,
         values: &[Value],
         row_id: RowId,
+        retained: bool,
     ) -> Result<(), QueryError> {
         for index in &table.indexes {
+            if retained && index_supports_delete_mark(index) {
+                continue;
+            }
             for key in table.index_keys(index, values)? {
                 self.with_index_dml(storage_id, &index.name, |index_file| {
                     index_file.insert_deferred(txn_id, key, row_id)
@@ -2838,20 +2840,20 @@ impl Database {
         Ok(cached)
     }
 
-    fn write_heap_rows(
+    fn write_heap_rows<V: AsRef<[Value]>>(
         &self,
         txn_id: u64,
         table_id: u64,
-        writes: &[HeapWrite],
+        writes: &[HeapWrite<V>],
     ) -> Result<(), QueryError> {
         self.write_heap_rows_tracked(txn_id, table_id, writes, &mut 0)
     }
 
-    fn write_heap_rows_tracked(
+    fn write_heap_rows_tracked<V: AsRef<[Value]>>(
         &self,
         txn_id: u64,
         table_id: u64,
-        writes: &[HeapWrite],
+        writes: &[HeapWrite<V>],
         written: &mut usize,
     ) -> Result<(), QueryError> {
         if writes.is_empty() {
@@ -2883,7 +2885,7 @@ impl Database {
                         txn_id,
                         write.row_id,
                         write.header,
-                        &write.values,
+                        write.values.as_ref(),
                         &write.external,
                     )?;
                     *written += 1;
@@ -2891,26 +2893,42 @@ impl Database {
                 Ok(())
             });
         }
-        for write in writes {
-            if write.header.is_deleted()
-                && self.with_heap_mut(table_id, |heap| {
-                    heap.try_write_mvcc_tombstone(txn_id, write.row_id, write.header)
-                })?
-            {
-                *written += 1;
-                continue;
+        let mut remaining = writes;
+        while let Some(write) = remaining.first() {
+            // Reuse the heap handle for each contiguous tombstone run. A
+            // layout requiring a full rewrite leaves the run before any
+            // mutation, so its WAL prefix can be published outside the handle.
+            if write.header.is_deleted() {
+                let patched = self.with_heap_mut(table_id, |heap| {
+                    let mut patched = 0;
+                    for write in remaining {
+                        if !write.header.is_deleted()
+                            || !heap.try_write_mvcc_tombstone(txn_id, write.row_id, write.header)?
+                        {
+                            break;
+                        }
+                        patched += 1;
+                        *written += 1;
+                    }
+                    Ok(patched)
+                })?;
+                remaining = &remaining[patched..];
             }
+            let Some((write, rest)) = remaining.split_first() else {
+                break;
+            };
             self.publish_wal_before_eager_heap_write(txn_id)?;
             self.with_heap_mut(table_id, |heap| {
                 heap.write_mvcc_ext(
                     txn_id,
                     write.row_id,
                     write.header,
-                    &write.values,
+                    write.values.as_ref(),
                     &write.external,
                 )
             })?;
             *written += 1;
+            remaining = rest;
         }
         Ok(())
     }
@@ -3414,7 +3432,7 @@ impl Database {
         })?;
         self.lock_row_nonblocking(txn.txn_id, table.id, row_id)?;
         self.push_undo_deferred(txn.txn_id, UndoKind::Insert, table.id, row_id, None, None)?;
-        self.insert_indexes_deferred(txn.txn_id, table, &values, row_id)?;
+        self.insert_indexes_deferred_at(txn.txn_id, table.id, table, &values, row_id, false)?;
         // The storage single-row API shares the same durable commit journal
         // and rollback/savepoint semantics as executor batches.
         if let Some(undo_id) = self.deferred_ann_undo_head(txn.txn_id, table)? {
@@ -4149,26 +4167,21 @@ impl Database {
         Ok(())
     }
 
-    fn lock_delete_rows(
+    fn lock_delete_unique_keys(
         &self,
         txn_id: u64,
         table: &TableSchema,
         deletes: &[DmlDelete],
     ) -> Result<(), QueryError> {
-        let mut row_ids = Vec::with_capacity(deletes.len());
         let mut unique_locks = Vec::new();
         for (offset, delete) in deletes.iter().enumerate() {
             if offset % 256 == 0 {
                 crate::engine::cancel::check_cancelled()?;
             }
-            row_ids.push(delete.row_id);
             self.collect_unique_key_locks_for_values(table, &delete.values, &mut unique_locks)?;
         }
-        // Non-blocking: deletes captured `delete.values` from an MVCC read;
-        // see `lock_update_rows` for the reasoning.
-        self.lock_rows_nonblocking(txn_id, table.id, row_ids)?;
-        self.lock_unique_keys_nonblocking(txn_id, unique_locks)?;
-        Ok(())
+        // The caller owns the row locks from the post-lock MVCC recheck.
+        self.lock_unique_keys_nonblocking(txn_id, unique_locks)
     }
 
     fn collect_unique_key_locks_for_values<'a>(
@@ -4291,6 +4304,9 @@ impl Database {
                 crate::engine::cancel::check_cancelled()?;
             }
             for index in &table.indexes {
+                if delete.retain_index_entries && index_supports_delete_mark(index) {
+                    continue;
+                }
                 let batch = by_index
                     .get_mut(&index.name)
                     .expect("index should have a batch entry");

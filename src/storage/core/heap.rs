@@ -2877,9 +2877,71 @@ impl HeapFile {
             return Ok(false);
         };
         let mut after = before;
-        after[0] |= MVCC_FLAG_DELETED;
+        after[0] |= header.flags & (MVCC_FLAG_DELETED | MVCC_FLAG_RETAINED_INDEX_KEYS);
         after[1..9].copy_from_slice(&header.last_txn_id.to_le_bytes());
         after[9..17].copy_from_slice(&header.undo_ptr.unwrap().to_le_bytes());
+        self.write_mvcc_header_patch(txn_id, row_id, before, after, header.undo_ptr)?;
+        Ok(true)
+    }
+
+    /// Restore an inline DeleteHeader predecessor without rewriting its body.
+    /// A version created by the deleting transaction may be absent from the
+    /// redo image before loser undo, so that case needs a full compensation.
+    fn try_restore_delete_header(
+        &self,
+        deleting_txn: u64,
+        undo_id: u64,
+        row_id: RowId,
+        header: RowHeader,
+    ) -> Result<bool, QueryError> {
+        if header.last_txn_id == 0
+            || header.last_txn_id == deleting_txn
+            || header.flags & (MVCC_FLAG_DELETED | MVCC_FLAG_ROW_PIECE) != 0
+        {
+            return Ok(false);
+        }
+        let _page_guard = self
+            .page_latch(row_id.page_id as u64)
+            .lock()
+            .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
+        let before = self.with_page(row_id.page_id as u64, |page| {
+            let Some(payload) = page.payload(row_id.slot_id as usize)? else {
+                return Ok(None);
+            };
+            if payload.first().copied() != Some(MVCC_ROW_VERSION) {
+                return Ok(None);
+            }
+            let (current, width, external) = read_mvcc_header(payload)?;
+            if width != 18
+                || external
+                || !current.is_deleted()
+                || current.flags & MVCC_FLAG_ROW_PIECE != 0
+                || current.last_txn_id != deleting_txn
+                || current.undo_ptr != Some(undo_id)
+            {
+                return Ok(None);
+            }
+            Ok(Some(<[u8; 17]>::try_from(&payload[1..18]).unwrap()))
+        })?;
+        let Some(before) = before else {
+            return Ok(false);
+        };
+        let mut after = before;
+        after[0] = (before[0] & !PUBLIC_FLAG_MASK) | (header.flags & PUBLIC_FLAG_MASK);
+        after[1..9].copy_from_slice(&header.last_txn_id.to_le_bytes());
+        after[9..17].copy_from_slice(&header.undo_ptr.unwrap_or(0).to_le_bytes());
+        self.write_mvcc_header_patch(0, row_id, before, after, None)?;
+        Ok(true)
+    }
+
+    fn write_mvcc_header_patch(
+        &self,
+        txn_id: u64,
+        row_id: RowId,
+        before: [u8; 17],
+        after: [u8; 17],
+        undo_lsn: Option<u64>,
+    ) -> Result<(), QueryError> {
         self.maybe_emit_heap_fpi(row_id.page_id)?;
         let key = self.page_key(row_id.page_id as u64);
         let write = |lsn| {
@@ -2889,8 +2951,7 @@ impl HeapFile {
                 })
         };
         if self.durability() == DurabilityMode::Memory {
-            write(0)?;
-            return Ok(true);
+            return write(0);
         }
         let payload = WalPayload::HeapUpdateLogical {
             path: self.relative_path(),
@@ -2901,7 +2962,7 @@ impl HeapFile {
                 before: smallvec::SmallVec::from_slice(&before),
                 after: smallvec::SmallVec::from_slice(&after),
             }],
-            undo_lsn: header.undo_ptr,
+            undo_lsn,
         };
         match try_buffer_txn_page_write(
             &self.log,
@@ -2911,14 +2972,13 @@ impl HeapFile {
             vec![key.clone()],
             write,
         ) {
-            Ok(result) => result?,
+            Ok(result) => result,
             Err((payload, write)) => {
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
                 let lsn = crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)?;
-                write(lsn)?;
+                write(lsn)
             }
         }
-        Ok(true)
     }
 
     fn write_mvcc(
@@ -5967,12 +6027,32 @@ impl HeapFile {
     /// reclaim is then a no-op rather than corruption). Writes a
     /// `WalPayload::SlotReclaim` record before flipping the page.
     pub(crate) fn reclaim_slot_logged(&self, row_id: RowId) -> Result<bool, QueryError> {
+        self.reclaim_slot_logged_guarded(row_id, None)
+    }
+
+    fn reclaim_retained_slot_logged(
+        &self,
+        row_id: RowId,
+        expected: RowHeader,
+    ) -> Result<bool, QueryError> {
+        self.reclaim_slot_logged_guarded(row_id, Some(expected))
+    }
+
+    fn reclaim_slot_logged_guarded(
+        &self,
+        row_id: RowId,
+        expected_retained: Option<RowHeader>,
+    ) -> Result<bool, QueryError> {
         let _page_guard = self
             .page_latch(row_id.page_id as u64)
             .lock()
             .map_err(|_| error(crate::error::catalog::ER_GET_ERRNO, "page latch poisoned"))?;
-        let mut page = self.read_page(row_id.page_id as u64)?;
-        if !page.is_slot_mvcc_tombstone(row_id.slot_id) {
+        // Only the deferred purge may free a marked slot, and only the
+        // exact version whose keys it has unlinked. A stale reclaim
+        // request must never apply to a later use of this RowId.
+        if !self.with_page(row_id.page_id as u64, |page| {
+            page.can_reclaim_slot(row_id.slot_id, expected_retained)
+        })? {
             return Ok(false);
         }
         self.maybe_emit_heap_fpi(row_id.page_id)?;
@@ -5992,12 +6072,18 @@ impl HeapFile {
             )?;
             lsn
         };
-        page.mark_slot_free(row_id.slot_id)?;
-        if lsn != 0 {
-            page.set_lsn(lsn);
-        }
+        // The page latch protects the checked slot through WAL publication.
+        // Only its length and flags change; use the authoritative raw image
+        // so each reclaimed row does not copy/decode/checksum an entire page.
+        // The buffer pool validates loaded images and finalizes the deferred
+        // checksum at full-image/flush boundaries, as for ordinary row patches.
         self.buffer_pool
-            .store_page(self.page_key(row_id.page_id as u64), page.encode(), lsn)?;
+            .with_raw_page_mut(self.page_key(row_id.page_id as u64), lsn, |bytes| {
+                let base = PAGE_HEADER_SIZE + row_id.slot_id as usize * SLOT_SIZE;
+                write_u16(bytes, base + 2, 0);
+                bytes[base + 4] = ROW_FLAG_FREE;
+                Ok(())
+            })?;
         // The tail page is already every insert's target; only older pages
         // need advertising.
         if u64::from(row_id.page_id) + 1 < self.page_count_relaxed() {
@@ -6151,6 +6237,41 @@ impl<'a> HeapPageView<'a> {
                 slot_id: slot_id as u16,
             },
         )
+    }
+
+    fn can_reclaim_slot(
+        &self,
+        slot_id: u16,
+        expected_retained: Option<RowHeader>,
+    ) -> Result<bool, QueryError> {
+        let idx = slot_id as usize;
+        if idx >= self.slot_count {
+            return Ok(false);
+        }
+        let base = PAGE_HEADER_SIZE + idx * SLOT_SIZE;
+        let flags = self.bytes[base + 4];
+        if flags & ROW_FLAG_FREE != 0 || read_u16(self.bytes, base + 2) == 0 {
+            return Ok(false);
+        }
+        // INSERT compensation can tombstone the slot directory itself. Its
+        // payload is no longer visible and cannot own retained index keys.
+        if flags & ROW_FLAG_DELETED != 0 {
+            return Ok(expected_retained.is_none());
+        }
+        let Some(payload) = self.payload(idx)? else {
+            return Ok(false);
+        };
+        if payload.len() < 2
+            || payload[0] != MVCC_ROW_VERSION
+            || payload[1] & MVCC_FLAG_DELETED == 0
+        {
+            return Ok(false);
+        }
+        let retained = peek_mvcc_header(payload)
+            .map(|(header, _, _)| header)
+            .filter(|header| header.flags & MVCC_FLAG_RETAINED_INDEX_KEYS != 0);
+        Ok(retained.map(|h| (h.last_txn_id, h.undo_ptr))
+            == expected_retained.map(|h| (h.last_txn_id, h.undo_ptr)))
     }
 }
 
@@ -6753,6 +6874,70 @@ mod raw_page_view_tests {
         assert!(validate_heap_page_header_with_cache(&second, 0, Some(&cache)).unwrap());
         assert!(cache.contains(0, second_checksum));
         assert!(!cache.contains(0, first_checksum));
+    }
+
+    #[test]
+    fn raw_reclaim_preserves_slot_and_retained_version_guards() {
+        let mut page = Page::new();
+        for flags in [
+            0,
+            MVCC_FLAG_DELETED,
+            MVCC_FLAG_DELETED | MVCC_FLAG_RETAINED_INDEX_KEYS,
+        ] {
+            let payload = encode_mvcc_row(
+                RowHeader {
+                    flags,
+                    last_txn_id: 7,
+                    undo_ptr: Some(11),
+                },
+                &[],
+                &RowCodec::empty(),
+                &[],
+            )
+            .unwrap();
+            page.insert(&payload).unwrap();
+        }
+        let physical = page.insert(b"insert compensation").unwrap();
+        page.delete(physical).unwrap();
+        page.insert(&[MVCC_ROW_VERSION]).unwrap();
+        page.insert(b"not an MVCC row").unwrap();
+        let free = page.insert(b"free slot").unwrap();
+        page.mark_slot_free(free).unwrap();
+        let bytes = page.encode();
+        let view = HeapPageView::new(&bytes).unwrap().unwrap();
+        let header = RowHeader {
+            flags: MVCC_FLAG_DELETED | MVCC_FLAG_RETAINED_INDEX_KEYS,
+            last_txn_id: 7,
+            undo_ptr: Some(11),
+        };
+        for expected in [
+            None,
+            Some(header),
+            Some(RowHeader {
+                last_txn_id: 8,
+                ..header
+            }),
+            Some(RowHeader {
+                undo_ptr: Some(12),
+                ..header
+            }),
+        ] {
+            for slot in 0..=page.slots.len() as u16 {
+                let retained = page
+                    .read(slot)
+                    .and_then(peek_mvcc_header)
+                    .map(|(header, _, _)| header)
+                    .filter(|header| header.flags & MVCC_FLAG_RETAINED_INDEX_KEYS != 0);
+                let legacy = page.is_slot_mvcc_tombstone(slot)
+                    && retained.map(|h| (h.last_txn_id, h.undo_ptr))
+                        == expected.map(|h| (h.last_txn_id, h.undo_ptr));
+                assert_eq!(
+                    view.can_reclaim_slot(slot, expected).unwrap(),
+                    legacy,
+                    "slot {slot}, expected {expected:?}"
+                );
+            }
+        }
     }
 
     #[test]

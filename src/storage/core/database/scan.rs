@@ -1044,6 +1044,30 @@ impl Database {
         Ok(())
     }
 
+    /// The caller owns the unpartitioned table's write binding. Reuse its
+    /// operation-local handle without holding a heap latch across callbacks.
+    fn dml_candidate_rows_from_heap(
+        &self,
+        table: &TableSchema,
+        txn: TxnView,
+        heap: &HeapHandle,
+        row_ids: Vec<RowId>,
+    ) -> Result<Vec<StoredRow>, QueryError> {
+        self.check_primary_read_view(table, txn)?;
+        let mut rows = Vec::with_capacity(row_ids.len());
+        for row_id in row_ids {
+            self.ensure_writable()?;
+            let Some(row) = Self::read_mvcc_row_with_handle(heap, row_id)? else {
+                continue;
+            };
+            if let Some(mut row) = self.dml_candidate_from_mvcc(row, txn)? {
+                Self::pad_full_row_to_schema(&mut row.values, table);
+                rows.push(row);
+            }
+        }
+        Ok(rows)
+    }
+
     fn dml_candidate_rows(
         &self,
         table: &TableSchema,
@@ -1267,9 +1291,9 @@ impl Database {
                 }))
             };
         }
-        let last_txn_status = {
-            let txns = self.txns_read()?;
-            txns.status(row.header.last_txn_id)
+        let last_txn_status = match self.slot_status_cache.lookup(row.header.last_txn_id) {
+            Some((status, _)) => Some(status),
+            None => self.txns_read()?.status(row.header.last_txn_id),
         };
         match last_txn_status {
             Some(TxnStatus::Active | TxnStatus::Prepared) => {

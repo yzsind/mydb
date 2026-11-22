@@ -10,6 +10,7 @@ use crate::util::decimal::wide_to_f64 as value_to_wide_f64;
 //       bit 2  FLAG_HAS_LAST_TXN_ID     (codec-internal)
 //       bit 3  FLAG_HAS_UNDO_PTR        (codec-internal)
 //       bit 4  FLAG_HAS_EXTERNAL        (codec-internal)
+//       bit 5  MVCC_FLAG_RETAINED_INDEX_KEYS
 //   [if FLAG_HAS_LAST_TXN_ID: u64 LE last_txn_id]
 //   [if FLAG_HAS_UNDO_PTR:    u64 LE undo_ptr]
 //   [varint layout_id]
@@ -56,7 +57,8 @@ const FLAG_HAS_EXTERNAL: u8 = 1 << 4;
 /// Mask of flag bits that originate from the caller (`RowHeader.flags`)
 /// rather than from the codec. The decoder strips codec-internal flag
 /// bits before returning a `RowHeader`, so callers never see them.
-const PUBLIC_FLAG_MASK: u8 = MVCC_FLAG_DELETED | MVCC_FLAG_ROW_PIECE;
+const PUBLIC_FLAG_MASK: u8 =
+    MVCC_FLAG_DELETED | MVCC_FLAG_ROW_PIECE | MVCC_FLAG_RETAINED_INDEX_KEYS;
 
 // ---------------------------------------------------------------------------
 // Off-page LOB materialization context

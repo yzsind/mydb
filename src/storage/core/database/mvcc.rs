@@ -12,6 +12,18 @@ const SCAN_VIS_CACHE_SLOTS: usize = 32;
 /// ownership transfer); a large insert record is applied in bounded row chunks.
 const ROLLBACK_BATCH_RECORDS: usize = 4096;
 const ROLLBACK_BATCH_BYTES: usize = 4 * 1024 * 1024;
+const ROLLBACK_DELETE_BATCH_ROWS: usize = 256;
+const ROLLBACK_DELETE_BATCH_BYTES: usize = 256 * 1024;
+
+struct RollbackDeleteBatch {
+    storage_id: u64,
+    table: Arc<TableSchema>,
+    rows: Vec<(u64, MvccStoredRow)>,
+    retained_index_entries: bool,
+    row_ids: HashSet<RowId>,
+    row_bytes: usize,
+    _scratch: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+}
 
 /// Brent's cycle detector: constant space, no limit on a valid chain's length,
 /// and one pointer comparison per hop. Physical undo addresses need not be
@@ -64,6 +76,10 @@ thread_local! {
     static ROLLBACK_PROGRESS_TEST_HOOK: RefCell<Option<Box<dyn FnMut(u64, Option<u64>, bool)>>> =
         const { RefCell::new(None) };
     static ROLLBACK_RECORD_TEST_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
+        const { RefCell::new(None) };
+    static ROLLBACK_DELETE_INDEX_TEST_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
+        const { RefCell::new(None) };
+    static ROLLBACK_DELETE_HEADER_TEST_HOOK: RefCell<Option<Box<dyn FnMut()>>> =
         const { RefCell::new(None) };
 }
 
@@ -473,7 +489,7 @@ impl Database {
                     };
                     undo_ptr = next_ptr;
                 }
-                UndoKind::DeleteHeader => {
+                UndoKind::DeleteHeader | UndoKind::DeleteHeaderRetained => {
                     let before_header = before_header
                         .ok_or_else(|| undo_corruption(undo_ptr, "missing delete before_header"))?;
                     if before_values.is_some()
@@ -1466,9 +1482,15 @@ impl Database {
         let batch_record_limit = ROLLBACK_BATCH_RECORD_LIMIT.with(|limit| limit.get());
         #[cfg(not(test))]
         let batch_record_limit = ROLLBACK_BATCH_RECORDS;
-        let mut undo_ptr = self.txns_read()?.undo_head(txn_id)?;
+        let txns = self.txns_read()?;
+        let mut undo_ptr = txns.undo_head(txn_id)?;
+        // A recovered prepared branch can have had its physical index rebuilt
+        // from the current heap. Restore its keys through the ordinary path.
+        let prepared = txns.status(txn_id) == Some(TxnStatus::Prepared);
+        drop(txns);
         let mut touched_tables = HashSet::new();
         let mut expression_compensation = None;
+        let mut delete_batch: Option<RollbackDeleteBatch> = None;
         let mut compensated = Vec::new();
         let mut sync_compensation = false;
         let mut walk = UndoChainWalk::default();
@@ -1525,9 +1547,27 @@ impl Database {
             {
                 expression_compensation = Some(crate::engine::expr::CompensationExpressionGuard::new());
             }
-            let header_only_delete = matches!(&record.kind, UndoKind::DeleteHeader);
+            let header_only_delete = matches!(
+                &record.kind,
+                UndoKind::DeleteHeader | UndoKind::DeleteHeaderRetained
+            );
+            let retained_index_entries =
+                matches!(&record.kind, UndoKind::DeleteHeaderRetained) && !prepared;
+            // Only consecutive deletes of distinct rows in one physical
+            // heap may move their index work ahead of their heap restores.
+            if delete_batch.as_ref().is_some_and(|batch| {
+                !header_only_delete
+                    || batch.retained_index_entries != retained_index_entries
+                    || batch.storage_id != record.table_id
+                    || batch.row_ids.contains(&record.row_id)
+            }) {
+                self.flush_rollback_deletes(txn_id, &mut delete_batch)?;
+            }
             let owns_reclaimable = !record.before_external.is_empty()
-                || matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader);
+                || matches!(
+                    record.kind,
+                    UndoKind::Delete | UndoKind::DeleteHeader | UndoKind::DeleteHeaderRetained
+                );
             sync_compensation |= owns_reclaimable;
             let mark_compensated = owns_reclaimable
                 || matches!(record.kind, UndoKind::Insert | UndoKind::InsertBatch { .. });
@@ -1593,7 +1633,7 @@ impl Database {
                     })?;
                     self.free_external_refs(record.table_id, &to_free);
                 }
-                UndoKind::Delete | UndoKind::DeleteHeader => {
+                UndoKind::Delete | UndoKind::DeleteHeader | UndoKind::DeleteHeaderRetained => {
                     let Some(header) = record.before_header else {
                         return Err(undo_corruption(
                             ptr,
@@ -1626,25 +1666,58 @@ impl Database {
                     };
                     let mut old_external = record.before_external;
                     old_external.extend(record.borrowed_external);
-                    if let Some(table) = self.table_by_id(record.table_id) {
-                        let index_values = self.rollback_index_values(
-                            &table,
+                    let table = self.table_by_id(record.table_id);
+                    let row = MvccStoredRow {
+                        row_id: record.row_id,
+                        header,
+                        values,
+                    };
+                    let row = match table.as_ref() {
+                        Some(table) if header_only_delete => self.queue_rollback_delete(
+                            txn_id,
+                            &mut delete_batch,
                             record.table_id,
-                            &values,
-                            &old_external,
-                        )?;
-                        self.insert_indexes_deferred_at(
-                            txn_id_for_ddl(),
-                            record.table_id,
-                            &table,
-                            index_values.as_ref(),
-                            record.row_id,
-                        )?;
+                            table,
+                            (record.id, row),
+                            retained_index_entries,
+                        )?,
+                        _ => Some(row),
+                    };
+                    if let Some(row) = row {
+                        if let Some(table) = table {
+                            let index_values = self.rollback_index_values(
+                                &table,
+                                record.table_id,
+                                &row.values,
+                                &old_external,
+                            )?;
+                            self.insert_indexes_deferred_at(
+                                txn_id_for_ddl(),
+                                record.table_id,
+                                &table,
+                                index_values.as_ref(),
+                                row.row_id,
+                                retained_index_entries,
+                            )?;
+                        }
+                        let mask = external_mask_from(&old_external, row.values.len());
+                        self.with_heap_mut(record.table_id, |heap| {
+                            if header_only_delete
+                                && heap.try_restore_delete_header(
+                                    txn_id, record.id, row.row_id, row.header,
+                                )?
+                            {
+                                return Ok(());
+                            }
+                            heap.write_mvcc_ext(
+                                txn_id_for_ddl(),
+                                row.row_id,
+                                row.header,
+                                &row.values,
+                                &mask,
+                            )
+                        })?;
                     }
-                    let mask = external_mask_from(&old_external, values.len());
-                    self.with_heap_mut(record.table_id, |heap| {
-                        heap.write_mvcc_ext(txn_id_for_ddl(), record.row_id, header, &values, &mask)
-                    })?;
                 }
                 UndoKind::UpdateDelta { before_cols } => {
                     // Reconstruct the old row by reading the current
@@ -1767,6 +1840,7 @@ impl Database {
                 && undo_ptr.is_some()
                 && !self.undo_boundary_matches(undo_ptr, stop_at)
             {
+                self.flush_rollback_deletes(txn_id, &mut delete_batch)?;
                 self.persist_rollback_progress(
                     txn_id,
                     undo_ptr,
@@ -1789,6 +1863,7 @@ impl Database {
             ));
         }
         if batch_records != 0 {
+            self.flush_rollback_deletes(txn_id, &mut delete_batch)?;
             self.persist_rollback_progress(
                 txn_id,
                 stop_at,
@@ -1800,6 +1875,131 @@ impl Database {
             )?;
         }
         Ok(touched_tables)
+    }
+
+    fn queue_rollback_delete(
+        &self,
+        txn_id: u64,
+        pending: &mut Option<RollbackDeleteBatch>,
+        storage_id: u64,
+        table: &Arc<TableSchema>,
+        entry: (u64, MvccStoredRow),
+        retained_index_entries: bool,
+    ) -> Result<Option<MvccStoredRow>, QueryError> {
+        use crate::engine::executor::mem_budget::{
+            estimate_row_bytes, ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        // The per-record crash hook requires the row to have been restored
+        // synchronously. Batch crash tests use the index and progress hooks.
+        #[cfg(test)]
+        if ROLLBACK_RECORD_TEST_HOOK.with(|hook| hook.borrow().is_some()) {
+            self.flush_rollback_deletes(txn_id, pending)?;
+            return Ok(Some(entry.1));
+        }
+        let row_bytes = estimate_row_bytes(&entry.1.values);
+        if pending.as_ref().is_some_and(|batch| {
+            !Arc::ptr_eq(&batch.table, table)
+                || batch.rows.len() == ROLLBACK_DELETE_BATCH_ROWS
+                || batch.row_bytes.saturating_add(row_bytes) > ROLLBACK_DELETE_BATCH_BYTES
+        }) {
+            self.flush_rollback_deletes(txn_id, pending)?;
+        }
+        if pending.is_none() {
+            if row_bytes > ROLLBACK_DELETE_BATCH_BYTES
+                || table.indexes.is_empty()
+                || table.indexes.iter().any(|index| {
+                    !index.index_type.eq_ignore_ascii_case("BTREE")
+                        || index.has_expression_parts()
+                        || index.state != crate::storage::schema::IndexState::Public
+                })
+            {
+                return Ok(Some(entry.1));
+            }
+            // Admit one bounded row buffer and one index's keys. Under memory
+            // pressure the existing single-row compensation remains available.
+            let Some(scratch) = ControlledMemoryCharge::try_new_optional(
+                ControlledMemoryCategory::StorageScratch,
+                3 * ROLLBACK_DELETE_BATCH_BYTES,
+            ) else {
+                return Ok(Some(entry.1));
+            };
+            *pending = Some(RollbackDeleteBatch {
+                storage_id,
+                table: table.clone(),
+                rows: Vec::new(),
+                retained_index_entries,
+                row_ids: HashSet::new(),
+                row_bytes: 0,
+                _scratch: scratch,
+            });
+        }
+        let batch = pending.as_mut().expect("delete batch admitted");
+        batch.row_ids.insert(entry.1.row_id);
+        batch.row_bytes += row_bytes;
+        batch.rows.push(entry);
+        Ok(None)
+    }
+
+    fn flush_rollback_deletes(
+        &self,
+        txn_id: u64,
+        pending: &mut Option<RollbackDeleteBatch>,
+    ) -> Result<(), QueryError> {
+        let Some(batch) = pending.take() else {
+            return Ok(());
+        };
+        let maintenance = txn_id_for_ddl();
+        if let [(_, row)] = batch.rows.as_slice() {
+            self.insert_indexes_deferred_at(
+                maintenance,
+                batch.storage_id,
+                &batch.table,
+                &row.values,
+                row.row_id,
+                batch.retained_index_entries,
+            )?;
+        } else {
+            // Writers retain their row locks and old-key repairs throughout
+            // this pass. Index inserts commute across distinct rows, and
+            // their redo must precede the heap restores and the progress WAL.
+            for index in &batch.table.indexes {
+                if batch.retained_index_entries && index_supports_delete_mark(index) {
+                    continue;
+                }
+                let mut entries = Vec::with_capacity(batch.rows.len());
+                for (_, row) in &batch.rows {
+                    entries.push(IndexEntry {
+                        key: batch.table.index_key(index, &row.values)?,
+                        row_id: row.row_id,
+                    });
+                }
+                entries.sort_unstable();
+                self.with_index_dml(batch.storage_id, &index.name, |file| {
+                    file.insert_entries_logged(maintenance, entries, false)
+                })?;
+                #[cfg(test)]
+                ROLLBACK_DELETE_INDEX_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
+            }
+        }
+        self.with_heap_mut(batch.storage_id, |heap| {
+            for (undo_id, row) in batch.rows {
+                if !heap.try_restore_delete_header(txn_id, undo_id, row.row_id, row.header)? {
+                    heap.write_mvcc_ext(maintenance, row.row_id, row.header, &row.values, &[])?;
+                    continue;
+                }
+                #[cfg(test)]
+                ROLLBACK_DELETE_HEADER_TEST_HOOK.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook();
+                    }
+                });
+            }
+            Ok(())
+        })
     }
 
     fn undo_boundary_matches(&self, head: Option<u64>, stop: Option<u64>) -> bool {
