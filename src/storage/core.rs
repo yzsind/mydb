@@ -432,6 +432,7 @@ pub(crate) struct TempTableSnapshot {
     _session_charges: Vec<Arc<crate::storage::temp_quota::ByteReservation>>,
     internal_key: String,
     table: Arc<TableSchema>,
+    fulltext_counters: Option<Arc<TableSchema>>,
     files: Vec<TempTableFileSnapshot>,
 }
 
@@ -606,6 +607,7 @@ pub(crate) struct PendingVectorMutation {
     /// Present for UPDATE so unchanged vector columns avoid needless churn;
     /// absent for INSERT and DELETE.
     pub(crate) old_values: Option<Vec<Value>>,
+    pub(crate) resolved_indexes: Option<Vec<(u64, Option<crate::vector::VectorValue>)>>,
 }
 
 /// One commit's superseded graph versions for one index, retired once no
@@ -4659,6 +4661,7 @@ include!("core/database/index_build_encoded.rs");
 include!("core/database/index_build_fulltext.rs");
 include!("core/database/index_maintenance.rs");
 include!("core/database/shadow_generation.rs");
+include!("core/database/fulltext_statistics.rs");
 include!("core/database/vector_index.rs");
 include!("core/database/vector_recovery.rs");
 include!("core/database/vector_replication.rs");
@@ -4693,6 +4696,7 @@ include!("core/recovery.rs");
 include!("core/recovery_compensation.rs");
 impl Drop for Database {
     fn drop(&mut self) {
+        crate::engine::executor::select::fulltext_context::clear_corpus_cache(self);
         clear_txn_wal_buffers_for_log(&self.log);
         // A plain `Database` drop is also the path tests and callers use
         // to simulate a crash. Clean shutdown goes through

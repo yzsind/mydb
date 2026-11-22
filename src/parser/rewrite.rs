@@ -75,6 +75,7 @@ pub(super) struct PostParseState {
     pub(super) create_zone_options: Vec<(String, String)>,
     pub(super) inline_index_visibility: Vec<(String, bool)>,
     pub(super) inline_index_includes: Vec<Vec<String>>,
+    pub(super) index_predicates: Vec<(String, String)>,
     pub(super) vector_options: Vec<crate::storage::vector_config::VectorIndexOptions>,
 }
 
@@ -169,6 +170,7 @@ impl PostParseState {
                 table.table_options.push(entry);
             }
         }
+        apply_index_predicates(statement, &self.index_predicates)?;
         apply_inline_index_visibility(statement, &self.inline_index_visibility)?;
         apply_inline_index_includes(statement, &self.inline_index_includes)?;
         apply_vector_options(statement, &self.vector_options)?;
@@ -440,9 +442,9 @@ pub(super) fn strip_fulltext_parsers(
                 };
             }
             if !index_options.parser.is_empty() && index_options.parser != "ngram" {
-                return Err(parse_error_full_span(
-                    sql,
-                    "FULLTEXT WITH PARSER: unsupported parser",
+                return Err(super::entry::parse_error_with_spec_at_zero(
+                    crate::error::catalog::ER_FUNCTION_NOT_DEFINED,
+                    format!("Function '{}' is not defined", index_options.parser),
                 ));
             }
             out.get_or_insert_with(|| sql.as_bytes().to_vec())[start..value.span.end].fill(b' ');
@@ -3715,7 +3717,7 @@ pub(super) fn rewrite_legacy_text_lengths(
 
     let bytes = sql.as_bytes();
     let is_ident = |byte: u8| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$');
-    let mut replacements: Vec<(usize, usize, &'static str)> = Vec::new();
+    let mut replacements: Vec<(usize, usize, String)> = Vec::new();
     let mut i = 0usize;
     while i < bytes.len() {
         match bytes[i] {
@@ -3806,13 +3808,8 @@ pub(super) fn rewrite_legacy_text_lengths(
                     i = close + 1;
                     continue;
                 }
-                let concrete = match length {
-                    0..=255 => "TINYTEXT",
-                    256..=65_535 => "TEXT",
-                    65_536..=16_777_215 => "MEDIUMTEXT",
-                    16_777_216..=4_294_967_295 => "LONGTEXT",
-                    _ => unreachable!("u32 length was checked above"),
-                };
+                let concrete =
+                    extensions::register(sql, extensions::Extension::TextLength(length as u32));
                 replacements.push((word_start, close + 1, concrete));
                 i = close + 1;
                 continue;
@@ -3827,7 +3824,7 @@ pub(super) fn rewrite_legacy_text_lengths(
         .iter()
         .map(|(start, end, replacement)| TextEdit {
             range: *start..*end,
-            replacement,
+            replacement: replacement.as_str(),
         })
         .collect::<Vec<_>>();
     rewrite_source_edits(sql, &edits)
@@ -4190,6 +4187,29 @@ impl<'a> Iterator for IndexDefinitionScanner<'a> {
             let i = self.position;
             self.position += 1;
             match bytes[i] {
+                b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                    self.position = bytes[i + 2..]
+                        .windows(2)
+                        .position(|w| w == b"*/")
+                        .map_or(bytes.len(), |n| i + n + 4);
+                    continue;
+                }
+                b'#' => {
+                    self.position = bytes[i..]
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(bytes.len(), |n| i + n);
+                    continue;
+                }
+                b'-' if bytes.get(i + 1) == Some(&b'-')
+                    && bytes.get(i + 2).is_none_or(u8::is_ascii_whitespace) =>
+                {
+                    self.position = bytes[i..]
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(bytes.len(), |n| i + n);
+                    continue;
+                }
                 b'\'' | b'"' | b'`' => {
                     self.position = quoted_span_end(bytes, i);
                     self.pending_constraint_name = false;
@@ -5164,3 +5184,175 @@ fn rewrite_keyword_matches_at(bytes: &[u8], pos: usize, keyword: &[u8]) -> bool 
 #[cfg(test)]
 #[path = "pct_option_contract_tests.rs"]
 mod pct_option_contract_tests;
+
+/// Lower WHERE after all index options. Inline definitions use provenance-
+/// bound key markers; standalone definitions retain their single owner.
+pub(super) fn strip_index_predicates(
+    sql: &str,
+    enabled: bool,
+) -> Result<(Cow<'_, str>, Vec<(String, String)>), ParseError> {
+    if !enabled
+        || !sql
+            .as_bytes()
+            .windows(5)
+            .any(|w| w.eq_ignore_ascii_case(b"WHERE"))
+    {
+        return Ok((Cow::Borrowed(sql), Vec::new()));
+    }
+    let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
+    let mut tokens = crate::sql_lex::SqlTokenCursor::new(sql, mode, MYSQL_VERSION_ID);
+    let mut next_word = || loop {
+        match tokens.next() {
+            Ok(Some(token)) if token.kind == crate::sql_lex::SqlTokenKind::Word => {
+                return Some(tokens.token_text(&token).to_ascii_uppercase())
+            }
+            Ok(Some(_)) => {}
+            _ => return None,
+        }
+    };
+    let head = next_word();
+    let standalone = match head.as_deref() {
+        Some("CREATE") => {
+            let mut kind = next_word();
+            if kind.as_deref() == Some("TEMPORARY") {
+                kind = next_word();
+            }
+            while matches!(kind.as_deref(), Some("UNIQUE" | "FULLTEXT" | "SPATIAL")) {
+                kind = next_word();
+            }
+            match kind.as_deref() {
+                Some("INDEX") => true,
+                Some("TABLE") => false,
+                _ => return Ok((Cow::Borrowed(sql), Vec::new())),
+            }
+        }
+        Some("ALTER") if next_word().as_deref() == Some("TABLE") => false,
+        _ => return Ok((Cow::Borrowed(sql), Vec::new())),
+    };
+    let mut scanner = IndexDefinitionScanner::new(sql, true);
+    if standalone {
+        scanner.base_depth = 0;
+        scanner.alter = true;
+        scanner.kind = IndexSegmentKind::Index;
+    }
+    let bytes = sql.as_bytes();
+    let mut edits = Vec::new();
+    let mut targets = Vec::new();
+    while let Some(word) = scanner.next() {
+        if !word.text.eq_ignore_ascii_case(b"WHERE") || word.key_close.is_none() {
+            continue;
+        }
+        if word.kind == IndexSegmentKind::PrimaryKey {
+            return Err(parse_error_at_zero(
+                "PRIMARY KEY cannot have a WHERE predicate",
+            ));
+        }
+        if word.kind != IndexSegmentKind::Index {
+            continue;
+        }
+        let mut end = word.end;
+        let mut depth = 0;
+        while end < bytes.len() {
+            match bytes[end] {
+                b'\'' | b'"' | b'`' => {
+                    end = quoted_span_end(bytes, end);
+                    continue;
+                }
+                b'/' if bytes.get(end + 1) == Some(&b'*') => {
+                    end = bytes[end + 2..]
+                        .windows(2)
+                        .position(|w| w == b"*/")
+                        .map_or(bytes.len(), |n| end + n + 4);
+                    continue;
+                }
+                b'#' => {
+                    end = bytes[end..]
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(bytes.len(), |n| end + n);
+                    continue;
+                }
+                b'-' if bytes.get(end + 1) == Some(&b'-')
+                    && bytes.get(end + 2).is_none_or(u8::is_ascii_whitespace) =>
+                {
+                    end = bytes[end..]
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .map_or(bytes.len(), |n| end + n);
+                    continue;
+                }
+                b'(' => depth += 1,
+                b')' if depth == 0 => break,
+                b')' => depth -= 1,
+                b',' | b';' if depth == 0 => break,
+                _ => {}
+            }
+            end += 1;
+        }
+        let ast = parse_catalog_expr(sql[word.end..end].trim())?;
+        let expr_sql = index_expression_to_catalog_sql(&ast, false)
+            .map_err(|e| parse_error_at_zero(e.to_string()))?;
+        let marker = if standalone {
+            String::new()
+        } else {
+            extensions::register(sql, extensions::Extension::IndexPredicate)
+        };
+        edits.push((word.start..end, String::new()));
+        if !standalone {
+            edits.push((
+                word.key_close.unwrap()..word.key_close.unwrap(),
+                format!(", `{marker}`"),
+            ));
+        }
+        targets.push((marker, expr_sql));
+        scanner.skip_to(end);
+    }
+    if targets.is_empty() {
+        return Ok((Cow::Borrowed(sql), targets));
+    }
+    edits.sort_by_key(|e| std::cmp::Reverse(e.0.start));
+    let mut result = sql.to_string();
+    for (range, text) in edits {
+        result.replace_range(range, &text);
+    }
+    Ok((Cow::Owned(result), targets))
+}
+fn apply_index_predicates(
+    statement: &mut Statement,
+    targets: &[(String, String)],
+) -> Result<(), ParseError> {
+    if targets.is_empty() || matches!(statement, Statement::Unsupported { .. }) {
+        return Ok(());
+    }
+    if let Statement::CreateIndex(index) = statement {
+        if let [(marker, sql)] = targets {
+            if marker.is_empty() {
+                index.predicate = Some(sql.clone());
+                return Ok(());
+            }
+        }
+        return Err(parse_error_at_zero(
+            "Cannot attribute CREATE INDEX predicate",
+        ));
+    }
+    let mut applied = vec![false; targets.len()];
+    for_each_inline_index(statement, |index| {
+        for (seq, (marker, sql)) in targets.iter().enumerate() {
+            if let Some(pos) = index.columns.iter().position(|name| name == marker) {
+                if applied[seq] {
+                    return Err(parse_error_at_zero("Ambiguous partial index predicate"));
+                }
+                remove_index_key_part(index, pos);
+                index.predicate = Some(sql.clone());
+                applied[seq] = true;
+            }
+        }
+        Ok(())
+    })?;
+    if applied.iter().any(|v| !v) {
+        return Err(parse_error_at_zero(
+            "Cannot attribute partial index predicate",
+        ));
+    }
+    Ok(())
+}

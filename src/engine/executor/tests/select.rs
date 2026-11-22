@@ -12521,7 +12521,7 @@ fn invoker_view_requires_invoker_privileges_for_body() {
     let denied = engine
         .execute_with_session(&mut alice, "SELECT id FROM v_invoker")
         .unwrap_err();
-    assert_eq!(denied.code(), 1142);
+    assert_eq!(denied.code(), 1356);
     engine
         .execute_with_session(&mut root, "GRANT SELECT ON test.secret TO 'alice'@'%'")
         .unwrap();
@@ -12615,7 +12615,7 @@ fn invoker_updatable_view_requires_invoker_privileges_for_base_dml() {
     let denied = engine
         .execute_with_session(&mut alice, "UPDATE v_secret_dml SET id = 2 WHERE id = 1")
         .unwrap_err();
-    assert_eq!(denied.code(), 1142);
+    assert_eq!(denied.code(), 1356);
 
     engine
         .execute_with_session(&mut root, "GRANT UPDATE ON test.secret TO 'alice'@'%'")

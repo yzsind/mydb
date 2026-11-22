@@ -18,8 +18,8 @@ pub(super) mod summary;
 
 pub(super) const MAGIC: u32 = 0x5a_4d_50_31; // ZMP1
 const VERSION: u16 = crate::storage::format_versions::PAGED_ZONE_MAP_PAGE_VERSION;
-const HEADER: usize = 64;
-const SLOT: usize = 20;
+pub(super) const HEADER: usize = 64;
+pub(super) const SLOT: usize = 20;
 const PACKED_SLOT: usize = 8;
 #[cfg(test)]
 const MAX_ENTRIES: usize = (PAGE_SIZE - HEADER) / SLOT;

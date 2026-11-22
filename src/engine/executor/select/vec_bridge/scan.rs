@@ -462,31 +462,72 @@ pub(super) struct FilteredStorageBatchStream {
 pub(crate) static RUNTIME_RANGE_ZONE_PRUNE_HITS: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
-/// Minimal sink for an inclusive TIMESTAMP range.  It lets the row codec feed
-/// the stored microsecond lane straight into two integer comparisons without
-/// constructing `PredicateValue`s or walking a boolean expression tree for
-/// every candidate row.
-pub(super) struct TimestampRangeDecodeSink {
-    pub(super) column: usize,
-    pub(super) low: i64,
-    pub(super) high: i64,
+#[cfg(test)]
+pub(crate) static NATIVE_TEMPORAL_RANGE_DECODE_HITS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// Compare native microseconds directly. Matching rows can also materialize
+/// the same lane for output reuse; rejecting rows allocate no value scratch.
+pub(super) struct NativeTemporalRangeDecodeSink {
+    pub(super) range: crate::engine::executor::select::plan::NativeTemporalRange,
+    pub(super) micros: Option<i64>,
     pub(super) result: Option<bool>,
     pub(super) unsupported: bool,
 }
 
-impl TimestampRangeDecodeSink {
-    pub(super) fn new(column: usize, low: i64, high: i64) -> Self {
+impl NativeTemporalRangeDecodeSink {
+    pub(super) fn new(range: crate::engine::executor::select::plan::NativeTemporalRange) -> Self {
         Self {
-            column,
-            low,
-            high,
+            range,
+            micros: None,
             result: None,
             unsupported: false,
         }
     }
 
-    pub(super) fn finish(self) -> Option<bool> {
-        (!self.unsupported).then_some(self.result.unwrap_or(false))
+    #[inline]
+    pub(super) fn finish(&self) -> Option<bool> {
+        if self.unsupported {
+            None
+        } else {
+            self.result
+        }
+    }
+
+    #[inline]
+    pub(super) fn materialized_value(
+        &self,
+    ) -> Option<crate::engine::executor::vec::scan_bridge::PredicateValue> {
+        use crate::engine::executor::select::plan::NativeTemporalKind;
+        use crate::engine::executor::vec::scan_bridge::PredicateValue;
+        if self.unsupported {
+            return None;
+        }
+        let micros = self.micros?;
+        Some(match self.range.kind {
+            NativeTemporalKind::Timestamp => PredicateValue::Timestamp(micros),
+            NativeTemporalKind::DateTime => PredicateValue::DateTime(micros),
+            NativeTemporalKind::Time => PredicateValue::Time(micros),
+        })
+    }
+
+    #[inline]
+    pub(super) fn put_native(
+        &mut self,
+        col: usize,
+        kind: crate::engine::executor::select::plan::NativeTemporalKind,
+        micros: i64,
+    ) {
+        if col != self.range.column || kind != self.range.kind {
+            return self.reject_other();
+        }
+        if kind == crate::engine::executor::select::plan::NativeTemporalKind::DateTime
+            && crate::types::decode_tagged_datetime(micros).is_some()
+        {
+            return self.reject_other();
+        }
+        self.micros = Some(micros);
+        self.result = Some(micros >= self.range.low && micros <= self.range.high);
     }
 
     pub(super) fn reject_other(&mut self) {
@@ -494,23 +535,100 @@ impl TimestampRangeDecodeSink {
     }
 }
 
-impl crate::storage::RowDecodeSink for TimestampRangeDecodeSink {
+impl crate::storage::RowDecodeSink for NativeTemporalRangeDecodeSink {
     fn put_null(&mut self, col: usize) {
-        if col == self.column {
+        if col == self.range.column {
+            self.micros = None;
             self.result = Some(false);
         } else {
             self.reject_other();
         }
     }
     fn put_timestamp(&mut self, col: usize, micros: i64) {
-        if col == self.column {
-            self.result = Some(micros >= self.low && micros <= self.high);
-        } else {
-            self.reject_other();
+        self.put_native(
+            col,
+            crate::engine::executor::select::plan::NativeTemporalKind::Timestamp,
+            micros,
+        );
+    }
+    fn put_datetime(&mut self, col: usize, micros: i64) {
+        self.put_native(
+            col,
+            crate::engine::executor::select::plan::NativeTemporalKind::DateTime,
+            micros,
+        );
+    }
+    fn put_time(&mut self, col: usize, micros: i64) {
+        self.put_native(
+            col,
+            crate::engine::executor::select::plan::NativeTemporalKind::Time,
+            micros,
+        );
+    }
+
+    reject_decode_lanes!(reject_other; put_i64, put_u64, put_f32, put_f64, put_decimal_compact, put_decimal_wide, put_date, put_year, put_bytes, put_string, put_json, put_geometry, put_vector, put_value);
+}
+
+#[cfg(test)]
+mod native_temporal_range_tests {
+    use super::*;
+    use crate::engine::executor::select::plan::{NativeTemporalKind, NativeTemporalRange};
+    use crate::engine::executor::vec::scan_bridge::PredicateValue;
+    use crate::storage::RowDecodeSink;
+
+    #[test]
+    fn native_temporal_range_output_cache_keeps_the_exact_lane() {
+        for kind in [
+            NativeTemporalKind::Timestamp,
+            NativeTemporalKind::DateTime,
+            NativeTemporalKind::Time,
+        ] {
+            let mut sink = NativeTemporalRangeDecodeSink::new(NativeTemporalRange {
+                column: 0,
+                low: 100,
+                high: 200,
+                kind,
+            });
+            assert_eq!(
+                sink.finish(),
+                None,
+                "a missing lane requires the full decoder"
+            );
+            sink.put_native(0, kind, 150);
+            assert_eq!(sink.finish(), Some(true));
+            assert!(matches!(
+                (kind, sink.materialized_value()),
+                (
+                    NativeTemporalKind::Timestamp,
+                    Some(PredicateValue::Timestamp(150))
+                ) | (
+                    NativeTemporalKind::DateTime,
+                    Some(PredicateValue::DateTime(150))
+                ) | (NativeTemporalKind::Time, Some(PredicateValue::Time(150)))
+            ));
+            sink.put_null(0);
+            assert_eq!(sink.finish(), Some(false));
+            assert!(sink.materialized_value().is_none());
+            sink.put_native(1, kind, 150);
+            assert_eq!(sink.finish(), None);
         }
     }
 
-    reject_decode_lanes!(reject_other; put_i64, put_u64, put_f32, put_f64, put_decimal_compact, put_decimal_wide, put_date, put_year, put_time, put_datetime, put_bytes, put_string, put_json, put_geometry, put_vector, put_value);
+    #[test]
+    fn native_temporal_range_declines_tagged_calendar_order() {
+        let mut sink = NativeTemporalRangeDecodeSink::new(NativeTemporalRange {
+            column: 0,
+            low: i64::MIN,
+            high: i64::MAX,
+            kind: NativeTemporalKind::DateTime,
+        });
+        sink.put_datetime(
+            0,
+            crate::types::encode_tagged_datetime(2020, 0, 15, 12, 0, 0, 0).unwrap(),
+        );
+        assert_eq!(sink.finish(), None);
+        assert!(sink.materialized_value().is_none());
+    }
 }
 
 impl FilteredStorageBatchStream {
@@ -774,12 +892,12 @@ impl BatchOperator for FilteredStorageBatchStream {
                 self.all_cols.as_slice()
             };
             let payload_output_slots = reuse_predicate_output.then_some(missing_output_slots);
-            let timestamp_range = (self.runtime_probes.is_empty()
+            let temporal_range = (self.runtime_probes.is_empty()
                 && self.predicate_columns.len() == 1)
                 .then(|| {
                     self.compiled
                         .as_ref()
-                        .and_then(crate::engine::executor::select::plan::CompiledPredicate::inclusive_timestamp_range)
+                        .and_then(crate::engine::executor::select::plan::CompiledPredicate::inclusive_native_temporal_range)
                 })
                 .flatten();
             {
@@ -802,8 +920,8 @@ impl BatchOperator for FilteredStorageBatchStream {
                         predicate_cache_typed.set(false);
                         match hit {
                             crate::storage::PayloadStreamHit::Payload(payload) => {
-                                if let Some((column, low, high)) = timestamp_range {
-                                    let mut sink = TimestampRangeDecodeSink::new(column, low, high);
+                                if let Some(range) = temporal_range {
+                                    let mut sink = NativeTemporalRangeDecodeSink::new(range);
                                     let fast = crate::storage::decode_row_into_sink_fast(
                                         payload.payload,
                                         payload.codec,
@@ -814,7 +932,27 @@ impl BatchOperator for FilteredStorageBatchStream {
                                     )?;
                                     if fast {
                                         if let Some(keep) = sink.finish() {
-                                            return Ok(keep);
+                                            let cache_ready = if keep && reuse_predicate_output {
+                                                if let Some(value) = sink.materialized_value() {
+                                                    typed_values.borrow_mut()[0] = value;
+                                                    predicate_cache_typed.set(true);
+                                                    true
+                                                } else {
+                                                    // Retain the complete decoder if a future lane
+                                                    // cannot satisfy the output cache contract.
+                                                    false
+                                                }
+                                            } else {
+                                                true
+                                            };
+                                            if cache_ready {
+                                                #[cfg(test)]
+                                                NATIVE_TEMPORAL_RANGE_DECODE_HITS.fetch_add(
+                                                    1,
+                                                    std::sync::atomic::Ordering::Relaxed,
+                                                );
+                                                return Ok(keep);
+                                            }
                                         }
                                     }
                                 }
@@ -1386,7 +1524,10 @@ pub(super) fn split_parallel_scan_workers(
     schema: Arc<BatchSchema>,
     worker_context: crate::engine::executor::select::execution_context::ExecutionContext,
 ) -> ParallelStorageBatchStream {
-    let degree = degree.max(1).min(tasks.len().max(1));
+    let degree = degree
+        .max(1)
+        .min(tasks.len().max(1))
+        .min(crate::planner::default_parallel_degree() as usize);
     let mut partitions = vec![std::collections::VecDeque::new(); degree];
     for (index, task) in tasks.into_iter().enumerate() {
         partitions[index % degree].push_back(task);

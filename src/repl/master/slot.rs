@@ -287,6 +287,27 @@ impl SemiSyncWaiter {
 }
 
 impl SlotRegistry {
+    /// Storage startup must preserve slot floors before the registry opens.
+    /// An empty directory (created on every normal startup) has no such floor.
+    pub(crate) fn has_persisted_slots(data_dir: &Path) -> Result<bool, QueryError> {
+        let entries = match fs::read_dir(data_dir.join(SLOTS_DIR)) {
+            Ok(entries) => entries,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(err) => return Err(io_to_query(err)),
+        };
+        for entry in entries {
+            if entry
+                .map_err(io_to_query)?
+                .path()
+                .extension()
+                .is_some_and(|ext| ext == "slot")
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Open the registry under `data_dir`, discovering any existing
     /// slot files.
     pub fn open(data_dir: impl Into<PathBuf>) -> Result<Self, QueryError> {

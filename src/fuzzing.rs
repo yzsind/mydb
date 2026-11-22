@@ -384,6 +384,13 @@ mod parser_smoke {
     }
 
     #[test]
+    fn parser_roundtrip_ci_44961068976() {
+        for input in [b"FJI@@.@\0@44".as_slice(), b"I.@\"\""] {
+            parser_roundtrip(input);
+        }
+    }
+
+    #[test]
     fn parser_corpus_modes_and_recovery() {
         let seeds = [
             "SELECT 1",

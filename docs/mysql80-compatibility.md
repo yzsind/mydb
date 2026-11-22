@@ -103,6 +103,8 @@ intentional differences, and migration boundaries.
 - **Naming and size limits**: table/column identifiers and indexes declared in CREATE/ALTER TABLE or standalone CREATE INDEX are validated up to 64 characters (errno 1059). Tables have at most 1017 live columns (errno 1117). Tables, views, and sequences share one relational-name namespace, and concurrent CREATEs are double-checked under the catalog write lock. See [limits and enforcement gaps](limits.md). Quoted table-name components containing a dot, including dotted schema components in qualified table references, are explicitly rejected to avoid ambiguous binding. Database names remain available to structured namespaces such as AI models.
 - **Generated columns** (`GENERATED ALWAYS AS`, VIRTUAL / STORED): ✅
 - **Intentional DDL differences**: generated columns and functional indexes may reference an AUTO_INCREMENT column after its value has been assigned. MODIFY without an explicit character set preserves the column's current character set. SHOW CREATE consistently uses backticks, including under ANSI_QUOTES. CHECK accepts numeric truth values; statically string-valued non-boolean expressions are rejected with 3812. Unsupported algorithm/lock combinations use 1846; a duplicate key encountered during cascading updates can use 1062 instead of MySQL's context-specific 1761, with statement rollback preserved.
+  Foreign keys implement `MATCH SIMPLE`; unsupported `MATCH FULL` and
+  `MATCH PARTIAL` return 1235 instead of silently applying SIMPLE semantics.
 - **INSTANT DROP and LOB space**: dropping a column preserves old row layouts and their LOB data without rewriting the heap. OPTIMIZE TABLE or a physical COPY rebuild removes the dropped values and reclaims their LOB space; the instantaneous drop itself does not promise immediate disk reclamation.
 - **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statement/metadata/show-tables.md). UPDATE_TIME is NULL when no reliable modification timestamp is available. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
@@ -114,6 +116,7 @@ intentional differences, and migration boundaries.
 - **`ALTER TABLE ALGORITHM={INSTANT|INPLACE|COPY|DEFAULT}`**: ✅
   ➕ Column type changes within the supported range are online by default and also accept `COPY, LOCK=NONE`; strict mode covers LOBs, partitioning, and vector indexes under on-disk storage — see [Online Column Type Change](online-column-type-change.md).
   Algorithms are validated against the actual work: adding generated columns or columns with enforced CHECKs requires COPY, and dropping a column whose index rebuilds cascade requires INPLACE; encoding-compatible constraint tightening only scans for validation under strict mode. Composite actions that cannot yet be published atomically return 1846 before modification. See [ALTER TABLE](statement/ddl/alter-table.md) for supported combinations.
+- **Partial indexes**: ➕ `WHERE` predicates on CREATE INDEX, inline CREATE TABLE keys and ALTER TABLE ADD INDEX, including UNIQUE BTREE, FULLTEXT, SPATIAL, HNSW and IVF. The optimizer requires a conservative implication proof; primary keys and foreign-key backing indexes must remain complete. See [partial indexes](partial-indexes.md).
 - **Online BTREE `ADD/CREATE INDEX` and `ADD PRIMARY KEY`**: ✅ Ordinary, unique, and primary key indexes allow concurrent DML during the Building phase by default, retaining sorted/bulk-load plus incremental catch-up; preparation and publication use read-compatible write barriers.
   Multi-index ALTERs that only add these indexes are also supported; `LOCK=SHARED` allows reads and blocks writes during the scan phase, and `LOCK=EXCLUSIVE` keeps exclusive access.
   The initiating statement always waits for Public or fails, regardless of `MYDB_DDL_ASYNC`, and never returns OK early.
@@ -237,13 +240,15 @@ for syntax and operational limits.
 
 **✅ `CREATE` / `OR REPLACE` / `ALTER` / `DROP VIEW`.**
 
-- Column aliases, `IF NOT EXISTS`, view expansion, cycle detection, and depth limits.
+- Column aliases, `IF NOT EXISTS`, view expansion, cycle detection, and explicit depth limits: 32 expanded view levels and at most 16 residual non-mergeable query levels.
 - **Semantic definition persistence**: the query AST parsed at CREATE/ALTER is saved to the catalog and shared via immutable objects; execution uses that AST. The SHOW CREATE text is for display only. Quoting/escaping semantics from creation survive SQL mode changes and restarts; the view dependency key includes a digest of the query semantics.
 - **Encoding resource bounds**: semantic query encoding is capped at 64 MiB, 1,000,000 JSON containers, and 4,000,000 scalars. Scalar expression depth is 1,024 and SELECT nesting is 63; semantic query depth is `1,024 + 63 = 1,087`, and encoded JSON depth is `4 × (1,024 + 1,087) = 8,444`. The compiled-expression depth limit of 64 is separate: deeper admitted expressions use the stack-extending scalar evaluator. Exceeding the encoding limits returns a clear error before the catalog write; corrupted or unknown-version semantic queries fail at catalog read time instead of being replaced with an empty query. Encoding capacity is charged to SystemMetadata; decode scratch space and stack segments are charged to ParserTransient.
 - **ALGORITHM tri-state**: `MERGE` / `UNDEFINED` / `TEMPTABLE` (genuinely materialized under `no_merge`).
 - **SQL SECURITY DEFINER / INVOKER**: ✅ the read path switches the privilege account. EXPLAIN additionally requires the caller to hold SHOW VIEW on referenced views and SELECT on their recursive dependencies; DEFINER execution privileges do not authorize plan disclosure.
-- **WITH CHECK OPTION** (LOCAL / CASCADED): ✅ genuinely enforced (post-DML image evaluation, failure 1369), including IN/EXISTS/scalar/ANY/ALL subquery predicates. Row-independent subqueries are materialized once per statement; correlated checks use each candidate post-image. Single-table views with computed projection columns are currently rejected for CHECK OPTION with error 1368; use a direct-column view for checked DML.
-- **Updatable views**: single-table INSERT / UPDATE / DELETE ✅, including nested views with wildcards and renamed columns; hidden base-table columns cannot be accessed via DML/locking reads.
+- **WITH CHECK OPTION** (LOCAL / CASCADED): ✅ genuinely enforced (post-DML image evaluation, failure 1369), including IN/EXISTS/scalar/ANY/ALL subquery predicates. Row-independent subqueries are materialized once per statement; correlated checks use each candidate post-image. Checks use the final image after BEFORE triggers and generated-column evaluation, including INSERT IGNORE filtering.
+- **Updatable views**: single-table INSERT / UPDATE / DELETE ✅, including nested views with wildcards and renamed columns. Computed projection columns remain readable in DML predicates, while writes to those columns report 1348. As an extension, an explicit INSERT list containing only real columns can use base-table defaults even when the view also projects computed columns. REPLACE rejects deletion of conflicting rows outside the view with error 3059. Hidden base-table columns cannot be accessed via DML/locking reads.
+- **Read-side views**: multi-table UPDATE/DELETE may materialize aggregate or otherwise non-updatable views used only as read sources; writing such a view remains an error. Correlated WHERE subqueries in single-table views remain a supported extension: DML selects candidates from the statement read view, and CHECK OPTION evaluates candidate post-images.
+- **Maintenance**: CHECK TABLE validates view dependencies; ANALYZE/OPTIMIZE/REPAIR report that a view is not a base table. FLUSH TABLES accepts view names.
 - **Non-recursive CTE views**: multiple references share the materialized result; recursive CTE views still fail explicitly with 1235.
 - **Locking reads**: simple updatable views, mergeable INNER/LEFT/RIGHT JOIN views, and their supported joins with base tables support real row locks and NOWAIT/SKIP LOCKED; complex locking-join shapes involving aggregation, window functions, NATURAL/USING, LATERAL, etc. are still explicitly rejected. Lock clauses inside a view definition fail explicitly with 1235 at CREATE/ALTER instead of being silently ignored.
 - **Dependency revalidation**: ALTER/REPLACE VIEW propagates invalidation and rebinds dependent views; DROP DATABASE invalidates cross-database dependencies; missing dependencies report 1356.
@@ -287,6 +292,22 @@ alias for the native mydb engine.
 
 ### Expressions and Operators
 
+- ➕ The parser also accepts standalone `OFFSET`, optional derived-table aliases,
+  `VALUES` rows without `ROW`, leading empty statements, and plural `EXTRACT`
+  units. These forms have defined semantics and are retained as extensions.
+- Derived output names may repeat. Positional results and unambiguous
+  projections remain usable; referencing an ambiguous derived column returns
+  error 1052 instead of rejecting the whole derived table with 1060.
+- Invalid client-encoded text literals return an encoding error instead of
+  silently becoming binary values or dropping invalid bytes. Use `_binary`
+  literals or hex literals for raw octets. Inert comments do not require valid
+  client-charset encoding. NUL in a line comment is a syntax error.
+  PyMySQL text-protocol callers should enable `binary_prefix=True` when binding
+  `bytes` or `bytearray` parameters so the driver emits `_binary` literals.
+- `CAST`/typed `CONVERT` reject column-only target types such as `TEXT`,
+  `VARCHAR`, `VARBINARY`, and `BLOB`; use `SIGNED`, `CHAR`, or `BINARY` as
+  appropriate. `INT`, `INTEGER`, and `BIGINT` remain native aliases of the
+  signed 64-bit cast. Native vector casts remain available.
 - ✅ Parsing follows the MySQL 8.0 `expr / bool_pri / predicate / bit_expr / simple_expr`
   hierarchy; covers right-recursive `BETWEEN`, `LIKE/REGEXP/IN/IS` predicate
   constraints, logical `XOR`, bitwise or/and/shift, `^`, `DIV/MOD`, `!`, `~`,
@@ -829,7 +850,9 @@ Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` 
 - Direct functions and static nested `CALL`s pin their version within the statement's MDL batch; both direct and nested calls check routine-level `EXECUTE`.
 - Block-level locals, conditions, and cursors are lexically scoped; declaration order, duplicate declarations, and `LEAVE` / `ITERATE` labels are validated at creation/recompilation.
 - Parameters, locals, OUT/INOUT, and RETURN reuse the DML type-conversion implementation; argument evaluation and IN/INOUT assignment use the caller's mode, while the procedure body/locals/RETURN use the creation-time `sql_mode`; on routine exit the caller's database, security identity, roles, and mode are restored.
-- Cursors consume a `ResultCursor` with bounded streaming FETCH; they are released automatically when leaving the declaring block or unwinding an exception.
+- Cursors consume a `ResultCursor` with bounded streaming FETCH; they are released automatically when leaving the declaring block or unwinding an exception. Cursor references and FETCH variables are validated at CREATE; FETCH arity is checked before consuming a row, including for empty cursors.
+- Lock waits retry the failed atomic SQL child within a CALL, preserving completed child effects. Routine result sets localize TIMESTAMP values using the session time zone. Read-only stored functions work on physical replicas; attempts to write return a read-only error without failing the instance.
+- SQL PREPARE inside procedures uses the same semantic validation and result metadata as session-level PREPARE. SHOW PROCEDURE/FUNCTION STATUS enumerates all visible schemas regardless of the current database.
 - HANDLER **specificity precedence** (errno > SQLSTATE > generic class); duplicate conditions in the same block and undeclared named conditions are rejected at CREATE. `SIGNAL`/`RESIGNAL` information items may use locals, parameters, user variables, and expressions.
 - SQL SECURITY DEFINER validates routine EXECUTE for both the caller and the DEFINER; the rejection code is 1370, and in-body table privilege denials remain 1142.
 - **sql_mode capture + replay** at CREATE/ALTER time (including the empty mode).
@@ -839,7 +862,7 @@ Procedure bodies support the full procedural language: `BEGIN…END`, `DECLARE` 
   `ParserTransient` category; parallel workers use a process-level cap and fall back to serial parsing when the budget is insufficient.
 - The handshake, `@@version`, binlog, and `/*!MMmmrr ... */` share the 8.0.46 version source of truth; parse errors
   preserve sqlparser's real line/column and the corresponding UTF-8 byte offset.
-- `max_sp_recursion_depth` (default 0; procedures exceeding it report 1456; function recursion always reports 1424).
+- `max_sp_recursion_depth` (default 0; procedures exceeding it report 1456; function recursion always reports 1424). Procedural block parsing has a separate 64-level nesting guard with an explicit parse error.
 - Inside functions: no result sets (1415), no commits (1422), no dynamic SQL (1336), no writes to the calling statement's tables (1442).
 - Non-SQL `LANGUAGE` is explicitly rejected; ❌ deliberately not done: `UNDO` handlers (MySQL lacks them too) and the physical `mysql.proc` table (removed in 8.0).
 
@@ -1075,7 +1098,7 @@ writes InnoDB tablespaces, redo/undo, or data dictionary formats.
 - **WAL**: segmented, group commit, platform-adaptive sync method (`MYDB_WAL_SYNC_METHOD`: `fsync` by default on macOS, `fdatasync` on Linux; true power-loss resistance requires an explicit `fullfsync`). The redo phase of crash recovery can replay in parallel.
 - **undo**: segmented + two-tier images (in-memory cache + on-disk segments), with `MYDB_UNDO_*` controlling retention/compression; a per-transaction undo cap guards against runaway large transactions.
 - **LOB / overflow**: the inline ↔ overflow threshold is `mydb_lob_inline_max`; up to 4 GiB is supported; optional transparent lz4 compression (`mydb_lob_compression`).
-- **Zone Map**: ➕ enabled by default for persistent user tables; persisted per storage object as **v6 `.zm` paged files**,
+- **Zone Map**: ➕ enabled by default for persistent user tables; persisted per storage object as **v8 `.zm` paged files**,
   with standard page v3 (16 KiB), managed through the shared buffer pool, page checksum/LSN, and physical redo.
   There is no separate summary cache or v5 manifest publication chain. Typed bounds, NULLs, and Exact/Bloom
   membership drive serial/parallel/vectorized pruning, always retaining the heap residual; it falls back conservatively when data is missing, summaries are untrusted,

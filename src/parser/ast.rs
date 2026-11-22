@@ -334,6 +334,7 @@ pub enum Statement {
         if_exists: bool,
     },
     Call(RoutineCall),
+    RaiseCondition(Box<RoutineStmt>),
     ShowCreateRoutine {
         kind: RoutineKind,
         name: String,
@@ -483,6 +484,7 @@ pub enum Statement {
     SetCharacterSet {
         charset: Option<String>,
     },
+    SetCharsetOptions(Vec<CharsetSetting>),
     Set(Vec<SetAssignment>),
     /// MySQL 8.0 `RESET PERSIST [IF EXISTS] [var_name]` — drop one persisted
     /// variable entry (or the whole file when `var` is `None`).
@@ -1417,6 +1419,18 @@ pub struct SetAssignment {
     pub value: Expr,
 }
 
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum CharsetSetting {
+    Names {
+        charset: Option<String>,
+        collation: Option<String>,
+    },
+    CharacterSet {
+        charset: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum SetScope {
@@ -1820,6 +1834,8 @@ pub enum DataType {
     /// TEXT family; carries the MySQL byte cap (TINYTEXT=255 …
     /// LONGTEXT=4G-1, plain TEXT=65535).
     Text(u32),
+    /// Legacy TEXT(M), resolved after column/table/database charset inheritance.
+    TextLength(u32),
     /// BLOB family; carries the MySQL byte cap (TINYBLOB=255 …
     /// LONGBLOB=4G-1, plain BLOB=65535).
     Blob(u32),
@@ -1854,6 +1870,7 @@ pub enum DataType {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexDef {
+    pub predicate: Option<String>,
     pub name: Option<String>,
     /// For column key parts, the column name. For MySQL 8.0 functional
     /// key parts (`((expr))`), the canonical SQL text of the expression
@@ -1912,6 +1929,7 @@ impl IndexDef {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndex {
+    pub predicate: Option<String>,
     pub name: String,
     pub table: String,
     pub algorithm: AlterAlgorithm,
@@ -1991,6 +2009,9 @@ pub struct Insert {
     /// The parser never populates this; DML execution evaluates it against
     /// each post-image row for WITH CHECK OPTION.
     pub view_check_predicate: Option<Expr>,
+    /// Internal old-image scope guard for REPLACE through a view.
+    #[serde(default)]
+    pub view_replace_predicate: Option<Expr>,
     pub on_duplicate_key_update: Option<Vec<Assignment>>,
     pub insert_alias: Option<InsertAlias>,
     pub ignore: bool,

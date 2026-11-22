@@ -866,8 +866,14 @@ fn eval_plan_between(
             negated,
             [
                 crate::engine::expr::ComparisonProvenance::from_exprs(expr, low)
+                    .with_hexbit_literals(expr, low)
+                    .with_between_domain(crate::engine::expr::between_comparison_domain(
+                        [expr, low, high],
+                        |e| plan_expr_result_type(e, row).unwrap_or(ColumnType::VarString),
+                    ))
                     .with_temporal_constant_context(expr, low),
                 crate::engine::expr::ComparisonProvenance::from_exprs(expr, high)
+                    .with_hexbit_literals(expr, high)
                     .with_temporal_constant_context(expr, high),
             ],
         )

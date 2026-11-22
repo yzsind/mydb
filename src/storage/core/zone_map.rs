@@ -24,7 +24,7 @@ pub(crate) use crate::storage::format_versions::ZONE_MAP_VERSION;
 // Semantic v6 truncates canonical weights instead of input characters.
 // Older summaries may already contain false-negative bounds; invalidate them
 // through the schema fingerprint even though sidecar framing is unchanged.
-const ZONE_MAP_SEMANTIC_VERSION: u32 = 6;
+const ZONE_MAP_SEMANTIC_VERSION: u32 = crate::storage::format_versions::ZONE_MAP_VERSION;
 #[cfg(test)]
 const ZONE_MAP_LZ4_MIN_BYTES: usize = 4096;
 #[cfg(test)]
@@ -39,8 +39,16 @@ const ZONE_TEXT_PREFIX_BYTES: usize = 64;
 /// Fingerprint collisions and Bloom false positives can only retain extra
 /// pages; equal SQL values always produce the same fingerprint.
 const ZONE_MEMBERSHIP_EXACT_LIMIT: usize = 32;
-const ZONE_MEMBERSHIP_MIN_BLOOM_WORDS: usize = 128; // 1 KiB.
+const ZONE_MEMBERSHIP_MIN_BLOOM_WORDS: usize = 8; // One 512-bit block.
 const ZONE_MEMBERSHIP_MAX_BLOOM_WORDS: usize = 1024; // 8 KiB.
+const ZONE_MEMBERSHIP_DELTA_LIMIT: usize = 32;
+// Two records, full slots, and their bounded foreground deltas fit one page.
+const ZONE_MEMBERSHIP_PAGE_FIT_WORDS: usize = ((PAGE_SIZE - zone_map_page::HEADER) / 2
+    - zone_map_page::SLOT
+    - 8
+    - (10 + ZONE_MEMBERSHIP_DELTA_LIMIT * 8))
+    / 64
+    * 8;
 const ZONE_MEMBERSHIP_DEFAULT_BLOOM_HASHES: u8 = 5;
 // With the maximum 8 KiB provisional bitmap, three probes stay below the 5%
 // FPR target at the worst supported ~7 bits/value layout. Using the final
@@ -75,6 +83,9 @@ static ZONE_MAP_RETRY_MS: AtomicU64 = AtomicU64::new(30_000);
 /// sidecar has holes (for example after an older bulk-import path published
 /// only the zones it touched).
 const ZONE_MAP_MAINTENANCE_MAX_ZONES_PER_PASS: usize = 64;
+const ZONE_MAP_MAINTENANCE_SCAN_BYTES: u64 = 64 * 1024 * 1024;
+const ZONE_MAP_MAINTENANCE_ROUND_TIME: Duration = Duration::from_secs(1);
+const ZONE_MAP_HOT_ZONE_MAX_WAIT_MS: u64 = 5 * 60 * 1000;
 const ZONE_MAP_MAINTENANCE_PASSES_PER_ROUND: usize = 10;
 const ZONE_MAP_MERGE_LATCHES: usize = 64;
 /// Append statements a growing zone absorbs with exact foreground widening
@@ -161,6 +172,16 @@ fn zone_map_maintenance_quiet_ms() -> u64 {
     return ZONE_MAP_QUIET_MS.load(Ordering::Relaxed);
 }
 
+fn zone_map_maintenance_window(zone_pages: u32) -> u64 {
+    (ZONE_MAP_MAINTENANCE_SCAN_BYTES / (u64::from(zone_pages).max(1) * PAGE_SIZE as u64))
+        .clamp(1, ZONE_MAP_MAINTENANCE_MAX_ZONES_PER_PASS as u64)
+}
+
+fn zone_map_diagnostics_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| crate::util::env::flag("MYDB_ZONE_MAP_DIAGNOSTICS", false))
+}
+
 /// Select stale and missing zones for one bounded maintenance pass.
 ///
 /// A missing entry is not a correctness bug at read time: candidate
@@ -220,10 +241,11 @@ fn zone_map_maintenance_targets_in_range<Z: AsRef<ZoneSummary>>(
         let invalid_columns = zone.state != Some(ZoneMapState::Empty)
             && required_columns.iter().any(|column_id| {
                 zone.columns.get(column_id).is_none_or(|summary| {
-                    matches!(
-                        summary.state,
-                        ZoneMapState::Unknown | ZoneMapState::Building
-                    )
+                    !summary.order_unsupported
+                        && matches!(
+                            summary.state,
+                            ZoneMapState::Unknown | ZoneMapState::Building
+                        )
                 })
             });
         let dropped_membership = zone.state != Some(ZoneMapState::Empty)
@@ -558,19 +580,39 @@ impl ZoneMembership {
 
     #[inline]
     fn bloom_positions(hash: u64, words: usize, hashes: u8) -> impl Iterator<Item = usize> {
+        let hash = Self::bloom_seed(hash);
         let h1 = hash;
         let h2 = hash.rotate_left(32) | 1;
-        debug_assert!(words.is_power_of_two());
+        debug_assert!(words.is_multiple_of(ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS));
         debug_assert!(words >= ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS);
         let block_count = words / ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS;
-        debug_assert!(block_count.is_power_of_two());
-        let block = hash.rotate_left(17) as usize & (block_count - 1);
+        let block = Self::bloom_block(hash, block_count);
         let block_bit_base = block * ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS * 64;
         let block_bit_mask = ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS * 64 - 1;
         (0..hashes).map(move |i| {
             block_bit_base
                 + (h1.wrapping_add(u64::from(i).wrapping_mul(h2)) as usize & block_bit_mask)
         })
+    }
+
+    /// Canonical FNV fingerprints remain stable; avalanche only the Bloom
+    /// address seed so structured integer/temporal/text suffixes cannot
+    /// correlate block choice with the in-block double-hash progression.
+    #[inline]
+    fn bloom_seed(mut hash: u64) -> u64 {
+        hash = (hash ^ (hash >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+        hash = (hash ^ (hash >> 27)).wrapping_mul(0x94d049bb133111eb);
+        hash ^ (hash >> 31)
+    }
+
+    #[inline]
+    fn bloom_block(hash: u64, blocks: usize) -> usize {
+        let hash = hash.rotate_left(17);
+        if blocks.is_power_of_two() {
+            hash as usize & (blocks - 1)
+        } else {
+            (hash % blocks as u64) as usize
+        }
     }
 
     fn bloom_from_hashes(
@@ -588,7 +630,7 @@ impl ZoneMembership {
     }
 
     fn valid_layout(words: usize, hashes: u8) -> bool {
-        words.is_power_of_two()
+        words.is_multiple_of(ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS)
             && (ZONE_MEMBERSHIP_MIN_BLOOM_WORDS..=ZONE_MEMBERSHIP_MAX_BLOOM_WORDS).contains(&words)
             && (1..=ZONE_MEMBERSHIP_MAX_BLOOM_HASHES).contains(&hashes)
     }
@@ -608,10 +650,13 @@ impl ZoneMembership {
 
     #[inline]
     fn insert_bloom_hash(words: &mut [u64], hashes: u8, set_bits: &mut u32, hash: u64) {
-        debug_assert!(words.len().is_power_of_two());
+        let hash = Self::bloom_seed(hash);
+        debug_assert!(words
+            .len()
+            .is_multiple_of(ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS));
         debug_assert!(words.len() >= ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS);
         let block_count = words.len() / ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS;
-        let block = hash.rotate_left(17) as usize & (block_count - 1);
+        let block = Self::bloom_block(hash, block_count);
         let block_bit_base = block * ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS * 64;
         let block_bit_mask = ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS * 64 - 1;
         let step = hash.rotate_left(32) | 1;
@@ -637,6 +682,16 @@ impl ZoneMembership {
         (1.0 - (-k * values as f64 / bits).exp()).powf(k)
     }
 
+    fn observed_false_positive_rate(words: &[u64], hashes: u8) -> f64 {
+        // A blocked probe chooses one block. Mean(p_block^k), rather than
+        // mean(p_block)^k, accounts for uneven occupancy and hot blocks.
+        words
+            .chunks_exact(ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS)
+            .map(|block| (f64::from(Self::count_set_bits(block)) / 512.0).powi(i32::from(hashes)))
+            .sum::<f64>()
+            / (words.len() / ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS) as f64
+    }
+
     fn meets_layout(&self, layout: ZoneMembershipLayout, local_ndv: u64) -> bool {
         match self {
             Self::Exact { .. } => true,
@@ -650,8 +705,7 @@ impl ZoneMembership {
                 } else {
                     *set_bits
                 };
-                let actual_fpr = (f64::from(actual_set_bits) / (words.len() * 64) as f64)
-                    .powi(i32::from(*hashes));
+                let actual_fpr = Self::observed_false_positive_rate(words, *hashes);
                 !Self::set_bits_saturated(actual_set_bits, words.len())
                     && actual_fpr
                         <= Self::false_positive_rate(layout.words, layout.hashes, local_ndv)
@@ -693,8 +747,7 @@ impl ZoneMembership {
                 folded[idx % layout.words] |= word;
             }
             let folded_set_bits = Self::count_set_bits(&folded);
-            let folded_fpr =
-                (f64::from(folded_set_bits) / (layout.words * 64) as f64).powi(i32::from(*hashes));
+            let folded_fpr = Self::observed_false_positive_rate(&folded, *hashes);
             if Self::set_bits_saturated(folded_set_bits, folded.len())
                 || folded_fpr
                     > Self::false_positive_rate(layout.words, layout.hashes, local_ndv).max(0.05)
@@ -705,6 +758,25 @@ impl ZoneMembership {
             *set_bits = folded_set_bits;
         }
         self.meets_layout(layout, local_ndv)
+    }
+
+    /// Fold only compatible block counts. The modulo block mapping makes
+    /// this a lossless union; measured occupancy must still meet the FPR
+    /// target before the smaller bitmap replaces the original.
+    fn compact_observed_layout(&mut self) {
+        let (word_count, hashes) = match self {
+            Self::Bloom { words, hashes, .. } => (words.len(), *hashes),
+            _ => return,
+        };
+        for words in
+            (ZONE_MEMBERSHIP_MIN_BLOOM_WORDS..word_count).step_by(ZONE_MEMBERSHIP_BLOOM_BLOCK_WORDS)
+        {
+            if word_count.is_multiple_of(words)
+                && self.prepare_for_layout(ZoneMembershipLayout { words, hashes }, 0)
+            {
+                break;
+            }
+        }
     }
 
     fn insert_hash(&mut self, hash: u64) {
@@ -856,10 +928,27 @@ struct ZoneMembershipLayout {
     hashes: u8,
 }
 
+impl ZoneMembershipLayout {
+    fn for_local_ndv(local_ndv: u64) -> Self {
+        let target_bits = local_ndv.saturating_mul(8);
+        let words = target_bits.div_ceil(512).saturating_mul(8).clamp(
+            ZONE_MEMBERSHIP_MIN_BLOOM_WORDS as u64,
+            ZONE_MEMBERSHIP_PAGE_FIT_WORDS as u64,
+        ) as usize;
+        let bits_per_value = (words * 64) as f64 / local_ndv.max(1) as f64;
+        // Near eight bits/value, a sixth probe only marginally improves the
+        // uniform-FPR model. Bound dependent accesses by the default budget.
+        let hashes = (bits_per_value * std::f64::consts::LN_2)
+            .round()
+            .clamp(1.0, f64::from(ZONE_MEMBERSHIP_DEFAULT_BLOOM_HASHES)) as u8;
+        Self { words, hashes }
+    }
+}
+
 impl Default for ZoneMembershipLayout {
     fn default() -> Self {
         Self {
-            words: ZONE_MEMBERSHIP_MIN_BLOOM_WORDS,
+            words: 128,
             hashes: ZONE_MEMBERSHIP_DEFAULT_BLOOM_HASHES,
         }
     }
@@ -1121,6 +1210,9 @@ pub(crate) struct ZoneColumnSummary {
     /// avoid emitting the same conservative transition again.
     #[serde(skip)]
     durable_unknown: bool,
+    /// Persistent, intentional fallback for non-epoch calendar encodings.
+    #[serde(default)]
+    order_unsupported: bool,
     pub has_null: bool,
     pub has_non_null: bool,
     pub min: Option<ZoneScalar>,
@@ -1135,6 +1227,7 @@ impl Default for ZoneColumnSummary {
         Self {
             state: ZoneMapState::Empty,
             durable_unknown: false,
+            order_unsupported: false,
             has_null: false,
             has_non_null: false,
             min: None,
@@ -1149,6 +1242,7 @@ impl ZoneColumnSummary {
     fn mark_unknown(&mut self) {
         self.state = ZoneMapState::Unknown;
         self.durable_unknown = false;
+        self.order_unsupported = false;
         self.min = None;
         self.max = None;
         self.membership = None;
@@ -1199,8 +1293,10 @@ impl ZoneColumnSummary {
     fn merge_summary_impl(&mut self, source: &Self, include_membership: bool) {
         if source.state == ZoneMapState::Unknown {
             let durable = self.durable_unknown || source.durable_unknown;
+            let order_unsupported = self.order_unsupported || source.order_unsupported;
             self.mark_unknown();
             self.durable_unknown = durable;
+            self.order_unsupported = order_unsupported;
             return;
         }
         if self.state == ZoneMapState::Unknown {
@@ -1244,6 +1340,7 @@ impl ZoneColumnSummary {
         let token = |summary: &Self| {
             (
                 summary.state,
+                summary.order_unsupported,
                 summary.has_null,
                 summary.has_non_null,
                 summary.truncated,
@@ -2176,6 +2273,7 @@ fn decode_zone_map_delta(bytes: &[u8]) -> Option<ZoneMapDeltaBatch> {
                 ZoneColumnSummary {
                     state: column_state,
                     durable_unknown: column_state == ZoneMapState::Unknown,
+                    order_unsupported: false,
                     has_null: flags & 1 != 0,
                     has_non_null: flags & 2 != 0,
                     truncated: flags & 4 != 0,
@@ -2561,6 +2659,7 @@ fn decode_zone_map_delta_v2(bytes: &[u8]) -> Option<ZoneMapDeltaBatch> {
                 ZoneColumnSummary {
                     state: zone_state_from_tag(flags & 3)?,
                     durable_unknown: flags & 3 == zone_state_tag(ZoneMapState::Unknown),
+                    order_unsupported: false,
                     has_null: flags & (1 << 2) != 0,
                     has_non_null: flags & (1 << 3) != 0,
                     truncated: flags & (1 << 4) != 0,
@@ -2765,6 +2864,17 @@ fn zone_membership_hash_borrowed(tag: u8, bytes: &[u8], truncated: bool) -> u64 
     hash.0
 }
 
+/// Equality fingerprints use the complete binary value. Range envelopes
+/// remain bounded prefixes and must never be used as equality identities.
+fn binary_membership_hash(column: &ColumnSchema, value: &Value) -> Option<u64> {
+    match (&column.data_type, value) {
+        (DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. }, Value::Bytes(bytes)) => {
+            Some(zone_membership_hash_borrowed(6, bytes, false))
+        }
+        _ => None,
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ZoneMapWorkerColumn {
     column_idx: usize,
@@ -2794,6 +2904,9 @@ fn compare_value_to_worker(
     stored: &WorkerScalar,
     text_scratch: &mut Vec<u8>,
 ) -> Result<Option<std::cmp::Ordering>, ()> {
+    if !zone_temporal_order_safe(value) {
+        return Err(());
+    }
     use DataTypeKind::*;
     match (&column.data_type, value, stored) {
         (
@@ -2847,7 +2960,10 @@ fn compare_value_to_worker(
         ) => {
             text_scratch.clear();
             crate::charset::collation_key_prefix_by_id_into(
-                collation_id, text, ZONE_TEXT_PREFIX_BYTES, text_scratch,
+                collation_id,
+                text,
+                ZONE_TEXT_PREFIX_BYTES,
+                text_scratch,
             );
             Ok(Some(text_scratch[..].cmp(&weight[..])))
         }
@@ -2859,7 +2975,10 @@ fn compare_value_to_worker(
             Ok(text) => {
                 text_scratch.clear();
                 crate::charset::collation_key_prefix_by_id_into(
-                    collation_id, text, ZONE_TEXT_PREFIX_BYTES, text_scratch,
+                    collation_id,
+                    text,
+                    ZONE_TEXT_PREFIX_BYTES,
+                    text_scratch,
                 );
                 Ok(Some(text_scratch[..].cmp(&weight[..])))
             }
@@ -2879,6 +2998,9 @@ fn worker_scalar_from_value(
     collation_id: u16,
     value: &Value,
 ) -> Option<WorkerScalar> {
+    if !zone_temporal_order_safe(value) {
+        return None;
+    }
     use DataTypeKind::*;
     match (&column.data_type, value) {
         (_, Value::Null) => None,
@@ -3102,8 +3224,12 @@ impl ZoneMapWorkerBatch {
                 value
                     .filter(|value| !matches!(value, Value::Null))
                     .filter(|value| !matches!(value, Value::Decimal(text) if text.len() > 256))
-                    .and_then(|value| worker_scalar_from_value(column, entry.collation_id, value))
-                    .map(|scalar| zone_membership_hash_worker(&scalar))
+                    .and_then(|value| {
+                        binary_membership_hash(column, value).or_else(|| {
+                            worker_scalar_from_value(column, entry.collation_id, value)
+                                .map(|scalar| zone_membership_hash_worker(&scalar))
+                        })
+                    })
             } else {
                 None
             };
@@ -3206,7 +3332,9 @@ impl ZoneMapWorkerColumn {
             let weight = ZONE_TEXT_PREFIX_BYTES + 1;
             let scratch = if weight > scratch_capacity {
                 weight.max(scratch_capacity.saturating_mul(2)).max(8)
-            } else { 0 };
+            } else {
+                0
+            };
             weight.saturating_mul(3).saturating_add(scratch)
         };
         let scalar = match value.expect("nonnull observation") {
@@ -3847,6 +3975,43 @@ impl NeutralMutations {
     }
 }
 
+/// Bounded runtime scheduling state, independent of the number of zones.
+/// Waiting hot zones eventually get the existing MVCC-safe rebuild attempt;
+/// a failed/union-only attempt remains conservative and eligible for retry.
+struct HotZoneWatch {
+    entries: [Option<(u64, u64)>; 64],
+}
+
+impl HotZoneWatch {
+    fn new() -> Self {
+        Self {
+            entries: [None; 64],
+        }
+    }
+    fn remove(&mut self, zone: u64) {
+        if let Some(entry) = self
+            .entries
+            .iter_mut()
+            .find(|entry| entry.is_some_and(|(id, _)| id == zone))
+        {
+            *entry = None;
+        }
+    }
+    fn eligible(&mut self, zone: u64, now: u64, quiet: bool) -> bool {
+        if quiet {
+            self.remove(zone);
+            return true;
+        }
+        if let Some((_, first)) = self.entries.iter().flatten().find(|(id, _)| *id == zone) {
+            return now.saturating_sub(*first) >= ZONE_MAP_HOT_ZONE_MAX_WAIT_MS;
+        }
+        if let Some(entry) = self.entries.iter_mut().find(|entry| entry.is_none()) {
+            *entry = Some((zone, now));
+        }
+        false
+    }
+}
+
 pub(crate) struct ZoneMap {
     storage_id: u64,
     zone_pages: u32,
@@ -3877,6 +4042,7 @@ pub(crate) struct ZoneMap {
     /// [`GROWING_ZONE_COUNT_BITS`]. See [`ZoneMap::note_growing_append`].
     growing_appends: AtomicU64,
     maintenance_cursor: AtomicU64,
+    hot_zone_watch: Mutex<HotZoneWatch>,
     // Presence-only prefix proof for an Unknown-hole root. Both fields are
     // read/updated under data_gate; a reset invalidates the proof by epoch.
     maintenance_coverage_cursor: AtomicU64,
@@ -3953,6 +4119,7 @@ impl ZoneMap {
             last_mutation_ms: AtomicU64::new(0),
             growing_appends: AtomicU64::new(u64::MAX),
             maintenance_cursor: AtomicU64::new(0),
+            hot_zone_watch: Mutex::new(HotZoneWatch::new()),
             maintenance_coverage_cursor: AtomicU64::new(0),
             maintenance_coverage_epoch: AtomicU64::new(0),
             #[cfg(test)]
@@ -3977,7 +4144,6 @@ impl ZoneMap {
         map.sync_derived_charge();
         map
     }
-
 
     fn bind_table_schema(&self, table: &TableSchema) {
         let object_id = if table.object_id == 0 {
@@ -5405,7 +5571,10 @@ mod paged_zone_map_handle_tests {
 fn zone_text_weight(text: &str, collation_id: u16) -> (Vec<u8>, bool) {
     let mut weight = Vec::with_capacity(ZONE_TEXT_PREFIX_BYTES + 1);
     crate::charset::collation_key_prefix_by_id_into(
-        collation_id, text, ZONE_TEXT_PREFIX_BYTES + 1, &mut weight,
+        collation_id,
+        text,
+        ZONE_TEXT_PREFIX_BYTES + 1,
+        &mut weight,
     );
     let truncated = weight.len() > ZONE_TEXT_PREFIX_BYTES;
     weight.truncate(ZONE_TEXT_PREFIX_BYTES);
@@ -5467,6 +5636,7 @@ struct CachedZoneTextPrefix {
 #[derive(Debug)]
 struct WorkerColumnState {
     state: ZoneMapState,
+    order_unsupported: bool,
     has_null: bool,
     has_non_null: bool,
     truncated: bool,
@@ -5498,6 +5668,7 @@ impl Default for WorkerColumnState {
     fn default() -> Self {
         Self {
             state: ZoneMapState::Empty,
+            order_unsupported: false,
             has_null: false,
             has_non_null: false,
             truncated: false,
@@ -5565,6 +5736,7 @@ impl WorkerColumnState {
     #[inline]
     fn mark_unknown(&mut self) {
         self.state = ZoneMapState::Unknown;
+        self.order_unsupported = false;
         self.min = None;
         self.max = None;
         self.membership = None;
@@ -5988,7 +6160,7 @@ impl WorkerColumnState {
             .as_ref()
             .is_some_and(|membership| !matches!(membership, ZoneMembership::Saturated))
         {
-            if !self.insert_membership_hash(zone_membership_hash_borrowed(6, incoming, truncated)) {
+            if !self.insert_membership_hash(zone_membership_hash_borrowed(6, bytes, false)) {
                 return;
             }
         }
@@ -6065,6 +6237,11 @@ impl WorkerColumnState {
         text_lease: &mut ZoneScratchLease,
     ) {
         if self.state == ZoneMapState::Unknown {
+            return;
+        }
+        if !zone_temporal_order_safe(value) {
+            self.mark_unknown();
+            self.order_unsupported = true;
             return;
         }
         if matches!(value, Value::Null) {
@@ -6296,6 +6473,11 @@ impl RowDecodeSink for ZoneRebuildDecodeSink<'_> {
 
     #[inline]
     fn put_date(&mut self, col: usize, days: i32) {
+        if crate::types::decode_tagged_date(days).is_some() {
+            self.running[col].mark_unknown();
+            self.running[col].order_unsupported = true;
+            return;
+        }
         self.observe_worker(col, WorkerScalar::Temporal(i64::from(days)));
     }
 
@@ -6311,6 +6493,11 @@ impl RowDecodeSink for ZoneRebuildDecodeSink<'_> {
 
     #[inline]
     fn put_datetime(&mut self, col: usize, micros: i64) {
+        if crate::types::decode_tagged_datetime(micros).is_some() {
+            self.running[col].mark_unknown();
+            self.running[col].order_unsupported = true;
+            return;
+        }
         self.observe_worker(col, WorkerScalar::Temporal(micros));
     }
 
@@ -6356,10 +6543,24 @@ impl RowDecodeSink for ZoneRebuildDecodeSink<'_> {
     }
 }
 
+fn compact_rebuilt_memberships(batch: &mut ZoneMapDeltaBatch) {
+    for zone in batch.zones.values_mut() {
+        for summary in zone.columns.values_mut() {
+            if let Some(membership) = &mut summary.membership {
+                membership.compact_observed_layout();
+            }
+        }
+    }
+}
+
 fn worker_state_into_summary(state: WorkerColumnState) -> ZoneColumnSummary {
+    // A heap-latch batch can end halfway through a zone. Preserve its full
+    // layout until all partials have been unioned; folding each half first
+    // destroys capacity needed by the complete zone.
     ZoneColumnSummary {
         state: state.state,
         durable_unknown: false,
+        order_unsupported: state.order_unsupported,
         has_null: state.has_null,
         has_non_null: state.has_non_null,
         truncated: state.truncated,
@@ -6437,7 +6638,9 @@ fn zone_map_membership_candidate_ndv(table: &TableSchema, column: &ColumnSchema)
         .columns
         .get(&normalize_name(&column.name))?
         .distinct_count;
-    (ndv != 0).then_some(ndv)
+    // A global constant is already exactly described by min=max. Omit it
+    // from the desired set too, so maintenance does not repair this omission.
+    (ndv > 1).then_some(ndv)
 }
 
 /// Count the selected map's entries without allocating it before admission.
@@ -6474,46 +6677,55 @@ fn zone_map_membership_requirements(
     {
         return BTreeMap::new();
     }
-    let zone_count = table
+    // Size full zones using page density; averaging over rounded-up zone
+    // count underestimates every full zone when the tail is mostly empty.
+    let rows_per_zone = table
         .stats
-        .heap_page_count
-        .div_ceil(u64::from(table.zone_pages()).max(1));
-    let rows_per_zone = table.stats.row_count.div_ceil(zone_count.max(1)).max(1);
+        .row_count
+        .saturating_mul(u64::from(table.zone_pages()).max(1))
+        .div_ceil(table.stats.heap_page_count.max(1))
+        .max(1);
     let mut candidates = zone_map_relevant_columns(table)
         .into_iter()
         .filter_map(|(idx, column_id)| {
             let ndv = zone_map_membership_candidate_ndv(table, &table.columns[idx])?;
             let local_ndv = ndv.min(rows_per_zone).max(1);
-            // About 6.24 bits/value is sufficient for a 5% target FPR at the
-            // optimal k. Round the resulting bytes up to a 1..8 KiB power of
-            // two so the persisted layout is stable and allocator-friendly.
-            let target_bits = local_ndv.saturating_mul(7);
-            let target_bytes = target_bits.div_ceil(8).max(1_024);
-            let bytes = target_bytes.next_power_of_two().clamp(1_024, 8 * 1_024) as usize;
-            let words = bytes / std::mem::size_of::<u64>();
-            let bits_per_value = (words * 64) as f64 / local_ndv as f64;
-            let hashes = (bits_per_value * std::f64::consts::LN_2)
-                .round()
-                .clamp(1.0, f64::from(ZONE_MEMBERSHIP_MAX_BLOOM_HASHES))
-                as u8;
+            // Keep 512-bit addressable blocks, but avoid power-of-two
+            // rounding and the half-page boundary crossed by 8 KiB records.
             Some((
                 idx,
                 column_id,
                 ndv,
                 local_ndv,
-                ZoneMembershipLayout { words, hashes },
+                ZoneMembershipLayout::for_local_ndv(local_ndv),
             ))
         })
         .collect::<Vec<_>>();
     candidates.sort_by(|left, right| {
-        right
-            .2
-            .cmp(&left.2)
+        // Expected in-domain equality exclusions per encoded byte under the
+        // same uniform-NDV assumption used for the provisional local NDV.
+        // This is a deterministic ranking proxy, not a correctness premise.
+        let score = |value: &(usize, u32, u64, u64, ZoneMembershipLayout)| {
+            (1.0 - value.3 as f64 / value.2 as f64) / (8 + value.4.words * 8) as f64
+        };
+        score(right)
+            .total_cmp(&score(left))
             .then_with(|| left.4.words.cmp(&right.4.words))
+            .then_with(|| right.2.cmp(&left.2))
             .then_with(|| left.0.cmp(&right.0))
     });
+    let mut remaining = (u64::from(table.zone_pages()) * PAGE_SIZE as u64 / 16).max(8 * 1024);
     candidates
         .into_iter()
+        .filter(|(_, _, _, _, layout)| {
+            let bytes = (layout.words * 8 + 8) as u64;
+            if bytes > remaining {
+                false
+            } else {
+                remaining -= bytes;
+                true
+            }
+        })
         .take(ZONE_MEMBERSHIP_MAX_COLUMNS)
         .map(|(_, column_id, _, local_ndv, layout)| (column_id, (layout, local_ndv)))
         .collect()
@@ -6596,7 +6808,15 @@ fn aggregate_column_values_range<R: AsRef<[Value]>>(
             match row.as_ref().get(col_idx) {
                 Some(Value::Null) => {}
                 Some(value) => match zone_scalar(column, value) {
-                    Some(scalar) => summary.merge_membership_value(&scalar),
+                    Some(scalar) => {
+                        if let Some(hash) = binary_membership_hash(column, value) {
+                            if let Some(membership) = &mut summary.membership {
+                                membership.insert_hash(hash);
+                            }
+                        } else {
+                            summary.merge_membership_value(&scalar);
+                        }
+                    }
                     None => {
                         summary.mark_unknown();
                         return;
@@ -6726,6 +6946,12 @@ fn zone_schema_fingerprint(table: &TableSchema) -> u64 {
 }
 
 fn zone_query_scalar(column: &ColumnSchema, value: &Value) -> Option<ZoneScalar> {
+    if matches!(
+        column.data_type,
+        DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. }
+    ) {
+        return zone_scalar_physical(column, value);
+    }
     // FLOAT comparisons execute in f64 for mixed numeric operands. Never
     // round the query to f32: doing so loses strict inequality boundary rows.
     if matches!(
@@ -6795,7 +7021,21 @@ fn zone_scalar(column: &ColumnSchema, value: &Value) -> Option<ZoneScalar> {
     })
 }
 
+#[inline]
+fn zone_temporal_order_safe(value: &Value) -> bool {
+    match value {
+        Value::Date(days) => crate::types::decode_tagged_date(*days).is_none(),
+        Value::DateTime(micros) => crate::types::decode_tagged_datetime(*micros).is_none(),
+        _ => true,
+    }
+}
+
 fn zone_scalar_physical(column: &ColumnSchema, value: &Value) -> Option<ZoneScalar> {
+    // Tagged calendar components do not share the epoch lane's ordering.
+    // Retain this column's zone until a component-ordered envelope exists.
+    if !zone_temporal_order_safe(value) {
+        return None;
+    }
     use DataTypeKind::*;
     match (&column.data_type, value) {
         (_, Value::Null) => None,
@@ -6994,11 +7234,11 @@ fn comparison_may_match(
 #[cfg(test)]
 #[inline]
 fn equality_may_match(summary: &ZoneColumnSummary, query: &ZoneScalar) -> bool {
-    equality_may_match_with(summary, query, |query| {
+    equality_may_match_with(summary, query, None, |hash| {
         summary
             .membership
             .as_ref()
-            .map(|membership| membership.may_contain_hash(zone_membership_hash(query)))
+            .map(|membership| membership.may_contain_hash(hash))
     })
 }
 
@@ -7009,14 +7249,27 @@ fn equality_may_match(summary: &ZoneColumnSummary, query: &ZoneScalar) -> bool {
 fn equality_may_match_with(
     summary: &ZoneColumnSummary,
     query: &ZoneScalar,
-    probe: impl FnOnce(&ZoneScalar) -> Option<bool>,
+    membership_hash: Option<u64>,
+    probe: impl FnOnce(u64) -> Option<bool>,
 ) -> bool {
     use crate::parser::BinaryOp;
     match comparison_decision(summary, BinaryOp::Eq, query) {
         ZoneMatchDecision::ProvenNoMatch => return false,
         // Membership fingerprints are meaningful only after min/max proves
         // that the query scalar is in the same SQL comparison domain.
-        ZoneMatchDecision::Unknown => return true,
+        ZoneMatchDecision::Unknown => {
+            // Complete binary equality identities are safe even when a
+            // truncated envelope cannot decide at a prefix boundary.
+            if !(membership_hash.is_some()
+                && summary.state == ZoneMapState::Ready
+                && summary.has_non_null
+                && matches!(query, ZoneScalar::Binary { .. })
+                && matches!(summary.min, Some(ZoneScalar::Binary { .. }))
+                && matches!(summary.max, Some(ZoneScalar::Binary { .. })))
+            {
+                return true;
+            }
+        }
         ZoneMatchDecision::MayMatch => {}
     }
     // Mixed FLOAT/f64 bounds have different fingerprint encodings. Range
@@ -7028,7 +7281,8 @@ fn equality_may_match_with(
     {
         return true;
     }
-    let Some(may_match) = probe(query) else {
+    let Some(may_match) = probe(membership_hash.unwrap_or_else(|| zone_membership_hash(query)))
+    else {
         return true;
     };
     ZONE_MAP_MEMBERSHIP_CHECKS.fetch_add(1, Ordering::Relaxed);
@@ -7080,15 +7334,21 @@ fn like_prefix_zone_bounds(
         return Some((lower, upper));
     }
 
-    if !matches!(column.data_type, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. }
-        | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
+    if !matches!(
+        column.data_type,
+        DataTypeKind::Char { .. }
+            | DataTypeKind::VarChar { .. }
+            | DataTypeKind::Enum { .. }
+            | DataTypeKind::Set { .. }
+    ) {
         return None;
     }
     // LIKE matches characters rather than collation elements. A canonical
     // prefix is safe only if adding a suffix cannot revise its weights.
     // Accent/case-sensitive Unicode keys include level separators and NFC
     // composition can revise the last character, so retain their SQL residual.
-    let id = crate::charset::collation_id(column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"));
+    let id =
+        crate::charset::collation_id(column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"));
     let info = crate::charset::resolve_collation_id(id)?;
     if !info.binary && info.case_sensitive {
         return None;
@@ -7098,10 +7358,15 @@ fn like_prefix_zone_bounds(
     // its lower bound is conservative, and the successor covers every suffix.
     let mut upper_weight = weight.clone();
     let upper = loop {
-        let Some(last) = upper_weight.last_mut() else { break None; };
+        let Some(last) = upper_weight.last_mut() else {
+            break None;
+        };
         if *last != u8::MAX {
             *last += 1;
-            break Some(ZoneScalar::Text { weight: upper_weight, truncated: false });
+            break Some(ZoneScalar::Text {
+                weight: upper_weight,
+                truncated: false,
+            });
         }
         upper_weight.pop();
     };
@@ -7119,6 +7384,7 @@ enum ZonePredicateProgram {
         column_id: u32,
         op: crate::parser::BinaryOp,
         query: ZoneScalar,
+        membership_hash: Option<u64>,
     },
     NullSafeNull {
         column_id: u32,
@@ -7135,6 +7401,7 @@ enum ZonePredicateProgram {
     InList {
         column_id: u32,
         values: Vec<ZoneScalar>,
+        membership_hashes: Vec<Option<u64>>,
     },
     LikePrefix {
         column_id: u32,
@@ -7154,11 +7421,11 @@ impl ZonePredicateProgram {
         }
         self.may_match_by(&mut |predicate, column| {
             zone.columns.get(&column).is_none_or(|summary| {
-                predicate.column_may_match(summary, |query| {
+                predicate.column_may_match(summary, |hash| {
                     summary
                         .membership
                         .as_ref()
-                        .map(|membership| membership.may_contain_hash(zone_membership_hash(query)))
+                        .map(|membership| membership.may_contain_hash(hash))
                 })
             })
         })
@@ -7181,13 +7448,18 @@ impl ZonePredicateProgram {
     fn column_may_match(
         &self,
         summary: &ZoneColumnSummary,
-        mut probe: impl FnMut(&ZoneScalar) -> Option<bool>,
+        mut probe: impl FnMut(u64) -> Option<bool>,
     ) -> bool {
         use crate::parser::BinaryOp;
         match self {
-            Self::Compare { op, query, .. } => {
+            Self::Compare {
+                op,
+                query,
+                membership_hash,
+                ..
+            } => {
                 if matches!(op, BinaryOp::Eq | BinaryOp::NullSafeEq) {
-                    equality_may_match_with(summary, query, probe)
+                    equality_may_match_with(summary, query, *membership_hash, probe)
                 } else {
                     comparison_may_match(summary, *op, query)
                 }
@@ -7205,9 +7477,18 @@ impl ZonePredicateProgram {
                 comparison_may_match(summary, BinaryOp::GtEq, low)
                     && comparison_may_match(summary, BinaryOp::LtEq, high)
             }
-            Self::InList { values, .. } => values
-                .iter()
-                .any(|value| equality_may_match_with(summary, value, &mut probe)),
+            Self::InList {
+                values,
+                membership_hashes,
+                ..
+            } => values.iter().enumerate().any(|(index, value)| {
+                equality_may_match_with(
+                    summary,
+                    value,
+                    membership_hashes.get(index).copied().flatten(),
+                    &mut probe,
+                )
+            }),
             Self::LikePrefix { lower, upper, .. } => {
                 comparison_may_match(summary, BinaryOp::GtEq, lower)
                     && upper
@@ -7244,7 +7525,11 @@ fn compile_zone_member_comparison(
         .iter()
         .map(literal_value)
         .collect::<Option<Vec<_>>>()?;
-    let member_start = if matches!(constants.get(2), Some(Value::UInt(_))) { 3 } else { 2 };
+    let member_start = if matches!(constants.get(2), Some(Value::UInt(_))) {
+        3
+    } else {
+        2
+    };
     let members = &constants[member_start..];
     let declared = match &column.data_type {
         DataTypeKind::Enum { values } | DataTypeKind::Set { values } => values,
@@ -7307,23 +7592,71 @@ fn compile_zone_member_comparison(
     } else {
         ZonePredicateProgram::InList {
             column_id: column.column_id,
+            membership_hashes: vec![None; values.len()],
             values,
         }
     })
 }
 
-fn zone_comparison_compatible(table: &TableSchema, column: &ColumnSchema, operands: &[&Expr]) -> bool {
+fn zone_comparison_compatible(
+    table: &TableSchema,
+    column: &ColumnSchema,
+    operands: &[&Expr],
+) -> bool {
+    if matches!(
+        column.data_type,
+        DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. }
+    ) {
+        return crate::engine::expr::aggregate_expr_collations(
+            operands.iter().copied(),
+            table,
+            "comparison",
+        )
+        .ok()
+        .flatten()
+            == Some(crate::charset::BINARY_COLLATION_ID);
+    }
     if matches!(column.data_type, DataTypeKind::Timestamp { .. })
-        && !crate::engine::expr::session_time_zone_is_fixed() {
+        && !crate::engine::expr::session_time_zone_is_fixed()
+    {
         return false;
     }
-    if matches!(column.data_type, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. }
-        | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }) {
-        let id = crate::charset::collation_id(column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"));
-        return crate::engine::expr::aggregate_expr_collations(operands.iter().copied(), table, "comparison")
-            .ok().flatten() == Some(id);
+    if matches!(
+        column.data_type,
+        DataTypeKind::Char { .. }
+            | DataTypeKind::VarChar { .. }
+            | DataTypeKind::Enum { .. }
+            | DataTypeKind::Set { .. }
+    ) {
+        let id = crate::charset::collation_id(
+            column.collation.as_deref().unwrap_or("utf8mb4_0900_ai_ci"),
+        );
+        return crate::engine::expr::aggregate_expr_collations(
+            operands.iter().copied(),
+            table,
+            "comparison",
+        )
+        .ok()
+        .flatten()
+            == Some(id);
     }
     true
+}
+
+fn zone_bound_value(
+    table: &TableSchema,
+    column: &ColumnSchema,
+    source: &Expr,
+    value: Value,
+) -> Option<Value> {
+    if matches!(
+        column.data_type,
+        DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. }
+    ) {
+        crate::engine::expr::binary_comparison_constant(&value, source, table)
+    } else {
+        Some(value)
+    }
 }
 
 fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredicateProgram> {
@@ -7389,7 +7722,10 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             } else {
                 return None;
             };
-            if !zone_comparison_compatible(table, column, &[left, right]) { return None; }
+            if !zone_comparison_compatible(table, column, &[left, right]) {
+                return None;
+            }
+            let value = zone_bound_value(table, column, constant, value)?;
             if matches!(
                 column.data_type,
                 DataTypeKind::DateTime { .. } | DataTypeKind::Timestamp { .. }
@@ -7415,6 +7751,7 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             Some(ZonePredicateProgram::Compare {
                 column_id: column.column_id,
                 op,
+                membership_hash: binary_membership_hash(column, &value),
                 // Inequality exclusion requires exact equality, so do not
                 // round a constant into the stored column domain (e.g. a
                 // DOUBLE literal into FLOAT). Unsupported coercions retain
@@ -7444,11 +7781,19 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             negated: false,
         } => {
             let column = expr_column(table, expr)?;
-            if !zone_comparison_compatible(table, column, &[expr, low, high]) { return None; }
+            if !zone_comparison_compatible(table, column, &[expr, low, high]) {
+                return None;
+            }
             Some(ZonePredicateProgram::Between {
                 column_id: column.column_id,
-                low: zone_query_scalar(column, &literal_value(low)?)?,
-                high: zone_query_scalar(column, &literal_value(high)?)?,
+                low: zone_query_scalar(
+                    column,
+                    &zone_bound_value(table, column, low, literal_value(low)?)?,
+                )?,
+                high: zone_query_scalar(
+                    column,
+                    &zone_bound_value(table, column, high, literal_value(high)?)?,
+                )?,
             })
         }
         Expr::InList {
@@ -7458,11 +7803,15 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
         } => {
             let column = expr_column(table, expr)?;
             let operands: Vec<&Expr> = std::iter::once(expr.as_ref()).chain(list.iter()).collect();
-            if !zone_comparison_compatible(table, column, &operands) { return None; }
+            if !zone_comparison_compatible(table, column, &operands) {
+                return None;
+            }
             let mut values = Vec::with_capacity(list.len());
+            let mut membership_hashes = Vec::with_capacity(list.len());
             for item in list {
-                let value = literal_value(item)?;
+                let value = zone_bound_value(table, column, item, literal_value(item)?)?;
                 if !matches!(value, Value::Null) {
+                    membership_hashes.push(binary_membership_hash(column, &value));
                     values.push(zone_query_scalar(column, &value)?);
                 }
             }
@@ -7472,6 +7821,7 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
                 ZonePredicateProgram::InList {
                     column_id: column.column_id,
                     values,
+                    membership_hashes,
                 }
             })
         }
@@ -7482,11 +7832,21 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
             escape_char,
         } => {
             let column = expr_column(table, expr)?;
-            if !zone_comparison_compatible(table, column, &[expr, pattern]) { return None; }
-            if !matches!(column.data_type, DataTypeKind::Char { .. } | DataTypeKind::VarChar { .. }
-                | DataTypeKind::Enum { .. } | DataTypeKind::Set { .. }
-                | DataTypeKind::Binary { .. } | DataTypeKind::VarBinary { .. }) { return None; }
-            let value = literal_value(pattern)?;
+            if !zone_comparison_compatible(table, column, &[expr, pattern]) {
+                return None;
+            }
+            if !matches!(
+                column.data_type,
+                DataTypeKind::Char { .. }
+                    | DataTypeKind::VarChar { .. }
+                    | DataTypeKind::Enum { .. }
+                    | DataTypeKind::Set { .. }
+                    | DataTypeKind::Binary { .. }
+                    | DataTypeKind::VarBinary { .. }
+            ) {
+                return None;
+            }
+            let value = zone_bound_value(table, column, pattern, literal_value(pattern)?)?;
             let pattern = match value {
                 Value::String(s) | Value::Decimal(s) => s,
                 Value::Bytes(bytes) => String::from_utf8(bytes).ok()?,
@@ -7498,6 +7858,10 @@ fn compile_zone_predicate(table: &TableSchema, expr: &Expr) -> Option<ZonePredic
                         column_id: column.column_id,
                         op: BinaryOp::Eq,
                         query: zone_like_scalar(column, &literal)?,
+                        membership_hash: binary_membership_hash(
+                            column,
+                            &Value::Bytes(literal.as_bytes().to_vec()),
+                        ),
                     })
                 }
                 crate::engine::expr::LikeSargablePattern::Prefix(prefix) => {
@@ -9217,7 +9581,7 @@ impl Database {
                             Value::String(membership_kind.into()),
                             Value::UInt(membership_bytes as u64),
                             Value::UInt(u64::from(membership_hashes)),
-                            Value::UInt(1),
+                            Value::UInt(2),
                             Value::UInt(ZONE_MAP_SEMANTIC_VERSION as u64),
                             Value::Int(i64::from(saturated)),
                         ]);
@@ -9807,39 +10171,43 @@ impl Database {
         // epochs and registered its snapshot before scanning, and publishing
         // N touches only N's zones, so per-batch validation is unchanged.
         let reclaim_database = crate::engine::executor::mem_budget::current_reclaim_database();
-        let pipelined = crate::util::thread_spawn::scope(|scope| -> Result<Option<bool>, QueryError> {
-            let mut fully_replaced = true;
-            type Scanned<G> = (
-                ZoneRebuildBatch<G>,
-                Result<Option<ScannedZoneRebuild>, QueryError>,
-            );
-            let mut in_flight: Option<(u64, u64, std::thread::ScopedJoinHandle<'_, Scanned<_>>)> =
-                None;
-            let ranges = (0..total)
-                .step_by(64)
-                .map(|first| Some((first, first.saturating_add(64).min(total))))
-                .chain(std::iter::once(None));
-            for range in ranges {
-                let mut started = None;
-                if let Some((first, end)) = range {
-                    if should_cancel() {
-                        return Ok(None);
-                    }
-                    let requested = (first..end).collect::<BTreeSet<_>>();
-                    match self.prepare_zone_rebuild_batch(
-                        table,
-                        storage_id,
-                        &requested,
-                        should_cancel,
-                        Some((first, total)),
-                    )? {
-                        PreparedZoneRebuild::Finished(None) => return Ok(None),
-                        PreparedZoneRebuild::Finished(Some(replaced)) => {
-                            fully_replaced &= replaced == end - first;
+        let pipelined = crate::util::thread_spawn::scope(
+            |scope| -> Result<Option<bool>, QueryError> {
+                let mut fully_replaced = true;
+                type Scanned<G> = (
+                    ZoneRebuildBatch<G>,
+                    Result<Option<ScannedZoneRebuild>, QueryError>,
+                );
+                let mut in_flight: Option<(
+                    u64,
+                    u64,
+                    std::thread::ScopedJoinHandle<'_, Scanned<_>>,
+                )> = None;
+                let ranges = (0..total)
+                    .step_by(64)
+                    .map(|first| Some((first, first.saturating_add(64).min(total))))
+                    .chain(std::iter::once(None));
+                for range in ranges {
+                    let mut started = None;
+                    if let Some((first, end)) = range {
+                        if should_cancel() {
+                            return Ok(None);
                         }
-                        PreparedZoneRebuild::Batch(batch) => {
-                            let reclaim_database = reclaim_database.as_ref();
-                            let handle = scope.spawn(move || {
+                        let requested = (first..end).collect::<BTreeSet<_>>();
+                        match self.prepare_zone_rebuild_batch(
+                            table,
+                            storage_id,
+                            &requested,
+                            should_cancel,
+                            Some((first, total)),
+                        )? {
+                            PreparedZoneRebuild::Finished(None) => return Ok(None),
+                            PreparedZoneRebuild::Finished(Some(replaced)) => {
+                                fully_replaced &= replaced == end - first;
+                            }
+                            PreparedZoneRebuild::Batch(batch) => {
+                                let reclaim_database = reclaim_database.as_ref();
+                                let handle = scope.spawn(move || {
                                 let _reclaim = reclaim_database.map(
                                     crate::engine::executor::mem_budget::ReclaimDatabaseScope::enter,
                                 );
@@ -9851,30 +10219,31 @@ impl Database {
                                 );
                                 (batch, scanned)
                             });
-                            started = Some((first, end, handle));
+                                started = Some((first, end, handle));
+                            }
                         }
                     }
+                    if let Some((first, end, handle)) = in_flight.take() {
+                        let (batch, scanned) = handle.join().map_err(|_| {
+                            error(
+                                crate::error::catalog::ER_GET_ERRNO,
+                                "zone map rebuild scan panicked",
+                            )
+                        })?;
+                        let Some(replaced) =
+                            self.publish_zone_rebuild_batch(table, batch, scanned, should_cancel)?
+                        else {
+                            return Ok(None);
+                        };
+                        fully_replaced &= replaced == end - first;
+                        map.maintenance_cursor
+                            .store(end % total.max(1), Ordering::Release);
+                    }
+                    in_flight = started;
                 }
-                if let Some((first, end, handle)) = in_flight.take() {
-                    let (batch, scanned) = handle.join().map_err(|_| {
-                        error(
-                            crate::error::catalog::ER_GET_ERRNO,
-                            "zone map rebuild scan panicked",
-                        )
-                    })?;
-                    let Some(replaced) =
-                        self.publish_zone_rebuild_batch(table, batch, scanned, should_cancel)?
-                    else {
-                        return Ok(None);
-                    };
-                    fully_replaced &= replaced == end - first;
-                    map.maintenance_cursor
-                        .store(end % total.max(1), Ordering::Release);
-                }
-                in_flight = started;
-            }
-            Ok(Some(fully_replaced))
-        })?;
+                Ok(Some(fully_replaced))
+            },
+        )?;
         let Some(fully_replaced) = pipelined else {
             map.rebuild_state.store(0, Ordering::Release);
             map.rebuild_finished_ms
@@ -10161,6 +10530,7 @@ impl Database {
             .into_iter()
             .map(|row_id| u64::from(row_id.page_id) / zone_pages)
             .collect::<BTreeSet<_>>();
+        compact_rebuilt_memberships(&mut fresh);
         Ok(Some(ScannedZoneRebuild {
             fresh,
             deferred_zones,
@@ -10459,6 +10829,7 @@ impl Database {
     where
         F: Fn() -> bool + Sync + ?Sized,
     {
+        let started = Instant::now();
         if should_stop() {
             return Ok(false);
         }
@@ -10502,7 +10873,7 @@ impl Database {
             .load(Ordering::Relaxed)
             .min(total_zones - 1);
         let end = first
-            .saturating_add(ZONE_MAP_MAINTENANCE_MAX_ZONES_PER_PASS as u64)
+            .saturating_add(zone_map_maintenance_window(map.zone_pages))
             .min(total_zones);
         let mut planning_lease = ZoneScratchLease::default();
         planning_lease.reserve(
@@ -10528,6 +10899,7 @@ impl Database {
         let mut sampled = BTreeMap::new();
         let mut eligible_lease = ZoneScratchLease::default();
         let mut eligible = BTreeSet::new();
+        let mut aged_eligible = 0;
         for id in first..end {
             if should_stop() {
                 map.rebuild_state.store(0, Ordering::Release);
@@ -10539,10 +10911,17 @@ impl Database {
                     "zone map lock poisoned",
                 )
             })?;
-            if map.zone_mutation(id)?.is_none_or(|mutation| {
+            let quiet = map.zone_mutation(id)?.is_none_or(|mutation| {
                 mutation.last_ms == 0
                     || now_ms.saturating_sub(mutation.last_ms) >= zone_map_maintenance_quiet_ms()
-            }) {
+            });
+            let selected = map
+                .hot_zone_watch
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .eligible(id, now_ms, quiet);
+            if selected {
+                aged_eligible += usize::from(!quiet);
                 eligible_lease.reserve(
                     zone_tree_bytes::<u64, ()>(eligible.len() + 1)
                         .saturating_sub(zone_tree_bytes::<u64, ()>(eligible.len())),
@@ -10568,6 +10947,15 @@ impl Database {
             &membership_columns,
         );
         targets.retain(|id| eligible.contains(id));
+        {
+            let mut watch = map.hot_zone_watch.lock().unwrap_or_else(|e| e.into_inner());
+            for &id in &eligible {
+                if !targets.contains(&id) {
+                    watch.remove(id);
+                }
+            }
+        }
+        let target_count = targets.len();
         let repaired = if targets.is_empty() {
             false
         } else {
@@ -10592,6 +10980,19 @@ impl Database {
         // not keep later cold zones from receiving their bounded repair turn.
         map.maintenance_cursor
             .store(if end == total_zones { 0 } else { end }, Ordering::Relaxed);
+        if zone_map_diagnostics_enabled() {
+            log_message(format_args!(
+                "zone_map_maintenance {}",
+                serde_json::json!({
+                    "storage_id": storage_id, "first_zone": first, "end_zone": end,
+                    "total_zones": total_zones, "eligible": eligible.len(), "targets": target_count,
+                    "repaired": repaired, "elapsed_us": started.elapsed().as_micros(),
+                "aged_eligible": aged_eligible,
+                    "scan_bytes_upper_bound": target_count as u64 * u64::from(map.zone_pages) * PAGE_SIZE as u64,
+                    "cursor": map.maintenance_cursor.load(Ordering::Relaxed),
+                })
+            ));
+        }
         let coverage = self.advance_zone_map_coverage(storage_id, map, total_zones, should_stop)?;
         if !map.missing_is_empty.load(Ordering::Acquire) {
             map.rebuild_state
@@ -10617,6 +11018,7 @@ impl Database {
     {
         let mut rebuilt = 0;
         let mut first_error = None;
+        let started = Instant::now();
         for _ in 0..ZONE_MAP_MAINTENANCE_PASSES_PER_ROUND {
             if should_cancel() {
                 break;
@@ -10628,6 +11030,11 @@ impl Database {
                         first_error = Some(err);
                     }
                 }
+            }
+            // Yield only between complete fair passes; aborting an in-flight
+            // rebuild at a wall deadline can starve a wide zone forever.
+            if started.elapsed() >= ZONE_MAP_MAINTENANCE_ROUND_TIME {
+                break;
             }
             // Zero repairs can still advance past a Ready or hot prefix.
             // Do not stop here: later batches may contain cold Unknown zones.
@@ -10675,7 +11082,9 @@ impl Database {
             .catalog_read()?
             .tables
             .values()
-            .filter(|table| table.database != crate::recyclebin::DATABASE && table.zone_map_enabled())
+            .filter(|table| {
+                table.database != crate::recyclebin::DATABASE && table.zone_map_enabled()
+            })
             .cloned()
             .collect::<Vec<_>>();
         let mut rebuilt = 0u64;
@@ -11073,9 +11482,10 @@ mod zone_map_tests {
     }
 
     #[test]
-    fn zone_map_foreground_dml_drops_growing_filter_and_schedules_rebuild() {
+    fn zone_map_foreground_dml_bounds_growing_filter_and_schedules_rebuild() {
         let map = paged_test_map(1, 64, 99);
-        for value in 0..64 {
+        let mut revoked = false;
+        for value in 0..96 {
             let mut batch = paged_delta(value);
             let zone = batch.zones.get_mut(&0).unwrap();
             zone.row_count_estimate = 1;
@@ -11093,18 +11503,25 @@ mod zone_map_tests {
                     .is_some_and(|membership| membership
                         .may_contain_hash(zone_membership_hash(&ZoneScalar::Signed(value)))));
             } else {
-                // Promotion to a Bloom filter is left to maintenance.
-                assert!(column.membership.is_none(), "value {value}");
+                // Compact promotion and bounded deltas can retain a filter.
+                // After revocation, a partial later delta cannot restore it.
+                if column.membership.is_none() {
+                    revoked = true;
+                }
+                if revoked {
+                    assert!(column.membership.is_none(), "value {value}");
+                }
             }
         }
+        assert!(revoked);
         for map in [&map.map, &map.reopen()] {
             let zone = map.read_zone(0, None).unwrap().unwrap();
-            assert_eq!(zone.row_count_estimate, 64);
+            assert_eq!(zone.row_count_estimate, 96);
             let column = &zone.columns[&7];
             // Bounds keep pruning exactly; only the membership proof is gone.
             assert_eq!(column.state, ZoneMapState::Ready);
             assert_eq!(column.min, Some(ZoneScalar::Signed(0)));
-            assert_eq!(column.max, Some(ZoneScalar::Signed(63)));
+            assert_eq!(column.max, Some(ZoneScalar::Signed(95)));
             assert!(column.membership.is_none());
             let zones = BTreeMap::from([(0, zone)]);
             let required = BTreeSet::from([7]);
@@ -11418,7 +11835,10 @@ mod zone_map_tests {
         }
         let exact = bounds(&db);
         assert_eq!(exact.state, ZoneMapState::Ready);
-        assert_eq!(exact.max, Some(ZoneScalar::Signed(GROWING_ZONE_EXACT_APPENDS as i64)));
+        assert_eq!(
+            exact.max,
+            Some(ZoneScalar::Signed(GROWING_ZONE_EXACT_APPENDS as i64))
+        );
         // Sustained appends into the growing zone defer it to maintenance.
         for value in 1_000..1_100 {
             engine
@@ -11430,7 +11850,9 @@ mod zone_map_tests {
         assert!(db
             .zone_map_candidate_ranges(&table, &predicate(1_099))
             .is_none_or(|ranges| !ranges.is_empty()));
-        let rows = engine.execute("SELECT COUNT(*) FROM t WHERE v = 1099").unwrap();
+        let rows = engine
+            .execute("SELECT COUNT(*) FROM t WHERE v = 1099")
+            .unwrap();
         assert_eq!(format!("{rows:?}").matches("Int(1)").count(), 1, "{rows:?}");
         // Once quiet, maintenance rebuilds exact bounds that cover every row.
         db.set_zone_map_maintenance_quiet_ms_for_tests(0);
@@ -11544,6 +11966,7 @@ mod zone_map_tests {
             column_id: 7,
             op: BinaryOp::Eq,
             query: ZoneScalar::Signed(value),
+            membership_hash: None,
         };
         let key = summary::key(7, Kind::Membership, 0);
         {
@@ -11707,6 +12130,30 @@ mod zone_map_tests {
     }
 
     #[test]
+    fn maintenance_window_has_physical_byte_budget() {
+        for pages in [1, 4, 16, 64, 256, 1024] {
+            let zones = zone_map_maintenance_window(pages);
+            assert!((1..=64).contains(&zones));
+            assert!(zones * u64::from(pages) * PAGE_SIZE as u64 <= ZONE_MAP_MAINTENANCE_SCAN_BYTES);
+        }
+    }
+
+    #[test]
+    fn hot_zone_watch_is_bounded_and_ages_without_a_quiet_period() {
+        let mut watch = HotZoneWatch::new();
+        for zone in 0..64 {
+            assert!(!watch.eligible(zone, 0, false));
+        }
+        assert!(!watch.eligible(64, ZONE_MAP_HOT_ZONE_MAX_WAIT_MS, false));
+        assert!(!watch.eligible(0, ZONE_MAP_HOT_ZONE_MAX_WAIT_MS - 1, false));
+        assert!(watch.eligible(0, ZONE_MAP_HOT_ZONE_MAX_WAIT_MS, false));
+        watch.remove(0);
+        assert!(!watch.eligible(64, ZONE_MAP_HOT_ZONE_MAX_WAIT_MS, false));
+        assert!(watch.eligible(64, ZONE_MAP_HOT_ZONE_MAX_WAIT_MS + 1, true));
+        assert_eq!(watch.entries.iter().flatten().count(), 63);
+    }
+
+    #[test]
     fn maintenance_target_batch_is_bounded() {
         let targets = zone_map_maintenance_targets(
             &BTreeMap::new(),
@@ -11770,11 +12217,23 @@ mod zone_map_tests {
             generated_program: None,
         };
         let prefix = "a".repeat(ZONE_TEXT_PREFIX_BYTES);
-        assert!(!zone_scalar(&column, &Value::String(prefix.clone())).unwrap().was_truncated());
-        assert!(zone_scalar(&column, &Value::String(format!("{prefix}b"))).unwrap().was_truncated());
+        assert!(!zone_scalar(&column, &Value::String(prefix.clone()))
+            .unwrap()
+            .was_truncated());
+        assert!(zone_scalar(&column, &Value::String(format!("{prefix}b")))
+            .unwrap()
+            .was_truncated());
         for value in ["数".repeat(16), "数".repeat(17), "aß".repeat(32)] {
-            let full = crate::charset::collation_key_by_id(crate::charset::collation_id("utf8mb4_0900_ai_ci"), &value);
-            assert_eq!(zone_scalar(&column, &Value::String(value)).unwrap().was_truncated(), full.len() > ZONE_TEXT_PREFIX_BYTES);
+            let full = crate::charset::collation_key_by_id(
+                crate::charset::collation_id("utf8mb4_0900_ai_ci"),
+                &value,
+            );
+            assert_eq!(
+                zone_scalar(&column, &Value::String(value))
+                    .unwrap()
+                    .was_truncated(),
+                full.len() > ZONE_TEXT_PREFIX_BYTES
+            );
         }
 
         let float_column = ColumnSchema {
@@ -12720,6 +13179,114 @@ mod zone_map_tests {
     }
 
     #[test]
+    fn blocked_bloom_fpr_accounts_for_nonuniform_blocks() {
+        let mut words = vec![0; 16];
+        words[..8].fill(u64::MAX);
+        assert_eq!(ZoneMembership::observed_false_positive_rate(&words, 5), 0.5);
+    }
+
+    #[test]
+    fn zone_membership_compacts_after_all_heap_batches_are_merged() {
+        let values = 8000;
+        let layout = ZoneMembershipLayout {
+            words: ZONE_MEMBERSHIP_PAGE_FIT_WORDS,
+            hashes: 5,
+        };
+        let hash = |id| zone_membership_hash_borrowed(6, format!("b{id:020}").as_bytes(), false);
+        let mut summary = ZoneColumnSummary::default();
+        for first in [1, values / 2 + 1] {
+            let mut worker = WorkerColumnState::default();
+            worker.enable_membership_with_layout(layout);
+            for id in first..first + values / 2 {
+                worker.observe_binary_bytes(format!("b{id:020}").as_bytes());
+            }
+            merge_column_summary_into(&mut summary, worker_state_into_summary(worker));
+        }
+        let mut batch = ZoneMapDeltaBatch {
+            storage_id: 1,
+            zone_pages: 64,
+            schema_fingerprint: 1,
+            zones: BTreeMap::new(),
+        };
+        batch.zones.entry(0).or_default().columns.insert(1, summary);
+        compact_rebuilt_memberships(&mut batch);
+        let membership = batch.zones[&0].columns[&1].membership.as_ref().unwrap();
+        assert!((1..=values).all(|id| membership.may_contain_hash(hash(id))));
+        let retained = (values + 1..=values + 20000)
+            .filter(|&id| membership.may_contain_hash(hash(id)))
+            .count();
+        assert!(
+            retained <= 1000,
+            "partial-zone folding raised FPR to {}",
+            retained as f64 / 20000.0
+        );
+    }
+
+    #[test]
+    fn structured_binary_bloom_keeps_fpr_after_compaction() {
+        for values in [256, 2048, 8000] {
+            let layout = ZoneMembershipLayout {
+                words: ((values as usize * 8).div_ceil(512) * 8)
+                    .clamp(8, ZONE_MEMBERSHIP_PAGE_FIT_WORDS),
+                hashes: 5,
+            };
+            let hash =
+                |id| zone_membership_hash_borrowed(6, format!("b{id:020}").as_bytes(), false);
+            let mut membership = ZoneMembership::empty_with_layout(layout);
+            for id in 1..=values {
+                membership.insert_hash(hash(id));
+            }
+            membership.compact_observed_layout();
+            for id in 1..=values {
+                assert!(membership.may_contain_hash(hash(id)));
+            }
+            let false_positives = (values + 1..=values + 20000)
+                .filter(|&id| membership.may_contain_hash(hash(id)))
+                .count();
+            let fpr = false_positives as f64 / 20000.0;
+            assert!(fpr <= 0.05, "values={values}, empirical FPR={fpr}");
+        }
+    }
+
+    #[test]
+    fn periodic_numeric_membership_keeps_wraparound_ranges_selective() {
+        // Repeated numeric runs create overlapping min/max at each wrap.
+        // Extra Bloom probes can correlate with those shared boundary values
+        // even when the average occupancy estimate appears acceptable.
+        let period = 10007u64;
+        let rows_per_zone = 640;
+        let target = 9657;
+        let hash =
+            |value: u64| zone_membership_hash(&ZoneScalar::Float64((value as f64 / 8.0).to_bits()));
+        let layout = ZoneMembershipLayout::for_local_ndv(rows_per_zone);
+        let (mut actual, mut retained) = (0, 0);
+        for first in (1..=1_000_000).step_by(rows_per_zone as usize) {
+            let last = (first + rows_per_zone - 1).min(1_000_000);
+            let (low, high) = (first % period, last % period);
+            let wrapped = last - first != high.wrapping_sub(low);
+            if !wrapped && !(low <= target && target <= high) {
+                continue;
+            }
+            let mut membership = ZoneMembership::empty_with_layout(layout);
+            let mut present = false;
+            for value in first..=last {
+                let value = value % period;
+                present |= value == target;
+                membership.insert_hash(hash(value));
+            }
+            membership.compact_observed_layout();
+            actual += usize::from(present);
+            retained += usize::from(membership.may_contain_hash(hash(target)));
+            assert!(!present || membership.may_contain_hash(hash(target)));
+        }
+        assert_eq!(actual, 99);
+        assert!(
+            retained <= actual + actual / 20,
+            "{retained} ranges for {actual} matches"
+        );
+    }
+
+    #[test]
     fn bloom_recurrence_matches_persisted_double_hash_positions() {
         for words in [
             ZONE_MEMBERSHIP_MIN_BLOOM_WORDS,
@@ -12940,7 +13507,7 @@ mod zone_map_tests {
             hashes: ZONE_MEMBERSHIP_PROVISIONAL_BLOOM_HASHES,
         };
         let final_layout = ZoneMembershipLayout {
-            words: ZONE_MEMBERSHIP_MIN_BLOOM_WORDS,
+            words: 128,
             hashes: ZONE_MEMBERSHIP_DEFAULT_BLOOM_HASHES,
         };
         let mut membership = ZoneMembership::empty_with_layout(provisional);
@@ -13421,8 +13988,14 @@ mod zone_map_tests {
     fn zone_text_prefix_obeys_collation_pad_attribute() {
         let no_pad = crate::charset::collation_id("utf8mb4_0900_ai_ci");
         let pad_space = crate::charset::collation_id("utf8mb4_general_ci");
-        assert_ne!(zone_text_weight("value ", no_pad), zone_text_weight("value", no_pad));
-        assert_eq!(zone_text_weight("value ", pad_space), zone_text_weight("value", pad_space));
+        assert_ne!(
+            zone_text_weight("value ", no_pad),
+            zone_text_weight("value", no_pad)
+        );
+        assert_eq!(
+            zone_text_weight("value ", pad_space),
+            zone_text_weight("value", pad_space)
+        );
     }
 
     #[test]

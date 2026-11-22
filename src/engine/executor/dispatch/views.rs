@@ -280,7 +280,7 @@ fn expand_views_in_select(
             Err(err) if err.is(crate::error::catalog::ER_NON_UPDATABLE_TABLE) => None,
             Err(err) => return Err(err),
         };
-        if let Some(mut plan) = plan {
+        if let Some(mut plan) = plan.filter(|p| p.read_expressions.is_empty()) {
             // Bind against the view before replacing its namespace with the
             // base table. In particular, correlated subqueries must not gain
             // access to base columns through outer-scope fallback.
@@ -1400,14 +1400,26 @@ fn simple_updatable_view_shape(
     if !wildcard && select.projection.len() != columns.len() {
         return Err("projection length mismatch");
     }
-    for item in &select.projection {
-        let PSelectItem::Expr { expr, .. } = item else {
-            continue;
-        };
-        match expr {
-            PExpr::Identifier(_) | PExpr::CompoundIdentifier(_) => {}
-            _ => return Err("expression column"),
+    if select_projection_has_aggregate(&select.projection) {
+        return Err("aggregate projection");
+    }
+    let mut unsupported = false;
+    struct ProjectionShape<'a>(&'a mut bool);
+    impl crate::parser::visit::AstVisitor for ProjectionShape<'_> {
+        fn enter_expr(&mut self, expr: &Expr) {
+            *self.0 |= matches!(expr, Expr::WindowFunction { .. });
         }
+    }
+    let mut has_direct = wildcard;
+    for item in &select.projection {
+        if let PSelectItem::Expr { expr, .. } = item {
+            has_direct |= matches!(expr, PExpr::Identifier(_) | PExpr::CompoundIdentifier(_));
+            unsupported |= super::super::prepared_dml::expr_contains_subquery(expr);
+            crate::parser::visit::visit_expr(&mut ProjectionShape(&mut unsupported), expr);
+        }
+    }
+    if unsupported || !has_direct {
+        return Err("projection has no writable row provenance");
     }
     let source = &select.from[0].name;
     if db.is_base_table(current_database, source) {
@@ -2104,6 +2116,7 @@ struct UpdatablePlan {
     /// (`database.table`).
     base_qualified: String,
     column_map: std::collections::HashMap<String, String>,
+    read_expressions: std::collections::HashMap<String, Expr>,
     insert_columns: Vec<String>,
     /// View-visible name and final base-column name in view declaration order.
     returning_columns: Vec<(String, String)>,
@@ -2114,8 +2127,8 @@ struct UpdatablePlan {
     /// Predicate evaluated against INSERT/UPDATE post-images when one
     /// or more views in the chain have WITH CHECK OPTION.
     check_predicate: Option<Expr>,
-    /// Public error identity for DEFINER failures; never expose the base table.
-    definer_view_name: Option<String>,
+    /// Public error identity for view authorization failures.
+    view_name: Option<String>,
     /// Account whose privileges authorize DML against the final base table.
     auth_context: crate::engine::auth::AuthorizationContext,
 }
@@ -2178,6 +2191,7 @@ fn resolve_updatable_view_schema(
             "projection length does not match stored view column metadata",
         ));
     }
+    let mut read_expressions = std::collections::HashMap::new();
     let mut direct_columns = Vec::with_capacity(body.projection.len());
     for (item, col) in body.projection.iter().zip(view.columns.iter()) {
         let PSelectItem::Expr { expr, alias } = item else {
@@ -2186,7 +2200,10 @@ fn resolve_updatable_view_schema(
         let referenced_name = match expr {
             PExpr::Identifier(n) => n.clone(),
             PExpr::CompoundIdentifier(parts) => parts.last().cloned().unwrap_or_default(),
-            _ => return Err(reject("expression column")),
+            _ => {
+                read_expressions.insert(col.name.to_ascii_lowercase(), expr.clone());
+                continue;
+            }
         };
         // Visible name = alias if any, else the column name. It must
         // match the stored view metadata; DML callers are remapped from
@@ -2202,6 +2219,9 @@ fn resolve_updatable_view_schema(
         let inner_account =
             effective_view_security_account(db, session, &inner_view, Some(&effective_account))?;
         let inner = resolve_updatable_view_schema(db, session, inner_view, inner_account, trail)?;
+        for expr in read_expressions.values_mut() {
+            remap_view_read_expression(expr, &inner.column_map, &inner.read_expressions)?;
+        }
         let mut column_map = std::collections::HashMap::new();
         let mut insert_columns = Vec::with_capacity(direct_columns.len());
         let mut returning_columns = Vec::with_capacity(direct_columns.len());
@@ -2211,6 +2231,10 @@ fn resolve_updatable_view_schema(
                 .get(&inner_name.to_ascii_lowercase())
                 .cloned()
             else {
+                if let Some(expr) = inner.read_expressions.get(&inner_name.to_ascii_lowercase()) {
+                    read_expressions.insert(visible_name.to_ascii_lowercase(), expr.clone());
+                    continue;
+                }
                 return Err(reject("view column does not map through nested view"));
             };
             column_map.insert(visible_name.to_ascii_lowercase(), base_name.clone());
@@ -2229,7 +2253,7 @@ fn resolve_updatable_view_schema(
                     &inner.column_map,
                 )?;
             } else {
-                rewrite_expr_view_columns(predicate, &inner.column_map)?;
+                remap_view_read_expression(predicate, &inner.column_map, &inner.read_expressions)?;
             }
         }
         let view_predicate = and_where(inner.view_predicate.clone(), current_predicate.clone());
@@ -2243,12 +2267,12 @@ fn resolve_updatable_view_schema(
         return Ok(UpdatablePlan {
             base_qualified: inner.base_qualified,
             column_map,
+            read_expressions,
             insert_columns,
             returning_columns,
             view_predicate,
             check_predicate,
-            definer_view_name: (view.security_type == RoutineSecuritySchema::Definer)
-                .then(|| format!("{}.{}", view.database, view.name)),
+            view_name: Some(format!("{}.{}", view.database, view.name)),
             auth_context: inner.auth_context,
         });
     }
@@ -2290,12 +2314,12 @@ fn resolve_updatable_view_schema(
     Ok(UpdatablePlan {
         base_qualified,
         column_map,
+        read_expressions,
         insert_columns,
         returning_columns,
         view_predicate: body.selection.clone(),
         check_predicate,
-        definer_view_name: (view.security_type == RoutineSecuritySchema::Definer)
-            .then(|| format!("{}.{}", view.database, view.name)),
+        view_name: Some(format!("{}.{}", view.database, view.name)),
         auth_context: effective_account,
     })
 }
@@ -2351,7 +2375,7 @@ fn authorize_updatable_view_base_privilege(
     let auth = db.auth_catalog();
     if auth.account_has_privilege(&ctx, &required, false) {
         Ok(())
-    } else if let Some(view) = &plan.definer_view_name {
+    } else if let Some(view) = &plan.view_name {
         Err(error(crate::error::catalog::ER_VIEW_INVALID,
             format!("View '{view}' references invalid table(s) or column(s) or definer/invoker of view lack rights to use them")))
     } else {
@@ -2556,12 +2580,12 @@ fn resolve_insert_view(
     Ok(Some(UpdatablePlan {
         base_qualified,
         column_map,
+        read_expressions: Default::default(),
         returning_columns,
         insert_columns,
         check_predicate,
         view_predicate: None,
-        definer_view_name: (view.security_type == RoutineSecuritySchema::Definer)
-            .then(|| format!("{}.{}", view.database, view.name)),
+        view_name: Some(format!("{}.{}", view.database, view.name)),
         auth_context,
     }))
 }
@@ -2582,6 +2606,31 @@ pub(in crate::engine::executor) fn rewrite_insert_through_view(
             stmt.target_alias.as_deref(),
             assignments.iter().map(|a| &a.value),
         )?;
+    }
+    if stmt.columns.is_none() && !plan.read_expressions.is_empty() {
+        return Err(non_writable_view_column(
+            plan.read_expressions.keys().min().unwrap(),
+        ));
+    }
+    if let Some(columns) = &stmt.columns {
+        for name in columns {
+            if plan
+                .read_expressions
+                .contains_key(&name.to_ascii_lowercase())
+            {
+                return Err(non_writable_view_column(name));
+            }
+        }
+    }
+    if let Some(assignments) = &stmt.on_duplicate_key_update {
+        for assignment in assignments {
+            if plan
+                .read_expressions
+                .contains_key(&assignment.column.to_ascii_lowercase())
+            {
+                return Err(non_writable_view_column(&assignment.column));
+            }
+        }
     }
     rewrite_returning_through_view(&mut stmt.returning, &plan)?;
     authorize_updatable_view_base_privilege(db, session, &plan, Privilege::Insert)?;
@@ -2610,7 +2659,11 @@ pub(in crate::engine::executor) fn rewrite_insert_through_view(
         }
     }
     stmt.view_check_predicate = and_where(stmt.view_check_predicate, plan.check_predicate.clone());
-    let _ = plan.view_predicate;
+    if stmt.replace {
+        authorize_updatable_view_base_privilege(db, session, &plan, Privilege::Delete)?;
+        stmt.view_replace_predicate =
+            and_where(stmt.view_replace_predicate, plan.view_predicate.clone());
+    }
     stmt.table = plan.base_qualified;
     Ok(stmt)
 }
@@ -2780,7 +2833,7 @@ impl crate::parser::visit::AstVisitorMut for ViewDmlRewriter<'_> {
     fn exit_select_alias_scope(&mut self) {
         self.aliases.pop();
     }
-    fn enter_expr(&mut self, expr: &mut Expr) {
+    fn exit_expr(&mut self, expr: &mut Expr) {
         if self.result.is_err() {
             return;
         }
@@ -2921,20 +2974,78 @@ fn rewrite_view_update_delete(
     // its presence duplicated work on every simple view UPDATE/DELETE.
     let plans = refs
         .iter()
-        .map(|reference| resolve_updatable_view(db, session, &reference.name))
+        .enumerate()
+        .map(|(index, reference)| {
+            let (database, name) =
+                crate::storage::split_table_name(&session.current_database, &reference.name);
+            let alias = reference.alias.as_deref().unwrap_or(&name);
+            let matches = |qualifier: &str| {
+                qualifier.eq_ignore_ascii_case(alias)
+                    || (reference.alias.is_none()
+                        && qualifier.eq_ignore_ascii_case(&format!("{database}.{name}")))
+            };
+            let writes = match &statement {
+                Statement::Update(stmt) => stmt.assignments.iter().any(|a| {
+                    a.table_qualifier.as_deref().map_or_else(
+                        || {
+                            // Resolve unqualified targets against the original namespaces.
+                            refs.len() == 1
+                                || db.view_definition(&database, &name).is_some_and(|v| {
+                                    v.columns
+                                        .iter()
+                                        .any(|c| c.name.eq_ignore_ascii_case(&a.column))
+                                })
+                                || db
+                                    .table_in_database(&database, &name)
+                                    .is_ok_and(|t| t.column_index(&a.column).is_ok())
+                        },
+                        matches,
+                    )
+                }),
+                Statement::Delete(stmt) => {
+                    if stmt.targets.is_empty() {
+                        index == 0
+                    } else {
+                        stmt.targets.iter().any(|target| matches(target))
+                    }
+                }
+                _ => unreachable!(),
+            };
+            if writes {
+                resolve_updatable_view(db, session, &reference.name)
+            } else {
+                Ok(None)
+            }
+        })
         .collect::<Result<Vec<_>, _>>()?;
     if plans.iter().all(Option::is_none) {
         return Ok(statement);
     }
     let mut bindings = Vec::with_capacity(refs.len());
     for (reference, plan) in refs.iter().zip(&plans) {
-        bindings.push(view_dml_binding(
+        let mut binding = view_dml_binding(
             db,
             session,
             reference,
             None,
             plan.as_ref().map(|p| p.column_map.clone()),
-        )?);
+        )?;
+        if let Some(plan) = plan {
+            if !plan.read_expressions.is_empty() {
+                let mut expressions = plan.read_expressions.clone();
+                for (name, base) in &plan.column_map {
+                    expressions.insert(name.clone(), Expr::Identifier(base.clone()));
+                }
+                for expr in expressions.values_mut() {
+                    let mut predicate = Some(expr.clone());
+                    qualify_view_predicate(&mut predicate, &binding.alias);
+                    *expr = predicate.unwrap();
+                }
+                binding.columns.extend(expressions.keys().cloned());
+                binding.expressions = Some(expressions);
+            }
+        }
+        bindings.push(binding);
     }
     let mut rewriter = ViewDmlRewriter {
         db,
@@ -2945,6 +3056,22 @@ fn rewrite_view_update_delete(
     };
     if let Statement::Update(s) = &mut statement {
         for assignment in &mut s.assignments {
+            for (index, plan) in plans.iter().enumerate() {
+                if let Some(plan) = plan {
+                    if plan
+                        .read_expressions
+                        .contains_key(&assignment.column.to_ascii_lowercase())
+                        && assignment.table_qualifier.as_ref().is_none_or(|q| {
+                            rewriter.scopes[0][index]
+                                .names
+                                .iter()
+                                .any(|name| name.eq_ignore_ascii_case(q))
+                        })
+                    {
+                        return Err(non_writable_view_column(&assignment.column));
+                    }
+                }
+            }
             let mut expr = if let Some(q) = &assignment.table_qualifier {
                 Expr::CompoundIdentifier(vec![q.clone(), assignment.column.clone()])
             } else {
@@ -3312,7 +3439,13 @@ pub(in crate::engine::executor) fn rewrite_update_through_view(
         .filter(|view| !view.invalid)
     {
         let body = stored_view_query(&view)?;
-        if !body.joins.is_empty() {
+        if !body.joins.is_empty()
+            && stmt.assignments.iter().any(|a| {
+                a.table_qualifier.as_ref().is_none_or(|q| {
+                    q.eq_ignore_ascii_case(stmt.primary_alias.as_deref().unwrap_or(&view.name))
+                })
+            })
+        {
             return rewrite_join_view_update(db, session, stmt, &view, body);
         }
     }
@@ -3340,7 +3473,12 @@ pub(in crate::engine::executor) fn rewrite_delete_through_view(
         .view_definition(&session.current_database, &stmt.table)
         .filter(|view| !view.invalid)
     {
-        if !stored_view_query(&view)?.joins.is_empty() {
+        if !stored_view_query(&view)?.joins.is_empty()
+            && (stmt.targets.is_empty()
+                || stmt.targets.iter().any(|target| {
+                    target.eq_ignore_ascii_case(stmt.primary_alias.as_deref().unwrap_or(&view.name))
+                }))
+        {
             return Err(error(
                 crate::error::catalog::ER_VIEW_DELETE_MERGE_VIEW,
                 format!(
@@ -3361,6 +3499,13 @@ fn rewrite_returning_through_view(
     returning: &mut Option<crate::parser::ReturningClause>,
     plan: &UpdatablePlan,
 ) -> Result<(), QueryError> {
+    if returning.is_some() && !plan.read_expressions.is_empty() {
+        return Err(error(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "RETURNING through a view with computed columns is not supported",
+        ));
+    }
+
     let Some(returning) = returning else {
         return Ok(());
     };
@@ -3438,6 +3583,49 @@ fn validate_view_dml_subqueries<'a>(
     expand_views_in_select(db, session, &mut select, 0, &mut ViewTrail::new())?;
     crate::engine::executor::qualification::qualify_select_tables(db, session, &mut select)?;
     crate::planner::validate_select_column_references(db, &select)
+}
+
+fn non_writable_view_column(name: &str) -> QueryError {
+    error(
+        crate::error::catalog::ER_NONUPDATEABLE_COLUMN,
+        format!("Column '{name}' is not updatable"),
+    )
+}
+
+fn remap_view_read_expression(
+    expr: &mut Expr,
+    columns: &std::collections::HashMap<String, String>,
+    expressions: &std::collections::HashMap<String, Expr>,
+) -> Result<(), QueryError> {
+    struct Remap<'a> {
+        columns: &'a std::collections::HashMap<String, String>,
+        expressions: &'a std::collections::HashMap<String, Expr>,
+        error: Option<QueryError>,
+    }
+    impl crate::parser::visit::AstVisitorMut for Remap<'_> {
+        fn exit_expr(&mut self, expr: &mut Expr) {
+            let name = match expr {
+                Expr::Identifier(name) => name.clone(),
+                Expr::CompoundIdentifier(parts) => parts.last().cloned().unwrap_or_default(),
+                _ => return,
+            };
+            if let Some(replacement) = self.expressions.get(&name.to_ascii_lowercase()) {
+                *expr = replacement.clone();
+            } else {
+                match mapped_view_column(self.columns, &name) {
+                    Ok(base) => *expr = Expr::Identifier(base),
+                    Err(err) => self.error = Some(err),
+                }
+            }
+        }
+    }
+    let mut visitor = Remap {
+        columns,
+        expressions,
+        error: None,
+    };
+    crate::parser::visit::visit_expr_mut(&mut visitor, expr);
+    visitor.error.map_or(Ok(()), Err)
 }
 
 fn mapped_view_column(

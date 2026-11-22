@@ -2536,3 +2536,81 @@ fn spatial_index_backup_restore_and_immutable_queries_keep_tree_pages() {
     drop(backup);
     discard_source(source, coordinator);
 }
+
+#[test]
+fn fulltext_seal_and_pitr_preserve_source_commit_history() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source
+        .execute("SET GLOBAL mydb_undo_retention_ms=600000")
+        .unwrap();
+    for ddl in [
+        "CREATE TABLE docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))",
+        "CREATE TABLE empty_docs(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body))",
+        "CREATE TABLE parts(id INT PRIMARY KEY,body TEXT,FULLTEXT KEY ft(body) WHERE id>1) PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(10),PARTITION p1 VALUES LESS THAN MAXVALUE)",
+    ] {
+        source.execute(ddl).unwrap();
+    }
+    for table in ["docs", "parts"] {
+        source.execute(&format!("INSERT INTO {table} VALUES(1,'database guide'),(2,'database history'),(20,'other words')")).unwrap();
+    }
+    let score_sql = "SELECT id,MATCH(body) AGAINST('database') FROM docs ORDER BY id";
+    let base_scores = rows(&source, score_sql);
+    let coordinator = Coordinator::get(source.db_handle()).unwrap();
+    let repository = root.path().join("repository");
+    coordinator
+        .configure(&repository, Policy::Manual, false, None)
+        .unwrap();
+    let base = job(&coordinator, coordinator.backup(&repository).unwrap())
+        .base_id
+        .unwrap();
+    let ledger = "system/commit-ledger.v1";
+    let base_data = repository.join("bases").join(&base).join("data");
+    assert_eq!(
+        fs::read(base_data.join(ledger)).unwrap(),
+        fs::read(source.db_handle().data_dir().join(ledger)).unwrap(),
+        "sealing must not introduce local commits into source history"
+    );
+    for sql in [
+        "UPDATE docs SET body='other words' WHERE id=1",
+        "INSERT INTO docs VALUES(3,'database database')",
+        "INSERT INTO empty_docs VALUES(1,'database first')",
+        "UPDATE parts SET body='database changed' WHERE id=20",
+    ] {
+        source.execute(sql).unwrap();
+    }
+    let expected = [score_sql, "SELECT id,MATCH(body) AGAINST('database') FROM empty_docs ORDER BY id", "SELECT id,MATCH(body) AGAINST('database') FROM parts WHERE MATCH(body) AGAINST('database') ORDER BY id"]
+        .map(|sql| (sql, rows(&source, sql)));
+    job(&coordinator, coordinator.backup_wal(&repository).unwrap());
+    let target = root.path().join("restored");
+    super::restore::restore(
+        &repository,
+        Some(&base),
+        None,
+        Target::Latest,
+        &target,
+        None,
+        false,
+    )
+    .unwrap();
+    for _ in 0..2 {
+        let restored = engine(&target);
+        for (sql, expected) in &expected {
+            assert_eq!(rows(&restored, sql), *expected, "{sql}");
+        }
+        restored.shutdown().unwrap();
+    }
+    let runtime = root.path().join("runtime");
+    let reader = super::open_base(&repository, &base, &runtime).unwrap();
+    let backup = StorageQueryEngine::open_backup_image(
+        reader.data_dir.clone(),
+        runtime,
+        Default::default(),
+        Arc::new(crate::engine::session_registry::SessionRegistry::new()),
+        vec![],
+    )
+    .unwrap();
+    assert_eq!(rows(&backup, score_sql), base_scores);
+    backup.shutdown().unwrap();
+    discard_source(source, coordinator);
+}

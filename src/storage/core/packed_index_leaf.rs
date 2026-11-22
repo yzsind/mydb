@@ -1897,7 +1897,7 @@ mod packed_leaf_tree_tests {
                 },
             })
             .collect();
-        index.apply_batch_deferred(2, removals).unwrap();
+        index.apply_batch_deferred(2, removals, None).unwrap();
 
         let incoming: Vec<_> = (100..47_900u32)
             .step_by(751)
@@ -1913,7 +1913,7 @@ mod packed_leaf_tree_tests {
             })
             .collect();
         index
-            .insert_batch_deferred(888, incoming.clone(), false)
+            .insert_batch_deferred(888, incoming.clone(), false, None)
             .unwrap();
         let dirty_native = || {
             index
@@ -1961,7 +1961,7 @@ mod packed_leaf_tree_tests {
             "native point reads must not force encoding"
         );
         for (key, row_id) in incoming.iter().step_by(3) {
-            index.delete_deferred(889, key.clone(), *row_id).unwrap();
+            index.delete_deferred(889, key.clone(), *row_id, None).unwrap();
             assert!(index.get(key, true).unwrap().is_empty());
         }
         index.flush().unwrap();

@@ -21,6 +21,8 @@ connection, are distinct from server errors.
 
 SQL `SIGNAL` and `RESIGNAL` can supply runtime diagnostics. They require a
 valid non-success SQLSTATE and, when supplied, a non-zero MySQL error number.
+Sequence creation and lookup use the standard relation errors 1050 and 1146;
+their messages identify the sequence by name.
 
 ## MYDB Reserved Range
 

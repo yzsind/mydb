@@ -27,7 +27,8 @@ pub(in crate::storage::core) fn encode_bounds(
 ) -> Result<Vec<u8>, QueryError> {
     let flags = u8::from(summary.has_null)
         | (u8::from(summary.has_non_null) << 1)
-        | (u8::from(summary.truncated) << 2);
+        | (u8::from(summary.truncated) << 2)
+        | (u8::from(summary.order_unsupported) << 3);
     let mut bytes = vec![RECORD_VERSION, zone_state_tag(summary.state), flags, 0];
     put_zone_scalar_v2(&mut bytes, summary.min.as_ref())
         .ok_or_else(|| corrupt("invalid minimum"))?;
@@ -42,7 +43,7 @@ pub(in crate::storage::core) fn decode_bounds(
     if bytes.len() < 6
         || bytes.len() > PAGE_SIZE - HEADER - SLOT
         || bytes[0] != RECORD_VERSION
-        || bytes[2] & !7 != 0
+        || bytes[2] & !15 != 0
         || bytes[3] != 0
     {
         return Err(corrupt("invalid bounds header"));
@@ -51,6 +52,7 @@ pub(in crate::storage::core) fn decode_bounds(
     let summary = ZoneColumnSummary {
         state: zone_state_from_tag(bytes[1]).ok_or_else(|| corrupt("invalid bounds state"))?,
         durable_unknown: false,
+        order_unsupported: bytes[2] & 8 != 0,
         has_null: bytes[2] & 1 != 0,
         has_non_null: bytes[2] & 2 != 0,
         truncated: bytes[2] & 4 != 0,
@@ -58,6 +60,9 @@ pub(in crate::storage::core) fn decode_bounds(
         max: read_zone_scalar_v2(&mut reader).ok_or_else(|| corrupt("invalid maximum"))?,
         membership: None,
     };
+    if summary.order_unsupported && summary.state != ZoneMapState::Unknown {
+        return Err(corrupt("unsupported order on a usable bounds record"));
+    }
     // Scalar readers validate fixed tags, canonical varints and Boolean
     // flags directly. Only Decimal has a normalized representation requiring
     // a round trip; integer/range probes avoid an encoding allocation.
@@ -512,7 +517,7 @@ impl<'a> Reader<'a> {
                         bounds[index]
                             .as_ref()
                             .expect("membership requested for decoded bounds"),
-                        |query| view.probe(zone_membership_hash(query)),
+                        |hash| view.probe(hash),
                     ) {
                         retained &= !bit;
                     }
@@ -555,15 +560,16 @@ impl<'a> Reader<'a> {
                 bytes.map(decode_bounds).transpose()
             });
             match bounds {
-                Ok(Some(summary)) => leaf.column_may_match(&summary, |query| {
+                Ok(Some(summary)) => leaf.column_may_match(&summary, |hash| {
                     match self.get(key(column, Kind::Membership, zone), |bytes| {
                         if let Some(bytes) = bytes {
                             inspected_bytes
                                 .set(inspected_bytes.get().saturating_add(bytes.len() as u64));
                         }
-                        bytes.map(MembershipView::open).transpose().map(|view| {
-                            view.and_then(|view| view.probe(zone_membership_hash(query)))
-                        })
+                        bytes
+                            .map(MembershipView::open)
+                            .transpose()
+                            .map(|view| view.and_then(|view| view.probe(hash)))
                     }) {
                         Ok(result) => result,
                         Err(err) => {
@@ -760,6 +766,7 @@ mod tests {
         pool.flush_and_evict_all().unwrap();
         let reader = Reader::open(&file, 99, 64, u64::MAX).unwrap();
         let impossible_now = ZonePredicateProgram::Compare {
+            membership_hash: None,
             column_id: 0,
             op: crate::parser::BinaryOp::Eq,
             query: ZoneScalar::Signed(-1),
@@ -785,6 +792,7 @@ mod tests {
                 crate::parser::BinaryOp::GtEq,
             ] {
                 let predicate = ZonePredicateProgram::Compare {
+                    membership_hash: None,
                     column_id: 0,
                     op,
                     query: ZoneScalar::Signed(query),
@@ -819,6 +827,7 @@ mod tests {
         };
         assert!(reader.may_match(0, &bounds_only).unwrap());
         let equality = ZonePredicateProgram::Compare {
+            membership_hash: None,
             column_id: 2,
             op: crate::parser::BinaryOp::Eq,
             query: ZoneScalar::Signed(50),
@@ -848,6 +857,7 @@ mod tests {
             "bounded range reads must amortize page access: {batch_hits} versus {point_hits}"
         );
         let eq = |value| ZonePredicateProgram::Compare {
+            membership_hash: None,
             column_id: 0,
             op: crate::parser::BinaryOp::Eq,
             query: ZoneScalar::Signed(value),
@@ -873,6 +883,7 @@ mod tests {
             },
             ZonePredicateProgram::NullSafeNull { column_id: 0 },
             ZonePredicateProgram::InList {
+                membership_hashes: vec![None; 3],
                 column_id: 0,
                 values: vec![
                     ZoneScalar::Signed(-1),

@@ -364,16 +364,7 @@ impl Database {
         if !has_forced_external && Self::row_lobs_stay_inline(codec, values) {
             return Ok((Vec::new(), Vec::new()));
         }
-        let is_lob_col = |i: usize| {
-            matches!(
-                codec.columns[i].kind,
-                ColumnKind::VarString
-                    | ColumnKind::VarBytes
-                    | ColumnKind::Json
-                    | ColumnKind::Geometry
-                    | ColumnKind::Vector { .. }
-            )
-        };
+        let is_lob_col = |i: usize| column_kind_can_externalize(&codec.columns[i].kind);
         let lob_byte_len = |i: usize| match &values[i] {
             Value::Bytes(b) => b.len(),
             Value::String(s) => s.len(),
@@ -970,6 +961,7 @@ impl Database {
                 }
                 if need_batch_unique_keys {
                     for (slot, index) in unique_indexes.iter().enumerate() {
+                        if !table.index_contains_row(index, &values)? { continue; }
                         let key = table.index_key(index, &values)?;
                         if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary
                         {
@@ -1043,6 +1035,17 @@ impl Database {
                         .enumerate()
                         .filter(|(_, index)| index.enforces_uniqueness())
                     {
+                        if index.predicate.is_some() {
+                            let mut seen = crate::util::fast_hash::ah_hash_set();
+                            for values in &prepared_rows {
+                                if !table.index_contains_row(index, values)? { continue; }
+                                let key = table.index_key(index, values)?;
+                                if key.0.iter().any(|p| matches!(p, KeyPart::Null)) { continue; }
+                                if !seen.insert(key.clone()) { return Err(duplicate_entry_error(&table, index, &key)); }
+                                self.check_unique_constraint(&table, txn, None, index, key)?;
+                            }
+                            continue;
+                        }
                         let key = match scalar_keys.as_ref() {
                             Some(keys) => keys.key(0, position).clone(),
                             None => table.index_key(index, &prepared_rows[0])?,
@@ -1162,7 +1165,7 @@ impl Database {
                     )?;
                 }
             }
-            self.defer_vector_insert_batch(
+            self.maintain_row_insert_batch(
                 txn.txn_id,
                 &table,
                 table.id,
@@ -1264,6 +1267,7 @@ impl Database {
                     .iter()
                     .filter(|index| index.enforces_uniqueness() && !skip_unique_check)
                 {
+                    if !table.index_contains_row(index, &values)? { continue; }
                     let key = table.index_key(index, &values)?;
                     if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                         continue;
@@ -1452,13 +1456,16 @@ impl Database {
                 // index_name); RowIds are only unique within one
                 // partition, so each partition has its own graph.
                 if mode == BulkInsertMode::User {
-                    self.defer_vector_insert_batch(
+                    self.maintain_row_insert_batch(
                         txn.txn_id,
                         table,
                         storage_id,
                         &group_values,
                         &inserted,
                     )?;
+                } else {
+                    self.maintain_fulltext_statistics(txn.txn_id, table, storage_id,
+                        group_values.iter().map(|row| (None, Some(row.as_slice()))))?;
                 }
                 for (orig, rid) in group_orig.iter().zip(inserted.iter()) {
                     row_ids[*orig] = *rid;
@@ -1613,6 +1620,7 @@ impl Database {
                         .iter()
                         .filter(|index| index.enforces_uniqueness())
                     {
+                        if !table.index_contains_row(index, &values)? { continue; }
                         let key = table.index_key(index, &values)?;
                         if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary
                         {
@@ -1705,13 +1713,16 @@ impl Database {
                 &inserted,
             )?;
             if mode == BulkInsertMode::User {
-                self.defer_vector_insert_batch(
+                self.maintain_row_insert_batch(
                     txn.txn_id,
                     &table,
                     table.id,
                     &prepared_rows,
                     &inserted,
                 )?;
+            } else {
+                self.maintain_fulltext_statistics(txn.txn_id, &table, table.id,
+                    prepared_rows.iter().map(|row| (None, Some(row.as_slice()))))?;
             }
             row_ids.extend(inserted);
             // Foreign-key child-side existence check runs *after* the batch
@@ -1799,6 +1810,9 @@ impl Database {
         self.acquire_table_write_binding(txn.txn_id, &table)?;
         let result = (|| {
             self.preflight_insert_undo_admission(table.id, payloads.len())?;
+            let fulltext_rows = if table.indexes.iter().any(|index| index.is_fulltext()) {
+                Some(payloads.iter().map(|payload| decode_row_schema_ext_for_layout(payload, &table.row_codec, table.row_codec.active_layout_id, false)).collect::<Result<Vec<_>, _>>()?)
+            } else { None };
             let inserted = self.with_heap_mut(table.id, |heap| {
                 heap.insert_mvcc_batch_pre_encoded(txn.txn_id, payloads)
             })?;
@@ -1815,6 +1829,9 @@ impl Database {
                 self.dml_stats
                     .record_rollback_inserted_rows(inserted.len() as u64);
                 return Err(err);
+            }
+            if let Some(rows) = &fulltext_rows {
+                self.maintain_fulltext_statistics(txn.txn_id, &table, table.id, rows.iter().map(|row| (None, Some(row.as_slice()))))?;
             }
             self.record_alter_copy_touched_rows(
                 txn.txn_id,
@@ -1916,6 +1933,7 @@ impl Database {
                     .record_rollback_inserted_rows(inserted.len() as u64);
                 return Err(err);
             }
+            self.maintain_fulltext_statistics(txn.txn_id, &table, table.id, prepared_rows.iter().map(|row| (None, Some(row.as_slice()))))?;
             self.record_alter_copy_touched_rows(
                 txn.txn_id,
                 table.id,
@@ -2220,9 +2238,10 @@ impl Database {
                     let mut pending = Vec::new();
                     let mut duplicate = None;
                     for (set_pos, (_, index)) in batch_unique_indexes.iter().enumerate() {
+                        if !table.index_contains_row(index, &new_values)? { pending.push((set_pos, None)); continue; }
                         let key = table.index_key(index, &new_values)?;
-                        let old_key = table.stored_index_key(index, base_values)?;
-                        if key == old_key {
+                        let old_key = table.index_contains_row(index, base_values)?.then(|| table.stored_index_key(index, base_values)).transpose()?;
+                        if old_key.as_ref() == Some(&key) {
                             continue;
                         }
                         if !index.primary && key.0.iter().any(|part| matches!(part, KeyPart::Null))
@@ -2492,17 +2511,12 @@ impl Database {
             // a permanent tombstone. One statement is an atomic rollback unit,
             // therefore its final undo head is a valid reachability marker for
             // every row changed by this batch.
-            if let Some(vector_undo_id) = self.deferred_ann_undo_head(txn.txn_id, &table)? {
+            if let Some(vector_undo_id) = self.row_derivatives_undo_head(txn.txn_id, &table)? {
+                self.maintain_fulltext_statistics(txn.txn_id, &table, table.id,
+                    updates.iter().map(|update| (Some(update.old_values.as_slice()), Some(update.new_values.as_slice()))))?;
                 for update in &updates {
-                    self.defer_vector_update(
-                        txn.txn_id,
-                        vector_undo_id,
-                        &table,
-                        update.row_id,
-                        table.id,
-                        Some(&update.old_values),
-                        &update.new_values,
-                    )?;
+                    self.defer_vector_update(txn.txn_id, vector_undo_id, &table,
+                        update.row_id, table.id, Some(&update.old_values), &update.new_values)?;
                 }
             }
             // B7 — batch the per-row AI cache hook into a single
@@ -2751,6 +2765,12 @@ impl Database {
             .collect::<Vec<_>>();
         self.note_zone_map_deletes(txn.txn_id, table.id, &deleted_row_ids)?;
         self.delete_index_batches_deferred(txn.txn_id, &table, &deletes)?;
+        self.maintain_fulltext_statistics(
+            txn.txn_id,
+            &table,
+            table.id,
+            deletes.iter().map(|delete| (Some(delete.values.as_slice()), None)),
+        )?;
         // Graph tombstones are commit-deferred: unlike the heap/index paths
         // they have no MVCC undo, so applying one here would survive ROLLBACK.
         if let Some(undo_ids) = vector_undo_ids {
@@ -2944,14 +2964,14 @@ impl Database {
                 heap.try_write_mvcc_tombstone(txn.txn_id, row_id, header)
             })?;
             if !patched {
-                self.publish_wal_before_eager_heap_write(txn.txn_id)?;
+                self.publish_wal_before_eager_write(txn.txn_id)?;
                 self.with_heap_mut(storage_id, |heap| {
                     heap.write_mvcc(txn.txn_id, row_id, header, &stored_values)
                 })?;
             }
             self.note_zone_map_deletes(txn.txn_id, storage_id, &[row_id])?;
             self.delete_indexes_deferred_at(txn.txn_id, storage_id, table, index_values, row_id)?;
-            self.defer_vector_delete(txn.txn_id, undo_id, table, index_values, row_id, storage_id)?;
+            self.maintain_row_delete(txn.txn_id, undo_id, table, index_values, row_id, storage_id)?;
             self.record_alter_copy_touched_rows(
                 txn.txn_id,
                 table.id,
@@ -4006,7 +4026,7 @@ impl Database {
                     &reuse_mask,
                 )?;
                 let write_result = self
-                    .publish_wal_before_eager_heap_write(txn.txn_id)
+                    .publish_wal_before_eager_write(txn.txn_id)
                     .and_then(|_| {
                         self.with_heap_mut(storage_id, |heap| {
                             heap.write_mvcc_ext(
@@ -4047,8 +4067,8 @@ impl Database {
             )?;
             // Publish the derived ANN replacement only after commit. The heap
             // undo record is the lifetime marker used by savepoint pruning.
-            if let Some(vector_undo_id) = self.deferred_ann_undo_head(txn.txn_id, table)? {
-                self.defer_vector_update(
+            if let Some(vector_undo_id) = self.row_derivatives_undo_head(txn.txn_id, table)? {
+                self.maintain_row_update(
                     txn.txn_id,
                     vector_undo_id,
                     table,
@@ -4406,8 +4426,8 @@ impl Database {
                         effective_changed_columns,
                         None,
                     )?;
-                    if let Some(undo_id) = self.deferred_ann_undo_head(txn.txn_id, table)? {
-                        self.defer_vector_update(
+                    if let Some(undo_id) = self.row_derivatives_undo_head(txn.txn_id, table)? {
+                        self.maintain_row_update(
                             txn.txn_id,
                             undo_id,
                             table,
@@ -4440,7 +4460,7 @@ impl Database {
             effective_changed_columns,
         )?;
         let write_result = self
-            .publish_wal_before_eager_heap_write(txn.txn_id)
+            .publish_wal_before_eager_write(txn.txn_id)
             .and_then(|_| {
                 self.with_heap_mut(storage_id, |heap| {
                     heap.write_mvcc_ext(
@@ -4478,7 +4498,7 @@ impl Database {
             effective_changed_columns,
             None,
         )?;
-        self.defer_vector_update(
+        self.maintain_row_update(
             txn.txn_id,
             undo_id,
             table,
@@ -4691,7 +4711,7 @@ impl Database {
         })?;
         // Publish old-key visibility before removing partition-local entries.
         self.delete_indexes_deferred_at(txn.txn_id, storage_id, table, old_values, row_id)?;
-        self.defer_vector_delete(txn.txn_id, undo_id, table, old_values, row_id, storage_id)?;
+        self.maintain_row_delete(txn.txn_id, undo_id, table, old_values, row_id, storage_id)?;
         if crate::binlog::should_record_table_rows(table) {
             crate::binlog::record_delete_rows(txn.txn_id, table, vec![old_values.to_vec()])?;
         }
@@ -4744,7 +4764,7 @@ impl Database {
             }
         }
         self.insert_index_batches_deferred_at(txn.txn_id, storage_id, table, index_entries)?;
-        self.defer_vector_insert_batch(
+        self.maintain_row_insert_batch(
             txn.txn_id,
             table,
             storage_id,
@@ -4847,21 +4867,11 @@ impl Database {
     }
 }
 
-/// M6 — does the table declare a column whose type is always externalized
-/// off-page (TEXT/BLOB/JSON/GEOMETRY family, or a variable-length VECTOR)?
-/// Used to decide whether CHECK TABLE runs the (heavier) row-driven LOB
-/// chain walk. `VECTOR(n)` (fixed dim) lives inline and is excluded.
+/// Match the row encoder's externalization eligibility, including VARCHAR,
+/// VARBINARY and fixed-dimension vectors. Keep DDL file publication and CHECK
+/// TABLE in sync with the persisted row codec, including historical layouts.
 fn table_has_externalizable_column(table: &TableSchema) -> bool {
-    table.columns.iter().any(|c| {
-        matches!(
-            c.data_type,
-            DataTypeKind::Text { .. }
-                | DataTypeKind::Blob { .. }
-                | DataTypeKind::Json
-                | DataTypeKind::Geometry { .. }
-                | DataTypeKind::Vector { dim: None, .. }
-        )
-    })
+    codec_has_externalizable_columns(&table.row_codec)
 }
 
 // ===========================================================================

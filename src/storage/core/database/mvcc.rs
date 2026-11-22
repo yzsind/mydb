@@ -1968,6 +1968,9 @@ impl Database {
                 }
                 let mut entries = Vec::with_capacity(batch.rows.len());
                 for (_, row) in &batch.rows {
+                    if !batch.table.index_contains_row(index, &row.values)? {
+                        continue;
+                    }
                     entries.push(IndexEntry {
                         key: batch.table.index_key(index, &row.values)?,
                         row_id: row.row_id,
@@ -1975,7 +1978,7 @@ impl Database {
                 }
                 entries.sort_unstable();
                 self.with_index_dml(batch.storage_id, &index.name, |file| {
-                    file.insert_entries_logged(maintenance, entries, false)
+                    file.insert_entries_logged(maintenance, entries, false, Some(self))
                 })?;
                 #[cfg(test)]
                 ROLLBACK_DELETE_INDEX_TEST_HOOK.with(|hook| {

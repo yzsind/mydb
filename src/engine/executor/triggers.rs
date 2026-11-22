@@ -112,6 +112,7 @@ pub(super) fn execute_insert_rows_with_triggers(
     on_duplicate: Option<&[crate::parser::Assignment]>,
     insert_alias: Option<&crate::parser::InsertAlias>,
     view_check_predicate: Option<&Expr>,
+    view_replace_predicate: Option<&Expr>,
     returning_clause: Option<&crate::parser::ReturningClause>,
     target_alias: Option<&str>,
     registry: &SessionRegistry,
@@ -128,6 +129,7 @@ pub(super) fn execute_insert_rows_with_triggers(
         on_duplicate,
         insert_alias,
         view_check_predicate,
+        view_replace_predicate,
         returning_clause,
         target_alias,
         false,
@@ -382,7 +384,7 @@ fn validate_trigger_body(
 fn validate_trigger_stmt(session: &SessionContext, stmt: &RoutineStmt) -> Result<(), QueryError> {
     match stmt {
         RoutineStmt::Return(_) => Err(error(
-            crate::error::catalog::ER_SP_NO_RETSET,
+            crate::error::catalog::ER_SP_BADRETURN,
             "RETURN is not allowed in triggers",
         )),
         RoutineStmt::Prepare { .. }

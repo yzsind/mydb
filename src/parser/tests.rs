@@ -5787,8 +5787,8 @@ fn legacy_lob_lengths_choose_smallest_mysql_family() {
         panic!("expected CREATE TABLE");
     };
     assert_eq!(table.columns[0].data_type, DataType::Blob(255));
-    assert_eq!(table.columns[1].data_type, DataType::Text(16_777_215));
-    assert_eq!(table.columns[2].data_type, DataType::Text(u32::MAX));
+    assert_eq!(table.columns[1].data_type, DataType::TextLength(70000));
+    assert_eq!(table.columns[2].data_type, DataType::TextLength(70000000));
 
     let Statement::CreateTable(table) =
         parse_statement("CREATE TABLE quoted_text (a VARCHAR(32) DEFAULT 'TEXT(70000)')").unwrap()
@@ -5796,6 +5796,46 @@ fn legacy_lob_lengths_choose_smallest_mysql_family() {
         panic!("expected CREATE TABLE");
     };
     assert_eq!(table.columns[0].data_type, DataType::VarChar(Some(32)));
+}
+
+#[test]
+fn float_display_width_validation_preserves_mysql_error_precedence() {
+    for data_type in ["FLOAT", "DOUBLE", "DOUBLE PRECISION"] {
+        for modifiers in ["", " UNSIGNED", " ZEROFILL"] {
+            for (width, scale, code) in [
+                (0, 0, 1439),
+                (0, 2, 1427),
+                (0, 30, 1427),
+                (0, 31, 1425),
+                (1, 2, 1427),
+                (255, 31, 1425),
+                (256, 0, 1439),
+            ] {
+                let definition = format!("{data_type}({width},{scale}){modifiers}");
+                for sql in [
+                    format!("CREATE TABLE bad_float (f {definition})"),
+                    format!("ALTER TABLE bad_float ADD COLUMN f {definition}"),
+                    format!("ALTER TABLE bad_float MODIFY COLUMN f {definition}"),
+                ] {
+                    let err = parse_statement(&sql).unwrap_err();
+                    assert_eq!(err.code(), code, "{sql}: {err:?}");
+                    assert_eq!(err.sql_state(), "42000", "{sql}: {err:?}");
+                }
+            }
+        }
+    }
+    for (definition, expected) in [
+        ("FLOAT(1,0)", DataType::Float(Some((1, 0)))),
+        ("FLOAT(2,2)", DataType::Float(Some((2, 2)))),
+        ("DOUBLE(255,30)", DataType::Double(Some((255, 30)))),
+    ] {
+        let Statement::CreateTable(table) =
+            parse_statement(&format!("CREATE TABLE valid_float (f {definition})")).unwrap()
+        else {
+            panic!("expected CREATE TABLE");
+        };
+        assert_eq!(table.columns[0].data_type, expected, "{definition}");
+    }
 }
 
 #[test]
@@ -6248,7 +6288,6 @@ fn ddl_parallel_hint_diagnostics_and_ordinary_comments_are_preserved() {
 fn create_index_and_show_fields_are_never_silently_dropped() {
     for sql in [
         "CREATE INDEX IF NOT EXISTS ix ON t(a)",
-        "CREATE INDEX ix ON t(a) WHERE a > 0",
         "CREATE INDEX ix ON t(a) NULLS NOT DISTINCT",
         "SHOW TERSE DATABASES",
     ] {
@@ -7284,5 +7323,45 @@ fn show_audit_unsupported_statement_identifies_show() {
             Statement::Unsupported { kind, .. } if kind == "SHOW statement"),
             "{sql}"
         );
+    }
+}
+
+#[test]
+fn partial_index_where_is_bound_to_its_own_definition() {
+    let Statement::CreateIndex(index) =
+        parse_statement("CREATE INDEX pi ON t(k) INCLUDE(v) WHERE active=1").unwrap()
+    else {
+        panic!("expected CREATE INDEX")
+    };
+    assert!(index.predicate.as_ref().unwrap().contains("active"));
+    let Statement::CreateTable(table) = parse_statement("CREATE TABLE t(k INT,v TEXT,active INT,KEY first(k) INCLUDE(v) WHERE active IN(1,2),KEY second(k) WHERE CONCAT(v,',WHERE')='x,WHERE',KEY ordinary(active))").unwrap() else { panic!("expected CREATE TABLE") };
+    assert!(table.indexes[0].predicate.is_some());
+    assert_eq!(table.indexes[0].included_columns, vec!["v".to_string()]);
+    assert!(table.indexes[1].predicate.is_some());
+    assert!(table.indexes[2].predicate.is_none());
+    let Statement::AlterTable(alter) = parse_statement("ALTER TABLE t ADD INDEX first(k) /* WHERE fake */ WHERE active=1, ADD INDEX second(k) WHERE active=2").unwrap() else { panic!("expected ALTER") };
+    assert_eq!(alter.actions.len(), 2);
+    for action in alter.actions {
+        let AlterAction::AddIndex(index) = action else {
+            panic!("expected index")
+        };
+        assert!(index.predicate.is_some());
+    }
+    assert!(parse_statement("CREATE TABLE t(k INT,PRIMARY KEY(k) WHERE k>0)").is_err());
+    assert!(parse_statement("ALTER TABLE t ADD INDEX x(k) WHERE").is_err());
+}
+
+#[test]
+fn partial_index_standalone_where_follows_index_options() {
+    for sql in [
+        "CREATE INDEX vi ON t(v) USING HNSW WITH(metric=l2,m=4) WHERE flag=1",
+        "CREATE INDEX ii ON t(v) USING IVF WITH(metric=l2,nlist=1) WHERE flag=1",
+        "CREATE FULLTEXT INDEX ft ON t(body) WITH PARSER ngram WHERE flag=1",
+        "CREATE INDEX ix ON t(k) INCLUDE(v) COMMENT 'WHERE ignored' INVISIBLE WHERE flag IN(1,2);",
+    ] {
+        let Statement::CreateIndex(index) = parse_statement(sql).unwrap() else {
+            panic!("expected index: {sql}")
+        };
+        assert!(index.predicate.is_some(), "{sql}");
     }
 }

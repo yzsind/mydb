@@ -193,6 +193,102 @@ impl PolicyExpressionSettings {
     }
 }
 
+/// Capture only stable expression semantics for persistent index predicates.
+pub(crate) fn capture_index_settings() -> PolicyExpressionSettings {
+    let mut settings = with_session_view(|view| match view {
+        Some(SessionView::Borrowed(session)) => PolicyExpressionSettings::capture(session),
+        Some(SessionView::Owned(info)) => PolicyExpressionSettings {
+            sql_mode: info.sql_mode.clone(),
+            temporal_sql_mode_bits: info.temporal_sql_mode_bits,
+            character_set_client: info.character_set_client.clone(),
+            character_set_connection: info.character_set_connection.clone(),
+            collation_connection: info.collation_connection.clone(),
+            div_precision_increment: info.div_precision_increment,
+            time_zone: info.time_zone.clone(),
+            lc_time_names: info.lc_time_names.clone(),
+            default_week_format: info.default_week_format,
+            block_encryption_mode: info.block_encryption_mode.clone(),
+            explicit_defaults_for_timestamp: info.explicit_defaults_for_timestamp,
+        },
+        None => PolicyExpressionSettings::capture(&crate::engine::api::SessionContext::default()),
+    });
+    if settings.time_zone.is_empty()
+        || settings.time_zone.eq_ignore_ascii_case("SYSTEM")
+        || settings.time_zone.eq_ignore_ascii_case("LOCAL")
+    {
+        if let Some(zone) = persistent_index_system_zone() {
+            settings.time_zone = zone.to_string();
+        }
+    }
+    settings
+}
+
+/// Resolve SYSTEM to a portable IANA name instead of binding persistent
+/// membership to the machine that happens to replay a write.
+pub(crate) fn persistent_index_system_zone() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let link = std::fs::read_link("/etc/localtime").ok();
+        let name = link
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .and_then(|p| p.split_once("/zoneinfo/").map(|(_, name)| name.to_string()))
+            .or_else(|| {
+                std::fs::read_to_string("/etc/timezone")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            });
+        name.filter(|name| crate::engine::tz::find_named_zone(name).is_some())
+    })
+    .as_deref()
+}
+pub(crate) fn index_settings_have_portable_zone(settings: &PolicyExpressionSettings) -> bool {
+    !settings.time_zone.is_empty()
+        && !settings.time_zone.eq_ignore_ascii_case("SYSTEM")
+        && !settings.time_zone.eq_ignore_ascii_case("LOCAL")
+}
+
+thread_local! {
+    static INDEX_SYSTEM_ZONE: std::cell::RefCell<Option<std::sync::Arc<crate::engine::tz::TimeZoneData>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_index_system_zone<R>(
+    name: Option<&str>,
+    f: impl FnOnce() -> R,
+) -> Result<R, QueryError> {
+    let Some(name) = name else {
+        return Ok(f());
+    };
+    let zone = crate::engine::tz::find_named_zone(name).ok_or_else(|| {
+        crate::error::catalog::ER_UNKNOWN_TIME_ZONE
+            .error(format!("Unknown persistent index time zone '{name}'"))
+    })?;
+    struct Restore(Option<std::sync::Arc<crate::engine::tz::TimeZoneData>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INDEX_SYSTEM_ZONE.with(|s| {
+                s.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(INDEX_SYSTEM_ZONE.with(|s| s.replace(Some(zone))));
+    Ok(f())
+}
+
+pub(crate) fn with_index_settings<R>(
+    settings: &PolicyExpressionSettings,
+    f: impl FnOnce() -> R,
+) -> R {
+    if settings.matches_current() || *settings == capture_index_settings() {
+        return f();
+    }
+    let mut info = current_session_expr_info().unwrap_or_else(|| {
+        capture_session_expr_info(&crate::engine::api::SessionContext::default())
+    });
+    settings.apply(&mut info);
+    with_session_expr_info_snapshot_arc(std::sync::Arc::new(info), f)
+}
+
 pub(crate) fn with_policy_query_settings<R>(
     settings: &PolicyExpressionSettings,
     f: impl FnOnce() -> Result<R, QueryError>,
@@ -1623,6 +1719,9 @@ pub(crate) fn session_time_offset_seconds_at(utc_epoch: i64) -> i64 {
     with_session_view(|view| {
         let tz = view.map(|v| v.time_zone().to_string()).unwrap_or_default();
         if tz.is_empty() || tz.eq_ignore_ascii_case("SYSTEM") {
+            if let Some(zone) = INDEX_SYSTEM_ZONE.with(|s| s.borrow().clone()) {
+                return i64::from(zone.offset_at_utc(utc_epoch));
+            }
             return chrono::DateTime::from_timestamp(utc_epoch, 0)
                 .map(|dt| i64::from(dt.with_timezone(&chrono::Local).offset().local_minus_utc()))
                 .unwrap_or(0);
@@ -4449,6 +4548,15 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                 empty_expr_schema(),
                 "between",
             )?;
+            let provenance = [
+                ComparisonProvenance::from_exprs(expr, low)
+                    .with_hexbit_literals(expr, low)
+                    .with_between_domain(between_comparison_domain(
+                        [expr, low, high],
+                        expr_result_type,
+                    )),
+                ComparisonProvenance::from_exprs(expr, high).with_hexbit_literals(expr, high),
+            ];
             let value = bind_binary_comparison_value(
                 expr,
                 empty_expr_schema(),
@@ -4467,7 +4575,9 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                 collation_id,
                 eval_const(high)?,
             )?;
-            with_compare_collation(collation_id, || eval_between(&value, &low, &high, *negated))
+            with_compare_collation(collation_id, || {
+                eval_between_with_provenance(&value, &low, &high, *negated, provenance)
+            })
         }
         Expr::Case {
             operand,
@@ -4785,8 +4895,14 @@ fn eval_expr_legacy_inner(
                     *negated,
                     [
                         ComparisonProvenance::from_exprs(expr, low)
+                            .with_hexbit_literals(expr, low)
+                            .with_between_domain(between_comparison_domain(
+                                [expr, low, high],
+                                |e| expr_result_type_in_table(e, table),
+                            ))
                             .with_temporal_constant_context(expr, low),
                         ComparisonProvenance::from_exprs(expr, high)
+                            .with_hexbit_literals(expr, high)
                             .with_temporal_constant_context(expr, high),
                     ],
                 )
@@ -15763,6 +15879,25 @@ pub(crate) fn value_bytes(value: &Value) -> Vec<u8> {
     value_bytes_ref(value).into_owned()
 }
 
+/// Bind a binary comparison operand with its source character-set
+/// provenance. Assignment padding/truncation is deliberately not applied:
+/// comparison constants must retain their complete octet sequence.
+pub(crate) fn binary_comparison_constant(
+    value: &Value,
+    source: &Expr,
+    table: &TableSchema,
+) -> Option<Value> {
+    match value {
+        Value::Bytes(_) | Value::Null => Some(value.clone()),
+        Value::String(_) | Value::SmallString(_) => {
+            let charset =
+                expr_collation(source, table).map_or_else(connection_charset, |c| c.charset);
+            encode_binary_assignment_value(value.clone(), charset).ok()
+        }
+        _ => None,
+    }
+}
+
 fn bind_binary_comparison_value(
     expr: &Expr,
     table: &TableSchema,
@@ -16890,6 +17025,9 @@ thread_local! {
 fn resolve_tz_spec(tz: &str) -> Result<TzSpec, QueryError> {
     let trimmed = tz.trim();
     if trimmed.eq_ignore_ascii_case("SYSTEM") || trimmed.eq_ignore_ascii_case("LOCAL") {
+        if let Some(zone) = INDEX_SYSTEM_ZONE.with(|s| s.borrow().clone()) {
+            return Ok(TzSpec::Named(zone));
+        }
         return Ok(crate::engine::tz::find_system_zone()
             .map(TzSpec::Named)
             .unwrap_or(TzSpec::System));
@@ -22991,8 +23129,17 @@ pub(crate) fn validate_expr_temporal_literals_with_resolver<'a>(
             Expr::Between {
                 expr, low, high, ..
             } => {
-                validate_pair(expr, low, resolve)?;
-                validate_pair(expr, high, resolve)?;
+                let domain = between_comparison_domain([expr, low, high], |operand| {
+                    schema_expr_result_type(operand, &mut |column| {
+                        resolve(column)
+                            .map(DataTypeKind::column_type)
+                            .unwrap_or(ColumnType::VarString)
+                    })
+                });
+                if domain != BetweenComparisonDomain::Numeric {
+                    validate_pair(expr, low, resolve)?;
+                    validate_pair(expr, high, resolve)?;
+                }
                 visit(expr, table, resolve)?;
                 visit(low, table, resolve)?;
                 visit(high, table, resolve)
@@ -26021,6 +26168,56 @@ fn temporal_string_pair(left: &Value, right: &Value) -> bool {
     (temporal(left) && value_is_stringish(right)) || (temporal(right) && value_is_stringish(left))
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum BetweenComparisonDomain {
+    #[default]
+    Runtime,
+    Numeric,
+    String,
+}
+
+pub(crate) fn between_comparison_domain(
+    operands: [&Expr; 3],
+    mut result_type: impl FnMut(&Expr) -> ColumnType,
+) -> BetweenComparisonDomain {
+    // Keep ordinary BETWEEN predicates on their existing comparison path.
+    if !operands.into_iter().any(expr_is_numeric_hexbit_literal) {
+        return BetweenComparisonDomain::Runtime;
+    }
+    let mut strings = true;
+    for operand in operands {
+        if matches!(operand, Expr::Literal(Literal::Null)) {
+            continue;
+        }
+        if matches!(
+            operand,
+            Expr::Placeholder(_) | Expr::UserVariable(_) | Expr::BoundValue(_) | Expr::Subquery(_)
+        ) {
+            strings = false;
+            continue;
+        }
+        match result_type(operand) {
+            ColumnType::Tiny
+            | ColumnType::Short
+            | ColumnType::MediumInt
+            | ColumnType::Long
+            | ColumnType::LongLong
+            | ColumnType::Float
+            | ColumnType::Double
+            | ColumnType::Decimal { .. }
+            | ColumnType::Year
+            | ColumnType::Bit { .. } => return BetweenComparisonDomain::Numeric,
+            ColumnType::Blob | ColumnType::VarString => {}
+            _ => strings = false,
+        }
+    }
+    if strings {
+        BetweenComparisonDomain::String
+    } else {
+        BetweenComparisonDomain::Runtime
+    }
+}
+
 /// Source properties needed by mixed numeric/string and temporal comparisons.
 /// Retained independently of runtime payload types and constant folding.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -26034,7 +26231,12 @@ pub(crate) struct ComparisonProvenance {
     pub(crate) temporal_warning_context: Option<u64>,
     pub(crate) left_constant: bool,
     pub(crate) right_constant: bool,
+    // Keep the common comparison record within its original 56-byte layout.
+    pub(crate) between_flags: u8,
 }
+
+#[cfg(target_pointer_width = "64")]
+const _: () = assert!(std::mem::size_of::<ComparisonProvenance>() <= 56);
 
 impl ComparisonProvenance {
     pub(crate) fn from_exprs(left_expr: &Expr, right_expr: &Expr) -> Self {
@@ -26076,6 +26278,54 @@ impl ComparisonProvenance {
             temporal_warning_context: None,
             left_constant: false,
             right_constant: false,
+            between_flags: 0,
+        }
+    }
+
+    pub(crate) fn with_hexbit_literals(mut self, left: &Expr, right: &Expr) -> Self {
+        self.set_between_literals(
+            expr_is_numeric_hexbit_literal(left),
+            expr_is_numeric_hexbit_literal(right),
+        );
+        self
+    }
+
+    pub(crate) fn with_between_domain(mut self, domain: BetweenComparisonDomain) -> Self {
+        self.set_between_domain(domain);
+        self
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_between_literals(&mut self, left: bool, right: bool) {
+        self.between_flags = (self.between_flags & !3) | left as u8 | ((right as u8) << 1);
+    }
+
+    #[inline(always)]
+    pub(crate) fn set_between_domain(&mut self, domain: BetweenComparisonDomain) {
+        self.between_flags = (self.between_flags & 3)
+            | match domain {
+                BetweenComparisonDomain::Runtime => 0,
+                BetweenComparisonDomain::Numeric => 4,
+                BetweenComparisonDomain::String => 8,
+            };
+    }
+
+    #[inline(always)]
+    fn left_hexbit_literal(&self) -> bool {
+        self.between_flags & 1 != 0
+    }
+
+    #[inline(always)]
+    fn right_hexbit_literal(&self) -> bool {
+        self.between_flags & 2 != 0
+    }
+
+    #[inline(always)]
+    fn between_domain(&self) -> BetweenComparisonDomain {
+        match self.between_flags >> 2 {
+            1 => BetweenComparisonDomain::Numeric,
+            2 => BetweenComparisonDomain::String,
+            _ => BetweenComparisonDomain::Runtime,
         }
     }
 
@@ -26106,6 +26356,7 @@ impl ComparisonProvenance {
             temporal_warning_context: None,
             left_constant: false,
             right_constant: false,
+            between_flags: 0,
             ..self
         } != Self::default()
     }
@@ -26167,6 +26418,7 @@ pub(crate) fn with_numeric_comparison_context_from_provenance<T>(
         temporal_warning_context,
         left_constant,
         right_constant,
+        ..
     } = provenance;
     let left_user_parameter =
         left_parameter.is_some_and(crate::engine::params::user_parameter_active);
@@ -27224,11 +27476,101 @@ pub(crate) fn decimal_literal_exceeds_storage_precision(text: &str) -> bool {
 /// True iff `expr` is a hex / bit literal — used to gate auto-coercion of
 /// `Value::Bytes` to `Value::UInt` in numeric contexts. Generic BLOB / BINARY
 /// columns also produce `Value::Bytes` and must NOT be auto-coerced.
+#[inline(always)]
 pub(crate) fn expr_is_numeric_hexbit_literal(expr: &Expr) -> bool {
-    matches!(
-        expr,
-        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_))
-    )
+    match expr {
+        Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_)) => true,
+        Expr::Case { .. } | Expr::Subquery(_) => wrapped_numeric_literal_provenance(expr),
+        Expr::Function { name, .. }
+            if matches!(
+                (name.len(), name.as_bytes()),
+                (2, [b'I' | b'i', b'F' | b'f'])
+                    | (
+                        6,
+                        [b'I' | b'i', b'F' | b'f', ..] | [b'N' | b'n', b'U' | b'u', ..]
+                    )
+                    | (8, [b'C' | b'c', b'O' | b'o', ..])
+            ) =>
+        {
+            wrapped_numeric_literal_provenance(expr)
+        }
+        _ => false,
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn wrapped_numeric_literal_provenance(expr: &Expr) -> bool {
+    enum Step<'a> {
+        Expr(&'a Expr),
+        Results(std::slice::Iter<'a, Expr>),
+    }
+    // Iterator frames preserve left-to-right early rejection without copying
+    // wide branch lists or consuming the native stack for deep wrappers.
+    let mut pending = smallvec::SmallVec::<[Step<'_>; 4]>::new();
+    pending.push(Step::Expr(expr));
+    let mut has_literal = false;
+    while let Some(step) = pending.pop() {
+        let expr = match step {
+            Step::Expr(expr) => expr,
+            Step::Results(mut items) => {
+                if let Some(expr) = items.next() {
+                    if !items.as_slice().is_empty() {
+                        pending.push(Step::Results(items));
+                    }
+                    pending.push(Step::Expr(expr));
+                }
+                continue;
+            }
+        };
+        match expr {
+            Expr::Literal(Literal::HexBytes(_) | Literal::BitBytes(_)) => has_literal = true,
+            Expr::Literal(
+                Literal::Null
+                | Literal::Bool(_)
+                | Literal::Int(_)
+                | Literal::UInt(_)
+                | Literal::Float(_)
+                | Literal::Decimal(_)
+                | Literal::String(_),
+            ) => {}
+            Expr::Case {
+                results,
+                else_result,
+                ..
+            } => {
+                if let Some(expr) = else_result {
+                    pending.push(Step::Expr(expr));
+                }
+                pending.push(Step::Results(results.iter()));
+            }
+            Expr::Function { name, args, .. } => {
+                let results = if name.eq_ignore_ascii_case("IF") {
+                    args.get(1..)
+                } else if name.eq_ignore_ascii_case("IFNULL")
+                    || name.eq_ignore_ascii_case("COALESCE")
+                {
+                    Some(args.as_slice())
+                } else if name.eq_ignore_ascii_case("NULLIF") {
+                    args.get(..1)
+                } else {
+                    None
+                };
+                let Some(results) = results else {
+                    return false;
+                };
+                pending.push(Step::Results(results.iter()));
+            }
+            Expr::Subquery(select) if select.projection.len() == 1 => {
+                let crate::parser::SelectItem::Expr { expr, .. } = &select.projection[0] else {
+                    return false;
+                };
+                pending.push(Step::Expr(expr));
+            }
+            _ => return false,
+        }
+    }
+    has_literal
 }
 
 /// A raw hex/bit literal is a binary string in string comparison context.
@@ -27284,14 +27626,19 @@ fn validate_hexbit_string_comparison(
 /// `Value::UInt` (big-endian). Pass-through for any other value or for >8-byte
 /// hex literals (those have no MySQL numeric semantics).
 pub(crate) fn coerce_hex_bytes_to_uint(v: Value) -> Value {
-    match v {
-        Value::Bytes(b) if b.len() <= 8 => {
-            let mut padded = [0u8; 8];
-            padded[8 - b.len()..].copy_from_slice(&b);
-            Value::UInt(u64::from_be_bytes(padded))
-        }
-        other => other,
+    hexbit_number(&v).unwrap_or(v)
+}
+
+fn hexbit_number(value: &Value) -> Option<Value> {
+    let Value::Bytes(bytes) = value else {
+        return None;
+    };
+    if bytes.len() > 8 {
+        return None;
     }
+    let mut padded = [0u8; 8];
+    padded[8 - bytes.len()..].copy_from_slice(bytes);
+    Some(Value::UInt(u64::from_be_bytes(padded)))
 }
 
 /// Resolve the context-sensitive MySQL semantics of hex/bit literals for
@@ -27424,6 +27771,22 @@ where
 /// has no `org_table`/`org_name`. `resolve_column` supplies signedness for
 /// identifier nodes in the caller's scope.
 pub(crate) fn expr_result_unsigned<F>(expr: &Expr, resolve_column: &F) -> bool
+where
+    F: Fn(&Expr) -> Option<bool>,
+{
+    match expr {
+        Expr::Identifier(_) | Expr::CompoundIdentifier(_) => resolve_column(expr).unwrap_or(false),
+        Expr::Literal(literal) => matches!(literal, Literal::UInt(_)),
+        Expr::BoundValue(value) => matches!(value, Value::UInt(_)),
+        _ => crate::util::stack::ensure_stack(
+            crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
+            || expr_result_unsigned_checked(expr, resolve_column),
+        ),
+    }
+}
+
+#[inline(never)]
+fn expr_result_unsigned_checked<F>(expr: &Expr, resolve_column: &F) -> bool
 where
     F: Fn(&Expr) -> Option<bool>,
 {
@@ -28024,19 +28387,6 @@ pub(crate) fn eval_logical_not(value: &Value) -> Value {
 /// already excludes the value (e.g. `10 BETWEEN NULL AND 5` = FALSE), and
 /// NULL only when the outcome is genuinely unknown. Single source of truth
 /// for every BETWEEN evaluation site.
-#[inline]
-pub(crate) fn eval_between(
-    value: &Value,
-    low: &Value,
-    high: &Value,
-    negated: bool,
-) -> Result<Value, QueryError> {
-    Ok(match eval_between_truth(value, low, high, negated)? {
-        None => Value::Null,
-        Some(result) => Value::Int(result as i64),
-    })
-}
-
 /// Share BETWEEN's three-valued result with filters without materializing a
 /// Value only to convert it back to a boolean for every input row.
 #[inline]
@@ -28069,6 +28419,58 @@ fn eval_between_truth_with_provenance(
     negated: bool,
     provenance: Option<[ComparisonProvenance; 2]>,
 ) -> Result<Option<bool>, QueryError> {
+    // One BETWEEN has one comparison domain. Only genuine hex/bit
+    // literal results acquire their big-endian numeric meaning; arbitrary
+    // BLOB values retain ordinary string-to-number conversion.
+    let flags = match &provenance {
+        Some(p) => [
+            p[0].left_hexbit_literal(),
+            p[0].right_hexbit_literal(),
+            p[1].right_hexbit_literal(),
+        ],
+        None => [false; 3],
+    };
+    if flags[0] || flags[1] || flags[2] {
+        let domain = provenance
+            .as_ref()
+            .map_or(BetweenComparisonDomain::Runtime, |p| p[0].between_domain());
+        if domain == BetweenComparisonDomain::String {
+            let operands = [value, low, high];
+            let strings =
+                operands.map(|v| value_is_numeric(v).then(|| Value::String(v.to_display_string())));
+            if strings.iter().any(Option::is_some) {
+                return eval_between_truth_with_provenance(
+                    strings[0].as_ref().unwrap_or(value),
+                    strings[1].as_ref().unwrap_or(low),
+                    strings[2].as_ref().unwrap_or(high),
+                    negated,
+                    provenance,
+                );
+            }
+        }
+        if domain == BetweenComparisonDomain::Numeric
+            || (domain != BetweenComparisonDomain::String
+                && [value, low, high].iter().any(|v| value_is_numeric(v)))
+        {
+            let operands = [value, low, high];
+            let converted: [Option<Value>; 3] = std::array::from_fn(|index| {
+                if flags[index] {
+                    hexbit_number(operands[index])
+                } else {
+                    None
+                }
+            });
+            if converted.iter().any(Option::is_some) {
+                return eval_between_truth_with_provenance(
+                    converted[0].as_ref().unwrap_or(value),
+                    converted[1].as_ref().unwrap_or(low),
+                    converted[2].as_ref().unwrap_or(high),
+                    negated,
+                    provenance,
+                );
+            }
+        }
+    }
     // A YEAR column converts constant bounds using its assignment domain,
     // including two-digit years. Runtime column bounds keep numeric semantics.
     let year_bound = |bound: &Value, index: usize| -> Result<Option<Value>, QueryError> {

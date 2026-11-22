@@ -332,6 +332,11 @@ impl<'a> AnalyzeZoneAccumulator<'a> {
             return;
         };
         let state = &mut self.running[slot];
+        if !zone_temporal_order_safe(value) {
+            state.mark_unknown();
+            state.order_unsupported = true;
+            return;
+        }
         let scalar = match value {
             Value::Null => return state.observe_null(),
             Value::Int(value) => WorkerScalar::Signed(*value),
@@ -463,7 +468,7 @@ fn analyze_plain_index_layout(
     table: &TableSchema,
     index: &IndexSchema,
 ) -> Option<AnalyzePlainIndexLayout> {
-    if !index.index_type.eq_ignore_ascii_case("BTREE")
+    if index.predicate.is_some() || !index.index_type.eq_ignore_ascii_case("BTREE")
         || index.fulltext.is_some()
         || index.has_expression_parts()
         || index.has_multi_valued_parts()
@@ -2927,7 +2932,7 @@ fn conditional_domain_key_columns(table: &TableSchema) -> Option<Vec<String>> {
         .indexes
         .iter()
         .find(|index| {
-            index.unique
+            index.predicate.is_none() && index.unique
                 && !index.primary
                 && index.columns.len() == 1
                 && index.index_type.eq_ignore_ascii_case("BTREE")

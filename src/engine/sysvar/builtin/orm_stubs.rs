@@ -30,6 +30,33 @@ pub(crate) fn max_prepared_stmt_count() -> u64 {
 }
 
 pub(crate) fn register(reg: &mut Registry) {
+    let ft = crate::storage::fulltext::tokenizer::global_config();
+    for (name, value) in [
+        ("innodb_ft_min_token_size", ft.min_token_size),
+        ("innodb_ft_max_token_size", ft.max_token_size),
+        ("ngram_token_size", ft.ngram_size),
+        ("ft_min_word_len", ft.min_token_size),
+        ("ft_max_word_len", ft.max_token_size),
+    ] {
+        reg.register(SysVar::const_read_only(
+            SysVarDef::new(
+                name,
+                Scope::Global,
+                DataType::UInt {
+                    min: 1,
+                    max: u64::MAX,
+                },
+            )
+            .with_doc("Default tokenizer setting captured by newly created FULLTEXT indexes."),
+            SysVarValue::UInt(value as u64),
+        ));
+    }
+    reg.register(SysVar::const_read_only(
+        SysVarDef::new("innodb_ft_enable_stopword", Scope::Global, DataType::Bool)
+            .with_doc("Default stopword policy captured by newly created FULLTEXT indexes."),
+        SysVarValue::Bool(ft.use_stopwords),
+    ));
+
     reg.register(SysVar::session_backed(
         SysVarDef::new(
             "max_error_count",
@@ -455,8 +482,6 @@ fn register_misc_stubs(reg: &mut Registry) {
         ));
     }
     for (name, value) in [
-        ("ft_min_word_len", 4),
-        ("ft_max_word_len", 84),
         ("ft_query_expansion_limit", 20),
         ("innodb_buffer_pool_chunk_size", 134_217_728),
     ] {

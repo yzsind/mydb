@@ -786,7 +786,7 @@ fn parse_partition_option_into(
     let opt = match opt {
         Opt::Storage => {
             // `STORAGE ENGINE = ...`
-            let _ = try_consume_ident_ci(t, "ENGINE")?;
+            expect_ident_ci(t, "ENGINE")?;
             Opt::Engine
         }
         Opt::Data => {
@@ -1100,10 +1100,18 @@ fn expect_punct(t: &mut Tokeniser<'_>, expected: Tok) -> Result<(), crate::parse
 
 fn parse_unsigned_int(t: &mut Tokeniser<'_>) -> Result<u32, crate::parser::ParseError> {
     match t.next()? {
-        Tok::Number(n) => n
-            .parse::<u64>()
-            .map(|value| value.min(u32::MAX as u64) as u32)
-            .map_err(|_| crate::parser::ParseError::at_zero(format!("invalid integer `{}`", n))),
+        Tok::Number(n) => {
+            let value = n.parse::<u64>().map_err(|_| {
+                crate::parser::ParseError::at_zero(format!("invalid integer `{n}`"))
+            })?;
+            u32::try_from(value).map_err(|_| {
+                let mut err = crate::parser::ParseError::at_zero(format!(
+                    "Partition count {n} is out of range; maximum supported count is 8192"
+                ));
+                err.spec = crate::error::catalog::ER_TOO_MANY_PARTITIONS_ERROR;
+                err
+            })
+        }
         other => Err(crate::parser::ParseError::at_zero(format!(
             "expected unsigned integer, got {:?}",
             other

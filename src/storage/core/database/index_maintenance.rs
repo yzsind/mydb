@@ -1613,7 +1613,7 @@ impl LoadDataIndexBuilders {
                         )?;
                     }
                 }
-                file.insert_batch_deferred(txn_id, owned, true)
+                file.insert_batch_deferred(txn_id, owned, true, Some(db))
             })
         };
         match sorted {
@@ -1732,7 +1732,7 @@ impl ScalarInsertKeys {
             // Preserve the existing large-batch parallel index fan-out.
             || (rows.len() >= 64 && table.indexes.len() > 1)
             || table.indexes.iter().any(|index| {
-                index.is_fulltext()
+                index.predicate.is_some() || index.is_fulltext()
                     || index.has_multi_valued_parts()
                     || index.is_spatial()
                     || index.is_vector()
@@ -2692,7 +2692,7 @@ impl Database {
             }
             for key in table.index_keys(index, values)? {
                 self.with_index_dml(storage_id, &index.name, |index_file| {
-                    index_file.insert_deferred(txn_id, key, row_id)
+                    index_file.insert_deferred(txn_id, key, row_id, Some(self))
                 })?;
             }
         }
@@ -2742,7 +2742,7 @@ impl Database {
             ) {
                 continue;
             }
-            if index.is_fulltext() || index.has_multi_valued_parts() {
+            if index.predicate.is_some() || index.is_fulltext() || index.has_multi_valued_parts() {
                 // Token/MVI-set diff: only disappearing keys need stale
                 // visibility repair.
                 let new_keys: std::collections::HashSet<IndexKey> =
@@ -2862,7 +2862,7 @@ impl Database {
         if writes.iter().all(|write| !write.header.is_deleted()) {
             // Preserve one prefix publication and one heap-handle lookup for
             // an ordinary UPDATE batch, including resizing/LOB rewrites.
-            self.publish_wal_before_eager_heap_write(txn_id)?;
+            self.publish_wal_before_eager_write(txn_id)?;
             return self.with_heap_mut(table_id, |heap| {
                 for write in writes {
                     #[cfg(test)]
@@ -2917,7 +2917,7 @@ impl Database {
             let Some((write, rest)) = remaining.split_first() else {
                 break;
             };
-            self.publish_wal_before_eager_heap_write(txn_id)?;
+            self.publish_wal_before_eager_write(txn_id)?;
             self.with_heap_mut(table_id, |heap| {
                 heap.write_mvcc_ext(
                     txn_id,
@@ -2994,6 +2994,7 @@ impl Database {
                 && !index.is_spatial()
                 && !index.is_vector()
                 && index.columns.len() <= 4
+                && index.predicate.is_none()
                 && index.key_expressions.iter().all(Option::is_none)
         });
         let parallel_candidate = rows.len() >= 64
@@ -3075,7 +3076,7 @@ impl Database {
         for index_offset in 0..table.indexes.len() {
             let index = &table.indexes[(index_start + index_offset) % table.indexes.len()];
             let mut entries = Vec::with_capacity(rows.len());
-            if index.is_fulltext() || index.has_multi_valued_parts() {
+            if index.predicate.is_some() || index.is_fulltext() || index.has_multi_valued_parts() {
                 for (values, row_id) in rows.iter().zip(row_ids.iter().copied()) {
                     for key in table.index_keys(index, values)? {
                         entries.push((key, row_id));
@@ -3123,7 +3124,7 @@ impl Database {
             // Shared (read) handle lock: concurrent DML / SELECT may be
             // navigating this index, so the destructive empty-tree bulk-load
             // reset is unsafe here. Build incrementally.
-            index_file.insert_batch_deferred(txn_id, entries, false)
+            index_file.insert_batch_deferred(txn_id, entries, false, Some(self))
         })
     }
 
@@ -3168,7 +3169,7 @@ impl Database {
             ) {
                 continue;
             }
-            if index.is_fulltext() || index.has_multi_valued_parts() {
+            if index.predicate.is_some() || index.is_fulltext() || index.has_multi_valued_parts() {
                 // Differential maintenance: delete keys in old∖new, insert
                 // keys in new∖old. A full delete-all + insert-all would
                 // churn the B-tree and defeat its exact-duplicate no-op
@@ -3183,7 +3184,7 @@ impl Database {
                             .get(key)
                             .is_some_and(|stored| stored.same_stored_value(key))
                         {
-                            index_file.delete_deferred(txn_id, key.clone(), row_id)?;
+                            index_file.delete_deferred(txn_id, key.clone(), row_id, Some(self))?;
                         }
                     }
                     for key in &new_keys {
@@ -3191,7 +3192,7 @@ impl Database {
                             .get(key)
                             .is_some_and(|stored| stored.same_stored_value(key))
                         {
-                            index_file.insert_deferred(txn_id, key.clone(), row_id)?;
+                            index_file.insert_deferred(txn_id, key.clone(), row_id, Some(self))?;
                         }
                     }
                     Ok(())
@@ -3239,7 +3240,7 @@ impl Database {
             ];
             self.with_index_dml(storage_id, &index.name, |index_file| {
                 let preencoded = index_file.preencode_mixed_index_batch_wal(txn_id, &entries)?;
-                index_file.apply_preencoded_batch_deferred(txn_id, entries, preencoded)
+                index_file.apply_preencoded_batch_deferred(txn_id, entries, preencoded, Some(self))
             })?;
         }
         // Txn-buffering: bound how many heap records (and thus deferred-pinned,
@@ -3277,11 +3278,12 @@ impl Database {
                                     txn_id_for_ddl(),
                                     key,
                                     physical_row_id,
+                                    Some(self),
                                 )?;
                             }
                         }
                         for key in &new_keys {
-                            index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id)?;
+                            index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id, Some(self))?;
                         }
                         Ok(())
                     })?;
@@ -3296,7 +3298,7 @@ impl Database {
                         .get(key)
                         .is_some_and(|stored| stored.same_stored_value(key))
                     {
-                        index_file.delete_deferred(txn_id_for_ddl(), key.clone(), row_id)?;
+                        index_file.delete_deferred(txn_id_for_ddl(), key.clone(), row_id, Some(self))?;
                     }
                 }
                 for key in &new_keys {
@@ -3304,7 +3306,7 @@ impl Database {
                         .get(key)
                         .is_some_and(|stored| stored.same_stored_value(key))
                     {
-                        index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id)?;
+                        index_file.insert_deferred(txn_id_for_ddl(), key.clone(), row_id, Some(self))?;
                     }
                 }
                 Ok(())
@@ -3341,7 +3343,7 @@ impl Database {
                 let entries = by_index
                     .get_mut(&index.name)
                     .expect("affected index should have a batch entry");
-                if index.is_fulltext() || index.has_multi_valued_parts() {
+                if index.predicate.is_some() || index.is_fulltext() || index.has_multi_valued_parts() {
                     // Token/MVI-set diff per updated row (see the single-row path).
                     let old_keys = table.stored_index_keys(index, &update.old_values)?;
                     let new_keys = table.index_keys(index, &update.new_values)?;
@@ -3435,8 +3437,8 @@ impl Database {
         self.insert_indexes_deferred_at(txn.txn_id, table.id, table, &values, row_id, false)?;
         // The storage single-row API shares the same durable commit journal
         // and rollback/savepoint semantics as executor batches.
-        if let Some(undo_id) = self.deferred_ann_undo_head(txn.txn_id, table)? {
-            self.defer_vector_update(txn.txn_id, undo_id, table, row_id, table.id, None, &values)?;
+        if let Some(undo_id) = self.row_derivatives_undo_head(txn.txn_id, table)? {
+            self.maintain_row_update(txn.txn_id, undo_id, table, row_id, table.id, None, &values)?;
         }
         Ok(row_id)
     }
@@ -4004,6 +4006,7 @@ impl Database {
             .iter()
             .filter(|index| index.enforces_uniqueness())
         {
+            if !table.index_contains_row(index, values)? { continue; }
             let key = if STORED {
                 table.stored_index_key(index, values)?
             } else {
@@ -4038,7 +4041,7 @@ impl Database {
                 .iter()
                 .find(|index| index.enforces_uniqueness())
                 .unwrap();
-            if !index.has_expression_parts()
+            if index.predicate.is_none() && !index.has_expression_parts()
                 && index.columns.len() == 1
                 && index.included_columns.is_empty()
             {
@@ -4088,7 +4091,8 @@ impl Database {
                 .iter()
                 .filter(|index| index.enforces_uniqueness())
             {
-                let key = table.index_key(index, values)?;
+                if !table.index_contains_row(index, values)? { continue; }
+            let key = table.index_key(index, values)?;
                 if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                     continue;
                 }
@@ -4118,17 +4122,22 @@ impl Database {
             {
                 continue;
             }
-            let old_key = table.stored_index_key(index, old_values)?;
-            let new_key = table.index_key(index, new_values)?;
-            if old_key == new_key {
+            if index.predicate.is_some() {
+                for values in [old_values, new_values] {
+                    if !table.index_contains_row(index, values)? { continue; }
+                    let key = table.stored_index_key(index, values)?;
+                    if !index.primary && key.0.iter().any(|p| matches!(p, KeyPart::Null)) { continue; }
+                    locks.push((table.id, index.name.as_str(), key));
+                }
                 continue;
             }
+            let old_key = table.stored_index_key(index, old_values)?;
+            let new_key = table.index_key(index, new_values)?;
+            if old_key == new_key { continue; }
             if !old_key.0.iter().any(|part| matches!(part, KeyPart::Null)) || index.primary {
                 locks.push((table.id, index.name.as_str(), old_key));
             }
-            if new_key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
-                continue;
-            }
+            if new_key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary { continue; }
             locks.push((table.id, index.name.as_str(), new_key));
         }
         self.lock_unique_keys_nonblocking(txn_id, locks)?;
@@ -4195,6 +4204,7 @@ impl Database {
             .iter()
             .filter(|index| index.enforces_uniqueness())
         {
+            if !table.index_contains_row(index, values)? { continue; }
             let key = table.index_key(index, values)?;
             if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                 continue;
@@ -4220,17 +4230,22 @@ impl Database {
             if !index_may_be_affected_by_columns(table, index, changed_columns) {
                 continue;
             }
-            let old_key = table.stored_index_key(index, old_values)?;
-            let new_key = table.index_key(index, new_values)?;
-            if old_key == new_key {
+            if index.predicate.is_some() {
+                for values in [old_values, new_values] {
+                    if !table.index_contains_row(index, values)? { continue; }
+                    let key = table.stored_index_key(index, values)?;
+                    if !index.primary && key.0.iter().any(|p| matches!(p, KeyPart::Null)) { continue; }
+                    locks.push((table.id, index.name.as_str(), key));
+                }
                 continue;
             }
+            let old_key = table.stored_index_key(index, old_values)?;
+            let new_key = table.index_key(index, new_values)?;
+            if old_key == new_key { continue; }
             if !old_key.0.iter().any(|part| matches!(part, KeyPart::Null)) || index.primary {
                 locks.push((table.id, index.name.as_str(), old_key));
             }
-            if new_key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
-                continue;
-            }
+            if new_key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary { continue; }
             locks.push((table.id, index.name.as_str(), new_key));
         }
         Ok(())
@@ -4278,7 +4293,7 @@ impl Database {
         // a concurrent snapshot can probe the gap before its repair exists.
         for (index, key) in deletes {
             self.with_index_dml(storage_id, &index.name, |index_file| {
-                index_file.delete_deferred(txn_id, key, row_id)
+                index_file.delete_deferred(txn_id, key, row_id, Some(self))
             })?;
         }
         Ok(())
@@ -4356,7 +4371,7 @@ impl Database {
                 continue;
             }
             self.with_index_dml(storage_id, &index.name, |index_file| {
-                index_file.apply_batch_deferred(txn_id, entries)
+                index_file.apply_batch_deferred(txn_id, entries, Some(self))
             })?;
         }
         Ok(())
@@ -4390,6 +4405,16 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        self.ensure_fulltext_statistics(table, index)?;
+        self.rebuild_index_with_options_postings(table, index, options)
+    }
+
+    fn rebuild_index_with_options_postings(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        options: IndexBuildOptions,
+    ) -> Result<(), QueryError> {
         if table.is_partitioned() && !index.is_vector() {
             for storage_id in table.storage_ids() {
                 let mut leaf = table.clone();
@@ -4397,7 +4422,7 @@ impl Database {
                 leaf.active_generation = self.storage_generation(storage_id);
                 leaf.partitioning = None;
                 leaf.build_column_index();
-                self.rebuild_index_with_options(&leaf, index, options)?;
+                self.rebuild_index_with_options_postings(&leaf, index, options)?;
             }
             return Ok(());
         }
@@ -4457,7 +4482,7 @@ impl Database {
                         // Exclusive (write) handle lock per chunk excludes
                         // every concurrent navigator, so the empty-tree
                         // bulk-load reset on the first chunk is safe.
-                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true)
+                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true, Some(self))
                     })?;
                     if chunk_no % 64 == 63 {
                         crate::engine::memory_reclaimer::reclaim_bulk_operation_pressure();
@@ -4481,7 +4506,7 @@ impl Database {
                     self.with_index_mut(table.id, &index.name, |index_file| {
                         // Exclusive (write) handle lock per chunk: safe to
                         // take the empty-tree bulk-load reset fast path.
-                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true)
+                        index_file.insert_batch_deferred(txn_id_for_ddl(), owned, true, Some(self))
                     })?;
                     chunk_no = chunk_no.saturating_add(1);
                     if chunk_no % 64 == 0 {
@@ -4549,6 +4574,16 @@ impl Database {
         index: &IndexSchema,
         options: IndexBuildOptions,
     ) -> Result<(), QueryError> {
+        self.ensure_fulltext_statistics(table, index)?;
+        self.rebuild_index_offline_bulk_with_options_postings(table, index, options)
+    }
+
+    pub(super) fn rebuild_index_offline_bulk_with_options_postings(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        options: IndexBuildOptions,
+    ) -> Result<(), QueryError> {
         if table.is_partitioned() && !index.is_vector() {
             for storage_id in table.storage_ids() {
                 let mut leaf = table.clone();
@@ -4556,7 +4591,7 @@ impl Database {
                 leaf.active_generation = self.storage_generation(storage_id);
                 leaf.partitioning = None;
                 leaf.build_column_index();
-                self.rebuild_index_offline_bulk_with_options(&leaf, index, options)?;
+                self.rebuild_index_offline_bulk_with_options_postings(&leaf, index, options)?;
             }
             return Ok(());
         }
@@ -4583,7 +4618,7 @@ impl Database {
         // come from their coherent buffer image and cold pages are read
         // directly without cache admission.
         if self.config.durability == crate::storage::DurabilityMode::Memory {
-            return self.rebuild_index_with_options(table, index, options);
+            return self.rebuild_index_with_options_postings(table, index, options);
         }
         if index.is_fulltext() {
             return self.rebuild_fulltext_index_parallel(table, index, options);
@@ -4654,6 +4689,9 @@ impl Database {
         scratch_bytes: usize,
         direct: bool,
     ) -> Result<SortedIndexEntries, QueryError> {
+        if let Some(index) = index.filter(|i| i.predicate.is_some()) {
+            return self.collect_sorted_multi_key_entries(table, index, degree, scratch_bytes);
+        }
         let mut sorter = IndexEntryExternalSorter::with_exact_run_bytes(scratch_bytes);
         if !table.storage_ids().contains(&table.id) {
             return sorter.finish_with_degree(self.data_dir(), degree);
@@ -4794,7 +4832,7 @@ impl Database {
                 DIRECT,
             );
         }
-        if index.is_fulltext() || index.has_multi_valued_parts() {
+        if index.predicate.is_some() || index.is_fulltext() || index.has_multi_valued_parts() {
             return self.collect_sorted_multi_key_entries(table, index, degree, scratch_bytes);
         }
         let data_dir = self.data_dir();
@@ -4913,7 +4951,15 @@ impl Database {
                 &(0..table.columns.len()).collect::<Vec<_>>(),
                 |row| {
                     if !row.header.is_deleted() {
-                        for key in table.index_keys(index, row.values)? {
+                        let keys = table.index_keys(index, row.values)?;
+                        if !keys.is_empty() && index.is_vector()
+                            && index.vector_meta_for_table(table).metric_enum() == vector::Metric::Cosine {
+                            let col = table.column_index(&index.columns[0])?;
+                            if matches!(row.values.get(col), Some(Value::Vector(value)) if vector::distance::typed_is_zero(value)) {
+                                return Err(vector::vector_err("COSINE indexes reject existing zero vectors"));
+                            }
+                        }
+                        for key in keys {
                             sorter.push_with_sort_degree(
                                 data_dir,
                                 IndexEntry {

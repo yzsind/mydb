@@ -509,7 +509,12 @@ pub(super) fn execute_update(
     let selection_for_scan = (!selection_is_correlated)
         .then_some(stmt.selection.as_ref())
         .flatten();
+    let compiled_selection =
+        selection_for_scan.map(|expr| CompiledWritePredicate::compile(expr, &table));
     let eval_selection = |expr: &Expr, values: &[Value]| {
+        if let Some(compiled) = &compiled_selection {
+            return compiled.eval_bool(&table, values);
+        }
         eval_delete_selection(
             db,
             txn,
@@ -562,9 +567,23 @@ pub(super) fn execute_update(
         changed_column_indexes.push(idx);
     }
     let has_update_triggers = table_has_update_triggers(db, &stmt.table);
+    let compiled_updates = updates
+        .iter()
+        .map(|(idx, expr, correlated)| {
+            if *correlated {
+                Ok(None)
+            } else {
+                compile_update_assignment(&table, *idx, expr).map(Some)
+            }
+        })
+        .collect::<Result<Vec<_>, QueryError>>()?;
     let apply_updates = |values: &[Value]| -> Result<Vec<Value>, QueryError> {
         let mut new_values = values.to_vec();
-        for (idx, expr, correlated) in &updates {
+        for ((idx, expr, correlated), compiled) in updates.iter().zip(&compiled_updates) {
+            if let Some(compiled) = compiled {
+                new_values[*idx] = compiled.eval(&table, &new_values)?;
+                continue;
+            }
             // MySQL evaluates SET assignments left-to-right: a later RHS sees
             // the already-updated value of an earlier column, so evaluate
             // against the progressively-updated `new_values`, not the
@@ -990,6 +1009,60 @@ fn execute_delete_candidates(
     Ok(returning.finish(QueryResponse::OkAffected { affected_rows }))
 }
 
+enum CompiledWritePredicate {
+    Membership(super::select::plan::CompiledPredicate),
+    Expression(crate::engine::expr_program::CompiledTableExpr),
+}
+
+impl CompiledWritePredicate {
+    fn compile(expr: &Expr, table: &TableSchema) -> Self {
+        match super::select::plan::CompiledPredicate::compile_write_membership(expr, table) {
+            Some(predicate) => Self::Membership(predicate),
+            None => Self::Expression(
+                crate::engine::expr_program::CompiledTableExpr::compile_once(expr, table),
+            ),
+        }
+    }
+    fn eval_bool(&self, table: &TableSchema, values: &[Value]) -> Result<bool, QueryError> {
+        match self {
+            Self::Membership(predicate) => predicate.eval(values),
+            Self::Expression(program) => program.eval_bool(table, values),
+        }
+    }
+}
+
+struct CompiledUpdateAssignment {
+    column_index: usize,
+    expression: Expr,
+    program: crate::engine::expr_program::CompiledTableExpr,
+}
+
+impl CompiledUpdateAssignment {
+    fn eval(&self, table: &TableSchema, values: &[Value]) -> Result<Value, QueryError> {
+        let value = self.program.eval(table, values)?;
+        crate::engine::expr::binary_assignment_value(
+            value,
+            &self.expression,
+            table,
+            &table.columns[self.column_index].data_type,
+        )
+    }
+}
+
+fn compile_update_assignment(
+    table: &TableSchema,
+    column_index: usize,
+    expr: &Expr,
+) -> Result<CompiledUpdateAssignment, QueryError> {
+    let bound = crate::engine::expr::bind_column_defaults(expr, table, Some(column_index))?;
+    let program = crate::engine::expr_program::CompiledTableExpr::compile_once(&bound, table);
+    Ok(CompiledUpdateAssignment {
+        column_index,
+        expression: bound,
+        program,
+    })
+}
+
 pub(super) fn execute_update_borrowed_simple(
     db: &Arc<Database>,
     session: &mut SessionContext,
@@ -1023,7 +1096,7 @@ pub(super) fn execute_update_borrowed_simple(
         crate::engine::expr::validate_expr_temporal_literals(selection, &table)?;
         crate::engine::expr::validate_dml_temporal_functions(selection)?;
     }
-    let mut updates: Vec<(usize, &Expr)> = Vec::with_capacity(stmt.assignments.len());
+    let mut updates = Vec::with_capacity(stmt.assignments.len());
     let mut changed_column_indexes = Vec::new();
     for assignment in &stmt.assignments {
         validate_assignment_qualifier(assignment, &stmt.table, stmt.primary_alias.as_deref())?;
@@ -1040,7 +1113,7 @@ pub(super) fn execute_update_borrowed_simple(
         if !changed_column_indexes.contains(&idx) {
             changed_column_indexes.push(idx);
         }
-        updates.push((idx, &assignment.value));
+        updates.push(compile_update_assignment(&table, idx, &assignment.value)?);
     }
     // B7 — snapshot the user-set columns BEFORE appending the auto
     // `ON UPDATE CURRENT_TIMESTAMP` columns. No-op detection must compare
@@ -1055,22 +1128,11 @@ pub(super) fn execute_update_borrowed_simple(
     }
     let apply_updates = |values: &[Value]| -> Result<Vec<Value>, QueryError> {
         let mut new_values = values.to_vec();
-        for (idx, expr) in &updates {
+        for assignment in &updates {
             // Left-to-right SET semantics: evaluate against the
             // progressively-updated row so a later RHS sees earlier
             // columns' new values (issue #80).
-            let v = if update_expr_contains_default(expr) {
-                let bound = crate::engine::expr::bind_column_defaults(expr, &table, Some(*idx))?;
-                eval_expr(&bound, &table, &new_values)?
-            } else {
-                eval_expr(expr, &table, &new_values)?
-            };
-            new_values[*idx] = crate::engine::expr::binary_assignment_value(
-                v,
-                expr,
-                &table,
-                &table.columns[*idx].data_type,
-            )?;
+            new_values[assignment.column_index] = assignment.eval(&table, &new_values)?;
         }
         apply_on_update_timestamps(&table, &mut new_values, &on_update_columns);
         Ok(new_values)
@@ -1087,6 +1149,10 @@ pub(super) fn execute_update_borrowed_simple(
         Ok(())
     };
 
+    let compiled_selection = stmt
+        .selection
+        .as_ref()
+        .map(|expr| CompiledWritePredicate::compile(expr, &table));
     let ordered_limited_candidates = ordered_limited_dml_candidates(
         db,
         txn,
@@ -1116,8 +1182,8 @@ pub(super) fn execute_update_borrowed_simple(
                 Some(&changed_column_indexes),
                 Some(&user_changed_columns),
                 |values| {
-                    if let Some(expr) = &stmt.selection {
-                        if !eval_bool(expr, &table, values)? {
+                    if let Some(compiled) = &compiled_selection {
+                        if !compiled.eval_bool(&table, values)? {
                             return Ok(values.to_vec());
                         }
                     }
@@ -1190,8 +1256,8 @@ pub(super) fn execute_update_borrowed_simple(
     let matched_rows = std::cell::Cell::new(0u64);
     let predicate = |values: &[Value]| -> Result<bool, QueryError> {
         crate::engine::cancel::check_cancelled()?;
-        match &stmt.selection {
-            Some(expr) => eval_bool(expr, &table, values),
+        match &compiled_selection {
+            Some(compiled) => compiled.eval_bool(&table, values),
             None => Ok(true),
         }
     };
@@ -1229,6 +1295,13 @@ pub(super) fn execute_prepared_range_update(
     check_safe_updates(session, stmt.selection.as_ref(), stmt.limit.as_ref())?;
     let table = &range.table;
     let update = &range.update;
+    let membership = stmt.selection.as_ref().and_then(|expr| {
+        super::select::plan::CompiledPredicate::compile_write_membership(expr, table)
+    });
+    let predicate = |values: &[Value]| match &membership {
+        Some(predicate) => predicate.eval(values),
+        None => range.predicate.eval_bool(table, values),
+    };
     if let Some(selection) = &stmt.selection {
         crate::engine::expr::validate_expr_temporal_literals(selection, table)?;
         crate::engine::expr::validate_dml_temporal_functions(selection)?;
@@ -1254,7 +1327,7 @@ pub(super) fn execute_prepared_range_update(
             Some(candidates),
             Some(&update.changed_columns),
             Some(&update.user_changed_columns),
-            |values| range.predicate.eval_bool(table, values),
+            &predicate,
             |values| {
                 matched += 1;
                 let mut values = values.to_vec();
@@ -1269,7 +1342,7 @@ pub(super) fn execute_prepared_range_update(
                 crate::engine::cancel::check_cancelled()?;
                 let row_matched = std::cell::Cell::new(false);
                 let mut predicate = |values: &[Value]| {
-                    let matches = range.predicate.eval_bool(table, values)?;
+                    let matches = predicate(values)?;
                     row_matched.set(matches);
                     Ok(matches)
                 };
@@ -1640,9 +1713,9 @@ pub(super) fn execute_delete(
     // the current-read recheck.
     let compiled_selection = (!selection_is_correlated)
         .then(|| {
-            stmt.selection.as_ref().map(|expr| {
-                crate::engine::expr_program::CompiledTableExpr::compile_once(expr, &table)
-            })
+            stmt.selection
+                .as_ref()
+                .map(|expr| CompiledWritePredicate::compile(expr, &table))
         })
         .flatten();
     let affected_rows =
@@ -1720,6 +1793,14 @@ pub(super) fn execute_delete_borrowed_simple(
     if let Some(response) = execute_ordered_index_delete(db, txn, stmt, &table)? {
         return Ok(Some(response));
     }
+    let compiled_selection = stmt
+        .selection
+        .as_ref()
+        .map(|expr| CompiledWritePredicate::compile(expr, &table));
+    let row_matches = |values: &[Value]| match &compiled_selection {
+        Some(predicate) => predicate.eval_bool(&table, values),
+        None => Ok(true),
+    };
     let ordered_limited_candidates = ordered_limited_dml_candidates(
         db,
         txn,
@@ -1739,20 +1820,15 @@ pub(super) fn execute_delete_borrowed_simple(
             let Some(row) = db.dml_candidate_row_at_for_write(&table, row_ref, txn)? else {
                 continue;
             };
-            if let Some(expr) = &stmt.selection {
-                if !eval_bool(expr, &table, &row.values)? {
-                    continue;
-                }
+            if !row_matches(&row.values)? {
+                continue;
             }
             match db.delete_row_by_id_at_if(
                 txn,
                 &table,
                 row_ref.storage_id,
                 row_ref.row_id,
-                |values| match &stmt.selection {
-                    Some(expr) => eval_bool(expr, &table, values),
-                    None => Ok(true),
-                },
+                &row_matches,
             ) {
                 Ok(true) => affected_rows += 1,
                 Ok(false) => {}
@@ -1774,10 +1850,7 @@ pub(super) fn execute_delete_borrowed_simple(
         for row in rows {
             let _rowid_scope = crate::storage::rowid::RowScope::enter(&table, row.row_ref)?;
             crate::engine::cancel::check_cancelled()?;
-            let matches = match &stmt.selection {
-                Some(expr) => eval_bool(expr, &table, &row.values)?,
-                None => true,
-            };
+            let matches = row_matches(&row.values)?;
             if !matches {
                 continue;
             }
@@ -1786,10 +1859,7 @@ pub(super) fn execute_delete_borrowed_simple(
                 &table,
                 row.row_ref.storage_id,
                 row.row_ref.row_id,
-                |values| match &stmt.selection {
-                    Some(expr) => eval_bool(expr, &table, values),
-                    None => Ok(true),
-                },
+                &row_matches,
             ) {
                 Ok(true) => affected_rows += 1,
                 Ok(false) => {}
@@ -1804,16 +1874,9 @@ pub(super) fn execute_delete_borrowed_simple(
         }
         return Ok(Some(QueryResponse::OkAffected { affected_rows }));
     }
-    let compiled_selection = stmt
-        .selection
-        .as_ref()
-        .map(|expr| crate::engine::expr_program::CompiledTableExpr::compile_once(expr, &table));
     let affected_rows = db.delete_rows_with_origin(txn, &stmt.table, candidates, |values| {
         crate::engine::cancel::check_cancelled()?;
-        match &compiled_selection {
-            Some(expr) => expr.eval_bool(&table, values),
-            None => Ok(true),
-        }
+        row_matches(values)
     })? as u64;
     Ok(Some(QueryResponse::OkAffected { affected_rows }))
 }

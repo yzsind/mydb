@@ -62,6 +62,7 @@ class Server:
     def connect(self):
         return pymysql.connect(host="127.0.0.1", port=self.port, user="root", password="root",
                                database="test", autocommit=True, charset="utf8mb4", ssl=self.tls,
+                               binary_prefix=True,
                                connect_timeout=2, read_timeout=60, write_timeout=60)
 
     def start(self):

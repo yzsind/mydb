@@ -1577,6 +1577,7 @@ fn rename_index_preserves_stable_physical_path() {
     db.add_index(
         "stable_index",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "old_idx".into(),
@@ -2979,6 +2980,7 @@ fn spatial_index_search_over_persistent_pages() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("sp".into()),
             columns: vec!["loc".into()],
             column_prefix_lengths: Vec::new(),
@@ -3193,6 +3195,7 @@ fn char_rows_store_compact_and_read_compact() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("c_idx".into()),
             columns: vec!["c".into()],
             column_prefix_lengths: Vec::new(),
@@ -3851,6 +3854,7 @@ fn add_index_bulk_builds_large_table_without_dirty_index_cache() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "v_idx".into(),
@@ -3983,6 +3987,7 @@ fn fulltext_backfill_builds_inverted_index() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -4081,6 +4086,7 @@ fn fulltext_insert_delete_maintains_inverted_index() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -4205,6 +4211,7 @@ fn fulltext_postings_carry_payload_stats() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -4387,6 +4394,7 @@ fn batched_add_index_encoded_keys_keep_lookup_semantics() {
     );
 
     let index = |name: &str, columns: &[&str]| IndexSchema {
+        predicate: None,
         readable_from_scn: 0,
         index_id: 0,
         name: name.into(),
@@ -4500,6 +4508,7 @@ fn offline_add_index_respects_existing_table_ix_lock() {
         .add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: "v_idx".into(),
@@ -4580,6 +4589,7 @@ fn add_primary_key_on_empty_table_persists_rebuilt_index_meta() {
         db.add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: "PRIMARY".into(),
@@ -4835,6 +4845,7 @@ fn analyze_table_keeps_small_table_stats_exact() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("vw_idx".into()),
             columns: vec!["v".into(), "w".into()],
             column_prefix_lengths: Vec::new(),
@@ -4932,6 +4943,7 @@ fn drop_index_removes_index_stats_without_refreshing_table_stats() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("v_idx".into()),
             columns: vec!["v".into()],
             column_prefix_lengths: Vec::new(),
@@ -5030,6 +5042,7 @@ fn analyze_table_large_high_cardinality_stats_are_bounded_and_stable() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("v_idx".into()),
             columns: vec!["v".into()],
             column_prefix_lengths: Vec::new(),
@@ -5206,6 +5219,7 @@ fn analyze_table_sampled_pages_estimate_stats_for_large_tables() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("v_idx".into()),
             columns: vec!["v".into()],
             column_prefix_lengths: Vec::new(),
@@ -10374,7 +10388,9 @@ fn large_index_batch_wal_is_split_below_replication_payload_limit() {
             }
         })
         .collect::<Vec<_>>();
-    index.insert_entries_logged(11, entries, true).unwrap();
+    index
+        .insert_entries_logged(11, entries, true, None)
+        .unwrap();
     {
         let mut guard = log.lock();
         guard.rotate_segment().unwrap();
@@ -10868,6 +10884,7 @@ fn rollback_persists_restored_heap_and_indexes_before_end_txn() {
             ],
             vec!["id".into()],
             vec![crate::parser::IndexDef {
+                predicate: None,
                 name: Some("k_1".into()),
                 columns: vec!["k".into()],
                 column_prefix_lengths: Vec::new(),
@@ -10964,6 +10981,7 @@ fn create_concurrent_index_update_table(db: &Database, rows: i64) {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_1".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -12050,6 +12068,7 @@ fn rollback_to_savepoint_rebuilds_indexes_after_secondary_update() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_1".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -12160,6 +12179,7 @@ fn rollback_to_savepoint_removes_batch_inserted_rows_and_indexes() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_idx".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -12439,6 +12459,7 @@ fn concurrent_composite_pk_insert_batches_commit_and_recover_consistently() {
             .unwrap(),
         );
         let secondary = |name: &str, columns: &[&str]| crate::parser::IndexDef {
+            predicate: None,
             name: Some(name.into()),
             columns: columns.iter().map(|column| (*column).into()).collect(),
             column_prefix_lengths: Vec::new(),
@@ -12715,6 +12736,7 @@ fn batch_index_entry_lookup_matches_scalar_prefix_and_exact_paths() {
     db.add_index(
         "test.batch_idx",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "idx_k_seq".into(),
@@ -12894,6 +12916,7 @@ fn routed_batch_lookup_matches_scalar_for_leaf_spanning_prefixes() {
     db.add_index(
         "test.routed_idx",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "idx_k_seq".into(),
@@ -14313,6 +14336,7 @@ fn consistency_check_detects_dangling_index_entry() {
                 page_id: 99,
                 slot_id: 1,
             },
+            None,
         )
     })
     .unwrap();
@@ -16071,6 +16095,7 @@ fn read_committed_dml_serializes_delete_insert_pairs() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_1".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -16787,6 +16812,7 @@ fn unique_key_wait_participates_in_deadlock_detection() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("u_idx".into()),
             columns: vec!["u".into()],
             column_prefix_lengths: Vec::new(),
@@ -17308,6 +17334,7 @@ fn btree_forward_range_cursor_matches_full_range_across_chunks() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "grp_idx".into(),
@@ -17406,6 +17433,7 @@ fn range_cursor_row_id_and_leaf_walkers_match_entries_oracle() {
         db.add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: name.into(),
@@ -17647,6 +17675,7 @@ fn analyze_computes_index_heap_order_correlation() {
         db.add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: name.into(),
@@ -17713,6 +17742,7 @@ fn analyze_sparse_heap_sample_preserves_repeated_composite_index_fanout() {
             ],
             vec!["id".into()],
             vec![crate::parser::IndexDef {
+                predicate: None,
                 name: Some("ab".into()),
                 columns: vec!["a".into(), "b".into()],
                 column_prefix_lengths: if text_keys {
@@ -18772,10 +18802,10 @@ fn durable_direct_bulk_builder_matches_memory_buffered_oracle() {
     entries.sort_unstable();
 
     strict
-        .insert_entries_logged(7, entries.clone(), true)
+        .insert_entries_logged(7, entries.clone(), true, None)
         .unwrap();
     memory
-        .insert_entries_logged(7, entries.clone(), true)
+        .insert_entries_logged(7, entries.clone(), true, None)
         .unwrap();
     assert_eq!(
         strict.range(None, None, false).unwrap(),
@@ -18799,10 +18829,10 @@ fn durable_direct_bulk_builder_matches_memory_buffered_oracle() {
         },
     };
     strict
-        .insert_entries_logged(8, vec![extra.clone()], true)
+        .insert_entries_logged(8, vec![extra.clone()], true, None)
         .unwrap();
     memory
-        .insert_entries_logged(8, vec![extra.clone()], true)
+        .insert_entries_logged(8, vec![extra.clone()], true, None)
         .unwrap();
     assert_eq!(
         strict.get(&extra.key, false).unwrap(),
@@ -18849,7 +18879,7 @@ fn direct_bulk_builder_failure_before_meta_restores_empty_usable_index() {
         },
     };
     index
-        .insert_entries_logged(10, vec![replacement.clone()], true)
+        .insert_entries_logged(10, vec![replacement.clone()], true, None)
         .unwrap();
     assert_eq!(
         index.get(&replacement.key, false).unwrap(),
@@ -20444,7 +20474,7 @@ fn sorted_append_demoting_compact_leaf_splits_instead_of_overflowing() {
         row_id: test_row_id(9_999, 128),
     };
     index
-        .insert_entries_logged(2, vec![outlier.clone()], true)
+        .insert_entries_logged(2, vec![outlier.clone()], true, None)
         .unwrap();
 
     assert_eq!(
@@ -20752,6 +20782,7 @@ fn v10_add_index_offline_bulk_dense_small_int_key_smoke() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "n_idx".into(),
@@ -20845,6 +20876,7 @@ fn v10_add_index_offline_bulk_150k_rows_small_int_key() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "n_idx".into(),
@@ -25464,6 +25496,7 @@ fn rebuild_indexes_encoded_path_is_stable() {
     }
     fn idx(name: &str, columns: Vec<String>) -> IndexSchema {
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: name.into(),
@@ -26870,7 +26903,12 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
     };
     for id in 1..=3 {
         index
-            .insert_deferred(1, IndexKey::from(vec![KeyPart::Int(id as i64)]), row(id))
+            .insert_deferred(
+                1,
+                IndexKey::from(vec![KeyPart::Int(id as i64)]),
+                row(id),
+                None,
+            )
             .unwrap();
     }
     let count = || {
@@ -26882,7 +26920,7 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
     };
     assert_eq!(count(), 3);
     index
-        .insert_deferred(2, IndexKey::from(vec![KeyPart::Int(4)]), row(4))
+        .insert_deferred(2, IndexKey::from(vec![KeyPart::Int(4)]), row(4), None)
         .unwrap();
     assert_eq!(
         count(),
@@ -26890,7 +26928,7 @@ fn btree_ordinal_cache_invalidates_after_leaf_only_insert_and_delete() {
         "a leaf-only insert must invalidate cached cardinality"
     );
     index
-        .delete_deferred(3, IndexKey::from(vec![KeyPart::Int(2)]), row(2))
+        .delete_deferred(3, IndexKey::from(vec![KeyPart::Int(2)]), row(2), None)
         .unwrap();
     assert_eq!(
         count(),
@@ -27254,6 +27292,7 @@ fn fulltext_unicode_prefix_generic_matches_fast_path() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -29485,7 +29524,7 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
                 let entries = index.entries()?;
                 for (key, row) in entries {
                     if key.0.first() == Some(&KeyPart::String("alpha".into())) {
-                        index.delete_deferred(0, key, row)?;
+                        index.delete_deferred(0, key, row, None)?;
                         index.insert_deferred(
                             0,
                             IndexKey::from(vec![
@@ -29493,6 +29532,7 @@ fn fulltext_corrupt_posting_fails_scans_and_persists_corruption_fence() {
                                 KeyPart::Bytes(vec![2, 1]),
                             ]),
                             row,
+                            None,
                         )?;
                     }
                 }
@@ -30377,6 +30417,7 @@ fn buffered_partial_index_insert_recovers_and_rolls_back_across_leaf_boundaries(
             ],
             vec!["id".into()],
             vec![crate::parser::IndexDef {
+                predicate: None,
                 name: Some("v_idx".into()),
                 columns: vec!["v".into()],
                 column_prefix_lengths: Vec::new(),
@@ -31579,4 +31620,251 @@ fn replication_visibility_proof_uses_wal_pressure_emergency_path() {
         "emergency control records must still count towards retained WAL"
     );
     db.ensure_operational().unwrap();
+}
+
+#[test]
+fn storage_release1121_buffered_insert_delete_preserves_wal_order() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let db = open_relaxed_test_db(dir.path());
+    db.create_table(
+        "wal_order",
+        vec![concurrent_index_test_column("id", true)],
+        vec!["id".into()],
+        vec![],
+    )
+    .unwrap();
+    let seed = db.begin_dml_txn().unwrap();
+    db.insert_rows(
+        seed,
+        "test.wal_order",
+        (1..=50).map(|i| vec![Value::Int(i)]).collect(),
+    )
+    .unwrap();
+    db.commit_txn(seed.txn_id).unwrap();
+    let txn = db.begin_dml_txn().unwrap();
+    let ids = db
+        .insert_rows(
+            txn,
+            "test.wal_order",
+            (101..=110).map(|i| vec![Value::Int(i)]).collect(),
+        )
+        .unwrap();
+    assert!(txn_wal_buffer_len(&db.log, txn.txn_id) > 0);
+    assert_eq!(
+        db.delete_rows(txn, "test.wal_order", Some(ids), |_| Ok(true))
+            .unwrap(),
+        10
+    );
+    db.commit_txn(txn.txn_id).unwrap();
+    db.log.lock().flush().unwrap();
+    let records = crate::wal::LogManager::scan(dir.path()).unwrap().records;
+    let kinds = records
+        .iter()
+        .filter(|r| r.txn_id == txn.txn_id)
+        .flat_map(|r| match &r.payload {
+            WalPayload::IndexBatch { ops, .. } => ops.iter().map(|op| op.kind).collect::<Vec<_>>(),
+            _ => vec![],
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            vec![WalIndexOpKind::Insert; 10],
+            vec![WalIndexOpKind::Delete; 10]
+        ]
+        .concat()
+    );
+}
+
+#[test]
+fn storage_release1121_eager_index_fallbacks_publish_the_parked_prefix() {
+    for mode in [
+        "single_insert",
+        "batch_insert",
+        "partial_insert",
+        "single_delete",
+        "two_op",
+    ] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let db = open_relaxed_test_db(dir.path());
+        db.create_table(
+            "fallbacks",
+            vec![concurrent_index_test_column("id", true)],
+            vec!["id".into()],
+            vec![],
+        )
+        .unwrap();
+        let table = db.table("test.fallbacks").unwrap();
+        let seed: Vec<_> = (1..=50)
+            .map(|id| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(id)]),
+                row_id: RowId::new(1, id as u16),
+            })
+            .collect();
+        db.with_index_dml(table.id, "PRIMARY", |file| {
+            file.bulk_load_sorted(0, seed.clone())
+        })
+        .unwrap();
+        let txn = db.begin_dml_txn().unwrap();
+        let entry = |id: i64| {
+            (
+                IndexKey::from(vec![KeyPart::Int(id)]),
+                RowId::new(1, id as u16),
+            )
+        };
+        db.with_index_dml(table.id, "PRIMARY", |file| {
+            let (key, row) = entry(101);
+            file.insert_deferred(txn.txn_id, key, row, Some(&db))?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(txn_wal_buffer_len(&db.log, txn.txn_id) > 0, "{mode}");
+        let used = db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire);
+        let reservation = if matches!(mode, "single_insert" | "batch_insert" | "single_delete") {
+            Some(
+                db.buffer_pool
+                    .reserve_deferred_wal_pages(
+                        (db.buffer_pool.capacity_pages() / 8 - used) as usize,
+                    )
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        db.with_index_dml(table.id, "PRIMARY", |file| match mode {
+            "single_insert" => {
+                let (key, row) = entry(200);
+                file.insert_deferred(txn.txn_id, key, row, Some(&db))
+            }
+            "batch_insert" => file.insert_batch_deferred(
+                txn.txn_id,
+                (200..210).map(entry).collect(),
+                false,
+                Some(&db),
+            ),
+            "partial_insert" => file.insert_batch_deferred(
+                txn.txn_id,
+                (200..4200).map(entry).collect(),
+                false,
+                Some(&db),
+            ),
+            "single_delete" => {
+                let (key, row) = entry(101);
+                file.delete_deferred(txn.txn_id, key, row, Some(&db))
+            }
+            "two_op" => {
+                // Different RowIds require the generic mixed-batch oracle.
+                let (old, old_row) = entry(101);
+                let (new, new_row) = entry(200);
+                let batch = smallvec::smallvec![
+                    IndexBatchEntry {
+                        kind: WalIndexOpKind::Delete,
+                        key: old,
+                        row_id: old_row
+                    },
+                    IndexBatchEntry {
+                        kind: WalIndexOpKind::Insert,
+                        key: new,
+                        row_id: new_row
+                    },
+                ];
+                let payload = file.preencode_mixed_index_batch_wal(txn.txn_id, &batch)?;
+                file.apply_preencoded_batch_deferred(txn.txn_id, batch, payload, Some(&db))
+            }
+            _ => unreachable!(),
+        })
+        .unwrap();
+        drop(reservation);
+        db.commit_txn(txn.txn_id).unwrap();
+        db.log.lock().flush().unwrap();
+        let scan = crate::wal::LogManager::scan(dir.path()).unwrap();
+        let mut expected: BTreeSet<_> = seed.into_iter().map(|e| (e.key, e.row_id)).collect();
+        let mut ops = Vec::new();
+        for record in scan.records.iter().filter(|r| r.txn_id == txn.txn_id) {
+            if let WalPayload::IndexBatch { ops: batch, .. } = &record.payload {
+                ops.extend(batch);
+            }
+        }
+        assert_eq!(
+            decode_wal_index_key(&ops[0].key).unwrap(),
+            entry(101).0,
+            "{mode}: eager WAL overtook the prefix"
+        );
+        for op in ops {
+            let item = (
+                decode_wal_index_key(&op.key).unwrap(),
+                wal_row_id_to_row_id(op.row_id),
+            );
+            match op.kind {
+                WalIndexOpKind::Insert => {
+                    expected.insert(item);
+                }
+                WalIndexOpKind::Delete => {
+                    expected.remove(&item);
+                }
+            }
+        }
+        let actual = db
+            .with_index_mut(table.id, "PRIMARY", |file| file.entries())
+            .unwrap()
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            actual, expected,
+            "{mode}: logical replay must match the live tree"
+        );
+        assert_eq!(
+            db.buffer_pool.deferred_wal_pages.load(Ordering::Acquire),
+            0,
+            "{mode}"
+        );
+    }
+}
+
+#[test]
+fn storage_release1121_empty_replication_registry_allows_recovery_checkpoint() {
+    for persisted_slot in [false, true] {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        {
+            let db = open_relaxed_test_db(dir.path());
+            create_checkpoint_test_table(&db);
+            insert_checkpoint_test_row(&db, 7);
+            let mut slots = crate::repl::master::slot::SlotRegistry::open(dir.path()).unwrap();
+            if persisted_slot {
+                slots.create_or_get("retained", 0);
+                slots.persist_all().unwrap();
+            }
+            db.buffer_pool.shutdown_flusher();
+        }
+        let before = crate::wal::LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .len();
+        let db = open_relaxed_test_db(dir.path());
+        assert!(db.last_recovery.redone_records > 0);
+        let after = crate::wal::LogManager::scan(dir.path())
+            .unwrap()
+            .records
+            .len();
+        if persisted_slot {
+            assert!(
+                after >= before,
+                "unregistered durable slot floors must retain WAL"
+            );
+        } else {
+            assert!(
+                after < before,
+                "an empty registry must allow recovery WAL reclamation: {before} -> {after}"
+            );
+        }
+        assert_eq!(
+            db.scan_rows(
+                "test.t",
+                TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted)
+            )
+            .unwrap()[0]
+                .values,
+            vec![Value::Int(7)]
+        );
+    }
 }

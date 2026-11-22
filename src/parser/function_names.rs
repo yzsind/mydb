@@ -133,6 +133,13 @@ pub(crate) fn is_clock_precision_function(name: &str) -> bool {
 }
 
 pub(super) fn validate_identifier(ident: &Ident) -> Result<(), ParseError> {
+    if ident.value.contains('\0') {
+        return parse_error_from_sql_span(
+            ident.span,
+            "NUL is not allowed in an SQL identifier",
+            vec![],
+        );
+    }
     if ident.quote_style.is_some() {
         return Ok(());
     }

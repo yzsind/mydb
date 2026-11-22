@@ -3719,7 +3719,7 @@ impl IndexFile {
     /// assert `IndexLeafPage::page_max_trx_id` was raised.
     #[cfg(test)]
     fn insert_with_txn(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
-        self.insert_deferred(txn_id, key, row_id)
+        self.insert_deferred(txn_id, key, row_id, None)
     }
 
     /// Test-only accessor for a leaf page's persisted writer bound.
@@ -3739,7 +3739,7 @@ impl IndexFile {
         key: IndexKey,
         row_id: RowId,
     ) -> Result<(), QueryError> {
-        self.delete_deferred(txn_id, key, row_id)
+        self.delete_deferred(txn_id, key, row_id, None)
     }
 
     /// Test-only helper: current root page id. Root migrates on splits
@@ -3789,7 +3789,34 @@ impl IndexFile {
         Ok(out)
     }
 
-    fn insert_deferred(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
+    /// Preserve transaction statement order when a deferred mutation falls back
+    /// to eager WAL. Call only after releasing leaf and topology latches: the
+    /// drain also finalizes heap frames and may emit their owed page images.
+    fn publish_wal_before_eager_index_write(
+        &self,
+        txn_id: u64,
+        wal_owner: Option<&Database>,
+    ) -> Result<(), QueryError> {
+        if let Some(db) = wal_owner {
+            debug_assert!(Arc::ptr_eq(&self.log, &db.log));
+            db.publish_wal_before_eager_write(txn_id)
+        } else if txn_wal_buffer_len(&self.log, txn_id) != 0 {
+            Err(error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "buffered index WAL requires its transaction owner for eager publication",
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn insert_deferred(
+        &self,
+        txn_id: u64,
+        key: IndexKey,
+        row_id: RowId,
+        wal_owner: Option<&Database>,
+    ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
             return spatial.apply(
                 txn_id,
@@ -3801,7 +3828,7 @@ impl IndexFile {
             );
         }
         let entry = IndexEntry { key, row_id };
-        match self.try_insert_entries_buffered(txn_id, std::slice::from_ref(&entry))? {
+        match self.try_insert_entries_buffered(txn_id, std::slice::from_ref(&entry), wal_owner)? {
             Some(BufferedIndexInsert::Complete) => Ok(()),
             Some(BufferedIndexInsert::Remaining { consumed: 0, lsn }) => {
                 let _logical = btree_logical_wal::LsnScope::new(Some(lsn));
@@ -3815,6 +3842,7 @@ impl IndexFile {
                 WalIndexOpKind::Insert,
                 entry,
                 |index, entry| index.insert_entry_concurrent(txn_id, entry),
+                wal_owner,
             ),
         }
     }
@@ -3837,6 +3865,7 @@ impl IndexFile {
         txn_id: u64,
         entries: Vec<(IndexKey, RowId)>,
         exclusive_handle: bool,
+        wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
             return spatial.insert_many(txn_id, entries);
@@ -3848,7 +3877,7 @@ impl IndexFile {
             .into_iter()
             .map(|(key, row_id)| IndexEntry { key, row_id })
             .collect();
-        self.insert_entries_logged(txn_id, entries, exclusive_handle)?;
+        self.insert_entries_logged(txn_id, entries, exclusive_handle, wal_owner)?;
         Ok(())
     }
 
@@ -3885,6 +3914,7 @@ impl IndexFile {
         &self,
         txn_id: u64,
         entries: Vec<IndexBatchEntry>,
+        wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
             return spatial.apply(txn_id, entries);
@@ -3896,6 +3926,7 @@ impl IndexFile {
         if entries.is_empty() {
             return Ok(());
         }
+        self.publish_wal_before_eager_index_write(txn_id, wal_owner)?;
         let lsn = self.append_mixed_index_batch_wal(txn_id, &entries)?;
         self.apply_batch_with_lsn(txn_id, entries, lsn)
     }
@@ -3905,6 +3936,7 @@ impl IndexFile {
         txn_id: u64,
         entries: smallvec::SmallVec<[IndexBatchEntry; 2]>,
         payload: Option<WalPayload>,
+        wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
             return spatial.apply(txn_id, entries);
@@ -3957,7 +3989,11 @@ impl IndexFile {
                         // silently dropping `false` loses redo and strands the
                         // frames permanently unflushable. Fall back to the
                         // canonical eager append and always balance every pin.
-                        let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+                        let appended = self
+                            .publish_wal_before_eager_index_write(txn_id, wal_owner)
+                            .and_then(|()| {
+                                crate::wal::LogManager::pre_encode_record(txn_id, payload)
+                            })
                             .and_then(|pre| {
                                 crate::wal::LogManager::append_pre_encoded_to(&self.log, pre)
                             });
@@ -3984,6 +4020,7 @@ impl IndexFile {
                     for key in &keys {
                         self.buffer_pool.finalize_deferred(key, 0);
                     }
+                    self.publish_wal_before_eager_index_write(txn_id, wal_owner)?;
                     let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
                     let lsn = Some(crate::wal::LogManager::append_pre_encoded_to(
                         &self.log, pre,
@@ -4004,6 +4041,7 @@ impl IndexFile {
         }
         let lsn = match payload {
             Some(payload) => {
+                self.publish_wal_before_eager_index_write(txn_id, wal_owner)?;
                 let pre = crate::wal::LogManager::pre_encode_record(txn_id, payload)?;
                 Some(crate::wal::LogManager::append_pre_encoded_to(
                     &self.log, pre,
@@ -4679,6 +4717,7 @@ impl IndexFile {
         txn_id: u64,
         entries: Vec<IndexEntry>,
         exclusive_handle: bool,
+        wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         if let Some(log) = &self.online_build_log {
             log.record(entries.into_iter().map(|entry| IndexBatchEntry {
@@ -4699,6 +4738,7 @@ impl IndexFile {
         // incrementally under `structure_lock.write()` — the sorted-append
         // fast path below already handles an empty tree efficiently.
         if exclusive_handle && self.is_empty()? {
+            self.publish_wal_before_eager_index_write(txn_id, wal_owner)?;
             let mut entries = entries;
             if !index_entries_are_strictly_sorted(&entries) {
                 entries.sort_unstable();
@@ -4706,7 +4746,7 @@ impl IndexFile {
             }
             return self.bulk_load_sorted(txn_id, entries);
         }
-        if let Some(outcome) = self.try_insert_entries_buffered(txn_id, &entries)? {
+        if let Some(outcome) = self.try_insert_entries_buffered(txn_id, &entries, wal_owner)? {
             return match outcome {
                 BufferedIndexInsert::Complete => Ok(()),
                 BufferedIndexInsert::Remaining { consumed, lsn } => {
@@ -4716,6 +4756,7 @@ impl IndexFile {
                 }
             };
         }
+        self.publish_wal_before_eager_index_write(txn_id, wal_owner)?;
         let lsn = self.append_index_batch_wal(txn_id, WalIndexOpKind::Insert, &entries)?;
         self.insert_entries_with_lsn(txn_id, entries, lsn)
     }
@@ -4733,6 +4774,7 @@ impl IndexFile {
         &self,
         txn_id: u64,
         entries: &[IndexEntry],
+        wal_owner: Option<&Database>,
     ) -> Result<Option<BufferedIndexInsert>, QueryError> {
         if self.online_build_log.is_some()
             || self.durability == DurabilityMode::Memory
@@ -4827,7 +4869,9 @@ impl IndexFile {
         };
         // Drop deferred collection before appending or entering an oracle.
         // No leaf or topology guard is held while touching the WAL mutex.
-        let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+        let appended = self
+            .publish_wal_before_eager_index_write(txn_id, wal_owner)
+            .and_then(|()| crate::wal::LogManager::pre_encode_record(txn_id, payload))
             .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre));
         let lsn = match appended {
             Ok(lsn) => {
@@ -7474,7 +7518,13 @@ impl IndexFile {
         self.meta_state.lock().meta.next_page_id
     }
 
-    fn delete_deferred(&self, txn_id: u64, key: IndexKey, row_id: RowId) -> Result<(), QueryError> {
+    fn delete_deferred(
+        &self,
+        txn_id: u64,
+        key: IndexKey,
+        row_id: RowId,
+        wal_owner: Option<&Database>,
+    ) -> Result<(), QueryError> {
         if let Some(spatial) = &self.spatial {
             return spatial.apply(
                 txn_id,
@@ -7520,7 +7570,9 @@ impl IndexFile {
                 // structural decline has not changed the leaf; a successful
                 // deferred mutation keeps its pin until the eager fallback
                 // has assigned a real LSN.
-                let appended = crate::wal::LogManager::pre_encode_record(txn_id, payload)
+                let appended = self
+                    .publish_wal_before_eager_index_write(txn_id, wal_owner)
+                    .and_then(|()| crate::wal::LogManager::pre_encode_record(txn_id, payload))
                     .and_then(|pre| crate::wal::LogManager::append_pre_encoded_to(&self.log, pre));
                 let lsn = match appended {
                     Ok(lsn) => {
@@ -7547,9 +7599,13 @@ impl IndexFile {
         // so we don't emit a 32 KB per-page before/after image for a
         // single B-tree leaf modification. Recovery replays via
         // `redo_index_batch` → `delete_internal`.
-        self.apply_single_index_op_logged(txn_id, WalIndexOpKind::Delete, entry, |index, entry| {
-            index.delete_entry_concurrent(txn_id, entry)
-        })
+        self.apply_single_index_op_logged(
+            txn_id,
+            WalIndexOpKind::Delete,
+            entry,
+            |index, entry| index.delete_entry_concurrent(txn_id, entry),
+            wal_owner,
+        )
     }
 
     /// Remove a single entry without excluding readers or writers on other
@@ -9323,6 +9379,7 @@ impl IndexFile {
         kind: WalIndexOpKind,
         entry: IndexEntry,
         apply: impl FnOnce(&Self, IndexEntry) -> Result<(), QueryError>,
+        wal_owner: Option<&Database>,
     ) -> Result<(), QueryError> {
         self.ensure_healthy()?;
         if let Some(log) = &self.online_build_log {
@@ -9338,6 +9395,7 @@ impl IndexFile {
         }
         // Publish redo before any page can become dirty/evictable. A future
         // peek-LSN is not a reservation: another writer can make it durable.
+        self.publish_wal_before_eager_index_write(txn_id, wal_owner)?;
         let wal_op = Self::encode_wal_index_op(kind, &entry)?;
         let pre = crate::wal::LogManager::pre_encode_record(
             txn_id,
@@ -19784,7 +19842,7 @@ mod logged_delete_batch_tests {
                 row_id: entry.row_id,
             })
             .collect();
-        file.apply_batch_deferred(7, deletes).unwrap();
+        file.apply_batch_deferred(7, deletes, None).unwrap();
         assert_eq!(file.root_page.load(Ordering::Acquire), root.children[1]);
         let root = file
             .read_page(file.root_page.load(Ordering::Acquire))
@@ -19843,7 +19901,7 @@ mod logged_delete_batch_tests {
                     }
                 })
                 .collect();
-            file.apply_batch_deferred(7, deletes).unwrap();
+            file.apply_batch_deferred(7, deletes, None).unwrap();
             file.validate_structure().unwrap();
         }
         let expected: Vec<_> = entries
@@ -19888,6 +19946,7 @@ mod logged_delete_batch_tests {
                     row_id: entry.row_id,
                 })
                 .collect(),
+            None,
         )
         .unwrap();
         assert!(file.entries().unwrap().is_empty());
@@ -20065,6 +20124,7 @@ mod logged_delete_batch_tests {
             8,
             removed_destination.key.clone(),
             removed_destination.row_id,
+            None,
         )
         .unwrap();
         assert!(
@@ -24170,9 +24230,7 @@ fn read_varint_u64_checked(buf: &[u8], offset: &mut usize) -> Result<u64, QueryE
 }
 
 #[cfg(test)]
-/// Byte length the LEB128 encoder will emit for `value`. Hot path:
-/// every size estimator that previously assumed 8 B for page_id
-/// now multiplies by this length per entry.
+/// Byte length the LEB128 encoder emits, used by codec regression tests.
 fn varint_u64_len(value: u64) -> usize {
     let mut len = 1usize;
     let mut v = value >> 7;

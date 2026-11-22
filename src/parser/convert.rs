@@ -87,8 +87,9 @@ fn convert_like_escape(escape: Option<&sqlparser::ast::Value>) -> Result<Option<
     let first = chars.next();
     if chars.next().is_some() {
         // MySQL 8.0.45 raises ER 1210 with SQLSTATE HY000 verbatim.
-        return Err(ParseError::at_zero(
-            "Incorrect arguments to ESCAPE (expected 0 or 1 characters)",
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_WRONG_ARGUMENTS,
+            "Incorrect arguments to ESCAPE",
         ));
     }
     Ok(first)
@@ -241,6 +242,17 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             let Some(name) = name else {
                 return unsupported("CREATE INDEX without name");
             };
+            if name
+                .0
+                .first()
+                .and_then(|p| p.as_ident())
+                .is_some_and(|i| i.value.eq_ignore_ascii_case("PRIMARY"))
+            {
+                return Err(numeric_spec_error(
+                    crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+                    "Incorrect index name 'PRIMARY'",
+                ));
+            }
             if concurrently {
                 return unsupported("CREATE INDEX CONCURRENTLY");
             }
@@ -252,9 +264,6 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             }
             if !with.is_empty() {
                 return unsupported("CREATE INDEX WITH storage parameters");
-            }
-            if predicate.is_some() {
-                return unsupported("partial CREATE INDEX with WHERE predicate");
             }
             let mut algorithm = AlterAlgorithm::Default;
             let mut lock = AlterLock::Default;
@@ -296,6 +305,15 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
                 ));
             }
             Ok(Statement::CreateIndex(CreateIndex {
+                predicate: predicate
+                    .as_ref()
+                    .map(|expr| {
+                        convert_expr(expr).and_then(|expr| {
+                            index_expression_to_catalog_sql(&expr, false)
+                                .map_err(|e| parse_error_at_zero(e.to_string()))
+                        })
+                    })
+                    .transpose()?,
                 name: object_name_to_string(name)?,
                 table: object_name_to_string(table_name)?,
                 algorithm,
@@ -1162,6 +1180,7 @@ fn convert_create_table(
         if column.unique {
             let columns = ConvertedIndexColumns::bare(vec![column.name.clone()]);
             indexes.push(IndexDef {
+                predicate: None,
                 // MySQL derives an unnamed inline UNIQUE index name from
                 // the first key column, not from a private `_uniq` suffix.
                 name: Some(column.name.clone()),
@@ -1215,6 +1234,7 @@ fn convert_create_table(
                     // generic index machinery, which preserves both —
                     // storage recognises the PRIMARY-named IndexDef.
                     indexes.push(IndexDef {
+                        predicate: None,
                         name: Some("PRIMARY".to_string()),
                         columns: columns.names,
                         column_prefix_lengths: columns.prefix_lengths,
@@ -1254,7 +1274,8 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
-                    name: constraint.index_name.or(constraint.name).map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.index_name.or(constraint.name))?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1284,7 +1305,8 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
-                    name: constraint.name.map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1315,7 +1337,8 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
-                    name: constraint.opt_index_name.map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1337,7 +1360,8 @@ fn convert_create_table(
                 let columns = convert_index_columns(constraint.columns)?;
                 validate_spatial_index_columns(&columns)?;
                 indexes.push(IndexDef {
-                    name: constraint.opt_index_name.map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1552,6 +1576,7 @@ fn column_alter_actions(
         for is_primary in [true, false] {
             if (is_primary && primary) || (!is_primary && unique) {
                 actions.push(AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: is_primary.then(|| "PRIMARY".to_string()),
                     columns: vec![column.clone()],
                     column_prefix_lengths: vec![None],
@@ -1629,7 +1654,8 @@ fn convert_alter_table_action(
                     &constraint.index_options,
                 )?;
                 AlterAction::AddIndex(IndexDef {
-                    name: constraint.index_name.or(constraint.name).map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.index_name.or(constraint.name))?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1665,6 +1691,7 @@ fn convert_alter_table_action(
                     }));
                 }
                 AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: Some("PRIMARY".to_string()),
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1687,7 +1714,8 @@ fn convert_alter_table_action(
                     &constraint.index_options,
                 )?;
                 AlterAction::AddIndex(IndexDef {
-                    name: constraint.name.map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -1733,7 +1761,8 @@ fn convert_alter_table_action(
                     "SPATIAL"
                 };
                 AlterAction::AddIndex(IndexDef {
-                    name: constraint.opt_index_name.map(ident_value),
+                    predicate: None,
+                    name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
                     column_descending: columns.descending,
@@ -2133,6 +2162,7 @@ pub(super) fn convert_insert(
         columns,
         source,
         view_check_predicate: None,
+        view_replace_predicate: None,
         on_duplicate_key_update,
         insert_alias,
         ignore,
@@ -2553,7 +2583,7 @@ fn convert_set_expr_checked(
 fn convert_values_query(
     sql: &str,
     values: &sqlparser::ast::Values,
-    order_by: Vec<OrderBy>,
+    mut order_by: Vec<OrderBy>,
     limit: Option<LimitValue>,
     offset: Option<LimitValue>,
     for_update: bool,
@@ -2580,9 +2610,24 @@ fn convert_values_query(
         }
         rows.push(converted);
     }
-    let columns = (0..width.unwrap_or(0))
+    let columns: Vec<String> = (0..width.unwrap_or(0))
         .map(|idx| format!("column_{idx}"))
         .collect();
+    for item in &mut order_by {
+        if let Expr::Literal(Literal::Int(position)) = item.expr {
+            let column = usize::try_from(position)
+                .ok()
+                .and_then(|p| p.checked_sub(1))
+                .and_then(|p| columns.get(p))
+                .ok_or_else(|| {
+                    parse_error_with_spec_at_zero(
+                        crate::error::catalog::ER_BAD_FIELD_ERROR,
+                        format!("Unknown column '{position}' in 'order clause'"),
+                    )
+                })?;
+            item.expr = Expr::Identifier(column.clone());
+        }
+    }
     Ok(Statement::Select(Select {
         rls_security_context: None,
         rls_expression_settings: None,
@@ -2653,6 +2698,83 @@ fn convert_projection_order(
             }));
         }
     }
+}
+
+pub(crate) fn validate_query_table_names(
+    from: &[TableRef],
+    derived: Option<&SubQuery>,
+    joins: &[Join],
+    default_database: Option<&str>,
+) -> Result<(), ParseError> {
+    fn insert(
+        table: &TableRef,
+        derived: Option<&SubQuery>,
+        default_database: Option<&str>,
+        names: &mut std::collections::HashSet<String>,
+    ) -> Result<(), ParseError> {
+        if table.name == "$nested_join_preserve" && table.alias.is_none() {
+            if let Some(inner) = derived.and_then(SubQuery::leftmost_select) {
+                for (index, table) in inner.from.iter().enumerate() {
+                    insert(
+                        table,
+                        if index == 0 {
+                            inner.derived.as_ref()
+                        } else {
+                            None
+                        },
+                        default_database,
+                        names,
+                    )?;
+                }
+                for join in &inner.joins {
+                    insert(&join.table, join.derived.as_ref(), default_database, names)?;
+                }
+                return Ok(());
+            }
+        }
+        let (database, object) = if derived.is_none() {
+            table
+                .name
+                .rsplit_once('.')
+                .unwrap_or((default_database.unwrap_or(""), &table.name))
+        } else {
+            (default_database.unwrap_or(""), table.name.as_str())
+        };
+        let name = table.alias.as_deref().unwrap_or(object);
+        let mut key = String::with_capacity(database.len() + name.len() + 1);
+        key.push_str(database);
+        key.push('\0');
+        key.push_str(name);
+        key.make_ascii_lowercase();
+        if !names.insert(key) {
+            return Err(parse_error_with_spec_at_zero(
+                crate::error::catalog::ER_NONUNIQ_TABLE,
+                format!("Not unique table/alias: '{name}'"),
+            ));
+        }
+        Ok(())
+    }
+    if from.len() + joins.len() < 2 {
+        return Ok(());
+    }
+    let mut names = std::collections::HashSet::with_capacity(from.len() + joins.len());
+    for (index, table) in from.iter().enumerate() {
+        insert(
+            table,
+            if index == 0 { derived } else { None },
+            default_database,
+            &mut names,
+        )?;
+    }
+    for join in joins {
+        insert(
+            &join.table,
+            join.derived.as_ref(),
+            default_database,
+            &mut names,
+        )?;
+    }
+    Ok(())
 }
 
 fn convert_select(
@@ -2769,6 +2891,7 @@ fn convert_select(
             (Some(primary_name), vec![base], derived_first, joins)
         }
     };
+    validate_query_table_names(&from, derived.as_ref(), &joins, None)?;
     let mut projection = select
         .projection
         .iter()
@@ -2980,6 +3103,31 @@ fn convert_window_frame(frame: &sqlparser::ast::WindowFrame) -> Result<WindowFra
         Some(b) => convert_window_frame_bound(b)?,
         None => WindowFrameBound::CurrentRow,
     };
+    let category = |bound: &WindowFrameBound| match bound {
+        WindowFrameBound::UnboundedPreceding => 0,
+        WindowFrameBound::Preceding(_) => 1,
+        WindowFrameBound::CurrentRow => 2,
+        WindowFrameBound::Following(_) => 3,
+        WindowFrameBound::UnboundedFollowing => 4,
+    };
+    if matches!(start, WindowFrameBound::UnboundedFollowing) {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_WINDOW_FRAME_START_ILLEGAL,
+            "Window frame cannot start with UNBOUNDED FOLLOWING",
+        ));
+    }
+    if matches!(end, WindowFrameBound::UnboundedPreceding) {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_WINDOW_FRAME_END_ILLEGAL,
+            "Window frame cannot end with UNBOUNDED PRECEDING",
+        ));
+    }
+    if category(&start) > category(&end) {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_WINDOW_FRAME_ILLEGAL,
+            "Window frame start follows frame end",
+        ));
+    }
     Ok(WindowFrame {
         units,
         start,
@@ -3940,10 +4088,18 @@ fn convert_foreign_key_constraint(
         match_kind,
         characteristics,
     } = fk;
-    // `MATCH FULL|PARTIAL|SIMPLE`: InnoDB parses but ignores the MATCH clause
-    // (all references behave as MATCH SIMPLE), so accepting it here — rather
-    // than erroring — mirrors MySQL 8.0. mydb likewise implements SIMPLE.
-    let _ = match_kind;
+    if matches!(
+        match_kind,
+        Some(
+            sqlparser::ast::ConstraintReferenceMatchKind::Full
+                | sqlparser::ast::ConstraintReferenceMatchKind::Partial
+        )
+    ) {
+        return Err(parse_error_with_spec_at_zero(
+            crate::error::catalog::ER_NOT_SUPPORTED_YET,
+            "MATCH FULL/PARTIAL foreign keys are not supported; use MATCH SIMPLE",
+        ));
+    }
     // `index_name` (the optional MySQL `FOREIGN KEY idx_name (...)` hint) and
     // `characteristics` (Postgres-style DEFERRABLE, unreachable from MySQL
     // grammar) are not modeled: the backing index name is chosen by
@@ -4076,7 +4232,9 @@ fn convert_data_type_with_unsigned(
         // spatial names; anything else falls through to the unsupported arm.
         SqlDataType::Custom(name, modifiers) => {
             let name_str = name.to_string();
-            if name_str.eq_ignore_ascii_case("VECTOR") {
+            if let Some(extensions::Extension::TextLength(length)) = extensions::get(&name_str) {
+                DataType::TextLength(length)
+            } else if name_str.eq_ignore_ascii_case("VECTOR") {
                 // `VECTOR(n)` — the dimension arrives as a string modifier.
                 {
                     let (dim, datatype) = parse_vector_type(&modifiers, sql)?;
@@ -4198,6 +4356,42 @@ fn numeric_literal_operand(expr: &mut Expr) {
             let value = literal_bytes_to_u64(bytes);
             i64::try_from(value).map_or(Literal::UInt(value), Literal::Int)
         }
+        Expr::Case {
+            results,
+            else_result,
+            ..
+        } => {
+            results.iter_mut().for_each(numeric_literal_operand);
+            if let Some(result) = else_result {
+                numeric_literal_operand(result);
+            }
+            return;
+        }
+        Expr::Function { name, args, .. } => {
+            if name.eq_ignore_ascii_case("IF") {
+                args.iter_mut().skip(1).for_each(numeric_literal_operand);
+            } else if name.eq_ignore_ascii_case("IFNULL") || name.eq_ignore_ascii_case("COALESCE") {
+                args.iter_mut().for_each(numeric_literal_operand);
+            } else if name.eq_ignore_ascii_case("NULLIF") {
+                if let Some(first) = args.first_mut() {
+                    numeric_literal_operand(first);
+                }
+            }
+            return;
+        }
+        Expr::Subquery(_) => {
+            // Coerce after evaluating the scalar query. Rewriting its SELECT
+            // list would also change alias references in HAVING/ORDER BY.
+            if crate::engine::expr::expr_is_numeric_hexbit_literal(expr) {
+                let original = std::mem::replace(expr, Expr::Literal(Literal::Null));
+                *expr = Expr::Function {
+                    name: "CAST".into(),
+                    distinct: false,
+                    args: vec![original, Expr::Literal(Literal::String("DOUBLE".into()))],
+                };
+            }
+            return;
+        }
         _ => return,
     };
     *expr = Expr::Literal(literal);
@@ -4248,7 +4442,15 @@ fn numeric_literal_comparison_group(mut operands: Vec<&mut Expr>) {
     for operand in &operands {
         if is_numeric_constant_literal(operand) {
             has_number = true;
-        } else if !is_hexbit_literal(operand) {
+        } else if !is_hexbit_literal(operand)
+            && !match &**operand {
+                Expr::Case { .. } | Expr::Subquery(_) => true,
+                Expr::Function { name, .. } => ["IF", "IFNULL", "NULLIF", "COALESCE"]
+                    .iter()
+                    .any(|n| name.eq_ignore_ascii_case(n)),
+                _ => false,
+            }
+        {
             return;
         }
     }
@@ -4434,7 +4636,7 @@ fn convert_expr_checked(expr: &SqlExpr) -> Result<Expr, ParseError> {
                 for operand in [left, right] {
                     if !arithmetic
                         || division
-                        || matches!(&**operand, Expr::Literal(Literal::BitBytes(_)))
+                        || !matches!(&**operand, Expr::Literal(Literal::HexBytes(_)))
                     {
                         numeric_literal_operand(operand);
                     }
@@ -4459,7 +4661,16 @@ fn convert_expr_checked(expr: &SqlExpr) -> Result<Expr, ParseError> {
             }
             Expr::Between {
                 expr, low, high, ..
-            } => numeric_literal_comparison_group(vec![&mut **expr, &mut **low, &mut **high]),
+            } => {
+                if [&**expr, &**low, &**high]
+                    .iter()
+                    .any(|e| is_numeric_constant_literal(e))
+                {
+                    for e in [expr, low, high] {
+                        numeric_literal_operand(e);
+                    }
+                }
+            }
             Expr::Case {
                 operand,
                 conditions,
@@ -4513,9 +4724,15 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
     match expr {
         SqlExpr::Nested(expr) => convert_expr(expr),
         SqlExpr::Identifier(ident) => {
+            if ident.value.contains('\0') {
+                return Err(parse_error_at_zero(
+                    "NUL is not allowed in an SQL identifier",
+                ));
+            }
             if ident.quote_style.is_none()
                 && (ident.value.eq_ignore_ascii_case("MOD")
-                    || ident.value.eq_ignore_ascii_case("BOTH"))
+                    || ident.value.eq_ignore_ascii_case("BOTH")
+                    || ident.value.eq_ignore_ascii_case("NOT"))
             {
                 return Err(parse_error_at_zero(
                     "reserved identifiers MOD and BOTH must be quoted",
@@ -4536,6 +4753,19 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             Ok(Expr::Identifier(value))
         }
         SqlExpr::CompoundIdentifier(parts) => {
+            if parts.first().is_some_and(|part| {
+                part.quote_style.is_none()
+                    && part.value.starts_with('@')
+                    && !part.value.starts_with("@@")
+            }) {
+                return user_variable_expr(
+                    &parts
+                        .iter()
+                        .map(|p| p.value.as_str())
+                        .collect::<Vec<_>>()
+                        .join(".")[1..],
+                );
+            }
             let system_variable = parts
                 .first()
                 .is_some_and(|part| part.quote_style.is_none() && part.value.starts_with("@@"));
@@ -4798,17 +5028,52 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             } = expr.as_ref()
             {
                 if is_sql_comparison_op(cmp_op) {
+                    reject_predicate_as_predicate_lhs(cmp_right)?;
                     return Ok(Expr::Binary {
                         left: Box::new(convert_expr(cmp_left)?),
                         op: convert_binary_op(cmp_op)?,
-                        right: Box::new(Expr::Between {
-                            expr: Box::new(convert_expr(cmp_right)?),
-                            low: Box::new(convert_expr(low)?),
-                            high: Box::new(convert_expr(high)?),
+                        right: Box::new(convert_expr(&SqlExpr::Between {
+                            expr: cmp_right.clone(),
+                            low: low.clone(),
+                            high: high.clone(),
                             negated: *negated,
-                        }),
+                        })?),
                     });
                 }
+            }
+
+            // IS applies to the whole BETWEEN. Retain parentheses: a Nested
+            // upper operand is an explicit bound and must not be rotated.
+            let truth_bound = match high.as_ref() {
+                SqlExpr::IsNull(inner)
+                | SqlExpr::IsNotNull(inner)
+                | SqlExpr::IsTrue(inner)
+                | SqlExpr::IsNotTrue(inner)
+                | SqlExpr::IsFalse(inner)
+                | SqlExpr::IsNotFalse(inner)
+                | SqlExpr::IsUnknown(inner)
+                | SqlExpr::IsNotUnknown(inner) => Some(inner),
+                _ => None,
+            };
+            if let Some(inner) = truth_bound {
+                let between = Box::new(SqlExpr::Between {
+                    expr: expr.clone(),
+                    negated: *negated,
+                    low: low.clone(),
+                    high: inner.clone(),
+                });
+                let rotated = match high.as_ref() {
+                    SqlExpr::IsNull(_) => SqlExpr::IsNull(between),
+                    SqlExpr::IsNotNull(_) => SqlExpr::IsNotNull(between),
+                    SqlExpr::IsTrue(_) => SqlExpr::IsTrue(between),
+                    SqlExpr::IsNotTrue(_) => SqlExpr::IsNotTrue(between),
+                    SqlExpr::IsFalse(_) => SqlExpr::IsFalse(between),
+                    SqlExpr::IsNotFalse(_) => SqlExpr::IsNotFalse(between),
+                    SqlExpr::IsUnknown(_) => SqlExpr::IsUnknown(between),
+                    SqlExpr::IsNotUnknown(_) => SqlExpr::IsNotUnknown(between),
+                    _ => unreachable!(),
+                };
+                return convert_expr(&rotated);
             }
 
             // The high operand is a `predicate`, not a `bool_pri`. Thus a
@@ -4822,12 +5087,12 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             {
                 if is_sql_comparison_op(high_op) {
                     return Ok(Expr::Binary {
-                        left: Box::new(Expr::Between {
-                            expr: Box::new(convert_expr(expr)?),
-                            low: Box::new(convert_expr(low)?),
-                            high: Box::new(convert_expr(high_left)?),
+                        left: Box::new(convert_expr(&SqlExpr::Between {
+                            expr: expr.clone(),
+                            low: low.clone(),
+                            high: high_left.clone(),
                             negated: *negated,
-                        }),
+                        })?),
                         op: convert_binary_op(high_op)?,
                         right: Box::new(convert_expr(high_right)?),
                     });
@@ -4851,6 +5116,16 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             }
             let name = scalar_call_name(function, function_object_name(&function.name)?)?;
             validate_function_syntax(function, &name)?;
+            if name.eq_ignore_ascii_case("DATE_ADD") || name.eq_ignore_ascii_case("DATE_SUB") {
+                let valid = matches!(&function.args, FunctionArguments::List(list)
+                    if list.args.len() == 2 && matches!(&list.args[1],
+                        FunctionArg::Unnamed(FunctionArgExpr::Expr(interval)) if is_sql_interval_expr(interval)));
+                if !valid {
+                    return Err(parse_error_at_zero(
+                        "DATE_ADD/DATE_SUB requires an explicit INTERVAL value and unit",
+                    ));
+                }
+            }
             let mut args = convert_function_args(&function.args)?;
             if name.eq_ignore_ascii_case("DEFAULT") {
                 if let [Expr::CompoundIdentifier(parts)] = args.as_slice() {
@@ -5301,11 +5576,29 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
             let mut args = vec![convert_expr(expr)?];
             if let Some(dt) = data_type {
                 if charset.is_some() {
-                    return parse_error_from_sql_span(
-                        expr.span(),
-                        "CONVERT charset clause is not supported",
-                        vec![],
-                    );
+                    if !matches!(dt, SqlDataType::Char(_) | SqlDataType::Character(_)) {
+                        return Err(parse_error_at_zero(
+                            "CONVERT CHARACTER SET requires a CHAR target",
+                        ));
+                    }
+                    let (type_name, extra) = convert_cast_data_type(dt)?;
+                    let mut cast_args =
+                        vec![args.remove(0), Expr::Literal(Literal::String(type_name))];
+                    cast_args.extend(extra);
+                    return Ok(Expr::Function {
+                        name: "CONVERT_USING".into(),
+                        args: vec![
+                            Expr::Function {
+                                name: "CAST".into(),
+                                args: cast_args,
+                                distinct: false,
+                            },
+                            Expr::Literal(Literal::String(object_name_to_string(
+                                charset.as_ref().unwrap(),
+                            )?)),
+                        ],
+                        distinct: false,
+                    });
                 }
                 let (type_name, extra) = convert_cast_data_type(dt)?;
                 args.push(Expr::Literal(Literal::String(type_name)));
@@ -5772,6 +6065,17 @@ fn validate_function_syntax(
             .iter()
             .any(|candidate| name.eq_ignore_ascii_case(candidate))
     };
+    if named(&["CONVERT"]) {
+        return Err(parse_error_at_zero(
+            "CONVERT requires a target type or USING charset",
+        ));
+    }
+    if named(&["VALUES"])
+        && !matches!(args, FunctionArguments::List(list)
+        if matches!(list.args.as_slice(), [FunctionArg::Unnamed(FunctionArgExpr::Expr(SqlExpr::Identifier(_) | SqlExpr::CompoundIdentifier(_)))]))
+    {
+        return Err(parse_error_at_zero("VALUES requires a column name"));
+    }
     if over.is_some() && named(&["ROW", "DEFAULT"]) {
         return Err(parse_error_at_zero(format!(
             "OVER is not allowed for {name}"
@@ -5916,13 +6220,11 @@ fn convert_function_args(args: &FunctionArguments) -> Result<Vec<Expr>, ParseErr
 fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>), ParseError> {
     Ok(match data_type {
         SqlDataType::Signed | SqlDataType::SignedInteger => ("SIGNED".to_string(), vec![]),
+        // Integer spellings are native aliases of the signed 64-bit cast.
+        SqlDataType::Int(None) | SqlDataType::Integer(None) | SqlDataType::BigInt(None) => {
+            ("SIGNED".to_string(), vec![])
+        }
         SqlDataType::Unsigned | SqlDataType::UnsignedInteger => ("UNSIGNED".to_string(), vec![]),
-        SqlDataType::Int(_)
-        | SqlDataType::Integer(_)
-        | SqlDataType::BigInt(_)
-        | SqlDataType::TinyInt(_)
-        | SqlDataType::SmallInt(_)
-        | SqlDataType::MediumInt(_) => ("SIGNED".to_string(), vec![]),
         SqlDataType::Char(len) | SqlDataType::Character(len) => {
             let mut extra = vec![];
             if let Some(CharacterLength::IntegerLength { length, .. }) = len {
@@ -5931,25 +6233,10 @@ fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>)
             }
             ("CHAR".to_string(), extra)
         }
-        SqlDataType::Varchar(len) | SqlDataType::CharVarying(len) => {
-            let mut extra = vec![];
-            if let Some(CharacterLength::IntegerLength { length, .. }) = len {
-                validate_cast_character_length(*length, 4, "CHAR")?;
-                extra.push(Expr::Literal(Literal::Int(*length as i64)));
-            }
-            ("CHAR".to_string(), extra)
-        }
-        SqlDataType::Text
-        | SqlDataType::TinyText
-        | SqlDataType::MediumText
-        | SqlDataType::LongText
-        | SqlDataType::Clob(_) => ("CHAR".to_string(), vec![]),
         SqlDataType::Date => ("DATE".to_string(), vec![]),
-        SqlDataType::Datetime(p) | SqlDataType::Timestamp(p, _) => {
-            ("DATETIME".to_string(), cast_fsp_extra(*p))
-        }
+        SqlDataType::Datetime(p) => ("DATETIME".to_string(), cast_fsp_extra(*p)),
         SqlDataType::Time(p, _) => ("TIME".to_string(), cast_fsp_extra(*p)),
-        SqlDataType::Decimal(info) | SqlDataType::Dec(info) | SqlDataType::Numeric(info) => {
+        SqlDataType::Decimal(info) | SqlDataType::Dec(info) => {
             let mut extra = vec![];
             match info {
                 ExactNumberInfo::PrecisionAndScale(p, s) => {
@@ -5968,6 +6255,9 @@ fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>)
         SqlDataType::Double(_) | SqlDataType::DoublePrecision | SqlDataType::Real => {
             ("DOUBLE".to_string(), vec![])
         }
+        SqlDataType::Float(ExactNumberInfo::Precision(p)) if *p > 24 => {
+            ("DOUBLE".to_string(), vec![])
+        }
         SqlDataType::Float(_) | SqlDataType::Float4 => ("FLOAT".to_string(), vec![]),
         SqlDataType::Binary(len) => {
             let mut extra = vec![];
@@ -5977,26 +6267,7 @@ fn convert_cast_data_type(data_type: &SqlDataType) -> Result<(String, Vec<Expr>)
             }
             ("BINARY".to_string(), extra)
         }
-        SqlDataType::Varbinary(len) => {
-            let mut extra = vec![];
-            if let Some(bl) = len {
-                let n = match bl {
-                    sqlparser::ast::BinaryLength::IntegerLength { length } => *length as i64,
-                    sqlparser::ast::BinaryLength::Max => i64::MAX,
-                };
-                extra.push(Expr::Literal(Literal::Int(n)));
-            }
-            ("BINARY".to_string(), extra)
-        }
-        SqlDataType::Blob(_)
-        | SqlDataType::TinyBlob
-        | SqlDataType::MediumBlob
-        | SqlDataType::LongBlob => ("BINARY".to_string(), vec![]),
         SqlDataType::JSON | SqlDataType::JSONB => ("JSON".to_string(), vec![]),
-        // MySQL 8.0 has no `CAST(x AS BOOLEAN)` target — it must raise the
-        // canonical "unsupported CAST target type" error, not silently degrade
-        // to CHAR via the catch-all below (project rule: no silent no-op).
-        SqlDataType::Bool | SqlDataType::Boolean => ("BOOLEAN".to_string(), vec![]),
         // sqlparser 0.61 has no native YEAR / NCHAR / VECTOR cast types;
         // the MySQL dialect surfaces them as Custom identifiers. Pass the
         // name through — the evaluator owns the supported-target list and
@@ -6736,10 +7007,12 @@ fn convert_table_factor(
             alias,
             sample: None,
         } => {
-            let alias_name = alias
-                .as_ref()
-                .map(table_alias_name)
-                .unwrap_or_else(|| "derived".to_string());
+            let alias_name = alias.as_ref().map(table_alias_name).unwrap_or_else(|| {
+                with_parser_source(|sql| {
+                    extensions::register(sql, extensions::Extension::DerivedAlias)
+                })
+                .unwrap_or_else(|| "derived".to_string())
+            });
             let mut subquery = convert_query_to_subquery(subquery)?;
             let alias_columns = table_alias_columns(alias.as_ref());
             let mut deferred_aliases = Vec::new();
@@ -6864,6 +7137,12 @@ fn convert_table_factor(
             // whole group in the normal derived-table manner.
             let (base, base_derived, _base_lateral, joins) =
                 convert_table_with_joins(table_with_joins)?;
+            validate_query_table_names(
+                std::slice::from_ref(&base),
+                base_derived.as_ref(),
+                &joins,
+                None,
+            )?;
             let nested = Select {
                 rls_security_context: None,
                 rls_expression_settings: None,
@@ -7030,7 +7309,7 @@ fn convert_join_using_columns(columns: &[ObjectName]) -> Result<Vec<String>, Str
             _ => return Err("JOIN USING qualified column".to_owned()),
         };
         if columns.len() > 1 && !seen.insert(name.to_ascii_lowercase()) {
-            return Err("JOIN USING duplicate column".to_string());
+            continue;
         }
         out.push(name.clone());
     }
@@ -7403,7 +7682,21 @@ fn convert_group_by(
 }
 
 fn validate_spatial_index_columns(columns: &ConvertedIndexColumns) -> Result<(), ParseError> {
-    let (spec, message) = if columns.names.len() != 1 {
+    let key_count = columns
+        .names
+        .iter()
+        .filter(|name| {
+            !matches!(
+                extensions::get(name),
+                Some(
+                    extensions::Extension::IndexPredicate
+                        | extensions::Extension::IndexVisibility
+                        | extensions::Extension::IndexInclude(_)
+                )
+            )
+        })
+        .count();
+    let (spec, message) = if key_count != 1 {
         (
             crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
             "A SPATIAL index requires exactly one key part",
@@ -7605,6 +7898,14 @@ fn convert_float_number_info(
                 return Err(numeric_spec_error(
                     crate::error::catalog::ER_M_BIGGER_THAN_D,
                     "For float(M,D), double(M,D) or decimal(M,D), M must be >= D",
+                ));
+            }
+            // MySQL validates the scale and M >= D before rejecting a zero
+            // display width, so FLOAT(0,2) reports ER_M_BIGGER_THAN_D.
+            if p == 0 {
+                return Err(numeric_spec_error(
+                    crate::error::catalog::ER_TOO_BIG_DISPLAYWIDTH,
+                    "Display width must be greater than zero",
                 ));
             }
             Ok(Some((p as u8, scale as u8)))
@@ -7901,8 +8202,14 @@ pub(super) fn accept_generic_table_option(
             "REDUNDANT",
             "COMPACT",
         ])?,
-        "KEY_BLOCK_SIZE" | "STATS_SAMPLE_PAGES" | "MAX_ROWS" | "MIN_ROWS" | "AVG_ROW_LENGTH"
-        | "AUTOEXTEND_SIZE" => {
+        "KEY_BLOCK_SIZE" => {
+            let parsed = uint_value()?;
+            if parsed.parse::<u64>().map_or(true, |n| n > 65535) {
+                return Err("KEY_BLOCK_SIZE must be between 0 and 65535".to_string());
+            }
+            parsed
+        }
+        "STATS_SAMPLE_PAGES" | "MAX_ROWS" | "MIN_ROWS" | "AVG_ROW_LENGTH" | "AUTOEXTEND_SIZE" => {
             if key == "STATS_SAMPLE_PAGES" && upper_value == "DEFAULT" {
                 "DEFAULT".to_string()
             } else {
@@ -9744,8 +10051,37 @@ fn validate_name_component(ident: &Ident) -> Result<&str, ParseError> {
     Ok(&ident.value)
 }
 
+fn ordinary_index_name(name: Option<Ident>) -> Result<Option<String>, ParseError> {
+    if name
+        .as_ref()
+        .is_some_and(|n| n.value.eq_ignore_ascii_case("PRIMARY"))
+    {
+        return Err(numeric_spec_error(
+            crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+            "Incorrect index name 'PRIMARY'",
+        ));
+    }
+    Ok(name.map(ident_value))
+}
+
 fn object_name_to_string(name: impl std::borrow::Borrow<ObjectName>) -> Result<String, ParseError> {
     let name = name.borrow();
+    if name.0.is_empty() || name.0.len() > 2 {
+        return Err(parse_error_at_zero("expected [database.]object"));
+    }
+    for (pos, part) in name.0.iter().enumerate() {
+        if part
+            .as_ident()
+            .is_some_and(|i| i.value.is_empty() || i.value.ends_with(' '))
+        {
+            let spec = if name.0.len() == 2 && pos == 0 {
+                crate::error::catalog::ER_WRONG_DB_NAME
+            } else {
+                crate::error::catalog::ER_WRONG_TABLE_NAME
+            };
+            return Err(numeric_spec_error(spec, "Incorrect object name"));
+        }
+    }
     for part in &name.0 {
         if let ObjectNamePart::Identifier(ident) = part {
             validate_identifier(ident)?;

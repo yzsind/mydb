@@ -67,11 +67,17 @@ fn parse_cast(parser: &mut Parser) -> Result<Expr, ParserError> {
         return Ok(super::scalar_function(name, vec![expr]));
     }
     parser.expect_keyword(Keyword::AS)?;
+    let national = parser.parse_keyword(Keyword::NATIONAL);
     let data_type = parser.parse_data_type()?;
+    if national && !matches!(data_type, DataType::Char(_) | DataType::Character(_)) {
+        return parser.expected("CHAR after NATIONAL", parser.peek_token());
+    }
     if matches!(data_type, DataType::Signed | DataType::Unsigned) {
         let _ = parser.parse_keyword(Keyword::INT);
     }
-    let charset = if parser.parse_keyword(Keyword::CHARSET) {
+    let charset = if national {
+        Some(sqlparser::ast::Ident::new("utf8mb3"))
+    } else if parser.parse_keyword(Keyword::CHARSET) {
         Some(parser.parse_identifier()?)
     } else if parser.parse_keyword(Keyword::CHARACTER) {
         parser.expect_keyword(Keyword::SET)?;

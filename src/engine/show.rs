@@ -1164,13 +1164,11 @@ pub(crate) fn show_routine_status(
     let schema_kind = routine_kind_schema(kind);
     let columns = show_routine_status_columns();
     let mut rows = db
-        .routines_in_database(&session.current_database)
-        .into_iter()
-        .chain(if session.current_database.eq_ignore_ascii_case("sys") {
-            crate::engine::sys_schema::routine_schemas()
-        } else {
-            Vec::new()
-        })
+        .catalog()
+        .routines
+        .values()
+        .map(|routine| routine.as_ref().clone())
+        .chain(crate::engine::sys_schema::routine_schemas())
         .filter(|routine| routine.kind == schema_kind)
         // B3: MySQL only lists routines the caller has some privilege on
         // (its schema, the routine, or globally). Reuse the IS visibility
@@ -2468,8 +2466,13 @@ pub(crate) fn create_table_sql_with_auto_increment(
                 .join(", ");
             format!(" INCLUDE ({cols})")
         };
+        let predicate_suffix = index
+            .predicate
+            .as_ref()
+            .map(|p| format!(" WHERE ({})", p.expr_sql))
+            .unwrap_or_default();
         defs.push(format!(
-            "  {key_kind}KEY `{}` ({columns}){include_suffix}{using_suffix}{parser_suffix}{comment}{visible}",
+            "  {key_kind}KEY `{}` ({columns}){include_suffix}{using_suffix}{parser_suffix}{comment}{visible}{predicate_suffix}",
             index.name.replace('`', "``")
         ));
     }

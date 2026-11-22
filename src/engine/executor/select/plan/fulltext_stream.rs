@@ -45,6 +45,8 @@ pub(super) fn open(
         && filter.is_none()
         && !txn.historical
         && !table.schema.is_partitioned()
+        && index.predicate.is_none()
+        && db.fulltext_index_covers_snapshot(index, txn)?
         && *mode == crate::parser::FtMode::Boolean
     {
         use crate::storage::fulltext::boolean::{parse_boolean_query, Matcher, Occur};

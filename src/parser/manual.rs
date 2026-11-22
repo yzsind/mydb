@@ -1259,6 +1259,7 @@ pub(super) fn try_parse_bulk_insert(sql: &str) -> Option<Statement> {
         columns,
         source: InsertSource::Values(rows),
         view_check_predicate: None,
+        view_replace_predicate: None,
         on_duplicate_key_update,
         insert_alias: None,
         ignore,
@@ -3987,37 +3988,58 @@ fn parse_create_routine_statement(_original_sql: &str, sql: &str) -> Result<Stat
     if kind == RoutineKind::Function {
         idx = consume_keyword_at(sql, idx, "RETURNS")
             .ok_or_else(|| parse_error_at_zero("CREATE FUNCTION requires RETURNS"))?;
-        let body_or_char_pos = find_first_top_level_keyword(
-            sql,
-            idx,
-            &[
-                "LANGUAGE",
-                "DETERMINISTIC",
-                "NOT",
-                "CONTAINS",
-                "NO",
-                "READS",
-                "MODIFIES",
-                "SQL",
-                "COMMENT",
-                "BEGIN",
-                "RETURN",
-                "IF",
-                "CASE",
-                "LOOP",
-                "WHILE",
-                "REPEAT",
-                "SET",
-                "SELECT",
-                "CALL",
-                "SIGNAL",
-                "RESIGNAL",
-                "PREPARE",
-                "EXECUTE",
-                "DEALLOCATE",
-            ],
-        )
-        .ok_or_else(|| parse_error_at_zero("CREATE FUNCTION requires a body"))?;
+        // SET is both a return type and a statement starter. Skip the
+        // complete type argument list before scanning for the body.
+        let mut search_start = if let Some(after_set) = consume_keyword_at(sql, idx, "SET") {
+            consume_parenthesized(sql, skip_ws(sql, after_set))
+                .map(|(_, end)| end)
+                .unwrap_or(idx)
+        } else {
+            idx
+        };
+        let body_or_char_pos = loop {
+            let position = find_first_top_level_keyword(
+                sql,
+                search_start,
+                &[
+                    "LANGUAGE",
+                    "DETERMINISTIC",
+                    "NOT",
+                    "CONTAINS",
+                    "NO",
+                    "READS",
+                    "MODIFIES",
+                    "SQL",
+                    "COMMENT",
+                    "BEGIN",
+                    "RETURN",
+                    "IF",
+                    "CASE",
+                    "LOOP",
+                    "WHILE",
+                    "REPEAT",
+                    "SET",
+                    "SELECT",
+                    "CALL",
+                    "SIGNAL",
+                    "RESIGNAL",
+                    "PREPARE",
+                    "EXECUTE",
+                    "DEALLOCATE",
+                ],
+            )
+            .ok_or_else(|| parse_error_at_zero("CREATE FUNCTION requires a body"))?;
+            if consume_keyword_at(sql, position, "SET").is_some()
+                && sql[idx..position]
+                    .trim_end()
+                    .to_ascii_uppercase()
+                    .ends_with("CHARACTER")
+            {
+                search_start = position + 3;
+                continue;
+            }
+            break position;
+        };
         let type_sql = sql[idx..body_or_char_pos].trim();
         let (dt, unsigned) = parse_routine_data_type(type_sql)?;
         return_type = Some(dt);
@@ -5302,7 +5324,18 @@ fn parse_routine_declare(sql: &str) -> Result<RoutineStmt, ParseError> {
         .step_by(2)
         .map(|token| unquote_identifier(token))
         .collect::<Vec<_>>();
-    let data_type_sql = tokens[type_idx..].join(" ");
+    let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
+    let mut cursor = crate::sql_lex::SqlTokenCursor::new(decl_sql, mode, MYSQL_VERSION_ID);
+    let mut end = 0;
+    for _ in 0..type_idx {
+        end = cursor
+            .next()
+            .map_err(|err| parse_lex_error(decl_sql, err))?
+            .ok_or_else(|| parse_error_at_zero("DECLARE variable requires a data type"))?
+            .span
+            .end;
+    }
+    let data_type_sql = decl_sql[end..].trim().to_string();
     let (data_type, unsigned) = parse_routine_data_type(&data_type_sql)?;
     Ok(RoutineStmt::DeclareVar {
         names,

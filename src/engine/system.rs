@@ -395,7 +395,7 @@ fn variable_result(rows: Vec<(&'static str, String)>) -> ResultSet {
             },
             Column {
                 source: crate::types::ColumnSource {
-                    collation_id: Some(63),
+                    collation_id: Some(255),
                     ..Default::default()
                 },
                 name: "Value".to_string(),

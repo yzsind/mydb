@@ -330,6 +330,12 @@ fn validate_add_index_definition(
     // not a column name. Functional parts have already passed
     // a stricter check inside `compile_index_key_expressions`.
     validate_mysql_identifier(&index.name)?;
+    if !index.primary && index.name.eq_ignore_ascii_case("PRIMARY") {
+        return Err(error(
+            crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+            "Incorrect index name 'PRIMARY'",
+        ));
+    }
     validate_index_column_names(table, index)?;
     if index.primary { validate_primary_generated_columns(&index.columns, &table.columns)?; }
     if index.is_spatial() {
@@ -828,7 +834,7 @@ fn prepare_create_table_schema(
             ));
         }
         column_checks.extend(column.checks.iter().cloned());
-        let mut schema = column_def_to_schema(column)?;
+        let mut schema = column_def_to_schema(column, &table_charset)?;
         apply_column_charset_defaults(&mut schema, &table_charset, &table_collation)?;
         column_schemas.push(schema);
     }
@@ -849,6 +855,7 @@ fn prepare_create_table_schema(
         )?;
         enforce_key_columns_not_null(&primary_key, &mut column_schemas)?;
         index_schemas.push(IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "PRIMARY".to_string(),
@@ -1183,6 +1190,7 @@ fn prepare_create_table_schema(
         validate_mysql_identifier(&resolved_name)?;
         check_comment_len(CommentTarget::Index, &resolved_name, &index.comment)?;
         index_schemas.push(IndexSchema {
+            predicate: index.predicate.map(crate::storage::schema::IndexPredicate::new),
             readable_from_scn: 0,
             index_id: 0,
             name: resolved_name,
@@ -1815,6 +1823,7 @@ impl Database {
             .cloned()
             .map(|mut index| {
                 index.state = IndexState::Public;
+                if let Some(meta) = &mut index.fulltext { meta.snapshot_origin_txn_id = 0; }
                 index
             })
             .collect::<Vec<_>>();
@@ -2150,6 +2159,7 @@ impl Database {
         let Some(table) = table else {
             return Ok(());
         };
+        self.drop_temp_table(&fulltext_temp_counter_key(table.id))?;
         for sid in table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -2181,6 +2191,7 @@ impl Database {
             .get(internal_key)
             .cloned()
             .ok_or_else(|| ddl_table_not_found(&internal_key))?;
+        self.drop_temp_table(&fulltext_temp_counter_key(table.id))?;
         for sid in table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -2276,7 +2287,10 @@ impl Database {
             "temp-snapshot",
         )?;
         let snapshot_dir = directory.path();
-        for sid in table.storage_ids() {
+        let fulltext_counters = self.temp_tables.read().map_err(|_| fulltext_statistics_error("temporary table lock poisoned"))?
+            .get(&fulltext_temp_counter_key(table.id)).cloned();
+        for schema in std::iter::once(&table).chain(fulltext_counters.iter()) {
+        for sid in schema.storage_ids() {
             self.with_heap_read(sid, |heap| {
                 self.flush_temp_snapshot_pages(
                     &heap.path,
@@ -2295,7 +2309,7 @@ impl Database {
                     )
                 })?;
             }
-            for index in &table.indexes {
+            for index in &schema.indexes {
                 self.with_index_read(sid, &index.name, |idx| {
                     if let Some(spatial) = &idx.spatial {
                         return self.flush_temp_snapshot_pages(
@@ -2315,9 +2329,12 @@ impl Database {
                 })?;
             }
         }
+        }
         let mut files = Vec::new();
         let mut session_charges = Vec::new();
-        for (idx, original) in self.temp_table_file_paths(&table).into_iter().enumerate() {
+        let mut paths = self.temp_table_file_paths(&table);
+        if let Some(auxiliary) = &fulltext_counters { paths.extend(self.temp_table_file_paths(auxiliary)); }
+        for (idx, original) in paths.into_iter().enumerate() {
             let snapshot = snapshot_dir.join(format!("{idx}.snap"));
             let existed = original.exists();
             if existed {
@@ -2345,6 +2362,7 @@ impl Database {
             _session_charges: session_charges,
             internal_key: internal_key.to_string(),
             table,
+            fulltext_counters,
             files,
         })
     }
@@ -2368,6 +2386,15 @@ impl Database {
             self.remove_temp_table_runtime_files(&current)?;
         }
         self.remove_temp_table_runtime_files(&snapshot.table)?;
+        let auxiliary_key = fulltext_temp_counter_key(snapshot.table.id);
+        self.drop_temp_table(&auxiliary_key)?;
+        if let Some(auxiliary) = &snapshot.fulltext_counters {
+            let registration = crate::storage::temp_quota::register_auxiliary(&self.data_dir, auxiliary.id, snapshot.table.id)?;
+            self.temp_tables.write().map_err(|_| fulltext_statistics_error("temporary table lock poisoned"))?
+                .insert(auxiliary_key, auxiliary.clone());
+            registration.commit();
+        }
+
         for file in &snapshot.files {
             if let Some(parent) = file.original.parent() {
                 fs::create_dir_all(parent).map_err(io_err)?;
@@ -2492,6 +2519,11 @@ impl Database {
                 format!("duplicate index '{}'", index.name),
             ));
         }
+        if index.predicate.is_some() {
+            let mut candidate = table.as_ref().clone(); candidate.indexes = vec![index.clone()];
+            candidate.compile_index_predicates()?; index = candidate.indexes.remove(0);
+        }
+        implicit_spatial_index(&mut index, &table);
         validate_table_index_count(table.indexes.iter().filter(|i| !i.primary).count() + 1)?;
         validate_index_column_names(&table, &index)?;
         validate_index_prefix_columns(&table, &index, &index.column_prefix_lengths)?;
@@ -2528,6 +2560,8 @@ impl Database {
             self.prepare_empty_temp_index_file(next.id, &index.name)?;
         }
         next.indexes.push(index.clone());
+        next.build_column_index();
+        index = next.indexes.last().expect("new temporary index").clone();
         next.bump_schema_version();
         if let Err(err) = self.rebuild_index(&next, &index) {
             self.remove_index_cache_entry(next.id, &index.name)?;
@@ -2710,13 +2744,7 @@ impl Database {
     /// short rows receive the catalog backfill default without a heap scan.
     pub fn add_temp_column(&self, internal_key: &str, column: ColumnDef) -> Result<(), QueryError> {
         let check_defs = column.checks.clone();
-        let mut new_column = column_def_to_schema(column)?;
-        if new_column.generated_expr.is_some() {
-            return Err(error(
-                crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                "adding a generated column to a temporary table requires COPY",
-            ));
-        }
+        let mut new_column;
         let table_id;
         {
             let mut tables = self.temp_tables.write().map_err(|_| {
@@ -2729,6 +2757,10 @@ impl Database {
                 .get_mut(internal_key)
                 .ok_or_else(|| ddl_table_not_found(&internal_key))?;
             let table = Arc::make_mut(table_arc);
+            new_column = column_def_to_schema_in_table(column, table, None)?;
+            if new_column.generated_expr.is_some() {
+                return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET, "adding a generated column to a temporary table requires COPY"));
+            }
             apply_column_charset_defaults(&mut new_column, &table.charset, &table.collation)?;
             if table
                 .iter_visible_columns()
@@ -2801,6 +2833,15 @@ impl Database {
         internal_key: &str,
         column_name: &str,
     ) -> Result<(), QueryError> {
+        self.drop_temp_column_checked(internal_key, column_name, true)
+    }
+
+    pub(crate) fn drop_temp_column_checked(
+        &self,
+        internal_key: &str,
+        column_name: &str,
+        check_visibility: bool,
+    ) -> Result<(), QueryError> {
         let snapshot = self
             .temp_tables
             .read()
@@ -2832,6 +2873,16 @@ impl Database {
                     format!("unknown column '{column_name}'"),
                 )
             })?;
+        if check_visibility
+            && !snapshot
+                .iter_visible_columns()
+                .any(|(_, c)| !c.invisible && !c.name.eq_ignore_ascii_case(column_name))
+        {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+                "A table must have at least one visible column.",
+            ));
+        }
         self.reject_policy_dependency_column_ddl(&snapshot)?;
         reject_column_referenced_by_check(&snapshot, column_name)?;
         reject_column_referenced_by_generated(&snapshot, column_name)?;
@@ -2905,6 +2956,7 @@ impl Database {
         candidate.reset_row_layouts_for_rewrite();
         candidate.build_column_index();
         validate_row_fits_page(&candidate)?;
+        self.drop_temp_table(&fulltext_temp_counter_key(old_table.id))?;
         for sid in old_table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -2962,8 +3014,8 @@ impl Database {
                     "temporary table does not exist",
                 )
             })?;
-        let mut schema = column_def_to_schema(column)?;
-        let position = old.column_index(&schema.name)?;
+        let position = old.column_index(&column.name)?;
+        let mut schema = column_def_to_schema_in_table(column, &old, Some(&old.columns[position].name))?;
         preserve_primary_key_not_null(&old, position, &mut schema);
         apply_column_charset_for_alter(
             &mut schema,
@@ -3008,7 +3060,7 @@ impl Database {
                 )
             })?;
         let position = old.column_index(old_name)?;
-        let mut schema = column_def_to_schema(column)?;
+        let mut schema = column_def_to_schema_in_table(column, &old, Some(old_name))?;
         preserve_primary_key_not_null(&old, position, &mut schema);
         apply_column_charset_for_alter(
             &mut schema,
@@ -3319,6 +3371,7 @@ impl Database {
             internal_key,
             TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
             |values| {
+                if !table.index_contains_row(index, values)? { return Ok(()); }
                 let key = table.index_key(index, values)?;
                 if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                     return Ok(());
@@ -3792,7 +3845,7 @@ impl Database {
         if actions.iter().any(|action| matches!(action, A::DropColumn(_) | A::RenameColumn { .. } | A::ModifyColumn(_) | A::ChangeColumn { .. })) {
             self.reject_policy_dependency_column_ddl(self.table(table_name)?.as_ref())?;
         }
-        if actions.len() <= 1 {
+        if actions.len() <= 1 && !matches!(actions.first(), Some(A::DropColumn(_))) {
             return Ok(());
         }
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
@@ -3817,7 +3870,7 @@ impl Database {
                             format!("duplicate column '{}'", column.name),
                         ));
                     }
-                    let mut schema = column_def_to_schema(column.clone())?;
+                    let mut schema = column_def_to_schema_in_table(column.clone(), &candidate, None)?;
                     apply_column_charset_defaults(
                         &mut schema,
                         &candidate.charset,
@@ -4028,7 +4081,7 @@ impl Database {
                     // definition) is rejected in pre-flight — before any
                     // earlier action in this multi-action ALTER mutates and
                     // flushes the catalog with no rollback.
-                    let mut new_schema = column_def_to_schema(column.clone())?;
+                    let mut new_schema = column_def_to_schema_in_table(column.clone(), &candidate, Some(&column.name))?;
                     preserve_primary_key_not_null(&candidate, idx, &mut new_schema);
                     apply_column_charset_for_alter(
                         &mut new_schema,
@@ -4053,7 +4106,7 @@ impl Database {
                     }
                     // Mirror prepare_change_column_candidate's up-front
                     // validation (see ModifyColumn above for the rationale).
-                    let mut new_schema = column_def_to_schema(new_def.clone())?;
+                    let mut new_schema = column_def_to_schema_in_table(new_def.clone(), &candidate, Some(old_name))?;
                     preserve_primary_key_not_null(&candidate, idx, &mut new_schema);
                     apply_column_charset_for_alter(
                         &mut new_schema,
@@ -4187,6 +4240,15 @@ impl Database {
             // (catalog + row-layout only). A COPY rewrite is irreversible by
             // schema restore.
             A::AddColumn(_) | A::ModifyColumn(_) | A::ChangeColumn { .. } => {
+                if let A::ChangeColumn { old_name, new_def } = action {
+                    if !old_name.eq_ignore_ascii_case(&new_def.name) {
+                        let table = self.table(table_name)?;
+                        if !table.foreign_keys.is_empty() || !table.fk_referenced_by.is_empty() {
+                            // Schema-only rollback cannot restore other tables' FK names.
+                            return Ok(false);
+                        }
+                    }
+                }
                 !self.alter_action_requires_copy(table_name, action)?
                     || self.alter_action_validation_only(table_name, action)?
             }
@@ -4404,6 +4466,7 @@ impl Database {
                             .find(|existing| existing.name.eq_ignore_ascii_case(index_name))
                         {
                             slot.state = crate::storage::IndexState::Public;
+                            if let Some(meta) = &mut slot.fulltext { meta.snapshot_origin_txn_id = u64::MAX; }
                             if slot.primary {
                                 table.primary_key = slot.columns.clone();
                                 enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
@@ -4489,6 +4552,7 @@ impl Database {
                         .find(|existing| existing.name.eq_ignore_ascii_case(&index_name))
                     {
                         slot.state = crate::storage::IndexState::Public;
+                        if let Some(meta) = &mut slot.fulltext { meta.snapshot_origin_txn_id = u64::MAX; }
                         if slot.primary {
                             table.primary_key = slot.columns.clone();
                             enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
@@ -4551,6 +4615,9 @@ impl Database {
             crate::storage::fulltext::snapshot_tokenizer_config_into(
                 index.fulltext.get_or_insert_with(Default::default),
             );
+        }
+        if index.is_fulltext() {
+            index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = u64::MAX;
         }
         if index.primary {
             index.unique = true;
@@ -4632,6 +4699,12 @@ impl Database {
                 ));
             }
             resolve_vector_config(&table.columns, &mut index)?;
+            if index.predicate.is_some() {
+                let mut candidate = table.as_ref().clone();
+                candidate.indexes = vec![index.clone()];
+                candidate.compile_index_predicates()?;
+                index = candidate.indexes.remove(0);
+            }
             validate_add_index_definition(table, &index)?;
             if !index.included_columns.is_empty() {
                 if index.unique {
@@ -4732,6 +4805,12 @@ impl Database {
                         )
                     })?);
             resolve_vector_config(&table.columns, &mut index)?;
+            if index.predicate.is_some() {
+                let mut candidate = table.clone();
+                candidate.indexes = vec![index.clone()];
+                candidate.compile_index_predicates()?;
+                index = candidate.indexes.remove(0);
+            }
             validate_add_index_definition(table, &index)?;
             if index.primary
                 && (table.indexes.iter().any(|existing| existing.primary)
@@ -4810,6 +4889,7 @@ impl Database {
             let mut building_index = index.clone();
             building_index.state = crate::storage::IndexState::Building;
             table.indexes.push(building_index);
+            table.assign_fulltext_corpora();
             table.bump_schema_version();
             table.clone()
         };
@@ -4904,6 +4984,7 @@ impl Database {
                     .find(|existing| existing.name.eq_ignore_ascii_case(index_name))
                 {
                     slot.state = crate::storage::IndexState::Public;
+                    if let Some(meta) = &mut slot.fulltext { meta.snapshot_origin_txn_id = u64::MAX; }
                     if slot.primary {
                         table.primary_key = slot.columns.clone();
                         enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
@@ -5033,7 +5114,7 @@ impl Database {
         check_table_ddl_writable(&database)?;
         let key = table_key(&database, &table_only);
         let check_defs = column.checks.clone();
-        let mut new_column_def = column_def_to_schema(column)?;
+        let mut new_column_def;
         let mut catalog = self.catalog_write()?;
         let schema_check_names = check_constraint_names_in_schema(&catalog, &database, Some(&key));
         let table_arc = catalog
@@ -5045,6 +5126,7 @@ impl Database {
         // column between this helper returning and the executor's rollback.
         let mut candidate = table_arc.as_ref().clone();
         let table = &mut candidate;
+        new_column_def = column_def_to_schema_in_table(column, table, None)?;
         apply_column_charset_defaults(&mut new_column_def, &table.charset, &table.collation)?;
         if table
             .iter_visible_columns()
@@ -5326,6 +5408,16 @@ impl Database {
                 format!("unknown column '{column_name}'"),
             ));
         }
+        if !catalog_txn_batch_deferred()
+            && !snapshot
+                .iter_visible_columns()
+                .any(|(_, c)| !c.invisible && !c.name.eq_ignore_ascii_case(column_name))
+        {
+            return Err(error(
+                crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+                "A table must have at least one visible column.",
+            ));
+        }
         self.reject_policy_dependency_column_ddl(&snapshot)?;
         reject_column_referenced_by_check(&snapshot, column_name)?;
         reject_column_referenced_by_generated(&snapshot, column_name)?;
@@ -5360,7 +5452,12 @@ impl Database {
         }
         let pos = candidate.column_index(column_name)?;
         candidate.columns[pos].state = ColumnState::Dropped;
-        candidate.primary_key.retain(|name| !name.eq_ignore_ascii_case(column_name));
+        if !catalog_txn_batch_deferred() {
+            ensure_table_keeps_visible_column(&candidate)?;
+        }
+        candidate
+            .primary_key
+            .retain(|name| !name.eq_ignore_ascii_case(column_name));
         candidate.publish_new_row_layout()?;
         candidate.build_column_index();
         validate_auto_increment_schema(&candidate)?;
@@ -5590,11 +5687,10 @@ impl Database {
                     },
                 ),
             ));
-            if dropped_index.is_spatial() {
-                let path = self.index_path_for_table_schema(&table_snapshot, storage_id, &dropped_index.name);
-                for extension in ["rtree.corrupt", "rtree.failed"] {
-                    retired.files.push(self.relative_path(&path.with_extension(extension)));
-                }
+            let path = self.index_path_for_table_schema(&table_snapshot, storage_id, &dropped_index.name);
+            let suffix = if dropped_index.is_spatial() { "rtree" } else { "idx" };
+            for extension in [format!("{suffix}.corrupt"), format!("{suffix}.failed")] {
+                retired.files.push(self.relative_path(&path.with_extension(extension)));
             }
             if dropped_index.is_vector() {
                 retired.vector_directories.push(self.relative_path(&self.vector_index_path_for_parts(storage_id, table_snapshot.active_generation.max(1), dropped_index.index_id, "vmanifest").with_extension("vector")));
@@ -5702,6 +5798,12 @@ impl Database {
         old_name: &str,
         new_name: &str,
     ) -> Result<(), QueryError> {
+        if new_name.eq_ignore_ascii_case("PRIMARY") {
+            return Err(error(
+                crate::error::catalog::ER_WRONG_NAME_FOR_INDEX,
+                "Incorrect index name 'PRIMARY'",
+            ));
+        }
         validate_mysql_identifier(new_name)?;
         let _descriptor = self.pin_ddl_table(table_name)?;
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
@@ -6276,8 +6378,13 @@ impl Database {
                 let check = candidate
                     .check_constraints
                     .iter()
-                    .find(|check| check.name == name)
-                    .unwrap()
+                    .find(|check| check.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_CHECK_CONSTRAINT_NOT_FOUND,
+                            format!("Check constraint '{name}' is not found"),
+                        )
+                    })?
                     .clone();
                 validate_existing_check_constraint_values(self, &candidate, &check)?;
                 self.set_check_constraint_enforced(&key, name, true)
@@ -6473,7 +6580,10 @@ impl Database {
             for (value, pos) in values.iter().zip(&columns) {
                 let column = &candidate.columns[*pos];
                 if !column.nullable && matches!(value, Value::Null) {
-                    return Err(crate::error::messages::bad_null(&column.name));
+                    return Err(error(
+                        crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                        "Invalid use of NULL value",
+                    ));
                 }
                 coerce_column_value_for_schema(value.clone(), column)?;
             }
@@ -6790,6 +6900,21 @@ impl Database {
             return Ok(None);
         }
         let old_table = self.table(table_name)?;
+        for action in actions {
+            if let A::ChangeColumn { old_name, new_def } = action {
+                if !old_name.eq_ignore_ascii_case(&new_def.name) {
+                    if self
+                        .fk_reject_column_referenced(&old_table, old_name)
+                        .is_err()
+                    {
+                        return Err(error(
+                            crate::error::catalog::ER_ALTER_OPERATION_NOT_SUPPORTED_REASON,
+                            "physical COPY cannot atomically rename foreign key columns; use a separate metadata ALTER",
+                        ));
+                    }
+                }
+            }
+        }
         let mut candidate = old_table.as_ref().clone();
         let mut changes_row_shape = false;
         for action in actions {
@@ -6805,7 +6930,7 @@ impl Database {
                             format!("duplicate column '{}'", column.name),
                         ));
                     }
-                    let mut schema = column_def_to_schema(column.clone())?;
+                    let mut schema = column_def_to_schema_in_table(column.clone(), &candidate, None)?;
                     apply_column_charset_defaults(
                         &mut schema,
                         &candidate.charset,
@@ -6856,7 +6981,7 @@ impl Database {
                     changes_row_shape = true;
                 }
                 A::ModifyColumn(column) => {
-                    let mut schema = column_def_to_schema(column.clone())?;
+                    let mut schema = column_def_to_schema_in_table(column.clone(), &candidate, Some(&column.name))?;
                     let position = candidate.column_index(&schema.name)?;
                     preserve_primary_key_not_null(&candidate, position, &mut schema);
                     apply_column_charset_for_alter(
@@ -6875,7 +7000,7 @@ impl Database {
                 A::ChangeColumn { old_name, new_def } => {
                     let position = candidate.column_index(old_name)?;
                     let old_column = candidate.columns[position].clone();
-                    let mut schema = column_def_to_schema(new_def.clone())?;
+                    let mut schema = column_def_to_schema_in_table(new_def.clone(), &candidate, Some(old_name))?;
                     preserve_primary_key_not_null(&candidate, position, &mut schema);
                     apply_column_charset_for_alter(
                         &mut schema,
@@ -7122,7 +7247,8 @@ impl Database {
     ) -> Result<(Arc<TableSchema>, TableSchema, bool), QueryError> {
         let table = self.table_for_column_change(table_name)?;
         self.reject_policy_dependency_column_ddl(&table)?;
-        let mut new_schema = column_def_to_schema(column)?;
+        let old_name = column.name.clone();
+        let mut new_schema = column_def_to_schema_in_table(column, &table, Some(&old_name))?;
         let pos = table
             .columns
             .iter()
@@ -7159,7 +7285,7 @@ impl Database {
     ) -> Result<(Arc<TableSchema>, TableSchema, bool), QueryError> {
         let table = self.table_for_column_change(table_name)?;
         self.reject_policy_dependency_column_ddl(&table)?;
-        let mut new_schema = column_def_to_schema(column)?;
+        let mut new_schema = column_def_to_schema_in_table(column, &table, Some(old_name))?;
         let pos = table
             .columns
             .iter()
@@ -7219,6 +7345,24 @@ impl Database {
                 &old_col_name,
                 &new_col_name,
             )?;
+            for fk in &mut candidate.foreign_keys {
+                for name in &mut fk.columns {
+                    if name.eq_ignore_ascii_case(&old_col_name) {
+                        *name = new_col_name.clone();
+                    }
+                }
+                if fk
+                    .referenced_database
+                    .eq_ignore_ascii_case(&candidate.database)
+                    && fk.referenced_table.eq_ignore_ascii_case(&candidate.name)
+                {
+                    for name in &mut fk.referenced_columns {
+                        if name.eq_ignore_ascii_case(&old_col_name) {
+                            *name = new_col_name.clone();
+                        }
+                    }
+                }
+            }
             rename_column_expression_references(&mut candidate, &old_col_name, &new_col_name)?;
             // P1-11 — same partition-column propagation as rename_column.
             rename_partition_column_references(&mut candidate, &old_col_name, &new_col_name)?;
@@ -7318,8 +7462,7 @@ impl Database {
         let old = &table.columns[pos];
         let type_changed =
             old.data_type != new_schema.data_type || old.unsigned != new_schema.unsigned;
-        let renamed = !old.name.eq_ignore_ascii_case(&new_schema.name);
-        if !type_changed && !renamed {
+        if !type_changed {
             return Ok(());
         }
         for fk in &table.foreign_keys {
@@ -7359,6 +7502,28 @@ impl Database {
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
         let key = table_key(&database, &table_only);
         let table_id = candidate.id;
+        let source = self.table(table_name)?;
+        let renames: Vec<_> = source
+            .columns
+            .iter()
+            .zip(&candidate.columns)
+            .filter(|(old, new)| old.column_id == new.column_id && old.name != new.name)
+            .map(|(old, new)| (old.name.clone(), new.name.clone()))
+            .collect();
+        let dependent_keys: BTreeSet<_> = if renames.is_empty() {
+            BTreeSet::new()
+        } else {
+            source
+                .fk_referenced_by
+                .iter()
+                .map(|edge| edge.child_table_key.clone())
+                .collect()
+        };
+        let _dependent_definitions = dependent_keys
+            .iter()
+            .map(|name| self.pin_ddl_table(name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let mut changed = Vec::new();
         {
             let mut catalog = self.catalog_write()?;
             let table_arc = catalog
@@ -7366,8 +7531,37 @@ impl Database {
                 .get_mut(&key)
                 .ok_or_else(|| ddl_table_not_found(&table_name))?;
             *Arc::make_mut(table_arc) = candidate;
+            for dependent in &dependent_keys {
+                let Some(other_arc) = catalog.tables.get_mut(dependent) else {
+                    continue;
+                };
+                let other = Arc::make_mut(other_arc);
+                let mut modified = false;
+                for fk in &mut other.foreign_keys {
+                    if fk.referenced_database.eq_ignore_ascii_case(&database)
+                        && fk.referenced_table.eq_ignore_ascii_case(&table_only)
+                    {
+                        for name in &mut fk.referenced_columns {
+                            if let Some((_, new)) = renames
+                                .iter()
+                                .find(|(old, _)| name.eq_ignore_ascii_case(old))
+                            {
+                                *name = new.clone();
+                                modified = true;
+                            }
+                        }
+                    }
+                }
+                if modified {
+                    other.bump_schema_version();
+                    changed.push(other.id);
+                }
+            }
         }
         self.refresh_heap_codec(table_id)?;
+        for id in changed {
+            self.note_catalog_table(id);
+        }
         self.note_catalog_table(table_id);
         self.commit_ddl_catalog_txn()
     }
@@ -7893,8 +8087,6 @@ impl Database {
             validate_row_fits_page(&candidate)?;
             let source_rows = self.scan_rows(&old_table.qualified_name(), ddl_txn)?;
             Self::set_alter_copy_job_total(&job, source_rows.len() as u64);
-            #[cfg(test)]
-            self.pause_ddl_backfill_for_test();
             let mut warnings = Vec::new();
             let mut rewritten_rows = Vec::with_capacity(source_rows.len());
             let defaults = AlterCopyDefaults::new(&old_table, &candidate, &job)?;
@@ -7914,6 +8106,7 @@ impl Database {
                     &defaults,
                 )?;
                 for index in candidate.indexes.iter().filter(|index| index.unique) {
+                    if !candidate.index_contains_row(index, &values)? { continue; }
                     let key = candidate.index_key(index, &values)?;
                     if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                         continue;
@@ -8024,6 +8217,9 @@ impl Database {
         let ddl_txn = self.begin_txn()?;
         let ddl_txn_id = ddl_txn.txn_id;
         candidate.row_generation_txn_id = ddl_txn_id;
+        for index in candidate.indexes.iter_mut().filter(|index| index.is_fulltext()) {
+            index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = ddl_txn_id;
+        }
         let shadow_id = {
             let mut catalog = self.catalog_write()?;
             let id = catalog.allocate_table_id()?;
@@ -8121,8 +8317,13 @@ impl Database {
                 .collect::<Vec<_>>();
             let projection = alter_copy_projection(&old_table, &candidate, &coercion_mask);
             let mut index_elapsed_us = 0_u64;
-            let external = table_has_externalizable_column(&old_table)
-                || table_has_externalizable_column(&candidate);
+            let external = self.alter_copy_requires_external_values(
+                &old_table,
+                &candidate,
+                &coercion_mask,
+            )?;
+            #[cfg(test)]
+            self.pause_ddl_backfill_for_test();
             let configured_pages = if external { 1 } else { ddl_copy_batch_pages() };
             let mut lo = 0_u64;
             crate::util::thread_spawn::scope(|scope| -> Result<(), QueryError> {
@@ -8177,6 +8378,7 @@ impl Database {
                             &index_key_plans,
                             &coercion_mask,
                             projection.as_ref(),
+                            external,
                         )?;
                     let actual_batch_bytes =
                         batch
@@ -8484,6 +8686,7 @@ impl Database {
                     }
                 }
             }
+            self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             Self::enter_alter_copy_finalizing(&job)?;
             let swap_started = Instant::now();
             let memory_graphs =
@@ -8788,6 +8991,42 @@ impl Database {
         Ok(())
     }
 
+    /// Retain projected transcoding when every potentially external column is
+    /// unchanged and the source has no overflow data. The source snapshot is
+    /// already pinned: later external versions take the full MVCC decode path,
+    /// and catch-up uses the externalizing writer. Memory generations cannot
+    /// prove the absence of resident LOBs through filesystem checks.
+    fn alter_copy_requires_external_values(
+        &self,
+        old_table: &TableSchema,
+        candidate: &TableSchema,
+        coercion_mask: &[bool],
+    ) -> Result<bool, QueryError> {
+        if (self.config.durability == DurabilityMode::Memory
+            && (table_has_externalizable_column(old_table)
+                || table_has_externalizable_column(candidate)))
+            || candidate
+                .row_codec
+                .columns
+                .iter()
+                .zip(coercion_mask)
+                .any(|(column, rewrite)| *rewrite && column_kind_can_externalize(&column.kind))
+        {
+            return Ok(true);
+        }
+        if table_has_externalizable_column(old_table) {
+            for storage_id in old_table.storage_ids() {
+                // Overflow stores are created on first write, never on read.
+                // File presence remains a conservative signal after generation
+                // publication, even when allocator metadata is still resident.
+                if self.overflow_path(storage_id).try_exists().map_err(io_err)? {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn scan_transform_alter_copy_batch_parallel(
         &self,
@@ -8803,6 +9042,7 @@ impl Database {
         index_key_plans: &[DdlCopyIndexKeyPlan],
         coercion_mask: &[bool],
         projection: Option<&AlterCopyProjection>,
+        external: bool,
     ) -> Result<
         (
             Vec<DdlCopyPreparedRow>,
@@ -8813,8 +9053,7 @@ impl Database {
         QueryError,
     > {
         let defaults = AlterCopyDefaults::new(old_table, candidate, job)?;
-        if table_has_externalizable_column(old_table) || table_has_externalizable_column(candidate)
-        {
+        if external {
             let started = Instant::now();
             let source_rows =
                 self.scan_rows_storage_range(old_table, storage_id, txn, page_lo, page_hi)?;
@@ -9849,7 +10088,10 @@ impl Database {
                 && !column.nullable
                 && matches!(values.get(idx), Some(Value::Null))
             {
-                return Err(crate::error::messages::bad_null(&column.name));
+                return Err(error(
+                    crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                    "Invalid use of NULL value",
+                ));
             }
         }
         Ok(())
@@ -9893,6 +10135,8 @@ impl Database {
             self.note_vector_inserts(table, values, row_id, table.id)?;
         }
         self.insert_index_batches_deferred(txn.txn_id, table, index_entries)?;
+        self.maintain_fulltext_statistics(txn.txn_id, table, table.id,
+            rows.iter().map(|row| (None, Some(row.as_slice()))))?;
         crate::binlog::record_write_rows(txn.txn_id, table, rows)?;
         Ok(())
     }
@@ -11016,6 +11260,12 @@ fn coerce_row_for_alter_copy_masked(
             Err(err) if !strict => {
                 *value = coerce_column_value_for_alter_copy_lossy(current, column, err, warnings)?;
             }
+            Err(err) if err.code() == 1048 => {
+                return Err(error(
+                    crate::error::catalog::ER_INVALID_USE_OF_NULL,
+                    "Invalid use of NULL value",
+                ));
+            }
             Err(err) => return Err(err),
         }
     }
@@ -11613,6 +11863,7 @@ impl Database {
                 )
             })?;
             updated.indexes.push(IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id,
                 name: index.to_string(),
@@ -13108,6 +13359,15 @@ impl Database {
                 "EXCHANGE PARTITION cannot target a partitioned table",
             ));
         }
+        // Different generations require physical relocation that the catalog
+        // storage-id swap alone cannot replay on a replica. Reject before any
+        // catalog mutation until that relocation has a durable WAL contract.
+        if table.active_generation != other_table.active_generation {
+            return Err(error(
+                crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "EXCHANGE PARTITION between different physical generations is not supported",
+            ));
+        }
         // MySQL 8.0 forbids EXCHANGE PARTITION when either table participates
         // in a foreign key — as child (outbound `foreign_keys`) or parent
         // (inbound `fk_referenced_by`). A raw file swap bypasses FK integrity,
@@ -13259,11 +13519,13 @@ impl Database {
                             .iter()
                             .map(|c| c.to_ascii_lowercase())
                             .collect::<Vec<_>>(),
-                        // Expressions and FT configuration determine physical key encoding.
+                        // Predicates, expressions and FT configuration determine physical membership and encoding.
+                        serde_json::to_string(&idx.predicate).expect("serializable index predicate"),
                         serde_json::to_string(&idx.key_expressions)
                             .expect("serializable index expressions"),
-                        serde_json::to_string(&idx.fulltext)
-                            .expect("serializable fulltext metadata"),
+                        serde_json::to_string(&idx.fulltext.as_ref().map(|meta| {
+                            let mut meta = meta.clone(); meta.corpus_id = 0; meta.snapshot_origin_txn_id = 0; meta
+                        })).expect("serializable fulltext metadata"),
                     )
                 })
                 .collect();
@@ -13638,7 +13900,27 @@ impl Database {
         self.note_catalog_table(table.id);
         self.note_catalog_table(other_table.id);
         self.note_catalog_table(partition_storage_id);
-        self.commit_ddl_catalog_txn()?;
+        if table.indexes.iter().any(|index| index.is_fulltext()) {
+            let counter_txn = self.begin_txn()?;
+            let _counter_rollback = OnlineIndexTxnGuard { db: self, txn_id: counter_txn.txn_id };
+            let (new_table, new_other) = {
+                let mut catalog = self.catalog_write()?;
+                for name in [&key,&other_key] {
+                    for index in Arc::make_mut(catalog.tables.get_mut(name).expect("EXCHANGE table"))
+                        .indexes.iter_mut().filter(|index| index.is_fulltext()) {
+                        index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = counter_txn.txn_id;
+                    }
+                }
+                (catalog.tables[&key].clone(), catalog.tables[&other_key].clone())
+            };
+            self.transfer_fulltext_statistics(counter_txn, &other_table, other_table.id,
+                &new_table, other_table.id)?;
+            self.transfer_fulltext_statistics(counter_txn, &table, partition_storage_id,
+                &new_other, partition_storage_id)?;
+            self.commit_catalog_txn_existing(counter_txn)?;
+        } else {
+            self.commit_ddl_catalog_txn()?;
+        }
         if partition_reorg_crash_point().as_deref() == Some("exchange_after_catalog") {
             return Ok(());
         }
@@ -15306,6 +15588,9 @@ fn plan_index_cascade_for_drop_column(
     let mut to_drop = Vec::new();
     let mut to_rebuild = Vec::new();
     for index in &table.indexes {
+        if index.predicate.as_ref().is_some_and(|p| p.referenced_columns.iter().any(|c| c == &lower_target)) {
+            return Err(error(crate::error::catalog::ER_DROP_INDEX_FK, "cannot drop column referenced by a partial index predicate"));
+        }
         // A functional index that depends on the column can't be mechanically
         // rewritten — MySQL blocks the whole drop (1553).
         if index

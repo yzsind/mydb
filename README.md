@@ -10,7 +10,7 @@ Mixed transactional and analytical workloads, with native AI retrieval.
 
 [English](README.md) · [简体中文](readme_cn.md)
 
-[Download](https://github.com/yzsind/mydb/releases/tag/v1.0.1) · [Why MyDB](docs/why-mydb.md) · [Performance evaluation](#performance-evaluation) · [Testing](#testing) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
+[Download](https://github.com/yzsind/mydb/releases/tag/v1.0.2) · [Why MyDB](docs/why-mydb.md) · [Performance evaluation](#performance-evaluation) · [Testing](#testing) · [Quick Start](#quick-start) · [Built for AI Agents](#built-for-ai-agents) · [Documentation](docs/README.md) · [MySQL Compatibility](docs/mysql80-compatibility.md)
 
 </div>
 
@@ -28,7 +28,7 @@ interfaces give services and agents direct access to the same engine. Automatic
 Zone Maps, online schema changes, and directly queryable backups reduce the
 work needed to tune access, evolve data structures, and inspect earlier data.
 
-MyDB 1.0.1 is a public-preview release intended for feature validation and controlled-environment evaluation.
+MyDB 1.0.2 is a public-preview release intended for feature validation and controlled-environment evaluation.
 
 | Core advantage | What it gives you |
 | --- | --- |
@@ -111,7 +111,7 @@ separate [November 17 scheduled run in the predecessor repository](https://githu
 ## Quick Start
 
 Download prebuilt packages for macOS ARM64, Linux x86_64, and Windows x64 from the
-[1.0.1 release page](https://github.com/yzsind/mydb/releases/tag/v1.0.1), which also
+[1.0.2 release page](https://github.com/yzsind/mydb/releases/tag/v1.0.2), which also
 includes SHA256 checksums and platform validation details.
 
 ### Run a downloaded binary

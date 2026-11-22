@@ -17,6 +17,7 @@ use super::stats::TableStats;
 use crate::engine::auth::AuthCatalog;
 
 pub const DEFAULT_DATABASE: &str = "test";
+include!("index_predicate.rs");
 // v22: the catalog is no longer persisted as `catalog/data_dictionary.json`.
 // It lives solely in the data-dictionary heap tables (`tables/<id>.heap`).
 // v46 stores transactional current rows and updates only affected objects. Data
@@ -1147,6 +1148,15 @@ impl TableSchema {
         let primary_key = match name {
             "schemata" => vec!["name"],
             "tables" => vec!["id"],
+            "fulltext_counters" => vec![
+                "table_id",
+                "generation",
+                "corpus_id",
+                "definition",
+                "storage_id",
+                "term",
+                "shard",
+            ],
             "table_stats" => vec!["table_id", "scope_id"],
             "column_stats" => vec!["table_id", "scope_id", "column_id"],
             "index_stats" => vec!["table_id", "scope_id", "index_id"],
@@ -1180,6 +1190,7 @@ impl TableSchema {
         .map(str::to_string)
         .collect::<Vec<_>>();
         let make_index = |name: &str, columns: Vec<String>, primary: bool| IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: name.to_string(),
@@ -1372,6 +1383,38 @@ impl TableSchema {
         }
     }
 
+    pub(crate) fn assign_fulltext_corpora(&mut self) {
+        let mut groups = std::collections::BTreeMap::new();
+        for pass in 0..2 {
+            for index in &mut self.indexes {
+                if !index.is_fulltext() {
+                    continue;
+                }
+                let meta = index.fulltext.get_or_insert_with(Default::default);
+                let mut config = meta.clone();
+                config.corpus_id = 0;
+                config.snapshot_origin_txn_id = 0;
+                let mut columns = index
+                    .columns
+                    .iter()
+                    .map(|c| normalize_name(c))
+                    .collect::<Vec<_>>();
+                columns.sort();
+                let key = (
+                    columns,
+                    serde_json::to_vec(&config).expect("serializable tokenizer"),
+                );
+                if pass == 0 {
+                    if meta.corpus_id != 0 {
+                        groups.entry(key).or_insert(meta.corpus_id);
+                    }
+                } else if meta.corpus_id == 0 {
+                    meta.corpus_id = *groups.entry(key).or_insert(index.index_id);
+                }
+            }
+        }
+    }
+
     /// Rebuild the per-table lookup maps and migrate legacy column metadata
     /// (`column_id` / `physical_pos` / `logical_pos` / `next_column_id`)
     /// for catalogs written before stable column identity was introduced.
@@ -1479,6 +1522,7 @@ impl TableSchema {
             }
         }
         self.next_index_id = next_index_id;
+        self.assign_fulltext_corpora();
         for fk in &mut self.foreign_keys {
             if let Some(index) = self
                 .indexes
@@ -1711,6 +1755,8 @@ impl TableSchema {
     }
 
     fn rebuild_index_expression_runtime(&mut self) {
+        // The catalog loader performs the failing validation before publication.
+        let _ = self.compile_index_predicates();
         if !self
             .indexes
             .iter()
@@ -1789,6 +1835,7 @@ impl TableSchema {
     /// reference) to the caller. Idempotent: re-running it after a
     /// successful compilation is a no-op besides the recompile cost.
     pub fn compile_pending_index_expressions(&mut self) -> Result<(), QueryError> {
+        self.compile_index_predicates()?;
         if !self
             .indexes
             .iter()
@@ -2293,6 +2340,8 @@ pub struct ColumnSchema {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IndexSchema {
+    #[serde(default)]
+    pub predicate: Option<Arc<IndexPredicate>>,
     /// Earliest snapshot whose complete key set is represented by this index.
     /// Online builds do not backfill keys deleted before their build began.
     #[serde(default)]
@@ -2370,9 +2419,17 @@ pub struct IndexSchema {
 /// this on-disk structure; queries read the index's own config first — otherwise env changes
 /// across a restart fork the build/query rules into **silent false negatives** (e.g. ngram_size
 /// 2->3: historical two-character postings cannot match a three-character single-token
-/// query). All fields are `Option` with `#[serde(default)]` — old indexes deserialize to `None` and use global defaults (old behavior preserved); new indexes always record their rules.
-#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
+/// query). Tokenizer options use `Option` defaults for in-memory constructors;
+/// SQL DDL persists complete rules and a nonzero shared corpus identity.
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 pub struct FulltextMeta {
+    /// Stable shared scoring corpus, independent of posting membership.
+    #[serde(default)]
+    pub corpus_id: u64,
+    /// Publication fence for postings and their scoring corpus. Zero means
+    /// maintenance started with the table; MAX is bound by CatalogTxn.
+    #[serde(default)]
+    pub snapshot_origin_txn_id: u64,
     /// Comparison collation captured with the posting format at index build.
     #[serde(default)]
     pub collation_id: Option<u16>,
@@ -2399,6 +2456,32 @@ pub struct FulltextMeta {
     #[serde(default)]
     pub position_gap: Option<u32>,
 }
+
+// Logical tokenizer equality excludes physical corpus/publication identity.
+impl PartialEq for FulltextMeta {
+    fn eq(&self, other: &Self) -> bool {
+        (
+            self.collation_id,
+            &self.parser,
+            self.ngram_size,
+            self.min_token_size,
+            self.max_token_size,
+            self.use_stopwords,
+            self.positions,
+            self.position_gap,
+        ) == (
+            other.collation_id,
+            &other.parser,
+            other.ngram_size,
+            other.min_token_size,
+            other.max_token_size,
+            other.use_stopwords,
+            other.positions,
+            other.position_gap,
+        )
+    }
+}
+impl Eq for FulltextMeta {}
 
 /// The concrete nearest-neighbor algorithm of a vector index. A type-safe view over the string `index_type`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2949,6 +3032,15 @@ impl IndexSchema {
 /// MySQL per-type maximum byte lengths for the TEXT / BLOB families.
 /// A value longer than the column's cap is rejected with error 1406.
 pub const TINY_LOB_MAX: u32 = 255;
+
+pub(crate) fn text_length_byte_cap(characters: u32, max_bytes_per_character: u8) -> u32 {
+    match u64::from(characters) * u64::from(max_bytes_per_character) {
+        0..=255 => TINY_LOB_MAX,
+        256..=65_535 => DEFAULT_LOB_MAX,
+        65_536..=16_777_215 => MEDIUM_LOB_MAX,
+        _ => LONG_LOB_MAX,
+    }
+}
 pub const DEFAULT_LOB_MAX: u32 = 65_535; // plain TEXT / BLOB
 pub const MEDIUM_LOB_MAX: u32 = 16_777_215; // 2^24 - 1
 pub const LONG_LOB_MAX: u32 = 4_294_967_295; // 2^32 - 1
@@ -4675,22 +4767,37 @@ impl TableSchema {
     }
 
     #[inline]
+    fn index_readable_without_predicate(
+        &self,
+        index: &IndexSchema,
+        include_invisible: bool,
+    ) -> bool {
+        index.state == IndexState::Public
+            && (index.visible || include_invisible)
+            && !index.key_expressions.iter().flatten().any(|part| {
+                part.referenced_columns.iter().any(|name| {
+                    self.column_index(name).ok().is_some_and(|i| {
+                        matches!(self.columns[i].data_type, DataTypeKind::Timestamp { .. })
+                    })
+                })
+            })
+    }
+
+    /// Name validation precedes the query's membership proof, but retains
+    /// INVISIBLE, build-state and expression-readability safety rules.
+    pub(crate) fn index_hint_name_available(&self, name: &str) -> bool {
+        let invisible = invisible_indexes_enabled();
+        self.indexes.iter().any(|i| {
+            i.name.eq_ignore_ascii_case(name) && self.index_readable_without_predicate(i, invisible)
+        })
+    }
+
+    #[inline]
     pub fn iter_queryable_indexes(&self) -> impl Iterator<Item = &IndexSchema> {
-        // Flatten the filter chain so LLVM can inline this through
-        // query planning hot paths. INVISIBLE indexes are excluded
-        // unless the executing statement runs with the session
-        // `optimizer_switch` flag `use_invisible_indexes=on` (installed
-        // via [`InvisibleIndexScope`]).
         let include_invisible = invisible_indexes_enabled();
-        self.indexes.iter().filter(move |idx| {
-            idx.state == IndexState::Public && (idx.visible || include_invisible)
-                // A writer-session TIMESTAMP conversion cannot provide a
-                // reader-session predicate or ordering. Retain the index for
-                // maintenance but never let a hint bypass this safety guard.
-                && !idx.key_expressions.iter().flatten().any(|part|
-                    part.referenced_columns.iter().any(|name|
-                        self.column_index(name).ok().is_some_and(|i|
-                            matches!(self.columns[i].data_type, DataTypeKind::Timestamp { .. }))))
+        self.indexes.iter().filter(move |index| {
+            self.index_readable_without_predicate(index, include_invisible)
+                && partial_index_queryable(self, index)
         })
     }
 
@@ -4779,7 +4886,7 @@ impl TableSchema {
                 .first()
                 .is_some_and(|c| c.eq_ignore_ascii_case(&column.name))
             {
-                flags |= if index.unique && index.columns.len() == 1 {
+                flags |= if index.unique && index.predicate.is_none() && index.columns.len() == 1 {
                     UNIQUE_KEY_FLAG
                 } else {
                     MULTIPLE_KEY_FLAG
@@ -5068,6 +5175,9 @@ impl TableSchema {
         index: &IndexSchema,
         values: &[Value],
     ) -> Result<Vec<IndexKey>, QueryError> {
+        if !self.index_contains_row(index, values)? {
+            return Ok(Vec::new());
+        }
         if index.is_fulltext() {
             return self.fulltext_index_keys(index, values);
         }
@@ -5625,6 +5735,9 @@ impl From<DataType> for DataTypeKind {
             DataType::Binary(len) => Self::Binary { len },
             DataType::VarBinary(len) => Self::VarBinary { len },
             DataType::Text(max_len) => Self::Text { max_len },
+            DataType::TextLength(length) => Self::Text {
+                max_len: text_length_byte_cap(length, 4),
+            },
             DataType::Blob(max_len) => Self::Blob { max_len },
             DataType::Date => Self::Date,
             DataType::Time { fsp } => Self::Time { fsp },

@@ -26,7 +26,7 @@ impl ExecutorTuningSnapshot {
                 sort_merge_fanin: positive_usize("MYDB_SORT_MERGE_FANIN")
                     .map(|value| value.clamp(2, 128)),
                 hash_join_bloom_adaptive: !boolean_is_disabled("MYDB_HASH_JOIN_BLOOM_ADAPTIVE"),
-                scheduler_parallelism: crate::planner::default_parallel_degree() as usize,
+                scheduler_parallelism: crate::planner::configured_parallel_degree() as usize,
             }
         }
         #[cfg(not(test))]
@@ -47,7 +47,7 @@ impl ExecutorTuningSnapshot {
 
     pub(crate) fn capture_for_session(parallelism: u64) -> Self {
         let mut snapshot = Self::capture();
-        snapshot.scheduler_parallelism = parallelism.max(1) as usize;
+        snapshot.scheduler_parallelism = parallelism.clamp(1, u32::MAX as u64) as usize;
         snapshot
     }
 }
@@ -84,9 +84,23 @@ pub(crate) fn enter_if_absent() -> Option<ExecutorTuningScope> {
 }
 
 pub(crate) fn current_or_capture() -> ExecutorTuningSnapshot {
-    CURRENT
+    let mut snapshot = CURRENT
         .with(|slot| slot.borrow().clone())
-        .unwrap_or_else(ExecutorTuningSnapshot::capture)
+        .unwrap_or_else(ExecutorTuningSnapshot::capture);
+    snapshot.scheduler_parallelism = snapshot
+        .scheduler_parallelism
+        .min(crate::planner::default_parallel_degree() as usize);
+    snapshot
+}
+
+/// Read the installed budget without capturing defaults. The planner also
+/// calls this accessor, so it must never recurse through snapshot capture.
+pub(crate) fn current_parallelism() -> Option<u32> {
+    CURRENT.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .map(|s| s.scheduler_parallelism as u32)
+    })
 }
 
 #[cfg(test)]
@@ -107,6 +121,11 @@ mod tests {
         assert_eq!(current_or_capture().stream_batch_rows, 17);
         assert!(enter_if_absent().is_none());
         assert_eq!(current_or_capture().sort_merge_fanin, Some(7));
+        assert_eq!(current_or_capture().scheduler_parallelism, 5);
+        {
+            let _serial = crate::planner::force_serial_scope();
+            assert_eq!(current_or_capture().scheduler_parallelism, 1);
+        }
         assert_eq!(current_or_capture().scheduler_parallelism, 5);
     }
 }

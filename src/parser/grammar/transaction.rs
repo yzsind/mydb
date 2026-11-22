@@ -1,5 +1,6 @@
 use super::super::{
-    ParseError, SetScope, Statement, TransactionCharacteristic, TransactionIsolation,
+    CharsetSetting, ParseError, SetScope, Statement, TransactionCharacteristic,
+    TransactionIsolation,
 };
 use super::cursor::Cursor;
 use crate::sql_lex::SqlTokenKind;
@@ -137,6 +138,65 @@ pub(in crate::parser) fn parse_set_session_statement(
     let mut cursor = Cursor::new(sql);
     if !cursor.keyword(b"SET")? {
         return Ok(None);
+    }
+    if cursor.peek()?.is_some_and(|token| {
+        token.kind == SqlTokenKind::Word
+            && ["NAMES", "CHARACTER", "CHARSET"]
+                .iter()
+                .any(|word| cursor.text(&token).eq_ignore_ascii_case(word))
+    }) {
+        fn name(cursor: &mut Cursor<'_>) -> Result<Option<String>, ParseError> {
+            let token = cursor
+                .next()?
+                .ok_or_else(|| cursor.expected("charset name or DEFAULT"))?;
+            let value = match token.kind {
+                SqlTokenKind::Word => cursor.text(&token).to_owned(),
+                SqlTokenKind::String | SqlTokenKind::QuotedIdentifier => {
+                    cursor.quoted_text(&token)?
+                }
+                _ => return Err(cursor.expected("charset name or DEFAULT")),
+            };
+            Ok(if value.eq_ignore_ascii_case("DEFAULT") {
+                None
+            } else {
+                Some(value)
+            })
+        }
+        let mut options = Vec::new();
+        loop {
+            if cursor.keyword(b"NAMES")? {
+                let charset = name(&mut cursor)?;
+                let collation = if cursor.keyword(b"COLLATE")? {
+                    name(&mut cursor)?
+                } else {
+                    None
+                };
+                options.push(CharsetSetting::Names { charset, collation });
+            } else {
+                if cursor.keyword(b"CHARACTER")? {
+                    cursor.expect_keyword(b"SET")?;
+                } else {
+                    cursor.expect_keyword(b"CHARSET")?;
+                }
+                options.push(CharsetSetting::CharacterSet {
+                    charset: name(&mut cursor)?,
+                });
+            }
+            if !cursor.symbol(b',')? {
+                break;
+            }
+        }
+        cursor.finish()?;
+        return Ok(Some(if options.len() == 1 {
+            match options.remove(0) {
+                CharsetSetting::Names { charset, collation } => {
+                    Statement::SetNames { charset, collation }
+                }
+                CharsetSetting::CharacterSet { charset } => Statement::SetCharacterSet { charset },
+            }
+        } else {
+            Statement::SetCharsetOptions(options)
+        }));
     }
     let scope = if cursor.keyword(b"SESSION")? || cursor.keyword(b"LOCAL")? {
         Some(SetScope::Session)

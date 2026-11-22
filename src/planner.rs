@@ -5462,6 +5462,12 @@ pub(crate) fn freeze_select_wildcards(
             }
         }
     }
+    if projection.is_empty() {
+        return Err(error(
+            crate::error::catalog::ER_TABLE_MUST_HAVE_A_VISIBLE_COLUMN,
+            "Wildcard projection has no visible columns",
+        ));
+    }
     select.projection = projection;
     Ok(())
 }
@@ -8259,7 +8265,7 @@ fn apply_parallel_hints(db: &Database, plan: PhysicalPlan, select: &Select) -> P
         let degree = if degree_hint == 0 {
             default_parallel_degree()
         } else {
-            degree_hint
+            degree_hint.min(default_parallel_degree())
         };
         if degree > 1 {
             parallelize_seq_scans(
@@ -8833,10 +8839,21 @@ pub(crate) fn sql_mentions_user_var_assign(sql: &str) -> bool {
 /// Returns 1 while a [`force_serial_scope`] guard is active (sequence
 /// functions must evaluate on the connection thread).
 pub(crate) fn default_parallel_degree() -> u32 {
-    if parallelism_force_disabled() {
+    if parallelism_force_disabled() || parallel_planner_config().disabled {
         return 1;
     }
-    parallel_planner_config().degree
+    crate::engine::executor::tuning::current_parallelism()
+        .unwrap_or_else(configured_parallel_degree)
+}
+
+/// Process default, independent of the currently executing statement.
+pub(crate) fn configured_parallel_degree() -> u32 {
+    let config = parallel_planner_config();
+    if config.disabled {
+        1
+    } else {
+        config.degree
+    }
 }
 
 #[cfg(test)]
@@ -8971,6 +8988,7 @@ mod sequence_force_serial_tests {
 }
 
 pub(crate) fn cpu_bound_parallel_degree(degree: u32) -> u32 {
+    let degree = degree.max(1).min(default_parallel_degree());
     let config = parallel_planner_config();
     if config.use_all_cores {
         return degree.max(1);
@@ -10173,10 +10191,7 @@ fn index_order_covers_order_by(
 
 fn validate_table_index_hints(table: &TableRef, schema: &TableSchema) -> Result<(), QueryError> {
     for name in table.index_hints.iter().flat_map(|hint| &hint.index_names) {
-        if !schema
-            .iter_queryable_indexes()
-            .any(|index| index.name.eq_ignore_ascii_case(name))
-        {
+        if !schema.index_hint_name_available(name) {
             return Err(error(
                 crate::error::catalog::ER_KEY_DOES_NOT_EXITS,
                 format!("Key '{name}' doesn't exist in table '{}'", schema.name),
@@ -10849,18 +10864,28 @@ pub(crate) fn find_matching_fulltext_index<'a>(
         .map(|c| c.to_ascii_lowercase())
         .collect();
     want.sort();
-    table.iter_queryable_indexes().find(|index| {
+    let matches_columns = |index: &IndexSchema| {
         if !index.is_fulltext() {
             return false;
         }
-        let mut have: Vec<String> = index
+        let mut have = index
             .columns
             .iter()
             .map(|c| c.to_ascii_lowercase())
-            .collect();
+            .collect::<Vec<_>>();
         have.sort();
         have == want
-    })
+    };
+    // MATCH has one logical tokenizer even when a predicate changes which
+    // physical indexes are complete enough to read. Otherwise adding a WHERE
+    // condition could change tokenization and lose rows outside a partial key.
+    let canonical = table
+        .iter_public_indexes()
+        .find(|index| matches_columns(index) && table.index_hint_name_available(&index.name))?;
+    table
+        .iter_queryable_indexes()
+        .find(|index| matches_columns(index) && index.fulltext == canonical.fulltext)
+        .or(Some(canonical))
 }
 
 fn cost_fulltext_base_access(
@@ -11523,6 +11548,11 @@ fn try_knn_vector_scan(
     filter: Option<Expr>,
     possible_keys: Vec<String>,
 ) -> Option<PhysicalPlan> {
+    let _partial_indexes = crate::storage::schema::PartialIndexScope::new(
+        &table.schema,
+        filter.as_ref(),
+        table.alias.as_deref(),
+    );
     // A scan-level TopK cannot cross operators that change row multiplicity
     // or need the complete input. Keep their final relational TopK intact.
     if select.from.len() > 1
@@ -12337,6 +12367,31 @@ fn choose_scan(
     filter: Option<Expr>,
     hints: &ScanHints<'_>,
 ) -> Result<PhysicalPlan, QueryError> {
+    let _partial_indexes = crate::storage::schema::PartialIndexScope::new(
+        &table.schema,
+        filter.as_ref(),
+        table.alias.as_deref(),
+    );
+    for hint in hints.index_hints {
+        if hint.hint_type == IndexHintType::Force
+            && !hint.index_names.is_empty()
+            && hint.index_names.iter().all(|name| {
+                table
+                    .schema
+                    .indexes
+                    .iter()
+                    .any(|i| i.name.eq_ignore_ascii_case(name) && i.predicate.is_some())
+            })
+            && !table.schema.iter_queryable_indexes().any(|i| {
+                hint.index_names
+                    .iter()
+                    .any(|n| n.eq_ignore_ascii_case(&i.name))
+            })
+        {
+            return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                "FORCE INDEX cannot use a partial index: query does not imply its WHERE predicate under the current expression settings"));
+        }
+    }
     if table.sample.is_some() {
         let index_hint = hints.query_hints.iter().any(|hint| {
             let target = match hint {
@@ -12972,7 +13027,10 @@ fn choose_scan(
                 ));
             };
             let Some(ft_index) = find_matching_fulltext_index(&table.schema, &match_columns)
-                .filter(|index| special_index_allowed(index, &table.schema, hints))
+                .filter(|index| {
+                    mode != crate::parser::FtMode::Boolean
+                        || special_index_allowed(index, &table.schema, hints)
+                })
             else {
                 return Err(error(
                     crate::error::catalog::ER_FT_MATCHING_KEY_NOT_FOUND,
@@ -13005,7 +13063,13 @@ fn choose_scan(
             }
             let fulltext_access_rows =
                 estimate_fulltext_access_rows(&table.schema, &specs, total_rows);
-            let heap_oracle = table.system_time.is_some() || table.schema.is_partitioned();
+            let heap_oracle = table.system_time.is_some()
+                || table.schema.is_partitioned()
+                || table
+                    .schema
+                    .indexes
+                    .iter()
+                    .any(|i| i.is_fulltext() && i.predicate.is_some());
             // MATCH does not preclude an ordinary conjunct from providing a
             // cheaper base row-id set. Keep the MATCH posting/score maps, but
             // intersect them with a sufficiently selective B-tree access.
@@ -14101,6 +14165,22 @@ fn set_scan_query_hint_note(mut plan: PhysicalPlan, scan_hints: &ScanHints<'_>) 
     }
 
     let mut parts = Vec::new();
+    if let Some(table) = scan_plan_table(&plan) {
+        for index in table
+            .schema
+            .indexes
+            .iter()
+            .filter(|i| i.predicate.is_some())
+        {
+            if !table
+                .schema
+                .iter_queryable_indexes()
+                .any(|i| i.index_id == index.index_id && i.name == index.name)
+            {
+                parts.push(format!("partial index {} excluded: predicate not implied under current expression settings", index.name));
+            }
+        }
+    }
     if let Some(idx_note) = build_hint_note(scan_hints.index_hints) {
         parts.push(idx_note);
     }
@@ -16664,6 +16744,12 @@ pub(crate) fn with_planning_params<R>(params: &[Value], f: impl FnOnce() -> R) -
     let previous = PLANNING_PARAMS.with(|slot| slot.replace(Some(params.to_vec())));
     let _guard = PlanningParamsGuard(previous);
     f()
+}
+
+/// Concrete values are exposed only to disposable partial-index proofs.
+/// They never replace placeholders in a reusable semantic SELECT.
+pub(crate) fn partial_index_planning_params() -> Option<Vec<Value>> {
+    PLANNING_PARAMS.with(|slot| slot.borrow().clone())
 }
 
 /// Bind only disposable costing predicates. The scan's own filter retains
@@ -24848,7 +24934,8 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
                     });
                 pk_ok
                     || schema.indexes.iter().any(|idx| {
-                        idx.unique
+                        idx.predicate.is_none()
+                            && idx.unique
                             && !idx.columns.is_empty()
                             && idx.columns.iter().all(|c| {
                                 let lc = format!("{table_index}\0{}", c.to_ascii_lowercase());
@@ -25249,7 +25336,7 @@ pub(crate) fn expr_literal_value(expr: &Expr) -> Option<Value> {
             if name.eq_ignore_ascii_case("CAST")
                 && args.len() >= 2
                 && matches!(
-                    args.last(),
+                    args.get(1),
                     Some(Expr::Literal(crate::parser::Literal::String(target)))
                         if {
                             let target = target.trim().to_ascii_uppercase();

@@ -9,6 +9,10 @@ use crate::engine::executor::mem_budget::{ControlledMemoryCategory, ControlledMe
 const CHILD_BYTES: usize = 8;
 const FANOUT: usize = (PAGE_SIZE - HEADER) / (SLOT + CHILD_BYTES);
 pub(super) const MAX_HEIGHT: usize = 12;
+#[cfg(test)]
+thread_local! {
+    static RANGE_DIRECTORY_ENTRIES_TESTED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
 pub(super) const ROOT_KEY: Key = Key {
     column: 0,
     kind: Kind::Meta as u8,
@@ -263,7 +267,14 @@ impl Root {
         let children = file.visit(page, AccessIntent::Normal, |view| {
             validate_node(&view, Kind::Directory, lower, upper)?;
             let mut children = Vec::with_capacity(view.len().min(FANOUT));
-            for index in 0..view.len() {
+            // A child owns [its key, the next key). Seek to the predecessor
+            // of start so a narrow range does not rescan every earlier
+            // descriptor on every 64-zone batch. Keep the predecessor at an
+            // exact separator too; the unchanged limit check excludes it.
+            let first_index = view.lower_bound(start).saturating_sub(1);
+            for index in first_index..view.len() {
+                #[cfg(test)]
+                RANGE_DIRECTORY_ENTRIES_TESTED.with(|count| count.set(count.get() + 1));
                 let (first, bytes) = view.entry(index).ok_or_else(|| corrupt("missing child"))?;
                 let limit = view.entry(index + 1).map(|(key, _)| key).or(upper);
                 if first >= end {
@@ -555,6 +566,58 @@ mod tests {
             column,
             kind: Kind::Bounds as u8,
             zone,
+        }
+    }
+
+    #[test]
+    fn zone_map_directory_narrow_ranges_seek_past_unrelated_children() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let leaves = FANOUT - 2;
+        let file = file_with_pages(dir.path(), leaves as u64 + 4);
+        let mut builder = Builder::new(&file, 77, 64).unwrap();
+        for zone in 0..leaves as u64 {
+            builder
+                .push_leaf(Kind::Bounds, &[(key(7, zone * 4), &zone.to_le_bytes())])
+                .unwrap();
+        }
+        let root = builder.finish().unwrap();
+        assert_eq!(root.height, 1);
+        let target = (leaves as u64 - 3) * 4;
+        RANGE_DIRECTORY_ENTRIES_TESTED.with(|count| count.set(0));
+        let mut found = Vec::new();
+        root.visit_range(&file, key(7, target), key(7, target + 5), |k, bytes| {
+            assert_eq!(read_u64(bytes, 0) * 4, k.zone);
+            found.push(k.zone);
+            Ok(true)
+        })
+        .unwrap();
+        assert_eq!(found, vec![target, target + 4]);
+        let inspected = RANGE_DIRECTORY_ENTRIES_TESTED.with(|count| count.get());
+        assert!(
+            inspected <= 4,
+            "narrow range inspected {inspected} children"
+        );
+        let last = (leaves as u64 - 1) * 4;
+        for (start, end) in [
+            (0, 0),
+            (0, 1),
+            (1, 4),
+            (4, 8),
+            (last, last + 1),
+            (last + 1, last + 5),
+        ] {
+            let mut found = Vec::new();
+            root.visit_range(&file, key(7, start), key(7, end), |k, _| {
+                found.push(k.zone);
+                Ok(true)
+            })
+            .unwrap();
+            let expected = (0..leaves as u64)
+                .map(|zone| zone * 4)
+                .filter(|zone| start <= *zone && *zone < end)
+                .collect::<Vec<_>>();
+            assert_eq!(found, expected, "range [{start}, {end})");
         }
     }
 

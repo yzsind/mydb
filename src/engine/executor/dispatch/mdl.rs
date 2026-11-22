@@ -163,9 +163,8 @@ fn collect_view_definer_overrides(
     // Validate each view body under its own security context before flattening
     // dependencies. This also checks access to intermediate INVOKER views.
     authorize_statement(db, &security, &body).map_err(|err| {
-        if view.security_type == RoutineSecuritySchema::Definer
-            && (err.is(crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR)
-                || err.is(crate::error::catalog::ER_COLUMNACCESS_DENIED_ERROR))
+        if err.is(crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR)
+                || err.is(crate::error::catalog::ER_COLUMNACCESS_DENIED_ERROR)
         {
             error(crate::error::catalog::ER_VIEW_INVALID, format!(
                 "View '{}.{}' references invalid table(s) or column(s) or definer/invoker of view lack rights to use them",

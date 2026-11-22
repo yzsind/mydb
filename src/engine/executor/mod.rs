@@ -1964,6 +1964,7 @@ pub(super) fn plan_semantics(
     session: &SessionContext,
 ) -> crate::engine::cache::PlanSemantics {
     crate::engine::cache::PlanSemantics {
+        execution_parallelism: session.sysvars.mydb_parallel_degree,
         rls_authorization: Some(crate::engine::rls::session_signature(db, session)),
         sql_mode_fingerprint: crate::binlog::sql_mode_str_to_bits(&session.sql_mode),
         optimizer_switch_fingerprint: crate::engine::cache::optimizer_switch_fingerprint(
@@ -7265,8 +7266,11 @@ fn parse_error_to_query_error(err: crate::parser::ParseError) -> QueryError {
         // syntax location/expectation details.
         err.spec.error(err.message)
     } else {
-        err.spec
-            .error(format!("{}; expected {:?}", err, err.expected))
+        err.spec.error(if err.expected.is_empty() {
+            err.to_string()
+        } else {
+            format!("{}; expected {:?}", err, err.expected)
+        })
     }
 }
 

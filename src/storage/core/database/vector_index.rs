@@ -618,6 +618,10 @@ impl Database {
         storage_id: u64,
         build: bool,
     ) -> Result<VectorGraph, QueryError> {
+        let filtered_table = table.indexes.iter().any(|i| i.is_vector() && i.predicate.is_some()).then(|| {
+            let mut candidate = table.clone(); candidate.indexes = vec![index.clone()]; candidate
+        });
+        let table = filtered_table.as_ref().unwrap_or(table);
         let build = build || self.durability_mode() == DurabilityMode::Memory;
         let column = table.column_index(&index.columns[0])?;
         if (matches!(table.columns[column].data_type,DataTypeKind::Vector {datatype,..} if datatype!=crate::vector::VectorDataType::Float32)
@@ -2413,6 +2417,20 @@ impl Database {
         VECTOR_BUILD_HEAP_SCANS.fetch_add(1, Ordering::Relaxed);
 
         crate::engine::cancel::check_cancelled()?;
+        if let [index] = table.indexes.as_slice() {
+            if index.is_vector() && index.predicate.is_some() {
+                let full_columns = (0..table.columns.len()).collect::<Vec<_>>();
+                let mut stopped = false;
+                return self.scan_rows_columns_storage_streaming_range_with_ids_impl(
+                    table, storage_id, txn, &full_columns, lo, hi, false, |row_id, values| {
+                        if !stopped && table.index_contains_row(index, values)? {
+                            let projected = columns.iter().map(|i| values[*i].clone()).collect::<Vec<_>>();
+                            stopped = visit(row_id, &projected)?;
+                        }
+                        Ok(())
+                    });
+            }
+        }
         let mut stopped = false;
         let mut observed = 0usize;
         self.scan_rows_columns_storage_streaming_range_with_ids_impl(
@@ -3563,11 +3581,12 @@ impl Database {
             .iter()
             .filter(|i| i.is_vector() && i.vector_algo() == VectorAlgo::Hnsw)
         {
+            if !table.index_contains_row(index, values)? { continue; }
             let col = table.column_index(&index.columns[0])?;
             if !matches!(
                 table.columns[col].data_type,
                 DataTypeKind::Vector { dim: None, .. }
-            ) || changed.is_some_and(|cols| !cols.contains(&col))
+            ) || changed.is_some_and(|cols| !cols.contains(&col) && !index_may_be_affected_by_columns(table, index, Some(cols)))
             {
                 continue;
             }
@@ -3619,6 +3638,7 @@ impl Database {
                 table.active_generation.max(1),
                 normalize_name(&index.name),
             );
+            if !table.index_contains_row(index, values)? { continue; }
             let col_idx = table.column_index(&index.columns[0])?;
             let Some(Value::Vector(bytes)) = values.get(col_idx) else {
                 continue;
@@ -3665,7 +3685,21 @@ impl Database {
                 normalize_name(&index.name),
             );
             let col = table.column_index(&index.columns[0])?;
-            let changed = match (old_values.get(col), new_values.get(col)) {
+            let old_member = index.predicate.is_none() || (!old_values.is_empty() && table.index_contains_row(index, old_values)?);
+            let new_member = table.index_contains_row(index, new_values)?;
+            if !old_member && !new_member { continue; }
+            // A non-member has no vector in this graph. This also turns a
+            // predicate-only update into a versioned graph insertion/retirement.
+            let mut excluded_old;
+            let mut excluded_new;
+            let old_values = if old_member { old_values } else {
+                excluded_old = old_values.to_vec(); excluded_old.resize(table.columns.len(), Value::Null);
+                excluded_old[col] = Value::Null; &excluded_old
+            };
+            let new_values = if new_member { new_values } else {
+                excluded_new = new_values.to_vec(); excluded_new[col] = Value::Null; &excluded_new
+            };
+            let changed = old_member != new_member || match (old_values.get(col), new_values.get(col)) {
                 (Some(old), Some(new)) => old != new,
                 _ => true,
             };
@@ -3941,6 +3975,7 @@ impl Database {
             .entry(txn_id)
             .or_default()
             .push(PendingVectorMutation {
+                resolved_indexes: None,
                 undo_id,
                 table_id: table.id,
                 storage_id,
@@ -3994,6 +4029,7 @@ impl Database {
             .entry(txn_id)
             .or_default()
             .push(PendingVectorMutation {
+                resolved_indexes: None,
                 undo_id,
                 table_id: table.id,
                 storage_id,
@@ -4084,7 +4120,19 @@ impl Database {
         for entry in pending {
             affected.insert((entry.table_id, entry.storage_id));
             if let Some(table) = self.table_by_id(entry.table_id) {
-                if let Some(new_values) = entry.new_values {
+                if let Some(resolved) = entry.resolved_indexes {
+                    for (index_id, vector) in resolved {
+                        let index = table.indexes.iter().find(|i| i.index_id == index_id)
+                            .ok_or_else(vector::persistence::corrupt)?;
+                        let col = table.column_index(&index.columns[0])?;
+                        let mut target = table.as_ref().clone();
+                        let mut definition = index.clone(); definition.predicate = None;
+                        target.indexes = vec![definition];
+                        let mut values = vec![Value::Null; target.columns.len()];
+                        values[col] = vector.map_or(Value::Null, Value::Vector);
+                        self.note_vector_updates(&target, &[], &values, entry.row_id, entry.storage_id, &retire)?;
+                    }
+                } else if let Some(new_values) = entry.new_values {
                     let old_values = entry.old_values.as_deref().unwrap_or(&[]);
                     self.note_vector_updates(
                         &table,

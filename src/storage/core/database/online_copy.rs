@@ -510,7 +510,7 @@ impl Database {
         for index in &target.indexes {
             for key in target.index_keys(index, &old.values)? {
                 self.with_index_dml(location.storage_id, &index.name, |file| {
-                    file.delete_deferred(txn.txn_id, key, location.row_id)
+                    file.delete_deferred(txn.txn_id, key, location.row_id, Some(self))
                 })?;
             }
         }
@@ -577,7 +577,7 @@ impl Database {
         )?[0];
         for (name, key) in keys {
             self.with_index_dml(storage_id, name, |file| {
-                file.insert_deferred(txn.txn_id, key, row_id)
+                file.insert_deferred(txn.txn_id, key, row_id, Some(self))
             })?;
         }
         let mut journal_values = vec![Value::Null; target.columns.len()];
@@ -849,6 +849,9 @@ impl Database {
             txn_id: txn.txn_id,
         };
         target.row_generation_txn_id = txn.txn_id;
+        for index in target.indexes.iter_mut().filter(|index| index.is_fulltext()) {
+            index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = txn.txn_id;
+        }
         let source_ids = rewrite
             .as_ref()
             .map(|r| r.source_ids.clone())
@@ -1232,6 +1235,9 @@ impl Database {
             } else {
                 self.with_heap_read(target.id, |heap| heap.page_count())?
             };
+            for id in &build_ids {
+                self.backfill_copied_fulltext_statistics(txn, &target, *id, *id)?;
+            }
             let key = table_key(&source.database, &source.name);
             self.catalog_write()?
                 .tables
