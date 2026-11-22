@@ -689,6 +689,44 @@ impl PackedNumericLeaf {
         })
     }
 
+    /// Consume a sorted run bounded by this leaf's current maximum. Decline
+    /// before mutation when the conservative removal bound needs rebalancing.
+    /// Missing and duplicate targets only make that bound more conservative.
+    fn delete_run(&mut self, entries: &[IndexEntry], txn_id: u64, is_root: bool) -> (bool, usize) {
+        if self.len() == 0 {
+            return (false, 0);
+        }
+        let last = self.unpack(self.at(self.len() - 1));
+        let consumed = entries.partition_point(|entry| entry <= &last);
+        if consumed == 0 || (!is_root && consumed >= self.len()) {
+            return (false, 0);
+        }
+        let mut removed_bytes = 0usize;
+        for entry in &entries[..consumed] {
+            if self.pack(entry).is_none() {
+                return (false, 0);
+            }
+            removed_bytes = removed_bytes.saturating_add(
+                IndexLeafPage::entry_bytes_in_layout(entry, self.key_layout, self.layout_aux)
+                    + SLOT_OFFSET_BYTES,
+            );
+        }
+        if !is_root && self.encoded_bytes.saturating_sub(removed_bytes) < INDEX_MIN_PAGE_BYTES {
+            return (false, 0);
+        }
+        let mut changed = false;
+        for (offset, entry) in entries[..consumed].iter().enumerate() {
+            match self.delete(entry, txn_id, is_root) {
+                Some(InPlaceDelete::Deleted { .. }) => changed = true,
+                Some(InPlaceDelete::NotFound) => {}
+                // Preserve publication of any applied prefix even if a
+                // future layout's checks become stricter than preflight.
+                None => return (changed, offset),
+            }
+        }
+        (changed, consumed)
+    }
+
     fn reposition(
         &mut self,
         old: &IndexEntry,
@@ -981,6 +1019,46 @@ mod packed_numeric_leaf_tests {
         match decode_validated_index_tree_page(bytes).unwrap() {
             IndexPage::Leaf(leaf) => leaf,
             _ => panic!("expected leaf"),
+        }
+    }
+
+    #[test]
+    fn packed_delete_runs_match_scalar_oracle_and_decline_underflow() {
+        for kind in 0..19 {
+            let mut initial: Vec<_> = (0..160).step_by(2).map(|n| entry(kind, n)).collect();
+            initial.sort();
+            let mut bytes = encode_index_tree_page(&IndexPage::Leaf(
+                IndexLeafPage::new_with_resolved_layout(initial.clone(), Some(77)),
+            ))
+            .unwrap();
+            let mut cache = PackedNumericLeaf::build(&bytes, &initial[0])
+                .unwrap()
+                .unwrap();
+            let mut targets: Vec<_> = initial.iter().skip(4).step_by(3).cloned().collect();
+            targets.push(targets[0].clone());
+            targets.push(initial.last().unwrap().clone());
+            targets.sort();
+            let mut oracle = bytes.clone();
+            for target in &targets {
+                try_delete_raw_leaf(&mut oracle, target, 91).unwrap();
+            }
+            assert_eq!(cache.delete_run(&targets, 91, true), (true, targets.len()));
+            cache.materialize(&mut bytes).unwrap();
+            let actual = decoded(&bytes);
+            let expected = decoded(&oracle);
+            assert_eq!(actual.entries, expected.entries, "kind={kind}");
+            assert_eq!(actual.page_max_trx_id, expected.page_max_trx_id);
+            assert_eq!(actual.next_leaf, expected.next_leaf);
+            let survivors = actual.entries.clone();
+            assert_eq!(cache.delete_run(&survivors, 92, false), (false, 0));
+            cache.materialize(&mut bytes).unwrap();
+            assert_eq!(decoded(&bytes).entries, survivors);
+            assert_eq!(
+                cache.delete_run(&survivors, 92, true),
+                (true, survivors.len())
+            );
+            cache.materialize(&mut bytes).unwrap();
+            assert!(decoded(&bytes).entries.is_empty());
         }
     }
 
@@ -1512,6 +1590,35 @@ impl<P: std::ops::Deref<Target = BufferPool>> PinnedFrame<P> {
                     value >= leaf.at(0)
                         && (leaf.next_leaf.is_none() || value <= leaf.at(leaf.len() - 1))
                 })
+        }))
+    }
+
+    fn packed_leaf_delete_batch_probe(
+        &self,
+        first: &IndexEntry,
+        last: &IndexEntry,
+        max_span: usize,
+    ) -> Result<Option<(bool, bool)>, QueryError> {
+        if !self.frame.has_packed_leaf() {
+            return Ok(None);
+        }
+        let _bytes = self.frame.bytes.read().map_err(|_| {
+            error(
+                crate::error::catalog::ER_GET_ERRNO,
+                "buffer frame read lock poisoned",
+            )
+        })?;
+        let packed = self.frame.packed_leaf.lock();
+        Ok(packed.as_ref().map(|leaf| {
+            let first_pos = leaf.pack(first).and_then(|value| leaf.search(value).ok());
+            let last_value = leaf.pack(last);
+            let can_batch =
+                leaf.len() > 0 && last_value.is_some_and(|value| value <= leaf.at(leaf.len() - 1));
+            let last_pos = last_value.and_then(|value| leaf.search(value).ok());
+            let dense = first_pos
+                .zip(last_pos)
+                .is_some_and(|(start, end)| end - start < max_span);
+            (can_batch, dense)
         }))
     }
 

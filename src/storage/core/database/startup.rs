@@ -623,6 +623,15 @@ impl Database {
                 for (key, mut expected_rows) in expected {
                     expected_rows.sort();
                     let mut actual_rows = self.lookup_index(&table, index, key.clone())?;
+                    if index_supports_delete_mark(index) {
+                        let mut filtered = Vec::with_capacity(actual_rows.len());
+                        for row_id in actual_rows {
+                            if !self.is_retained_index_entry(&table, index, &key, row_id)? {
+                                filtered.push(row_id);
+                            }
+                        }
+                        actual_rows = filtered;
+                    }
                     actual_rows.sort();
                     if actual_rows != expected_rows {
                         return Err(error(
@@ -658,6 +667,11 @@ impl Database {
                     self.with_index_mut(table.id, &index.name, |index_file| index_file.entries())?;
                 for (key, row_id) in entries {
                     let Some(values) = live_by_row_id.get(&row_id) else {
+                        if index_supports_delete_mark(index)
+                            && self.is_retained_index_entry(&table, index, &key, row_id)?
+                        {
+                            continue;
+                        }
                         return Err(error(
                             crate::error::catalog::ER_GET_ERRNO,
                             format!(
@@ -679,6 +693,33 @@ impl Database {
             }
         }
         Ok(())
+    }
+
+    fn is_retained_index_entry(
+        &self,
+        table: &TableSchema,
+        index: &IndexSchema,
+        key: &IndexKey,
+        row_id: RowId,
+    ) -> Result<bool, QueryError> {
+        if self.retained_index_deletes.load(Ordering::Acquire) == 0 {
+            return Ok(false);
+        }
+        let Some(mut row) = self.read_mvcc_row(table.id, row_id)? else {
+            return Ok(false);
+        };
+        if !row.header.is_deleted()
+            || row.header.flags & MVCC_FLAG_RETAINED_INDEX_KEYS == 0
+            || !row.header.undo_ptr.is_some_and(|ptr| {
+                self.undo
+                    .read()
+                    .is_retained_index_delete(ptr, table.id, row_id)
+            })
+        {
+            return Ok(false);
+        }
+        Self::pad_full_row_to_schema(&mut row.values, table);
+        Ok(table.stored_index_key(index, &row.values)? == *key)
     }
 
     pub(crate) fn prepare_snapshot_indexes(&self) -> Result<(), QueryError> {

@@ -279,6 +279,9 @@ pub(crate) enum UndoKind {
     UpdateDelta {
         before_cols: Vec<u16>,
     },
+    /// The heap tombstone also retires ordinary non-unique index entries.
+    /// Purge must unlink those entries before this undo record can disappear.
+    DeleteHeaderRetained,
 }
 
 /// Row identity and transaction linkage without materializing before-images.
@@ -509,6 +512,7 @@ pub(crate) fn encode_undo_record(record: &UndoRecord) -> Result<Vec<u8>, QueryEr
         UndoKind::Update => out.push(2),
         UndoKind::Delete => out.push(3),
         UndoKind::DeleteHeader => out.push(5),
+        UndoKind::DeleteHeaderRetained => out.push(6),
         UndoKind::UpdateDelta { before_cols } => {
             out.push(4);
             out.extend_from_slice(&(before_cols.len() as u32).to_le_bytes());
@@ -674,6 +678,7 @@ pub(crate) fn decode_undo_record(input: &[u8]) -> Result<UndoRecord, QueryError>
         2 => UndoKind::Update,
         3 => UndoKind::Delete,
         5 => UndoKind::DeleteHeader,
+        6 => UndoKind::DeleteHeaderRetained,
         4 => {
             let count = undo_read_u32(input, &mut pos)? as usize;
             if count > input.len().saturating_sub(pos) / 2 {
@@ -777,6 +782,7 @@ pub(crate) fn decode_undo_record_metadata(input: &[u8]) -> Result<UndoRecord, Qu
         2 => (UndoKind::Update, 0),
         3 => (UndoKind::Delete, 0),
         5 => (UndoKind::DeleteHeader, 0),
+        6 => (UndoKind::DeleteHeaderRetained, 0),
         4 => {
             let count = undo_read_u32(input, &mut pos)? as usize;
             skip(
@@ -1324,6 +1330,7 @@ pub(crate) struct UndoManager {
     /// concurrent segment writer can reserve before doing frame I/O.
     resident_charge: Arc<parking_lot::Mutex<ControlledMemoryCharge>>,
     segment_pins: Arc<parking_lot::Mutex<UndoSegmentPins>>,
+    retained_index_deletes: Arc<AtomicU64>,
     pub(crate) next_undo_id: u64,
     /// Keyed by `undo_ptr`. AHash keeps steady-state insert/remove/lookup O(1).
     /// Records stay inline: the directory reaches its small workload high-water
@@ -1654,6 +1661,7 @@ impl Default for UndoManager {
                     .expect("zero-byte undo governor reservation must succeed"),
             )),
             segment_pins,
+            retained_index_deletes: Arc::new(AtomicU64::new(0)),
             next_undo_id: 1,
             records: FastHashMap::default(),
             created_index: BTreeMap::new(),
@@ -1740,7 +1748,11 @@ pub(crate) fn estimate_undo_resident_bytes(record: &UndoRecord) -> u64 {
         UndoKind::UpdateDelta { before_cols } => {
             (before_cols.capacity() * std::mem::size_of::<u16>()) as u64
         }
-        UndoKind::Insert | UndoKind::Update | UndoKind::Delete | UndoKind::DeleteHeader => 0,
+        UndoKind::Insert
+        | UndoKind::Update
+        | UndoKind::Delete
+        | UndoKind::DeleteHeader
+        | UndoKind::DeleteHeaderRetained => 0,
     });
     if let Some(values) = &record.before_values {
         size = size.saturating_add((values.capacity() * std::mem::size_of::<Value>()) as u64);
@@ -1795,7 +1807,10 @@ pub(crate) fn estimate_undo_record_bytes(record: &UndoRecord) -> u64 {
         // (table_id 8 + ... + chain_depth 4) lives in the surrounding
         // record so we charge ~18 B per row, not 20.
         UndoKind::InsertBatch { row_ids } => 1 + (row_ids.len() as u64) * 18,
-        UndoKind::Update | UndoKind::Delete | UndoKind::DeleteHeader => 1,
+        UndoKind::Update
+        | UndoKind::Delete
+        | UndoKind::DeleteHeader
+        | UndoKind::DeleteHeaderRetained => 1,
         UndoKind::UpdateDelta { before_cols } => 1 + 4 + (before_cols.len() as u64) * 2,
     };
     // table_id (8) + RowId (6) + before_header (~6) = 20-ish per
@@ -2170,11 +2185,15 @@ fn decode_segment_file_filtered(
                 // only the tiny metadata needed by the established apply_purge
                 // path: external LOB descriptors and/or a DELETE tombstone
                 // target. The heavy before-image stays on disk.
-                let needs_cleanup =
-                    matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader)
-                        || !record.before_external.is_empty();
+                let needs_cleanup = matches!(
+                    record.kind,
+                    UndoKind::Delete | UndoKind::DeleteHeader | UndoKind::DeleteHeaderRetained
+                ) || !record.before_external.is_empty();
                 if needs_cleanup {
-                    if !matches!(record.kind, UndoKind::Delete | UndoKind::DeleteHeader) {
+                    if !matches!(
+                        record.kind,
+                        UndoKind::Delete | UndoKind::DeleteHeader | UndoKind::DeleteHeaderRetained
+                    ) {
                         // Column lists are irrelevant to LOB cleanup.
                         record.kind = UndoKind::Update;
                     }
@@ -2721,13 +2740,21 @@ impl UndoManager {
                         ) {
                             continue;
                         }
-                        let needs_cleanup =
-                            matches!(metadata.kind, UndoKind::Delete | UndoKind::DeleteHeader)
-                                || !metadata.before_external.is_empty();
+                        let needs_cleanup = matches!(
+                            metadata.kind,
+                            UndoKind::Delete
+                                | UndoKind::DeleteHeader
+                                | UndoKind::DeleteHeaderRetained
+                        ) || !metadata.before_external.is_empty();
                         if !needs_cleanup {
                             continue;
                         }
-                        if !matches!(metadata.kind, UndoKind::Delete | UndoKind::DeleteHeader) {
+                        if !matches!(
+                            metadata.kind,
+                            UndoKind::Delete
+                                | UndoKind::DeleteHeader
+                                | UndoKind::DeleteHeaderRetained
+                        ) {
                             metadata.kind = UndoKind::Update;
                         }
                         metadata.prev_undo_ptr = None;
@@ -3287,7 +3314,9 @@ impl UndoManager {
             }
             if let Some(mut record) = self.records.remove(&old) {
                 record.id = new;
-                self.records.insert(new, record);
+                if let Some(replaced) = self.records.insert(new, record) {
+                    self.forget_retained_index_delete(&replaced);
+                }
                 let origin = self.compaction_origins.remove(&old).unwrap_or(old);
                 self.compaction_origins.insert(new, origin);
             }
@@ -3776,9 +3805,59 @@ impl UndoManager {
                 .evictable_since_pass
                 .saturating_add(resident_size(&record) - metadata_resident_bytes(&record));
         }
+        if matches!(record.kind, UndoKind::DeleteHeaderRetained) {
+            self.retained_index_deletes.fetch_add(1, Ordering::Release);
+        }
         self.records.insert(id, UndoRecord { id, ..record });
         reservation.commit();
         Ok(())
+    }
+
+    pub(crate) fn retained_index_delete_handle(&self) -> Arc<AtomicU64> {
+        Arc::clone(&self.retained_index_deletes)
+    }
+
+    fn forget_retained_index_delete(&self, record: &UndoRecord) {
+        if matches!(record.kind, UndoKind::DeleteHeaderRetained) {
+            self.retained_index_deletes.fetch_sub(1, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn is_retained_index_delete(&self, ptr: u64, table_id: u64, row_id: RowId) -> bool {
+        self.records
+            .get(&self.canonical_ptr(ptr))
+            .is_some_and(|record| {
+                record.table_id == table_id
+                    && record.row_id == row_id
+                    && matches!(record.kind, UndoKind::DeleteHeaderRetained)
+            })
+    }
+
+    /// Return only committed, uncompensated marks. The caller has already
+    /// checked the snapshot horizon and keeps competing purge passes out.
+    pub(crate) fn retained_index_purge_targets(
+        &self,
+        victims: &[u64],
+        states: &BTreeMap<u64, UndoCreatorState>,
+    ) -> Vec<(u64, u64, u64, RowId)> {
+        victims
+            .iter()
+            .filter_map(|&id| {
+                let record = self.records.get(&id)?;
+                (matches!(record.kind, UndoKind::DeleteHeaderRetained)
+                    && !self.compensated.contains(&id)
+                    && !matches!(
+                        states.get(&record.txn_id),
+                        Some(UndoCreatorState::RolledBack)
+                    ))
+                .then_some((
+                    id,
+                    record.txn_id,
+                    record.table_id,
+                    record.row_id,
+                ))
+            })
+            .collect()
     }
 
     fn refresh_metrics(&mut self) {
@@ -4503,7 +4582,8 @@ impl UndoManager {
                         UndoKind::Insert
                         | UndoKind::Update
                         | UndoKind::Delete
-                        | UndoKind::DeleteHeader => {}
+                        | UndoKind::DeleteHeader
+                        | UndoKind::DeleteHeaderRetained => {}
                     }
                     let old_resident = resident_size(rec);
                     rec.resident_size =
@@ -4638,6 +4718,7 @@ impl UndoManager {
         let Some(record) = self.records.remove(&undo_ptr) else {
             return Ok(());
         };
+        self.forget_retained_index_delete(&record);
         self.compaction_origins.remove(&undo_ptr);
         self.eviction_candidates
             .remove(&(record.created_unix_ms, undo_ptr));
@@ -5174,6 +5255,7 @@ impl UndoManager {
             let Some(removed) = self.records.remove(id) else {
                 continue;
             };
+            self.forget_retained_index_delete(&removed);
             self.compaction_origins.remove(id);
             self.eviction_candidates
                 .remove(&(removed.created_unix_ms, *id));
@@ -5263,6 +5345,7 @@ impl UndoManager {
             let Some(removed) = self.records.remove(id) else {
                 continue;
             };
+            self.forget_retained_index_delete(&removed);
             self.eviction_candidates
                 .remove(&(removed.created_unix_ms, *id));
             if let Some(ids) = self.created_index.get_mut(&removed.created_unix_ms) {
@@ -5867,7 +5950,12 @@ impl UndoManager {
             }
             // Insert the relocated copy (bumps segment_live_records for the
             // output segment, current/resident/txn bytes, created_index).
+            let retained = matches!(rec.kind, UndoKind::DeleteHeaderRetained);
             self.insert_loaded_record_reserved(rec, reservation)?;
+            if retained {
+                // Keep the read gate closed throughout relocation.
+                self.retained_index_deletes.fetch_sub(1, Ordering::Release);
+            }
             remap.push((old_ptr, new_ptr));
         }
         // Record the relocation so EVERY stale ptr (the MVCC row-version

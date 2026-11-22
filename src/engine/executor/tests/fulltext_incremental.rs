@@ -59,6 +59,65 @@ fn assert_corpora(e: &StorageQueryEngine, name: &str, txn: TxnView) {
 }
 
 #[test]
+fn fulltext_incremental_chunked_ordered_delete_rollback_and_restart() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let e = open_strict_test_engine(dir.path());
+        e.execute("CREATE TABLE ft_delete(id INT PRIMARY KEY,body TEXT,active INT,FULLTEXT f(body),FULLTEXT fp(body) WHERE active=1,INDEX ps(active) WHERE active=1)").unwrap();
+        let values = (0..600)
+            .map(|id| format!("({id},'quartz ruby',{})", id % 2))
+            .collect::<Vec<_>>()
+            .join(",");
+        e.execute(&format!("INSERT INTO ft_delete VALUES {values}"))
+            .unwrap();
+        let mut session = SessionContext::default();
+        for sql in [
+            "BEGIN",
+            "SAVEPOINT keep",
+            "DELETE FROM ft_delete ORDER BY id LIMIT 300",
+            "ROLLBACK TO keep",
+            "DELETE FROM ft_delete ORDER BY id DESC LIMIT 300",
+            "ROLLBACK",
+            "DELETE FROM ft_delete ORDER BY id LIMIT 300",
+        ] {
+            let response = e.execute_with_session(&mut session, sql).unwrap();
+            if sql.starts_with("DELETE") {
+                assert!(matches!(
+                    response,
+                    QueryResponse::OkAffected { affected_rows: 300 }
+                ));
+            }
+            let view = session.current_txn.map_or_else(
+                || current(&e),
+                |txn| {
+                    e.db_for_tests().session_statement_view(
+                        txn,
+                        IsolationLevel::ReadCommitted,
+                        None,
+                    )
+                },
+            );
+            assert_corpora(&e, "test.ft_delete", view);
+            assert_corpora(&e, "test.ft_delete", current(&e));
+        }
+        assert_eq!(
+            rows(&e, "SELECT COUNT(*) FROM ft_delete"),
+            vec![vec![Value::Int(300)]]
+        );
+        e.shutdown().unwrap();
+    }
+    let e = open_strict_test_engine(dir.path());
+    assert_corpora(&e, "test.ft_delete", current(&e));
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT COUNT(*) FROM ft_delete WHERE active=1 AND MATCH(body) AGAINST('quartz')"
+        ),
+        vec![vec![Value::Int(150)]]
+    );
+}
+
+#[test]
 fn fulltext_incremental_cold_statistics_do_not_scan_heap() {
     let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
     let e = open_test_engine(dir.path());

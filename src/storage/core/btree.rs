@@ -200,6 +200,7 @@ fn record_bulk_index_build(index: &IndexFile, direct: bool, started: Instant) {
     }
 }
 const INDEX_MIN_PAGE_BYTES: usize = PAGE_SIZE / 4;
+const MIN_LEAF_DELETE_BATCH: usize = 8;
 const INDEX_HEADER_BYTES: usize = 64;
 /// Common index page header (offsets 0..24). The buffer-pool +
 /// WAL layer manages this header uniformly for every page-typed
@@ -4536,10 +4537,8 @@ impl IndexFile {
     ) -> Result<(), QueryError> {
         let previous_lsn = btree_logical_wal::current();
         btree_logical_wal::set(lsn);
-        // Logged deletions share the point-delete oracle: fitting leaves need
-        // only their leaf latch and a shared topology guard. Underflow still
-        // takes the exclusive structural fallback for that entry. Keep the
-        // batch mutation epoch open across entries for range-cursor repair.
+        // Keep the mutation epoch open across logged deletes for range-cursor
+        // repair, even as the leaf operations release the topology lock.
         if lsn.is_some()
             && entries
                 .iter()
@@ -4547,16 +4546,7 @@ impl IndexFile {
         {
             let result = (|| {
                 let _mutation = (entries.len() > 1).then(|| self.begin_mutation());
-                for entry in entries {
-                    self.delete_entry_concurrent(
-                        txn_id,
-                        IndexEntry {
-                            key: entry.key,
-                            row_id: entry.row_id,
-                        },
-                    )?;
-                }
-                Ok(())
+                self.delete_logged_entries(txn_id, entries)
             })();
             btree_logical_wal::set(previous_lsn);
             return result;
@@ -4585,6 +4575,141 @@ impl IndexFile {
         })();
         btree_logical_wal::set(previous_lsn);
         result
+    }
+
+    fn delete_logged_entries(
+        &self,
+        txn_id: u64,
+        entries: Vec<IndexBatchEntry>,
+    ) -> Result<(), QueryError> {
+        if entries.len() < MIN_LEAF_DELETE_BATCH {
+            for entry in entries {
+                self.delete_entry_concurrent(
+                    txn_id,
+                    IndexEntry {
+                        key: entry.key,
+                        row_id: entry.row_id,
+                    },
+                )?;
+            }
+            return Ok(());
+        }
+        let mut entries: Vec<_> = entries
+            .into_iter()
+            .map(|entry| IndexEntry {
+                key: entry.key,
+                row_id: entry.row_id,
+            })
+            .collect();
+        entries.sort_unstable();
+        let mut remaining = entries.as_slice();
+        let mut skip_probe = 0;
+        while let Some(first) = remaining.first() {
+            let Some(probe) = remaining.get(MIN_LEAF_DELETE_BATCH - 1) else {
+                for entry in remaining {
+                    self.delete_entry_concurrent(txn_id, entry.clone())?;
+                }
+                break;
+            };
+            if skip_probe != 0 {
+                self.delete_entry_concurrent(txn_id, first.clone())?;
+                remaining = &remaining[1..];
+                skip_probe -= 1;
+                continue;
+            }
+            let batch_leaf = {
+                let _structure = self.structure_lock.read();
+                let (pinned, _) = self.find_leaf_for_entry_with_candidate(first, first)?;
+                let max_span = MIN_LEAF_DELETE_BATCH * 2;
+                let (can_batch, dense) =
+                    match pinned.packed_leaf_delete_batch_probe(first, probe, max_span)? {
+                        Some(result) => result,
+                        None => pinned.with_index_raw_bytes(|bytes| {
+                            let leaf = parse_leaf_payload_header(bytes)?;
+                            let first_pos = raw_leaf_position(&leaf, first)?.ok();
+                            let probe_pos = raw_leaf_position(&leaf, probe)?;
+                            let can_batch = match probe_pos {
+                                Ok(_) => true,
+                                Err(pos) => pos < leaf.count,
+                            };
+                            let dense = first_pos
+                                .zip(probe_pos.ok())
+                                .is_some_and(|(start, end)| end - start < max_span);
+                            Ok((can_batch, dense))
+                        })?,
+                    };
+                // Do not acquire a write lease or materialize a numeric image
+                // for targets scattered over several leaves. Reuse the
+                // original point path and its amortized sparse-run probe.
+                if can_batch {
+                    let consumed = self.try_delete_pinned_leaf_run(txn_id, &pinned, remaining)?;
+                    if consumed != 0 {
+                        remaining = &remaining[consumed..];
+                        continue;
+                    }
+                }
+                if !dense {
+                    // Sparse edits preserve raw slot holes for subsequent
+                    // inserts. Amortize this failed density probe.
+                    skip_probe = MIN_LEAF_DELETE_BATCH - 1;
+                }
+                if !dense && self.try_delete_pinned_entry(txn_id, &pinned, first)? {
+                    remaining = &remaining[1..];
+                    continue;
+                }
+                dense
+            };
+            let _structure = self.structure_lock.write();
+            if batch_leaf {
+                let consumed = self.delete_leaf_batch_unlocked(txn_id, remaining)?;
+                if consumed != 0 {
+                    remaining = &remaining[consumed..];
+                    continue;
+                }
+            }
+            self.delete_internal_unlocked(txn_id, first.key.clone(), first.row_id, false)?;
+            remaining = &remaining[1..];
+        }
+        Ok(())
+    }
+
+    /// Apply a sorted run to one leaf. The first entry's route and the
+    /// current leaf maximum bound the run even if topology changed between
+    /// the shared probe and acquisition of the write guard.
+    fn delete_leaf_batch_unlocked(
+        &self,
+        txn_id: u64,
+        entries: &[IndexEntry],
+    ) -> Result<usize, QueryError> {
+        let mut consumed = 0;
+        self.with_structural_recovery(|| {
+            let mut path = Vec::new();
+            let page_id = self.find_leaf_for_entry(&entries[0], &mut path)?;
+            let mut leaf = self.read_leaf(page_id)?;
+            // Existing stale lower separators can route missing entries
+            // into this leaf, so absent targets must be harmless.
+            let Some(last) = leaf.entries.last() else {
+                return Ok(());
+            };
+            consumed = entries.partition_point(|entry| entry <= last);
+            let targets = &entries[..consumed];
+            let first_changed = targets.binary_search(&leaf.entries[0]).is_ok();
+            let old_len = leaf.entries.len();
+            let mut targets = targets.iter().peekable();
+            leaf.entries.retain(|entry| {
+                while targets.peek().is_some_and(|target| *target < entry) {
+                    targets.next();
+                }
+                targets.peek().is_none_or(|target| *target != entry)
+            });
+            if leaf.entries.len() != old_len {
+                leaf.recompute_cached_size();
+                self.write_page(txn_id, page_id, IndexPage::Leaf(leaf))?;
+                self.rebalance_after_leaf_delete(txn_id, page_id, path, first_changed)?;
+            }
+            Ok(())
+        })?;
+        Ok(consumed)
     }
 
     fn insert_entries_logged(
@@ -7503,27 +7628,76 @@ impl IndexFile {
         txn_id: u64,
         entry: &IndexEntry,
     ) -> Result<bool, QueryError> {
-        let completed_without_structure_change = {
-            let _structure = self.structure_lock.read();
-            let pinned = self.find_leaf_for_entry_with_candidate(entry, entry)?.0;
-            let leaf_id = pinned.frame.key.page_id;
-            let (leaf_latch, same_bucket) = self.lock_leaf_latches(leaf_id, leaf_id)?;
-            let _mutation = self.begin_mutation();
-            let root_page = self.root_page.load(Ordering::Acquire);
-            let result =
-                self.try_delete_leaf_nonstructural_in_place(txn_id, &pinned, entry, root_page)?;
-            drop(same_bucket);
-            drop(leaf_latch);
-            match result {
-                Some(InPlaceDelete::Deleted { .. }) => {
-                    self.dirty.store(true, Ordering::Release);
-                    true
-                }
-                Some(InPlaceDelete::NotFound) => true,
-                None => false,
+        let _structure = self.structure_lock.read();
+        let pinned = self.find_leaf_for_entry_with_candidate(entry, entry)?.0;
+        self.try_delete_pinned_entry(txn_id, &pinned, entry)
+    }
+
+    fn try_delete_pinned_entry(
+        &self,
+        txn_id: u64,
+        pinned: &PinnedFrame,
+        entry: &IndexEntry,
+    ) -> Result<bool, QueryError> {
+        let leaf_id = pinned.frame.key.page_id;
+        let (leaf_latch, same_bucket) = self.lock_leaf_latches(leaf_id, leaf_id)?;
+        let _mutation = self.begin_mutation();
+        let root_page = self.root_page.load(Ordering::Acquire);
+        let result =
+            self.try_delete_leaf_nonstructural_in_place(txn_id, pinned, entry, root_page)?;
+        drop(same_bucket);
+        drop(leaf_latch);
+        match result {
+            Some(InPlaceDelete::Deleted { .. }) => {
+                self.dirty.store(true, Ordering::Release);
+                Ok(true)
             }
+            Some(InPlaceDelete::NotFound) => Ok(true),
+            None => Ok(false),
+        }
+    }
+
+    fn try_delete_pinned_leaf_run(
+        &self,
+        txn_id: u64,
+        pinned: &PinnedFrame,
+        entries: &[IndexEntry],
+    ) -> Result<usize, QueryError> {
+        let leaf_id = pinned.frame.key.page_id;
+        if !self.lazy_write_eligible(leaf_id)? {
+            return Ok(0);
+        }
+        let (_leaf_latch, _same_bucket) = self.lock_leaf_latches(leaf_id, leaf_id)?;
+        let _mutation = self.begin_mutation();
+        let is_root = leaf_id == self.root_page.load(Ordering::Acquire);
+        if let Some((changed, consumed)) = self.buffer_pool.try_modify_existing_packed_leaf(
+            pinned,
+            self.lazy_mutation_lsn(),
+            |leaf| {
+                let result = leaf.delete_run(entries, txn_id, is_root);
+                Some((result.0, result))
+            },
+        )? {
+            if consumed != 0 {
+                if changed {
+                    self.dirty.store(true, Ordering::Release);
+                }
+                return Ok(consumed);
+            }
+        }
+        let result =
+            self.buffer_pool
+                .modify_pinned_raw_page(pinned, self.lazy_mutation_lsn(), |bytes| {
+                    let result = try_delete_raw_leaf_run(bytes, entries, txn_id, is_root)?;
+                    Ok((result.is_some_and(|result| result.0), result))
+                })?;
+        let Some((changed, consumed)) = result else {
+            return Ok(0);
         };
-        Ok(completed_without_structure_change)
+        if changed {
+            self.dirty.store(true, Ordering::Release);
+        }
+        Ok(consumed)
     }
 
     #[cfg(test)]
@@ -10013,7 +10187,7 @@ impl IndexFile {
             }
             return Ok(());
         }
-        self.rebalance_child(txn_id, page_id, path)
+        self.rebalance_child(txn_id, page_id, path, entry_count == 0)
     }
 
     fn rebalance_internal_if_needed(
@@ -10046,7 +10220,7 @@ impl IndexFile {
             self.refresh_parent_separator(txn_id, &path, page_id)?;
             return Ok(());
         }
-        self.rebalance_child(txn_id, page_id, path)
+        self.rebalance_child(txn_id, page_id, path, false)
     }
 
     fn rebalance_child(
@@ -10054,6 +10228,7 @@ impl IndexFile {
         txn_id: u64,
         page_id: u64,
         mut path: Vec<(u64, usize)>,
+        empty_leaf: bool,
     ) -> Result<(), QueryError> {
         let Some((parent_id, child_idx)) = path.pop() else {
             return Ok(());
@@ -10065,7 +10240,41 @@ impl IndexFile {
                 "corrupt index: rebalance parent mismatch",
             ));
         }
-        if child_idx > 0 {
+        // Unlink a drained leaf without copying its live sibling. The path
+        // still describes the old topology, including the predecessor when
+        // it belongs to another parent. Readers are excluded by the caller's
+        // structural write guard, as for an ordinary merge.
+        if empty_leaf && parent.children.len() > 1 {
+            let leaf = self.read_leaf(page_id)?;
+            let mut predecessor = child_idx.checked_sub(1).map(|idx| parent.children[idx]);
+            if predecessor.is_none() {
+                for &(ancestor_id, idx) in path.iter().rev() {
+                    if idx > 0 {
+                        let ancestor = self.read_internal(ancestor_id)?;
+                        predecessor = Some(self.rightmost_leaf_from(ancestor.children[idx - 1])?);
+                        break;
+                    }
+                }
+            }
+            if let Some(previous_id) = predecessor {
+                let mut previous = self.read_leaf(previous_id)?;
+                if previous.next_leaf != Some(page_id) {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt index: empty leaf predecessor mismatch",
+                    ));
+                }
+                previous.next_leaf = leaf.next_leaf;
+                previous.set_page_max_trx_id(previous.page_max_trx_id.max(leaf.page_max_trx_id));
+                self.write_page(txn_id, previous_id, IndexPage::Leaf(previous))?;
+            }
+            parent.children.remove(child_idx);
+            parent.keys.remove(child_idx.saturating_sub(1));
+            self.write_page(txn_id, parent_id, IndexPage::Internal(parent))?;
+            self.free_page(txn_id, page_id)?;
+            return self.rebalance_internal_if_needed(txn_id, parent_id, path);
+        }
+        if !empty_leaf && child_idx > 0 {
             let left_id = parent.children[child_idx - 1];
             if self.try_borrow_from_left(txn_id, left_id, page_id, &mut parent, child_idx)? {
                 // Borrowing changes the separator in-place. A variable-width
@@ -10083,7 +10292,7 @@ impl IndexFile {
                 return Ok(());
             }
         }
-        if child_idx + 1 < parent.children.len() {
+        if !empty_leaf && child_idx + 1 < parent.children.len() {
             let right_id = parent.children[child_idx + 1];
             if self.try_borrow_from_right(txn_id, page_id, right_id, &mut parent, child_idx)? {
                 if encoded_internal_page_len(&parent) <= PAGE_SIZE {
@@ -10203,16 +10412,24 @@ impl IndexFile {
                     .pop()
                     .expect("left internal should have child after len check");
                 page.children.insert(0, moved);
-                self.recompute_internal_keys(&mut left)?;
-                self.recompute_internal_keys(&mut page)?;
-                parent.keys[child_idx - 1] = self.first_entry_of_page(moved)?.ok_or_else(|| {
+                // The old parent bound separates the moved child from the
+                // receiver's old first child. The donor's last bound becomes
+                // the new parent bound; no child pages need to be read.
+                page.keys.insert(0, parent.keys[child_idx - 1].clone());
+                let separator = left.keys.pop().ok_or_else(|| {
                     error(
                         crate::error::catalog::ER_GET_ERRNO,
-                        "borrow produced empty internal",
+                        "corrupt index: left internal has no separator",
                     )
                 })?;
                 let left = IndexInternalPage::new_generic(left.keys, left.children);
                 let page = IndexInternalPage::new_generic(page.keys, page.children);
+                if encoded_internal_page_len(&left) > PAGE_SIZE
+                    || encoded_internal_page_len(&page) > PAGE_SIZE
+                {
+                    return Ok(false);
+                }
+                parent.keys[child_idx - 1] = separator;
                 self.write_page(txn_id, left_id, IndexPage::Internal(left))?;
                 self.write_page(txn_id, page_id, IndexPage::Internal(page))?;
                 Ok(true)
@@ -10282,18 +10499,22 @@ impl IndexFile {
                 }
                 let moved = right.children.remove(0);
                 page.children.push(moved);
-                self.recompute_internal_keys(&mut page)?;
-                self.recompute_internal_keys(&mut right)?;
-                parent.keys[child_idx] =
-                    self.first_entry_of_page(right.children[0])?
-                        .ok_or_else(|| {
-                            error(
-                                crate::error::catalog::ER_GET_ERRNO,
-                                "borrow produced empty right internal",
-                            )
-                        })?;
+                page.keys.push(parent.keys[child_idx].clone());
+                if right.keys.is_empty() {
+                    return Err(error(
+                        crate::error::catalog::ER_GET_ERRNO,
+                        "corrupt index: right internal has no separator",
+                    ));
+                }
+                let separator = right.keys.remove(0);
                 let page = IndexInternalPage::new_generic(page.keys, page.children);
                 let right = IndexInternalPage::new_generic(right.keys, right.children);
+                if encoded_internal_page_len(&page) > PAGE_SIZE
+                    || encoded_internal_page_len(&right) > PAGE_SIZE
+                {
+                    return Ok(false);
+                }
+                parent.keys[child_idx] = separator;
                 self.write_page(txn_id, page_id, IndexPage::Internal(page))?;
                 self.write_page(txn_id, right_id, IndexPage::Internal(right))?;
                 Ok(true)
@@ -15520,6 +15741,98 @@ fn try_delete_raw_leaf(
     }))
 }
 
+/// Compact the slot directory once for a sorted partial-leaf batch. All
+/// routing, bounds and minimum-fill checks complete before any byte changes.
+/// Record bodies stay in place, preserving the same reusable holes as point
+/// deletion. The bitmap is bounded by the physical page's slot capacity.
+fn try_delete_raw_leaf_run(
+    buf: &mut [u8],
+    entries: &[IndexEntry],
+    txn_id: u64,
+    is_root: bool,
+) -> Result<Option<(bool, usize)>, QueryError> {
+    let mut deleted = [0u64; (PAGE_SIZE / SLOT_OFFSET_BYTES + 63) / 64];
+    let (consumed, count, slot_start, removed_count) = {
+        let header = parse_leaf_payload_header(buf)?;
+        if header.count == 0 {
+            return Ok(None);
+        }
+        let last = decode_raw_leaf_entry_at(&header, header.count - 1)?;
+        let consumed = entries.partition_point(|entry| entry <= &last);
+        if consumed < MIN_LEAF_DELETE_BATCH || (!is_root && consumed >= header.count) {
+            return Ok(None);
+        }
+        let mut removed_count = 0;
+        let mut removed_bytes = 0usize;
+        for entry in &entries[..consumed] {
+            let Ok(pos) = raw_leaf_position(&header, entry)? else {
+                continue;
+            };
+            let bit = 1u64 << (pos % 64);
+            if deleted[pos / 64] & bit != 0 {
+                continue;
+            }
+            let slot = header.read_slot(pos);
+            if slot.offset as usize + slot.len as usize > header.slot_array_start {
+                return Err(error(
+                    crate::error::catalog::ER_GET_ERRNO,
+                    "corrupt index: slot record bounds",
+                ));
+            }
+            deleted[pos / 64] |= bit;
+            removed_count += 1;
+            removed_bytes += slot.len as usize + SLOT_OFFSET_BYTES;
+        }
+        let (live_bytes, _) = raw_leaf_live_encoded_len_and_count(buf)?;
+        if !is_root
+            && (removed_count >= header.count
+                || live_bytes.saturating_sub(removed_bytes) < INDEX_MIN_PAGE_BYTES)
+        {
+            return Ok(None);
+        }
+        (
+            consumed,
+            header.count,
+            header.slot_array_start,
+            removed_count,
+        )
+    };
+    if removed_count == 0 {
+        return Ok(Some((false, consumed)));
+    }
+    let slots_abs = INDEX_HEADER_BYTES + slot_start;
+    let mut destination = slots_abs;
+    for position in 0..count {
+        let source = slots_abs + position * SLOT_OFFSET_BYTES;
+        if deleted[position / 64] & (1u64 << (position % 64)) != 0 {
+            let offset = read_u16(buf, source) as usize;
+            let len = read_u16(buf, source + 2) as usize;
+            buf[INDEX_HEADER_BYTES + offset..INDEX_HEADER_BYTES + offset + len].fill(0);
+        } else {
+            buf.copy_within(source..source + SLOT_OFFSET_BYTES, destination);
+            destination += SLOT_OFFSET_BYTES;
+        }
+    }
+    buf[destination..slots_abs + count * SLOT_OFFSET_BYTES].fill(0);
+    let old_payload_len = read_u32(buf, 20) as usize;
+    write_u16(
+        buf,
+        INDEX_HEADER_BYTES + LEAF_OFF_ENTRY_COUNT,
+        (count - removed_count) as u16,
+    );
+    write_u64(
+        buf,
+        INDEX_HEADER_BYTES + LEAF_OFF_PAGE_MAX_TRX_ID,
+        read_u64(buf, INDEX_HEADER_BYTES + LEAF_OFF_PAGE_MAX_TRX_ID).max(txn_id),
+    );
+    write_u32(
+        buf,
+        20,
+        (old_payload_len - removed_count * SLOT_OFFSET_BYTES) as u32,
+    );
+    Ok(Some((true, consumed)))
+}
+
 /// Infallible commit after slot lookup and record-bound validation.
 fn delete_raw_leaf_prepared(
     buf: &mut [u8],
@@ -19390,6 +19703,91 @@ enum ReverseLeafSpan {
 mod logged_delete_batch_tests {
     use super::*;
 
+    #[test]
+    fn raw_delete_run_matches_point_deletes_and_preserves_underflow_image() {
+        for kind in 0..11 {
+            let entries: Vec<_> = (0..200i64)
+                .map(|n| IndexEntry {
+                    key: IndexKey::from(match kind {
+                        0 => vec![KeyPart::Int(n - 100)],
+                        1 => vec![KeyPart::UInt((1u64 << 63) + n as u64)],
+                        2 => vec![KeyPart::Decimal {
+                            value: i128::from(n) * 1234,
+                            scale: 3,
+                        }],
+                        3 => vec![KeyPart::Date(18000 + n as i32)],
+                        4 => vec![KeyPart::String(format!("{n:05}{}", "x".repeat(24)))],
+                        5 => vec![KeyPart::Bytes(
+                            format!("{n:05}{}", "x".repeat(24)).into_bytes(),
+                        )],
+                        6 => vec![
+                            KeyPart::Null,
+                            KeyPart::Int(n / 3),
+                            KeyPart::String(format!("{n:05}")),
+                        ],
+                        7 => vec![KeyPart::DateTime(1_600_000_000_000_000 + n)],
+                        8 => vec![KeyPart::Float64(f64_to_order_u64(n as f64 / 3.0))],
+                        9 => vec![KeyPart::Time(n * 10000 - 1_000_000)],
+                        _ => vec![
+                            KeyPart::UInt(n as u64),
+                            KeyPart::Date(18000),
+                            KeyPart::Decimal {
+                                value: i128::from(n) * 1234,
+                                scale: 3,
+                            },
+                        ],
+                    }),
+                    row_id: RowId {
+                        page_id: 1,
+                        slot_id: n as u16,
+                    },
+                })
+                .collect();
+            let original = encode_index_tree_page(&IndexPage::Leaf(
+                IndexLeafPage::new_with_resolved_layout(entries.clone(), None),
+            ))
+            .unwrap();
+            let mut targets: Vec<_> = entries.iter().skip(2).step_by(7).cloned().collect();
+            targets.push(targets[0].clone());
+            let mut beyond = entries.last().unwrap().clone();
+            beyond.row_id.slot_id = u16::MAX;
+            targets.push(beyond);
+            targets.sort();
+            let mut actual = original.clone();
+            let mut oracle = original.clone();
+            for target in &targets {
+                try_delete_raw_leaf(&mut oracle, target, 17).unwrap();
+            }
+            assert_eq!(
+                try_delete_raw_leaf_run(&mut actual, &targets, 17, true).unwrap(),
+                Some((true, targets.len() - 1)),
+                "kind={kind}"
+            );
+            assert_eq!(actual, oracle, "kind={kind}");
+            let mut declined = original.clone();
+            assert_eq!(
+                try_delete_raw_leaf_run(&mut declined, &entries[..190], 18, false).unwrap(),
+                None
+            );
+            assert_eq!(declined, original);
+            if kind == 4 {
+                assert!(
+                    raw_leaf_live_encoded_len_and_count(&original).unwrap().0
+                        > INDEX_MIN_PAGE_BYTES
+                );
+                assert_eq!(
+                    try_delete_raw_leaf_run(&mut declined, &entries[..16], 18, false).unwrap(),
+                    Some((true, 16))
+                );
+                let mut oracle = original.clone();
+                for target in &entries[..16] {
+                    try_delete_raw_leaf(&mut oracle, target, 18).unwrap();
+                }
+                assert_eq!(declined, oracle);
+            }
+        }
+    }
+
     fn fixture() -> (tempfile::TempDir, Arc<IndexFile>) {
         std::fs::create_dir_all("/tmp/mydb").unwrap();
         let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
@@ -19412,6 +19810,153 @@ mod logged_delete_batch_tests {
             .unwrap(),
         );
         (dir, file)
+    }
+
+    #[test]
+    fn deleting_a_complete_leaf_unlinks_without_rewriting_survivors() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..2000u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::Int(i64::from(n))]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let root = file
+            .read_internal(file.root_page.load(Ordering::Acquire))
+            .unwrap();
+        assert_eq!(root.children.len(), 2);
+        let first = file.read_leaf(root.children[0]).unwrap();
+        let right = file.read_leaf(root.children[1]).unwrap();
+        assert!(encoded_leaf_page_len(&right) > INDEX_MIN_PAGE_BYTES);
+        let deletes: Vec<_> = first
+            .entries
+            .iter()
+            .map(|entry| IndexBatchEntry {
+                kind: WalIndexOpKind::Delete,
+                key: entry.key.clone(),
+                row_id: entry.row_id,
+            })
+            .collect();
+        file.apply_batch_deferred(7, deletes, None).unwrap();
+        assert_eq!(file.root_page.load(Ordering::Acquire), root.children[1]);
+        let root = file
+            .read_page(file.root_page.load(Ordering::Acquire))
+            .unwrap();
+        let IndexPage::Leaf(remaining) = root.as_ref() else {
+            panic!("unlinking the empty leaf must collapse the two-child root");
+        };
+        assert_eq!(remaining.entries, right.entries);
+        assert_eq!(remaining.next_leaf, None);
+        file.validate_structure().unwrap();
+        for entry in &first.entries {
+            assert_eq!(file.get_unique_one(&entry.key).unwrap(), None);
+        }
+        for entry in &right.entries {
+            assert_eq!(file.get_unique_one(&entry.key).unwrap(), Some(entry.row_id));
+        }
+    }
+
+    #[test]
+    fn empty_leaf_unlink_repairs_cross_parent_chain_and_reuses_pages() {
+        let (_dir, file) = fixture();
+        let entries: Vec<_> = (0..5000u16)
+            .map(|n| IndexEntry {
+                key: IndexKey::from(vec![KeyPart::String(format!("{n:05}{}", "x".repeat(240)))]),
+                row_id: RowId {
+                    page_id: 1,
+                    slot_id: n,
+                },
+            })
+            .collect();
+        file.bulk_load_sorted(txn_id_for_ddl(), entries.clone())
+            .unwrap();
+        let root = file
+            .read_internal(file.root_page.load(Ordering::Acquire))
+            .unwrap();
+        assert!(root.children.len() > 1);
+        let internal = file.read_internal(root.children[1]).unwrap();
+        let first = internal.children[0];
+        let leaves = [
+            first,
+            file.rightmost_leaf().unwrap(),
+            file.leftmost_leaf().unwrap(),
+        ];
+        let mut deleted = std::collections::BTreeSet::new();
+        for leaf_id in leaves {
+            let leaf = file.read_leaf(leaf_id).unwrap();
+            let deletes = leaf
+                .entries
+                .iter()
+                .map(|entry| {
+                    deleted.insert(entry.clone());
+                    IndexBatchEntry {
+                        kind: WalIndexOpKind::Delete,
+                        key: entry.key.clone(),
+                        row_id: entry.row_id,
+                    }
+                })
+                .collect();
+            file.apply_batch_deferred(7, deletes, None).unwrap();
+            file.validate_structure().unwrap();
+        }
+        let expected: Vec<_> = entries
+            .iter()
+            .filter(|entry| !deleted.contains(*entry))
+            .cloned()
+            .collect();
+        assert_eq!(
+            file.entries().unwrap(),
+            expected
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.row_id))
+                .collect::<Vec<_>>()
+        );
+        file.buffer_pool.flush_and_evict_all().unwrap();
+        file.validate_structure().unwrap();
+        for entry in &entries {
+            assert_eq!(
+                file.get_unique_one(&entry.key).unwrap(),
+                (!deleted.contains(entry)).then_some(entry.row_id)
+            );
+        }
+        for entry in &deleted {
+            file.insert_with_txn(8, entry.key.clone(), entry.row_id)
+                .unwrap();
+        }
+        assert_eq!(
+            file.entries().unwrap(),
+            entries
+                .iter()
+                .map(|entry| (entry.key.clone(), entry.row_id))
+                .collect::<Vec<_>>()
+        );
+        file.validate_structure().unwrap();
+        file.apply_batch_deferred(
+            9,
+            entries
+                .iter()
+                .map(|entry| IndexBatchEntry {
+                    kind: WalIndexOpKind::Delete,
+                    key: entry.key.clone(),
+                    row_id: entry.row_id,
+                })
+                .collect(),
+            None,
+        )
+        .unwrap();
+        assert!(file.entries().unwrap().is_empty());
+        assert!(matches!(
+            file.read_page(file.root_page.load(Ordering::Acquire))
+                .unwrap()
+                .as_ref(),
+            IndexPage::Leaf(_)
+        ));
+        file.validate_structure().unwrap();
     }
 
     #[test]

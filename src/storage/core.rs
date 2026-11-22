@@ -241,6 +241,7 @@ const ROW_FLAG_FREE: u8 = 2;
 // now persist an overflow allocation generation (overflow v3).
 const MVCC_FLAG_DELETED: u8 = 1;
 const MVCC_FLAG_ROW_PIECE: u8 = 1 << 1;
+const MVCC_FLAG_RETAINED_INDEX_KEYS: u8 = 1 << 5;
 const HEAP_FORWARDING_STUB_VERSION: u8 = 0xff;
 // rowid-6bytes stub layout: `[u8 version][u32 page_id][u16 slot]` = 7 B.
 // Was 9 B in v6 (which carried the per-slot `generation`). Forwarding
@@ -561,6 +562,7 @@ struct DmlDelete {
     row_id: RowId,
     header: RowHeader,
     values: Vec<Value>,
+    retain_index_entries: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -793,10 +795,10 @@ pub(crate) struct VectorBuildDelta {
 }
 
 #[derive(Debug, Clone)]
-struct HeapWrite {
+struct HeapWrite<V = Vec<Value>> {
     row_id: RowId,
     header: RowHeader,
-    values: Vec<Value>,
+    values: V,
     /// Per-column external mask for off-page BLOB/TEXT columns. Empty
     /// for rows with no externalized values (the common case).
     external: Vec<Option<LobRef>>,
@@ -1358,6 +1360,11 @@ pub struct Database {
     // Shared with TransactionManager, published only on repair mutations.
     index_repair_version: Arc<AtomicU64>,
     index_repair_epochs: Arc<IndexRepairEpochs>,
+    retained_index_deletes: Arc<AtomicU64>,
+    retained_index_purge_frontier: AtomicU64,
+    undo_purge_serial: parking_lot::Mutex<()>,
+    deferred_index_purge_rows: AtomicU64,
+    deferred_index_purge_us: AtomicU64,
     // M3.4 - Largest contiguous transaction-id prefix whose slots have been
     // safely folded away. Every id <= this value is unconditionally visible
     // to current snapshots; sparse slot collection must not jump this prefix.

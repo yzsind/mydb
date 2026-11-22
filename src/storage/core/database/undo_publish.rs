@@ -104,6 +104,7 @@ struct UndoPublicationLane {
 
 struct UndoLatch {
     inner: parking_lot::RwLock<UndoTablespace>,
+    retained_index_deletes: Arc<AtomicU64>,
     publications: Box<[UndoPublicationLane]>,
     sequence: AtomicU64,
     stage_allowed: AtomicBool,
@@ -183,6 +184,7 @@ impl UndoLatch {
             cache_limit: AtomicU64::new(value.mem_cache_limit_bytes),
             disk_softfail_warn: AtomicBool::new(value.disk_cap_softfail_warn()),
             canonical_resident: AtomicU64::new(value.resident_bytes),
+            retained_index_deletes: value.retained_index_delete_handle(),
             inner: parking_lot::RwLock::new(value),
             publications,
             sequence: AtomicU64::new(0),
@@ -251,7 +253,13 @@ impl UndoLatch {
             let (buffer, position) = &mut snapshots[index];
             let entry = buffer.records[*position].take().unwrap();
             *position += 1;
+            let retained = matches!(entry.record.kind, UndoKind::DeleteHeaderRetained);
             undo.consolidate_published_record(entry.record, entry.reservation);
+            if retained {
+                // Hand off to the canonical directory without opening a
+                // window where visibility shortcuts miss the mark.
+                self.retained_index_deletes.fetch_sub(1, Ordering::Release);
+            }
             drop(entry.segment_lease);
         }
         for (shard, (mut buffer, _)) in self.publications.iter().zip(snapshots) {
@@ -342,6 +350,7 @@ impl UndoLatch {
             )
         })?;
         let resident = u64::from(record.resident_size);
+        let retained = matches!(record.kind, UndoKind::DeleteHeaderRetained);
         let (count, pending) = {
             let lane = &self.publications[self.shard(ptr)];
             let mut shard = lane.state.lock();
@@ -355,6 +364,11 @@ impl UndoLatch {
                 },
                 &self.sequence,
             )?;
+            if retained {
+                // The heap write follows publication, even when this record
+                // stays in the live lane until a later canonical read.
+                self.retained_index_deletes.fetch_add(1, Ordering::Release);
+            }
             shard.live_bytes = shard.live_bytes.saturating_add(resident);
             let count = shard.live.records.len();
             lane.count.store(count, Ordering::Release);

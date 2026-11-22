@@ -29,10 +29,20 @@ pub(crate) enum LockingReadLockWatermark {
 /// records held the write latch ~160 us on average (up to ~3 ms) and the
 /// planning read latch ~130 us, stalling every publisher meanwhile.
 const UNDO_PURGE_ROUND_RECORDS: usize = 64;
+// Coalesce retained-key WAL fences independently of undo-directory leases.
+const RETAINED_PURGE_BATCH_RECORDS: usize = 1024;
 // A scan also visits active and snapshot-pinned versions. Give it bounded
 // headroom over the victim quota so a productive pass can fill that quota
 // and request immediate draining instead of throttling reclaim behind DML.
 const UNDO_PURGE_SCAN_BUDGET_FACTOR: usize = 4;
+
+#[cfg(test)]
+thread_local! {
+    static AFTER_DEFERRED_INDEX_PURGE_WAL: RefCell<Option<Box<dyn Fn()>>> =
+        const { RefCell::new(None) };
+    static AFTER_RETAINED_SLOT_RECLAIM_WAL: RefCell<Option<Box<dyn Fn()>>> =
+        const { RefCell::new(None) };
+}
 
 /// A commit whose MVCC state and WAL record have been published, but whose
 /// durability barrier and post-durable hooks are intentionally deferred.
@@ -5780,6 +5790,12 @@ impl Database {
     /// shrink a backlog that is still growing — so it is gated off the
     /// write-load hot path here.
     pub(crate) fn purge_obsolete_undo(&self) -> bool {
+        // Foreground pressure, checkpoint and the worker may all request
+        // purge. A retained mark must have one owner until its keys are
+        // durable and the old heap identity can be recycled.
+        let Some(_purge) = self.undo_purge_serial.try_lock() else {
+            return false;
+        };
         let maintenance = self.backup_maintenance_gate.read();
         if self.capture.active.load(Ordering::Acquire) {
             return false;
@@ -5803,6 +5819,12 @@ impl Database {
         // writer's before-image, so treat the frontier as an implicit active
         // snapshot until its commit gap closes.
         let (oldest_registered_snapshot_scn, visible_scn) = self.snapshot_visibility_horizon();
+        if oldest_registered_snapshot_scn.is_none()
+            && self.retained_index_deletes.load(Ordering::Acquire) == 0
+        {
+            self.retained_index_purge_frontier
+                .store(0, Ordering::Release);
+        }
         let oldest_snapshot_scn = Some(
             oldest_registered_snapshot_scn
                 // A registered reader at the same frontier can have been
@@ -5825,8 +5847,14 @@ impl Database {
         let mut newer_records = false;
         let mut purged = 0usize;
         let mut outcome = crate::storage::undo::PurgeOutcome::default();
+        // Coalesce retained-key cleanup and its durability fence without
+        // lengthening the undo-directory write leases. Until the fence has
+        // completed, every selected record remains present in the directory.
+        let mut pending_victims = Vec::new();
+        let mut pending_creators = BTreeMap::new();
         while purged < batch_limit && scan_remaining > 0 {
-            let round_limit = (batch_limit - purged).min(UNDO_PURGE_ROUND_RECORDS);
+            let round_limit =
+                (batch_limit - purged - pending_victims.len()).min(UNDO_PURGE_ROUND_RECORDS);
             let candidates = self
                 .undo
                 .read()
@@ -5868,7 +5896,7 @@ impl Database {
                 }
                 Some(states)
             });
-            let victims = self.undo.read().plan_purge_candidates(
+            let mut victims = self.undo.read().plan_purge_candidates(
                 &candidates,
                 &active_txn_heads,
                 oldest_snapshot_scn,
@@ -5876,15 +5904,37 @@ impl Database {
                 committed_creator_watermark,
                 &recent_committed_txns,
             );
-            if !victims.is_empty() {
-                purged += victims.len();
-                let mut undo = self.undo.write();
-                if physical_replica {
-                    // Physical source pointers must not be remapped here.
-                    undo.evict_replica_records(&victims);
-                } else {
-                    outcome.absorb(undo.apply_purge_victims(&victims, &creator_states));
+            let retained = self.retained_index_deletes.load(Ordering::Acquire) != 0;
+            if !physical_replica && (retained || !pending_victims.is_empty()) {
+                if !victims.is_empty() {
+                    pending_creators.extend(creator_states);
+                    pending_victims.extend(victims);
                 }
+                if retained
+                    && pending_victims.len() < RETAINED_PURGE_BATCH_RECORDS
+                    && purged + pending_victims.len() < batch_limit
+                    && scan_remaining > 0
+                    && !sweep_complete
+                {
+                    continue;
+                }
+                purged += self.apply_undo_purge_rounds(
+                    &mut pending_victims,
+                    &pending_creators,
+                    retained,
+                    physical_replica,
+                    &mut outcome,
+                );
+                pending_victims.clear();
+                pending_creators.clear();
+            } else {
+                purged += self.apply_undo_purge_rounds(
+                    &mut victims,
+                    &creator_states,
+                    retained,
+                    physical_replica,
+                    &mut outcome,
+                );
             }
             if sweep_complete {
                 break;
@@ -5915,6 +5965,214 @@ impl Database {
             self.maybe_compact_undo_when_caught_up(retention_ms);
         }
         was_full
+    }
+
+    fn apply_undo_purge_rounds(
+        &self,
+        victims: &mut Vec<u64>,
+        creator_states: &BTreeMap<u64, crate::storage::undo::UndoCreatorState>,
+        retained: bool,
+        physical_replica: bool,
+        outcome: &mut crate::storage::undo::PurgeOutcome,
+    ) -> usize {
+        if retained && !victims.is_empty() {
+            self.exclude_blocked_index_purge_victims(victims, creator_states, physical_replica);
+        }
+        for round in victims.chunks(UNDO_PURGE_ROUND_RECORDS) {
+            let mut undo = self.undo.write();
+            if physical_replica {
+                // Physical source pointers must not be remapped here.
+                undo.evict_replica_records(round);
+            } else {
+                outcome.absorb(undo.apply_purge_victims(round, creator_states));
+            }
+        }
+        victims.len()
+    }
+
+    fn exclude_blocked_index_purge_victims(
+        &self,
+        victims: &mut Vec<u64>,
+        creator_states: &BTreeMap<u64, crate::storage::undo::UndoCreatorState>,
+        physical_replica: bool,
+    ) {
+        let targets = self
+            .undo
+            .read()
+            .retained_index_purge_targets(victims, creator_states);
+        if targets.is_empty() {
+            return;
+        }
+        let mut by_table = BTreeMap::<u64, Vec<(u64, u64, RowId)>>::new();
+        for (undo_id, txn_id, table_id, row_id) in targets {
+            by_table
+                .entry(table_id)
+                .or_default()
+                .push((undo_id, txn_id, row_id));
+        }
+        let mut retry = HashSet::new();
+        for (table_id, records) in by_table {
+            match self.purge_retained_index_entries(table_id, &records, physical_replica) {
+                Ok(blocked) => retry.extend(blocked),
+                Err(err) => {
+                    retry.extend(records.iter().map(|record| record.0));
+                    log_message(format_args!(
+                        "index delete-mark purge for table {table_id} will retry: {}",
+                        err.message(),
+                    ));
+                }
+            }
+        }
+        if !retry.is_empty() {
+            victims.retain(|id| !retry.contains(id));
+        }
+        // A newer snapshot may have loaded a leaf before its retained entry
+        // was removed. It must continue checking the heap even after the
+        // last undo record clears the pending counter.
+        self.retained_index_purge_frontier
+            .fetch_max(self.visible_scn().saturating_add(1), Ordering::Release);
+    }
+
+    /// Return the undo ids that must remain available for a later purge pass.
+    fn purge_retained_index_entries(
+        &self,
+        table_id: u64,
+        records: &[(u64, u64, RowId)],
+        physical_replica: bool,
+    ) -> Result<Vec<u64>, QueryError> {
+        let Some(table) = self.table_by_id_checked(table_id)? else {
+            return Ok(Vec::new());
+        };
+        let started = Instant::now();
+        // A read-only slot supplies a short table binding without WAL or
+        // row locks. The exclusive DDL barrier cannot replace the heap or
+        // index while this round derives and unlinks its keys.
+        let lease = if physical_replica {
+            None
+        } else {
+            Some(self.begin_read_only_txn()?.txn_id)
+        };
+        let result = (|| {
+            if let Some(lease) = lease {
+                if !matches!(
+                    self.table_locks_sharded.try_acquire_bound(
+                        lease,
+                        table_id,
+                        TableLockMode::IntentExclusive,
+                        Some(table.schema_version),
+                    ),
+                    TableAcquireOutcome::Acquired { .. } | TableAcquireOutcome::AlreadyHeld
+                ) {
+                    return Ok(records.iter().map(|&(undo_id, _, _)| undo_id).collect());
+                }
+            }
+            let mut blocked = Vec::new();
+            let mut batches = BTreeMap::<String, Vec<IndexBatchEntry>>::new();
+            let mut reclaim = Vec::with_capacity(if physical_replica { 0 } else { records.len() });
+            for &(undo_id, txn_id, row_id) in records {
+                let current = self.read_mvcc_row(table_id, row_id)?;
+                let still_marked = current.as_ref().is_some_and(|row| {
+                    row.header.is_deleted()
+                        && row.header.flags & MVCC_FLAG_RETAINED_INDEX_KEYS != 0
+                        && row.header.last_txn_id == txn_id
+                        && row.header.undo_ptr.is_some_and(|ptr| {
+                            if ptr == undo_id {
+                                return true;
+                            }
+                            let undo = self.undo.read();
+                            undo.canonical_ptr(ptr) == undo.canonical_ptr(undo_id)
+                        })
+                });
+                if !still_marked {
+                    continue;
+                }
+                if physical_replica {
+                    // The source must remove the keys and reclaim the slot.
+                    // Preserve its mark on the replica until that WAL arrives.
+                    blocked.push(undo_id);
+                    continue;
+                }
+                let mut row = current.expect("matching tombstone");
+                Self::pad_full_row_to_schema(&mut row.values, &table);
+                for index in table
+                    .indexes
+                    .iter()
+                    .filter(|index| index_supports_delete_mark(index))
+                {
+                    let batch = batches.entry(index.name.clone()).or_default();
+                    for key in table.stored_index_keys(index, &row.values)? {
+                        batch.push(IndexBatchEntry {
+                            kind: WalIndexOpKind::Delete,
+                            key,
+                            row_id,
+                        });
+                    }
+                }
+                reclaim.push((row_id, row.header));
+            }
+            if !batches.is_empty() {
+                self.apply_index_batches_deferred(txn_id_for_ddl(), &table, batches)?;
+                #[cfg(test)]
+                AFTER_DEFERRED_INDEX_PURGE_WAL.with(|hook| -> Result<(), QueryError> {
+                    if let Some(hook) = hook.borrow().as_ref() {
+                        self.log.lock().flush()?;
+                        hook();
+                    }
+                    Ok(())
+                })?;
+            }
+            let mut reclaimed = 0;
+            for chunk in reclaim.chunks(UNDO_PURGE_ROUND_RECORDS) {
+                reclaimed += self.with_heap_mut(table_id, |heap| {
+                    let mut reclaimed = 0;
+                    for &(row_id, header) in chunk {
+                        if heap.reclaim_retained_slot_logged(row_id, header)? {
+                            reclaimed += 1;
+                        }
+                    }
+                    Ok(reclaimed)
+                })?;
+            }
+            if !physical_replica && self.config.durability != DurabilityMode::Memory {
+                // The key unlink records precede SlotReclaim in the WAL.
+                // A slot can be reused as soon as both are appended, but
+                // the persistent undo mark outlives their durability fence.
+                #[cfg(test)]
+                AFTER_RETAINED_SLOT_RECLAIM_WAL.with(|hook| -> Result<(), QueryError> {
+                    if let Some(hook) = hook.borrow().as_ref() {
+                        self.log.lock().flush()?;
+                        hook();
+                    }
+                    Ok(())
+                })?;
+                let lsn = self.log_state_atomics.next_lsn().saturating_sub(1);
+                crate::wal::LogManager::sync_durable_to(&self.log, lsn)?;
+            }
+            if reclaimed != 0 {
+                self.slot_reclaim_total_atomic
+                    .fetch_add(reclaimed, Ordering::Relaxed);
+                self.slot_reclaim_runs_atomic
+                    .fetch_add(1, Ordering::Relaxed);
+                self.deferred_index_purge_rows
+                    .fetch_add(reclaimed, Ordering::Relaxed);
+                self.deferred_index_purge_us.fetch_add(
+                    started.elapsed().as_micros().min(u128::from(u64::MAX)) as u64,
+                    Ordering::Relaxed,
+                );
+            }
+            Ok(blocked)
+        })();
+        if let Some(lease) = lease {
+            self.commit_txn(lease)?;
+        }
+        result
+    }
+
+    pub(crate) fn deferred_index_purge_metrics(&self) -> (u64, u64) {
+        (
+            self.deferred_index_purge_rows.load(Ordering::Relaxed),
+            self.deferred_index_purge_us.load(Ordering::Relaxed),
+        )
     }
 
     /// Segment compaction, only reached from the *caught-up* purge path.
@@ -6452,7 +6710,7 @@ impl Database {
             return Ok(());
         }
         let result = crate::engine::executor::mem_budget::with_critical_memory_reservations(|| {
-            self.rollback_txn_inner(txn_id, after_unlock)
+            self.rollback_txn_inner(txn_id, &head, after_unlock)
         });
         match result {
             Ok(()) => Ok(()),
@@ -6475,6 +6733,7 @@ impl Database {
     fn rollback_txn_inner(
         &self,
         txn_id: u64,
+        head: &UndoHead,
         after_unlock: impl FnOnce(),
     ) -> Result<(), QueryError> {
         self.pending_heap_shrinks.remove(txn_id);
@@ -6522,12 +6781,7 @@ impl Database {
                     }
                 }
             }
-            let mut txns = self.txns_write()?;
-            txns.rollback(txn_id)?;
-            self.slot_status_cache.mark_rolled_back(txn_id);
-            self.active_write_txns_atomic
-                .store(txns.active_write_count, Ordering::Release);
-            drop(txns);
+            self.finish_rollback_txn(txn_id, head)?;
             self.table_locks_sharded.release_txn(txn_id);
             let lock_release = self.lock_manager().unlock_txn(txn_id);
             let mut released = self.wake_released_lock_waiters(lock_release);
@@ -6540,12 +6794,7 @@ impl Database {
         }
         self.append_wal(txn_id, WalPayload::AbortTxn)?;
         let touched_tables = self.rollback_txn_changes(txn_id)?;
-        let mut txns = self.txns_write()?;
-        txns.rollback(txn_id)?;
-        self.slot_status_cache.mark_rolled_back(txn_id);
-        self.active_write_txns_atomic
-            .store(txns.active_write_count, Ordering::Release);
-        drop(txns);
+        self.finish_rollback_txn(txn_id, head)?;
         self.table_locks_sharded.release_txn(txn_id);
         let lock_release = self.lock_manager().unlock_txn(txn_id);
         let mut released = self.wake_released_lock_waiters(lock_release);
@@ -6562,6 +6811,24 @@ impl Database {
             _ => {}
         }
         end_txn_redo_policy(&self.log, txn_id);
+        Ok(())
+    }
+
+    fn finish_rollback_txn(&self, txn_id: u64, head: &UndoHead) -> Result<(), QueryError> {
+        // The append fence and transaction locks are still held. Readers
+        // may use remaining repairs until their scope epoch advances. Keep
+        // both slot views in flight until every repair has been removed.
+        self.index_repair_state.clear_rolled_back(
+            txn_id,
+            head,
+            &self.index_repair_epochs,
+            &self.index_repair_version,
+        );
+        let mut txns = self.txns_write()?;
+        txns.publish_rollback(txn_id)?;
+        self.slot_status_cache.mark_rolled_back(txn_id);
+        self.active_write_txns_atomic
+            .store(txns.active_write_count, Ordering::Release);
         Ok(())
     }
 

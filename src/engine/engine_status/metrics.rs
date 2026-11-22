@@ -389,6 +389,8 @@ pub(super) fn collect(db: &Database) -> Vec<(String, String)> {
         // per-slot reclaim failures (heap open / WAL append). Failures
         // leave the slot in DELETED state — correctness is preserved,
         // only slot reuse stalls.
+        "deferred_index_purge_rows" => db.deferred_index_purge_metrics().0.to_string(),
+        "deferred_index_purge_us" => db.deferred_index_purge_metrics().1.to_string(),
         "slot_reclaim_total" => db.slot_reclaim_status_counters().0.to_string(),
         "slot_reclaim_runs" => db.slot_reclaim_status_counters().1.to_string(),
         "slot_reclaim_errors" => db.slot_reclaim_status_counters().2.to_string(),

@@ -47,6 +47,159 @@ fn result_rows(response: QueryResponse) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn prepared_range_delete_compiled_predicate_rebinds_types_and_restores_indexes() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE del_types(id INT PRIMARY KEY,k INT,a DECIMAL(12,2),s VARCHAR(40),dt DATE,j JSON,KEY ki(k))").unwrap();
+    engine.execute("INSERT INTO del_types VALUES (1,1,10.25,'Alpha','2026-10-08','{\"x\":1}'),(2,2,20.50,'beta','2026-10-09','{\"x\":2}'),(3,3,NULL,NULL,NULL,NULL),(4,4,40.00,'ALPHA','2026-10-10','{\"x\":4}')").unwrap();
+    let mut session = SessionContext::default();
+    let original = result_rows(
+        engine
+            .execute("SELECT * FROM del_types ORDER BY id")
+            .unwrap(),
+    );
+    for (sql, bindings) in [
+        (
+            "DELETE FROM del_types WHERE id BETWEEN 1 AND 4 AND a>=?",
+            vec![
+                (Value::Int(15), 2),
+                (Value::Decimal("10.25".into()), 3),
+                (Value::Null, 0),
+                (Value::String("35.0".into()), 1),
+            ],
+        ),
+        (
+            "DELETE FROM del_types WHERE k BETWEEN 1 AND 4 AND LOWER(s)=LOWER(?)",
+            vec![
+                (Value::String("ALPHA".into()), 2),
+                (Value::Null, 0),
+                (Value::String("beta".into()), 1),
+            ],
+        ),
+        (
+            "DELETE FROM del_types WHERE id BETWEEN 1 AND 4 AND dt>=CAST(? AS DATE)",
+            vec![
+                (Value::String("2026-10-09".into()), 2),
+                (Value::Null, 0),
+                (Value::String("2026-10-08".into()), 3),
+            ],
+        ),
+        (
+            "DELETE FROM del_types WHERE k BETWEEN 1 AND 4 AND COALESCE(JSON_EXTRACT(j,'$.x'),0)>=?",
+            vec![(Value::Int(2), 2), (Value::Null, 0), (Value::Int(4), 1)],
+        ),
+    ] {
+        let parsed = engine.prepare_cached(&mut session, sql, 1).unwrap();
+        let mut state = PreparedDmlState::default();
+        for (param, expected_count) in bindings {
+            let params = [param];
+            engine.execute_with_session(&mut session, "BEGIN").unwrap();
+            let count = affected(fast(&engine, &mut session, &mut state, &parsed, sql, &params).expect("range DELETE fast path").unwrap());
+            assert_eq!(count, expected_count, "{sql} {params:?}");
+            let rows = result_rows(engine.execute_with_session(&mut session, "SELECT * FROM del_types ORDER BY id").unwrap());
+            let indexed = result_rows(engine.execute_with_session(&mut session, "SELECT id,k FROM del_types FORCE INDEX(ki) WHERE k BETWEEN 1 AND 4 ORDER BY id").unwrap());
+            engine.execute_with_session(&mut session, "ROLLBACK").unwrap();
+            assert_eq!(result_rows(engine.execute("SELECT * FROM del_types ORDER BY id").unwrap()), original);
+            engine.execute_with_session(&mut session, "BEGIN").unwrap();
+            assert_eq!(affected(legacy(&engine, &mut session, &parsed, sql, &params).unwrap()), count, "{sql} {params:?}");
+            assert_eq!(result_rows(engine.execute_with_session(&mut session, "SELECT * FROM del_types ORDER BY id").unwrap()), rows);
+            assert_eq!(result_rows(engine.execute_with_session(&mut session, "SELECT id,k FROM del_types FORCE INDEX(ki) WHERE k BETWEEN 1 AND 4 ORDER BY id").unwrap()), indexed);
+            engine.execute_with_session(&mut session, "ROLLBACK").unwrap();
+        }
+    }
+    engine.db_for_tests().check_consistency().unwrap();
+}
+
+#[test]
+fn prepared_ordered_delete_rebinds_limit_across_savepoint_rollback() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE prepared_prefix(id INT PRIMARY KEY, k INT, KEY ord(k,id))")
+        .unwrap();
+    let values = (0..600)
+        .map(|id| format!("({id},{})", id % 13))
+        .collect::<Vec<_>>()
+        .join(",");
+    engine
+        .execute(&format!("INSERT INTO prepared_prefix VALUES{values}"))
+        .unwrap();
+    let sql = "DELETE FROM prepared_prefix ORDER BY k DESC,id DESC LIMIT ?";
+    let mut session = SessionContext::default();
+    let parsed = engine.prepare_cached(&mut session, sql, 1).unwrap();
+    let mut state = PreparedDmlState::default();
+    engine.execute_with_session(&mut session, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut session, "SAVEPOINT prefix")
+        .unwrap();
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(257)]
+            )
+            .expect("ordered DELETE uses the prepared DML executor")
+            .unwrap()
+        ),
+        257
+    );
+    engine
+        .execute_with_session(&mut session, "ROLLBACK TO SAVEPOINT prefix")
+        .unwrap();
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(300)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        300
+    );
+    assert_eq!(
+        affected(
+            fast(
+                &engine,
+                &mut session,
+                &mut state,
+                &parsed,
+                sql,
+                &[Value::Int(0)]
+            )
+            .unwrap()
+            .unwrap()
+        ),
+        0
+    );
+    engine.execute_with_session(&mut session, "COMMIT").unwrap();
+    let remaining = result_rows(
+        engine
+            .execute("SELECT id,k FROM prepared_prefix ORDER BY k,id")
+            .unwrap(),
+    );
+    let mut expected: Vec<_> = (0..600)
+        .map(|id| vec![Value::Int(id), Value::Int(id % 13)])
+        .collect();
+    expected.sort_by_key(|row| match (&row[1], &row[0]) {
+        (Value::Int(k), Value::Int(id)) => (*k, *id),
+        _ => unreachable!(),
+    });
+    expected.truncate(300);
+    assert_eq!(remaining, expected);
+    engine.db_for_tests().check_consistency().unwrap();
+}
+
+#[test]
 fn prepared_transaction_control_uses_inline_fast_path() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());

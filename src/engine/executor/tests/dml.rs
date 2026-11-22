@@ -958,6 +958,194 @@ fn full_primary_key_update_and_delete_take_direct_unique_path() {
 }
 
 #[test]
+fn ordered_delete_current_cursor_sees_replacements_after_rr_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE cursor_delete(id INT PRIMARY KEY, v INT)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO cursor_delete VALUES(1,10),(2,20),(3,30),(4,40)")
+        .unwrap();
+    let mut reader = SessionContext::default();
+    engine
+        .execute_with_session(
+            &mut reader,
+            "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ",
+        )
+        .unwrap();
+    engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut reader, "SELECT * FROM cursor_delete")
+        .unwrap();
+    engine
+        .execute("DELETE FROM cursor_delete WHERE id=1")
+        .unwrap();
+    engine
+        .execute("INSERT INTO cursor_delete VALUES(1,99)")
+        .unwrap();
+    assert!(matches!(
+        engine
+            .execute_with_session(&mut reader, "DELETE FROM cursor_delete ORDER BY id LIMIT 2")
+            .unwrap(),
+        QueryResponse::OkAffected { affected_rows: 2 }
+    ));
+    engine
+        .execute_with_session(&mut reader, "ROLLBACK")
+        .unwrap();
+    engine.execute_with_session(&mut reader, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut reader, "INSERT INTO cursor_delete VALUES(5,50)")
+        .unwrap();
+    assert!(matches!(
+        engine
+            .execute_with_session(
+                &mut reader,
+                "DELETE FROM cursor_delete ORDER BY id DESC LIMIT 2"
+            )
+            .unwrap(),
+        QueryResponse::OkAffected { affected_rows: 2 }
+    ));
+    engine.execute_with_session(&mut reader, "COMMIT").unwrap();
+    let QueryResponse::ResultSet(result) = engine
+        .execute("SELECT id,v FROM cursor_delete ORDER BY id")
+        .unwrap()
+    else {
+        panic!("expected result set");
+    };
+    assert_eq!(
+        result.rows,
+        vec![
+            vec![Value::Int(1), Value::Int(99)],
+            vec![Value::Int(2), Value::Int(20)],
+            vec![Value::Int(3), Value::Int(30)]
+        ]
+    );
+}
+
+#[test]
+fn ordered_delete_cursor_refills_after_concurrent_delete_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = std::sync::Arc::new(engine_with_lock_wait_ms(dir.path(), 500));
+    engine
+        .execute("CREATE TABLE cursor_refill(id INT PRIMARY KEY)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO cursor_refill VALUES(1),(2),(3),(4)")
+        .unwrap();
+    let mut owner = SessionContext::default();
+    engine.execute_with_session(&mut owner, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut owner, "DELETE FROM cursor_refill WHERE id=1")
+        .unwrap();
+    let waiter_engine = std::sync::Arc::clone(&engine);
+    let waiter = std::thread::spawn(move || {
+        waiter_engine.execute("DELETE FROM cursor_refill ORDER BY id LIMIT 2")
+    });
+    std::thread::sleep(Duration::from_millis(20));
+    engine.execute_with_session(&mut owner, "COMMIT").unwrap();
+    assert!(matches!(
+        waiter.join().unwrap().unwrap(),
+        QueryResponse::OkAffected { affected_rows: 2 }
+    ));
+    let QueryResponse::ResultSet(result) = engine.execute("SELECT id FROM cursor_refill").unwrap()
+    else {
+        panic!("expected result set");
+    };
+    assert_eq!(result.rows, vec![vec![Value::Int(4)]]);
+}
+
+#[test]
+fn ordered_delete_cursor_handles_composite_nullable_keys_and_savepoints() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    engine.execute("CREATE TABLE cursor_types(id INT PRIMARY KEY, d DECIMAL(20,4), s VARCHAR(16), payload LONGBLOB, KEY ord(d,s,id))").unwrap();
+    for start in (0..769).step_by(128) {
+        let values = (start..(start + 128).min(769))
+            .map(|id| {
+                format!(
+                    "({id},{},'s{}',{})",
+                    if id % 17 == 0 {
+                        "NULL".into()
+                    } else {
+                        format!("{}.1234", id % 31)
+                    },
+                    id % 9,
+                    if id % 127 == 0 {
+                        "REPEAT('z',20000)"
+                    } else {
+                        "NULL"
+                    }
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        engine
+            .execute(&format!("INSERT INTO cursor_types VALUES{values}"))
+            .unwrap();
+    }
+    let QueryResponse::ResultSet(prefix) = engine
+        .execute("SELECT id FROM cursor_types ORDER BY d,s,id LIMIT 300")
+        .unwrap()
+    else {
+        panic!("expected result set");
+    };
+    let expected: std::collections::HashSet<_> = prefix
+        .rows
+        .into_iter()
+        .map(|row| match row[0] {
+            Value::Int(id) => id,
+            _ => unreachable!(),
+        })
+        .collect();
+    let mut writer = SessionContext::default();
+    engine.execute_with_session(&mut writer, "BEGIN").unwrap();
+    engine
+        .execute_with_session(&mut writer, "SAVEPOINT before_prefix")
+        .unwrap();
+    assert!(matches!(
+        engine
+            .execute_with_session(
+                &mut writer,
+                "DELETE FROM cursor_types ORDER BY d,s,id LIMIT 300"
+            )
+            .unwrap(),
+        QueryResponse::OkAffected { affected_rows: 300 }
+    ));
+    let QueryResponse::ResultSet(remaining) = engine
+        .execute_with_session(&mut writer, "SELECT id FROM cursor_types FORCE INDEX(ord)")
+        .unwrap()
+    else {
+        panic!("expected result set");
+    };
+    assert_eq!(remaining.rows.len(), 469);
+    assert!(remaining.rows.iter().all(|row| match row[0] {
+        Value::Int(id) => !expected.contains(&id),
+        _ => false,
+    }));
+    engine
+        .execute_with_session(&mut writer, "ROLLBACK TO SAVEPOINT before_prefix")
+        .unwrap();
+    assert!(matches!(
+        engine
+            .execute_with_session(
+                &mut writer,
+                "DELETE FROM cursor_types ORDER BY d DESC,s DESC,id DESC LIMIT 257"
+            )
+            .unwrap(),
+        QueryResponse::OkAffected { affected_rows: 257 }
+    ));
+    engine.execute_with_session(&mut writer, "COMMIT").unwrap();
+    engine.db_for_tests().check_consistency().unwrap();
+    let QueryResponse::ResultSet(remaining) =
+        engine.execute("SELECT id FROM cursor_types").unwrap()
+    else {
+        panic!("expected result set");
+    };
+    assert_eq!(remaining.rows.len(), 512);
+}
+
+#[test]
 fn ordered_limited_dml_uses_index_order_without_materializing_all_matches() {
     let dir = tempfile::tempdir().unwrap();
     let engine = open_test_engine(dir.path());
