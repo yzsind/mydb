@@ -34,12 +34,12 @@ mod sql_execution_audit_1108;
 mod sql_execution_fixes;
 mod subquery_scope_audit;
 mod support;
-mod trigger_release_1122;
 mod table_ddl_audit_1012;
 mod table_ddl_audit_1027;
 mod table_ddl_audit_1120;
 mod tablesample;
 mod temporal_comparison_consistency;
+mod trigger_release_1122;
 mod txn_acid_audit_1108;
 mod vaderyang_issues;
 

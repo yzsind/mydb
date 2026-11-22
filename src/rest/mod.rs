@@ -289,9 +289,23 @@ impl<E: QueryEngine> RestServer<E> {
                             peer.issuer = Some(distinguished_name(cert.issuer()));
                         }
                     }
-                    serve(stream, app.layer(Extension(peer)), config, control_streams, state).await;
+                    serve(
+                        stream,
+                        app.layer(Extension(peer)),
+                        config,
+                        control_streams,
+                        state,
+                    )
+                    .await;
                 } else {
-                    serve(stream, app.layer(Extension(peer)), config, control_streams, state).await;
+                    serve(
+                        stream,
+                        app.layer(Extension(peer)),
+                        config,
+                        control_streams,
+                        state,
+                    )
+                    .await;
                 }
             }) {
                 crate::util::logging::log_message(format_args!(

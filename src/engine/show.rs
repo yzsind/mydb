@@ -754,8 +754,7 @@ pub(crate) fn show_index(
         }));
     }
     let table = db.table(&table_name)?;
-    let estimated_rows =
-        crate::engine::table_stats_view::effective_row_count(db, &table);
+    let estimated_rows = crate::engine::table_stats_view::effective_row_count(db, &table);
     let mut rows = Vec::new();
     // SHOW INDEX hides Building entries — they aren't queryable yet,
     // so surfacing them would mislead clients into believing the

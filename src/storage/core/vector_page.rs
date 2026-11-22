@@ -6059,6 +6059,9 @@ mod vector_page_tests {
                 LogManager::open(dir.path()).unwrap(),
             ));
             let pool = test_pool(&log);
+            // Keep this a WAL-only crash: IO workers hold their own pool Arc
+            // and may otherwise flush old frames while recovery is replaying.
+            pool.shutdown_flusher();
             let file = Arc::new(
                 VectorIndexFile::open_with_durability(
                     path.clone(),
@@ -6093,6 +6096,8 @@ mod vector_page_tests {
                 .collect();
             // WAL durable; buffer-pool pages intentionally NOT flushed.
             log.lock().flush().unwrap();
+            assert_eq!(pool.write_ios.load(Ordering::Acquire), 0);
+            assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
             drop(g);
             drop(pool);
             drop(log);

@@ -543,7 +543,8 @@ fn audit_scope_defaults_and_validation() {
         r.write(name, SetScope::Session, &mut peer, None, changed.clone())
             .unwrap();
         assert_eq!(
-            r.snapshot_for_show(Scope::Global, Some(&peer), None).unwrap()
+            r.snapshot_for_show(Scope::Global, Some(&peer), None)
+                .unwrap()
                 .into_iter()
                 .find(|v| v.name == name)
                 .unwrap()

@@ -6666,8 +6666,7 @@ fn partition_dml_explain_input(
         } = node.clone()
         {
             let access_rows =
-                crate::engine::table_stats_view::effective_row_count(db, &table.schema)
-                    as f64;
+                crate::engine::table_stats_view::effective_row_count(db, &table.schema) as f64;
             *node = planner::PhysicalPlan::SeqScan {
                 table,
                 filter,

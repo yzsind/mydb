@@ -274,7 +274,20 @@ async fn availability_http_shutdown_rejects_racing_session_admission() {
         engine.clone(),
         engine.registry().clone(),
     );
-    let sessions = state.sessions.lock();
+    let (locked_tx, locked_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let holder = {
+        let state = state.clone();
+        tokio::task::spawn_blocking(move || {
+            let _sessions = state.sessions.lock();
+            let _ = locked_tx.send(());
+            let _ = release_rx.blocking_recv();
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(5), locked_rx)
+        .await
+        .expect("session admission lock was not acquired")
+        .unwrap();
     let creating = tokio::spawn(create_session(state.clone(), identity.clone(), None));
     tokio::time::timeout(Duration::from_secs(5), async {
         while state.registry.snapshot().is_empty() {
@@ -291,7 +304,8 @@ async fn availability_http_shutdown_rejects_racing_session_admission() {
         })
     };
     state.closing_notified().await;
-    drop(sessions);
+    release_tx.send(()).unwrap();
+    holder.await.unwrap();
     assert!(creating.await.unwrap().is_err());
     closing.await.unwrap();
     assert!(create_session(state.clone(), identity, None).await.is_err());
