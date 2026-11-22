@@ -849,6 +849,9 @@ impl Database {
             txn_id: txn.txn_id,
         };
         target.row_generation_txn_id = txn.txn_id;
+        for index in target.indexes.iter_mut().filter(|index| index.is_fulltext()) {
+            index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = txn.txn_id;
+        }
         let source_ids = rewrite
             .as_ref()
             .map(|r| r.source_ids.clone())
@@ -1232,6 +1235,9 @@ impl Database {
             } else {
                 self.with_heap_read(target.id, |heap| heap.page_count())?
             };
+            for id in &build_ids {
+                self.backfill_copied_fulltext_statistics(txn, &target, *id, *id)?;
+            }
             let key = table_key(&source.database, &source.name);
             self.catalog_write()?
                 .tables

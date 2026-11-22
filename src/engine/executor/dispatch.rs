@@ -2964,6 +2964,7 @@ fn create_index_schema_from_parts(
     fulltext_parser: String,
     vector_options: Option<crate::storage::vector_config::VectorIndexOptions>,
     defer_expressions: bool,
+    predicate: Option<String>,
 ) -> Result<IndexSchema, QueryError> {
     ensure_base_table(db, table_name)?;
     let name = allocate_index_name(db, table_name, name, &columns)?;
@@ -3069,6 +3070,7 @@ fn create_index_schema_from_parts(
         &comment,
     )?;
     Ok(IndexSchema {
+        predicate: predicate.map(crate::storage::schema::IndexPredicate::new),
         readable_from_scn: 0,
         index_id: 0,
         name,
@@ -3116,9 +3118,10 @@ fn execute_create_temp_index(
         comment,
         fulltext_parser,
         vector_options,
+        predicate,
         ..
     } = stmt;
-    let index = create_index_schema_from_parts(
+    let mut index = create_index_schema_from_parts(
         db,
         &internal_key,
         Some(name),
@@ -3136,6 +3139,7 @@ fn execute_create_temp_index(
         fulltext_parser,
         vector_options,
         false,
+        predicate.clone(),
     )
     .map_err(|err| {
         if err.is(crate::error::catalog::ER_NO_SUCH_TABLE) {
@@ -3147,6 +3151,7 @@ fn execute_create_temp_index(
             err
         }
     })?;
+    index.predicate = predicate.map(crate::storage::schema::IndexPredicate::new);
     let snapshot = db.snapshot_temp_table(&internal_key)?;
     match db.add_temp_index(&internal_key, index) {
         Ok(()) => {
@@ -3263,6 +3268,7 @@ fn execute_temp_alter_table(
                         index.fulltext_parser,
                         index.vector_options,
                         false,
+                        index.predicate,
                     )?;
                     db.add_temp_index(&temp.internal_key, index_schema)?;
                 }
@@ -8709,6 +8715,7 @@ pub(super) fn execute_qualified_statement(
                                 index.fulltext_parser.clone(),
                                 index.vector_options.clone(),
                                 false,
+                                index.predicate.clone(),
                             )?;
                             db.validate_add_index_existing_rows(&table_name, &schema)?;
                         }
@@ -8770,6 +8777,7 @@ pub(super) fn execute_qualified_statement(
                         index.fulltext_parser.clone(),
                         index.vector_options.clone(),
                         true,
+                        index.predicate.clone(),
                     )?);
                 }
                 match db.rewrite_compound_alter_once(
@@ -8850,6 +8858,9 @@ pub(super) fn execute_qualified_statement(
                         meta
                     });
                     indexes.push(IndexSchema {
+                        predicate: index
+                            .predicate
+                            .map(crate::storage::schema::IndexPredicate::new),
                         readable_from_scn: 0,
                         index_id: 0,
                         name,
@@ -9048,6 +9059,7 @@ pub(super) fn execute_qualified_statement(
                                 db.add_index_with_async_options(
                                     &table_name,
                                     IndexSchema {
+                                        predicate: index.predicate.map(crate::storage::schema::IndexPredicate::new),
                                         readable_from_scn: 0,
                                         index_id: 0,
                                         name,
@@ -9507,6 +9519,7 @@ pub(super) fn execute_qualified_statement(
                 comment,
                 fulltext_parser,
                 vector_options,
+                predicate,
                 query_hints,
                 hint_warnings: _,
             } = stmt;
@@ -9544,6 +9557,7 @@ pub(super) fn execute_qualified_statement(
             db.add_indexes_for_sql(
                 &qualified_table,
                 vec![IndexSchema {
+                    predicate: predicate.map(crate::storage::schema::IndexPredicate::new),
                     readable_from_scn: 0,
                     index_id: 0,
                     name,

@@ -961,8 +961,8 @@ impl Database {
         if txn_id == 0 {
             return;
         }
-        if Self::parse_heap_table_id(path)
-            == Some(crate::storage::data_dictionary::DD_DDL_RETIREMENTS)
+        if Self::parse_heap_table_id(path).is_some_and(|id| matches!(id,
+            crate::storage::data_dictionary::DD_DDL_RETIREMENTS | crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS))
         {
             return;
         }

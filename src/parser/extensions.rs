@@ -20,6 +20,7 @@ pub(super) enum Extension {
     ReturningTarget(String),
     IndexInclude(usize),
     IndexVisibility,
+    IndexPredicate,
     VectorOptions(usize),
     TextLength(u32),
     DerivedAlias,

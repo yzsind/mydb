@@ -1,10 +1,21 @@
 # Docker Deployment
 
+[GitHub repository](https://github.com/yzsind/mydb) ·
+[Docker Hub](https://hub.docker.com/r/ninedata/mydb) ·
+[Releases](https://github.com/yzsind/mydb/releases)
+
 Pull the prebuilt `ninedata/mydb:latest` image from Docker Hub to get started.
 The image enables TLS, `fast-alloc`, and `zstd-compression` by default, and the
 database process runs as the non-root user with UID/GID `10001:10001`. It contains
-the server, backup CLI, SQL client, timezone data, and third-party license/source
-notices.
+the server, `mydb-backup`, the native Rust `mydb-cli`, a MySQL-compatible SQL
+client, timezone data, and third-party license/source notices.
+
+MyDB 1.0.2 is a public-preview release for feature validation and evaluation in
+controlled environments. See the [product introduction](../README.md) for
+current capabilities and published performance results. The `latest` image tag
+can change; record `SELECT VERSION()` and pin an image digest for repeatable
+deployments. Check [physical-format compatibility](changing-versions.md) before
+reusing an existing volume with another image version.
 
 ## Quick start
 
@@ -36,6 +47,10 @@ mysql -h127.0.0.1 -P8738 -uapp -p test -e 'SELECT 1'
 docker exec mydb mydb-backup --help
 ```
 
+On a fresh volume, MyDB creates the `test` database. `MYDB_ROOT_PASSWORD` sets
+the initial administrator password only; it does not change accounts in an
+existing volume. If omitted on first start, the initial password is `root`.
+
 The SQL client bundled by Debian also supports `--ssl`; an external MySQL 8.0
 client negotiates TLS by default when the server offers it. These first-start
 examples use the ephemeral local certificate. Remote deployments should install
@@ -48,11 +63,18 @@ The image automatically reads `/etc/mydb/mydb.cnf`. A complete config file can
 be read-only mounted at that path to replace the image's default configuration:
 
 ```bash
+cat > ./mydb.cnf <<'EOF'
+[mydb]
+host = 0.0.0.0
+port = 8738
+data_dir = /var/lib/mydb
+durability = strict
+EOF
 chmod 0644 ./mydb.cnf
-docker run -d --name mydb \
-  -p 127.0.0.1:8738:8738 \
-  -v mydb-data:/var/lib/mydb \
-  -v ./mydb.cnf:/etc/mydb/mydb.cnf:ro \
+docker run -d --name mydb-custom \
+  -p 127.0.0.1:8739:8738 \
+  -v mydb-custom-data:/var/lib/mydb \
+  -v "$(pwd)/mydb.cnf:/etc/mydb/mydb.cnf:ro" \
   -e MYDB_ROOT_PASSWORD='change-me' \
   ninedata/mydb:latest
 ```
@@ -67,7 +89,7 @@ loading of the fixed path:
 
 ```bash
 docker run --rm \
-  -v ./custom.cnf:/run/mydb/custom.cnf:ro \
+  -v "$(pwd)/custom.cnf:/run/mydb/custom.cnf:ro" \
   ninedata/mydb:latest --config /run/mydb/custom.cnf
 ```
 
@@ -85,7 +107,17 @@ docker run -d --name mydb \
 
 Configuration precedence inside the container is: image default or mounted
 config < `MYDB_*` environment variables < CLI arguments in the container
-command. A named volume is the recommended default; if you bind mount a host
+command. For supported persisted global variables, values saved by `SET PERSIST`
+are loaded after these startup inputs and can override them on an existing
+volume. Inspect `performance_schema.persisted_variables` and
+`SHOW GLOBAL VARIABLES`; use `RESET PERSIST variable_name` to remove a saved
+override for the next restart. See
+[configuration precedence](configuration.md#precedence-and-when-settings-take-effect).
+
+`MYDB_MEMORY_TARGET` is an advisory working-set target for caches and spill
+watermarks, not a hard process memory limit.
+
+A named volume is the recommended default; if you bind mount a host
 data directory, that directory must be writable by UID/GID `10001:10001`.
 On macOS Docker Desktop, keep database and backup repositories on Linux named
 volumes. Transient hard-link lookup failures were observed on shared host
@@ -95,12 +127,21 @@ instead of publishing it.
 `docker stop` sends `SIGTERM`, and mydb runs its existing connection drain,
 checkpoint, and graceful shutdown procedures.
 
+```bash
+docker stop mydb
+docker start mydb
+docker logs --tail 100 mydb
+```
+
 ## Optional: build from source
 
 The repository root also provides a Dockerfile for optional source builds.
 To build a local Linux AMD64 image on an Apple Silicon Mac:
 
 ```bash
+git clone https://github.com/yzsind/mydb.git
+cd mydb
+
 docker buildx build \
   --platform linux/amd64 \
   --progress=plain \
@@ -142,12 +183,5 @@ contents of Rust `1.95.0-slim-bookworm` (including the build machine
 architecture) and Debian `bookworm-slim` (including the target architecture).
 `--load` loads the result into the local daemon; use `--push` instead when
 pushing directly to a registry.
-
-For supported persisted global variables, values saved by `SET PERSIST` are
-loaded after these startup inputs and can override them on an existing volume.
-Inspect `performance_schema.persisted_variables` and `SHOW GLOBAL VARIABLES`;
-use `RESET PERSIST variable_name` to remove a saved override for the next restart.
-See [configuration precedence](configuration.md#precedence-and-when-settings-take-effect)
-and [changing versions](changing-versions.md).
 
 [Back to product introduction](../README.md) · [Full configuration reference](configuration.md)

@@ -159,7 +159,7 @@ pub use schema::{
     DataTypeKind, DatabaseSchema, DmlRowRef, DmlStoredRow, EventIntervalSchema,
     EventOnCompletionSchema, EventScheduleSchema, EventSchema, EventStatusSchema, ForeignKeySchema,
     FulltextMeta, InboundFk, IndexBound, IndexColumnDirection, IndexExpression, IndexKey,
-    IndexKeyPart, IndexSchema, IndexState, KeyPart, ParamTarget, ReferentialAction,
+    IndexKeyPart, IndexPredicate, IndexSchema, IndexState, KeyPart, ParamTarget, ReferentialAction,
     RoutineKindSchema, RoutineParamModeSchema, RoutineParamSchema, RoutineSchema,
     RoutineSecuritySchema, RoutineSqlDataAccessSchema, RowLayoutColumnSchema, RowLayoutSchema,
     RowLayoutState, StoredRow, TableSchema, TriggerEventSchema, TriggerOrderKindSchema,

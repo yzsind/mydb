@@ -49,9 +49,31 @@ impl Providers {
         let mut charge = crate::engine::executor::mem_budget::ScopedCharge::new(0);
         let mut heap_rows = Vec::new();
         let mut documents = None;
-        if !expressions.is_empty() && table.is_partitioned() {
+        let mut needs_heap = txn.historical
+            || table.is_partitioned()
+            || table
+                .indexes
+                .iter()
+                .any(|index| index.is_fulltext() && index.predicate.is_some());
+        if !needs_heap {
+            for expression in &expressions {
+                if let Some((_, _, _, columns)) = crate::planner::fulltext_match_parts(expression) {
+                    if let Some(index) =
+                        crate::planner::find_matching_fulltext_index(table, &columns)
+                    {
+                        if !db.fulltext_index_covers_snapshot(index, txn)? {
+                            needs_heap = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        if !expressions.is_empty() && needs_heap {
             let mut ids = HashMap::new();
-            for (storage_id, row) in db.scan_rows_with_storage(&table.qualified_name(), txn)? {
+            for (storage_id, row) in
+                db.scan_rows_with_storage(&db.storage_key_for_table(table), txn)?
+            {
                 charge.add_non_spillable(
                     crate::engine::executor::mem_budget::estimate_row_bytes(&row.values)
                         .saturating_mul(2)

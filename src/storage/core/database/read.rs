@@ -1277,7 +1277,7 @@ impl Database {
         let Some(row) = self.read_row(table, row_id, txn)? else {
             return Ok(false);
         };
-        if index.is_fulltext() || index.has_multi_valued_parts() {
+        if index.predicate.is_some() || index.is_fulltext() || index.has_multi_valued_parts() {
             Ok(table
                 .index_keys(index, &row.values)?
                 .iter()
@@ -1303,6 +1303,7 @@ impl Database {
             let Some(row) = self.read_row(table, row_id, txn)? else {
                 return Ok(false);
             };
+            if !table.index_contains_row(index, &row.values)? { return Ok(false); }
             let key = table.index_key(index, &row.values)?;
             let value = match key.0.get(key_position) {
                 Some(KeyPart::Null) => None,

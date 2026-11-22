@@ -810,6 +810,39 @@ impl<'a> CatalogTxn<'a> {
                 );
             }
         }
+        // Bind new FULLTEXT access to the actual nonempty catalog commit,
+        // including builds that reuse an existing corpus. The fence must not
+        // refer to an empty/read-only build transaction that can be discarded.
+        let mut fulltext_origins = Vec::new();
+        for replacement in &mut self.replacements {
+            if replacement.dd_table_id != crate::storage::data_dictionary::DD_INDEXES { continue; }
+            for row in &mut replacement.rows {
+                if !row.get(3).and_then(crate::types::value_str).is_some_and(|kind| kind.eq_ignore_ascii_case("FULLTEXT")) { continue; }
+                let encoded = row.get(11).and_then(crate::types::value_str)
+                    .ok_or_else(|| fulltext_statistics_error("missing tokenizer at publication"))?;
+                let mut meta = serde_json::from_str::<Option<crate::storage::FulltextMeta>>(encoded).map_err(fulltext_statistics_error)?
+                    .ok_or_else(|| fulltext_statistics_error("missing corpus at publication"))?;
+                if meta.snapshot_origin_txn_id != u64::MAX { continue; }
+                meta.snapshot_origin_txn_id = txn.txn_id;
+                row[11] = Value::String(serde_json::to_string(&Some(meta)).map_err(fulltext_statistics_error)?);
+                let (Some(Value::UInt(table_id)),Some(Value::UInt(index_id))) = (row.first(),row.get(10)) else {
+                    return Err(fulltext_statistics_error("invalid publication identity"));
+                };
+                fulltext_origins.push((*table_id,*index_id));
+            }
+        }
+        if !fulltext_origins.is_empty() {
+            let mut catalog = self.db.catalog_write()?;
+            for (table_id,index_id) in fulltext_origins {
+                let key = self.db.catalog.table_key_by_id(table_id)
+                    .ok_or_else(|| fulltext_statistics_error("missing publication owner"))?;
+                let table = catalog.tables.get_mut(&key).ok_or_else(|| fulltext_statistics_error("missing publication table"))?;
+                if let Some(meta) = Arc::make_mut(table).indexes.iter_mut().find(|index| index.index_id == index_id)
+                    .and_then(|index| index.fulltext.as_mut()) {
+                    meta.snapshot_origin_txn_id = txn.txn_id;
+                }
+            }
+        }
         // The deferred candidate path reserves its publication before taking
         // the live-catalog latch. Other DDL prepares here, before DD shards,
         // to preserve the policy-publication -> DD-shard lock order.
@@ -1627,6 +1660,28 @@ impl Database {
             rows[0][schema.column_index("schema_version")?] = Value::UInt(version);
             txn.replace(DD_TABLES, selector, rows);
         }
+        // Retire scoring families with their defining DDL. MVCC tombstones
+        // retain old-snapshot visibility while ordinary purge can reclaim the
+        // rows; repeated DROP/CREATE or COPY must not leak live counters.
+        let mut old_fulltext = HashMap::<u64, (u64, HashSet<u64>)>::new();
+        for table_id in &replaced_tables {
+            let old = self.catalog_rows_for_selector(DD_TABLES,
+                CatalogRowSelector::PrimaryValues(vec![Value::UInt(*table_id)]))?;
+            let Some(Value::UInt(generation)) = old.first().and_then(|row| row.get(19)) else { continue; };
+            let indexes = self.catalog_rows_for_selector(DD_INDEXES,
+                CatalogRowSelector::PrefixValues(vec![Value::UInt(*table_id)]))?;
+            let mut corpora = HashSet::new();
+            for index in indexes {
+                if !index.get(3).and_then(crate::types::value_str).is_some_and(|kind| kind.eq_ignore_ascii_case("FULLTEXT")) { continue; }
+                let encoded = index.get(11).and_then(crate::types::value_str)
+                    .ok_or_else(|| fulltext_statistics_error("missing persisted tokenizer"))?;
+                let meta = serde_json::from_str::<Option<crate::storage::FulltextMeta>>(encoded)
+                    .map_err(fulltext_statistics_error)?
+                    .ok_or_else(|| fulltext_statistics_error("missing persisted corpus"))?;
+                corpora.insert(meta.corpus_id);
+            }
+            if !corpora.is_empty() { old_fulltext.insert(*table_id, (*generation, corpora)); }
+        }
         let catalog = self.catalog_read()?;
         for mutation in mutations {
             match mutation {
@@ -1655,6 +1710,20 @@ impl Database {
                             crate::error::catalog::ER_GET_ERRNO,
                             "refusing to persist an incomplete table descriptor",
                         ));
+                    }
+                    if table.is_none() {
+                        // Include private families left by an interrupted
+                        // offline build that never acquired catalog metadata.
+                        txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                            CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id)]), Vec::new());
+                    } else if let Some((generation, corpora)) = old_fulltext.remove(&table_id) {
+                        let retained = table.filter(|table| table.active_generation == generation)
+                            .map(|table| table.indexes.iter().filter_map(|index| index.fulltext.as_ref().map(|meta| meta.corpus_id)).collect::<HashSet<_>>())
+                            .unwrap_or_default();
+                        for corpus in corpora.difference(&retained) {
+                            txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                                CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id), Value::UInt(generation), Value::UInt(*corpus)]), Vec::new());
+                        }
                     }
                     let rows = table
                         .map(|table| dd_rows_for_table(table))

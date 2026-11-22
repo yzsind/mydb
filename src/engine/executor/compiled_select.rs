@@ -398,7 +398,8 @@ pub(super) fn reusable_memo(
 ) -> Option<Arc<PreparedSelectMemo>> {
     let mut selectivity = None;
     let valid = |memo: &PreparedSelectMemo, selectivity: &mut Option<String>| {
-        memo.semantics.matches_session(db, session)
+        !memo.compiled.replan_partial_indexes
+            && memo.semantics.matches_session(db, session)
             && memo_catalog_is_valid(db, memo, current_epoch)
             && current_parameter_signature_matches(db, memo, params, selectivity)
     };

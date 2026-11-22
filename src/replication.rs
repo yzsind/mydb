@@ -7254,6 +7254,118 @@ fn io_error(action: &str, err: std::io::Error) -> QueryError {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn fulltext_incremental_mysql_row_apply_preserves_transactional_counters() {
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = StorageQueryEngine::open_with_storage_config_without_background_workers(
+            dir.path(),
+            crate::storage::StorageConfig {
+                durability: crate::storage::DurabilityMode::Memory,
+                ..crate::storage::StorageConfig::from_env()
+            },
+        )
+        .unwrap();
+        engine.execute("CREATE TABLE ft_repl(id INT PRIMARY KEY,body TEXT,active INT,FULLTEXT f(body) WHERE active=1)").unwrap();
+        let db = engine.database_for_replication();
+        let row = |id, body: Option<&str>, active| {
+            vec![
+                Value::Int(id),
+                body.map(|value| Value::String(value.into()))
+                    .unwrap_or(Value::Null),
+                Value::Int(active),
+            ]
+        };
+        let first = row(1, Some("quartz quartz ruby"), 1);
+        let second = row(2, Some("quartz sapphire"), 0);
+        let third = row(3, None, 0);
+        let txn = db.begin_txn().unwrap();
+        apply_write_rows(
+            db,
+            txn,
+            "test",
+            "ft_repl",
+            &[first.clone(), second.clone(), third.clone()],
+        )
+        .unwrap();
+        db.commit_txn(txn.txn_id).unwrap();
+        let table = db.table("test.ft_repl").unwrap();
+        let index = &table.indexes[1];
+        let terms = vec!["quartz".into(), "ruby".into(), "diamond".into()];
+        let old = db.begin_read_only_txn().unwrap();
+        let before = db
+            .fulltext_corpus_statistics(old, &table, index, &terms, None)
+            .unwrap();
+        assert_eq!(
+            (
+                before.documents,
+                before.total_tokens,
+                before.frequencies["quartz"]
+            ),
+            (3, 5, 2)
+        );
+        for commit in [false, true] {
+            let txn = db.begin_txn().unwrap();
+            apply_update_rows(
+                db,
+                txn,
+                "test",
+                "ft_repl",
+                &[
+                    RowUpdate {
+                        before: first.clone(),
+                        after: row(1, Some("diamond"), 0),
+                    },
+                    RowUpdate {
+                        before: second.clone(),
+                        after: row(2, Some("quartz emerald"), 1),
+                    },
+                ],
+            )
+            .unwrap();
+            apply_delete_rows(db, txn, "test", "ft_repl", &[third.clone()]).unwrap();
+            apply_write_rows(
+                db,
+                txn,
+                "test",
+                "ft_repl",
+                &[row(4, Some("quartz ruby"), 1)],
+            )
+            .unwrap();
+            let own = db
+                .fulltext_corpus_statistics(txn, &table, index, &terms, None)
+                .unwrap();
+            assert_eq!(
+                (
+                    own.documents,
+                    own.total_tokens,
+                    own.frequencies["quartz"],
+                    own.frequencies["diamond"]
+                ),
+                (3, 5, 2, 1)
+            );
+            let frozen = db
+                .fulltext_corpus_statistics(old, &table, index, &terms, None)
+                .unwrap();
+            assert_eq!(frozen.frequencies, before.frequencies);
+            if commit {
+                db.commit_txn(txn.txn_id).unwrap();
+            } else {
+                db.rollback_txn(txn.txn_id).unwrap();
+            }
+        }
+        db.rollback_txn(old.txn_id).unwrap();
+        let current = TxnView::read_only(
+            db.visible_scn(),
+            crate::storage::IsolationLevel::ReadCommitted,
+        );
+        let after = db
+            .fulltext_corpus_statistics(current, &table, index, &terms, None)
+            .unwrap();
+        assert_eq!(after.frequencies["diamond"], 1);
+        let QueryResponse::ResultSet(rs) = engine.execute("SELECT id FROM ft_repl WHERE active=1 AND MATCH(body) AGAINST('quartz') ORDER BY id").unwrap().materialize().unwrap() else {panic!("rows")};
+        assert_eq!(rs.rows, vec![vec![Value::Int(2)], vec![Value::Int(4)]]);
+    }
+
+    #[test]
     fn relay_borrowed_serialization_preserves_versioned_bytes() {
         for op in [
             RelayOp::Noop,

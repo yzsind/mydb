@@ -2466,8 +2466,13 @@ pub(crate) fn create_table_sql_with_auto_increment(
                 .join(", ");
             format!(" INCLUDE ({cols})")
         };
+        let predicate_suffix = index
+            .predicate
+            .as_ref()
+            .map(|p| format!(" WHERE ({})", p.expr_sql))
+            .unwrap_or_default();
         defs.push(format!(
-            "  {key_kind}KEY `{}` ({columns}){include_suffix}{using_suffix}{parser_suffix}{comment}{visible}",
+            "  {key_kind}KEY `{}` ({columns}){include_suffix}{using_suffix}{parser_suffix}{comment}{visible}{predicate_suffix}",
             index.name.replace('`', "``")
         ));
     }

@@ -591,3 +591,7 @@ mod table_ddl_audit_1108;
 mod exec_optimizer_audit_1108;
 
 mod dump_compatibility;
+
+mod partial_index;
+
+mod fulltext_incremental;

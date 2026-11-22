@@ -5194,6 +5194,7 @@ pub(in crate::engine::executor::select) fn cached_column_metas(table: &PlanTable
 /// (for IDF) plus a per-candidate-row `(tf, doc_len)` map decoded from
 /// the postings — so scoring is a pure payload read, no heap retable.
 pub(super) struct FtScoringTerm {
+    pub(super) token: String,
     pub(super) df: usize,
     pub(super) by_row: AhHashMap<RowId, (u32, u32)>,
 }
@@ -5354,6 +5355,7 @@ pub(super) fn fulltext_natural_language_candidates(
                 by_row.insert(p.row_id, (p.tf, p.doc_len));
             }
             terms.push(FtScoringTerm {
+                token: token.clone(),
                 df: batch.postings.len(),
                 by_row,
             });
@@ -5568,11 +5570,15 @@ pub(super) fn fulltext_boolean_candidates(
                 by_row.insert(p.row_id, (p.tf, p.doc_len));
             }
             scoring.push(FtScoringTerm {
+                token: tok.clone(),
                 df: batch.postings.len(),
                 by_row,
             });
         }
     }
+    // Hash iteration must not make BM25 addition order depend on which
+    // physical index supplied the same visible documents.
+    scoring.sort_unstable_by(|left, right| left.token.cmp(&right.token));
 
     let mut candidates: Vec<RowId> = base.into_iter().collect();
     candidates.sort_unstable();
@@ -5642,7 +5648,7 @@ pub(in crate::engine::executor) fn build_fulltext_match_runtime(
         &query,
         mode,
     )?;
-    let (candidates, scoring_terms) = match mode {
+    let (candidates, mut scoring_terms) = match mode {
         crate::parser::FtMode::NaturalLanguage => {
             fulltext_natural_language_candidates(&source, tokenizer.as_ref(), &query, need_score)?
         }
@@ -5653,15 +5659,28 @@ pub(in crate::engine::executor) fn build_fulltext_match_runtime(
     let mut idfs = Vec::new();
     let mut doc_len_of = ah_hash_map();
     let mut avgdl = 1.0;
-    if need_score {
-        let frozen = super::super::fulltext_context::statistics(table, index)?;
-        // The unsigned modified-row counter counts INSERT, UPDATE and DELETE
-        // and is only a staleness trigger. BM25's document count must use the
-        // signed committed row delta, otherwise update-heavy tables make IDF
-        // drift upward without gaining a single document.
-        let est = source.corpus.map_or(frozen.base_n, |corpus| corpus.0);
+    if need_score && !candidates.is_empty() {
+        let (documents, average_length) = if let Some((documents, average)) = source.corpus {
+            // The heap oracle already counted the complete visible corpus;
+            // its term posting counts are complete as well.
+            (documents, average)
+        } else {
+            let terms = scoring_terms
+                .iter()
+                .map(|term| term.token.clone())
+                .collect::<Vec<_>>();
+            let corpus =
+                super::super::fulltext_context::corpus_statistics(db, txn, table, index, &terms)?;
+            for term in &mut scoring_terms {
+                term.df = corpus.frequencies.get(&term.token).copied().unwrap_or(0) as usize;
+            }
+            (
+                corpus.documents as f64,
+                corpus.total_tokens as f64 / corpus.documents.max(1) as f64,
+            )
+        };
         let max_df = scoring_terms.iter().map(|term| term.df).max().unwrap_or(0) as f64;
-        let n_docs = est.max(candidates.len() as f64).max(max_df).max(1.0);
+        let n_docs = documents.max(candidates.len() as f64).max(max_df).max(1.0);
         idfs = scoring_terms
             .iter()
             .map(|term| crate::storage::fulltext::bm25::idf(n_docs, term.df as f64))
@@ -5671,21 +5690,9 @@ pub(in crate::engine::executor) fn build_fulltext_match_runtime(
                 doc_len_of.entry(*row_id).or_insert(*doc_len);
             }
         }
-        let (sum, count) = candidates
-            .iter()
-            .fold((0u64, 0u64), |(sum, count), row_id| {
-                doc_len_of
-                    .get(row_id)
-                    .map(|len| (sum + *len as u64, count + 1))
-                    .unwrap_or((sum, count))
-            });
-        if count > 0 {
-            avgdl = (sum as f64 / count as f64).max(1.0);
-        }
-        if let Some(corpus_avg) = source.corpus.map(|corpus| corpus.1).or(frozen.corpus_avg) {
-            avgdl = corpus_avg;
-        }
+        avgdl = average_length.max(1.0);
     }
+
     Ok(FtMatchRuntime {
         fingerprint,
         restrict,
@@ -5791,10 +5798,13 @@ pub(super) fn execute_fulltext_like_prefilter(
     } else {
         plan.tokens.clone()
     };
-    if runtime_tokens.is_empty() || !crate::storage::schema::like_ngram_prefilter_enabled() {
+    if runtime_tokens.is_empty()
+        || !crate::storage::schema::like_ngram_prefilter_enabled()
+        || !db.fulltext_index_covers_snapshot(index, txn)?
+    {
         crate::engine::status_counters::record_like_ngram_no_safe_token();
         let ids = db
-            .scan_rows(&table.schema.qualified_name(), txn)?
+            .scan_rows(&db.storage_key_for_table(&table.schema), txn)?
             .into_iter()
             .map(|row| row.row_id)
             .collect();
@@ -5914,7 +5924,30 @@ pub(super) fn open_fulltext_scan(
     // ambiguous across partition heaps. Build a visible-text oracle with
     // query-local document ids for these paths until specialized indexes can
     // carry the required version/partition identity.
-    let heap_documents = if txn.historical || table.schema.is_partitioned() {
+    let _partial_indexes = crate::storage::schema::PartialIndexScope::new(
+        &table.schema,
+        filter.as_ref(),
+        table.alias.as_deref(),
+    );
+    let needs_complete_postings = std::iter::once(index)
+        .chain(additional_matches.iter().map(|m| &m.index))
+        .any(|i| {
+            i.predicate.is_some()
+                && !table
+                    .schema
+                    .iter_queryable_indexes()
+                    .any(|candidate| candidate.index_id == i.index_id && candidate.name == i.name)
+        });
+    let mut snapshot_covered = true;
+    for candidate in std::iter::once(index).chain(additional_matches.iter().map(|spec| &spec.index))
+    {
+        snapshot_covered &= db.fulltext_index_covers_snapshot(candidate, txn)?;
+    }
+    let heap_documents = if txn.historical
+        || table.schema.is_partitioned()
+        || needs_complete_postings
+        || !snapshot_covered
+    {
         if txn.historical {
             db.record_temporal_heap_fallback();
         }
@@ -5994,7 +6027,7 @@ pub(super) fn open_fulltext_scan(
                 }
                 ids
             } else {
-                db.scan_rows(&table.schema.qualified_name(), txn)?
+                db.scan_rows(&db.storage_key_for_table(&table.schema), txn)?
                     .into_iter()
                     .map(|row| row.row_id)
                     .collect()
@@ -6022,7 +6055,7 @@ pub(super) fn open_fulltext_scan(
             .map(heap_document_id)
             .collect::<Result<Vec<_>, _>>()?
     } else {
-        db.scan_rows(&table.schema.qualified_name(), txn)?
+        db.scan_rows(&db.storage_key_for_table(&table.schema), txn)?
             .into_iter()
             .map(|row| row.row_id)
             .collect()

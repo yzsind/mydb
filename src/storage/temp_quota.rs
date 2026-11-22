@@ -102,6 +102,7 @@ impl Drop for ByteReservation {
 }
 
 struct TableQuota {
+    counts_as_table: bool,
     quota: Arc<SessionTempQuota>,
     files: Mutex<HashMap<PathBuf, u64>>,
 }
@@ -109,7 +110,9 @@ impl Drop for TableQuota {
     fn drop(&mut self) {
         let bytes: u64 = self.files.get_mut().values().sum();
         let mut used = self.quota.used.lock();
-        used.tables = used.tables.saturating_sub(1);
+        if self.counts_as_table {
+            used.tables = used.tables.saturating_sub(1);
+        }
         used.storage = used.storage.saturating_sub(bytes);
     }
 }
@@ -151,6 +154,7 @@ pub(crate) fn register(
     registry().lock().insert(
         key.clone(),
         Arc::new(TableQuota {
+            counts_as_table: true,
             quota: quota.clone(),
             files: Mutex::new(HashMap::new()),
         }),
@@ -160,6 +164,35 @@ pub(crate) fn register(
         committed: false,
     })
 }
+/// Charge an internal temporary heap to its owner's storage/undo limits,
+/// without consuming another user-visible temporary-table slot.
+pub(crate) fn register_auxiliary(
+    data_dir: &Path,
+    table: u64,
+    owner: u64,
+) -> Result<Registration, QueryError> {
+    let mut tables = registry().lock();
+    let quota = tables
+        .get(&key(data_dir, owner))
+        .map(|entry| entry.quota.clone())
+        .ok_or_else(|| {
+            crate::error::catalog::ER_GET_ERRNO.error("missing temporary table quota owner")
+        })?;
+    let key = key(data_dir, table);
+    tables.insert(
+        key.clone(),
+        Arc::new(TableQuota {
+            counts_as_table: false,
+            quota,
+            files: Mutex::new(HashMap::new()),
+        }),
+    );
+    Ok(Registration {
+        key,
+        committed: false,
+    })
+}
+
 pub(crate) fn unregister(data_dir: &Path, table: u64) {
     registry().lock().remove(&key(data_dir, table));
 }

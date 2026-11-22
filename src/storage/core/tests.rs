@@ -1577,6 +1577,7 @@ fn rename_index_preserves_stable_physical_path() {
     db.add_index(
         "stable_index",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "old_idx".into(),
@@ -2979,6 +2980,7 @@ fn spatial_index_search_over_persistent_pages() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("sp".into()),
             columns: vec!["loc".into()],
             column_prefix_lengths: Vec::new(),
@@ -3193,6 +3195,7 @@ fn char_rows_store_compact_and_read_compact() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("c_idx".into()),
             columns: vec!["c".into()],
             column_prefix_lengths: Vec::new(),
@@ -3851,6 +3854,7 @@ fn add_index_bulk_builds_large_table_without_dirty_index_cache() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "v_idx".into(),
@@ -3983,6 +3987,7 @@ fn fulltext_backfill_builds_inverted_index() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -4081,6 +4086,7 @@ fn fulltext_insert_delete_maintains_inverted_index() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -4205,6 +4211,7 @@ fn fulltext_postings_carry_payload_stats() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -4387,6 +4394,7 @@ fn batched_add_index_encoded_keys_keep_lookup_semantics() {
     );
 
     let index = |name: &str, columns: &[&str]| IndexSchema {
+        predicate: None,
         readable_from_scn: 0,
         index_id: 0,
         name: name.into(),
@@ -4500,6 +4508,7 @@ fn offline_add_index_respects_existing_table_ix_lock() {
         .add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: "v_idx".into(),
@@ -4580,6 +4589,7 @@ fn add_primary_key_on_empty_table_persists_rebuilt_index_meta() {
         db.add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: "PRIMARY".into(),
@@ -4835,6 +4845,7 @@ fn analyze_table_keeps_small_table_stats_exact() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("vw_idx".into()),
             columns: vec!["v".into(), "w".into()],
             column_prefix_lengths: Vec::new(),
@@ -4932,6 +4943,7 @@ fn drop_index_removes_index_stats_without_refreshing_table_stats() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("v_idx".into()),
             columns: vec!["v".into()],
             column_prefix_lengths: Vec::new(),
@@ -5030,6 +5042,7 @@ fn analyze_table_large_high_cardinality_stats_are_bounded_and_stable() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("v_idx".into()),
             columns: vec!["v".into()],
             column_prefix_lengths: Vec::new(),
@@ -5206,6 +5219,7 @@ fn analyze_table_sampled_pages_estimate_stats_for_large_tables() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("v_idx".into()),
             columns: vec!["v".into()],
             column_prefix_lengths: Vec::new(),
@@ -10870,6 +10884,7 @@ fn rollback_persists_restored_heap_and_indexes_before_end_txn() {
             ],
             vec!["id".into()],
             vec![crate::parser::IndexDef {
+                predicate: None,
                 name: Some("k_1".into()),
                 columns: vec!["k".into()],
                 column_prefix_lengths: Vec::new(),
@@ -10966,6 +10981,7 @@ fn create_concurrent_index_update_table(db: &Database, rows: i64) {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_1".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -12052,6 +12068,7 @@ fn rollback_to_savepoint_rebuilds_indexes_after_secondary_update() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_1".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -12162,6 +12179,7 @@ fn rollback_to_savepoint_removes_batch_inserted_rows_and_indexes() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_idx".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -12441,6 +12459,7 @@ fn concurrent_composite_pk_insert_batches_commit_and_recover_consistently() {
             .unwrap(),
         );
         let secondary = |name: &str, columns: &[&str]| crate::parser::IndexDef {
+            predicate: None,
             name: Some(name.into()),
             columns: columns.iter().map(|column| (*column).into()).collect(),
             column_prefix_lengths: Vec::new(),
@@ -12717,6 +12736,7 @@ fn batch_index_entry_lookup_matches_scalar_prefix_and_exact_paths() {
     db.add_index(
         "test.batch_idx",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "idx_k_seq".into(),
@@ -12896,6 +12916,7 @@ fn routed_batch_lookup_matches_scalar_for_leaf_spanning_prefixes() {
     db.add_index(
         "test.routed_idx",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "idx_k_seq".into(),
@@ -16074,6 +16095,7 @@ fn read_committed_dml_serializes_delete_insert_pairs() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("k_1".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),
@@ -16790,6 +16812,7 @@ fn unique_key_wait_participates_in_deadlock_detection() {
         ],
         vec!["id".into()],
         vec![crate::parser::IndexDef {
+            predicate: None,
             name: Some("u_idx".into()),
             columns: vec!["u".into()],
             column_prefix_lengths: Vec::new(),
@@ -17311,6 +17334,7 @@ fn btree_forward_range_cursor_matches_full_range_across_chunks() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "grp_idx".into(),
@@ -17409,6 +17433,7 @@ fn range_cursor_row_id_and_leaf_walkers_match_entries_oracle() {
         db.add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: name.into(),
@@ -17650,6 +17675,7 @@ fn analyze_computes_index_heap_order_correlation() {
         db.add_index(
             "test.t",
             IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id: 0,
                 name: name.into(),
@@ -17716,6 +17742,7 @@ fn analyze_sparse_heap_sample_preserves_repeated_composite_index_fanout() {
             ],
             vec!["id".into()],
             vec![crate::parser::IndexDef {
+                predicate: None,
                 name: Some("ab".into()),
                 columns: vec!["a".into(), "b".into()],
                 column_prefix_lengths: if text_keys {
@@ -20755,6 +20782,7 @@ fn v10_add_index_offline_bulk_dense_small_int_key_smoke() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "n_idx".into(),
@@ -20848,6 +20876,7 @@ fn v10_add_index_offline_bulk_150k_rows_small_int_key() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "n_idx".into(),
@@ -25467,6 +25496,7 @@ fn rebuild_indexes_encoded_path_is_stable() {
     }
     fn idx(name: &str, columns: Vec<String>) -> IndexSchema {
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: name.into(),
@@ -27262,6 +27292,7 @@ fn fulltext_unicode_prefix_generic_matches_fast_path() {
     db.add_index(
         "test.docs",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "ft".into(),
@@ -30386,6 +30417,7 @@ fn buffered_partial_index_insert_recovers_and_rolls_back_across_leaf_boundaries(
             ],
             vec!["id".into()],
             vec![crate::parser::IndexDef {
+                predicate: None,
                 name: Some("v_idx".into()),
                 columns: vec!["v".into()],
                 column_prefix_lengths: Vec::new(),

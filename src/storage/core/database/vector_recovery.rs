@@ -131,7 +131,8 @@ impl Database {
                 .ok_or_else(vector::persistence::corrupt)?;
             for index in table.indexes.iter().filter(|index| index.is_vector()) {
                 let col = table.column_index(&index.columns[0])?;
-                let value = match values.as_ref().and_then(|values| values.get(col)) {
+                let member = values.as_ref().map(|v| table.index_contains_row(index, v)).transpose()?.unwrap_or(false);
+                let value = match values.as_ref().filter(|_| member).and_then(|values| values.get(col)) {
                     Some(Value::Vector(value)) => Some(value.clone()),
                     Some(Value::Null) | None => None,
                     _ => return Err(vector::persistence::corrupt()),
@@ -469,9 +470,8 @@ impl Database {
                         mutation.storage_id,
                         mutation.row_id,
                     ))
-                    .or_insert_with(|| vec![Value::Null; table.columns.len()]);
-                values[table.column_index(&index.columns[0])?] =
-                    mutation.value.map_or(Value::Null, Value::Vector);
+                    .or_insert_with(Vec::new);
+                values.push((index.index_id, mutation.value));
             }
         }
         let mut pending = self
@@ -487,8 +487,9 @@ impl Database {
                     table_id,
                     storage_id,
                     row_id,
-                    new_values: Some(values),
+                    new_values: None,
                     old_values: None,
+                    resolved_indexes: Some(values),
                 });
         }
         Ok(())
@@ -525,7 +526,8 @@ impl Database {
             .filter(|index| index.is_vector())
             .map(|index| {
                 let col = target.column_index(&index.columns[0])?;
-                let value = match values.and_then(|values| values.get(col)) {
+                let member = values.map(|v| target.index_contains_row(index, v)).transpose()?.unwrap_or(false);
+                let value = match values.filter(|_| member).and_then(|values| values.get(col)) {
                     Some(Value::Vector(value)) => Some(value.clone()),
                     _ => None,
                 };

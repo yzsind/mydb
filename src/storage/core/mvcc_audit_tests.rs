@@ -367,6 +367,7 @@ fn audit_mvcc_release_preserves_later_savepoint() {
 fn audit_mvcc_lob_index_rollback() {
     let (_dir, db) = audit_db();
     db.add_index("test.t", IndexSchema {
+        predicate: None,
         readable_from_scn: 0,
         index_id: 0, name: "body_idx".into(), columns: vec!["body".into()],
         column_prefix_lengths: vec![Some(8)], column_directions: Vec::new(),

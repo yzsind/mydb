@@ -176,6 +176,7 @@ fn run_lineitem() -> Result<(), QueryError> {
         // lineitem's orderkey/partkey/suppkey single-col indexes.
         vec![
             IndexDef {
+                predicate: None,
                 name: Some("idx_orderkey".to_string()),
                 columns: vec!["l_orderkey".to_string()],
                 column_prefix_lengths: Vec::new(),
@@ -191,6 +192,7 @@ fn run_lineitem() -> Result<(), QueryError> {
                 vector_options: None,
             },
             IndexDef {
+                predicate: None,
                 name: Some("idx_partkey".to_string()),
                 columns: vec!["l_partkey".to_string()],
                 column_prefix_lengths: Vec::new(),
@@ -206,6 +208,7 @@ fn run_lineitem() -> Result<(), QueryError> {
                 vector_options: None,
             },
             IndexDef {
+                predicate: None,
                 name: Some("idx_suppkey".to_string()),
                 columns: vec!["l_suppkey".to_string()],
                 column_prefix_lengths: Vec::new(),

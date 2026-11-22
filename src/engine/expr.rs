@@ -193,6 +193,102 @@ impl PolicyExpressionSettings {
     }
 }
 
+/// Capture only stable expression semantics for persistent index predicates.
+pub(crate) fn capture_index_settings() -> PolicyExpressionSettings {
+    let mut settings = with_session_view(|view| match view {
+        Some(SessionView::Borrowed(session)) => PolicyExpressionSettings::capture(session),
+        Some(SessionView::Owned(info)) => PolicyExpressionSettings {
+            sql_mode: info.sql_mode.clone(),
+            temporal_sql_mode_bits: info.temporal_sql_mode_bits,
+            character_set_client: info.character_set_client.clone(),
+            character_set_connection: info.character_set_connection.clone(),
+            collation_connection: info.collation_connection.clone(),
+            div_precision_increment: info.div_precision_increment,
+            time_zone: info.time_zone.clone(),
+            lc_time_names: info.lc_time_names.clone(),
+            default_week_format: info.default_week_format,
+            block_encryption_mode: info.block_encryption_mode.clone(),
+            explicit_defaults_for_timestamp: info.explicit_defaults_for_timestamp,
+        },
+        None => PolicyExpressionSettings::capture(&crate::engine::api::SessionContext::default()),
+    });
+    if settings.time_zone.is_empty()
+        || settings.time_zone.eq_ignore_ascii_case("SYSTEM")
+        || settings.time_zone.eq_ignore_ascii_case("LOCAL")
+    {
+        if let Some(zone) = persistent_index_system_zone() {
+            settings.time_zone = zone.to_string();
+        }
+    }
+    settings
+}
+
+/// Resolve SYSTEM to a portable IANA name instead of binding persistent
+/// membership to the machine that happens to replay a write.
+pub(crate) fn persistent_index_system_zone() -> Option<&'static str> {
+    static NAME: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    NAME.get_or_init(|| {
+        let link = std::fs::read_link("/etc/localtime").ok();
+        let name = link
+            .as_ref()
+            .and_then(|p| p.to_str())
+            .and_then(|p| p.split_once("/zoneinfo/").map(|(_, name)| name.to_string()))
+            .or_else(|| {
+                std::fs::read_to_string("/etc/timezone")
+                    .ok()
+                    .map(|s| s.trim().to_string())
+            });
+        name.filter(|name| crate::engine::tz::find_named_zone(name).is_some())
+    })
+    .as_deref()
+}
+pub(crate) fn index_settings_have_portable_zone(settings: &PolicyExpressionSettings) -> bool {
+    !settings.time_zone.is_empty()
+        && !settings.time_zone.eq_ignore_ascii_case("SYSTEM")
+        && !settings.time_zone.eq_ignore_ascii_case("LOCAL")
+}
+
+thread_local! {
+    static INDEX_SYSTEM_ZONE: std::cell::RefCell<Option<std::sync::Arc<crate::engine::tz::TimeZoneData>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn with_index_system_zone<R>(
+    name: Option<&str>,
+    f: impl FnOnce() -> R,
+) -> Result<R, QueryError> {
+    let Some(name) = name else {
+        return Ok(f());
+    };
+    let zone = crate::engine::tz::find_named_zone(name).ok_or_else(|| {
+        crate::error::catalog::ER_UNKNOWN_TIME_ZONE
+            .error(format!("Unknown persistent index time zone '{name}'"))
+    })?;
+    struct Restore(Option<std::sync::Arc<crate::engine::tz::TimeZoneData>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            INDEX_SYSTEM_ZONE.with(|s| {
+                s.replace(self.0.take());
+            });
+        }
+    }
+    let _restore = Restore(INDEX_SYSTEM_ZONE.with(|s| s.replace(Some(zone))));
+    Ok(f())
+}
+
+pub(crate) fn with_index_settings<R>(
+    settings: &PolicyExpressionSettings,
+    f: impl FnOnce() -> R,
+) -> R {
+    if settings.matches_current() || *settings == capture_index_settings() {
+        return f();
+    }
+    let mut info = current_session_expr_info().unwrap_or_else(|| {
+        capture_session_expr_info(&crate::engine::api::SessionContext::default())
+    });
+    settings.apply(&mut info);
+    with_session_expr_info_snapshot_arc(std::sync::Arc::new(info), f)
+}
+
 pub(crate) fn with_policy_query_settings<R>(
     settings: &PolicyExpressionSettings,
     f: impl FnOnce() -> Result<R, QueryError>,
@@ -1623,6 +1719,9 @@ pub(crate) fn session_time_offset_seconds_at(utc_epoch: i64) -> i64 {
     with_session_view(|view| {
         let tz = view.map(|v| v.time_zone().to_string()).unwrap_or_default();
         if tz.is_empty() || tz.eq_ignore_ascii_case("SYSTEM") {
+            if let Some(zone) = INDEX_SYSTEM_ZONE.with(|s| s.borrow().clone()) {
+                return i64::from(zone.offset_at_utc(utc_epoch));
+            }
             return chrono::DateTime::from_timestamp(utc_epoch, 0)
                 .map(|dt| i64::from(dt.with_timezone(&chrono::Local).offset().local_minus_utc()))
                 .unwrap_or(0);
@@ -16926,6 +17025,9 @@ thread_local! {
 fn resolve_tz_spec(tz: &str) -> Result<TzSpec, QueryError> {
     let trimmed = tz.trim();
     if trimmed.eq_ignore_ascii_case("SYSTEM") || trimmed.eq_ignore_ascii_case("LOCAL") {
+        if let Some(zone) = INDEX_SYSTEM_ZONE.with(|s| s.borrow().clone()) {
+            return Ok(TzSpec::Named(zone));
+        }
         return Ok(crate::engine::tz::find_system_zone()
             .map(TzSpec::Named)
             .unwrap_or(TzSpec::System));

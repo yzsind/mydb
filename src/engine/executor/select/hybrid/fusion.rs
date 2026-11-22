@@ -40,18 +40,8 @@ pub(in crate::engine::executor::select) fn open_plan(
         unreachable!()
     };
     let (constant, weights) = bind_options(spec)?;
-    let mut statistics_result = Ok(());
-    for input in inputs {
-        input.walk(|node| {
-            if statistics_result.is_ok() {
-                if let PhysicalPlan::FulltextScan { table, index, .. } = node {
-                    statistics_result =
-                        super::super::fulltext_context::statistics(table, index).map(|_| ());
-                }
-            }
-        });
-    }
-    statistics_result?;
+    // Every FULLTEXT branch reads corpus statistics at this same TxnView;
+    // no live row-count estimate needs to be frozen ahead of branch startup.
     let width = columns.len() - 3 - usize::from(spec.score_details);
     let rankers = spec.score_details.then(|| {
         spec.branches

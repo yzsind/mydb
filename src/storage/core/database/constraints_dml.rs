@@ -60,6 +60,7 @@ impl Database {
             .iter()
             .filter(|index| index.enforces_uniqueness())
         {
+            if !table.index_contains_row(index, values)? { continue; }
             let key = table.index_key(index, values)?;
             if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                 continue;
@@ -131,9 +132,10 @@ impl Database {
             if !index_may_be_affected_by_columns(table, index, changed_columns) {
                 continue;
             }
-            let old_key = table.stored_index_key(index, old_values)?;
+            if !table.index_contains_row(index, new_values)? { continue; }
+            let old_key = table.index_contains_row(index, old_values)?.then(|| table.stored_index_key(index, old_values)).transpose()?;
             let new_key = table.index_key(index, new_values)?;
-            if old_key == new_key {
+            if old_key.as_ref() == Some(&new_key) {
                 continue;
             }
             if new_key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
@@ -396,6 +398,7 @@ impl Database {
                 }
             }
             for (row, values) in rows.iter().enumerate() {
+                if !table.index_contains_row(index, values)? { continue; }
                 let _partition = if table.is_partitioned() {
                     Some(
                         crate::engine::executor::partition_router::push_pruned_partitions(vec![
@@ -443,6 +446,7 @@ impl Database {
                 let _partition =
                     crate::engine::executor::partition_router::push_pruned_partitions(vec![sid]);
                 for (index, keys) in &mut seen {
+                    if !table.index_contains_row(index, values)? { continue; }
                     let key = table.index_key(index, values)?;
                     if !index.primary && key.0.iter().any(|part| matches!(part, KeyPart::Null)) {
                         continue;
@@ -473,6 +477,7 @@ impl Database {
             let mut min_key: Option<IndexKey> = None;
             let mut max_key: Option<IndexKey> = None;
             for (ordinal, values) in rows.iter().enumerate() {
+                if !table.index_contains_row(index, values)? { continue; }
                 let key = table.index_key(index, values)?;
                 if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                     continue;
@@ -695,6 +700,7 @@ impl Database {
     ) -> Result<(), QueryError> {
         let mut sorted_keys: Vec<IndexKey> = Vec::with_capacity(rows.len());
         for values in rows {
+            if !table.index_contains_row(index, values)? { continue; }
             let key = table.index_key(index, values)?;
             if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                 continue;
@@ -822,7 +828,7 @@ impl Database {
         let Some(latest) = self.read_mvcc_row(storage_id, row_id)? else {
             return Ok(());
         };
-        if table.stored_index_key(index, &latest.values)? == *key {
+        if table.index_contains_row(index, &latest.values)? && table.stored_index_key(index, &latest.values)? == *key {
             let writer_status = self.txns_read()?.status(latest.header.last_txn_id);
             match writer_status {
                 Some(TxnStatus::Active | TxnStatus::Prepared)

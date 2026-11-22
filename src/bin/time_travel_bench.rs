@@ -308,6 +308,7 @@ fn create_schema(db: &Database) -> Result<(), QueryError> {
         vec![col("id"), col("k"), col("payload")],
         vec!["id".into()],
         vec![IndexDef {
+            predicate: None,
             name: Some("idx_k".into()),
             columns: vec!["k".into()],
             column_prefix_lengths: Vec::new(),

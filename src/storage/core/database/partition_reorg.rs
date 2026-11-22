@@ -1255,9 +1255,26 @@ impl Database {
                         *count = count.saturating_add(1);
                     }
                     let txn = self.begin_txn()?;
-                    if let Err(err) =
+                    let copied = (|| {
+                        // The heap-only descriptor intentionally has no
+                        // indexes. Scoring still covers every copied row and
+                        // must use the final logical corpus definition.
+                        if candidate.indexes.iter().any(|index| index.is_fulltext()) {
+                            let mut groups = BTreeMap::<u64, Vec<&[Value]>>::new();
+                            for values in &batch {
+                                let storage_id = if candidate.is_partitioned() {
+                                    candidate.route_row_to_partition(values)?.storage_id
+                                } else { candidate.id };
+                                groups.entry(storage_id).or_default().push(values);
+                            }
+                            for (storage_id, rows) in groups {
+                                self.maintain_fulltext_statistics(txn.txn_id, candidate, storage_id,
+                                    rows.iter().map(|values| (None, Some(*values))))?;
+                            }
+                        }
                         self.insert_rows_shadow_bulk_detailed_for(txn, candidate_arc.clone(), batch)
-                    {
+                    })();
+                    if let Err(err) = copied {
                         let _ = self.rollback_txn(txn.txn_id);
                         return Err(err);
                     }

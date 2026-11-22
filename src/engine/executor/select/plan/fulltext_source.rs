@@ -31,7 +31,7 @@ pub(super) fn collect_heap_documents(
     let mut rows = Vec::new();
     let mut charge = ScopedCharge::new(0);
     db.scan_rows_ordered_streaming_with_refs(
-        &table.schema.qualified_name(),
+        &db.storage_key_for_table(&table.schema),
         txn,
         |identity, values| {
             crate::engine::cancel::check_cancelled()?;

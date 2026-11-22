@@ -1753,6 +1753,12 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
                         .is_some_and(|word| word.eq_ignore_ascii_case(b"TEMPORARY"))
             }
         };
+        let (sql, index_predicates) = try_rewrite_sql_with(sql, |sql| {
+            strip_index_predicates(
+                sql,
+                prescan.has_index_where && (head_is(b"CREATE") || head_is(b"ALTER")),
+            )
+        })?;
         let (sql, inline_index_visibility) = try_rewrite_sql_with(sql, |sql| {
             strip_inline_index_visibility(sql, inline_indexes && prescan.has_index_visibility)
         })?;
@@ -1814,6 +1820,7 @@ fn parse_statement_via_sqlparser_normalized(sql: &str) -> Result<Statement, Pars
             create_zone_options,
             inline_index_visibility,
             inline_index_includes,
+            index_predicates,
             vector_options,
         };
         let sql = try_rewrite_sql(sql, rewrite_mysql_right_nested_join_groups)?;
@@ -2576,6 +2583,7 @@ pub(crate) struct PreScan {
     pub has_index_visibility: bool,
     pub has_column_format_or_storage: bool,
     pub has_include: bool,
+    pub has_index_where: bool,
 }
 
 /// Compute pre-scan keyword presence with head-keyword gating. Each
@@ -2643,6 +2651,7 @@ pub(crate) fn prescan_keywords(sql: &str, head: &[u8]) -> PreScan {
             ps.has_index_visibility |= is(b"INVISIBLE") || is(b"VISIBLE");
             ps.has_column_format_or_storage |= is(b"COLUMN_FORMAT") || is(b"STORAGE");
             ps.has_include |= is(b"INCLUDE");
+            ps.has_index_where |= is(b"WHERE");
         }
     }
 

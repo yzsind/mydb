@@ -390,6 +390,7 @@ fn mvcc_fix_lob_update_prefix_keys_and_repeated_purge() {
     db.add_index(
         "test.t",
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "body_idx".into(),
@@ -690,6 +691,7 @@ fn mvcc_fix_compaction_preserves_pending_vector_identity() {
     db.pending_vector_deletes.lock().unwrap().insert(
         writer.txn_id,
         vec![PendingVectorMutation {
+                resolved_indexes: None,
             undo_id: original,
             table_id: table.id,
             storage_id: table.id,

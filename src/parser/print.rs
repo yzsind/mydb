@@ -332,9 +332,10 @@ fn render_expr_options(expr: &Expr, canonical: bool, queries: bool) -> String {
             .collect::<Vec<_>>()
             .join("."),
         Expr::UserVariable(name) => {
-            if name
-                .chars()
-                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
             {
                 format!("@{name}")
             } else {

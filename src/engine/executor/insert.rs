@@ -3334,6 +3334,9 @@ pub(super) fn find_conflicting_row_id(
     values: &[Value],
 ) -> Result<Option<RowId>, QueryError> {
     for index in table.indexes.iter().filter(|i| i.enforces_uniqueness()) {
+        if !table.index_contains_row(index, values)? {
+            continue;
+        }
         let key = table.index_key(index, values)?;
         if key.0.iter().any(|p| matches!(p, KeyPart::Null)) && !index.primary {
             continue;
@@ -3353,6 +3356,9 @@ pub(super) fn find_all_conflicting_row_ids(
 ) -> Result<Vec<RowId>, QueryError> {
     let mut all_ids: Vec<RowId> = Vec::new();
     for index in table.indexes.iter().filter(|i| i.enforces_uniqueness()) {
+        if !table.index_contains_row(index, values)? {
+            continue;
+        }
         let key = table.index_key(index, values)?;
         if key.0.iter().any(|p| matches!(p, KeyPart::Null)) && !index.primary {
             continue;
