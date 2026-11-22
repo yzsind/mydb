@@ -265,9 +265,6 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
             if !with.is_empty() {
                 return unsupported("CREATE INDEX WITH storage parameters");
             }
-            if predicate.is_some() {
-                return unsupported("partial CREATE INDEX with WHERE predicate");
-            }
             let mut algorithm = AlterAlgorithm::Default;
             let mut lock = AlterLock::Default;
             for option in alter_options {
@@ -308,6 +305,15 @@ pub(super) fn convert_statement(sql: &str, stmt: SqlStatement) -> Result<Stateme
                 ));
             }
             Ok(Statement::CreateIndex(CreateIndex {
+                predicate: predicate
+                    .as_ref()
+                    .map(|expr| {
+                        convert_expr(expr).and_then(|expr| {
+                            index_expression_to_catalog_sql(&expr, false)
+                                .map_err(|e| parse_error_at_zero(e.to_string()))
+                        })
+                    })
+                    .transpose()?,
                 name: object_name_to_string(name)?,
                 table: object_name_to_string(table_name)?,
                 algorithm,
@@ -1174,6 +1180,7 @@ fn convert_create_table(
         if column.unique {
             let columns = ConvertedIndexColumns::bare(vec![column.name.clone()]);
             indexes.push(IndexDef {
+                predicate: None,
                 // MySQL derives an unnamed inline UNIQUE index name from
                 // the first key column, not from a private `_uniq` suffix.
                 name: Some(column.name.clone()),
@@ -1227,6 +1234,7 @@ fn convert_create_table(
                     // generic index machinery, which preserves both —
                     // storage recognises the PRIMARY-named IndexDef.
                     indexes.push(IndexDef {
+                        predicate: None,
                         name: Some("PRIMARY".to_string()),
                         columns: columns.names,
                         column_prefix_lengths: columns.prefix_lengths,
@@ -1266,6 +1274,7 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.index_name.or(constraint.name))?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1296,6 +1305,7 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1327,6 +1337,7 @@ fn convert_create_table(
                     });
                 }
                 indexes.push(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1349,6 +1360,7 @@ fn convert_create_table(
                 let columns = convert_index_columns(constraint.columns)?;
                 validate_spatial_index_columns(&columns)?;
                 indexes.push(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1564,6 +1576,7 @@ fn column_alter_actions(
         for is_primary in [true, false] {
             if (is_primary && primary) || (!is_primary && unique) {
                 actions.push(AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: is_primary.then(|| "PRIMARY".to_string()),
                     columns: vec![column.clone()],
                     column_prefix_lengths: vec![None],
@@ -1641,6 +1654,7 @@ fn convert_alter_table_action(
                     &constraint.index_options,
                 )?;
                 AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.index_name.or(constraint.name))?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1677,6 +1691,7 @@ fn convert_alter_table_action(
                     }));
                 }
                 AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: Some("PRIMARY".to_string()),
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1699,6 +1714,7 @@ fn convert_alter_table_action(
                     &constraint.index_options,
                 )?;
                 AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -1745,6 +1761,7 @@ fn convert_alter_table_action(
                     "SPATIAL"
                 };
                 AlterAction::AddIndex(IndexDef {
+                    predicate: None,
                     name: ordinary_index_name(constraint.opt_index_name)?,
                     columns: columns.names,
                     column_prefix_lengths: columns.prefix_lengths,
@@ -7660,7 +7677,21 @@ fn convert_group_by(
 }
 
 fn validate_spatial_index_columns(columns: &ConvertedIndexColumns) -> Result<(), ParseError> {
-    let (spec, message) = if columns.names.len() != 1 {
+    let key_count = columns
+        .names
+        .iter()
+        .filter(|name| {
+            !matches!(
+                extensions::get(name),
+                Some(
+                    extensions::Extension::IndexPredicate
+                        | extensions::Extension::IndexVisibility
+                        | extensions::Extension::IndexInclude(_)
+                )
+            )
+        })
+        .count();
+    let (spec, message) = if key_count != 1 {
         (
             crate::error::catalog::ER_TOO_MANY_KEY_PARTS,
             "A SPATIAL index requires exactly one key part",

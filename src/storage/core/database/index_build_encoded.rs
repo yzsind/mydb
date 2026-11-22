@@ -5229,7 +5229,7 @@ impl CompiledIndexKeyProgram {
                 .len()
                 .saturating_add(index.included_columns.len()),
         );
-        let mut direct = !index.is_fulltext()
+        let mut direct = index.predicate.is_none() && !index.is_fulltext()
             && !index.is_spatial()
             && !index.is_vector()
             && !index.has_multi_valued_parts();
@@ -7137,6 +7137,7 @@ mod encoded_index_program_tests {
 
     fn dummy_index() -> IndexSchema {
         IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "encoded_test".into(),

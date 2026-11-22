@@ -1117,6 +1117,7 @@ pub(crate) const HIDDEN_DD_TABLES: &[&str] = &[
     "column_histograms",
     "columns",
     "indexes",
+    "fulltext_counters",
     "index_column_usage",
     "check_constraints",
     "row_security_policies",

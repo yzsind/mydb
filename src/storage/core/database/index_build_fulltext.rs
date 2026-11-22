@@ -299,11 +299,12 @@ impl Database {
             ControlledMemoryCategory, ControlledMemoryCharge,
         };
         const WORKER_SCRATCH: usize = 4 * 1024 * 1024;
-        let columns = index
+        let text_columns = index
             .columns
             .iter()
             .map(|name| table.column_index(name))
             .collect::<Result<Vec<_>, _>>()?;
+        let columns = if index.predicate.is_some() { (0..table.columns.len()).collect::<Vec<_>>() } else { text_columns.clone() };
         let page_count = self.with_heap_read(table.id, |heap| Ok(heap.page_count_relaxed()))?;
         let requested = options
             .effective_degree
@@ -346,6 +347,7 @@ impl Database {
                     for worker in 0..degree {
                         let next_page = &next_page;
                         let columns = &columns;
+                        let text_columns = &text_columns;
                         let program = program.clone();
                         let cancel = cancel.clone();
                         let cfg = &cfg;
@@ -380,6 +382,9 @@ impl Database {
                                                     if row.header.is_deleted() {
                                                         return Ok(false);
                                                     }
+                                                    if index.predicate.is_some() && !table.index_contains_row(index, row.values)? { return Ok(false); }
+                                                    let texts = index.predicate.as_ref().map(|_| text_columns.iter().map(|i| row.values[*i].clone()).collect::<Vec<_>>());
+                                                    let text_values = texts.as_deref().unwrap_or(row.values);
                                                     let document_bytes = row
                                                         .values
                                                         .iter()
@@ -403,7 +408,7 @@ impl Database {
                                                     fulltext_build_pending(
                                                         tokenizer.as_ref(),
                                                         cfg,
-                                                        row.values,
+                                                        text_values,
                                                         |pending| {
                                                             sorter.push(
                                                                 self.data_dir(),

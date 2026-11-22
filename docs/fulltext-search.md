@@ -105,15 +105,15 @@ rechecked. An ordinary full-text index is not a substring index.
 
 ## Ranking and configuration
 
-BM25 uses posting term frequency and document length. Indexed reads estimate
-the document count from table statistics and committed row deltas. They use
-the corpus average length collected by `ANALYZE TABLE` when available, and
-otherwise approximate it from matching documents. Run `ANALYZE TABLE` after
-large corpus changes to refresh these estimates.
+BM25 uses posting term frequency and document length, together with document
+count, total token length and term document frequencies from the whole visible
+corpus. These counts share a bounded cache keyed by the table definition,
+column set, tokenizer and read snapshot. A cold cache streams the corpus;
+`ANALYZE TABLE` remains useful for optimizer cost estimates.
 
-Scores do not promise numeric equality with MySQL. Ordinary index statistics
-and posting document frequencies are not fully versioned; concurrent corpus
-changes can affect ranking even when a document's visible text stays the same.
+Scores do not promise numeric equality with MySQL. Complete and partial
+indexes share the same snapshot baseline; filtering candidates does not
+redefine the corpus.
 Term equality uses the indexed column's collation, including case and accent
 sensitivity. Index construction, writes, natural-language searches, boolean
 terms, phrases, and wildcard prefixes share the same normalization rules.
@@ -140,6 +140,40 @@ Document lengths and stored token positions use unsigned 32-bit fields.
 Writes and index builds return error 1690 when a document exceeds these
 limits, including through a large inter-column gap. They do not saturate or
 wrap positions into an invalid posting or a cross-column phrase match.
+
+## Transactional scoring statistics
+
+BM25 uses the complete visible table corpus, including rows excluded from a
+partial FULLTEXT index. Compatible indexes over the same column set and
+persisted tokenizer configuration share a corpus identity. Document count,
+total token count and each term's document frequency are maintained
+incrementally in internal MVCC counter rows. A document contributes once to a
+term's frequency, even when the term repeats or appears in multiple columns.
+NULL and empty documents still contribute to the document count.
+
+Counters are written in the data transaction and participate in savepoints,
+rollback, XA, WAL recovery, physical replication, checkpoints and backups.
+Readers see counters from their own statement or transaction snapshot,
+including their own writes. Changing only a partial-index predicate column
+does not change the corpus. New FULLTEXT indexes initialize counters during
+DDL; queries never initialize them by scanning user rows. For views without
+uncommitted changes, cold-cache and write-first scoring read only the requested
+terms' counter shards. Inside a write transaction, scoring combines the
+snapshot counters with that transaction's modified document versions. This
+extra work scales with its own changes and preserves RR, savepoint and
+read-your-writes semantics without scanning unrelated rows. Statistics space
+and write cost depend on the token vocabulary; reads touch at most 64 counter
+rows per requested term and physical partition, plus the document count and
+length counters. Different tokenizer configurations retain separate corpora.
+Index builds, physical rewrites and partition exchanges retain a publication
+fence. A snapshot older than that fence uses the visible-document oracle,
+including rows removed before the index was built. It does not read a newer
+corpus as though it existed in the old snapshot. The normal current-view
+statistics path remains incremental.
+
+Temporary FULLTEXT tables keep their counters in session temporary storage,
+with the owning table's storage and undo quotas. Temporary counters are
+removed with DROP/TRUNCATE and are not persisted or replicated.
 
 ## Execution paths and limits
 
@@ -176,7 +210,7 @@ filtering and score projection; see [Backup and Recovery](backup-and-recovery.md
 ## Persistence and failures
 
 FULLTEXT indexes are important persistent objects. Their posting B-trees,
-scoring payloads, tokenizer configuration and positional data participate in
+scoring payloads, persisted corpus counters, tokenizer configuration and positional data participate in
 transactional maintenance, checkpoints, backup and recovery. The ability to
 reconstruct an index does not make a failed write or flush optional.
 
@@ -195,3 +229,8 @@ table through `INNODB_FT_INDEX_TABLE` and `INNODB_FT_CONFIG`. The optional mydb
 extension `database/table/index` selects one index. DOC_ID is a diagnostic
 identity synthesized from storage and row identifiers and can change on row
 migration; POSITION counts tokens rather than InnoDB byte offsets.
+
+## Partial indexes and corpus statistics
+
+FULLTEXT supports `WHERE` predicates on index definitions; see [partial indexes](partial-indexes.md).
+BM25 uses the whole visible table for document count, average token length and term document frequency. Candidate filtering does not redefine the scoring corpus. Complete indexes, partial indexes and visible-heap oracles use the same baseline. Corpus metadata is cached by table definition, indexed column set, tokenizer configuration and read snapshot. Cold metadata is computed with a streaming scan; cache entries retain counts rather than documents and are released when their database closes.

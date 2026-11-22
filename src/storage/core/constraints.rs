@@ -218,10 +218,19 @@ pub(crate) fn coerce_updated_row(
 
 fn validate_row_domain_constraints(table: &TableSchema, values: &[Value]) -> Result<(), QueryError> {
     crate::binlog::validate_row_domain(table, values)?;
+    validate_cosine_index_rows(table, values, false)
+}
+
+fn validate_cosine_index_rows(table: &TableSchema, values: &[Value], generated_ready: bool) -> Result<(), QueryError> {
     for index in table.indexes.iter().filter(|index| {
         index.is_vector()
             && index.vector_meta().metric_enum() == crate::engine::vector::Metric::Cosine
     }) {
+        if let Some(predicate) = &index.predicate {
+            if !generated_ready && predicate.referenced_columns.iter().any(|name|
+                table.column_index(name).ok().is_some_and(|i| table.columns[i].generated_expr.is_some())) { continue; }
+            if !table.index_contains_row(index, values)? { continue; }
+        }
         let col_idx = table.column_index(&index.columns[0])?;
         if let Some(Value::Vector(bytes)) = values.get(col_idx) {
             if crate::engine::vector::distance::typed_is_zero(bytes) {
@@ -270,6 +279,8 @@ pub(crate) fn index_may_be_affected_by_columns(
     // columns its expression references changed. INCLUDE columns are
     // appended verbatim to the key, so they're treated like column key
     // parts.
+    if index.predicate.as_ref().is_some_and(|p| p.referenced_columns.iter().any(|name|
+        table.column_index(name).map_or(true, |i| changed_columns.contains(&i)))) { return true; }
     let key_part_changed = (0..index.columns.len()).any(|pos| match index.key_part(pos) {
         Some(crate::storage::IndexKeyPart::Column(name)) => match table.column_index(name) {
             Ok(idx) => changed_columns.contains(&idx),
@@ -364,7 +375,7 @@ fn materialize_generated_columns(
         let value = generated_column_value(table, idx, values)?;
         values[idx] = value;
     }
-    Ok(())
+    validate_cosine_index_rows(table, values, true)
 }
 
 fn generated_column_value(
@@ -1196,6 +1207,20 @@ fn rename_column_expression_references(
     old_name: &str,
     new_name: &str,
 ) -> Result<(), QueryError> {
+    for index in &mut table.indexes {
+        if let Some(predicate) = &mut index.predicate {
+            let predicate = Arc::make_mut(predicate);
+            let mut expr = crate::parser::parse_catalog_expr(&predicate.expr_sql)
+                .map_err(|e| error(crate::error::catalog::ER_PARSE_ERROR, e.to_string()))?;
+            rename_expr_column(&mut expr, old_name, new_name);
+            predicate.expr_sql = encode_catalog_expr(&expr)?;
+            predicate.ast = None;
+            predicate.program = None;
+            for name in &mut predicate.referenced_columns {
+                if name.eq_ignore_ascii_case(old_name) { *name = new_name.to_ascii_lowercase(); }
+            }
+        }
+    }
     // DEFAULT expressions have the same schema scope as generated columns.
     // Rewrite identifiers through the AST so literals and function names stay intact.
     for column in &mut table.columns {
@@ -4813,6 +4838,7 @@ fn validate_existing_unique_index_values(
     if index.has_expression_parts() {
         let mut seen = crate::util::fast_hash::ah_hash_set();
         for row in db.scan_rows(&table.qualified_name(), txn)? {
+            if !table.index_contains_row(index, &row.values)? { continue; }
             let key = table.index_key(index, &row.values)?;
             if key.0.iter().any(|part| matches!(part, KeyPart::Null)) {
                 if index.primary {

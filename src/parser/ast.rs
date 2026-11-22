@@ -1870,6 +1870,7 @@ pub enum DataType {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IndexDef {
+    pub predicate: Option<String>,
     pub name: Option<String>,
     /// For column key parts, the column name. For MySQL 8.0 functional
     /// key parts (`((expr))`), the canonical SQL text of the expression
@@ -1928,6 +1929,7 @@ impl IndexDef {
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateIndex {
+    pub predicate: Option<String>,
     pub name: String,
     pub table: String,
     pub algorithm: AlterAlgorithm,

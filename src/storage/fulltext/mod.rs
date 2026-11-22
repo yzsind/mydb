@@ -20,10 +20,10 @@
 //! tokenizer from that snapshot — env changes across restarts can no longer mismatch historical indexes. Old indexes deserialize to `None` and use global defaults.
 //!
 //! ## Scoring
-//! Relevance uses BM25 (the `bm25` submodule). Indexed reads use ANALYZE's corpus
-//! average when available, otherwise the candidate-set mean; `N` is estimated
-//! from catalog statistics and committed row deltas. Historical and partitioned
-//! query oracles compute statistics from their visible documents.
+//! Relevance uses BM25 (the `bm25` submodule). Complete indexes, partial
+//! indexes and heap oracles share document counts, total token length and
+//! query-term frequencies from the same visible corpus. A bounded snapshot
+//! cache retains these counts without retaining documents or posting lists.
 
 pub(crate) mod bm25;
 pub(crate) mod boolean;

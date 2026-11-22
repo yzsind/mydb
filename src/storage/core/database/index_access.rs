@@ -796,7 +796,7 @@ impl Database {
             let mut visible = Vec::with_capacity(ids.len());
             for id in ids {
                 if let Some(row) = self.read_row(table, id, txn)? {
-                    if table.stored_index_key(index, &row.values)? == key {
+                    if table.index_contains_row(index, &row.values)? && table.stored_index_key(index, &row.values)? == key {
                         visible.push(id);
                     }
                 }
@@ -883,7 +883,7 @@ impl Database {
         // row also needs a key recheck after reconstructing its MVCC version.
         for id in ids {
             if let Some(row) = self.read_row(table, id, txn)? {
-                if table.stored_index_key(index, &row.values)? == key {
+                if table.index_contains_row(index, &row.values)? && table.stored_index_key(index, &row.values)? == key {
                     return Ok(Some(id));
                 }
             }
@@ -1482,7 +1482,7 @@ impl Database {
         }
         let repairs_after = self.has_pending_index_repairs();
         if entries.len() != before
-            || ((repairs_before || repairs_after) && index.has_multi_valued_parts())
+            || ((repairs_before || repairs_after) && (index.predicate.is_some() || index.has_multi_valued_parts()))
         {
             self.filter_and_dedup_repaired_index_entries(table, index, txn, &mut entries)?;
         }
@@ -1648,6 +1648,18 @@ impl Database {
         // as before; the cursor owns only a short-lived cached index handle.
         self.range_index_entries_cursor(table, index, low, high)?
             .collect_remaining()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn physical_index_entries_for_test(
+        &self, table: &TableSchema, index: &IndexSchema,
+    ) -> Result<Vec<(IndexKey, RowId)>, QueryError> {
+        let mut entries = Vec::new();
+        for storage_id in table.storage_ids() {
+            entries.extend(self.with_index_read(storage_id, &index.name, |file| file.entries())?);
+        }
+        entries.sort_unstable();
+        Ok(entries)
     }
 
     /// Hot-path variant of `range_index_bounds_entries_visible` that
@@ -2693,7 +2705,7 @@ impl Database {
                     let Some(row) = self.read_row(table, row_id, txn)? else {
                         return Ok(false);
                     };
-                    Ok(table.stored_index_key(index, &row.values)? == *key)
+                    Ok(table.index_contains_row(index, &row.values)? && table.stored_index_key(index, &row.values)? == *key)
                 },
                 choose.take().unwrap(),
             )

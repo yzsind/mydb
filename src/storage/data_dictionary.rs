@@ -130,6 +130,7 @@ pub(crate) const DD_COLUMN_STATS: u64 = DD_TABLE_ID_BASE + 28;
 pub(crate) const DD_INDEX_STATS: u64 = DD_TABLE_ID_BASE + 29;
 pub(crate) const DD_EXTENDED_STATS: u64 = DD_TABLE_ID_BASE + 30;
 pub(crate) const DD_COLUMN_HISTOGRAMS: u64 = DD_TABLE_ID_BASE + 31;
+pub(crate) const DD_FULLTEXT_COUNTERS: u64 = DD_TABLE_ID_BASE + 36;
 pub(crate) const DD_RECYCLEBIN: u64 = DD_TABLE_ID_BASE + 35;
 pub(crate) const DD_API_KEYS: u64 = DD_TABLE_ID_BASE + 34;
 pub(crate) const DD_ROW_SECURITY_POLICIES: u64 = DD_TABLE_ID_BASE + 32;
@@ -447,6 +448,11 @@ fn indexes_table() -> TableSchema {
                 true,
             ),
             ucol("readable_from_scn", DataTypeKind::BigInt, false),
+            col(
+                "predicate_json",
+                DataTypeKind::Text { max_len: 65_535 },
+                true,
+            ),
             col(
                 "vector_config_json",
                 DataTypeKind::Text { max_len: 65_535 },
@@ -909,6 +915,25 @@ fn build_dd_tables() -> Vec<Arc<TableSchema>> {
             DD_COLUMN_HISTOGRAMS,
             "column_histograms",
             &["table_id", "column_id"],
+        )),
+        Arc::new(TableSchema::system_table(
+            DD_FULLTEXT_COUNTERS,
+            "fulltext_counters",
+            vec![
+                ucol("table_id", DataTypeKind::BigInt, false),
+                ucol("generation", DataTypeKind::BigInt, false),
+                ucol("corpus_id", DataTypeKind::BigInt, false),
+                col(
+                    "definition",
+                    DataTypeKind::VarBinary { len: Some(8192) },
+                    false,
+                ),
+                ucol("storage_id", DataTypeKind::BigInt, false),
+                col("term", DataTypeKind::VarBinary { len: Some(1024) }, false),
+                ucol("shard", DataTypeKind::BigInt, false),
+                col("document_count", DataTypeKind::BigInt, false),
+                col("total_tokens", DataTypeKind::BigInt, false),
+            ],
         )),
         Arc::new(table_dynamic_metadata_table()),
         Arc::new(TableSchema::system_table(
@@ -1435,6 +1460,7 @@ fn push_table_rows(
             uv(index.index_id),
             jsonv(&index.fulltext),
             uv(index.readable_from_scn),
+            jsonv(&index.predicate),
             jsonv(&index.vector),
         ]);
         let mut ord = 0u64;
@@ -1848,7 +1874,7 @@ fn catalog_from_dd_rows_with_auth(
                 let parts = icu_by_index.remove(&(id, r_str(r, 2))).unwrap_or_default();
                 let mut index = reconstruct_index(r, parts)?;
                 if index.is_vector() {
-                    let raw = r.get(13).and_then(crate::types::value_str).ok_or_else(|| {
+                    let raw = r.get(14).and_then(crate::types::value_str).ok_or_else(|| {
                         crate::storage::error(
                             crate::error::catalog::ER_GET_ERRNO,
                             "missing vector_config in data dictionary",
@@ -2008,6 +2034,7 @@ fn catalog_from_dd_rows_with_auth(
         }
         validate_persisted_layouts(&table)?;
         table.build_column_index();
+        table.compile_index_predicates()?;
         table.stats = match super::stats_store::load(set, &table) {
             Ok(stats) => stats,
             Err(err) if err.message() == "corrupt optimizer statistics object" => {
@@ -2401,7 +2428,18 @@ fn reconstruct_index(
     // Persist the complete per-index snapshot: process environment changes
     // must never change the tokenizer of an existing physical index.
     let fulltext = r_json::<Option<crate::storage::schema::FulltextMeta>>(irow, 11)?;
+    if index_type.eq_ignore_ascii_case("FULLTEXT")
+        && fulltext
+            .as_ref()
+            .is_none_or(|meta| meta.corpus_id == 0 || meta.snapshot_origin_txn_id == u64::MAX)
+    {
+        return Err(super::error(
+            crate::error::catalog::ER_GET_ERRNO,
+            "invalid persisted FULLTEXT corpus identity",
+        ));
+    }
     Ok(IndexSchema {
+        predicate: r_json(irow, 13)?,
         readable_from_scn: r_u64(irow, 12),
         index_id: r_u64(irow, 10),
         name: r_str(irow, 2),
@@ -2417,7 +2455,7 @@ fn reconstruct_index(
         visible: r_bool(irow, 6),
         comment: r_str(irow, 8),
         fulltext,
-        vector: r_json(irow, 13)?,
+        vector: r_json(irow, 14)?,
     })
 }
 
@@ -2890,6 +2928,8 @@ mod tests {
         let idx = &mut table.indexes[1];
         idx.index_type = "FULLTEXT".into();
         idx.fulltext = Some(crate::storage::schema::FulltextMeta {
+            corpus_id: idx.index_id,
+            snapshot_origin_txn_id: 0,
             collation_id: None,
             parser: "ngram".into(),
             ngram_size: Some(2),
@@ -2996,6 +3036,7 @@ mod tests {
             primary_key: vec!["id".to_string()],
             indexes: vec![
                 IndexSchema {
+                    predicate: None,
                     readable_from_scn: 0,
                     index_id: 0,
                     name: "PRIMARY".to_string(),
@@ -3014,6 +3055,7 @@ mod tests {
                     fulltext: None,
                 },
                 IndexSchema {
+                    predicate: None,
                     readable_from_scn: 0,
                     index_id: 0,
                     name: "idx_name".to_string(),

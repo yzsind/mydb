@@ -281,6 +281,17 @@ pub(crate) enum UndoKind {
     },
 }
 
+/// Row identity and transaction linkage without materializing before-images.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UndoRowMetadata {
+    pub(crate) txn_id: u64,
+    pub(crate) prev_undo_ptr: Option<u64>,
+    pub(crate) table_id: u64,
+    pub(crate) row_id: RowId,
+    pub(crate) insert_batch: bool,
+    pub(crate) chain_depth: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct UndoRecord {
     pub(crate) id: u64,
@@ -4225,6 +4236,21 @@ impl UndoManager {
                 }
             }
         }
+    }
+
+    /// Metadata remains resident when large row payloads have been evicted.
+    pub(crate) fn row_metadata(&self, undo_ptr: u64) -> Option<UndoRowMetadata> {
+        let record = self
+            .records
+            .get(&self.resolve_forwarded(undo_ptr).unwrap_or(undo_ptr))?;
+        Some(UndoRowMetadata {
+            txn_id: record.txn_id,
+            prev_undo_ptr: record.prev_undo_ptr,
+            table_id: record.table_id,
+            row_id: record.row_id,
+            insert_batch: matches!(record.kind, UndoKind::InsertBatch { .. }),
+            chain_depth: record.chain_depth,
+        })
     }
 
     #[cfg(test)]

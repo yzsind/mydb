@@ -855,6 +855,7 @@ fn prepare_create_table_schema(
         )?;
         enforce_key_columns_not_null(&primary_key, &mut column_schemas)?;
         index_schemas.push(IndexSchema {
+            predicate: None,
             readable_from_scn: 0,
             index_id: 0,
             name: "PRIMARY".to_string(),
@@ -1189,6 +1190,7 @@ fn prepare_create_table_schema(
         validate_mysql_identifier(&resolved_name)?;
         check_comment_len(CommentTarget::Index, &resolved_name, &index.comment)?;
         index_schemas.push(IndexSchema {
+            predicate: index.predicate.map(crate::storage::schema::IndexPredicate::new),
             readable_from_scn: 0,
             index_id: 0,
             name: resolved_name,
@@ -1821,6 +1823,7 @@ impl Database {
             .cloned()
             .map(|mut index| {
                 index.state = IndexState::Public;
+                if let Some(meta) = &mut index.fulltext { meta.snapshot_origin_txn_id = 0; }
                 index
             })
             .collect::<Vec<_>>();
@@ -2156,6 +2159,7 @@ impl Database {
         let Some(table) = table else {
             return Ok(());
         };
+        self.drop_temp_table(&fulltext_temp_counter_key(table.id))?;
         for sid in table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -2187,6 +2191,7 @@ impl Database {
             .get(internal_key)
             .cloned()
             .ok_or_else(|| ddl_table_not_found(&internal_key))?;
+        self.drop_temp_table(&fulltext_temp_counter_key(table.id))?;
         for sid in table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -2282,7 +2287,10 @@ impl Database {
             "temp-snapshot",
         )?;
         let snapshot_dir = directory.path();
-        for sid in table.storage_ids() {
+        let fulltext_counters = self.temp_tables.read().map_err(|_| fulltext_statistics_error("temporary table lock poisoned"))?
+            .get(&fulltext_temp_counter_key(table.id)).cloned();
+        for schema in std::iter::once(&table).chain(fulltext_counters.iter()) {
+        for sid in schema.storage_ids() {
             self.with_heap_read(sid, |heap| {
                 self.flush_temp_snapshot_pages(
                     &heap.path,
@@ -2301,7 +2309,7 @@ impl Database {
                     )
                 })?;
             }
-            for index in &table.indexes {
+            for index in &schema.indexes {
                 self.with_index_read(sid, &index.name, |idx| {
                     if let Some(spatial) = &idx.spatial {
                         return self.flush_temp_snapshot_pages(
@@ -2321,9 +2329,12 @@ impl Database {
                 })?;
             }
         }
+        }
         let mut files = Vec::new();
         let mut session_charges = Vec::new();
-        for (idx, original) in self.temp_table_file_paths(&table).into_iter().enumerate() {
+        let mut paths = self.temp_table_file_paths(&table);
+        if let Some(auxiliary) = &fulltext_counters { paths.extend(self.temp_table_file_paths(auxiliary)); }
+        for (idx, original) in paths.into_iter().enumerate() {
             let snapshot = snapshot_dir.join(format!("{idx}.snap"));
             let existed = original.exists();
             if existed {
@@ -2351,6 +2362,7 @@ impl Database {
             _session_charges: session_charges,
             internal_key: internal_key.to_string(),
             table,
+            fulltext_counters,
             files,
         })
     }
@@ -2374,6 +2386,15 @@ impl Database {
             self.remove_temp_table_runtime_files(&current)?;
         }
         self.remove_temp_table_runtime_files(&snapshot.table)?;
+        let auxiliary_key = fulltext_temp_counter_key(snapshot.table.id);
+        self.drop_temp_table(&auxiliary_key)?;
+        if let Some(auxiliary) = &snapshot.fulltext_counters {
+            let registration = crate::storage::temp_quota::register_auxiliary(&self.data_dir, auxiliary.id, snapshot.table.id)?;
+            self.temp_tables.write().map_err(|_| fulltext_statistics_error("temporary table lock poisoned"))?
+                .insert(auxiliary_key, auxiliary.clone());
+            registration.commit();
+        }
+
         for file in &snapshot.files {
             if let Some(parent) = file.original.parent() {
                 fs::create_dir_all(parent).map_err(io_err)?;
@@ -2498,6 +2519,10 @@ impl Database {
                 format!("duplicate index '{}'", index.name),
             ));
         }
+        if index.predicate.is_some() {
+            let mut candidate = table.as_ref().clone(); candidate.indexes = vec![index.clone()];
+            candidate.compile_index_predicates()?; index = candidate.indexes.remove(0);
+        }
         implicit_spatial_index(&mut index, &table);
         validate_table_index_count(table.indexes.iter().filter(|i| !i.primary).count() + 1)?;
         validate_index_column_names(&table, &index)?;
@@ -2535,6 +2560,8 @@ impl Database {
             self.prepare_empty_temp_index_file(next.id, &index.name)?;
         }
         next.indexes.push(index.clone());
+        next.build_column_index();
+        index = next.indexes.last().expect("new temporary index").clone();
         next.bump_schema_version();
         if let Err(err) = self.rebuild_index(&next, &index) {
             self.remove_index_cache_entry(next.id, &index.name)?;
@@ -2929,6 +2956,7 @@ impl Database {
         candidate.reset_row_layouts_for_rewrite();
         candidate.build_column_index();
         validate_row_fits_page(&candidate)?;
+        self.drop_temp_table(&fulltext_temp_counter_key(old_table.id))?;
         for sid in old_table.storage_ids() {
             self.remove_heap_cache_entry(sid)?;
             self.remove_overflow_cache_entry(sid)?;
@@ -3343,6 +3371,7 @@ impl Database {
             internal_key,
             TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
             |values| {
+                if !table.index_contains_row(index, values)? { return Ok(()); }
                 let key = table.index_key(index, values)?;
                 if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                     return Ok(());
@@ -4437,6 +4466,7 @@ impl Database {
                             .find(|existing| existing.name.eq_ignore_ascii_case(index_name))
                         {
                             slot.state = crate::storage::IndexState::Public;
+                            if let Some(meta) = &mut slot.fulltext { meta.snapshot_origin_txn_id = u64::MAX; }
                             if slot.primary {
                                 table.primary_key = slot.columns.clone();
                                 enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
@@ -4522,6 +4552,7 @@ impl Database {
                         .find(|existing| existing.name.eq_ignore_ascii_case(&index_name))
                     {
                         slot.state = crate::storage::IndexState::Public;
+                        if let Some(meta) = &mut slot.fulltext { meta.snapshot_origin_txn_id = u64::MAX; }
                         if slot.primary {
                             table.primary_key = slot.columns.clone();
                             enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
@@ -4584,6 +4615,9 @@ impl Database {
             crate::storage::fulltext::snapshot_tokenizer_config_into(
                 index.fulltext.get_or_insert_with(Default::default),
             );
+        }
+        if index.is_fulltext() {
+            index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = u64::MAX;
         }
         if index.primary {
             index.unique = true;
@@ -4665,6 +4699,12 @@ impl Database {
                 ));
             }
             resolve_vector_config(&table.columns, &mut index)?;
+            if index.predicate.is_some() {
+                let mut candidate = table.as_ref().clone();
+                candidate.indexes = vec![index.clone()];
+                candidate.compile_index_predicates()?;
+                index = candidate.indexes.remove(0);
+            }
             validate_add_index_definition(table, &index)?;
             if !index.included_columns.is_empty() {
                 if index.unique {
@@ -4765,6 +4805,12 @@ impl Database {
                         )
                     })?);
             resolve_vector_config(&table.columns, &mut index)?;
+            if index.predicate.is_some() {
+                let mut candidate = table.clone();
+                candidate.indexes = vec![index.clone()];
+                candidate.compile_index_predicates()?;
+                index = candidate.indexes.remove(0);
+            }
             validate_add_index_definition(table, &index)?;
             if index.primary
                 && (table.indexes.iter().any(|existing| existing.primary)
@@ -4843,6 +4889,7 @@ impl Database {
             let mut building_index = index.clone();
             building_index.state = crate::storage::IndexState::Building;
             table.indexes.push(building_index);
+            table.assign_fulltext_corpora();
             table.bump_schema_version();
             table.clone()
         };
@@ -4937,6 +4984,7 @@ impl Database {
                     .find(|existing| existing.name.eq_ignore_ascii_case(index_name))
                 {
                     slot.state = crate::storage::IndexState::Public;
+                    if let Some(meta) = &mut slot.fulltext { meta.snapshot_origin_txn_id = u64::MAX; }
                     if slot.primary {
                         table.primary_key = slot.columns.clone();
                         enforce_key_columns_not_null(&table.primary_key, &mut table.columns)?;
@@ -8058,6 +8106,7 @@ impl Database {
                     &defaults,
                 )?;
                 for index in candidate.indexes.iter().filter(|index| index.unique) {
+                    if !candidate.index_contains_row(index, &values)? { continue; }
                     let key = candidate.index_key(index, &values)?;
                     if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                         continue;
@@ -8168,6 +8217,9 @@ impl Database {
         let ddl_txn = self.begin_txn()?;
         let ddl_txn_id = ddl_txn.txn_id;
         candidate.row_generation_txn_id = ddl_txn_id;
+        for index in candidate.indexes.iter_mut().filter(|index| index.is_fulltext()) {
+            index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = ddl_txn_id;
+        }
         let shadow_id = {
             let mut catalog = self.catalog_write()?;
             let id = catalog.allocate_table_id()?;
@@ -8634,6 +8686,7 @@ impl Database {
                     }
                 }
             }
+            self.backfill_copied_fulltext_statistics(ddl_txn, &candidate, shadow_id, candidate.id)?;
             Self::enter_alter_copy_finalizing(&job)?;
             let swap_started = Instant::now();
             let memory_graphs =
@@ -10082,6 +10135,8 @@ impl Database {
             self.note_vector_inserts(table, values, row_id, table.id)?;
         }
         self.insert_index_batches_deferred(txn.txn_id, table, index_entries)?;
+        self.maintain_fulltext_statistics(txn.txn_id, table, table.id,
+            rows.iter().map(|row| (None, Some(row.as_slice()))))?;
         crate::binlog::record_write_rows(txn.txn_id, table, rows)?;
         Ok(())
     }
@@ -11808,6 +11863,7 @@ impl Database {
                 )
             })?;
             updated.indexes.push(IndexSchema {
+                predicate: None,
                 readable_from_scn: 0,
                 index_id,
                 name: index.to_string(),
@@ -13463,11 +13519,13 @@ impl Database {
                             .iter()
                             .map(|c| c.to_ascii_lowercase())
                             .collect::<Vec<_>>(),
-                        // Expressions and FT configuration determine physical key encoding.
+                        // Predicates, expressions and FT configuration determine physical membership and encoding.
+                        serde_json::to_string(&idx.predicate).expect("serializable index predicate"),
                         serde_json::to_string(&idx.key_expressions)
                             .expect("serializable index expressions"),
-                        serde_json::to_string(&idx.fulltext)
-                            .expect("serializable fulltext metadata"),
+                        serde_json::to_string(&idx.fulltext.as_ref().map(|meta| {
+                            let mut meta = meta.clone(); meta.corpus_id = 0; meta.snapshot_origin_txn_id = 0; meta
+                        })).expect("serializable fulltext metadata"),
                     )
                 })
                 .collect();
@@ -13842,7 +13900,27 @@ impl Database {
         self.note_catalog_table(table.id);
         self.note_catalog_table(other_table.id);
         self.note_catalog_table(partition_storage_id);
-        self.commit_ddl_catalog_txn()?;
+        if table.indexes.iter().any(|index| index.is_fulltext()) {
+            let counter_txn = self.begin_txn()?;
+            let _counter_rollback = OnlineIndexTxnGuard { db: self, txn_id: counter_txn.txn_id };
+            let (new_table, new_other) = {
+                let mut catalog = self.catalog_write()?;
+                for name in [&key,&other_key] {
+                    for index in Arc::make_mut(catalog.tables.get_mut(name).expect("EXCHANGE table"))
+                        .indexes.iter_mut().filter(|index| index.is_fulltext()) {
+                        index.fulltext.as_mut().expect("FULLTEXT metadata").snapshot_origin_txn_id = counter_txn.txn_id;
+                    }
+                }
+                (catalog.tables[&key].clone(), catalog.tables[&other_key].clone())
+            };
+            self.transfer_fulltext_statistics(counter_txn, &other_table, other_table.id,
+                &new_table, other_table.id)?;
+            self.transfer_fulltext_statistics(counter_txn, &table, partition_storage_id,
+                &new_other, partition_storage_id)?;
+            self.commit_catalog_txn_existing(counter_txn)?;
+        } else {
+            self.commit_ddl_catalog_txn()?;
+        }
         if partition_reorg_crash_point().as_deref() == Some("exchange_after_catalog") {
             return Ok(());
         }
@@ -15510,6 +15588,9 @@ fn plan_index_cascade_for_drop_column(
     let mut to_drop = Vec::new();
     let mut to_rebuild = Vec::new();
     for index in &table.indexes {
+        if index.predicate.as_ref().is_some_and(|p| p.referenced_columns.iter().any(|c| c == &lower_target)) {
+            return Err(error(crate::error::catalog::ER_DROP_INDEX_FK, "cannot drop column referenced by a partial index predicate"));
+        }
         // A functional index that depends on the column can't be mechanically
         // rewritten — MySQL blocks the whole drop (1553).
         if index

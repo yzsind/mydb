@@ -330,6 +330,7 @@ fn fk_find_referenced_index<'a>(
         // extension, with ambiguous parent UPDATE/DELETE behavior. Require
         // a complete unique key so referential actions identify one parent.
         (idx.unique || idx.primary)
+            && idx.predicate.is_none()
             && idx.state == IndexState::Public
             && !idx.is_fulltext()
             && idx.columns.len() == referenced.len()
@@ -354,7 +355,7 @@ fn fk_find_child_backing_index(
         .iter()
         .chain(pending.iter())
         .find(|idx| {
-            idx.state == IndexState::Public
+            idx.predicate.is_none() && idx.state == IndexState::Public
                 && !idx.is_fulltext()
                 && idx.columns.len() >= columns.len()
                 && columns
@@ -612,6 +613,7 @@ fn fk_build_one(
                 index_names.insert(normalize_name(&idx_name));
                 let n = child_cols.len();
                 let index = IndexSchema {
+                    predicate: None,
                     readable_from_scn: 0,
                     index_id: 0,
                     name: idx_name.clone(),

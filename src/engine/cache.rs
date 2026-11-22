@@ -1204,6 +1204,7 @@ pub(crate) struct RuntimeScalarPointPlan {
 pub struct CompiledSelectPlan {
     pub semantic_select: Arc<Select>,
     pub physical: Arc<PhysicalPlan>,
+    pub(crate) replan_partial_indexes: bool,
     pub executable: Arc<CompiledOperator>,
     pub(crate) compact_range:
         Option<Arc<crate::engine::executor::select::simple::CompactRangeRecipe>>,
@@ -1258,6 +1259,9 @@ impl CompiledSelectPlan {
         object_deps: SmallVec<[ObjectDep; 2]>,
         epoch: u64,
     ) -> Self {
+        let replan_partial_indexes = crate::planner::collect_physical_plan_tables(&physical)
+            .iter()
+            .any(|t| t.schema.indexes.iter().any(|i| i.predicate.is_some()));
         let batch_route = crate::engine::executor::select::vec_bridge::should_route_result_to_batch(
             &physical,
             &semantic_select.projection,
@@ -1268,11 +1272,13 @@ impl CompiledSelectPlan {
             })
         });
         struct ExecutionShape {
+            selects: usize,
             limits: SmallVec<[usize; 2]>,
             sampling: bool,
         }
         impl crate::parser::visit::AstVisitor for ExecutionShape {
             fn enter_select(&mut self, select: &Select) {
+                self.selects += 1;
                 for value in [select.limit.as_ref(), select.offset.as_ref()] {
                     if let Some(
                         crate::parser::LimitValue::Placeholder(index)
@@ -1290,6 +1296,7 @@ impl CompiledSelectPlan {
             }
         }
         let mut shape = ExecutionShape {
+            selects: 0,
             limits: SmallVec::new(),
             sampling: false,
         };
@@ -1314,7 +1321,17 @@ impl CompiledSelectPlan {
                 }
             }
         });
+        let executable = Arc::new(CompiledOperator::compile(&physical, &semantic_select));
+        // A residual-free complete unique probe never relies on a sibling
+        // partial index's membership proof. Retain its normal late-bound
+        // cache without weakening guards for partial or nested access paths.
+        let complete_point = shape.selects == 1
+            && !runtime_scalar_candidate
+            && matches!(executable.as_ref(), CompiledOperator::ProjectedUniquePointLookup(point)
+                if point.index.predicate.is_none());
+        let replan_partial_indexes = replan_partial_indexes && !complete_point;
         Self {
+            replan_partial_indexes,
             zone_pruning_deps,
             execution_class: SelectExecutionClass::from_select(&semantic_select),
             batch_route,
@@ -1324,7 +1341,7 @@ impl CompiledSelectPlan {
                 )
                 .ok(),
             column_output_layout: OnceLock::new(),
-            executable: Arc::new(CompiledOperator::compile(&physical, &semantic_select)),
+            executable,
             compact_range: crate::engine::executor::select::simple::compile_compact_range_recipe(
                 &semantic_select,
                 &physical,
@@ -1587,6 +1604,11 @@ impl PlanCache {
             object_deps,
             self.epoch.current(),
         );
+        // Eligibility can depend on concrete parameter values. Keep semantic
+        // prepared templates, but never share a value-dependent physical proof.
+        if entry.replan_partial_indexes {
+            return Arc::new(entry);
+        }
         let mut estimate = AstBytes::default();
         crate::parser::visit::visit_select(&mut estimate, &entry.semantic_select);
         let mut nodes = 0u64;

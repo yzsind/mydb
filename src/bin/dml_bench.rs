@@ -282,6 +282,7 @@ fn col_varchar(name: &str, len: u32) -> ColumnDef {
 fn sec_index(name: &str, cols: &[&str]) -> IndexDef {
     let n = cols.len();
     IndexDef {
+        predicate: None,
         name: Some(name.into()),
         columns: cols.iter().map(|s| s.to_string()).collect(),
         column_prefix_lengths: Vec::new(),

@@ -2,10 +2,10 @@
 //!
 //! The per-(token, doc) `tf` / document length `|D|` / positions are all encoded by
 //! [`super::payload::FtPayload`] into the second `Bytes` segment of the inverted key, so BM25 scoring
-//! **reads straight from the inverted posting — zero row lookups, zero re-tokenization**. `df` comes
-//! from the deduplicated count over the token's inverted range; `N` is estimated as the catalog's live
-//! row count, floored to `max(df, candidates.len(), 1)` to keep IDF positive; `avgdl` approximates to
-//! the mean of known doc_len in the **candidate set** (exact whole-store doc_len needs a full heap scan; the MySQL-style approximation is the chosen tradeoff).
+//! reads term frequency and document length directly from postings. Document
+//! frequency, document count and average length come from the shared visible-
+//! corpus statistics provider, independently of candidate filtering. Its bounded
+//! snapshot cache retains counts; cold statistics require a streaming heap scan.
 //!
 //! Formula (Lucene-style BM25; not a promise of MySQL score equality):
 //! ```text

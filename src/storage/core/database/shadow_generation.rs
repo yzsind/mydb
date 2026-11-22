@@ -73,6 +73,8 @@ pub(crate) struct ShadowGenerationBuilder {
 #[derive(Clone)]
 pub(crate) struct ShadowHeapAppender {
     db: Arc<Database>,
+    fulltext_table: Option<Arc<TableSchema>>,
+    txn_id: u64,
     shadow_id: u64,
     build_lsn: u64,
     order: Arc<(Mutex<ShadowAppendOrder>, Condvar)>,
@@ -374,6 +376,8 @@ impl ShadowGenerationBuilder {
     pub(crate) fn heap_appender(&self) -> ShadowHeapAppender {
         ShadowHeapAppender {
             db: Arc::clone(&self.db),
+            fulltext_table: self.live_table.indexes.iter().any(|index| index.is_fulltext()).then(|| self.live_table.clone()),
+            txn_id: self.txn_id,
             shadow_id: self.shadow_table.id,
             build_lsn: self.build_lsn,
             order: Arc::new((
@@ -530,6 +534,10 @@ impl ShadowHeapAppender {
         if payloads.is_empty() {
             return Ok(Vec::new());
         }
+        let fulltext_rows = self.fulltext_table.as_ref().map(|table| {
+            payloads.iter().map(|payload| decode_row_schema_ext_for_layout(payload,
+                &table.row_codec, table.row_codec.active_layout_id, false)).collect::<Result<Vec<_>, _>>()
+        }).transpose()?;
         let refs = payloads.iter().map(Vec::as_slice).collect::<Vec<_>>();
         let scratch = refs
             .capacity()
@@ -569,6 +577,12 @@ impl ShadowHeapAppender {
             let first_page_id = self.db.with_heap_read(self.shadow_id, |heap| {
                 heap.reserve_prepared_shadow_batch_direct(&mut prepared)
             })?;
+            // One statement's parallel appenders share a transaction shard.
+            // Keep its counter RMW inside the ordered writer lane as well.
+            if let (Some(table), Some(rows)) = (&self.fulltext_table, &fulltext_rows) {
+                self.db.maintain_fulltext_statistics(self.txn_id, table, table.id,
+                    rows.iter().map(|row| (None, Some(row.as_slice()))))?;
+            }
             state.next_batch = state.next_batch.saturating_add(1);
             ready.notify_all();
             first_page_id

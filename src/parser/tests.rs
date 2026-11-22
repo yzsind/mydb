@@ -6288,7 +6288,6 @@ fn ddl_parallel_hint_diagnostics_and_ordinary_comments_are_preserved() {
 fn create_index_and_show_fields_are_never_silently_dropped() {
     for sql in [
         "CREATE INDEX IF NOT EXISTS ix ON t(a)",
-        "CREATE INDEX ix ON t(a) WHERE a > 0",
         "CREATE INDEX ix ON t(a) NULLS NOT DISTINCT",
         "SHOW TERSE DATABASES",
     ] {
@@ -7324,5 +7323,45 @@ fn show_audit_unsupported_statement_identifies_show() {
             Statement::Unsupported { kind, .. } if kind == "SHOW statement"),
             "{sql}"
         );
+    }
+}
+
+#[test]
+fn partial_index_where_is_bound_to_its_own_definition() {
+    let Statement::CreateIndex(index) =
+        parse_statement("CREATE INDEX pi ON t(k) INCLUDE(v) WHERE active=1").unwrap()
+    else {
+        panic!("expected CREATE INDEX")
+    };
+    assert!(index.predicate.as_ref().unwrap().contains("active"));
+    let Statement::CreateTable(table) = parse_statement("CREATE TABLE t(k INT,v TEXT,active INT,KEY first(k) INCLUDE(v) WHERE active IN(1,2),KEY second(k) WHERE CONCAT(v,',WHERE')='x,WHERE',KEY ordinary(active))").unwrap() else { panic!("expected CREATE TABLE") };
+    assert!(table.indexes[0].predicate.is_some());
+    assert_eq!(table.indexes[0].included_columns, vec!["v".to_string()]);
+    assert!(table.indexes[1].predicate.is_some());
+    assert!(table.indexes[2].predicate.is_none());
+    let Statement::AlterTable(alter) = parse_statement("ALTER TABLE t ADD INDEX first(k) /* WHERE fake */ WHERE active=1, ADD INDEX second(k) WHERE active=2").unwrap() else { panic!("expected ALTER") };
+    assert_eq!(alter.actions.len(), 2);
+    for action in alter.actions {
+        let AlterAction::AddIndex(index) = action else {
+            panic!("expected index")
+        };
+        assert!(index.predicate.is_some());
+    }
+    assert!(parse_statement("CREATE TABLE t(k INT,PRIMARY KEY(k) WHERE k>0)").is_err());
+    assert!(parse_statement("ALTER TABLE t ADD INDEX x(k) WHERE").is_err());
+}
+
+#[test]
+fn partial_index_standalone_where_follows_index_options() {
+    for sql in [
+        "CREATE INDEX vi ON t(v) USING HNSW WITH(metric=l2,m=4) WHERE flag=1",
+        "CREATE INDEX ii ON t(v) USING IVF WITH(metric=l2,nlist=1) WHERE flag=1",
+        "CREATE FULLTEXT INDEX ft ON t(body) WITH PARSER ngram WHERE flag=1",
+        "CREATE INDEX ix ON t(k) INCLUDE(v) COMMENT 'WHERE ignored' INVISIBLE WHERE flag IN(1,2);",
+    ] {
+        let Statement::CreateIndex(index) = parse_statement(sql).unwrap() else {
+            panic!("expected index: {sql}")
+        };
+        assert!(index.predicate.is_some(), "{sql}");
     }
 }
