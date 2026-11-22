@@ -566,9 +566,8 @@ struct IndexRepairEpoch {
 /// Bounded, conservative index-local emptiness proofs. Hash collisions only
 /// force an extra repair lookup; they never hide a repair. Both registration
 /// and removal advance the version, including empty -> nonempty -> empty.
-/// Registry shards mutate these concurrently, so every change is an atomic
-/// read-modify-write: the key count moves first, then the version is
-/// recomputed from the count it observes.
+/// Registry shards mutate these concurrently. Each publication changes the
+/// key count atomically, then recomputes the version from the count it observes.
 #[derive(Debug)]
 pub(crate) struct IndexRepairEpochs([IndexRepairEpoch; INDEX_REPAIR_SCOPES]);
 
@@ -601,30 +600,34 @@ impl IndexRepairEpochs {
 
     /// See [`IndexRepairEpoch::rollbacks`].
     pub(crate) fn rollback_epoch(&self, table_id: u64, index_name: &str) -> u64 {
-        self.0[Self::scope(table_id, index_name)]
-            .rollbacks
+        self.rollback_version(table_id, index_name)
             .load(Ordering::Acquire)
     }
 
-    fn note_rollback(&self, key: &IndexRepairKey) {
-        self.0[Self::scope(key.table_id, &key.index_name)]
-            .rollbacks
-            .fetch_add(1, Ordering::AcqRel);
+    pub(crate) fn rollback_version(&self, table_id: u64, index_name: &str) -> &AtomicU64 {
+        &self.0[Self::scope(table_id, index_name)].rollbacks
     }
 
-    fn publish(&self, key: &IndexRepairKey, key_delta: i8) {
-        let epoch = &self.0[Self::scope(key.table_id, &key.index_name)];
-        match key_delta {
-            1 => {
-                epoch.keys.fetch_add(1, Ordering::AcqRel);
-            }
-            -1 => {
-                let previous = epoch.keys.fetch_sub(1, Ordering::AcqRel);
-                assert!(previous > 0, "index repair scope underflow");
-            }
-            _ => {}
+    fn publish_registration(&self, key: &IndexRepairKey, new_key: bool) {
+        let epoch = self.for_key(key);
+        if new_key {
+            epoch.keys.fetch_add(1, Ordering::AcqRel);
         }
         advance_repair_version(&epoch.version, &epoch.keys);
+    }
+
+    fn for_key(&self, key: &IndexRepairKey) -> &IndexRepairEpoch {
+        &self.0[Self::scope(key.table_id, &key.index_name)]
+    }
+}
+
+impl IndexRepairEpoch {
+    fn publish_removals(&self, count: usize) {
+        if count != 0 {
+            let previous = self.keys.fetch_sub(count, Ordering::AcqRel);
+            assert!(previous >= count, "index repair scope underflow");
+        }
+        advance_repair_version(&self.version, &self.keys);
     }
 }
 
@@ -652,11 +655,25 @@ pub(crate) struct NamedSavepoint {
 
 const INDEX_REPAIR_ENTRY_SHARDS: usize = 64;
 const INDEX_REPAIR_LOG_SHARDS: usize = 64;
+const INDEX_REPAIR_CLEAR_BATCH_SIZE: usize = 1024;
+
+#[cfg(test)]
+pub(crate) mod index_repair_cleanup_test_hook {
+    use std::cell::RefCell;
+
+    thread_local! {
+        pub(crate) static AFTER_BATCH: RefCell<Option<Box<dyn FnMut(u64)>>> =
+            const { RefCell::new(None) };
+        pub(crate) static AFTER_POINT_PROBE: RefCell<Option<Box<dyn FnOnce()>>> =
+            const { RefCell::new(None) };
+    }
+}
 
 type IndexRepairEntryMap = BTreeMap<IndexRepairKey, Vec<IndexRepairEntry>>;
 /// Registered retirements of one row in one index, `(seq, writer)` in
 /// registration order.
-type IndexRepairRowMap = HashMap<(u64, String, RowId), smallvec::SmallVec<[(u64, u64); 2]>>;
+type IndexRepairRowMap =
+    hashbrown::HashMap<(u64, String, RowId), SmallVec<[(u64, u64); 2]>, ahash::RandomState>;
 
 /// Old-key visibility repairs. A writer publishes here before removing a
 /// physical index entry; slot publication remains separate.
@@ -682,7 +699,7 @@ pub(crate) struct IndexRepairState {
     /// Distinct retired keys across all entry shards; drives the global
     /// version's non-empty bit.
     keys: AtomicUsize,
-    /// Writers that currently own a non-empty registration log.
+    /// Writers with registered repairs, including detached logs being drained.
     writers: AtomicUsize,
     next_seq: AtomicU64,
 }
@@ -697,7 +714,7 @@ impl Default for IndexRepairState {
                 .map(|_| CachePadded::new(parking_lot::Mutex::new(HashMap::new())))
                 .collect(),
             row_shards: (0..INDEX_REPAIR_ENTRY_SHARDS)
-                .map(|_| CachePadded::new(parking_lot::Mutex::new(HashMap::new())))
+                .map(|_| CachePadded::new(parking_lot::Mutex::new(IndexRepairRowMap::default())))
                 .collect(),
             keys: AtomicUsize::new(0),
             writers: AtomicUsize::new(0),
@@ -758,11 +775,22 @@ impl IndexRepairState {
 
     fn remove_row_retirement(&self, key: &IndexRepairKey, row_id: RowId, seq: u64) {
         let mut rows = self.row_shard(row_id).lock();
-        let row_key = (key.table_id, key.index_name.clone(), row_id);
-        if let Some(chain) = rows.get_mut(&row_key) {
-            chain.retain(|entry| entry.0 != seq);
+        // The borrowed name hashes the same way as the stored String.
+        let row_key = (key.table_id, key.index_name.as_str(), row_id);
+        let hash = rows.hasher().hash_one(row_key);
+        if let hashbrown::hash_map::RawEntryMut::Occupied(mut entry) =
+            rows.raw_entry_mut().from_hash(hash, |(table, name, row)| {
+                (*table, name.as_str(), *row) == row_key
+            })
+        {
+            let chain = entry.get_mut();
+            if chain.last().is_some_and(|entry| entry.0 == seq) {
+                chain.pop();
+            } else {
+                chain.retain(|entry| entry.0 != seq);
+            }
             if chain.is_empty() {
-                rows.remove(&row_key);
+                entry.remove();
             }
         }
     }
@@ -851,7 +879,7 @@ impl IndexRepairState {
             }
             // Publish while the shard lease is held so an optimistic reader
             // that misses this entry is guaranteed to see the version move.
-            epochs.publish(&key, i8::from(new_key));
+            epochs.publish_registration(&key, new_key);
             advance_repair_version(version, &self.keys);
             drop(shard);
             log.push(IndexRepairLogEntry { key, seq });
@@ -882,7 +910,11 @@ impl IndexRepairState {
         let Some(log) = logs.get_mut(&txn_id) else {
             return;
         };
-        let removed = log.split_off(len.min(log.len()));
+        let removed = if len == 0 {
+            std::mem::take(log)
+        } else {
+            log.split_off(len.min(log.len()))
+        };
         if let Some(head) = head {
             head.set_index_repair_log_len(log.len());
         }
@@ -890,29 +922,146 @@ impl IndexRepairState {
             logs.remove(&txn_id);
             self.writers.fetch_sub(1, Ordering::AcqRel);
         }
-        for entry in removed.into_iter().rev() {
+        self.remove_logged_repairs(txn_id, removed, epochs, version, rollback);
+    }
+
+    fn remove_logged_repairs(
+        &self,
+        txn_id: u64,
+        removed: Vec<IndexRepairLogEntry>,
+        epochs: &IndexRepairEpochs,
+        version: &AtomicU64,
+        rollback: bool,
+    ) {
+        for IndexRepairLogEntry { key, seq } in removed.into_iter().rev() {
+            let epoch = epochs.for_key(&key);
             if rollback {
-                epochs.note_rollback(&entry.key);
+                epoch.rollbacks.fetch_add(1, Ordering::AcqRel);
             }
-            let mut shard = self.entry_shard(&entry.key).write();
-            let remove_key = if let Some(entries) = shard.get_mut(&entry.key) {
-                entries.retain(|repair| {
-                    let keep = repair.txn_id != txn_id || repair.seq != entry.seq;
-                    if !keep {
-                        self.remove_row_retirement(&entry.key, repair.row_id, repair.seq);
-                    }
-                    keep
-                });
-                entries.is_empty()
-            } else {
-                false
-            };
-            if remove_key {
-                shard.remove(&entry.key);
+            let mut shard = self.entry_shard(&key).write();
+            let removed_key = self.remove_entry(&mut shard, txn_id, key, seq);
+            if removed_key {
                 self.keys.fetch_sub(1, Ordering::AcqRel);
             }
-            epochs.publish(&entry.key, if remove_key { -1 } else { 0 });
+            epoch.publish_removals(usize::from(removed_key));
             advance_repair_version(version, &self.keys);
+        }
+    }
+
+    fn remove_entry(
+        &self,
+        shard: &mut IndexRepairEntryMap,
+        txn_id: u64,
+        key: IndexRepairKey,
+        seq: u64,
+    ) -> bool {
+        let std::collections::btree_map::Entry::Occupied(mut bucket) = shard.entry(key) else {
+            return false;
+        };
+        let entries = bucket.get_mut();
+        // Registration assigns seq and appends while holding this shard.
+        // Removals preserve that order, including across writers.
+        let removed = if entries.last().is_some_and(|entry| entry.seq == seq) {
+            entries.pop()
+        } else {
+            entries
+                .binary_search_by_key(&seq, |entry| entry.seq)
+                .ok()
+                .map(|pos| entries.remove(pos))
+        };
+        if let Some(repair) = removed {
+            debug_assert_eq!(repair.txn_id, txn_id);
+            self.remove_row_retirement(bucket.key(), repair.row_id, seq);
+        }
+        if bucket.get().is_empty() {
+            bucket.remove();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Clear a finishing writer after physical compensation and before
+    /// publishing its terminal status. The caller serializes this transaction
+    /// and retains its row locks, so no new registration can follow detachment.
+    /// The directory stays unlocked, and each scope's rollback epoch advances
+    /// before its first removal under the shard lease.
+    pub(crate) fn clear_rolled_back(
+        &self,
+        txn_id: u64,
+        head: &UndoHead,
+        epochs: &IndexRepairEpochs,
+        version: &AtomicU64,
+    ) {
+        if head.index_repair_log_len() == 0 {
+            return;
+        }
+        let Some(mut removed) = self.log_shard(txn_id).lock().remove(&txn_id) else {
+            return;
+        };
+        // Short OLTP transactions avoid allocating shard buckets.
+        if removed.len() < 32 {
+            self.remove_logged_repairs(txn_id, removed, epochs, version, true);
+        } else {
+            self.clear_rolled_back_shards(txn_id, &mut removed, epochs, version);
+        }
+        head.set_index_repair_log_len(0);
+        self.writers.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn clear_rolled_back_shards(
+        &self,
+        txn_id: u64,
+        removed: &mut Vec<IndexRepairLogEntry>,
+        epochs: &IndexRepairEpochs,
+        version: &AtomicU64,
+    ) {
+        let mut shards: [Vec<IndexRepairLogEntry>; INDEX_REPAIR_ENTRY_SHARDS] =
+            std::array::from_fn(|_| Vec::new());
+        while !removed.is_empty() {
+            let start = removed.len().saturating_sub(INDEX_REPAIR_CLEAR_BATCH_SIZE);
+            let mut active_shards = 0_u64;
+            for entry in removed.drain(start..).rev() {
+                let shard = Self::entry_shard_of(&entry.key);
+                active_shards |= 1 << shard;
+                shards[shard].push(entry);
+            }
+            while active_shards != 0 {
+                let shard = active_shards.trailing_zeros() as usize;
+                active_shards &= active_shards - 1;
+                let mut map = self.entry_shards[shard].write();
+                let mut removals = [0_u16; INDEX_REPAIR_SCOPES];
+                let mut touched_scopes = 0_u128;
+                let mut total_removed = 0;
+                for IndexRepairLogEntry { key, seq } in shards[shard].drain(..) {
+                    let scope = IndexRepairEpochs::scope(key.table_id, &key.index_name);
+                    let bit = 1_u128 << scope;
+                    if touched_scopes & bit == 0 {
+                        epochs.0[scope].rollbacks.fetch_add(1, Ordering::AcqRel);
+                        touched_scopes |= bit;
+                    }
+                    if self.remove_entry(&mut map, txn_id, key, seq) {
+                        removals[scope] += 1;
+                        total_removed += 1;
+                    }
+                }
+                // Publish while the shard is still locked, so a reader
+                // missing a removal cannot validate the old version.
+                while touched_scopes != 0 {
+                    let scope = touched_scopes.trailing_zeros() as usize;
+                    touched_scopes &= touched_scopes - 1;
+                    epochs.0[scope].publish_removals(usize::from(removals[scope]));
+                }
+                self.keys.fetch_sub(total_removed, Ordering::AcqRel);
+                advance_repair_version(version, &self.keys);
+                drop(map);
+                #[cfg(test)]
+                index_repair_cleanup_test_hook::AFTER_BATCH.with(|hook| {
+                    if let Some(hook) = hook.borrow_mut().as_mut() {
+                        hook(txn_id);
+                    }
+                });
+            }
         }
     }
 
@@ -3991,6 +4140,15 @@ impl TransactionManager {
     /// lock and then calls `LockManager::unlock_txn` (lock order
     /// `txns` → `lock_manager`).
     pub(crate) fn rollback(&mut self, txn_id: u64) -> Result<(), QueryError> {
+        self.publish_rollback(txn_id)?;
+        self.clear_index_repairs(txn_id);
+        Ok(())
+    }
+
+    /// Publish the terminal slot after all physical restores. Runtime
+    /// rollback has already cleared repairs outside the directory. Startup
+    /// may use `rollback` while it still has exclusive access to the database.
+    pub(crate) fn publish_rollback(&mut self, txn_id: u64) -> Result<(), QueryError> {
         let slot = self.slots.get_mut(&txn_id).ok_or_else(|| {
             error(
                 crate::error::catalog::ER_WARNING_NOT_COMPLETE_ROLLBACK,
@@ -4009,7 +4167,6 @@ impl TransactionManager {
         slot.status = TxnStatus::RolledBack;
         slot.rollback_fence_scn = Some(self.commit_frontier);
         self.advance_oldest_write_capable_after_finish(txn_id);
-        self.clear_index_repairs(txn_id);
         self.named_savepoints.remove(&txn_id);
         Ok(())
     }

@@ -1663,6 +1663,9 @@ pub(super) fn execute_delete(
         crate::engine::expr::validate_expr_temporal_literals(selection, &table)?;
         crate::engine::expr::validate_dml_temporal_functions(selection)?;
     }
+    if let Some(response) = execute_ordered_index_delete(db, txn, &stmt, &table)? {
+        return Ok(response);
+    }
     let ordered_limited_candidates = ordered_limited_dml_candidates(
         db,
         txn,
@@ -1824,6 +1827,9 @@ pub(super) fn execute_delete_borrowed_simple(
         crate::engine::expr::validate_expr_temporal_literals(selection, &table)?;
         crate::engine::expr::validate_dml_temporal_functions(selection)?;
     }
+    if let Some(response) = execute_ordered_index_delete(db, txn, stmt, &table)? {
+        return Ok(Some(response));
+    }
     let compiled_selection = stmt
         .selection
         .as_ref()
@@ -1910,6 +1916,87 @@ pub(super) fn execute_delete_borrowed_simple(
         row_matches(values)
     })? as u64;
     Ok(Some(QueryResponse::OkAffected { affected_rows }))
+}
+
+/// Walk an index-covered ORDER BY until LIMIT rows have actually been deleted.
+/// Keep predicates, row callbacks and partition routing on their existing
+/// paths: they can affect evaluation order or modify later candidates.
+fn execute_ordered_index_delete(
+    db: &Arc<Database>,
+    txn: TxnView,
+    stmt: &Delete,
+    table: &TableSchema,
+) -> Result<Option<QueryResponse>, QueryError> {
+    if stmt.limit.is_none()
+        || stmt.order_by.is_empty()
+        || stmt.selection.is_some()
+        || stmt.ignore
+        || stmt.returning.is_some()
+        || table.is_partitioned()
+        || !table.fk_referenced_by.is_empty()
+        || table_has_delete_triggers(db, &stmt.table)
+    {
+        return Ok(None);
+    }
+    let Some(limit) = optional_limit_value(stmt.limit.as_ref())?.filter(|limit| *limit > 0) else {
+        // The ordinary path also validates ORDER BY for LIMIT 0.
+        return Ok(None);
+    };
+    let Some((index, low, high, _)) = plan_ordered_dml_index(table, None, &stmt.order_by) else {
+        return Ok(None);
+    };
+    if !index.index_type.eq_ignore_ascii_case("BTREE")
+        || index.has_expression_parts()
+        || index.has_multi_valued_parts()
+    {
+        return Ok(None);
+    }
+    let null_row = vec![Value::Null; table.columns.len()];
+    for item in &stmt.order_by {
+        eval_expr(&item.expr, table, &null_row)?;
+    }
+    // DELETE is a current read even in an older RR transaction. Merge keys
+    // retired by active writers, but do not suppress a newer committed row
+    // merely because it was inserted after the transaction's read snapshot.
+    let current = TxnView {
+        snapshot_scn: u64::MAX,
+        ..txn
+    };
+    let ascending = stmt.order_by.iter().all(|item| item.asc);
+    let mut forward = ascending
+        .then(|| db.range_index_snapshot_cursor(table, index, low.clone(), high.clone(), current))
+        .transpose()?;
+    let mut reverse = (!ascending)
+        .then(|| db.range_index_snapshot_reverse_cursor(table, index, low, high, current))
+        .transpose()?;
+    let mut affected_rows = 0usize;
+    while affected_rows < limit {
+        crate::engine::cancel::check_cancelled()?;
+        let fetch = (limit - affected_rows).min(1024);
+        let chunk = match (&mut forward, &mut reverse) {
+            (Some(cursor), _) => cursor.next_chunk(fetch)?,
+            (_, Some(cursor)) => cursor.next_chunk(fetch)?,
+            _ => unreachable!("ordered DELETE has one cursor direction"),
+        };
+        if chunk.is_empty() {
+            break;
+        }
+        crate::engine::api::add_statement_dml_candidate_rows(chunk.len() as u64);
+        let mut seen = HashSet::with_capacity(chunk.len());
+        let row_ids = chunk
+            .into_iter()
+            .filter_map(|(_, row_id)| seen.insert(row_id).then_some(row_id))
+            .collect();
+        affected_rows += db.delete_rows(txn, &stmt.table, Some(row_ids), |_| {
+            crate::engine::cancel::check_cancelled()?;
+            Ok(true)
+        })?;
+        // A candidate deleted by another writer does not consume LIMIT.
+        // Refill from the cursor rather than truncating a stale prefix.
+    }
+    Ok(Some(QueryResponse::OkAffected {
+        affected_rows: affected_rows as u64,
+    }))
 }
 
 /// Prepared exact-unique DELETE counterpart to

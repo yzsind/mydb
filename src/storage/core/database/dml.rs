@@ -648,15 +648,42 @@ impl Database {
     /// Capture the old version's off-page chains into a DELETE undo
     /// record and produce the tombstone values with externalized columns
     /// nulled (DELETE never copies LOB bytes; the pre-image lives in the
-    /// undo `before_external`). Returns `(undo_id, tombstone_values)`.
-    fn prepare_delete_lob(
+    /// undo `before_external`). Header-only deletes borrow the unchanged
+    /// values; full rewrites own the image with external columns nulled.
+    fn prepare_delete_lob<'a>(
         &self,
         txn_id: u64,
         storage_id: u64,
         row_id: RowId,
         old_header: RowHeader,
-        current_values: &[Value],
-    ) -> Result<(u64, Vec<Value>), QueryError> {
+        current_values: &'a [Value],
+        retain_index_entries: bool,
+        cached_heap: Option<&HeapHandle>,
+    ) -> Result<(u64, std::borrow::Cow<'a, [Value]>, bool), QueryError> {
+        let header_only = match cached_heap {
+            Some(heap) => heap.read().has_reserved_undo_slot(row_id)?,
+            None => self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?,
+        };
+        if header_only {
+            let undo_id = self.push_undo_ext(
+                txn_id,
+                if retain_index_entries {
+                    UndoKind::DeleteHeaderRetained
+                } else {
+                    UndoKind::DeleteHeader
+                },
+                storage_id,
+                row_id,
+                Some(old_header),
+                None,
+                Vec::new(),
+            )?;
+            return Ok((
+                undo_id,
+                std::borrow::Cow::Borrowed(current_values),
+                retain_index_entries,
+            ));
+        }
         let before_external = self.read_row_external_refs(storage_id, row_id)?;
         let mut tombstone = current_values.to_vec();
         for (i, _) in &before_external {
@@ -664,22 +691,16 @@ impl Database {
                 *slot = Value::Null;
             }
         }
-        let header_only = before_external.is_empty()
-            && self.with_heap_read(storage_id, |heap| heap.has_reserved_undo_slot(row_id))?;
         let undo_id = self.push_undo_ext(
             txn_id,
-            if header_only {
-                UndoKind::DeleteHeader
-            } else {
-                UndoKind::Delete
-            },
+            UndoKind::Delete,
             storage_id,
             row_id,
             Some(old_header),
-            (!header_only).then(|| tombstone.clone()),
+            Some(tombstone.clone()),
             before_external,
         )?;
-        Ok((undo_id, tombstone))
+        Ok((undo_id, std::borrow::Cow::Owned(tombstone), false))
     }
 
     /// Externalize each row's over-threshold LOB columns, then run the
@@ -2636,7 +2657,13 @@ impl Database {
             return Ok(count);
         }
         self.acquire_table_write_binding(txn.txn_id, &table)?;
-        let rows = self.dml_candidate_rows(&table, txn, candidates)?;
+        let delete_heap = self.heap_handle(table.id)?;
+        let rows = match candidates {
+            Some(row_ids) => {
+                self.dml_candidate_rows_from_heap(&table, txn, &delete_heap, row_ids)?
+            }
+            None => self.dml_candidate_rows(&table, txn, None)?,
+        };
         let mut deletes = Vec::new();
         for row in rows {
             let _rowid_scope = crate::storage::rowid::RowScope::enter(
@@ -2653,7 +2680,8 @@ impl Database {
             if txn.txn_id != 0 {
                 self.lock_rows_nonblocking(txn.txn_id, table.id, std::iter::once(row.row_id))?;
             }
-            let Some(mut current) = self.read_mvcc_row(table.id, row.row_id)? else {
+            let Some(mut current) = Self::read_mvcc_row_with_handle(&delete_heap, row.row_id)?
+            else {
                 continue;
             };
             self.check_dml_write_allowed(txn, table.id, &current)?;
@@ -2676,25 +2704,44 @@ impl Database {
                 row_id: row.row_id,
                 header: current.header,
                 values: current.values,
+                retain_index_entries: false,
             });
         }
-        self.lock_delete_rows(txn.txn_id, &table, &deletes)?;
-        let mut heap_writes = Vec::with_capacity(deletes.len());
-        for chunk in deletes.chunks(256) {
+        self.lock_delete_unique_keys(txn.txn_id, &table, &deletes)?;
+        let mut heap_writes = Vec::with_capacity(deletes.len().min(256));
+        let mut vector_undo_ids =
+            table_has_deferred_ann_indexes(&table).then(|| Vec::with_capacity(deletes.len()));
+        let retain_index_entries = !is_temp_table_id(table.id)
+            && txn.txn_id != 0
+            && current_redo_enabled()
+            && table.indexes.iter().any(index_supports_delete_mark);
+        let flush_chunk_wal = deletes.len() > 256;
+        for chunk in deletes.chunks_mut(256) {
             crate::engine::cancel::check_cancelled()?;
-            let start = heap_writes.len();
+            heap_writes.clear();
             for delete in chunk {
-                let (undo_id, tombstone) = self.prepare_delete_lob(
+                let (undo_id, tombstone, retained) = self.prepare_delete_lob(
                     txn.txn_id,
                     table.id,
                     delete.row_id,
                     delete.header,
                     &delete.values,
+                    retain_index_entries,
+                    Some(&delete_heap),
                 )?;
+                delete.retain_index_entries = retained;
+                if let Some(ids) = &mut vector_undo_ids {
+                    ids.push(undo_id);
+                }
                 heap_writes.push(HeapWrite {
                     row_id: delete.row_id,
                     header: RowHeader {
-                        flags: MVCC_FLAG_DELETED,
+                        flags: MVCC_FLAG_DELETED
+                            | if retained {
+                                MVCC_FLAG_RETAINED_INDEX_KEYS
+                            } else {
+                                0
+                            },
                         last_txn_id: txn.txn_id,
                         undo_ptr: Some(undo_id),
                     },
@@ -2702,8 +2749,15 @@ impl Database {
                     external: Vec::new(),
                 });
             }
-            self.write_heap_rows(txn.txn_id, table.id, &heap_writes[start..])?;
+            self.write_heap_rows(txn.txn_id, table.id, &heap_writes)?;
+            // Bound deferred page pins throughout a large DELETE, as for
+            // batched INSERT. Otherwise the reservation fills and the rest
+            // of the statement falls back to individual WAL appends.
+            if flush_chunk_wal {
+                self.maybe_flush_txn_wal_buffer(txn.txn_id)?;
+            }
         }
+        drop(heap_writes);
         crate::engine::cancel::check_cancelled()?;
         let deleted_row_ids = deletes
             .iter()
@@ -2711,12 +2765,16 @@ impl Database {
             .collect::<Vec<_>>();
         self.note_zone_map_deletes(txn.txn_id, table.id, &deleted_row_ids)?;
         self.delete_index_batches_deferred(txn.txn_id, &table, &deletes)?;
+        self.maintain_fulltext_statistics(
+            txn.txn_id,
+            &table,
+            table.id,
+            deletes.iter().map(|delete| (Some(delete.values.as_slice()), None)),
+        )?;
         // Graph tombstones are commit-deferred: unlike the heap/index paths
         // they have no MVCC undo, so applying one here would survive ROLLBACK.
-        self.maintain_fulltext_statistics(txn.txn_id, &table, table.id,
-            deletes.iter().map(|delete| (Some(delete.values.as_slice()), None)))?;
-        for (delete, write) in deletes.iter().zip(&heap_writes) {
-            if let Some(undo_id) = write.header.undo_ptr {
+        if let Some(undo_ids) = vector_undo_ids {
+            for (delete, undo_id) in deletes.iter().zip(undo_ids) {
                 self.defer_vector_delete(
                     txn.txn_id,
                     undo_id,
@@ -4630,12 +4688,14 @@ impl Database {
         let current = self
             .read_mvcc_row(storage_id, row_id)?
             .ok_or_else(|| error(crate::error::catalog::ER_KEY_NOT_FOUND, "row not found"))?;
-        let (undo_id, tombstone) = self.prepare_delete_lob(
+        let (undo_id, tombstone, _) = self.prepare_delete_lob(
             txn.txn_id,
             storage_id,
             row_id,
             current.header,
             &current.values,
+            false,
+            None,
         )?;
         self.with_heap_mut(storage_id, |heap| {
             heap.write_mvcc(

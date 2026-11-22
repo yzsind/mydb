@@ -694,6 +694,7 @@ impl Database {
             undo.concurrent_persistent_append_eligibility_handle();
         // Admit fixed metadata before starting background workers, so an OOM
         // during startup cannot leave an unattached worker pool running.
+        let retained_index_deletes = undo.retained_index_delete_handle();
         let undo = UndoLatch::new(undo)?;
         let mdl = MdlManager::try_new()?;
         let buffer_pool = BufferPool::new_with_options(
@@ -902,6 +903,11 @@ impl Database {
             index_repair_state,
             index_repair_version,
             index_repair_epochs,
+            retained_index_deletes,
+            retained_index_purge_frontier: AtomicU64::new(0),
+            undo_purge_serial: parking_lot::Mutex::new(()),
+            deferred_index_purge_rows: AtomicU64::new(0),
+            deferred_index_purge_us: AtomicU64::new(0),
             min_retained_txn_id: AtomicU64::new(min_retained_txn_id_seed),
             recovered_index_writer_bound,
             index_page_max_trx_shortcut_hits: AtomicU64::new(0),

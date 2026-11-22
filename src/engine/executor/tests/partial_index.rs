@@ -10,6 +10,41 @@ fn rows(engine: &StorageQueryEngine, sql: &str) -> Vec<Vec<Value>> {
 }
 
 #[test]
+fn partial_unique_index_batch_delete_rollback_preserves_membership() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let e = open_test_engine(dir.path());
+    e.execute("CREATE TABLE pi_delete(id INT PRIMARY KEY,k INT,active INT,UNIQUE INDEX pu(k) WHERE active=1,INDEX ps(k) WHERE active=1)").unwrap();
+    e.execute("INSERT INTO pi_delete VALUES(1,7,0),(2,7,NULL),(3,7,1),(4,8,1)")
+        .unwrap();
+    let mut session = SessionContext::default();
+    for boundary in ["ROLLBACK TO keep", "ROLLBACK"] {
+        e.execute_with_session(&mut session, "BEGIN").unwrap();
+        e.execute_with_session(&mut session, "SAVEPOINT keep")
+            .unwrap();
+        e.execute_with_session(&mut session, "DELETE FROM pi_delete")
+            .unwrap();
+        e.execute_with_session(&mut session, boundary).unwrap();
+        assert_physical_members(&e, "pi_delete", "pu");
+        assert_physical_members(&e, "pi_delete", "ps");
+        if session.current_txn.is_some() {
+            e.execute_with_session(&mut session, "COMMIT").unwrap();
+        }
+    }
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT id FROM pi_delete FORCE INDEX(pu) WHERE active=1 AND k=7"
+        ),
+        vec![vec![Value::Int(3)]]
+    );
+    e.execute("UPDATE pi_delete SET active=0 WHERE id=3")
+        .unwrap();
+    e.execute("UPDATE pi_delete SET active=1 WHERE id=1")
+        .unwrap();
+    assert_physical_members(&e, "pi_delete", "pu");
+}
+
+#[test]
 fn partial_index_membership_unique_transitions_and_rollback() {
     let dir = tempfile::tempdir().unwrap();
     let e = open_test_engine(dir.path());
@@ -242,6 +277,20 @@ fn partial_index_physical_members_and_random_dml_match_heap() {
         }
     }
     e.execute("DELETE FROM pi WHERE id%2=0").unwrap();
+    assert_eq!(
+        rows(
+            &e,
+            "SELECT id,k FROM pi FORCE INDEX(pp) WHERE active=1 ORDER BY id"
+        ),
+        rows(
+            &e,
+            "SELECT id,k FROM pi IGNORE INDEX(pp) WHERE active=1 ORDER BY id"
+        )
+    );
+    // DELETE retains secondary keys until undo purge; reads must already
+    // exclude tombstones, and purge must restore exact physical membership.
+    e.db_for_tests().set_undo_retention_ms(0).unwrap();
+    e.db_for_tests().purge_obsolete_undo();
     assert_physical_members(&e, "pi", "pp");
     e.execute("ANALYZE TABLE pi").unwrap();
     assert_physical_members(&e, "pi", "pp");
