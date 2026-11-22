@@ -16,6 +16,7 @@ disabled collector does not prove absence of a problem.
 | Replica behind | SHOW MYDB REPLICA STATUS / SHOW REPLICA STATUS | Inspect error and progress watermarks; do not compare a native LSN to a binlog position |
 | Backup failed | SHOW MYDB BACKUP JOBS; SHOW MYDB BACKUP STATUS | Inspect Error/Phase and archive health, then rehearse recovery |
 | Recycle-bin pressure | SHOW RECYCLEBIN; Mydb_recyclebin counters | Inspect expiration, pressure and cleanup failures; retention is not a backup guarantee |
+| External monitoring | `GET /metrics` with `rest_metrics_enabled=ON` and a `PROCESS` API key | Scrape WAL/checkpoint, buffer-pool, lock, memory, disk and replication series; use rate()/increase() on `_total` counters; see [REST SQL API](rest-api.md#prometheus-metrics) |
 
 ## Ready-to-run snapshots
 

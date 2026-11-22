@@ -159,7 +159,20 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
     let addr = listener.local_addr()?;
     let rest_config = mydb::rest::RestConfig::from_startup()?;
     let mcp_config = mydb::mcp::McpConfig::from_startup()?;
-    let http_enabled = rest_config.enabled || mcp_config.enabled;
+    let http_enabled = rest_config.enabled || rest_config.metrics_enabled || mcp_config.enabled;
+    let http_routes = {
+        let mut routes = Vec::new();
+        if rest_config.enabled {
+            routes.push("SQL");
+        }
+        if mcp_config.enabled {
+            routes.push("MCP");
+        }
+        if rest_config.metrics_enabled {
+            routes.push("metrics");
+        }
+        routes.join("/")
+    };
     let bind_http = |addr, scheme| {
         mydb::mysql::server::bind_listener(addr).map_err(|error| {
             std::io::Error::new(
@@ -315,12 +328,12 @@ async fn async_main(startup: StartupConfig) -> std::io::Result<()> {
             mydb::rest::RestServer::new(rest_config, engine.clone(), registry.clone(), rest_tls)
                 .with_mcp(mcp_config);
         log_message(format_args!(
-            "mydb HTTP SQL/MCP listening on {} ({rest_scheme})",
+            "mydb HTTP {http_routes} listening on {} ({rest_scheme})",
             listener.local_addr()?,
         ));
         if let Some(local) = &loopback_http_listener {
             log_message(format_args!(
-                "mydb HTTP SQL/MCP listening on {} (loopback HTTP)",
+                "mydb HTTP {http_routes} listening on {} (loopback HTTP)",
                 local.local_addr()?,
             ));
         }
@@ -434,6 +447,7 @@ fn print_help() {
          \x20 --mcp-allowed-origins JSON     Exact HTTP origins (default [])\n\
          \nREST SQL server:\n\
          \x20 --rest-enabled ON|OFF          Enable REST SQL (default OFF)\n\
+         \x20 --rest-metrics-enabled ON|OFF  Enable GET /metrics (default OFF)\n\
          \x20 --rest-host IP --rest-port N    REST address (default 127.0.0.1:8739)\n\
          \x20 --rest-tls-mode required|disabled  HTTPS by default; plaintext loopback only\n\
          \x20 --rest-loopback-http-addr IP:PORT  Optional loopback HTTP endpoint alongside HTTPS\n\

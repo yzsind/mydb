@@ -49,14 +49,16 @@ The shared REST SQL/MCP listener is disabled by default and shares the SQL engin
 account resource limits with MySQL. See [REST SQL API](rest-api.md) for
 credentials, full key retrieval, transactions, result formats and recovery.
 All options below also support CLI `--rest-...` and `MYDB_REST_*` variables.
-The listener starts when either `rest_enabled` or `mcp_enabled` is ON; REST
-and MCP routes are enabled independently. The `rest_*` listener, TLS, SQL
-session and memory settings below apply to both protocols. See [MCP Server](mcp.md)
+The listener starts when `rest_enabled`, `mcp_enabled`, or
+`rest_metrics_enabled` is ON; REST, MCP and Prometheus routes are enabled
+independently. The `rest_*` listener, TLS, SQL
+session and memory settings below apply to all three routes. See [MCP Server](mcp.md)
 for the `/mcp` endpoint, authentication and `mcp_*` limits.
 
 | Option | Default |
 | --- | --- |
 | `rest_enabled` | `OFF` |
+| `rest_metrics_enabled` | `OFF`; enables authenticated `GET /metrics` on the shared listener |
 | `rest_host`, `rest_port` | `127.0.0.1`, `8739` |
 | `rest_tls_mode` | `required`; `disabled` requires loopback |
 | `rest_loopback_http_addr` | Unset; optional loopback HTTP address with `rest_tls_mode=required` |

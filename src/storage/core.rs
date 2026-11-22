@@ -1297,6 +1297,11 @@ pub struct Database {
     /// retained history (in-flight txn undo chains, replication slots)
     /// must not re-trigger a checkpoint that cannot shrink it anyway.
     wal_bytes_after_last_checkpoint_atomic: AtomicU64,
+    /// WAL bytes right after the last SUCCESSFUL checkpoint. Failure-driven
+    /// trigger backoff is recorded separately in
+    /// `wal_bytes_after_last_checkpoint_atomic`; observability must not
+    /// report a cleared backlog when no checkpoint completed.
+    wal_bytes_after_last_successful_checkpoint_atomic: AtomicU64,
     /// Backpressure for automatic size-triggered checkpoints. A workload
     /// that emits many first-update-after-checkpoint page images can cross
     /// `checkpoint_wal_bytes` repeatedly within a few seconds; this mirror

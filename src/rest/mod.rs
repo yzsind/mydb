@@ -1,5 +1,6 @@
 //! HTTP SQL transport sharing the database engine and SQL session lifecycle.
 pub mod config;
+mod metrics;
 use crate::engine::{
     api::{QueryEngine, SessionContext},
     session_registry::SessionRegistry,
@@ -50,6 +51,9 @@ impl<E: QueryEngine> RestServer<E> {
         let mut router = Router::new()
             .route("/health/live", get(endpoint::<E>))
             .route("/health/ready", get(endpoint::<E>));
+        if self.state.config.metrics_enabled {
+            router = router.route("/metrics", get(endpoint::<E>));
+        }
         if self.state.config.enabled {
             router = router
                 .route("/api/v1/status", get(endpoint::<E>))
@@ -350,6 +354,9 @@ async fn endpoint<E: QueryEngine>(
         ));
     }
     let identity = runtime::authenticate(&state, request.headers(), peer)?;
+    if path == "/metrics" {
+        return metrics_response(state, identity).await;
+    }
     if path == "/api/v1/status" {
         let mut ctx = SessionContext::default();
         ctx.authenticated_as = identity.outcome.context.authenticated_as;
@@ -418,6 +425,67 @@ async fn endpoint<E: QueryEngine>(
         return Ok(response);
     }
     sql(state, request, identity, None).await
+}
+async fn metrics_response<E: QueryEngine>(
+    state: Arc<runtime::State<E>>,
+    identity: Identity,
+) -> Result<Response> {
+    let mut ctx = SessionContext::default();
+    ctx.authenticated_as = identity.outcome.context.authenticated_as;
+    ctx.active_roles = identity.outcome.context.active_roles;
+    state
+        .engine
+        .authorize_global_privilege(&ctx, crate::engine::auth::Privilege::Process)?;
+    // Startup configuration rejects plaintext non-loopback listeners. Keep a
+    // per-request check as defense in depth for accepted peers and for future
+    // listener changes.
+    let secure = identity.peer.cipher.is_some()
+        || identity
+            .peer
+            .host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|ip| ip.to_canonical().is_loopback());
+    if !secure {
+        return Err(Failure::new(
+            StatusCode::FORBIDDEN,
+            "INSECURE_METRICS_TRANSPORT",
+            "Metrics require TLS or a loopback peer",
+        ));
+    }
+    let permit = match state.scrape.clone().try_acquire_owned() {
+        Ok(permit) => permit,
+        Err(_) => {
+            let mut response =
+                Failure::unavailable("Metrics scrape capacity exceeded").into_response();
+            response
+                .headers_mut()
+                .insert("retry-after", axum::http::HeaderValue::from_static("1"));
+            return Ok(response);
+        }
+    };
+    let collect_state = state.clone();
+    let shutting_down = crate::mysql::shutdown::is_shutting_down();
+    let body = tokio::task::spawn_blocking(move || {
+        // Hold the permit inside the blocking task. Dropping the handler
+        // future (client disconnect) must not let detached collection work
+        // escape the scrape bound.
+        let _permit = permit;
+        let snapshot = collect_state.engine.metrics_snapshot();
+        let transport = metrics::runtime_metrics(&collect_state);
+        metrics::render(snapshot.as_ref(), &transport, shutting_down)
+    })
+    .await
+    .map_err(|_| Failure::internal("Metrics collection failed"))?;
+    let mut response = (StatusCode::OK, body).into_response();
+    response.headers_mut().insert(
+        axum::http::header::CONTENT_TYPE,
+        axum::http::HeaderValue::from_static("text/plain; version=0.0.4; charset=utf-8"),
+    );
+    response.headers_mut().insert(
+        "x-content-type-options",
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
+    Ok(response)
 }
 pub(crate) fn session_info<E: QueryEngine>(
     session: &runtime::Session<E>,

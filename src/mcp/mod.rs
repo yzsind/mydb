@@ -33,7 +33,7 @@ use std::{
     borrow::Cow,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll},
@@ -62,6 +62,7 @@ struct Lease<E: QueryEngine> {
     supervisor: Mutex<Option<oneshot::Sender<()>>>,
     ready_at: Mutex<Option<Instant>>,
     persistent_created: AtomicBool,
+    sent_bytes: Arc<AtomicU64>,
     connection: Option<crate::rest::ConnectionAbort>,
 }
 const DELIVERY_PENDING: u8 = 0;
@@ -235,6 +236,9 @@ impl<E: QueryEngine> Stream for Delivery<E> {
                 Poll::Ready(None)
             }
             Poll::Ready(Some(Ok(bytes))) => {
+                self.lease
+                    .sent_bytes
+                    .fetch_add(bytes.len() as u64, Ordering::Relaxed);
                 if bytes.windows(9).any(|w| w == b"\"jsonrpc\"") {
                     self.lease.ready_at.lock().get_or_insert_with(Instant::now);
                 }
@@ -367,6 +371,7 @@ async fn admit<E: QueryEngine>(
         supervisor: Mutex::new(None),
         ready_at: Mutex::new((envelope.method.as_deref() != Some("tools/call")).then(Instant::now)),
         persistent_created: AtomicBool::new(false),
+        sent_bytes: state.sql.sent_bytes.clone(),
         connection: head
             .extensions
             .get::<crate::rest::ConnectionAbort>()

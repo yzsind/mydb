@@ -183,6 +183,7 @@ See [interface stability](configuration.md#interface-stability).
 | `rest_max_sessions` | `MYDB_REST_MAX_SESSIONS` | `Integer 1..1073741824` | — | Yes |
 | `rest_max_timeout_ms` | `MYDB_REST_MAX_TIMEOUT_MS` | `Integer 1..1073741824` | — | Yes |
 | `rest_memory_limit_mb` | `MYDB_REST_MEMORY_LIMIT_MB` | `Integer 1..1073741824` | — | Yes |
+| `rest_metrics_enabled` | `MYDB_REST_METRICS_ENABLED` | `ON/OFF` | — | Yes |
 | `rest_port` | `MYDB_REST_PORT` | `Integer 0..65535` | — | Yes |
 | `rest_previous_keys_file` | `MYDB_REST_PREVIOUS_KEYS_FILE` | `Nonempty string` | — | Yes |
 | `rest_session_idle_timeout_ms` | `MYDB_REST_SESSION_IDLE_TIMEOUT_MS` | `Integer 1..1073741824` | — | Yes |
