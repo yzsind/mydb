@@ -1,0 +1,19 @@
+name: Install pinned nextest
+description: Install a verified release binary with a locked source-build fallback
+runs:
+  using: composite
+  steps:
+    - uses: taiki-e/install-action@v2
+      id: prebuilt
+      continue-on-error: true
+      with:
+        tool: cargo-nextest@0.9.151
+    # Release downloads can return HTTP 403 even after retries. Keep the same
+    # version and use crates.io rather than blocking all test partitions.
+    - name: Build nextest if the release download failed
+      if: steps.prebuilt.outcome == 'failure'
+      shell: bash
+      run: cargo install cargo-nextest --version 0.9.151 --locked --force
+    - name: Verify nextest
+      shell: bash
+      run: cargo nextest --version
