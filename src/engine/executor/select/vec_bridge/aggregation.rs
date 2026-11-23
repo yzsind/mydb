@@ -444,6 +444,9 @@ pub(super) fn hash_agg_output_preflight_for_template(
             }
             (result_type, source)
         };
+        if matches!(aggregate, Expr::Function {name, ..} if name.eq_ignore_ascii_case("COUNT")) {
+            source.flags |= crate::mysql::protocol::NOT_NULL_FLAG;
+        }
         // Numeric aggregate expressions retain numeric coercibility even
         // when their result is projected as a CTE column. Keep MIN/MAX's
         // catalog descriptor and existing wire widths/flags intact.

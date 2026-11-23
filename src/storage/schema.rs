@@ -352,6 +352,10 @@ pub struct ViewColumnDef {
     #[serde(default)]
     pub unsigned: bool,
     #[serde(default)]
+    pub zerofill: bool,
+    #[serde(default)]
+    pub display_width: Option<u16>,
+    #[serde(default)]
     pub default_value: Option<String>,
 }
 

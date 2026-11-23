@@ -1764,8 +1764,8 @@ pub fn commit_gate() -> parking_lot::MutexGuard<'static, ()> {
 
 pub fn disabled_error() -> QueryError {
     error(
-        crate::error::catalog::ER_NOT_SUPPORTED_YET,
-        "binary logging is disabled",
+        crate::error::catalog::ER_NO_BINARY_LOGGING,
+        "You are not using binary logging",
     )
 }
 
@@ -2182,11 +2182,7 @@ pub fn handle_admin_sql_scoped(
             unlock_tables_for_session_scoped(session, scope);
             Ok(QueryResponse::Ok)
         }
-        // MySQL 5.7+: SHOW PROFILES / SHOW PROFILE are deprecated. mydb has no
-        // statement profiler — return an empty result set with the canonical
-        // column shape so clients (and JDBC metadata probes) parse cleanly.
-        AdminCommand::Profiles => Ok(empty_show_profiles_result()),
-        AdminCommand::Profile => Ok(empty_show_profile_result()),
+        AdminCommand::Profiles | AdminCommand::Profile => Err(crate::error::catalog::ER_NOT_SUPPORTED_YET.error("Statement profiling is not supported; use performance_schema statement instrumentation")),
         // SHOW BINLOG EVENTS uses the bounded historical/live event reader.
         AdminCommand::BinlogEvents => show_binlog_events(sql),
         AdminCommand::PurgeTo(prefix) => {
@@ -2202,30 +2198,13 @@ pub fn handle_admin_sql_scoped(
     }
 }
 
-/// Empty result set matching MySQL's `SHOW PROFILES` shape.
-fn empty_show_profiles_result() -> QueryResponse {
-    QueryResponse::ResultSet(ResultSet {
-        columns: AdminCommand::Profiles.columns(),
-        rows: Vec::new(),
-    })
-}
-
-/// Empty result set matching MySQL's `SHOW PROFILE` shape.
-fn empty_show_profile_result() -> QueryResponse {
-    QueryResponse::ResultSet(ResultSet {
-        columns: AdminCommand::Profile.columns(),
-        rows: Vec::new(),
-    })
-}
-
 /// Parse and execute `SHOW BINLOG EVENTS [IN 'file'] [FROM pos] [LIMIT [offset,] n]`.
 /// Uses the same bounded historical/live reader as `COM_BINLOG_DUMP`.
 fn show_binlog_events(sql: &str) -> Result<QueryResponse, QueryError> {
     const MAX_SHOW_EVENTS: usize = 100_000;
     const MAX_SHOW_BYTES: usize = 64 * 1024 * 1024;
     let req = parse_show_binlog_events_clause(sql)?;
-    // If binlog is disabled, MySQL returns an empty result set rather than
-    // an error — match that for JDBC metadata probes.
+    // A disabled log has no events, matching MySQL 8.0 even for IN names.
     let Some(manager) = manager() else {
         return Ok(QueryResponse::ResultSet(ResultSet {
             columns: show_binlog_events_columns(),
@@ -5108,6 +5087,12 @@ enum RowsPayload<'a> {
 }
 
 fn show_master_status(session: &SessionContext) -> Result<QueryResponse, QueryError> {
+    if !enabled() && session.binlog_snapshot_status.is_none() {
+        return Ok(QueryResponse::ResultSet(ResultSet {
+            columns: AdminCommand::MasterStatus.columns(),
+            rows: Vec::new(),
+        }));
+    }
     let snapshot = session
         .binlog_snapshot_status
         .as_deref()
@@ -5151,8 +5136,9 @@ fn show_binary_logs() -> Result<QueryResponse, QueryError> {
 /// entry by `handle_register_slave`); empty when the replica advertised none.
 /// Columns match MySQL 8.0.
 fn show_replicas() -> Result<QueryResponse, QueryError> {
-    let manager = require_manager()?;
-    let entries = manager.registered_replicas();
+    let entries = manager()
+        .map(|manager| manager.registered_replicas())
+        .unwrap_or_default();
     Ok(QueryResponse::ResultSet(ResultSet {
         columns: AdminCommand::Replicas.columns(),
         rows: entries

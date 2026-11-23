@@ -752,11 +752,9 @@ fn processlist_rows(db: &Database, registry: &SessionRegistry) -> Vec<Vec<Value>
 }
 
 /// `performance_schema.accounts` — one row per distinct (user, host) with a
-/// live connection. CURRENT_CONNECTIONS counts live sessions in the group.
-/// mydb keeps no historical connection accounting, so TOTAL_CONNECTIONS is
-/// reported equal to CURRENT_CONNECTIONS (honest: never undercounted, but not
-/// a lifetime total). The MAX_SESSION_* memory water-marks are NULL — mydb has
-/// no per-session memory instrumentation.
+/// live or retired connection. CURRENT_CONNECTIONS counts live sessions;
+/// TOTAL_CONNECTIONS and memory high-water marks merge live and retired
+/// snapshots using the same normalized host identity.
 fn accounts_rows(registry: &SessionRegistry) -> Vec<Vec<Value>> {
     let mut counts: std::collections::BTreeMap<(String, String), (i64, u64, u64, u64)> =
         std::collections::BTreeMap::new();
@@ -775,7 +773,8 @@ fn accounts_rows(registry: &SessionRegistry) -> Vec<Vec<Value>> {
         if p.kind != crate::engine::session_registry::ProcessKind::Foreground {
             continue;
         }
-        let entry = counts.entry((p.user, p.host)).or_insert((0, 0, 0, 0));
+        let host = super::session_registry::normalize_status_host(&p.host);
+        let entry = counts.entry((p.user, host)).or_insert((0, 0, 0, 0));
         entry.0 += 1;
         entry.1 = entry.1.saturating_add(1);
         entry.2 = entry.2.max(p.session_peak_bytes);
@@ -821,7 +820,11 @@ fn connection_summary_rows<const BY_HOST: bool>(registry: &SessionRegistry) -> V
             continue;
         }
         let entry = counts
-            .entry(if BY_HOST { p.host } else { p.user })
+            .entry(if BY_HOST {
+                super::session_registry::normalize_status_host(&p.host)
+            } else {
+                p.user
+            })
             .or_insert((0, 0, 0, 0));
         entry.0 += 1;
         entry.1 = entry.1.saturating_add(1);
@@ -986,13 +989,8 @@ fn variables_info_rows() -> Vec<Vec<Value>> {
 /// `performance_schema.variables_by_thread` — emit `(THREAD_ID,
 /// VARIABLE_NAME, VARIABLE_VALUE)` for every live connection.
 ///
-/// We currently emit the same row set per thread, taken at the global
-/// scope, plus a session-overlay row for the **active** thread (the one
-/// running the SELECT). True per-thread tracking would require every
-/// connection to publish a periodic snapshot of its session sysvars into
-/// the registry; that's a future enhancement. The cardinality matches
-/// MySQL — N_threads × N_session_variables — so monitoring queries get
-/// the row count they expect.
+/// Each connection publishes its own session-variable snapshot in the
+/// registry. The active connection uses its current statement context.
 fn variables_by_thread_rows(
     db: &Database,
     registry: &crate::engine::session_registry::SessionRegistry,
@@ -1908,10 +1906,10 @@ fn session_connect_attrs_rows(
     for p in processes {
         for (ordinal, (name, value)) in p.connection_attrs.iter().enumerate() {
             rows.push(vec![
-                Value::UInt(p.id as u64),         // PROCESSLIST_ID
-                s(name),                          // ATTR_NAME
-                s(value),                         // ATTR_VALUE
-                Value::Int((ordinal + 1) as i64), // ORDINAL_POSITION
+                Value::UInt(p.id as u64),   // PROCESSLIST_ID
+                s(name),                    // ATTR_NAME
+                s(value),                   // ATTR_VALUE
+                Value::Int(ordinal as i64), // ORDINAL_POSITION
             ]);
         }
     }

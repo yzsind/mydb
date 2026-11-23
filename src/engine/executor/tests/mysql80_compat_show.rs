@@ -1148,9 +1148,16 @@ fn show_audit_database_validation_preserves_empty_and_system_schemas() {
         "EVENTS",
     ] {
         let sql = format!("SHOW {noun} FROM no_such_show_audit_db");
-        let err = exec(&engine, &mut session, &sql).unwrap_err();
-        assert_eq!(err.code(), 1049, "{sql}: {err:?}");
-        assert!(err.message().contains("no_such_show_audit_db"));
+        if noun == "EVENTS" {
+            let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, &sql).unwrap() else {
+                panic!("{sql}");
+            };
+            assert!(rs.rows.is_empty());
+        } else {
+            let err = exec(&engine, &mut session, &sql).unwrap_err();
+            assert_eq!(err.code(), 1049, "{sql}: {err:?}");
+            assert!(err.message().contains("no_such_show_audit_db"));
+        }
         let sql = format!("SHOW {noun} FROM SHOW_AUDIT_EMPTY LIKE '%'");
         let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, &sql).unwrap() else {
             panic!("{sql}");
@@ -1227,11 +1234,8 @@ fn show_audit_profile_validates_execution_and_prepare() {
         "SHOW PROFILE CPU /* comment */ LIMIT 0",
         "SHOW/* comment */PROFILE CPU,IPC FOR/* comment */QUERY 1 LIMIT 0; /* tail */",
     ] {
-        let QueryResponse::ResultSet(rs) = exec(&engine, &mut session, sql).unwrap() else {
-            panic!("{sql}");
-        };
-        assert!(rs.rows.is_empty(), "{sql}");
-        assert_eq!(engine.describe_prepared_statement(&mut session, sql).unwrap(), rs.columns, "{sql}");
+        assert_eq!(exec(&engine, &mut session, sql).unwrap_err().code(),1235,"{sql}");
+        assert_eq!(engine.describe_prepared_statement(&mut session,sql).unwrap_err().code(),1235,"{sql}");
     }
     for sql in [
         "SHOW PROFILE CPU BLKXJUNK",

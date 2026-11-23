@@ -258,7 +258,7 @@ impl Database {
         count: u64,
         live_row_delta: i64,
     ) -> Result<(), QueryError> {
-        if !is_temp_table_id(table.id) {
+        if count != 0 && !is_temp_table_id(table.id) {
             // The caller already owns the schema-validated table id. Going
             // back through `qualified_name` + normalization + a catalog read
             // allocated and re-resolved that same identity for every changed

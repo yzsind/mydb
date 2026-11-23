@@ -6437,6 +6437,12 @@ fn compile_node_inner(expr: &Expr, schema: &InputSchema) -> Result<ExprNode, Com
             args,
             distinct,
         } => {
+            if name.eq_ignore_ascii_case("__TYPED_CONST") {
+                if crate::engine::expr_type::typed_constant_descriptor(args).is_none() {
+                    return Err(CompileError::Unsupported);
+                }
+                return compile_node(&args[0], schema);
+            }
             if name.eq_ignore_ascii_case("__JSON_AGG_VALUE") && args.len() == 1 {
                 let node = compile_node(&args[0], schema)?;
                 return Ok(

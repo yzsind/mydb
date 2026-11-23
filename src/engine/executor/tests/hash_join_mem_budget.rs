@@ -223,7 +223,7 @@ fn row_hot_join_output_honors_budget_without_strict_materialization_mode() {
             let before = crate::engine::executor::select::plan::HASH_JOIN_SKEW_CHUNKS
                 .load(std::sync::atomic::Ordering::Relaxed);
             let result = with_query_budget(budget.clone(), || {
-                engine.execute("SELECT COUNT(*) FROM (SELECT * FROM hot_probe p LEFT JOIN hot_build b ON p.k=b.k) t")
+                engine.execute("SELECT COUNT(*) FROM (SELECT * FROM hot_probe p LEFT JOIN hot_build b ON p.k=b.k) t(pk,pv,bk,bv)")
             });
             assert!(
                 matches!(result, Err(ref e) if e.code() == 1037),

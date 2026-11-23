@@ -207,7 +207,7 @@ fn exec_audit_in_arity() {
 fn exec_audit_wide_ambiguity() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
-    assert_eq!(engine.execute("SELECT d.a FROM (SELECT 1 AS a,2 AS a,3 AS b,4 AS c,5 AS d,6 AS e,7 AS f,8 AS g,9 AS h,10 AS i) d").unwrap_err().code(), 1052);
+    assert_eq!(engine.execute("SELECT d.a FROM (SELECT 1 AS a,2 AS a,3 AS b,4 AS c,5 AS d,6 AS e,7 AS f,8 AS g,9 AS h,10 AS i) d").unwrap_err().code(), 1060);
 }
 
 #[test]

@@ -3022,6 +3022,17 @@ fn parse_optional_show_limit(
             after_row_count,
         ));
     }
+    if let Some(after_offset) = consume_keyword_at(sql, idx, "OFFSET") {
+        let (offset, end) = parse_usize_literal_at(sql, after_offset)
+            .ok_or_else(|| parse_error_at_zero("SHOW diagnostics OFFSET requires a row offset"))?;
+        return Ok((
+            Some(ShowLimit {
+                offset,
+                row_count: first,
+            }),
+            end,
+        ));
+    }
     Ok((
         Some(ShowLimit {
             offset: 0,

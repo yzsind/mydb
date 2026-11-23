@@ -918,6 +918,9 @@ const PREC_COLLATE: u8 = 140;
 const PREC_PERIOD: u8 = 160;
 
 impl Dialect for MydbDialect {
+    fn supports_parens_around_table_factor(&self) -> bool {
+        true
+    }
     fn dialect(&self) -> std::any::TypeId {
         // Preserve MySQL identity so `dialect_of!(self is MySqlDialect)` holds.
         self.inner.dialect()

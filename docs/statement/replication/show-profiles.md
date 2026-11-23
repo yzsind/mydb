@@ -2,7 +2,7 @@
 
 ## Description
 
-The deprecated statement profiler, kept for compatibility with MySQL 5.7 client probing.
+The deprecated MySQL statement profiler syntax is recognized, but legacy profiling is not implemented.
 
 ## Syntax
 
@@ -15,18 +15,19 @@ The deprecated statement profiler, kept for compatibility with MySQL 5.7 client 
 
 ## Behavior, Prerequisites, and Limitations
 
-- mydb does not collect legacy statement profiles; its empty compatibility results do not represent measured execution.
-- The commands return a canonical empty result set column shape, which is explicitly documented compatibility behavior; performance diagnosis should use performance_schema and EXPLAIN ANALYZE.
+- mydb does not collect legacy statement profiles.
+- Execution and prepared-statement metadata binding return error 1235 (`ER_NOT_SUPPORTED_YET`). Use performance_schema and EXPLAIN ANALYZE for measured execution.
 
 ## Privileges, Results, and Operational Details
 
-No legacy samples are collected. PROFILE/PROFILES returns their canonical empty result schema without changing transactions. Profile types include ALL, BLOCK IO, CONTEXT SWITCHES, CPU, IPC, MEMORY, PAGE FAULTS, SOURCE and SWAPS. LIMIT uses the shared count/offset grammar; it cannot create measurements. Use EXPLAIN ANALYZE for a measured execution and performance_schema for live instrumentation.
+No legacy samples are collected. Valid PROFILE/PROFILES statements return an explicit unsupported-feature error. Profile types include ALL, BLOCK IO, CONTEXT SWITCHES, CPU, IPC, MEMORY, PAGE FAULTS, SOURCE and SWAPS. LIMIT uses the shared count/offset grammar. Invalid syntax returns error 1064.
 
 ## Examples
 
 ```sql
 SHOW PROFILES;
 SHOW PROFILE CPU FOR QUERY 1;
+-- Both statements return error 1235.
 ```
 
 ## See Also

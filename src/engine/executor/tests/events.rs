@@ -938,12 +938,15 @@ fn event_audit_show_requires_database() {
     let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
     let engine = open_test_engine(dir.path());
     let mut session = SessionContext::default();
-    assert!(exec(
+    let QueryResponse::ResultSet(result) = exec(
         &engine,
         &mut session,
-        "SHOW EVENTS FROM nonexistent_event_audit_db"
+        "SHOW EVENTS FROM nonexistent_event_audit_db",
     )
-    .is_err());
+    .unwrap() else {
+        panic!("SHOW EVENTS");
+    };
+    assert!(result.rows.is_empty());
     session.current_database.clear();
     for sql in ["SHOW EVENTS", "SHOW CREATE EVENT absent"] {
         let err = exec(&engine, &mut session, sql).unwrap_err();

@@ -530,7 +530,13 @@ fn build_collations() -> Vec<CollationInfo> {
             id: *id,
             is_default: name == DEFAULT_COLLATION,
             is_compiled: *id == UTF8MB4_0900_AI_CI_ID || binary,
-            sort_len: 0,
+            sort_len: if binary {
+                1
+            } else if name.ends_with("ja_0900_as_cs_ks") {
+                24
+            } else {
+                0
+            },
             pad_attribute: "NO PAD",
             case_sensitive,
             accent_sensitive,
@@ -578,7 +584,12 @@ fn seed_to_collation(seed: CollationSeed) -> CollationInfo {
         id: seed.id,
         is_default: default_collation_name(seed.charset) == Some(seed.name),
         is_compiled: true,
-        sort_len: seed.sort_len,
+        sort_len: match seed.name {
+            "latin2_czech_cs" | "tis620_thai_ci" => 4,
+            "latin1_german2_ci" | "cp1250_czech_cs" | "gb18030_chinese_ci" => 2,
+            "gb18030_unicode_520_ci" => 8,
+            _ => seed.sort_len,
+        },
         pad_attribute: seed.pad_attribute,
         case_sensitive: seed.case_sensitive,
         accent_sensitive: seed.accent_sensitive,

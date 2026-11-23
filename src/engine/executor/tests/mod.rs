@@ -23,6 +23,7 @@ mod release_audit_1119;
 mod release_audit_1119_expr;
 mod release_audit_1121;
 mod release_audit_1122;
+mod release_audit_1123;
 mod release_audit_followup_1107;
 mod rest_access_keys;
 mod rls;

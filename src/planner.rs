@@ -2996,24 +2996,67 @@ pub(crate) fn resolve_order_by_output_refs(
     if select.order_by.iter().all(|order| order.names_bound) {
         return Ok(());
     }
-    let mut output: HashMap<String, Option<&Expr>> = HashMap::new();
+    let wildcard_scope = if !select.joins.is_empty()
+        && select
+            .order_by
+            .iter()
+            .any(|order| !order.names_bound && matches!(order.expr, Expr::Identifier(_)))
+        && select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        }) {
+        build_column_scope(db, select, None).ok()
+    } else {
+        None
+    };
+    let mut output: HashMap<String, Option<std::borrow::Cow<'_, Expr>>> = HashMap::new();
+    fn add<'a>(
+        output: &mut HashMap<String, Option<std::borrow::Cow<'a, Expr>>>,
+        name: String,
+        expr: std::borrow::Cow<'a, Expr>,
+    ) {
+        output
+            .entry(name.to_ascii_lowercase())
+            .and_modify(|slot| {
+                if slot
+                    .as_ref()
+                    .is_some_and(|old| !expr_semantically_eq(old, &expr))
+                {
+                    *slot = None;
+                }
+            })
+            .or_insert(Some(expr));
+    }
     for item in &select.projection {
         if let SelectItem::Expr { expr, alias } = item {
             let name = alias
                 .clone()
                 .unwrap_or_else(|| crate::engine::expr::expr_name(expr))
                 .to_ascii_lowercase();
-            output
-                .entry(name)
-                .and_modify(|slot| {
-                    if slot
-                        .as_ref()
-                        .is_some_and(|old| !expr_semantically_eq(old, expr))
-                    {
-                        *slot = None;
+            add(&mut output, name, std::borrow::Cow::Borrowed(expr));
+        } else if let Some(scope) = &wildcard_scope {
+            for table in scope.tables.iter().filter(|table| table.visible) {
+                if matches!(item, SelectItem::QualifiedWildcard(q) if !table.matches_name(q)) {
+                    continue;
+                }
+                for name in &table.wildcard_columns {
+                    // Bare ORDER names prefer the output. Other names keep
+                    // FROM resolution, without expanding the actual wildcard.
+                    if !select.order_by.iter().any(|order| !order.names_bound && matches!(&order.expr, Expr::Identifier(requested) if name.eq_ignore_ascii_case(requested))) {
+                        continue;
                     }
-                })
-                .or_insert(Some(expr));
+                    add(
+                        &mut output,
+                        name.clone(),
+                        std::borrow::Cow::Owned(Expr::CompoundIdentifier(vec![
+                            table.alias.as_ref().unwrap_or(&table.name).clone(),
+                            name.clone(),
+                        ])),
+                    );
+                }
+            }
         }
     }
     let needs = select.order_by.iter().filter(|order| !order.names_bound).any(|order| {
@@ -3029,7 +3072,7 @@ pub(crate) fn resolve_order_by_output_refs(
         }
         return Ok(());
     }
-    let scope = build_column_scope(db, select, None).ok();
+    let scope = wildcard_scope.or_else(|| build_column_scope(db, select, None).ok());
     let ambiguous = |name: &str| {
         error(
             crate::error::catalog::ER_NON_UNIQ_ERROR,
@@ -4587,9 +4630,14 @@ pub fn resolve_join_using_natural(db: &Database, select: &mut Select) -> Result<
         join.natural = false;
         has_coalescing_join = true;
         output = if join.join_type == JoinType::Right {
-            merge_join_output_columns(&right, &output, &using_columns)?
+            merge_join_output_columns(&right, &output, &using_columns, false)?
         } else {
-            merge_join_output_columns(&output, &right, &using_columns)?
+            merge_join_output_columns(
+                &output,
+                &right,
+                &using_columns,
+                join.join_type == JoinType::Full,
+            )?
         };
     }
 
@@ -4745,6 +4793,7 @@ fn merge_join_output_columns(
     left: &[JoinOutputColumn],
     right: &[JoinOutputColumn],
     using_columns: &[String],
+    full_join: bool,
 ) -> Result<Vec<JoinOutputColumn>, QueryError> {
     let mut common = Vec::with_capacity(using_columns.len());
     let mut using_set = HashSet::new();
@@ -4761,11 +4810,19 @@ fn merge_join_output_columns(
             .first()
             .map(|col| col.name.clone())
             .unwrap_or_else(|| column.clone());
+        // INNER/LEFT use the left key; RIGHT passes its preserved side first.
+        // Only FULL needs a value from either input. Preserve direct column
+        // provenance so merged keys remain writable through mergeable views.
+        let direct = left_matches[0].expr.clone();
         let mut all = left_matches;
         all.extend(right_matches);
         common.push(JoinOutputColumn {
             name,
-            expr: coalesce_join_columns(&all),
+            expr: if full_join {
+                coalesce_join_columns(&all)
+            } else {
+                direct
+            },
             coalesced: true,
             qualifiers: merged_qualifiers(&all),
         });
@@ -5257,6 +5314,20 @@ pub(crate) fn apply_derived_column_aliases<'a>(
     columns: impl ExactSizeIterator<Item = &'a mut String>,
 ) -> Result<(), QueryError> {
     if table.column_aliases.is_empty() {
+        // An unaliased nested join retains its independent table namespaces.
+        // Actual derived relations must publish unique output names.
+        if table.name == "$nested_join_preserve" || columns.len() < 2 {
+            return Ok(());
+        }
+        let mut seen = std::collections::HashSet::new();
+        for name in columns {
+            if !seen.insert(name.to_ascii_lowercase()) {
+                return Err(error(
+                    crate::error::catalog::ER_DUP_FIELDNAME,
+                    format!("Duplicate column name '{name}'"),
+                ));
+            }
+        }
         return Ok(());
     }
     if columns.len() != table.column_aliases.len() {

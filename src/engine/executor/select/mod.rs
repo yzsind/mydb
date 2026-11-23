@@ -767,7 +767,7 @@ fn execute_select_with_cte_joins_inner(
             for item in &stmt.projection {
                 match item {
                     SelectItem::Wildcard => {
-                        for f in &sample.fields {
+                        for f in sample.fields.iter().filter(|field| !field.invisible) {
                             output.push((f.value).clone());
                         }
                     }
@@ -1298,6 +1298,69 @@ fn null_plan_row_for_sources(sources: &[MaterializedSource]) -> self::plan::Plan
     }
 }
 
+type ScalarLateralProjection = (Vec<Column>, PlanProjectionProgram);
+
+fn compile_scalar_lateral_projection(
+    db: &Database,
+    table: &TableRef,
+    derived: &SubQuery,
+    sample: &PlanRow,
+) -> Result<Option<ScalarLateralProjection>, QueryError> {
+    let SubQuery::Select(select) = derived else {
+        return Ok(None);
+    };
+    if select.table.is_some()
+        || !select.from.is_empty()
+        || !select.joins.is_empty()
+        || select.derived.is_some()
+        || select.values.is_some()
+        || select.json_table.is_some()
+        || select.selection.is_some()
+        || !select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select.having.is_some()
+        || !select.order_by.is_empty()
+        || select.limit.is_some()
+        || select.offset.is_some()
+        || select.distinct
+        || select.for_update
+        || select.lock_clause.is_some()
+        || select.sql_calc_found_rows
+        || !select.named_windows.is_empty()
+        || !select.query_hints.is_empty()
+        || !select.hint_warnings.is_empty()
+        || select.rls_security_context.is_some()
+        || select.rls_expression_settings.is_some()
+        || select.projection.is_empty()
+    {
+        return Ok(None);
+    }
+    for item in &select.projection {
+        let SelectItem::Expr { expr, .. } = item else {
+            return Ok(None);
+        };
+        if !planner::expr_is_deterministic(expr) || expr_has_toplevel_aggregate(expr) {
+            return Ok(None);
+        }
+    }
+    let program = PlanProjectionProgram::compile_once(sample, &select.projection);
+    if !program.fully_compiled() {
+        return Ok(None);
+    }
+    // Describe through the ordinary correlated binder once, so names, wire
+    // flags and declared domains agree with PREPARE and the fallback executor.
+    let bound = self::eval::bind_correlated_subquery_tree(db, derived, sample);
+    if let SubQuery::Select(bound) = &bound {
+        validate_select_static_collations(bound)?;
+    }
+    let mut columns = describe_subquery_columns(db, &bound)?;
+    crate::planner::apply_derived_column_aliases(
+        table,
+        columns.iter_mut().map(|column| &mut column.name),
+    )?;
+    Ok(Some((columns, program)))
+}
+
 fn nested_loop_lateral_join(
     db: &Arc<Database>,
     txn: TxnView,
@@ -1336,11 +1399,24 @@ fn nested_loop_lateral_join(
         ));
     }
 
+    // A deterministic, source-free lateral SELECT is a scalar projection of
+    // each left row. Compile it once instead of dispatching a query per row.
+    let scalar_projection =
+        compile_scalar_lateral_projection(db, table_ref, derived, &left_rows[0])?;
     let mut out = Vec::new();
     let mut right_columns: Option<Vec<Column>> = None;
     for left in &left_rows {
-        let right_source =
-            materialize_lateral_join_source_for_row(db, txn, table_ref, derived, left, registry)?;
+        let right_source = if let Some((columns, program)) = &scalar_projection {
+            let values = program.project_row_values(left)?;
+            MaterializedSource {
+                alias: alias.clone(),
+                table_name: alias.clone(),
+                columns: columns.clone(),
+                rows: SourceRows::Owned(vec![values]),
+            }
+        } else {
+            materialize_lateral_join_source_for_row(db, txn, table_ref, derived, left, registry)?
+        };
         if let Some(columns) = &right_columns {
             if columns.len() != right_source.columns.len() {
                 return Err(error(
@@ -4866,14 +4942,20 @@ pub(super) fn describe_statement_columns<'q>(
         crate::parser::QueryRef::Other(Statement::Describe { table }) => {
             describe_show_columns(db, session, table, false)
         }
-        crate::parser::QueryRef::Other(Statement::ShowDatabases { .. }) => {
-            Ok(show_databases(db, session, None)?.columns())
+        crate::parser::QueryRef::Other(Statement::ShowDatabases { filter }) => {
+            Ok(show_databases(db, session, filter.as_ref())?.columns())
         }
-        crate::parser::QueryRef::Other(Statement::ShowTables { database, full, .. }) => {
-            Ok(show_tables_columns(
+        crate::parser::QueryRef::Other(Statement::ShowTables {
+            database,
+            full,
+            filter,
+        }) => {
+            let mut columns = show_tables_columns(
                 database.as_deref().unwrap_or(&session.current_database),
                 *full,
-            ))
+            );
+            crate::engine::show::append_show_like_heading(&mut columns, filter.as_ref());
+            Ok(columns)
         }
         crate::parser::QueryRef::Other(Statement::ShowTableStatus { .. }) => {
             Ok(show_table_status_columns())
@@ -4899,6 +4981,21 @@ pub(super) fn describe_statement_columns<'q>(
         crate::parser::QueryRef::Other(Statement::ShowCreateTable { table }) => {
             describe_show_create_table(db, session, table)
         }
+        crate::parser::QueryRef::Other(Statement::ShowCreateSequence { name }) => {
+            Ok(crate::engine::show::show_create_sequence(db, session, name)?.columns())
+        }
+        crate::parser::QueryRef::Other(Statement::ShowSequences { database, filter }) => Ok(
+            crate::engine::show::show_sequences(db, session, database.as_deref(), filter.as_ref())?
+                .columns(),
+        ),
+        crate::parser::QueryRef::Other(Statement::ShowCreateUser { account }) => {
+            Ok(crate::engine::show::show_create_user_result(
+                db,
+                session,
+                &super::dispatch::show_account_key(account, session),
+            )?
+            .columns())
+        }
         crate::parser::QueryRef::Other(Statement::ShowCreateRoutine { kind, name }) => {
             Ok(crate::engine::show::show_create_routine(db, session, *kind, name)?.columns())
         }
@@ -4917,6 +5014,9 @@ pub(super) fn describe_statement_columns<'q>(
             crate::engine::show::show_events(db, session, database.as_deref(), filter.as_ref())?
                 .columns(),
         ),
+        crate::parser::QueryRef::Other(Statement::ShowCreateEvent { name }) => {
+            Ok(crate::engine::show::show_create_event(db, session, name)?.columns())
+        }
         crate::parser::QueryRef::Other(Statement::ShowCharset { .. }) => {
             Ok(show_charset_result(None)?.columns())
         }
@@ -4979,12 +5079,22 @@ pub(super) fn describe_statement_columns<'q>(
         crate::parser::QueryRef::Other(Statement::ShowProcesslist { .. }) => {
             Ok(processlist_columns())
         }
-        crate::parser::QueryRef::Other(Statement::ShowGrants)
-        | crate::parser::QueryRef::Other(Statement::ShowGrantsFor { .. }) => Ok(vec![Column {
-            source: Default::default(),
-            name: "Grants".to_string(),
-            column_type: ColumnType::VarString,
-        }]),
+        crate::parser::QueryRef::Other(Statement::ShowGrants) => {
+            Ok(crate::engine::show::show_grants_result(db, session, None, &[])?.columns())
+        }
+        crate::parser::QueryRef::Other(Statement::ShowGrantsFor {
+            account,
+            using_roles,
+        }) => Ok(crate::engine::show::show_grants_result(
+            db,
+            session,
+            Some(&super::dispatch::show_account_key(account, session)),
+            &using_roles
+                .iter()
+                .map(super::dispatch::account_key)
+                .collect::<Vec<_>>(),
+        )?
+        .columns()),
         crate::parser::QueryRef::Other(Statement::ReplicationAdmin { sql }) => {
             Ok(crate::replication_sql::admin_result_columns(sql))
         }
@@ -5122,9 +5232,10 @@ pub(super) fn describe_select_columns(
             .from
             .iter()
             .any(|table| table.name == "$nested_join_preserve")
-        && !stmt.joins.iter().any(|join| {
-            (join.lateral && join.derived.is_some()) || join.table.name == "$nested_join_preserve"
-        })
+        && !stmt
+            .joins
+            .iter()
+            .any(|join| join.table.name == "$nested_join_preserve")
     {
         let mut described = stmt.clone();
         let mut stubs = std::collections::HashMap::new();
@@ -5152,10 +5263,55 @@ pub(super) fn describe_select_columns(
                 described.table = Some(table.name.clone());
             }
         }
+        // LATERAL predicates must bind to the preceding metadata scope, even
+        // during CREATE VIEW/PREPARE when no input rows are read.
+        drop(describe_source);
+        let mut preceding = described.clone();
+        preceding.joins.clear();
+        preceding.projection = vec![SelectItem::Wildcard];
         for join in &mut described.joins {
             if let Some(subquery) = join.derived.take() {
-                describe_source(&mut join.table, &subquery)?;
+                let columns = super::cte::with_cte_registry_extended(stubs.clone(), || {
+                    if join.lateral {
+                        let plan = planner::plan_select(db, &preceding)?;
+                        let mut metadata = Vec::new();
+                        plan::collect_plan_fields(&plan.physical, &mut metadata);
+                        let row = PlanRow {
+                            fields: metadata
+                                .into_iter()
+                                .map(|meta| PlanField {
+                                    meta: plan::intern_col_meta(meta),
+                                    value: Value::Null,
+                                })
+                                .collect(),
+                            ..Default::default()
+                        };
+                        let bound = self::eval::bind_correlated_subquery_tree(db, &subquery, &row);
+                        describe_subquery_columns(db, &bound)
+                    } else {
+                        describe_subquery_columns(db, &subquery)
+                    }
+                })?;
+                let mut columns = columns;
+                crate::planner::apply_derived_column_aliases(
+                    &join.table,
+                    columns.iter_mut().map(|c| &mut c.name),
+                )?;
+                let key = super::cte::next_inline_derived_name();
+                join.table
+                    .alias
+                    .get_or_insert_with(|| join.table.name.clone());
+                join.table.name = key.clone();
+                join.lateral = false;
+                stubs.insert(
+                    key,
+                    Arc::new(crate::engine::api::CteResult::materialized(
+                        columns,
+                        Vec::new(),
+                    )),
+                );
             }
+            preceding.joins.push(join.clone());
         }
         return super::cte::with_cte_registry_extended(stubs, || {
             describe_select_columns(db, &described)
@@ -6211,9 +6367,6 @@ fn rename_derived_response(
     table: &TableRef,
     response: &mut QueryResponse,
 ) -> Result<(), QueryError> {
-    if table.column_aliases.is_empty() {
-        return Ok(());
-    }
     let columns = match response {
         QueryResponse::ResultSet(result) => result.columns.as_mut_slice(),
         QueryResponse::SharedResultSet(result) => Arc::make_mut(&mut result.columns),

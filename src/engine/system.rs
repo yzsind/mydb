@@ -273,7 +273,12 @@ pub(crate) fn preserves_statement_diagnostics(sql: &str) -> bool {
     if !plausible {
         return false;
     }
-    let upper = normalize_sql(sql).to_ascii_uppercase();
+    let sql = &sql[start.min(sql.len())..];
+    let mode =
+        crate::sql_lex::SqlLexMode::from_parser_bits(crate::parser::current_parser_sql_mode_bits());
+    let cleaned = crate::sql_lex::mask_comments(sql, mode, crate::parser::MYSQL_VERSION_ID, false)
+        .unwrap_or_else(|_| std::borrow::Cow::Borrowed(sql));
+    let upper = normalize_sql(&cleaned).to_ascii_uppercase();
     upper.starts_with("SHOW WARNINGS")
         || upper.starts_with("GET DIAGNOSTICS")
         || upper.starts_with("GET CURRENT DIAGNOSTICS")
@@ -294,11 +299,32 @@ fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
 }
 
 fn is_show_count_warnings(upper: &str) -> bool {
-    upper.starts_with("SHOW COUNT(*) WARNINGS")
+    is_show_diagnostic_count(upper, "WARNINGS")
 }
 
 fn is_show_count_errors(upper: &str) -> bool {
-    upper.starts_with("SHOW COUNT(*) ERRORS")
+    is_show_diagnostic_count(upper, "ERRORS")
+}
+
+fn is_show_diagnostic_count(upper: &str, kind: &str) -> bool {
+    let Some(tail) = upper.strip_prefix("SHOW ") else {
+        return false;
+    };
+    let Some(tail) = tail.trim_start().strip_prefix("COUNT") else {
+        return false;
+    };
+    let Some(tail) = tail.trim_start().strip_prefix('(') else {
+        return false;
+    };
+    let Some(tail) = tail.trim_start().strip_prefix('*') else {
+        return false;
+    };
+    let Some(tail) = tail.trim_start().strip_prefix(')') else {
+        return false;
+    };
+    tail.trim_start().strip_prefix(kind).is_some_and(|rest| {
+        rest.is_empty() || rest.starts_with(';') || rest.starts_with(char::is_whitespace)
+    })
 }
 
 pub(crate) fn references_diagnostics_count(upper: &str) -> bool {

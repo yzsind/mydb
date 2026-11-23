@@ -959,9 +959,6 @@ impl Database {
     /// Record a transaction-local signed population change. The change is
     /// intentionally invisible to planners until `commit_txn` publishes it.
     pub(crate) fn record_pending_live_row_delta(&self, txn_id: u64, table_id: u64, delta: i64) {
-        if delta == 0 {
-            return;
-        }
         let mut pending = self.pending_live_row_deltas
             [txn_id as usize & (PENDING_LIVE_ROW_DELTA_SHARDS - 1)]
             .lock();
@@ -980,18 +977,19 @@ impl Database {
                 .lock();
             pending.remove(&txn_id).unwrap_or_default()
         };
+        let updated_ms = if committed.is_empty() { 0 } else { current_unix_ms() };
         for (table_id, delta) in committed {
             let counters = self.table_live_row_deltas.read();
             if let Some(counter) = counters.get(&table_id) {
                 counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+                counter.updated_ms.fetch_max(updated_ms, std::sync::atomic::Ordering::Relaxed);
                 continue;
             }
             drop(counters);
-            self.table_live_row_deltas
-                .write()
-                .entry(table_id)
-                .or_insert_with(|| Arc::new(AtomicI64::new(0)))
-                .fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+            let mut counters = self.table_live_row_deltas.write();
+            let counter = counters.entry(table_id).or_insert_with(|| Arc::new(CommittedTableDelta::new(0)));
+            counter.fetch_add(delta, std::sync::atomic::Ordering::Relaxed);
+            counter.updated_ms.fetch_max(updated_ms, std::sync::atomic::Ordering::Relaxed);
         }
     }
 
@@ -1033,6 +1031,12 @@ impl Database {
             .get(&table_id)
             .map(|counter| counter.load(std::sync::atomic::Ordering::Relaxed))
             .unwrap_or(0)
+    }
+
+    pub(crate) fn table_update_time_ms(&self, table_id: u64) -> Option<u64> {
+        self.table_live_row_deltas.read().get(&table_id)
+            .map(|counter| counter.updated_ms.load(std::sync::atomic::Ordering::Relaxed))
+            .filter(|time| *time != 0)
     }
 
     /// Snapshot the sidecar delta for `table_id`, returning the
@@ -3041,7 +3045,7 @@ impl Database {
                 .clamp(i64::MIN as i128, i64::MAX as i128) as i64;
             self.table_live_row_deltas
                 .write()
-                .insert(table.id, Arc::new(AtomicI64::new(delta)));
+                .insert(table.id, Arc::new(CommittedTableDelta::new(delta)));
         }
         Ok(())
     }

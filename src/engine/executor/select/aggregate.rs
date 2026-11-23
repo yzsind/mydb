@@ -2424,7 +2424,7 @@ pub(super) fn group_marker_meta(idx: usize) -> super::plan::ColMetaRef {
         return meta;
     }
     let meta = super::plan::intern_col_meta(super::plan::ColMeta {
-        invisible: false,
+        invisible: true,
         table: "$group".to_string(),
         alias: None,
         column: format!("group_{idx}"),

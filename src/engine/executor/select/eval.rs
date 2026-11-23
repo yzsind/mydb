@@ -515,6 +515,18 @@ pub(super) struct PlanProjectionProgram {
 }
 
 impl PlanProjectionProgram {
+    pub(super) fn fully_compiled(&self) -> bool {
+        self.items.iter().all(|item| {
+            matches!(
+                item,
+                CompiledPlanSelectItem::Expr {
+                    compiled: CompiledPlanExpr::SimpleField(_) | CompiledPlanExpr::Program(_),
+                    ..
+                }
+            )
+        })
+    }
+
     pub(super) fn compile_once(row: &PlanRow, projection: &[SelectItem]) -> Self {
         let schema = input_schema_for_plan_row(row);
         let items: Vec<_> = projection
@@ -960,6 +972,15 @@ fn eval_plan_structural_expr(
 
 #[inline]
 pub(super) fn eval_plan_expr_legacy(expr: &Expr, row: &PlanRow) -> Result<Value, QueryError> {
+    if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let _depth = crate::engine::expr::ExpressionDepthGuard::enter()?;
+            return eval_plan_expr_legacy(
+                crate::engine::expr_type::typed_constant_payload(args)?,
+                row,
+            );
+        }
+    }
     if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
         let _depth = crate::engine::expr::ExpressionDepthGuard::enter()?;
         return eval_plan_column_reference(expr, row);
@@ -1846,6 +1867,18 @@ pub(super) fn eval_plan_expr_with_db(
     row: &PlanRow,
     eval_ctx: &mut EvalQueryContext,
 ) -> Result<Value, QueryError> {
+    if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let _depth = crate::engine::expr::ExpressionDepthGuard::enter()?;
+            return eval_plan_expr_with_db(
+                db,
+                txn,
+                crate::engine::expr_type::typed_constant_payload(args)?,
+                row,
+                eval_ctx,
+            );
+        }
+    }
     if matches!(expr, Expr::Identifier(_) | Expr::CompoundIdentifier(_)) {
         // Preserve both recursion scopes of the existing with-db -> legacy
         // dispatch, but enter neither of its large recursive frames.
@@ -3829,7 +3862,7 @@ pub(super) fn bind_correlated_subquery(
 }
 
 fn bind_correlated_subquery_in_place(
-    db: &Arc<Database>,
+    db: &Database,
     sub: &mut Select,
     outer_row: &PlanRow,
 ) -> Vec<ValueKey> {
@@ -3857,12 +3890,12 @@ fn bind_correlated_subquery_in_place(
 /// EXCEPT and WITH bodies keep their ordinary statement executor, while
 /// correlation substitution is applied with each leaf's own inner scope.
 pub(super) fn bind_correlated_subquery_tree(
-    db: &Arc<Database>,
+    db: &Database,
     subquery: &crate::parser::SubQuery,
     outer_row: &PlanRow,
 ) -> crate::parser::SubQuery {
     struct BindLeaves<'a> {
-        db: &'a Arc<Database>,
+        db: &'a Database,
         outer_row: &'a PlanRow,
     }
     impl crate::parser::visit::AstVisitorMut for BindLeaves<'_> {
@@ -3870,7 +3903,17 @@ pub(super) fn bind_correlated_subquery_tree(
             !matches!(query, crate::parser::QueryExpr::Rrf(_))
         }
         fn enter_select(&mut self, select: &mut Select) {
+            let original = select.projection.clone();
             let _ = bind_correlated_subquery_in_place(self.db, select, self.outer_row);
+            for (item, original) in select.projection.iter_mut().zip(original) {
+                if let (SelectItem::Expr { expr, alias }, SelectItem::Expr { expr: original, .. }) =
+                    (item, original)
+                {
+                    if alias.is_none() && *expr != original {
+                        *alias = Some(expr_name(&original));
+                    }
+                }
+            }
         }
         fn walk_select_children(&self, _: &Select) -> bool {
             // The scope-aware binder already handled this leaf and its children.
@@ -6051,7 +6094,7 @@ fn inner_columns_with_projection_aliases<'a>(
 // lexical scopes. Keep every substitution in the caller's binding collector
 // so memoization keys include values referenced inside their definitions/body.
 fn substitute_outer_in_query<'q>(
-    db: &Arc<Database>,
+    db: &Database,
     query: impl Into<crate::parser::QueryMut<'q>>,
     outer_row: &PlanRow,
 ) -> bool {
@@ -6085,11 +6128,7 @@ fn substitute_outer_in_query<'q>(
     }
 }
 
-fn substitute_outer_in_derived(
-    db: &Arc<Database>,
-    sub: &mut SubQuery,
-    outer_row: &PlanRow,
-) -> bool {
+fn substitute_outer_in_derived(db: &Database, sub: &mut SubQuery, outer_row: &PlanRow) -> bool {
     match sub {
         SubQuery::Select(select) => {
             let (columns, tables) = inner_select_scope(db, select);
@@ -6102,7 +6141,7 @@ fn substitute_outer_in_derived(
 }
 
 fn substitute_outer_in_select(
-    db: &Arc<Database>,
+    db: &Database,
     select: &mut Select,
     outer_row: &PlanRow,
     inner_cols: &HashSet<String>,
@@ -6191,7 +6230,11 @@ fn substitute_outer_in_select(
 /// coercibility. This also keeps lateral projection metadata independent of
 /// the connection's default collation.
 fn bound_outer_field(field: &PlanField) -> Expr {
-    let value = Expr::BoundValue(field.value.clone());
+    let value = crate::engine::expr_type::typed_constant(
+        Expr::BoundValue(field.value.clone()),
+        field.column_type,
+        &field.source,
+    );
     if matches!(field.column_type, ColumnType::VarString | ColumnType::Blob) {
         if let Some(collation) = field
             .source
@@ -6300,7 +6343,7 @@ fn outer_aggregate_cache_key(
 }
 
 fn substitute_outer_in_expr(
-    db: &Arc<Database>,
+    db: &Database,
     expr: &mut Expr,
     outer_row: &PlanRow,
     inner_cols: &HashSet<String>,
@@ -6406,7 +6449,7 @@ fn substitute_outer_in_expr(
 /// closer scope from accidental capture and still lets genuinely external
 /// references reach `outer_row`.
 fn substitute_outer_in_nested_select(
-    db: &Arc<Database>,
+    db: &Database,
     select: &mut Select,
     outer_row: &PlanRow,
     enclosing_cols: &HashSet<String>,
