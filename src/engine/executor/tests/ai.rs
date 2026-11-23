@@ -1129,3 +1129,65 @@ fn audit_numeric_projection_widens_narrow_abs_and_negation_wire_types() {
     );
     assert_eq!(packet.len(), 42);
 }
+
+#[test]
+fn five_audit_ai_sibling_budget_rejected_before_dispatch() {
+    let mock = Mock::new();
+    let dir = temp();
+    crate::util::env::with_vars(
+        &[
+            ("MYDB_AI_ENABLED", Some("ON")),
+            ("MYDB_AI_LOCAL_CONFIG", None),
+        ],
+        || {
+            let e = open_test_engine(&dir.path().join("data"));
+            let mut s = SessionContext::default();
+            exec(
+                &e,
+                &mut s,
+                &format!(
+                    "CREATE AI CONNECTION local WITH CONFIG '{}'",
+                    json!({"protocol":"ollama","base_url":format!("http://127.0.0.1:{}",mock.port),"auth":{"type":"none"}})
+                ),
+            );
+            exec(
+                &e,
+                &mut s,
+                r#"CREATE AI MODEL test.chat USING local WITH CONFIG '{"kind":"text_generation","remote_model":"mock-chat","model_revision":"v1"}'"#,
+            );
+            exec(&e, &mut s, "CREATE TABLE ai_input(id INT PRIMARY KEY)");
+            exec(
+                &e,
+                &mut s,
+                &format!(
+                    "INSERT INTO ai_input VALUES {}",
+                    (1..=51)
+                        .map(|i| format!("({i})"))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                ),
+            );
+            let response = e.execute_with_session(&mut s, "SELECT CONCAT(AI_GENERATE('test.chat',CAST(id AS CHAR)),AI_GENERATE('test.chat',CAST(id AS CHAR))) FROM ai_input");
+            let error = match response {
+                Err(e) => e,
+                Ok(r) => r.materialize().unwrap_err(),
+            };
+            assert!(error.is(crate::error::catalog::ER_AI_BUDGET_EXCEEDED));
+            assert_eq!(mock.requests.lock().unwrap().len(), 0);
+            let set = format!(
+                "SET @value=CONCAT({})",
+                vec!["AI_GENERATE('test.chat','set')"; 101].join(",")
+            );
+            let error = e.execute_with_session(&mut s, &set).unwrap_err();
+            assert!(error.is(crate::error::catalog::ER_AI_BUDGET_EXCEEDED));
+            assert_eq!(mock.requests.lock().unwrap().len(), 0);
+            let rs = materialize(exec(
+                &e,
+                &mut s,
+                "SELECT IF(id=1,AI_GENERATE('test.chat','hello'),NULL) FROM ai_input LIMIT 2",
+            ));
+            assert_eq!(rs.rows.len(), 2);
+            assert_eq!(mock.requests.lock().unwrap().len(), 1);
+        },
+    );
+}

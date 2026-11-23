@@ -8222,11 +8222,19 @@ pub(super) fn execute_qualified_statement(
                 .iter()
                 .any(|a| crate::engine::ai::sql::expr_has_ai(&a.value))
             {
-                let value = crate::engine::ai::with_calls(db.clone(), session, || {
-                    crate::engine::expr::with_session_expr_info(session, || {
-                        crate::engine::expr::eval_const(&assignments[0].value)
-                    })
-                })?;
+                let projection = Select {
+                    projection: vec![SelectItem::Expr {
+                        expr: assignments[0].value.clone(),
+                        alias: None,
+                    }],
+                    ..Select::default()
+                };
+                let QueryResponse::ResultSet(mut result) =
+                    ai::project(db, session, projection, registry)?.materialize()?
+                else {
+                    unreachable!("AI SET projection returns one row")
+                };
+                let value = result.rows.remove(0).remove(0);
                 session.set_user_variable(assignments[0].name.trim_start_matches('@'), value)?;
                 return Ok(QueryResponse::Ok);
             }

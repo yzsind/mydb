@@ -290,6 +290,31 @@ pub(super) fn execute_load_data_with_reader(
         ));
     }
     let _warning_scope = crate::engine::api::StatementWarningSinkScope::enter();
+    for (idx, column) in table.iter_visible_columns() {
+        if !column.nullable
+            && !column.auto_increment
+            && column.generated_expr.is_none()
+            && column.default.is_none()
+            && column.default_expr.is_none()
+            && !load_column_indexes.contains(&idx)
+            && !stmt
+                .set_clauses
+                .iter()
+                .any(|(name, _)| name.eq_ignore_ascii_case(&column.name))
+        {
+            let err = crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD.error(format!(
+                "Field '{}' doesn't have a default value",
+                column.name
+            ));
+            if load_is_strict() && !stmt.ignore_duplicates {
+                return Err(err);
+            }
+            crate::engine::api::push_statement_condition(
+                crate::error::ConditionLevel::Warning,
+                &err,
+            );
+        }
+    }
     let parser = FieldParser {
         input_charset: LoadLegacyCharset::from_name(stmt.charset.as_deref()),
         field_terminator: stmt.field_terminated_by.as_bytes().to_vec(),
@@ -3187,6 +3212,7 @@ fn execute_prepared_load_data_fast(
                 storage_ids: Vec::new(),
                 row_ids,
                 first_insert_id: 0,
+                last_copied_insert_id: 0,
             },
         };
         crate::engine::api::set_statement_insert_id(inserted.first_insert_id);
@@ -3370,6 +3396,7 @@ impl<'a> LoadDataPreparedWriter<'a> {
                 storage_ids: Vec::new(),
                 row_ids,
                 first_insert_id: 0,
+                last_copied_insert_id: 0,
             },
         };
         if self.first_insert_id == 0 && inserted.first_insert_id != 0 {

@@ -560,6 +560,9 @@ pub struct InsertRowsResult {
     pub row_ids: Vec<RowId>,
     pub storage_ids: Vec<u64>,
     pub first_insert_id: u64,
+    /// Last copied AUTO_INCREMENT value after assignment/coercion. Opaque
+    /// pre-encoded LOAD batches report zero; their decoder owns insert IDs.
+    pub last_copied_insert_id: u64,
 }
 
 impl RowId {

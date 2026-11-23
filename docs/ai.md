@@ -129,6 +129,11 @@ SELECT AI_GENERATE('test.local_chat', 'Describe MVCC in one sentence.');
 SELECT VECTOR_DIM(AI_EMBED('test.local_embed', 'Database transactions'));
 ```
 
+`ALTER AI MODEL ... WITH CONFIG` replaces the complete configuration document.
+Omitted capabilities are disabled, and ALTER can only tighten capabilities.
+To restore a removed capability, drop and recreate the model, then regrant its
+model-specific privileges; recreating the same name assigns a new model ID.
+
 Capability declarations must match the actual model and deployment. They do
 not make an unsupported provider parameter work. Ollama requests use
 `stream=false`; embedding requests also use `truncate=false`.
@@ -466,6 +471,9 @@ Pure expressions surrounding a single eagerly evaluated AI call retain the
 external stage's batching and concurrency. Conditional expressions retain SQL
 short-circuit behavior. When materialized inputs prove that the statement would
 exceed its AI item budget, execution fails before contacting the provider.
+Sibling calls are included even when they cannot be batched. Pure conditional
+predicates count only their selected branches; a branch that depends on model
+output reserves a conservative bound for all its possible calls.
 `on_error='return'` must be selected on a DETAIL call, rather than in model
 defaults. Caller `response_format` replaces the model default as a whole.
 

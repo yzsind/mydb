@@ -8,6 +8,7 @@ mod distinct_order_by;
 mod dml_metadata_audit_1109;
 mod engine_status;
 mod final_release_audit_1107;
+mod five_audit_1123;
 mod fresh_release_audit;
 mod function_runtime_fixes;
 mod github_release_audit;

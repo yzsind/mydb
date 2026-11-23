@@ -1505,6 +1505,13 @@ impl Database {
         // Foreign keys are persistent-catalog concerns and therefore remain
         // outside the shared persistent/temporary schema builder.
         if !foreign_keys.is_empty() {
+            let mut parent_definitions = Vec::new();
+            for def in &foreign_keys {
+                let (database, name) = split_table_name(&table.database, &def.referenced_table);
+                let key = table_key(&database, &name);
+                let exists = self.catalog_read()?.tables.contains_key(&key);
+                if exists { parent_definitions.push(self.pin_ddl_table(&key)?); }
+            }
             let (foreign_key_schemas, backing_indexes) = {
                 let catalog = self.catalog_read()?;
                 build_foreign_keys_for_table(&catalog, &table, foreign_keys)?
@@ -2752,19 +2759,13 @@ impl Database {
     /// short rows receive the catalog backfill default without a heap scan.
     pub fn add_temp_column(&self, internal_key: &str, column: ColumnDef) -> Result<(), QueryError> {
         let check_defs = column.checks.clone();
+        let validate_checks = !check_defs.is_empty();
         let mut new_column;
         let table_id;
+        let old = self.temp_ddl_schema(internal_key)?;
+        let mut candidate = old.as_ref().clone();
         {
-            let mut tables = self.temp_tables.write().map_err(|_| {
-                error(
-                    crate::error::catalog::ER_GET_ERRNO,
-                    "temporary table lock poisoned",
-                )
-            })?;
-            let table_arc = tables
-                .get_mut(internal_key)
-                .ok_or_else(|| ddl_table_not_found(&internal_key))?;
-            let table = Arc::make_mut(table_arc);
+            let table = &mut candidate;
             new_column = column_def_to_schema_in_table(column, table, None)?;
             if new_column.generated_expr.is_some() {
                 return Err(error(crate::error::catalog::ER_NOT_SUPPORTED_YET, "adding a generated column to a temporary table requires COPY"));
@@ -2833,6 +2834,10 @@ impl Database {
             validate_row_fits_page(table)?;
             table_id = table.id;
         }
+        if validate_checks {
+            self.validate_temp_check_constraints(internal_key, &candidate)?;
+        }
+        self.mutate_temp_table_schema(internal_key, |table| { *table = candidate; Ok(()) })?;
         self.refresh_heap_codec(table_id)
     }
 
@@ -3308,7 +3313,17 @@ impl Database {
         self.scan_rows_ordered_streaming(
             internal_key,
             TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted),
-            |values| self.check_check_constraints(candidate, values, None),
+            |values| {
+                if values.len() == candidate.columns.len() {
+                    return self.check_check_constraints(candidate, values, None);
+                }
+                let mut values = values.to_vec();
+                for column in candidate.columns.iter().skip(values.len()) {
+                    values.push(crate::engine::executor::insert::column_read_backfill_default(column));
+                }
+                materialize_generated_columns(candidate, &mut values, None)?;
+                self.check_check_constraints(candidate, &values, None)
+            },
         )
     }
 
@@ -3840,7 +3855,14 @@ impl Database {
         // B1 — drop any idle reservations any connection had for
         // this table. Their `next` is below the new counter and
         // would collide with values about to be allocated.
-        self.persist_auto_increment_max(table.id, max_value)
+        self.persist_auto_increment_max(table.id, max_value)?;
+        // This DDL may be the last write before a crash. Publish the same
+        // durability guarantee as an acknowledged ordinary transaction.
+        if self.config.durability != DurabilityMode::Memory {
+            let lsn = state.logged.lock().lsn;
+            self.sync_commit_lsn(lsn)?;
+        }
+        Ok(())
     }
 
     pub fn validate_alter_table_actions(
@@ -5536,12 +5558,16 @@ impl Database {
                     }
                 }
                 let key = table_key(&candidate.database, &candidate.name);
-                self.catalog_write()?
-                    .tables
-                    .insert(key.clone(), Arc::new(candidate.clone()));
+                {
+                    let mut catalog = self.catalog_write()?;
+                    catalog.tables.insert(key.clone(), Arc::new(candidate.clone()));
+                    build_fk_runtime(&mut catalog);
+                }
                 self.note_catalog_table(candidate.id);
                 if let Err(err) = self.commit_catalog_txn_existing(txn) {
-                    self.catalog_write()?.tables.insert(key, snapshot.clone());
+                    let mut catalog = self.catalog_write()?;
+                    catalog.tables.insert(key, snapshot.clone());
+                    build_fk_runtime(&mut catalog);
                     return Err(err);
                 }
                 Ok(())
@@ -5665,7 +5691,9 @@ impl Database {
                 ));
             }
             table.stats.indexes.remove(&normalize_name(index_name));
+            table.build_column_index();
             table.bump_schema_version();
+            build_fk_runtime(&mut catalog);
             (table_snapshot, dropped_index)
         };
         let mut retired = DropTableIntent {
@@ -7414,10 +7442,6 @@ impl Database {
         new_schema: &ColumnSchema,
     ) -> Result<(), QueryError> {
         let old = &table.columns[pos];
-        if !new_schema.nullable && table.foreign_keys.iter().any(|fk| fk.references_column(&old.name)
-            && (fk.on_delete == ReferentialAction::SetNull || fk.on_update == ReferentialAction::SetNull)) {
-            return Err(error(crate::error::catalog::ER_FK_COLUMN_NOT_NULL, format!("Column '{}' cannot be NOT NULL: needed in a foreign key constraint with SET NULL", old.name)));
-        }
         let type_changed =
             old.data_type != new_schema.data_type || old.unsigned != new_schema.unsigned;
         if !type_changed {
@@ -7469,7 +7493,13 @@ impl Database {
     ) -> Result<(), QueryError> {
         let old = &table.columns[pos];
         let type_changed =
-            old.data_type != new_schema.data_type || old.unsigned != new_schema.unsigned;
+            old.data_type != new_schema.data_type || old.unsigned != new_schema.unsigned
+                || old.charset != new_schema.charset || old.collation != new_schema.collation;
+        if !new_schema.nullable && table.foreign_keys.iter().any(|fk| fk.references_column(&old.name)
+            && (fk.on_delete == ReferentialAction::SetNull || fk.on_update == ReferentialAction::SetNull)) {
+            return Err(error(crate::error::catalog::ER_FK_COLUMN_NOT_NULL,
+                format!("Column '{}' cannot be NOT NULL: needed in a foreign key constraint with SET NULL", old.name)));
+        }
         if !type_changed {
             return Ok(());
         }
@@ -7511,6 +7541,8 @@ impl Database {
         let key = table_key(&database, &table_only);
         let table_id = candidate.id;
         let source = self.table(table_name)?;
+        let rebuild_fk = !source.foreign_keys.is_empty() || !source.fk_referenced_by.is_empty()
+            || !candidate.foreign_keys.is_empty() || !candidate.fk_referenced_by.is_empty();
         let renames: Vec<_> = source
             .columns
             .iter()
@@ -7565,6 +7597,9 @@ impl Database {
                     changed.push(other.id);
                 }
             }
+        }
+        if rebuild_fk {
+            build_fk_runtime(&mut *self.catalog_write()?);
         }
         self.refresh_heap_codec(table_id)?;
         for id in changed {
@@ -13444,11 +13479,11 @@ impl Database {
                     format!("EXCHANGE PARTITION: column '{}' charset, collation or generated expression differs", left.name),
                 ));
             }
-            if left.nullable != right.nullable || left.unsigned != right.unsigned {
+            if left.nullable != right.nullable || left.unsigned != right.unsigned || left.auto_increment != right.auto_increment {
                 return Err(error(
                     crate::error::catalog::ER_TABLES_DIFFERENT_METADATA,
                     format!(
-                        "EXCHANGE PARTITION: column '{}' nullability / unsigned attribute differs",
+                        "EXCHANGE PARTITION: column '{}' nullability / unsigned / AUTO_INCREMENT attribute differs",
                         left.name
                     ),
                 ));

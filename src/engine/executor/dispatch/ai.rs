@@ -904,21 +904,8 @@ pub(super) fn project(
         let SelectItem::Expr { expr, .. } = item else {
             continue;
         };
-        if let Some(Expr::Function { name, args, .. }) = eager_external_call(expr) {
-            for row in &rows {
-                let model = crate::engine::expr::eval_expr(&args[0], &schema, row)?;
-                let input = crate::engine::expr::eval_expr(&args[1], &schema, row)?;
-                if !matches!(model, Value::Null) && !matches!(input, Value::Null) {
-                    known_items = known_items.saturating_add(match &input {
-                        Value::Json(bytes) if name.eq_ignore_ascii_case("AI_EMBED_DETAIL") => {
-                            crate::engine::json::to_serde(bytes)?
-                                .as_array()
-                                .map_or(1, Vec::len)
-                        }
-                        _ => 1,
-                    });
-                }
-            }
+        for row in &rows {
+            known_items = known_items.saturating_add(projected_ai_items(expr, &schema, row)?);
         }
     }
     calls.validate_item_count(known_items)?;
@@ -1070,6 +1057,150 @@ impl crate::engine::api::ResultCursor for ExternalCursor {
     fn take_warnings(&mut self) -> crate::engine::api::SqlWarnings {
         std::mem::take(&mut *self.warnings.lock())
     }
+}
+
+/// Count materialized calls independently of batching eligibility. Pure branch
+/// predicates keep their SQL short-circuit semantics; branches depending on an
+/// external result reserve their conservative combined upper bound.
+fn projected_ai_items(
+    expr: &Expr,
+    schema: &TableSchema,
+    row: &[Value],
+) -> Result<usize, QueryError> {
+    let eval = |expr: &Expr| {
+        crate::engine::expr::with_suppressed_expression_warnings(|| {
+            crate::engine::expr::eval_expr(expr, schema, row)
+        })
+    };
+    let mut count = 0usize;
+    let mut failure = None;
+    crate::parser::visit::inspect_value_expr(
+        expr,
+        |node| {
+            if failure.is_some() {
+                return false;
+            }
+            let selected = (|| -> Result<Option<Option<&Expr>>, QueryError> {
+                match node {
+                    Expr::Function { name, args, .. } if ai::is_function(name) => {
+                        let model = eval(&args[0])?;
+                        let input = eval(&args[1])?;
+                        if !matches!(model, Value::Null) && !matches!(input, Value::Null) {
+                            let items = match &input {
+                                Value::Json(bytes)
+                                    if name.eq_ignore_ascii_case("AI_EMBED_DETAIL") =>
+                                {
+                                    crate::engine::json::to_serde(bytes)?
+                                        .as_array()
+                                        .map_or(1, Vec::len)
+                                }
+                                _ => 1,
+                            };
+                            count = count.saturating_add(items);
+                        }
+                        return Ok(Some(None));
+                    }
+                    Expr::Function { name, args, .. }
+                        if name.eq_ignore_ascii_case("IF")
+                            && args.len() == 3
+                            && !expr_has_ai(&args[0]) =>
+                    {
+                        return Ok(Some(Some(
+                            &args[if crate::engine::expr::truthy(&eval(&args[0])?) {
+                                1
+                            } else {
+                                2
+                            }],
+                        )));
+                    }
+                    Expr::Function { name, args, .. }
+                        if (name.eq_ignore_ascii_case("COALESCE")
+                            || name.eq_ignore_ascii_case("IFNULL")) =>
+                    {
+                        for arg in args {
+                            if expr_has_ai(arg) {
+                                return Ok(None);
+                            }
+                            if !matches!(eval(arg)?, Value::Null) {
+                                return Ok(Some(None));
+                            }
+                        }
+                        return Ok(Some(None));
+                    }
+                    Expr::Function { name, args, .. }
+                        if name.eq_ignore_ascii_case("NULLIF")
+                            && args.len() == 2
+                            && !expr_has_ai(&args[0]) =>
+                    {
+                        if matches!(eval(&args[0])?, Value::Null) {
+                            return Ok(Some(None));
+                        }
+                    }
+                    Expr::Case {
+                        operand,
+                        conditions,
+                        results,
+                        else_result,
+                    } if operand.as_deref().is_none_or(|v| !expr_has_ai(v))
+                        && conditions.iter().all(|v| !expr_has_ai(v)) =>
+                    {
+                        for (condition, result) in conditions.iter().zip(results) {
+                            let test = if let Some(operand) = operand {
+                                eval(&Expr::Binary {
+                                    left: operand.clone(),
+                                    op: crate::parser::BinaryOp::Eq,
+                                    right: Box::new(condition.clone()),
+                                })?
+                            } else {
+                                eval(condition)?
+                            };
+                            if crate::engine::expr::truthy(&test) {
+                                return Ok(Some(Some(result)));
+                            }
+                        }
+                        return Ok(Some(else_result.as_deref()));
+                    }
+                    Expr::Binary { left, op, .. }
+                        if !expr_has_ai(left)
+                            && matches!(
+                                op,
+                                crate::parser::BinaryOp::And | crate::parser::BinaryOp::Or
+                            ) =>
+                    {
+                        let value = eval(left)?;
+                        if (*op == crate::parser::BinaryOp::And
+                            && !matches!(value, Value::Null)
+                            && !crate::engine::expr::truthy(&value))
+                            || (*op == crate::parser::BinaryOp::Or
+                                && crate::engine::expr::truthy(&value))
+                        {
+                            return Ok(Some(None));
+                        }
+                    }
+                    _ => {}
+                }
+                Ok(None)
+            })();
+            match selected {
+                Ok(Some(branch)) => {
+                    if let Some(branch) = branch {
+                        match projected_ai_items(branch, schema, row) {
+                            Ok(items) => count = count.saturating_add(items),
+                            Err(err) => failure = Some(err),
+                        }
+                    }
+                    false
+                }
+                Ok(None) => true,
+                Err(err) => {
+                    failure = Some(err);
+                    false
+                }
+            }
+        },
+        |_| {},
+    );
+    failure.map_or(Ok(count), Err)
 }
 
 fn eager_external_call(expr: &Expr) -> Option<Expr> {

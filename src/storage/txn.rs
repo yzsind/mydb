@@ -3507,17 +3507,22 @@ impl TransactionManager {
         let mut replay_slots = hashbrown::HashMap::<_, _, ahash::RandomState>::default();
         for index in 0..records.len() {
             let header = records.header(index)?;
+            let started_unix_ms = if header.source_time_us == 0 {
+                current_unix_ms()
+            } else {
+                header.source_time_us / 1_000
+            };
             if header.record_type == WalRecordType::UndoRecord {
                 let undo = records.undo_record(index)?.expect("undo header");
                 let undo_id = &undo.undo_id;
                 let bytes = undo.bytes.as_ref();
                 manager.next_txn_id = manager.next_txn_id.max(header.txn_id + 1);
-                if let Ok(undo) =
+                let undo =
                     crate::storage::undo::decode_undo_record_metadata(bytes).or_else(|_| {
                         serde_json::from_slice::<UndoRecord>(bytes).map_err(|e| {
                             crate::error::catalog::ER_GET_ERRNO.error(format!("undo decode: {}", e))
                         })
-                    })
+                    })?;
                 {
                     replay_slots
                         .entry(header.txn_id)
@@ -3525,7 +3530,7 @@ impl TransactionManager {
                             txn_id: header.txn_id,
                             status: TxnStatus::Active,
                             start_scn: 0,
-                            started_unix_ms: current_unix_ms(),
+                            started_unix_ms,
                             commit_scn: None,
                             undo_head: UndoHead::default(),
                             is_writer: false,
@@ -3578,7 +3583,7 @@ impl TransactionManager {
                         txn_id: record.txn_id,
                         status: TxnStatus::Active,
                         start_scn: *start_scn,
-                        started_unix_ms: current_unix_ms(),
+                        started_unix_ms,
                         commit_scn: None,
                         undo_head: UndoHead::default(),
                         is_writer: false,
@@ -3665,7 +3670,7 @@ impl TransactionManager {
                         txn_id: record.txn_id,
                         status: TxnStatus::Active,
                         start_scn: 0,
-                        started_unix_ms: current_unix_ms(),
+                        started_unix_ms,
                         commit_scn: None,
                         undo_head: UndoHead::default(),
                         is_writer: false,
@@ -7956,5 +7961,36 @@ mod mvcc_registration_tests {
         txns.note_registered_txn(1);
         assert_eq!(txns.registered_txn_frontier, 99);
         assert!(txns.registered_txn_ranges.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod recovery_decode_audit_tests {
+    use super::*;
+    #[test]
+    fn five_audit_recovered_transaction_keeps_original_timestamp() {
+        let records = vec![crate::wal::WalRecord {
+            source_time_us: 5_000_000,
+            lsn: 1,
+            prev_txn_lsn: 0,
+            txn_id: 42,
+            payload: WalPayload::BeginTxn { start_scn: 1 },
+        }];
+        let (manager, _) = TransactionManager::from_wal_source(&records).unwrap();
+        assert_eq!(manager.slot(42).unwrap().started_unix_ms, 5_000);
+    }
+    #[test]
+    fn five_audit_recovery_rejects_undecodable_undo() {
+        let records = vec![crate::wal::WalRecord {
+            source_time_us: 1,
+            lsn: 1,
+            prev_txn_lsn: 0,
+            txn_id: 42,
+            payload: WalPayload::UndoRecord {
+                undo_id: 1,
+                bytes: b"invalid undo".to_vec(),
+            },
+        }];
+        assert!(TransactionManager::from_wal_source(&records).is_err());
     }
 }

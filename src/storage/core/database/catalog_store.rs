@@ -886,6 +886,13 @@ impl<'a> CatalogTxn<'a> {
         if lock_shards.is_empty() {
             lock_shards.push(0);
         }
+        // Checkpoint materialization takes this fence before DD shards.
+        // Preserve that lock order for AUTO_INCREMENT attribute retirement.
+        let _auto_fence = if self.replacements.iter().any(|r|
+            r.dd_table_id == crate::storage::data_dictionary::DD_COLUMNS
+            && !r.rows.iter().any(|row| row.get(9) == Some(&Value::Int(1)))) {
+            Some(self.db.auto_increment_checkpoint_fence.write())
+        } else { None };
         let mut _dd_commit_guards = Vec::with_capacity(lock_shards.len());
         for shard in lock_shards {
             _dd_commit_guards.push(CATALOG_DD_COMMIT_LOCKS[shard].lock().map_err(|_| {
@@ -958,6 +965,22 @@ impl<'a> CatalogTxn<'a> {
                     };
                 }
             }
+        }
+        let mut auto_retirements = Vec::new();
+        for replacement in &self.replacements {
+            if replacement.dd_table_id != crate::storage::data_dictionary::DD_COLUMNS
+                || replacement.rows.iter().any(|row| row.get(9) == Some(&Value::Int(1))) { continue; }
+            let Some(id) = replacement.selector.object_id() else { continue; };
+            let previous = self.db.catalog_rows_for_selector(replacement.dd_table_id, replacement.selector.clone())?;
+            if previous.iter().any(|row| row.get(9) == Some(&Value::Int(1))) { auto_retirements.push(id); }
+        }
+        for &id in &auto_retirements {
+            let disk_version = self.db.read_auto_increment_metadata(id)?.map_or(0, |row| row.0);
+            let version = self.db.auto_increment.get(id).map_or(0, |state| state.version.load(Ordering::Acquire))
+                .max(disk_version).checked_add(1).ok_or_else(|| error(crate::error::catalog::ER_AUTOINC_READ_FAILED, "AUTO_INCREMENT version overflow"))?;
+            self.replace(crate::storage::data_dictionary::DD_TABLE_DYNAMIC_METADATA,
+                CatalogRowSelector::PrimaryValues(vec![Value::UInt(id)]),
+                vec![vec![Value::UInt(id), Value::UInt(version), Value::UInt(0), Value::UInt(0)]]);
         }
         // DD row mutations are the physical implementation of the enclosing
         // DDL query. They must not appear as a second user binlog transaction;
@@ -1063,6 +1086,7 @@ impl<'a> CatalogTxn<'a> {
             CATALOG_TXN_ROLLBACKS.fetch_add(1, Ordering::Relaxed);
             return Err(err);
         }
+        for id in auto_retirements { self.db.auto_increment.forget_table(id); }
         CATALOG_MUTATED_ROWS.fetch_add(mutation_rows, Ordering::Relaxed);
         CATALOG_TXN_COMMITS.fetch_add(1, Ordering::Relaxed);
         for (old, new) in &self.sequence_changes {
