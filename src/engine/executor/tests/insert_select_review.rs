@@ -151,7 +151,7 @@ fn insert_select_multichunk_ignore_trailer() {
     assert_eq!(resp, QueryResponse::OkAffected { affected_rows: 80 });
     assert_eq!(
         crate::engine::api::peek_statement_info(),
-        "Records: 160 Duplicates: 80 Warnings: 80"
+        "Records: 160  Duplicates: 80  Warnings: 80"
     );
 }
 

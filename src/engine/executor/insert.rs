@@ -321,12 +321,12 @@ pub(super) fn enforce_missing_required_columns(
 /// duplicates gets no trailer — MySQL reports just "1 row affected" there.
 pub(super) fn finalize_insert_info(records: u64, is_select: bool) {
     let duplicates = crate::engine::api::take_insert_duplicates();
-    if records == 1 && duplicates == 0 && !is_select {
+    if records == 1 && !is_select {
         return;
     }
     let warnings = crate::engine::api::statement_warning_count();
     crate::engine::api::set_statement_info(format!(
-        "Records: {records} Duplicates: {duplicates} Warnings: {warnings}"
+        "Records: {records}  Duplicates: {duplicates}  Warnings: {warnings}"
     ));
 }
 
@@ -406,8 +406,8 @@ pub(super) fn execute_insert(
         }
         InsertSource::Query(select) => {
             let table = db.table(&stmt.table)?.clone();
-            if insert_targets_generated(&table, stmt.columns.as_deref())? {
-                return Err(generated_column_assignment_error());
+            if let Some(column) = insert_targets_generated(&table, stmt.columns.as_deref())? {
+                return Err(generated_column_assignment_error(&table, column));
             }
             // For INSERT … SELECT the PARTITION clause similarly enforces
             // the routed-partition constraint. The per-chunk path below
@@ -482,8 +482,8 @@ pub(super) fn execute_insert_borrowed(
         // wrapper on every execute.
         InsertSource::Query(select) => {
             let table = db.table(&stmt.table)?;
-            if insert_targets_generated(&table, stmt.columns.as_deref())? {
-                return Err(generated_column_assignment_error());
+            if let Some(column) = insert_targets_generated(&table, stmt.columns.as_deref())? {
+                return Err(generated_column_assignment_error(&table, column));
             }
             execute_insert_from_select_stream(
                 db,
@@ -1964,13 +1964,13 @@ where
         .any(|&column| table.columns[column].generated_expr.is_some());
     let expr_rows = expr_rows.into_iter();
     let mut rows = Vec::with_capacity(expr_rows.size_hint().0);
-    for row in expr_rows {
+    for (row_index, row) in expr_rows.enumerate() {
         crate::engine::cancel::check_cancelled()?;
         let expressions = row.as_ref();
         if expressions.len() != column_indexes.len() {
             return Err(error(
                 crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                "column count does not match value count",
+                format!("Column count doesn't match value count at row {}", row_index + 1),
             ));
         }
         let simple = !has_generated_target
@@ -2020,7 +2020,7 @@ where
                 let explicit_default = explicit_lob_default(expr.borrow(), &table.columns[column])?;
                 if !simple && table.columns[column].generated_expr.is_some() {
                     if !expr_is_default_for_column(expr.borrow(), &table.columns[column].name) {
-                        return Err(generated_column_assignment_error());
+                        return Err(generated_column_assignment_error(&table, column));
                     }
                     return Ok(Value::Null);
                 }
@@ -2048,7 +2048,8 @@ where
                 }
                 Ok(value)
             })
-            .collect::<Result<Vec<Value>, QueryError>>()?;
+            .collect::<Result<Vec<Value>, QueryError>>()
+            .map_err(|err| err.with_input_row_number(row_index + 1))?;
         rows.push(values);
     }
     Ok(rows)
@@ -2241,7 +2242,7 @@ fn validate_on_duplicate_assignments(
         if table.columns[idx].generated_expr.is_some()
             && !expr_is_default_for_column(&assignment.value, &table.columns[idx].name)
         {
-            return Err(generated_column_assignment_error());
+            return Err(generated_column_assignment_error(table, idx));
         }
     }
     Ok(())
@@ -3489,7 +3490,7 @@ pub(super) fn execute_insert_values(
         .columns
         .iter()
         .any(|column| column.generated_expr.is_some());
-    for row in &mut rows {
+    for (row_index, row) in rows.iter_mut().enumerate() {
         crate::engine::cancel::check_cancelled()?;
         if row.len() != column_indexes.len() {
             return Err(error(
@@ -3499,7 +3500,7 @@ pub(super) fn execute_insert_values(
         }
         if full_width_identity {
             if has_generated {
-                db.materialize_generated_columns_for_insert(&table, row)?;
+                db.materialize_generated_columns_for_insert(&table, row).map_err(|err| err.with_input_row_number(row_index + 1))?;
             }
             continue;
         }
@@ -3507,7 +3508,7 @@ pub(super) fn execute_insert_values(
             expand_ordered_insert_row(&table, &column_indexes, &missing_positions, row);
             enforce_missing_required_columns(&table, row, &missing_required, false)?;
             if has_generated {
-                db.materialize_generated_columns_for_insert(&table, row)?;
+                db.materialize_generated_columns_for_insert(&table, row).map_err(|err| err.with_input_row_number(row_index + 1))?;
             }
             continue;
         }
@@ -3536,7 +3537,7 @@ pub(super) fn execute_insert_values(
         // The plain (non-IGNORE) VALUES path: IGNORE/REPLACE/ODKU are routed to
         // `execute_insert_with_conflict`, so `ignore` is always false here.
         enforce_missing_required_columns(&table, &mut values, &missing_required, false)?;
-        db.materialize_generated_columns_for_insert(&table, &mut values)?;
+        db.materialize_generated_columns_for_insert(&table, &mut values).map_err(|err| err.with_input_row_number(row_index + 1))?;
         *row = values;
     }
     let inserted = if autoinc_fast {
@@ -3618,11 +3619,9 @@ pub(super) fn insert_column_indexes(
 pub(super) fn insert_targets_generated(
     table: &TableSchema,
     columns: Option<&[String]>,
-) -> Result<bool, QueryError> {
+) -> Result<Option<usize>, QueryError> {
     let column_indexes = insert_column_indexes(table, columns)?;
-    Ok(column_indexes
-        .iter()
-        .any(|idx| table.columns[*idx].generated_expr.is_some()))
+    Ok(column_indexes.into_iter().find(|idx| table.columns[*idx].generated_expr.is_some()))
 }
 
 fn expr_is_default_for_column(expr: &Expr, column: &str) -> bool {
@@ -3633,10 +3632,10 @@ fn expr_is_default_for_column(expr: &Expr, column: &str) -> bool {
     }
 }
 
-fn generated_column_assignment_error() -> QueryError {
+fn generated_column_assignment_error(table: &TableSchema, column: usize) -> QueryError {
     error(
         crate::error::catalog::ER_NON_DEFAULT_VALUE_FOR_GENERATED_COLUMN,
-        "value specified for generated column is not allowed; use DEFAULT",
+        format!("The value specified for generated column '{}' in table '{}' is not allowed.", table.columns[column].name, table.name),
     )
 }
 

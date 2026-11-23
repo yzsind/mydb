@@ -1336,7 +1336,7 @@ fn g3_multi_row_insert_info_trailer() {
         .unwrap();
     assert_eq!(
         take_statement_info(),
-        "Records: 3 Duplicates: 0 Warnings: 0"
+        "Records: 3  Duplicates: 0  Warnings: 0"
     );
 }
 
@@ -1373,7 +1373,7 @@ fn g3_odku_duplicates_counted() {
         .unwrap();
     assert_eq!(
         take_statement_info(),
-        "Records: 2 Duplicates: 1 Warnings: 1"
+        "Records: 2  Duplicates: 1  Warnings: 1"
     );
 }
 
@@ -1392,7 +1392,7 @@ fn g3_replace_duplicates_counted() {
         .unwrap();
     assert_eq!(
         take_statement_info(),
-        "Records: 2 Duplicates: 1 Warnings: 0"
+        "Records: 2  Duplicates: 1  Warnings: 0"
     );
 }
 
@@ -1523,7 +1523,7 @@ fn replace_on_triggered_table_counts_duplicates_in_info() {
         .unwrap();
     assert_eq!(
         take_statement_info(),
-        "Records: 2 Duplicates: 1 Warnings: 0"
+        "Records: 2  Duplicates: 1  Warnings: 0"
     );
     // The AFTER DELETE trigger ran exactly once for the replaced row.
     let audit = rows_of(engine.execute("SELECT COUNT(*) FROM audit").unwrap());
@@ -1624,10 +1624,7 @@ fn replace_multi_unique_key_deletes_all_conflicts() {
         }
         other => panic!("expected OkAffected, got {other:?}"),
     }
-    assert_eq!(
-        take_statement_info(),
-        "Records: 1 Duplicates: 2 Warnings: 0"
-    );
+    assert!(take_statement_info().is_empty());
     let out = rows_of(
         engine
             .execute("SELECT id, a, b FROM t ORDER BY id")
@@ -1691,7 +1688,7 @@ fn g3_insert_select_info_trailer() {
     engine.execute("INSERT INTO dst SELECT * FROM src").unwrap();
     assert_eq!(
         take_statement_info(),
-        "Records: 2 Duplicates: 0 Warnings: 0"
+        "Records: 2  Duplicates: 0  Warnings: 0"
     );
 }
 

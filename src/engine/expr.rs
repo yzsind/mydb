@@ -1590,6 +1590,13 @@ impl SessionView<'_> {
             SessionView::Owned(i) => i.user_variables.get(key).cloned(),
         }
     }
+    fn user_variable_is_binary_or_null(&self, key: &str) -> bool {
+        let value = match self {
+            SessionView::Borrowed(session) => session.user_variables.get(key),
+            SessionView::Owned(info) => info.user_variables.get(key),
+        };
+        value.is_none_or(|value| matches!(value, Value::Null | Value::Bytes(_)))
+    }
     fn only_full_group_by(&self) -> bool {
         let sql_mode = match self {
             SessionView::Borrowed(s) => s.sql_mode.as_str(),
@@ -8209,7 +8216,15 @@ where
         "SEC_TO_TIME" => {
             let value = eval_one(name, args, &mut eval_arg)?;
             null_or(value, |value| {
-                let micros = (numeric(&value)? * 1_000_000.0).round().clamp(
+                let seconds = numeric(&value)?;
+                if seconds.abs() > TIME_MAX_SECONDS as f64 {
+                    crate::engine::api::push_statement_warning(
+                        crate::error::ConditionLevel::Warning,
+                        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                        format!("Truncated incorrect time value: '{}'", diagnostic_value(&str_value(&value))),
+                    );
+                }
+                let micros = (seconds * 1_000_000.0).round().clamp(
                     -(TIME_MAX_SECONDS as f64) * 1_000_000.0,
                     TIME_MAX_SECONDS as f64 * 1_000_000.0,
                 ) as i64;
@@ -11516,7 +11531,7 @@ where
             } else {
                 compare_values(&value, &best)?
             };
-            if (greatest && ordering == Ordering::Greater)
+            if (greatest && (ordering == Ordering::Greater || (string_context && ordering == Ordering::Equal)))
                 || (!greatest && ordering == Ordering::Less)
             {
                 best = value;
@@ -13961,7 +13976,8 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
     // displacement identifies an instant; DATETIME conversion renders that
     // instant in the current session time zone (unlike a naive datetime
     // string, whose fields are preserved verbatim).
-    if let Ok(with_offset) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f%:z") {
+    if let Some(with_offset) = chrono::DateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f%:z")
+        .ok().filter(|dt| dt.nanosecond() < 1_000_000_000) {
         let utc_micros = with_offset.timestamp_micros();
         let local_micros = session_utc_timestamp_to_local_datetime_micros(utc_micros)?;
         if let Some(local) = chrono::DateTime::from_timestamp_micros(local_micros) {
@@ -13979,6 +13995,7 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
                 date.and_hms_micro_opt(parts.hour, parts.minute, parts.second, parts.micros)
             })
         {
+            warn_superfluous_datetime_delimiter(trimmed);
             return Ok(dt);
         }
     }
@@ -13989,7 +14006,8 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
         "%Y-%m-%d %H:%M",
         "%Y-%m-%dT%H:%M:%S",
     ] {
-        if let Ok(dt) = NaiveDateTime::parse_from_str(trimmed, fmt) {
+        if let Some(dt) = NaiveDateTime::parse_from_str(trimmed, fmt)
+            .ok().filter(|dt| dt.nanosecond() < 1_000_000_000) {
             return Ok(dt);
         }
     }
@@ -14000,10 +14018,12 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
     // (`10:30:45.123456`) so EXTRACT(MICROSECOND / *_MICROSECOND …) and other
     // time functions accept sub-second precision like MySQL. The fractional
     // form is tried first; `%H:%M:%S` remains for the no-fraction case.
-    if let Ok(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f") {
+    if let Some(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S%.f")
+        .ok().filter(|time| time.nanosecond() < 1_000_000_000) {
         return Ok(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_time(time));
     }
-    if let Ok(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S") {
+    if let Some(time) = NaiveTime::parse_from_str(trimmed, "%H:%M:%S")
+        .ok().filter(|time| time.nanosecond() < 1_000_000_000) {
         return Ok(NaiveDate::from_ymd_opt(1970, 1, 1).unwrap().and_time(time));
     }
     // MySQL compact numeric date/datetime forms: `20200101`, `991231`,
@@ -14031,6 +14051,21 @@ pub(crate) fn parse_datetime(value: &Value) -> Result<NaiveDateTime, QueryError>
         crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
         "incorrect datetime value",
     ))
+}
+
+pub(crate) fn warn_superfluous_datetime_delimiter(text: &str) {
+    let text = text.trim();
+    let Some(separator) = text.bytes().position(|byte| matches!(byte, b' ' | b'T')) else {
+        return;
+    };
+    let Some(&delimiter) = text.as_bytes().get(separator + 1).filter(|byte| byte.is_ascii_punctuation()) else {
+        return;
+    };
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        crate::error::catalog::ER_WARN_DEPRECATED_SUPERFLUOUS_DELIMITER,
+        format!("Delimiter '{}' in position {} in datetime value '{}' at row 1 is superfluous and is deprecated. Please remove.", char::from(delimiter), separator + 1, diagnostic_value(text)),
+    );
 }
 
 /// Coerce a constant comparison operand into the physical temporal lane used
@@ -23459,12 +23494,33 @@ pub(crate) fn validate_expr_collations(expr: &Expr, table: &TableSchema) -> Resu
                 if upper == "COLLATE" && args.len() == 2 {
                     if let Expr::Literal(Literal::String(name)) = &args[1] {
                         let target = crate::charset::resolve_collation(name)?;
-                        if let Some(source) = expr_collation_memo(&args[0], table, memo) {
-                            if source.charset != target.charset && source.charset != "binary" {
+                        let source = expr_collation_memo(&args[0], table, memo);
+                        // Inspect the domain without cloning a potentially
+                        // large string/blob just to validate its charset.
+                        let binary_variable = match &args[0] {
+                            Expr::UserVariable(name) => {
+                                let key = crate::engine::api::normalize_user_variable_name(name);
+                                with_session_view(|view| view.is_none_or(|view| view.user_variable_is_binary_or_null(&key)))
+                            }
+                            _ => false,
+                        };
+                        let bit_string = expr_column_index(&args[0], table)
+                            .and_then(|index| table.columns.get(index))
+                            .is_some_and(|column| matches!(column.data_type, DataTypeKind::Bit { .. }));
+                        let source_charset = if binary_variable || bit_string {
+                            Some("binary")
+                        } else {
+                            source.map(|source| source.charset).or_else(|| {
+                                matches!(expr_type_descriptor(&args[0], table).class,
+                                    ExprTypeClass::Null).then_some("binary")
+                            })
+                        };
+                        if let Some(source_charset) = source_charset {
+                            if source_charset != target.charset {
                                 return Err(crate::error::catalog::ER_COLLATION_CHARSET_MISMATCH
                                     .error(format!(
                                         "COLLATION '{}' is not valid for CHARACTER SET '{}'",
-                                        name, source.charset
+                                        name, source_charset
                                     )));
                             }
                         }
@@ -28859,7 +28915,7 @@ fn lenient_str_to_f64(s: &str) -> Result<f64, QueryError> {
             match context {
                 Some(NumericComparisonContext { numeric_kind, .. }) => {
                     let kind = match numeric_kind {
-                        NumericComparisonKind::Integer => "INTEGER",
+                        NumericComparisonKind::Integer => "DOUBLE",
                         NumericComparisonKind::Decimal => "DECIMAL",
                         NumericComparisonKind::Double => "DOUBLE",
                     };

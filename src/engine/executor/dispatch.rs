@@ -8172,6 +8172,7 @@ pub(super) fn execute_qualified_statement(
         }
         Statement::Prepare { name, source } => {
             execute_sql_prepare(db, session, name, source, registry)?;
+            crate::engine::api::set_statement_info("Statement prepared".to_string());
             Ok(QueryResponse::Ok)
         }
         Statement::ExecutePrepared { name, using } => {
@@ -9259,6 +9260,14 @@ pub(super) fn execute_qualified_statement(
                 }
             }
             revalidate_altered_table_views(db, session, &alter_db, &alter_name)?;
+            if maintenance_rows.is_empty() {
+                let records = if db.table(&table_name)?.active_generation != _alter_source.active_generation {
+                    let current = db.table(&table_name)?;
+                    current.stats.row_count.saturating_add_signed(db.table_live_row_delta(current.id))
+                } else { 0 };
+                let warnings = crate::engine::api::statement_warning_count();
+                crate::engine::api::set_statement_info(format!("Records: {records}  Duplicates: 0  Warnings: {warnings}"));
+            }
             if db.table(&table_name)?.active_generation != _alter_source.active_generation
                 && maintenance_rows.is_empty()
             {

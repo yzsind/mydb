@@ -159,6 +159,15 @@ pub fn parse_boolean_query(
             return Err(malformed());
         }
         if let Some(stripped) = word.strip_suffix('*') {
+            // Long ngram operands are phrases, not prefixes of the fixed-width
+            // indexed tokens. Keep short prefixes unfiltered, including stopwords.
+            if tokenizer.ngram_size().is_some_and(|n| stripped.chars().count() > n) {
+                let tokens = tokenizer.tokenize(stripped);
+                if !tokens.is_empty() {
+                    clauses.push(BoolClause { occur, matcher: Matcher::Phrase(tokens) });
+                }
+                continue;
+            }
             let prefix = tokenizer.normalize_word(stripped);
             if !prefix.is_empty() {
                 clauses.push(BoolClause {
@@ -276,6 +285,18 @@ mod tests {
         let c = parse_boolean_query("+data*", default_tok().as_ref()).unwrap();
         assert_eq!(c[0].occur, Occur::Must);
         assert_eq!(c[0].matcher, Matcher::Prefix("data".into()));
+    }
+
+    #[test]
+    fn issue67_ngram_prefixes_follow_the_persisted_character_width() {
+        for n in 1..=4 {
+            let tokenizer = build_tokenizer("ngram", Some(n));
+            let clauses = parse_boolean_query("数据库系统*", tokenizer.as_ref()).unwrap();
+            assert_eq!(clauses[0].matcher, Matcher::Phrase(tokenizer.tokenize("数据库系统")));
+            let prefix = "数据".chars().take(n.min(2)).collect::<String>();
+            let clauses = parse_boolean_query(&format!("{prefix}*"), tokenizer.as_ref()).unwrap();
+            assert_eq!(clauses[0].matcher, Matcher::Prefix(tokenizer.normalize_word(&prefix)));
+        }
     }
 
     #[test]

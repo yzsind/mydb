@@ -6670,7 +6670,8 @@ pub(crate) fn parse_datetime_to_micros(s: &str) -> Result<i64, QueryError> {
         "%Y-%m-%dT%H:%M:%S%.f",
         "%Y-%m-%dT%H:%M:%S",
     ] {
-        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt) {
+        if let Some(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, fmt)
+            .ok().filter(|dt| chrono::Timelike::nanosecond(dt) < 1_000_000_000) {
             return Ok(dt.and_utc().timestamp_micros());
         }
     }

@@ -805,8 +805,8 @@ impl Database {
             .iter()
             .any(|column| column.generated_expr.is_some());
         let mut prepared_rows = Vec::with_capacity(rows.len());
-        for mut values in rows {
-            coerce_row(&table, &mut values)?;
+        for (row_index, mut values) in rows.into_iter().enumerate() {
+            coerce_row(&table, &mut values).map_err(|err| err.with_input_row_number(row_index + 1))?;
             if has_generated_columns {
                 materialize_generated_columns(&table, &mut values, None)?;
             }
@@ -952,9 +952,9 @@ impl Database {
                 } else {
                     Vec::new()
                 };
-            for values in &mut rows {
+            for (row_index, values) in rows.iter_mut().enumerate() {
                 if !hints.rows_prepared {
-                    coerce_row(&table, values)?;
+                    coerce_row(&table, values).map_err(|err| err.with_input_row_number(row_index + 1))?;
                     if has_generated_columns {
                         materialize_generated_columns(&table, values, None)?;
                     }
@@ -1260,7 +1260,7 @@ impl Database {
             }
             let mut prepared: Vec<Prepared> = Vec::with_capacity(rows.len());
             for (orig_idx, mut values) in rows.into_iter().enumerate() {
-                coerce_row(table, &mut values)?;
+                coerce_row(table, &mut values).map_err(|err| err.with_input_row_number(orig_idx + 1))?;
                 materialize_generated_columns(table, &mut values, None)?;
                 for index in table
                     .indexes
@@ -1612,8 +1612,8 @@ impl Database {
                     .filter(|index| index.enforces_uniqueness())
                     .map(|index| (index.name.clone(), crate::util::fast_hash::ah_hash_set()))
                     .collect::<BTreeMap<_, crate::util::fast_hash::AhHashSet<IndexKey>>>();
-                for mut values in rows {
-                    coerce_row(&table, &mut values)?;
+                for (row_index, mut values) in rows.into_iter().enumerate() {
+                    coerce_row(&table, &mut values).map_err(|err| err.with_input_row_number(row_index + 1))?;
                     materialize_generated_columns(&table, &mut values, None)?;
                     for index in table
                         .indexes
@@ -1664,8 +1664,8 @@ impl Database {
                     None,
                 )?;
             } else {
-                for mut values in rows {
-                    coerce_row(&table, &mut values)?;
+                for (row_index, mut values) in rows.into_iter().enumerate() {
+                    coerce_row(&table, &mut values).map_err(|err| err.with_input_row_number(row_index + 1))?;
                     materialize_generated_columns(&table, &mut values, None)?;
                     prepared_rows.push(values);
                 }
@@ -1890,8 +1890,8 @@ impl Database {
                 &mut rows,
             )?;
             let mut prepared_rows = Vec::with_capacity(rows.len());
-            for mut values in rows {
-                coerce_row(&table, &mut values)?;
+            for (row_index, mut values) in rows.into_iter().enumerate() {
+                coerce_row(&table, &mut values).map_err(|err| err.with_input_row_number(row_index + 1))?;
                 materialize_generated_columns(&table, &mut values, None)?;
                 prepared_rows.push(values);
             }

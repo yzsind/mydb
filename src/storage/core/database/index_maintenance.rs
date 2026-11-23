@@ -3601,6 +3601,7 @@ impl Database {
         let state = self.auto_increment_state(table.id, initial_max)?;
         let column = &table.columns[idx];
         let (step, offset) = crate::engine::expr::session_auto_increment();
+        let max_allowed = auto_increment_type_max(&column.data_type, column.unsigned)?;
         let (first_insert_id, max_seen) = loop {
             let base = state.max_value.load(Ordering::Acquire);
             let mut first_insert_id = 0;
@@ -3615,6 +3616,9 @@ impl Database {
                 })?;
                 if should_assign_auto_increment(current) {
                     let next = next_auto_increment_after(max_seen, step, offset)?;
+                    // Unit-step exhaustion leaves the last column value to
+                    // ordinary unique-key handling, including IGNORE/ODKU.
+                    let next = if step == 1 { next.min(max_allowed) } else { next };
                     generated.push(next);
                     if first_insert_id == 0 {
                         first_insert_id = next;
@@ -3691,6 +3695,15 @@ impl Database {
                     "auto-increment value is out of range",
                 )
             })?;
+            if step == 1 && new_max > max_allowed {
+                if current < max_allowed {
+                    return Err(error(
+                        crate::error::catalog::ER_AUTOINC_READ_FAILED,
+                        "Failed to read auto-increment value from storage engine",
+                    ));
+                }
+                return self.assign_auto_increment_values_legacy(table, rows, idx);
+            }
             if state
                 .max_value
                 .compare_exchange_weak(current, new_max, Ordering::AcqRel, Ordering::Acquire)

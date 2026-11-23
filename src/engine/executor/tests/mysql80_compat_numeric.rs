@@ -1049,7 +1049,7 @@ fn integer_assignment_uses_exact_numeric_prefix_rounding_and_mode_policy() {
             "INSERT INTO integer_assignment_text (i) VALUES ('1.2.3')",
         )
         .unwrap_err();
-    assert_eq!((err.code(), err.sql_state().as_ref()), (1366, "HY000"));
+    assert_eq!((err.code(), err.sql_state().as_ref()), (1265, "01000"));
 }
 
 #[test]

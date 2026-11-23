@@ -428,7 +428,7 @@ pub(crate) fn show_tables(
     filter: Option<&ShowFilter>,
 ) -> Result<QueryResponse, QueryError> {
     require_show_database(db, database)?;
-    let columns = show_tables_columns(database, full);
+    let columns = show_tables_columns(database, full, filter);
     if let Some(rows) = crate::engine::information_schema::show_tables_rows(db, database, full)? {
         let mut rows = rows;
         rows.retain(|row| {
@@ -445,7 +445,7 @@ pub(crate) fn show_tables(
             &mut rows,
             &columns,
             filter,
-            &format!("Tables_in_{database}"),
+            &columns[0].name,
         )?;
         return Ok(QueryResponse::ResultSet(ResultSet { columns, rows }));
     }
@@ -504,7 +504,7 @@ pub(crate) fn show_tables(
         &mut rows,
         &columns,
         filter,
-        &format!("Tables_in_{database}"),
+        &columns[0].name,
     )?;
     Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
 }
@@ -513,10 +513,13 @@ pub(crate) fn show_tables(
 // after MySQL's Tables_in_<db> and Table_type columns we append TABLE_ROWS, DATA_LENGTH,
 // INDEX_LENGTH, CREATE_TIME and TABLE_COMMENT. The design covers user and system
 // databases alike and must not be dropped as a MySQL compatibility gap; plain SHOW TABLES still returns only the table-name column.
-pub(crate) fn show_tables_columns(database: &str, full: bool) -> Vec<Column> {
+pub(crate) fn show_tables_columns(database: &str, full: bool, filter: Option<&ShowFilter>) -> Vec<Column> {
     let mut columns = vec![Column {
         source: Default::default(),
-        name: format!("Tables_in_{database}"),
+        name: match filter {
+            Some(ShowFilter::Like(pattern)) => format!("Tables_in_{database} ({pattern})"),
+            _ => format!("Tables_in_{database}"),
+        },
         column_type: ColumnType::VarString,
     }];
     if full {
@@ -2112,14 +2115,14 @@ pub(crate) fn default_value_sql(value: &Value) -> String {
         | Value::DateTime(_)
         | Value::Timestamp(_)
         | Value::Vector(_) => escape_sql_string_literal(&value_to_string(value)),
-        other => value_to_string(other),
+        other => escape_sql_string_literal(&value_to_string(other)),
     }
 }
 
 /// Column-level `CHARACTER SET` / `COLLATE` echo, following MySQL's
-/// SHOW CREATE TABLE elision rules: nothing when the column inherits
-/// the table default; `CHARACTER SET` only when the charset differs
-/// from the table's; `COLLATE` only when the collation is not the
+/// SHOW CREATE TABLE elision rules: `CHARACTER SET` when the effective
+/// column charset or collation differs from the table's; `COLLATE` when
+/// the column collation is not the
 /// charset's default one.
 fn column_charset_collate_sql(
     table: &TableSchema,
@@ -2169,11 +2172,8 @@ fn column_charset_collate_sql(
             (cs, coll)
         }
     };
-    if effective_charset == table_charset && effective_collation == table_collation {
-        return String::new();
-    }
     let mut out = String::new();
-    if effective_charset != table_charset {
+    if effective_charset != table_charset || effective_collation != table_collation {
         out.push_str(&format!(" CHARACTER SET {effective_charset}"));
     }
     let charset_default = crate::charset::default_collation_for_charset(&effective_charset)

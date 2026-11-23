@@ -1299,7 +1299,7 @@ fn show_full_tables_includes_table_statistics_and_metadata() {
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "Tables_in_test",
+            "Tables_in_test (orders%)",
             "Table_type",
             "TABLE_ROWS",
             "DATA_LENGTH",

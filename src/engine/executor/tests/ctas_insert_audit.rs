@@ -335,7 +335,7 @@ fn audit_trigger_ignore_info_survives_nested_statements() {
             "INSERT IGNORE INTO t SELECT 1 UNION ALL SELECT 2",
         )
         .unwrap();
-    assert!(crate::engine::api::peek_statement_info().contains("Records: 2 Duplicates: 1"));
+    assert!(crate::engine::api::peek_statement_info().contains("Records: 2  Duplicates: 1"));
 }
 
 #[test]

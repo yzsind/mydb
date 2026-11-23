@@ -2610,7 +2610,14 @@ fn rows(
             Ok(collation_applicability_rows())
         }
         ("information_schema", "engines") => Ok(engines_rows()),
-        ("information_schema", "processlist") => Ok(processlist_rows(db, registry)),
+        ("information_schema", "processlist") => {
+            crate::engine::api::push_static_statement_warning(
+                crate::error::ConditionLevel::Warning,
+                crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
+                "'INFORMATION_SCHEMA.PROCESSLIST' is deprecated and will be removed in a future release. Please use performance_schema.processlist instead",
+            );
+            Ok(processlist_rows(db, registry))
+        }
         ("information_schema", "global_variables") => system_variables_rows_scoped(
             db,
             crate::engine::sysvar::Scope::Global,
