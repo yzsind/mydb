@@ -765,3 +765,32 @@ fn online_analyze_warm_throughput_benchmark() {
         eprintln!("ANALYZE_BENCH width={width} us={times:?}");
     }
 }
+
+#[test]
+fn audit1123_kill_connection_cancels_analyze_before_publication() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = std::sync::Arc::new(open_test_engine(root.path()));
+    engine.execute("CREATE TABLE killed_stats(id INT)").unwrap();
+    engine
+        .execute("INSERT INTO killed_stats VALUES(1),(2)")
+        .unwrap();
+    let db = engine.database();
+    let before = db.table("killed_stats").unwrap().schema_version;
+    let registry = crate::engine::SessionRegistry::new();
+    let handle = registry.register(1123003, "root".into(), "localhost".into(), "test".into());
+    let token = crate::engine::cancel::QueryCancelToken::from_session(handle);
+    let hook = db.install_analyze_test_hook();
+    let worker = engine.clone();
+    let analyze = std::thread::spawn(move || {
+        let mut session = SessionContext::default();
+        session.connection_id = 1123003;
+        session.current_query_token = Some(token);
+        worker.execute_with_session(&mut session, "ANALYZE TABLE killed_stats")
+    });
+    let reached = hook.wait_until_reached(Duration::from_secs(10));
+    registry.kill_connection(1123003).unwrap();
+    hook.release();
+    assert!(reached);
+    assert_eq!(analyze.join().unwrap().unwrap_err().code(), 1317);
+    assert_eq!(db.table("killed_stats").unwrap().schema_version, before);
+}

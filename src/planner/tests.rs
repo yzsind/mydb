@@ -6460,3 +6460,145 @@ fn issue_5_index_join_pruning_uses_schema_column_slots() {
     assert!(columns.contains(&table.schema.column_index("payload").unwrap()));
     assert!(!columns.contains(&table.schema.column_index("extra").unwrap()));
 }
+
+#[test]
+fn audit1123_explicit_histograms_estimate_skewed_ranges_and_survive_reopen() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    {
+        let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+        engine
+            .execute("CREATE TABLE skew(id INT,v VARCHAR(20),n INT)")
+            .unwrap();
+        engine.execute("INSERT INTO skew SELECT n,IF(n<990,'A',CONCAT('B',n)),IF(n<990,0,n) FROM generate_series(1,1000) s(n)").unwrap();
+        engine.execute("ANALYZE TABLE skew").unwrap();
+        engine
+            .execute("ANALYZE TABLE skew UPDATE HISTOGRAM ON v,n WITH 16 BUCKETS")
+            .unwrap();
+        engine.shutdown().unwrap();
+    }
+    let engine = crate::engine::StorageQueryEngine::open(dir.path()).unwrap();
+    let table = engine.db_for_tests().table("skew").unwrap();
+    for (column, bound) in [("v", Value::String("A".into())), ("n", Value::Int(0))] {
+        assert!(
+            (estimate_range_rows_for_column(
+                &table,
+                column,
+                Some((BinaryOp::Gt, &bound)),
+                None,
+                1000.0
+            ) - 11.0)
+                .abs()
+                < 0.001
+        );
+        assert!(
+            (estimate_range_rows_for_column(
+                &table,
+                column,
+                Some((BinaryOp::LtEq, &bound)),
+                None,
+                1000.0
+            ) - 989.0)
+                .abs()
+                < 0.001
+        );
+        assert_eq!(
+            estimate_range_rows_for_column(
+                &table,
+                column,
+                Some((BinaryOp::Gt, &bound)),
+                Some((BinaryOp::LtEq, &bound)),
+                1000.0
+            ),
+            0.0
+        );
+    }
+    engine
+        .execute("CREATE TABLE mixed_domain(v VARCHAR(20))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO mixed_domain VALUES('01'),('2'),('10')")
+        .unwrap();
+    engine.execute("ANALYZE TABLE mixed_domain").unwrap();
+    engine
+        .execute("ANALYZE TABLE mixed_domain UPDATE HISTOGRAM ON v")
+        .unwrap();
+    let with_histogram = engine.db_for_tests().table("mixed_domain").unwrap();
+    let mut without_histogram = with_histogram.as_ref().clone();
+    without_histogram.stats.explicit_histograms.clear();
+    let bound = Value::Int(2);
+    assert_eq!(
+        estimate_range_rows_for_column(
+            &with_histogram,
+            "v",
+            Some((BinaryOp::Gt, &bound)),
+            None,
+            3.0
+        ),
+        estimate_range_rows_for_column(
+            &without_histogram,
+            "v",
+            Some((BinaryOp::Gt, &bound)),
+            None,
+            3.0
+        ),
+        "a numeric comparison cannot use a lexically sorted text histogram"
+    );
+}
+
+#[test]
+fn audit1123_boolean_fulltext_cardinality_distinguishes_union_and_required_terms() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(root.path());
+    engine
+        .execute("CREATE TABLE ft(s TEXT,FULLTEXT KEY f(s))")
+        .unwrap();
+    engine.execute("INSERT INTO ft SELECT IF(n=1,'rareword','commonword') FROM generate_series(1,1000) s(n)").unwrap();
+    engine.execute("ANALYZE TABLE ft").unwrap();
+    let table = engine.db_for_tests().table("ft").unwrap();
+    let index = table
+        .indexes
+        .iter()
+        .find(|i| i.is_fulltext())
+        .unwrap()
+        .clone();
+    for (query, expected) in [
+        ("commonword rareword", 1000.0),
+        ("+commonword +rareword", 1.0),
+        ("-commonword", 0.0),
+    ] {
+        let spec = FulltextMatchPlan {
+            index: index.clone(),
+            mode: crate::parser::FtMode::Boolean,
+            query: query.into(),
+            query_param: None,
+            columns: vec!["s".into()],
+            match_fingerprint: 0,
+            restrict_to_matches: true,
+            needs_score: false,
+        };
+        assert!(
+            (estimate_fulltext_access_rows(&table, &[spec], 1000.0) - expected).abs() < 0.001,
+            "{query}"
+        );
+    }
+}
+
+#[test]
+fn audit1123_decorrelation_switch_gates_semi_join_lifting() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(root.path());
+    engine.execute("CREATE TABLE a(k INT)").unwrap();
+    engine.execute("CREATE TABLE b(k INT)").unwrap();
+    for (mode, joins) in [("off", 0), ("on", 1)] {
+        crate::util::env::with_vars(&[("MYDB_DECORRELATE", Some(mode))], || {
+            let Statement::Select(mut select) =
+                crate::parser::parse_statement("SELECT k FROM a WHERE k IN(SELECT k FROM b)")
+                    .unwrap()
+            else {
+                panic!()
+            };
+            normalize_select_predicates(engine.db_for_tests(), &mut select);
+            assert_eq!(select.joins.len(), joins);
+        });
+    }
+}

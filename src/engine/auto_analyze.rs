@@ -35,6 +35,7 @@ struct Config {
     total_runs: AtomicU64,
     /// Observability: cumulative count of tables re-sampled.
     total_tables_analyzed: AtomicU64,
+    total_failures: AtomicU64,
 }
 
 fn config() -> &'static Config {
@@ -65,6 +66,7 @@ fn config() -> &'static Config {
             last_run_unix_ms: AtomicU64::new(0),
             total_runs: AtomicU64::new(0),
             total_tables_analyzed: AtomicU64::new(0),
+            total_failures: AtomicU64::new(0),
         }
     })
 }
@@ -123,6 +125,7 @@ pub struct AutoAnalyzeStats {
     pub last_run_unix_ms: u64,
     pub total_runs: u64,
     pub total_tables_analyzed: u64,
+    pub total_failures: u64,
 }
 
 /// Snapshot the current Auto-ANALYZE observability counters + config.
@@ -135,6 +138,7 @@ pub fn stats_snapshot() -> AutoAnalyzeStats {
         last_run_unix_ms: cfg.last_run_unix_ms.load(Ordering::Relaxed),
         total_runs: cfg.total_runs.load(Ordering::Relaxed),
         total_tables_analyzed: cfg.total_tables_analyzed.load(Ordering::Relaxed),
+        total_failures: cfg.total_failures.load(Ordering::Relaxed),
     }
 }
 
@@ -148,6 +152,28 @@ fn record_run(tables_analyzed: u64) {
     cfg.total_runs.fetch_add(1, Ordering::Relaxed);
     cfg.total_tables_analyzed
         .fetch_add(tables_analyzed, Ordering::Relaxed);
+}
+
+pub(crate) fn record_failure() {
+    config().total_failures.fetch_add(1, Ordering::Relaxed);
+}
+
+fn run_analyze_round(task: impl FnOnce() -> Result<u64, crate::types::QueryError>) {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(task)) {
+        Ok(Ok(n)) => record_run(n),
+        Ok(Err(err)) => {
+            record_failure();
+            crate::util::logging::log_message(format_args!(
+                "background auto-analyze failed: {err}"
+            ));
+        }
+        Err(_) => {
+            record_failure();
+            crate::util::logging::log_message(format_args!(
+                "background auto-analyze panicked; retry next pass"
+            ));
+        }
+    }
 }
 
 /// Background Auto-ANALYZE worker. Mirrors the shutdown / wake / join
@@ -187,16 +213,7 @@ impl AutoAnalyzeHandle {
                 let Some(_write) = crate::repl::background_write_permit() else {
                     continue;
                 };
-                match db.auto_analyze_stale_tables(ratio()) {
-                    Ok(n) => record_run(n),
-                    Err(err) => {
-                        crate::util::logging::log_message(format_args!(
-                            "background auto-analyze failed: {} ({})",
-                            err.message(),
-                            err.sql_state()
-                        ));
-                    }
-                }
+                run_analyze_round(|| db.auto_analyze_stale_tables(ratio()));
             }
         });
         Self { worker }
@@ -204,5 +221,19 @@ impl AutoAnalyzeHandle {
 
     pub fn shutdown(&self) {
         self.worker.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod audit1123_tests {
+    use super::*;
+    #[test]
+    fn audit1123_auto_analyze_survives_a_failed_round() {
+        let failures = stats_snapshot().total_failures;
+        run_analyze_round(|| panic!("injected auto-analyze panic"));
+        assert!(stats_snapshot().total_failures > failures);
+        let runs = stats_snapshot().total_runs;
+        run_analyze_round(|| Ok(0));
+        assert!(stats_snapshot().total_runs > runs);
     }
 }

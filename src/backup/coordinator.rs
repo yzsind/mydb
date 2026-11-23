@@ -12,7 +12,7 @@ pub enum Policy {
     Manual,
     Continuous,
 }
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Pending {
     pub base_id: String,
@@ -578,7 +578,15 @@ impl Coordinator {
                     *guard = Some(next);
                     return Ok(None);
                 }
+                if policy.is_none() {
+                    return Err(backup_err("backup repository is not configured"));
+                }
             }
+        }
+        if policy.is_none() {
+            return Err(backup_err(
+                "DISCARD_PENDING requires an explicit WAL_ARCHIVE policy",
+            ));
         }
         let _serial = self.serial.lock().unwrap_or_else(|e| e.into_inner());
         let policy = policy.unwrap_or_else(|| {
@@ -1570,6 +1578,9 @@ impl Coordinator {
         Ok(())
     }
     fn reconcile(&self) -> Result<(), QueryError> {
+        if self.capturing.load(Ordering::Acquire) {
+            return Ok(());
+        }
         let _database = self.db()?;
         // Immutable baseline hashing can take minutes. Retain a repository
         // lease while validating, but leave status and budget patches usable.
@@ -1797,6 +1808,28 @@ impl Coordinator {
             publications.push(publication);
             Ok(())
         })?;
+        let original = state.clone();
+        drop(guard);
+        for publication in &publications {
+            if let Publication::Range { range } = publication {
+                super::restore::verify_range(&repo, range)?;
+            }
+        }
+        let mut guard = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let state = guard
+            .as_mut()
+            .ok_or_else(|| backup_err("archive control disappeared during reconciliation"))?;
+        if ArchiveIdentity::from(state as &Control) != ArchiveIdentity::from(&original)
+            || state.position != original.position
+            || state.cursor != original.cursor
+            || state.lifecycle != original.lifecycle
+            || state.latest_base != original.latest_base
+            || state.pending != original.pending
+        {
+            return Err(backup_err(
+                "archive head changed during reconciliation; retry",
+            ));
+        }
         for publication in publications.into_iter().rev() {
             match publication {
                 Publication::Base { base }
@@ -1859,7 +1892,7 @@ impl Coordinator {
                         return Err(backup_err("unacknowledged archive gap"));
                     }
                     // Full payload validation is performed by the range reader before ACK.
-                    super::restore::verify_range(&repo, &range)?;
+                    // The immutable suffix was verified before taking control.
                     state.last_range = Some((
                         range.id.clone(),
                         sha256_hex(
@@ -1917,19 +1950,25 @@ impl Coordinator {
             state.position = position;
             self.save(state)?;
         }
-        self.repair_retention(state, &repo)?;
+        let retention_state = state.clone();
         if state.lifecycle == "CLOSED" {
             self.save(state)?;
             self.db()?.capture.set_lease("archive", None)?;
         }
+        drop(guard);
+        self.repair_retention(&retention_state, &repo)?;
         Ok(())
     }
     /// Validate the exact acknowledged head once on source startup. Ordinary
     /// archive rounds inspect only the unacknowledged catalog suffix.
     fn verify_confirmed_head(&self) -> Result<(), QueryError> {
         self.confirmed_head_verified.store(false, Ordering::Release);
-        let mut guard = self.control.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(state) = guard.as_mut() else {
+        let Some(state) = self
+            .control
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+        else {
             return Ok(());
         };
         if state.effective == Policy::Disabled || state.stream_id.is_none() {
@@ -1939,26 +1978,61 @@ impl Coordinator {
         let mut repo = match Repository::open(&state.repository, None) {
             Ok(repo) => repo,
             Err(error) => {
-                state.error = error_detail(&error);
+                self.record_error(&error);
                 return Ok(());
             }
         };
         let _lease = Lease::acquire(&repo.root, false)?;
         repo.require_key(None)?;
-        let verify = verify_receipt(&repo, state);
-        if let Err(error) = &verify {
-            if !["RESOURCE_LIMIT", "CANCELLED", "KEY_UNAVAILABLE"]
-                .contains(&failure_class(&error_detail(error)))
+        // Hash immutable payloads outside the status/budget mutex. Archive
+        // callers serialize policy changes; a budget patch remains admissible.
+        let verify = verify_receipt(&repo, &state);
+        {
+            let mut guard = self.control.lock().unwrap_or_else(|e| e.into_inner());
+            let current = guard
+                .as_mut()
+                .ok_or_else(|| backup_err("archive control disappeared during verification"))?;
+            if ArchiveIdentity::from(current as &Control) != ArchiveIdentity::from(&state)
+                || current.position != state.position
+                || current.cursor != state.cursor
             {
-                state.lifecycle = "BROKEN".into();
+                return Err(backup_err(
+                    "archive head changed during verification; retry",
+                ));
             }
-            state.error = error_detail(error);
-            self.save(state)?;
+            if let Err(error) = &verify {
+                if !["RESOURCE_LIMIT", "CANCELLED", "KEY_UNAVAILABLE"]
+                    .contains(&failure_class(&error_detail(error)))
+                {
+                    current.lifecycle = "BROKEN".into();
+                }
+                current.error = error_detail(error);
+                self.save(current)?;
+            }
         }
         verify?;
-        self.repair_retention(state, &repo)?;
+        self.repair_retention(&state, &repo)?;
         self.confirmed_head_verified.store(true, Ordering::Release);
         Ok(())
+    }
+
+    fn save_retention_lease(&self, state: &Control, lease: WalLease) -> Result<(), QueryError> {
+        let guard = self.control.lock().unwrap_or_else(|e| e.into_inner());
+        let current = guard
+            .as_ref()
+            .ok_or_else(|| backup_err("archive control disappeared during retention repair"))?;
+        if ArchiveIdentity::from(current) != ArchiveIdentity::from(state)
+            || current.position != state.position
+            || current.cursor != state.cursor
+        {
+            return Err(backup_err(
+                "archive head changed during retention repair; retry",
+            ));
+        }
+        // Persist the current control, including a concurrent emergency budget
+        // patch, before advancing its independently durable retention proof.
+        self.save(current)?;
+        self.db()?.capture.set_lease("archive", Some(lease))
     }
     fn repair_retention(&self, state: &Control, repo: &Repository) -> Result<(), QueryError> {
         if state.effective == Policy::Disabled
@@ -1985,13 +2059,12 @@ impl Coordinator {
         }
         if lease.floor == floor {
             if lease.proof != state.position.digest {
-                self.save(state)?;
-                db.capture.set_lease(
-                    "archive",
-                    Some(WalLease {
+                self.save_retention_lease(
+                    state,
+                    WalLease {
                         proof: state.position.digest.clone(),
                         ..lease
-                    }),
+                    },
                 )?;
             }
             return Ok(());
@@ -2026,14 +2099,13 @@ impl Coordinator {
         }
         // A prior failed save may already have changed the in-memory cursor.
         // Reconfirm the source ACK before advancing its independently persisted pin.
-        self.save(state)?;
-        db.capture.set_lease(
-            "archive",
-            Some(WalLease {
+        self.save_retention_lease(
+            state,
+            WalLease {
                 floor,
                 proof: state.position.digest.clone(),
                 ..lease
-            }),
+            },
         )?;
         db.capture.budget.acknowledged(acknowledged);
         Ok(())

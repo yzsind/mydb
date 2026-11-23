@@ -2096,3 +2096,142 @@ fn private_metadata_write_cannot_truncate_a_hard_link_to_an_external_file() {
     );
     assert!(result.is_err());
 }
+
+#[test]
+fn audit1123_confirmed_range_verification_preserves_status_and_budget_access() {
+    let f = Fixture::new();
+    f.source.execute("INSERT INTO t VALUES(2,20)").unwrap();
+    Fixture::wait(
+        &f.coordinator,
+        f.coordinator.backup_wal(&f.repository).unwrap(),
+    );
+    let state = f.coordinator.control.lock().unwrap().clone().unwrap();
+    let id = state.last_range.as_ref().unwrap().0.clone();
+    let c = f.coordinator.clone();
+    let repository = f.repository.clone();
+    let observed = Arc::new(AtomicBool::new(false));
+    let checked = observed.clone();
+    super::faults::install(
+        "range_before_full_verify",
+        &f.repository
+            .join("streams")
+            .join(state.stream_id.unwrap())
+            .join("ranges")
+            .join(id),
+        move || {
+            assert!(
+                c.control.try_lock().is_ok(),
+                "payload hashing holds the control mutex"
+            );
+            c.configure_patch(&repository, None, false, Some(123456789))?;
+            checked.store(true, Ordering::Release);
+            Ok(())
+        },
+    );
+    f.coordinator.test_verify_head().unwrap();
+    assert!(observed.load(Ordering::Acquire));
+    assert_eq!(
+        f.coordinator
+            .control
+            .lock()
+            .unwrap()
+            .as_ref()
+            .unwrap()
+            .max_pending_wal_bytes,
+        123456789
+    );
+}
+
+#[test]
+fn audit1123_import_rejects_unreferenced_diagnostics_with_valid_transcript() {
+    let f = Fixture::new();
+    let clean = f.root.path().join("clean.bundle");
+    super::management::export(
+        &f.repository,
+        Some(&f.base),
+        None,
+        super::restore::Target::Base,
+        &clean,
+        None,
+    )
+    .unwrap();
+    let modified = f.root.path().join("modified.bundle");
+    let mut reader = super::bundle::Reader::new(fs::File::open(clean).unwrap()).unwrap();
+    let mut writer = super::bundle::Writer::new(fs::File::create(&modified).unwrap()).unwrap();
+    let mut magic = [0; 16];
+    reader.read_exact(&mut magic).unwrap();
+    writer.write_all(&magic).unwrap();
+    loop {
+        let mut size = [0; 4];
+        reader.read_exact(&mut size).unwrap();
+        let n = u32::from_le_bytes(size) as usize;
+        if n == 0 {
+            break;
+        }
+        let mut name = vec![0; n];
+        reader.read_exact(&mut name).unwrap();
+        let mut len = [0; 8];
+        reader.read_exact(&mut len).unwrap();
+        let mut payload = vec![0; u64::from_le_bytes(len) as usize];
+        reader.read_payload_exact(&mut payload).unwrap();
+        let mut digest = [0; 32];
+        reader.read_exact(&mut digest).unwrap();
+        writer.write_all(&size).unwrap();
+        writer.write_all(&name).unwrap();
+        writer.write_all(&len).unwrap();
+        writer.write_payload(&payload, f.root.path()).unwrap();
+        writer.write_all(&digest).unwrap();
+        writer.objects += 1;
+    }
+    reader.finish(writer.objects).unwrap();
+    let name = b"catalog/diagnostics/VERIFY.json";
+    let payload = b"{\"status\":\"PASSED\"}";
+    writer
+        .write_all(&(name.len() as u32).to_le_bytes())
+        .unwrap();
+    writer.write_all(name).unwrap();
+    writer
+        .write_all(&(payload.len() as u64).to_le_bytes())
+        .unwrap();
+    writer.write_payload(payload, f.root.path()).unwrap();
+    writer.write_all(&Sha256::digest(payload)).unwrap();
+    writer.objects += 1;
+    writer.finish().unwrap();
+    drop(writer);
+    let destination = f.root.path().join("imported");
+    let err = super::management::import(&destination, &modified, None).unwrap_err();
+    assert!(
+        err.message().contains("unreferenced bundle object"),
+        "{err}"
+    );
+    assert!(!destination.exists());
+}
+
+#[test]
+fn audit1123_gc_keeps_corrupt_live_data_and_removes_unreferenced_blobs() {
+    let f = Fixture::new();
+    let repo = super::repository::Repository::open(&f.repository, None).unwrap();
+    let orphan = repo.store_blob(b"unreferenced orphan payload").unwrap();
+    let orphan_path = repo.encoded_blob_path(&orphan).unwrap();
+    let (_, image) = repo.base(&f.base).unwrap();
+    let file = image
+        .manifest
+        .files
+        .iter()
+        .find(|file| file.len > 0)
+        .unwrap();
+    let path = f
+        .repository
+        .join("bases")
+        .join(&f.base)
+        .join("data")
+        .join(&file.path);
+    let mut bytes = fs::read(&path).unwrap();
+    bytes[0] ^= 1;
+    fs::write(&path, &bytes).unwrap();
+    assert!(repo.base(&f.base).is_err());
+    super::management::gc(&f.repository, true, None).unwrap();
+    assert!(!orphan_path.exists());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
+    assert!(repo.base(&f.base).is_err());
+}

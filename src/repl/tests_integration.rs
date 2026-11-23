@@ -27,7 +27,7 @@ struct Master {
 /// intentionally has a later WAL origin and is therefore not a valid replica
 /// fixture.
 fn fresh_database_tempdir() -> TempDir {
-    let dir = TempDir::new().expect("tempdir");
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).expect("tempdir");
     std::fs::write(dir.path().join(".mydb-test-fresh-data-dir"), []).unwrap();
     dir
 }
@@ -651,6 +651,52 @@ mod online_apply {
         (engine, dir, service)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn audit1123_partition_shadow_build_and_retirement_replicate() {
+        let (source, _source_dir, service) = build_master_engine().await;
+        let writer = source.clone();
+        tokio::task::spawn_blocking(move || {
+            for sql in [
+                "CREATE TABLE r(k INT,s VARCHAR(30),KEY(k)) PARTITION BY RANGE(k)(PARTITION p0 VALUES LESS THAN(10),PARTITION pmax VALUES LESS THAN MAXVALUE)",
+                "CREATE TABLE h(k INT,s VARCHAR(30),KEY(k)) PARTITION BY HASH(k) PARTITIONS 4",
+                "CREATE TABLE u(k INT,s VARCHAR(30),KEY(k))",
+                "CREATE TABLE stg(k INT,s VARCHAR(30),KEY(k))",
+                "INSERT INTO r SELECT n,'original' FROM generate_series(1,30) s(n)",
+                "INSERT INTO h SELECT n,'original' FROM generate_series(1,30) s(n)",
+                "INSERT INTO u SELECT n,'original' FROM generate_series(1,30) s(n)",
+                "INSERT INTO stg VALUES(3,'exchange')",
+            ] { writer.execute(sql).unwrap(); }
+        }).await.unwrap();
+        let (replica, _replica_dir, mut lifecycle, status) =
+            spawn_replica(service.bind_addr()).await;
+        for (step,(table,ddl)) in [
+            ("r","REORGANIZE PARTITION pmax INTO(PARTITION p1 VALUES LESS THAN(100),PARTITION pmax VALUES LESS THAN MAXVALUE)"),
+            ("r","DROP PARTITION p1"),
+            ("r","TRUNCATE PARTITION p0"),
+            ("r","EXCHANGE PARTITION p0 WITH TABLE stg"),
+            ("h","ADD PARTITION PARTITIONS 2"),
+            ("h","COALESCE PARTITION 3"),
+            ("h","REBUILD PARTITION ALL"),
+            ("u","PARTITION BY HASH(k) PARTITIONS 3"),
+            ("u","REMOVE PARTITIONING"),
+        ].into_iter().enumerate() {
+            let writer=source.clone();
+            let ddl=format!("ALTER TABLE {table} {ddl}");
+            let query=format!("SELECT k,s FROM {table} ORDER BY k,s");
+            let read=query.clone();
+            let expected=tokio::task::spawn_blocking(move || {
+                writer.execute(&ddl).unwrap();
+                writer.execute(&format!("INSERT INTO {table} VALUES({},'post-ddl')",1000+step)).unwrap();
+                let QueryResponse::ResultSet(result)=writer.execute(&read).unwrap() else {panic!()};
+                result.rows
+            }).await.unwrap();
+            assert_eq!(poll_select_exact(&replica,&query,&expected,10000).await,expected,
+                "step {step}: {}",status.lock());
+        }
+        lifecycle.stop_and_wait().await;
+        service.shutdown().await;
+    }
+
     /// Bring up a replica engine with the production reconnect lifecycle.
     /// A local snapshot can temporarily block physical slot reclamation;
     /// retry it just as a running server would instead of ending the fixture.
@@ -662,7 +708,7 @@ mod online_apply {
         ReceiverLifecycle,
         Arc<PlMutex<String>>,
     ) {
-        let dir = TempDir::new().unwrap();
+        let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
         // This private base is not opened until every received file has
         // completed the shared device barrier.
         let preparation = crate::platform::fs::FixtureSyncBatch::new(dir.path()).unwrap();

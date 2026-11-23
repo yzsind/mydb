@@ -6825,3 +6825,69 @@ fn release1106_partition_write_constraint_covers_joined_update() {
         vec![vec![Value::Int(5)]]
     );
 }
+
+#[test]
+fn audit1123_committed_drop_partition_reports_success_when_cleanup_must_retry() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = std::sync::Arc::new(open_strict_cold_metadata_engine(root.path()));
+    engine.execute("CREATE TABLE cleanup_drop(id INT PRIMARY KEY) PARTITION BY RANGE(id)(PARTITION p0 VALUES LESS THAN(10),PARTITION pmax VALUES LESS THAN MAXVALUE)").unwrap();
+    engine
+        .execute("INSERT INTO cleanup_drop VALUES(1),(11)")
+        .unwrap();
+    let db = engine.database();
+    db.set_partition_cleanup_background(false);
+    let table = db.table("cleanup_drop").unwrap();
+    let sid = table
+        .partitioning
+        .as_ref()
+        .unwrap()
+        .storage_ids_for_name("p0")
+        .unwrap()[0];
+    let path = crate::storage::naming::table_object_generation_path(
+        root.path(),
+        sid,
+        table.active_generation,
+        "heap",
+    );
+    let hook = db.install_ddl_backfill_test_hook();
+    let writer = engine.clone();
+    let dropper =
+        std::thread::spawn(move || writer.execute("ALTER TABLE cleanup_drop DROP PARTITION p0"));
+    let reached = hook.wait_until_reached(Duration::from_secs(10));
+    let held = path.with_extension("held");
+    if reached {
+        std::fs::rename(&path, &held).unwrap();
+        std::fs::create_dir(&path).unwrap();
+    }
+    hook.release();
+    let result = dropper.join().unwrap();
+    assert!(reached);
+    result.unwrap();
+    assert_eq!(
+        partition_test_rows(&engine, "SELECT id FROM cleanup_drop"),
+        vec![vec![Value::Int(11)]]
+    );
+    assert_eq!(db.partition_ddl_job_snapshots().len(), 1);
+    std::fs::remove_dir(&path).unwrap();
+    std::fs::rename(&held, &path).unwrap();
+    db.recover_partition_reorgs().unwrap();
+    assert!(db.partition_ddl_job_snapshots().is_empty());
+}
+
+#[test]
+fn audit1123_partition_identifiers_count_characters() {
+    let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let engine = open_test_engine(root.path());
+    let name = "分".repeat(64);
+    engine.execute(&format!("CREATE TABLE utf8_part(k INT) PARTITION BY RANGE(k)(PARTITION `{name}` VALUES LESS THAN MAXVALUE)")).unwrap();
+    engine.execute("INSERT INTO utf8_part VALUES(1)").unwrap();
+    assert_eq!(
+        partition_test_rows(
+            &engine,
+            &format!("SELECT * FROM utf8_part PARTITION(`{name}`)")
+        ),
+        vec![vec![Value::Int(1)]]
+    );
+    let too_long = "分".repeat(65);
+    assert_eq!(engine.execute(&format!("CREATE TABLE long_part(k INT) PARTITION BY RANGE(k)(PARTITION `{too_long}` VALUES LESS THAN MAXVALUE)")).unwrap_err().code(),1059);
+}

@@ -496,3 +496,54 @@ pub(super) fn load(set: &DdRowSet, table: &TableSchema) -> Result<TableStats, Qu
     }
     Ok(stats)
 }
+
+/// Startup headers need scalar counts, not distributions or column bindings.
+/// Decode the same root/leaf rows used by the full descriptor loader.
+pub(crate) fn apply_header_row(table: &mut TableSchema, row: &[Value]) -> Result<(), QueryError> {
+    if row.len() != 15 || uint(row, 0)? != table.id || uint(row, 2)? > table.schema_version {
+        return Err(corrupt());
+    }
+    let scope = uint(row, 1)?;
+    let (count, pages, modified, analyzed) = (
+        uint(row, 3)?,
+        uint(row, 4)?,
+        uint(row, 5)?,
+        optional(row, 6)?,
+    );
+    if scope == 0 {
+        let sample = float(row, 7)?;
+        let confidence = float(row, 8)?;
+        if sample.is_some_and(|n| n > 1.0) || confidence.is_some_and(|n| n > 1.0) {
+            return Err(corrupt());
+        }
+        let baseline = match row.get(10) {
+            Some(Value::Int(n)) => *n,
+            _ => return Err(corrupt()),
+        };
+        table.stats.row_count = count;
+        table.stats.heap_page_count = pages;
+        table.stats.modified_rows_since_analyze = modified;
+        table.stats.analyzed_at_unix_ms = analyzed;
+        table.stats.sample_fraction = sample;
+        table.stats.confidence = confidence;
+        table.stats.analyze_revision = uint(row, 9)?;
+        table.stats.last_analyze_live_baseline = baseline;
+        table.stats.last_analyze_modification_baseline = uint(row, 11)?;
+    } else {
+        if !table
+            .partitioning
+            .as_ref()
+            .is_some_and(|partitioning| partitioning.owns_storage_id(scope))
+        {
+            return Err(corrupt());
+        }
+        let mut leaf = PartitionStats::empty();
+        leaf.row_count = count;
+        leaf.heap_page_count = pages;
+        leaf.modified_rows_since_analyze = modified;
+        leaf.analyzed_at_unix_ms = analyzed;
+        leaf.check_ok = optional(row, 12)?.map(|v| v != 0);
+        table.stats.partition_stats.insert(scope, leaf);
+    }
+    Ok(())
+}

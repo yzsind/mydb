@@ -4547,6 +4547,13 @@ impl QueryEngine for StorageQueryEngine {
         statement: Arc<Statement>,
     ) -> Result<QueryResponse, QueryError> {
         self.attach_expression_registry(session);
+        let _trace = crate::engine::cbo::trace::statement(
+            session.connection_id,
+            crate::engine::cbo::trace::optimizer_trace_setting_enabled(
+                &session.sysvars.optimizer_trace,
+            ),
+            sql,
+        );
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
@@ -4892,6 +4899,13 @@ impl QueryEngine for StorageQueryEngine {
             return None;
         }
         self.attach_expression_registry(session);
+        let _trace = crate::engine::cbo::trace::statement(
+            session.connection_id,
+            crate::engine::cbo::trace::optimizer_trace_setting_enabled(
+                &session.sysvars.optimizer_trace,
+            ),
+            sql,
+        );
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);
@@ -5164,6 +5178,13 @@ impl QueryEngine for StorageQueryEngine {
         shape_sql: Arc<str>,
     ) -> Result<QueryResponse, QueryError> {
         self.attach_expression_registry(session);
+        let _trace = crate::engine::cbo::trace::statement(
+            session.connection_id,
+            crate::engine::cbo::trace::optimizer_trace_setting_enabled(
+                &session.sysvars.optimizer_trace,
+            ),
+            sql,
+        );
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let _group_concat_scope =
             select::aggregate::enter_group_concat_max_len(session.group_concat_max_len);

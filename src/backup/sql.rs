@@ -389,7 +389,10 @@ pub(crate) fn execute(
                     Ok(QueryResponse::Ok)
                 }
                 Status => {
-                    let control = coordinator.control.lock().unwrap();
+                    let control = coordinator
+                        .control
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
                     let mut rows = Vec::new();
                     let mut put = |name: &str, value: String| {
                         rows.push(vec![Value::String(name.into()), Value::String(value)])
@@ -491,10 +494,14 @@ pub(crate) fn execute(
                         put("Last_Error_Unix_Ms", state.last_error_unix_ms.to_string());
                         put(
                             "Source_Time_Lag_Us",
-                            now_ms()
-                                .saturating_mul(1000)
-                                .saturating_sub(state.covered_time)
-                                .to_string(),
+                            if state.covered_time == 0 {
+                                String::new()
+                            } else {
+                                now_ms()
+                                    .saturating_mul(1000)
+                                    .saturating_sub(state.covered_time)
+                                    .to_string()
+                            },
                         );
                         put(
                             "Backup_Resources",

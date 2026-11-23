@@ -14,8 +14,28 @@ pub(crate) fn prune(
     apply: bool,
     key_file: Option<&Path>,
 ) -> Result<(), QueryError> {
+    prune_impl(path, stream, window, apply, key_file, true)
+}
+
+pub(crate) fn gc(path: &Path, apply: bool, key_file: Option<&Path>) -> Result<(), QueryError> {
+    prune_impl(path, None, None, apply, key_file, false)
+}
+
+fn prune_impl(
+    path: &Path,
+    stream: Option<&str>,
+    window: Option<&str>,
+    apply: bool,
+    key_file: Option<&Path>,
+    verify_payloads: bool,
+) -> Result<(), QueryError> {
     let mut repo = Repository::open(path, key_file)?;
-    repo.require_key(key_file)?;
+    if verify_payloads {
+        repo.require_key(key_file)?;
+    }
+    if stream.is_some() && window.is_none() {
+        return Err(backup_err("--stream requires --retain-pitr"));
+    }
     let _lease = Lease::acquire(&repo.root, apply)?;
     let root = repo.position()?;
     repo.verify_coverage(&root)?;
@@ -26,7 +46,9 @@ pub(crate) fn prune(
     repo.visit_live(&root, |_, event| {
         match event {
             Publication::Base { base } => {
-                repo.base(&base.id)?;
+                if verify_payloads {
+                    repo.base(&base.id)?;
+                }
                 if bases.len() >= 100_000 {
                     return Err(backup_err("base GC metadata budget exceeded"));
                 }
@@ -39,7 +61,9 @@ pub(crate) fn prune(
                 bases.push(base);
             }
             Publication::Range { range } => {
-                super::restore::verify_range(&repo, &range)?;
+                if verify_payloads {
+                    super::restore::verify_range(&repo, &range)?;
+                }
                 upper
                     .entry(range.stream_id.clone())
                     .and_modify(|t| *t = (*t).max(range.covered_time))
@@ -799,16 +823,60 @@ pub(crate) fn import_with_resume(
         imported.require_key(key_file)?;
     }
     imported.verify_coverage(&position)?;
+    let mut unexpected = seen;
+    for name in ["repository.json", "gc.lock", "publish.lock"] {
+        unexpected.remove(name);
+    }
+    imported.remove_import_catalog_paths(&mut unexpected)?;
     imported.visit_live(&position, |_, event| {
         match event {
             Publication::Base { base } => {
-                imported.base(&base.id)?;
+                let (_, image) = imported.base(&base.id)?;
+                for name in ["manifest", "commit", "seal"] {
+                    unexpected.remove(&format!("bases/{}/{name}", base.id));
+                }
+                for name in [
+                    "mydb-snapshot.json",
+                    "mydb-snapshot.id",
+                    "mydb-image-mode.json",
+                    "system/mydb.lock",
+                ] {
+                    unexpected.remove(&format!("bases/{}/data/{name}", base.id));
+                }
+                for file in image.manifest.files {
+                    unexpected.remove(&format!("bases/{}/data/{}", base.id, file.path));
+                }
+                if let Some(stream) = &base.stream_id {
+                    imported.fence_at(stream, &position)?;
+                    unexpected.remove(&format!("streams/{stream}/descriptor"));
+                    unexpected.remove(&format!("streams/{stream}/fences/current"));
+                }
             }
-            Publication::Range { range } => super::restore::verify_range(&imported, &range)?,
+            Publication::Range { range } => {
+                super::restore::verify_range(&imported, &range)?;
+                for name in ["manifest", "commit"] {
+                    unexpected.remove(&format!(
+                        "streams/{}/ranges/{}/{name}",
+                        range.stream_id, range.id
+                    ));
+                }
+                unexpected.remove(&format!("streams/{}/descriptor", range.stream_id));
+                unexpected.remove(&format!("streams/{}/fences/current", range.stream_id));
+                for chunk in range.chunks {
+                    unexpected.remove(&format!(
+                        "blobs/{}/{}",
+                        imported.header.wal_key_id.as_deref().unwrap_or("plain"),
+                        chunk.hash
+                    ));
+                }
+            }
             _ => {}
         }
         Ok(())
     })?;
+    if let Some(path) = unexpected.first() {
+        return Err(backup_err(format!("unreferenced bundle object '{path}'")));
+    }
     if destination.exists()
         && fs::read_dir(&destination)
             .map_err(|e| io_err("inspect import target", e))?

@@ -987,3 +987,63 @@ impl Repository {
         Ok(needed)
     }
 }
+
+impl Repository {
+    /// Every imported catalog file must belong to the authenticated lineage.
+    /// Payload verification alone does not authorize unrelated generations or
+    /// a diagnostic report supplied by the bundle's producer.
+    pub(super) fn remove_import_catalog_paths(
+        &self,
+        files: &mut BTreeSet<String>,
+    ) -> Result<(), QueryError> {
+        files.remove("catalog/CURRENT");
+        let mut position = self.position()?;
+        while position.generation > 0 {
+            files.remove(&format!(
+                "catalog/generations/{:020}-{}",
+                position.generation, position.digest
+            ));
+            let event = self.checked_event(&position)?;
+            if let Publication::Checkpoint {
+                digest, history, ..
+            } = &event.publication
+            {
+                files.remove(&format!("catalog/checkpoints/{digest}"));
+                files.remove(&format!("catalog/history/indexes/{history}"));
+                let path = self.root.join("catalog/history/indexes").join(history);
+                let bytes = read_bounded(&path, MAX_METADATA_BYTES)?;
+                if sha256_hex(&bytes) != *history {
+                    return Err(backup_err("import history index checksum mismatch"));
+                }
+                let _parse = ControlledMemoryCharge::try_new(
+                    ControlledMemoryCategory::SystemMetadata,
+                    bytes.len().saturating_mul(16),
+                )?;
+                let index: serde_json::Value =
+                    serde_json::from_slice(&bytes).map_err(|e| backup_err(e.to_string()))?;
+                for pack in index
+                    .get("packs")
+                    .and_then(serde_json::Value::as_array)
+                    .ok_or_else(|| backup_err("invalid import history index"))?
+                {
+                    let digest = pack
+                        .get("digest")
+                        .and_then(serde_json::Value::as_str)
+                        .ok_or_else(|| backup_err("invalid import history pack"))?;
+                    validate_hash(digest)?;
+                    files.remove(&format!("catalog/history/packs/{digest}"));
+                }
+            }
+            position = Position {
+                generation: position.generation - 1,
+                digest: event.previous,
+            };
+        }
+        if !position.digest.is_empty() {
+            return Err(backup_err("invalid import catalog genesis"));
+        }
+        // verify_coverage has already authenticated the installed pointer.
+        files.remove("catalog/CHECKPOINT");
+        Ok(())
+    }
+}

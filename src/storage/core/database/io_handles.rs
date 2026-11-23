@@ -668,6 +668,44 @@ impl Database {
             }
             Ok(())
         })?;
+        // One bounded scan of scalar statistics keeps metadata accurate on
+        // the first read after restart without loading any distributions.
+        let mut headers = catalog
+            .tables
+            .values_mut()
+            .map(|table| (table.id, table))
+            .collect::<HashMap<_, _>>();
+        let mut corrupt = HashSet::new();
+        self.scan_dd_table_projected_batched(
+            crate::storage::data_dictionary::DD_TABLE_STATS,
+            &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14],
+            15,
+            512,
+            |rows| {
+                for row in rows {
+                    let Some(Value::UInt(id)) = row.first() else {
+                        continue;
+                    };
+                    if corrupt.contains(id) {
+                        continue;
+                    }
+                    let Some(table) = headers.get_mut(id) else {
+                        continue;
+                    };
+                    if let Err(err) =
+                        crate::storage::stats_store::apply_header_row(Arc::make_mut(table), &row)
+                    {
+                        Arc::make_mut(table).stats = crate::storage::TableStats::empty();
+                        corrupt.insert(*id);
+                        log_message(format_args!(
+                            "Discarding corrupt optimizer statistics header for table {id}: {err}"
+                        ));
+                    }
+                }
+                Ok(())
+            },
+        )?;
+        drop(headers);
         Ok(catalog)
     }
 

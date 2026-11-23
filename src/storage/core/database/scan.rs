@@ -1653,7 +1653,7 @@ impl Database {
         table_name: &str,
         columns: &[String],
         buckets: usize,
-    ) -> Result<Vec<String>, QueryError> {
+    ) -> Result<Vec<Result<String, QueryError>>, QueryError> {
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_statistics_writable()?;
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
@@ -1673,10 +1673,13 @@ impl Database {
         let analyze_lock = self.analyze_lock(&key);
         let _table_analyze = analyze_lock.lock();
         let table = self.table(&key)?;
-        let selected: Vec<_> = columns
+        let mut selected = Vec::new();
+        let mut seen_columns = HashSet::new();
+        let results = columns
             .iter()
+            .filter(|name| seen_columns.insert(normalize_name(name)))
             .map(|name| {
-                table
+                let (position, column) = table
                     .iter_visible_columns()
                     .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
                     .ok_or_else(|| {
@@ -1684,22 +1687,27 @@ impl Database {
                             crate::error::catalog::ER_BAD_FIELD_ERROR,
                             format!("Unknown column '{name}' in '{key}'"),
                         )
-                    })
+                    })?;
+                if matches!(
+                    column.data_type,
+                    DataTypeKind::Json
+                        | DataTypeKind::Geometry { .. }
+                        | DataTypeKind::Vector { .. }
+                ) {
+                    return Err(error(
+                        crate::error::catalog::ER_NOT_SUPPORTED_YET,
+                        format!(
+                            "Histogram not supported for column '{}' of this data type",
+                            column.name
+                        ),
+                    ));
+                }
+                selected.push((position, column));
+                Ok(column.name.clone())
             })
-            .collect::<Result<_, _>>()?;
-        for (_, column) in &selected {
-            if matches!(
-                column.data_type,
-                DataTypeKind::Json | DataTypeKind::Geometry { .. } | DataTypeKind::Vector { .. }
-            ) {
-                return Err(error(
-                    crate::error::catalog::ER_NOT_SUPPORTED_YET,
-                    format!(
-                        "Histogram not supported for column '{}' of this data type",
-                        column.name
-                    ),
-                ));
-            }
+            .collect::<Vec<_>>();
+        if selected.is_empty() {
+            return Ok(results);
         }
         let positions: Vec<_> = selected.iter().map(|(pos, _)| *pos).collect();
         let (txn, _snapshot) =
@@ -1766,9 +1774,8 @@ impl Database {
         let mut candidate = (*table).clone();
         candidate.stats.explicit_histograms.extend(histograms);
         self.publish_stats_candidate(&table, candidate)?;
-        Ok(selected.iter().map(|(_, c)| c.name.clone()).collect())
+        Ok(results)
     }
-
     /// `ANALYZE TABLE ... DROP HISTOGRAM ON cols`. Clears the named
     /// columns' histograms (leaving their other stats intact). Returns
     /// the resolved column names.
@@ -1776,7 +1783,7 @@ impl Database {
         &self,
         table_name: &str,
         columns: &[String],
-    ) -> Result<Vec<String>, QueryError> {
+    ) -> Result<Vec<Result<String, QueryError>>, QueryError> {
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_statistics_writable()?;
         let (database, table_only) = split_table_name(DEFAULT_DATABASE, table_name);
@@ -1789,60 +1796,42 @@ impl Database {
         let key = table_key(&database, &table_only);
         let analyze_lock = self.analyze_lock(&key);
         let _table_analyze = analyze_lock.lock();
-        self.validate_histogram_columns(&key, columns)?;
-        let table = self.table_by_key(&key).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                "histogram table disappeared",
-            )
-        })?;
+        let table = self.table(&key)?;
         let mut candidate = (*table).clone();
-        let mut resolved = Vec::with_capacity(columns.len());
-        for name in columns {
-            let column = table
-                .columns
-                .iter()
-                .find(|c| c.name.eq_ignore_ascii_case(name))
-                .expect("validated histogram column");
-            resolved.push(column.name.clone());
-            candidate
-                .stats
-                .explicit_histograms
-                .remove(&normalize_name(name));
+        let mut seen_columns = HashSet::new();
+        let resolved = columns
+            .iter()
+            .filter(|name| seen_columns.insert(normalize_name(name)))
+            .map(|name| {
+                let (_, column) = table
+                    .iter_visible_columns()
+                    .find(|(_, c)| c.name.eq_ignore_ascii_case(name))
+                    .ok_or_else(|| {
+                        error(
+                            crate::error::catalog::ER_BAD_FIELD_ERROR,
+                            format!("Unknown column '{name}' in '{key}'"),
+                        )
+                    })?;
+                if candidate
+                    .stats
+                    .explicit_histograms
+                    .remove(&normalize_name(&column.name))
+                    .is_none()
+                {
+                    return Err(error(
+                        crate::error::catalog::ER_BAD_FIELD_ERROR,
+                        format!("No histogram statistics found for column '{}'", column.name),
+                    ));
+                }
+                Ok(column.name.clone())
+            })
+            .collect::<Vec<_>>();
+        if resolved.iter().all(Result::is_err) {
+            return Ok(resolved);
         }
         self.publish_stats_candidate(&table, candidate)?;
         Ok(resolved)
     }
-
-    /// Confirm every requested histogram column exists on the table,
-    /// returning MySQL error 1054 (unknown column) otherwise.
-    fn validate_histogram_columns(
-        &self,
-        table_key: &str,
-        columns: &[String],
-    ) -> Result<(), QueryError> {
-        let catalog = self.catalog_read()?;
-        let table = catalog.tables.get(table_key).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_key}' doesn't exist"),
-            )
-        })?;
-        for col in columns {
-            let exists = table
-                .columns
-                .iter()
-                .any(|c| c.name.eq_ignore_ascii_case(col));
-            if !exists {
-                return Err(error(
-                    crate::error::catalog::ER_BAD_FIELD_ERROR,
-                    format!("Unknown column '{col}' in '{table_key}'"),
-                ));
-            }
-        }
-        Ok(())
-    }
-
     pub fn refresh_stale_stats_for_tables<'a>(
         &self,
         table_names: impl IntoIterator<Item = &'a str>,
@@ -1850,9 +1839,22 @@ impl Database {
         // Hold the role barrier through the catalog commit, not only the scan.
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_operational()?;
-        if self.physical_replica_mode() || self.is_snapshot_read_only() {
+        if self.physical_replica_mode()
+            || self.is_snapshot_read_only()
+            || crate::engine::sysvar::builtin::replication::read_only()
+            || crate::engine::sysvar::builtin::replication::super_read_only()
+            || self.capture.active.load(Ordering::Acquire)
+        {
             return Ok(());
         }
+        let Some(_write) = crate::repl::background_write_permit() else {
+            return Ok(());
+        };
+        let Some(_global) =
+            crate::binlog::optional_maintenance_permit(self.global_read_lock_scope())
+        else {
+            return Ok(());
+        };
         let mut refreshed = false;
         let mut seen = HashSet::new();
         for name in table_names {
@@ -1876,7 +1878,6 @@ impl Database {
         }
         Ok(())
     }
-
     /// Partition-aware fan-out for the streaming column scan. Visits
     /// each partition's heap in declaration order; deferred rows are
     /// re-read against the same partition's heap so MVCC visibility

@@ -36,7 +36,7 @@ Repository is an absolute server-side path, optionally prefixed with `file://`; 
 
 ## Consistency and Completion
 
-The capture includes a final writer barrier/checkpoint; long conflicting work and resource/freeze budgets can prevent completion. Capture is online with a short, bounded writer barrier during sealing. Prepared XA is retained for recovery and remains invisible to ordinary baseline queries. Only a sealed published baseline is returned by SHOW MYDB BACKUPS; staging bytes do not establish recoverability.
+The capture includes a final writer barrier/checkpoint; long conflicting work and resource/freeze budgets can prevent completion. Most copying is online. The writer barriers include checkpoint and durable filesystem work, so the freeze budget is a completion threshold rather than a hard wall-clock bound on write pauses. Prepared XA is retained for recovery and remains invisible to ordinary baseline queries. Only a sealed published baseline is returned by SHOW MYDB BACKUPS; staging bytes do not establish recoverability.
 
 For ongoing protection:
 
