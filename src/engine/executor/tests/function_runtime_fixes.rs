@@ -519,3 +519,38 @@ fn computed_stream_chunks_share_charged_result_metadata() {
         },
     );
 }
+
+/// MySQL 8.0.46 evaluates the integer arguments of `ROUND`/`TRUNCATE` (`D`),
+/// `FORMAT` (`D`) and `CONV` (both bases) through `Item::val_int()`: exact
+/// DECIMAL values round half away from zero, approximate DOUBLE values round
+/// ties to even, and strings truncate toward zero. mydb truncated every type,
+/// so `ROUND(123.456, 0.5)` returned 123 instead of 123.5.
+#[test]
+fn mysql_integer_argument_coercion_for_round_truncate_format_and_conv() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let values = row(
+        &engine,
+        "SELECT \
+            ROUND(123.456, 0.5) = 123.5, \
+            ROUND(123.456, 1.5) = 123.46, \
+            ROUND(123.456, 2.5) = 123.456, \
+            ROUND(123.456, -1.5) = 100, \
+            ROUND(123.456, '1.5') = 123.5, \
+            ROUND(123.456, 1.5e0) = 123.46, \
+            ROUND(123.456, 2.5e0) = 123.46, \
+            ROUND(123.456, 0.5e0) = 123, \
+            TRUNCATE(123.456, 1.5) = 123.45, \
+            TRUNCATE(123.456, 0.5) = 123.4, \
+            FORMAT(123.456, 1.5) = '123.46', \
+            FORMAT(123.456, 1.5e0) = '123.46', \
+            CONV('10', 16.5, 10) = '17', \
+            CONV('10', 16, 10.5) = '15', \
+            CONV('10', 15.5e0, 10) = '16'",
+    );
+    assert_eq!(values.len(), 15);
+    for (index, value) in values.iter().enumerate() {
+        assert_eq!(*value, Value::Int(1), "column {index}");
+    }
+}

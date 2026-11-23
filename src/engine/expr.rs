@@ -7457,7 +7457,7 @@ where
                 // and D > 30 is 30. Without this clamp the exact decimal
                 // kernel would raise 1690 for scale > 38, which MySQL
                 // itself never does for FORMAT.
-                let raw_d = int_value(&values[1])?;
+                let raw_d = integer_arg_value(&values[1])?;
                 let decimals = raw_d.clamp(0, 30) as usize;
                 let locale = values
                     .get(2)
@@ -7658,8 +7658,8 @@ where
             let values = eval_args(args, &mut eval_arg)?;
             null_if_any(values, |values| {
                 let n_str = string_value(&values[0]);
-                let from_base = int_value(&values[1])?;
-                let to_base = int_value(&values[2])?;
+                let from_base = integer_arg_value(&values[1])?;
+                let to_base = integer_arg_value(&values[2])?;
                 if !(2..=36).contains(&from_base.unsigned_abs())
                     || !(2..=36).contains(&to_base.unsigned_abs())
                 {
@@ -10577,13 +10577,49 @@ pub(crate) fn clamp_round_decimals(d: i64) -> i32 {
     d.clamp(i32::MIN as i64, i32::MAX as i64) as i32
 }
 
+/// MySQL evaluates the integer arguments of `ROUND`/`TRUNCATE` (`D`),
+/// `FORMAT` (`D`) and `CONV` (both bases) through `Item::val_int()`: exact
+/// DECIMAL values round half away from zero (`0.5` -> 1, `2.5` -> 3),
+/// approximate FLOAT/DOUBLE values round ties to even (`2.5e0` -> 2), and
+/// strings keep the lenient truncating prefix (`'1.5'` -> 1, warning 1292).
+/// `int_value` only implements the truncating paths, so these call sites
+/// must not share it; functions such as `BIN`/`OCT` deliberately truncate
+/// and keep using `int_value`.
+fn integer_arg_value(value: &Value) -> Result<i64, QueryError> {
+    use num_traits::{Signed, ToPrimitive};
+
+    match value {
+        Value::Float(number) => Ok((*number as f64).round_ties_even() as i64),
+        Value::Double(number) => Ok(number.round_ties_even() as i64),
+        Value::DecimalCompact(..)
+        | Value::Decimal128(..)
+        | Value::DecimalWide(..)
+        | Value::Decimal(_) => {
+            let exact = value.exact_decimal().ok_or_else(|| {
+                error(
+                    crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+                    "incorrect DECIMAL value",
+                )
+            })?;
+            let rounded = crate::util::decimal::rescale_exact(exact, 0, true);
+            let (magnitude, _) = rounded.into_big_parts();
+            Ok(magnitude.to_i64().unwrap_or(if magnitude.is_negative() {
+                i64::MIN
+            } else {
+                i64::MAX
+            }))
+        }
+        _ => int_value(value),
+    }
+}
+
 /// Coerce ROUND/TRUNCATE's D argument without routing an unsigned BIGINT
 /// through i64. Values above i64::MAX are still positive and therefore mean
 /// "keep all available fractional digits", not a huge negative scale.
 pub(crate) fn round_decimals_value(value: &Value) -> Result<i32, QueryError> {
     match value {
         Value::UInt(value) => Ok((*value).min(i32::MAX as u64) as i32),
-        _ => Ok(clamp_round_decimals(int_value(value)?)),
+        _ => Ok(clamp_round_decimals(integer_arg_value(value)?)),
     }
 }
 
