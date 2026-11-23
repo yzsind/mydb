@@ -3927,6 +3927,7 @@ fn append_table_statistics_rows(
             // pre-first-ANALYZE).
             let cardinality = table
                 .index_prefix_cardinality(&index.name, idx + 1)
+                .filter(|_| !index.is_fulltext() && !index.is_spatial() && !index.is_vector())
                 .filter(|c| *c > 0)
                 .unwrap_or_else(|| {
                     if index.is_fulltext() {
@@ -4644,7 +4645,7 @@ fn trigger_row(trigger: &TriggerSchema) -> Vec<Value> {
         if trigger.created_ms == 0 {
             metadata_create_time_value()
         } else {
-            mysql_time_value(trigger.created_ms)
+            trigger_time_value(trigger.created_ms)
         },
         s(&trigger.sql_mode),
         s(&trigger.definer()),
@@ -5315,6 +5316,9 @@ fn column_statistics_rows(db: &Database) -> Result<Vec<Vec<Value>>, QueryError> 
     let visibility = Visibility::compute(db);
     let mut rows = Vec::new();
     for header in db.catalog().tables.values() {
+        if header.database == crate::recyclebin::DATABASE {
+            continue;
+        }
         if !visibility.table_visible(&header.database, &header.name) {
             continue;
         }
@@ -8362,6 +8366,25 @@ pub(crate) fn mysql_time_value(unix_ms: u64) -> Value {
     let offset = crate::engine::expr::session_time_offset_seconds_at(secs);
     chrono::DateTime::from_timestamp(secs.saturating_add(offset), 0)
         .map(|dt| Value::String(dt.format("%Y-%m-%d %H:%M:%S").to_string()))
+        .unwrap_or(Value::Null)
+}
+
+/// Trigger metadata declares TIMESTAMP(2); retain its fractional seconds
+/// without changing the whole-second presentation of other catalog objects.
+pub(crate) fn trigger_time_value(unix_ms: u64) -> Value {
+    if unix_ms == 0 {
+        return Value::Null;
+    }
+    let secs = (unix_ms / 1000) as i64;
+    let offset = crate::engine::expr::session_time_offset_seconds_at(secs);
+    chrono::DateTime::from_timestamp(secs.saturating_add(offset), 0)
+        .map(|dt| {
+            Value::String(format!(
+                "{}.{:02}",
+                dt.format("%Y-%m-%d %H:%M:%S"),
+                unix_ms % 1000 / 10
+            ))
+        })
         .unwrap_or(Value::Null)
 }
 

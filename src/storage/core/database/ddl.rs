@@ -12531,32 +12531,41 @@ impl Database {
             ));
             err
         })?;
-        journal.phase = PartitionDdlPhase::Swapped;
-        self.update_partition_reorg_journal(&journal_path, &mut journal)?;
-        if partition_reorg_crash_at("after_swap") {
-            return Ok(());
-        }
-        journal.phase = PartitionDdlPhase::Cleanup;
-        self.update_partition_reorg_journal(&journal_path, &mut journal)?;
-        if self.partition_cleanup_background.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        self.evict_partition_vector_graphs(table.id, &drop_leaf_sids);
-        for sid in &drop_leaf_sids {
-            self.remove_heap_cache_entry(*sid)?;
-            for index in &table.indexes {
-                self.remove_index_cache_entry(*sid, &index.name)?;
+        #[cfg(test)]
+        self.pause_ddl_backfill_for_test();
+        let cleanup = (|| -> Result<(), QueryError> {
+            journal.phase = PartitionDdlPhase::Swapped;
+            self.update_partition_reorg_journal(&journal_path, &mut journal)?;
+            if partition_reorg_crash_at("after_swap") {
+                return Ok(());
             }
-            self.remove_partition_storage_files(
-                &database,
-                &name,
-                table.id,
-                *sid,
-                &journal.index_names,
-                &journal,
-            )?;
+            journal.phase = PartitionDdlPhase::Cleanup;
+            self.update_partition_reorg_journal(&journal_path, &mut journal)?;
+            if self.partition_cleanup_background.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            self.evict_partition_vector_graphs(table.id, &drop_leaf_sids);
+            for sid in &drop_leaf_sids {
+                self.remove_heap_cache_entry(*sid)?;
+                for index in &table.indexes {
+                    self.remove_index_cache_entry(*sid, &index.name)?;
+                }
+                self.remove_partition_storage_files(
+                    &database,
+                    &name,
+                    table.id,
+                    *sid,
+                    &journal.index_names,
+                    &journal,
+                )?;
+            }
+            self.remove_partition_reorg_journal(&journal_path)?;
+            Ok(())
+        })();
+        if let Err(err) = cleanup {
+            if !self.is_operational() { return Err(err); }
+            log_message(format_args!("committed DROP PARTITION cleanup pending; durable intent retained: {err}"));
         }
-        self.remove_partition_reorg_journal(&journal_path)?;
         Ok(())
     }
 
@@ -12742,12 +12751,13 @@ impl Database {
     ) -> Result<(), QueryError> {
         let (database, name) = split_table_name(DEFAULT_DATABASE, table_name);
         let key = table_key(&database, &name);
-        let table = self
-            .catalog_read()?
-            .tables
-            .get(&key)
-            .cloned()
-            .ok_or_else(|| ddl_table_not_found(&table_name))?;
+        let table = self.table(&key)?;
+        if !table.foreign_keys.is_empty() || !table.fk_referenced_by.is_empty() {
+            return Err(error(
+                crate::error::catalog::ER_FOREIGN_KEY_ON_PARTITIONED,
+                "Foreign keys are not supported on partitioned tables",
+            ));
+        }
         if !cutover.is_some_and(|(_, _, online)| online) {
             self.check_ddl_table_lock(table.id)?;
         }
@@ -15266,7 +15276,7 @@ fn validate_partition_layout_mysql80(table: &TableSchema) -> Result<(), QueryErr
     let mut list_values = std::collections::BTreeSet::new();
     let mut previous_range: Option<Vec<PartitionLiteral>> = None;
     for partition in &part.partitions {
-        if partition.name.is_empty() || partition.name.len() > 64 {
+        if partition.name.is_empty() || partition.name.chars().count() > 64 {
             return Err(error(
                 crate::error::catalog::ER_TOO_LONG_IDENT,
                 format!(
@@ -15282,7 +15292,7 @@ fn validate_partition_layout_mysql80(table: &TableSchema) -> Result<(), QueryErr
             ));
         }
         for subpartition in &partition.subpartitions {
-            if subpartition.name.is_empty() || subpartition.name.len() > 64 {
+            if subpartition.name.is_empty() || subpartition.name.chars().count() > 64 {
                 return Err(error(
                     crate::error::catalog::ER_TOO_LONG_IDENT,
                     format!(

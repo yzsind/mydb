@@ -2614,3 +2614,49 @@ fn fulltext_seal_and_pitr_preserve_source_commit_history() {
     backup.shutdown().unwrap();
     discard_source(source, coordinator);
 }
+
+#[test]
+fn audit1123_persisted_variables_roundtrip_without_source_bindings() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    source
+        .execute("SET PERSIST_ONLY max_connections=513")
+        .unwrap();
+    let expected = fs::read(source.db_handle().data_dir().join("system/mysqld-auto.cnf")).unwrap();
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let repo = root.path().join("repository");
+    let base = job(&c, c.backup(&repo).unwrap()).base_id.unwrap();
+    let destination = root.path().join("restore");
+    super::restore::restore(
+        &repo,
+        Some(&base),
+        None,
+        Target::Base,
+        &destination,
+        None,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read(destination.join("system/mysqld-auto.cnf")).unwrap(),
+        expected
+    );
+    assert!(!destination.join("system/backup-control").exists());
+    assert!(!destination.join("system/replication").exists());
+    discard_source(source, c);
+}
+
+#[test]
+fn audit1123_budget_patch_requires_an_existing_repository_binding() {
+    let root = root();
+    let source = engine(&root.path().join("source"));
+    let c = Coordinator::get(source.db_handle()).unwrap();
+    let repo = root.path().join("unconfigured");
+    let error = c
+        .configure_patch(&repo, None, false, Some(4096))
+        .unwrap_err();
+    assert!(error.message().contains("not configured"));
+    assert!(!repo.exists());
+    assert!(c.control.lock().unwrap().is_none());
+    discard_source(source, c);
+}

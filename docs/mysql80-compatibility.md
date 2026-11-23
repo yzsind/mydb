@@ -1354,8 +1354,11 @@ The following expression differences are retained:
 - SQL `PREPARE` may defer semantic name/grouping validation until `EXECUTE`, where invalid statements return explicit errors. Numeric-string LIMIT/OFFSET parameters are applied; negative limits return 1690 and floating-point bindings return 1210.
 - `PAD_CHAR_TO_FULL_LENGTH` is unsupported and returns 1235 when assigned through `sql_mode`.
 - Error codes and SQLSTATEs are aligned; messages keep mydb's clear descriptions and position hints and are not required to copy MySQL's text verbatim.
-- `ONLY_FULL_GROUP_BY` is on by default; loose grouping requires explicitly removing it from the session `sql_mode`. MySQL's complete primary-key functional-dependency inference is not reproduced; an otherwise ungrouped column can still return 1055. `DISTINCT` does not allow ordering by unprojected source columns.
+- `ONLY_FULL_GROUP_BY` is on by default; loose grouping requires explicitly removing it from the session `sql_mode`. Primary-key and UNIQUE NOT NULL dependencies retain qualified table and alias identity; unsupported dependency proofs still return 1055. `DISTINCT` does not allow ordering by unprojected source columns.
 - B-tree `DESC` declarations are accepted and retained as metadata with a warning; physical keys use ascending encoding, and reverse scans or an explicit sort preserve query ordering. Mixed ASC/DESC declarations do not provide mixed-direction physical ordering.
+
+- Explicit `ANALYZE TABLE ... UPDATE HISTOGRAM` snapshots inform supported range estimates. Equality estimates retain automatic frequency/sketch/zone-map evidence. Histograms remain snapshots until explicitly rebuilt; TRUNCATE discards them to avoid retaining a distribution for removed data. Mixed column requests return per-column status or Error rows, preserving successful columns.
+- Partition conversion rejects both parents and children of foreign-key constraints before changing storage. `EXCHANGE PARTITION` requires matching physical generations and returns an explicit unsupported-feature error when physical relocation would be required. A damaged partition DDL journal stops startup because an EXCHANGE intent can be necessary to finish committed file moves; it is not always disposable cleanup metadata.
 
 ### Recycle Bin
 

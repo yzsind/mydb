@@ -270,10 +270,15 @@ fn analyze_histogram_unknown_column_errors() {
     engine
         .execute("CREATE TABLE hx (id INT PRIMARY KEY)")
         .unwrap();
-    let err = engine
-        .execute("ANALYZE TABLE hx UPDATE HISTOGRAM ON nope")
-        .unwrap_err();
-    assert_eq!(err.code(), 1054, "unknown histogram column must be 1054");
+    let rows = rows_of(
+        engine
+            .execute("ANALYZE TABLE hx UPDATE HISTOGRAM ON nope")
+            .unwrap(),
+    );
+    assert_eq!(rows[0][2], Value::String("Error".into()));
+    assert!(rows[0][3]
+        .to_display_string()
+        .contains("Unknown column 'nope'"));
 }
 
 #[test]

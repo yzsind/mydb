@@ -810,6 +810,9 @@ pub(crate) fn show_index(
                 Value::Int(saturating_i64(
                     table
                         .index_prefix_cardinality(&index.name, seq + 1)
+                        .filter(|_| {
+                            !index.is_fulltext() && !index.is_spatial() && !index.is_vector()
+                        })
                         .filter(|count| *count > 0)
                         .unwrap_or_else(|| {
                             if index.is_fulltext() {
@@ -1242,7 +1245,7 @@ pub(crate) fn show_create_trigger(
             Value::String(trigger.character_set_client.clone()),
             Value::String(trigger.collation_connection.clone()),
             Value::String(trigger.database_collation.clone()),
-            mysql_time_value(trigger.created_ms),
+            crate::engine::information_schema::trigger_time_value(trigger.created_ms),
         ]],
     }))
 }
@@ -1274,7 +1277,7 @@ pub(crate) fn show_triggers(
                 Value::String(trigger.table_name.clone()),
                 Value::String(trigger.body_sql.clone()),
                 Value::String(trigger.timing.as_str().to_string()),
-                mysql_time_value(trigger.created_ms),
+                crate::engine::information_schema::trigger_time_value(trigger.created_ms),
                 Value::String(trigger.sql_mode.clone()),
                 Value::String(trigger.definer()),
                 Value::String(trigger.character_set_client.clone()),
@@ -1295,7 +1298,7 @@ fn show_create_trigger_columns() -> Vec<Column> {
         col("character_set_client", ColumnType::VarString),
         col("collation_connection", ColumnType::VarString),
         col("Database Collation", ColumnType::VarString),
-        col("Created", ColumnType::DateTime),
+        trigger_created_column(),
     ]
 }
 
@@ -1306,13 +1309,20 @@ fn show_triggers_columns() -> Vec<Column> {
         col("Table", ColumnType::VarString),
         col("Statement", ColumnType::VarString),
         col("Timing", ColumnType::VarString),
-        col("Created", ColumnType::DateTime),
+        trigger_created_column(),
         col("sql_mode", ColumnType::VarString),
         col("Definer", ColumnType::VarString),
         col("character_set_client", ColumnType::VarString),
         col("collation_connection", ColumnType::VarString),
         col("Database Collation", ColumnType::VarString),
     ]
+}
+
+fn trigger_created_column() -> Column {
+    let mut column = col("Created", ColumnType::DateTime);
+    column.source.decimals = Some(2);
+    column.source.length = Some(22);
+    column
 }
 
 /// B3: MySQL gates trigger metadata (SHOW TRIGGERS / SHOW CREATE TRIGGER)

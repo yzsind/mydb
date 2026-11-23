@@ -1187,11 +1187,21 @@ impl Database {
     pub fn auto_analyze_stale_tables(&self, ratio: f64) -> Result<u64, QueryError> {
         let _role = self.zone_map_gate.read_recursive();
         self.ensure_operational()?;
-        if self.physical_replica_mode() || self.is_snapshot_read_only() {
+        if self.physical_replica_mode()
+            || self.is_snapshot_read_only()
+            || crate::engine::sysvar::builtin::replication::read_only()
+            || crate::engine::sysvar::builtin::replication::super_read_only()
+            || self.capture.active.load(Ordering::Acquire)
+        {
             // Optimizer statistics belong to the source dictionary. Reads use
             // those statistics and conservative estimates without publishing.
             return Ok(0);
         }
+        let Some(_global) =
+            crate::binlog::optional_maintenance_permit(self.global_read_lock_scope())
+        else {
+            return Ok(0);
+        };
         // Phase 1: collect stale candidate keys under a read lock.
         let candidates: Vec<String> = {
             let catalog = self.catalog_read()?;
@@ -1199,7 +1209,10 @@ impl Database {
                 .tables
                 .iter()
                 .filter_map(|(key, table)| {
-                    if table.system || table.database == crate::recyclebin::DATABASE || crate::storage::naming::is_system_database(&table.database) {
+                    if table.system
+                        || table.database == crate::recyclebin::DATABASE
+                        || crate::storage::naming::is_system_database(&table.database)
+                    {
                         return None;
                     }
                     let delta = self.table_modification_delta(table.id);
@@ -1222,7 +1235,13 @@ impl Database {
                 Ok(true) => {
                     refreshed = refreshed.saturating_add(1);
                 }
-                Ok(false) | Err(_) => continue,
+                Ok(false) => continue,
+                Err(err) => {
+                    crate::engine::auto_analyze::record_failure();
+                    log_message(format_args!(
+                        "auto-analyze table {key} failed; retry next pass: {err}"
+                    ));
+                }
             }
         }
 
@@ -1231,7 +1250,6 @@ impl Database {
         }
         Ok(refreshed)
     }
-
     fn refresh_table_stats(
         &self,
         table_key: &str,

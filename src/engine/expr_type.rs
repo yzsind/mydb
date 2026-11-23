@@ -2027,7 +2027,9 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
         Expr::BoundValue(value) => bound_value_type(value, context),
         Expr::UserVariable(name) => crate::engine::expr::session_user_variable(name)
             .map(|value| bound_value_type(&value, context))
-            .unwrap_or_else(|| ExprType::new(Unknown, true)),
+            // An unset session variable evaluates to NULL, including during
+            // branch aggregation in stored-program expressions.
+            .unwrap_or_else(|| ExprType::new(Null, true)),
         Expr::GroupKeyRef { expr, .. } => infer_expr_type(expr, context),
         Expr::Grouping(_) => ExprType::new(
             Integer {

@@ -42,6 +42,7 @@ mod table_ddl_audit_1120;
 mod tablesample;
 mod temporal_comparison_consistency;
 mod trigger_release_1122;
+mod trigger_release_1123;
 mod txn_acid_audit_1108;
 mod vaderyang_issues;
 

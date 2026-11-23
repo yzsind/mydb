@@ -693,6 +693,15 @@ fn parse_statement_source(
         validate_enum_set_member_lengths(sql)?;
     }
 
+    // The native trigger grammar handles trivia and MySQL quoting itself.
+    // Retain its body before compatibility masking/normalization so catalog
+    // metadata and subsequent compilation use the original source text.
+    if head_is(b"CREATE") {
+        if let Some(result) = try_parse_create_trigger_statement(sql) {
+            return result;
+        }
+    }
+
     if head_is(b"SELECT") || head_is(b"WITH") || head_is(b"TABLE") {
         if let Some(statement) = parse_select_into_statement(sql)? {
             return Ok(statement);

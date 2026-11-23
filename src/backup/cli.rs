@@ -204,10 +204,8 @@ pub(crate) fn run(args: Vec<String>) -> Result<(), QueryError> {
                     .map_err(|e| backup_err(e.to_string()))?
             );
         }
-        "gc" => super::management::prune(
+        "gc" => super::management::gc(
             &path("--repository")?,
-            None,
-            None,
             options.contains_key("--apply"),
             key_file.as_deref(),
         )?,

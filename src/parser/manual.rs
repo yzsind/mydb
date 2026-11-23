@@ -3906,6 +3906,30 @@ fn looks_like_create_routine(sql: &str) -> bool {
         || consume_keyword_at(sql, idx, "FUNCTION").is_some()
 }
 
+pub(super) fn try_parse_create_trigger_statement(
+    sql: &str,
+) -> Option<Result<Statement, ParseError>> {
+    let trimmed = trim_sql_statement(sql);
+    looks_like_create_trigger(trimmed).then(|| {
+        // A delimiter followed by trailing comments is not removed by the
+        // whitespace-only trim. Locate it lexically so quoted semicolons and
+        // comments inside the stored body remain untouched.
+        let mode = crate::sql_lex::SqlLexMode::from_parser_bits(current_parser_sql_mode_bits());
+        let mut cursor = crate::sql_lex::SqlTokenCursor::new(trimmed, mode, MYSQL_VERSION_ID);
+        let mut last = None;
+        while let Some(token) = cursor.next().map_err(|err| parse_lex_error(trimmed, err))? {
+            last = Some(token);
+        }
+        let statement = match last {
+            Some(token) if token.kind == crate::sql_lex::SqlTokenKind::Symbol(b';') => {
+                trimmed[..token.span.start].trim_end()
+            }
+            _ => trimmed,
+        };
+        parse_create_trigger_statement(statement, statement)
+    })
+}
+
 fn looks_like_create_trigger(sql: &str) -> bool {
     let Some(mut idx) = consume_keyword_at(sql, 0, "CREATE") else {
         return false;

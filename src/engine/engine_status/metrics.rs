@@ -1118,6 +1118,7 @@ pub(super) fn collect(db: &Database) -> Vec<(String, String)> {
             aa.last_run_unix_ms.to_string(),
         ),
         ("auto_analyze_total_runs", aa.total_runs.to_string()),
+        ("auto_analyze_total_failures", aa.total_failures.to_string()),
         (
             "auto_analyze_total_tables_analyzed",
             aa.total_tables_analyzed.to_string(),

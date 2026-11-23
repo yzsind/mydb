@@ -410,11 +410,7 @@ fn qualify_idents_with_scope_inner(expr: &mut Expr, scope: &ScopeWrap<'_, '_>) {
                     }
                 }
             }
-            Expr::Subquery(_)
-            | Expr::Exists { .. }
-            | Expr::InSubquery { .. }
-            | Expr::QuantifiedComparison { .. }
-            | Expr::WindowFunction { .. } => return false,
+            Expr::Subquery(_) | Expr::Exists { .. } | Expr::WindowFunction { .. } => return false,
             _ => {}
         }
         true

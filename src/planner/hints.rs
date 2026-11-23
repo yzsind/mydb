@@ -31,7 +31,10 @@ pub(super) fn index_allowed_by_hints(
         .filter(|h| matches!(h.hint_type, IndexHintType::Use | IndexHintType::Force))
         .flat_map(|h| h.index_names.iter().map(|n| n.as_str()))
         .collect();
-    if !allowed.is_empty() {
+    if applicable
+        .iter()
+        .any(|h| matches!(h.hint_type, IndexHintType::Use | IndexHintType::Force))
+    {
         return allowed.iter().any(|n| n.eq_ignore_ascii_case(index_name));
     }
     true
@@ -65,7 +68,10 @@ pub(super) fn filter_index_candidates(
         .filter(|h| matches!(h.hint_type, IndexHintType::Use | IndexHintType::Force))
         .flat_map(|h| h.index_names.iter().map(|n| n.as_str()))
         .collect();
-    if !allowed.is_empty() {
+    if applicable
+        .iter()
+        .any(|h| matches!(h.hint_type, IndexHintType::Use | IndexHintType::Force))
+    {
         candidates.retain(|c| allowed.iter().any(|n| c.index.name.eq_ignore_ascii_case(n)));
     }
 }

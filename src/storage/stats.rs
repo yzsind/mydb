@@ -3026,7 +3026,7 @@ pub struct SqlHistogramBucket {
 
 impl SqlHistogram {
     pub fn to_json(&self) -> String {
-        fn endpoint(value: &Value) -> String {
+        let endpoint = |value: &Value| -> String {
             match value {
                 Value::Int(_)
                 | Value::UInt(_)
@@ -3037,8 +3037,17 @@ impl SqlHistogram {
                 | Value::Decimal128(..)
                 | Value::DecimalWide(_)
                 | Value::Year(_) => value.to_display_string(),
-                Value::Bytes(bytes) => {
+                Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+                    if self.data_type == "string" =>
+                {
                     use base64::Engine;
+                    let text;
+                    let bytes = if let Value::Bytes(bytes) = value {
+                        bytes.as_slice()
+                    } else {
+                        text = value.to_display_string();
+                        text.as_bytes()
+                    };
                     serde_json::to_string(&format!(
                         "base64:type254:{}",
                         base64::engine::general_purpose::STANDARD.encode(bytes)
@@ -3047,7 +3056,7 @@ impl SqlHistogram {
                 }
                 _ => serde_json::to_string(&value.to_display_string()).unwrap(),
             }
-        }
+        };
         let buckets = self
             .buckets
             .iter()
@@ -3088,6 +3097,32 @@ pub(crate) fn sql_histogram(
         .collation
         .as_deref()
         .unwrap_or(crate::charset::DEFAULT_COLLATION);
+    for value in &mut values {
+        match &column.data_type {
+            T::Enum { values: members } => {
+                let text = value.to_display_string();
+                *value = Value::UInt(
+                    members
+                        .iter()
+                        .position(|member| *member == text)
+                        .map_or(0, |i| i as u64 + 1),
+                );
+            }
+            T::Set { values: members } => {
+                let text = value.to_display_string();
+                let mask = members
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, member)| {
+                        text.split(',')
+                            .any(|part| !part.is_empty() && part == member.as_str())
+                    })
+                    .fold(0u64, |mask, (i, _)| mask | (1u64 << i));
+                *value = Value::UInt(mask);
+            }
+            _ => {}
+        }
+    }
     let compare = |a: &Value, b: &Value| match (a, b) {
         (Value::String(_) | Value::SmallString(_), Value::String(_) | Value::SmallString(_)) => {
             crate::charset::compare_strings(

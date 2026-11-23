@@ -590,6 +590,7 @@ fn collect_files<'a>(
     }
     for relative in [
         "system/commit-ledger.v1",
+        "system/mysqld-auto.cnf",
         "system/commit-clock.v1",
         "system/storage.control",
         "system/history-index.v1",
@@ -655,6 +656,13 @@ fn push_source_file(
 ) -> Result<(), QueryError> {
     let relative = relative_path(data_dir, &path)?;
     validate_restore_path(&relative)?;
+    if relative.ends_with(".idx.corrupt") || relative.ends_with(".rtree.corrupt") {
+        return Err(backup_err(format!("source index corruption fence '{relative}': repair or drop the affected index before backup")));
+    }
+    if relative.ends_with(".hvec.incoming") || relative.ends_with(".vpub.tmp") {
+        return Ok(());
+    }
+
     if out.skip.is_some_and(|set| set.contains(relative.as_str())) {
         return Ok(());
     }

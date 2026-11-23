@@ -2023,6 +2023,20 @@ pub fn server_id() -> u32 {
     config_snapshot().server_id
 }
 
+/// Optional maintenance must not publish while FTWRL is held. Retaining the
+/// ownership mutex also closes admission against a concurrent FTWRL request.
+pub(crate) fn optional_maintenance_permit(scope: u64) -> Option<impl Drop> {
+    let owners = GLOBAL_READ_LOCK_OWNERS.try_lock()?;
+    if owners
+        .iter()
+        .any(|(held_scope, _)| *held_scope == 0 || scope == 0 || *held_scope == scope)
+    {
+        None
+    } else {
+        Some(owners)
+    }
+}
+
 /// Wait before executing any write effects. The ownership mutex and condvar
 /// share the predicate, so releasing the last owner cannot lose a wakeup.
 /// The owner itself must fail instead of waiting for its own UNLOCK TABLES.

@@ -162,7 +162,30 @@ impl CatalogManager {
         }
         header.foreign_keys = Vec::new();
         header.fk_referenced_by = Vec::new();
-        header.stats = crate::storage::TableStats::empty();
+        header.stats = crate::storage::TableStats {
+            row_count: table.stats.row_count,
+            heap_page_count: table.stats.heap_page_count,
+            modified_rows_since_analyze: table.stats.modified_rows_since_analyze,
+            analyzed_at_unix_ms: table.stats.analyzed_at_unix_ms,
+            analyze_revision: table.stats.analyze_revision,
+            last_analyze_live_baseline: table.stats.last_analyze_live_baseline,
+            last_analyze_modification_baseline: table.stats.last_analyze_modification_baseline,
+            partition_stats: table
+                .stats
+                .partition_stats
+                .iter()
+                .map(|(&sid, leaf)| {
+                    let mut compact = crate::storage::PartitionStats::empty();
+                    compact.row_count = leaf.row_count;
+                    compact.heap_page_count = leaf.heap_page_count;
+                    compact.modified_rows_since_analyze = leaf.modified_rows_since_analyze;
+                    compact.analyzed_at_unix_ms = leaf.analyzed_at_unix_ms;
+                    compact.check_ok = leaf.check_ok;
+                    (sid, compact)
+                })
+                .collect(),
+            ..crate::storage::TableStats::empty()
+        };
         header.row_layouts = Vec::new();
         header.column_name_map = HashMap::default();
         header.column_id_map = HashMap::new();
@@ -1687,7 +1710,7 @@ impl Database {
         // Retire scoring families with their defining DDL. MVCC tombstones
         // retain old-snapshot visibility while ordinary purge can reclaim the
         // rows; repeated DROP/CREATE or COPY must not leak live counters.
-        let mut old_fulltext = HashMap::<u64, (u64, HashSet<u64>)>::new();
+        let mut old_fulltext = HashMap::<u64, (u64, HashSet<u64>, Vec<u64>)>::new();
         for table_id in &replaced_tables {
             let old = self.catalog_rows_for_selector(DD_TABLES,
                 CatalogRowSelector::PrimaryValues(vec![Value::UInt(*table_id)]))?;
@@ -1704,7 +1727,18 @@ impl Database {
                     .ok_or_else(|| fulltext_statistics_error("missing persisted corpus"))?;
                 corpora.insert(meta.corpus_id);
             }
-            if !corpora.is_empty() { old_fulltext.insert(*table_id, (*generation, corpora)); }
+            if !corpora.is_empty() {
+                let partitioning = old
+                    .first()
+                    .and_then(|row| row.get(15))
+                    .and_then(crate::types::value_str)
+                    .map(serde_json::from_str::<Option<crate::storage::partitioning::PartitionInfo>>)
+                    .transpose()
+                    .map_err(fulltext_statistics_error)?
+                    .flatten();
+                let sids = partitioning.map_or_else(|| vec![*table_id], |p| p.storage_ids());
+                old_fulltext.insert(*table_id, (*generation, corpora, sids));
+            }
         }
         let catalog = self.catalog_read()?;
         for mutation in mutations {
@@ -1740,10 +1774,29 @@ impl Database {
                         // offline build that never acquired catalog metadata.
                         txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
                             CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id)]), Vec::new());
-                    } else if let Some((generation, corpora)) = old_fulltext.remove(&table_id) {
+                    } else if let Some((generation, corpora, old_sids)) = old_fulltext.remove(&table_id) {
                         let retained = table.filter(|table| table.active_generation == generation)
                             .map(|table| table.indexes.iter().filter_map(|index| index.fulltext.as_ref().map(|meta| meta.corpus_id)).collect::<HashSet<_>>())
                             .unwrap_or_default();
+                        if let Some(table) = table.filter(|t| t.active_generation == generation) {
+                            let live_sids = table.storage_ids().into_iter().collect::<HashSet<_>>();
+                            for sid in old_sids.iter().filter(|sid| !live_sids.contains(*sid)) {
+                                for index in table.indexes.iter().filter(|index| {
+                                    index
+                                        .fulltext
+                                        .as_ref()
+                                        .is_some_and(|meta| retained.contains(&meta.corpus_id))
+                                }) {
+                                    txn.replace(
+                                        crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                                        CatalogRowSelector::PrefixValues(
+                                            self.fulltext_counter_prefix(table, index, *sid)?,
+                                        ),
+                                        Vec::new(),
+                                    );
+                                }
+                            }
+                        }
                         for corpus in corpora.difference(&retained) {
                             txn.replace(crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
                                 CatalogRowSelector::PrefixValues(vec![Value::UInt(table_id), Value::UInt(generation), Value::UInt(*corpus)]), Vec::new());
@@ -2830,5 +2883,34 @@ impl Database {
             return Err(err);
         }
         self.commit_txn(txn.txn_id).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod audit1123_fulltext_retirement_tests {
+    use super::*;
+    #[test]
+    fn audit1123_partition_ddl_retires_fulltext_counter_leaves() {
+        let root = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+        let engine = crate::engine::StorageQueryEngine::open(root.path()).unwrap();
+        engine.execute("CREATE TABLE ft(k INT,s TEXT,FULLTEXT KEY f(s)) PARTITION BY RANGE(k)(PARTITION p0 VALUES LESS THAN(10),PARTITION pmax VALUES LESS THAN MAXVALUE)").unwrap();
+        engine
+            .execute("INSERT INTO ft VALUES(1,'alpha beta'),(11,'gamma delta')")
+            .unwrap();
+        let db = engine.database();
+        let id = db.table("ft").unwrap().id;
+        let counter_rows = || {
+            db.catalog_rows_for_selector(
+                crate::storage::data_dictionary::DD_FULLTEXT_COUNTERS,
+                CatalogRowSelector::PrefixValues(vec![Value::UInt(id)]),
+            )
+            .unwrap()
+        };
+        assert!(!counter_rows().is_empty());
+        engine.execute("ALTER TABLE ft DROP PARTITION p0").unwrap();
+        let live = db.table("ft").unwrap().storage_ids();
+        assert!(counter_rows()
+            .iter()
+            .all(|row| matches!(row.get(4),Some(Value::UInt(sid)) if live.contains(sid))));
     }
 }

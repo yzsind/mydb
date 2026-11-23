@@ -7361,3 +7361,40 @@ fn partial_index_standalone_where_follows_index_options() {
         assert!(index.predicate.is_some(), "{sql}");
     }
 }
+
+#[test]
+fn trigger_release_1123_retains_source_across_modes_and_batches() {
+    for bits in [
+        0,
+        crate::engine::api::SQL_MODE_ANSI_QUOTES,
+        crate::engine::api::SQL_MODE_NO_BACKSLASH_ESCAPES,
+    ] {
+        let _mode = ParserSqlModeGuard::activate(bits);
+        let body = "BEGIN /* 注释 ' */ SET @s = 'a''b'; -- comment\n SET @n=1; # comment\n END";
+        let sql = format!("CREATE /* header */ DEFINER=`root`@`localhost` TRIGGER `tr` BEFORE INSERT ON `t` FOR EACH ROW {body}");
+        let Statement::CreateTrigger(def) = parse_statement(&sql).unwrap() else {
+            panic!()
+        };
+        assert_eq!(def.body.sql, body);
+        assert_eq!(def.create_sql, sql);
+        let batch = parse_statements(&format!("{sql}; SELECT 1")).unwrap();
+        let Statement::CreateTrigger(def) = &batch[0] else {
+            panic!()
+        };
+        assert_eq!(def.body.sql, body);
+        assert_eq!(def.create_sql, sql);
+        assert_eq!(batch.len(), 2);
+    }
+}
+
+#[test]
+fn trigger_release_1123_trailing_comments_do_not_hide_delimiter() {
+    let body = "BEGIN /* body */ SET @s=';'; END /* trailing body comment */";
+    for tail in ["", ";", "; /* outside */", "; -- outside\n"] {
+        let sql = format!("CREATE TRIGGER tr BEFORE INSERT ON t FOR EACH ROW {body}{tail}");
+        let Statement::CreateTrigger(def) = parse_statement(&sql).unwrap() else {
+            panic!()
+        };
+        assert_eq!(def.body.sql, body);
+    }
+}
