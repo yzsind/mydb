@@ -227,7 +227,12 @@ async fn availability_dual_listener_failure_preserves_other_listener_and_transac
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{sql}");
+            let status = response.status();
+            // Session ownership lasts through result delivery. Finish reading
+            // the response before issuing another request on this session.
+            let body = response.json::<Value>().await.unwrap();
+            assert_eq!(status, StatusCode::OK, "{sql}: {body}");
+            assert!(body["error"].is_null(), "{sql}: {body}");
         }
         failure.notify_one();
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -246,7 +251,10 @@ async fn availability_dual_listener_failure_preserves_other_listener_and_transac
             .send()
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
+        let status = response.status();
+        let body = response.json::<Value>().await.unwrap();
+        assert_eq!(status, StatusCode::OK, "COMMIT: {body}");
+        assert!(body["error"].is_null(), "COMMIT: {body}");
         let crate::engine::api::QueryResponse::ResultSet(rows) =
             engine.execute("SELECT id FROM survivor").unwrap()
         else {
