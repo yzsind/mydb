@@ -333,6 +333,8 @@ fn render_expr_options(expr: &Expr, canonical: bool, queries: bool) -> String {
             .join("."),
         Expr::UserVariable(name) => {
             if !name.is_empty()
+                // Empty dot-separated components need quoting to parse again.
+                && name.split('.').all(|part| !part.is_empty())
                 && name
                     .chars()
                     .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '$' | '.'))
