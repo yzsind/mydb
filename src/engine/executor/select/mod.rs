@@ -5266,7 +5266,6 @@ pub(super) fn describe_select_columns(
         }
         // LATERAL predicates must bind to the preceding metadata scope, even
         // during CREATE VIEW/PREPARE when no input rows are read.
-        drop(describe_source);
         let mut preceding = described.clone();
         preceding.joins.clear();
         preceding.projection = vec![SelectItem::Wildcard];

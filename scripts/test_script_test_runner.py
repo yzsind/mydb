@@ -21,6 +21,9 @@ class ScriptRunnerTests(unittest.TestCase):
     def test_discovers_new_unittest_modules_without_importing_integration_drivers(self):
         (self.root / 'test_new_unit.py').write_text('import unittest\nclass Checks(unittest.TestCase):\n pass\n')
         (self.root / 'test_live.py').write_text('raise RuntimeError("integration must not be imported")\n')
+        (self.root / 'test_live_unittest.py').write_text(
+            'REQUIRES_SERVER = True\nraise RuntimeError("server required")\n'
+            'import unittest\nclass Checks(unittest.TestCase):\n pass\n')
         (self.root / 'test_alias.py').write_text('from unittest import TestCase as Case\nclass Checks(Case):\n pass\n')
         (self.root / 'test_async.py').write_text('import unittest\nclass Checks(unittest.IsolatedAsyncioTestCase):\n pass\n')
         self.assertEqual([p.name for p in runner.unit_modules(self.root)],

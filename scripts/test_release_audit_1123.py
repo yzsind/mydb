@@ -12,6 +12,7 @@ import unittest
 import pymysql
 import mysql.connector
 
+REQUIRES_SERVER = True
 ARGS = None
 
 

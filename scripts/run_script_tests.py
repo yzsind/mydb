@@ -19,6 +19,14 @@ def unit_modules(directory=ROOT):
     modules = []
     for path in sorted(directory.glob('test_*.py')):
         tree = ast.parse(path.read_text(encoding='utf-8'), filename=str(path))
+        # Server-backed unittest drivers must be invoked with their own CLI.
+        # Read the marker without importing modules that may open connections.
+        if any(isinstance(node, ast.Assign)
+               and any(isinstance(target, ast.Name) and target.id == 'REQUIRES_SERVER'
+                       for target in node.targets)
+               and isinstance(node.value, ast.Constant) and node.value.value is True
+               for node in tree.body):
+            continue
         case_names = {'TestCase', 'IsolatedAsyncioTestCase'}
         for node in tree.body:
             if isinstance(node, ast.ImportFrom) and node.module == 'unittest':
