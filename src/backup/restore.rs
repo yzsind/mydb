@@ -216,6 +216,16 @@ pub(crate) fn visit_range(
     Ok(())
 }
 pub(crate) fn verify_range(repo: &Repository, range: &Range) -> Result<(), QueryError> {
+    #[cfg(test)]
+    super::faults::hit(
+        "range_before_full_verify",
+        &repo
+            .root
+            .join("streams")
+            .join(&range.stream_id)
+            .join("ranges")
+            .join(&range.id),
+    )?;
     visit_range(repo, range, |_, _, _| Ok(()))
 }
 

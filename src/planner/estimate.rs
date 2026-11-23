@@ -92,12 +92,57 @@ pub(super) fn estimate_fulltext_access_rows(
                     })
                     .collect::<Vec<_>>();
                 let estimated_docs = match spec.mode {
-                    crate::parser::FtMode::NaturalLanguage => dfs.iter().sum::<u64>(),
-                    crate::parser::FtMode::Boolean => dfs.iter().copied().min().unwrap_or(0),
+                    crate::parser::FtMode::NaturalLanguage => {
+                        dfs.iter().copied().fold(0u64, u64::saturating_add)
+                    }
+                    crate::parser::FtMode::Boolean => {
+                        use crate::storage::fulltext::boolean::{
+                            parse_boolean_query, Matcher, Occur,
+                        };
+                        let df = |token: &str| {
+                            stats
+                                .token_df_top
+                                .iter()
+                                .find(|entry| entry.token == token)
+                                .map_or(fallback_df, |entry| entry.document_count)
+                        };
+                        if let Ok(clauses) = parse_boolean_query(&spec.query, tokenizer.as_ref()) {
+                            let required = clauses.iter().any(|c| c.occur == Occur::Must);
+                            let candidates = clauses
+                                .iter()
+                                .filter(|c| {
+                                    if required {
+                                        c.occur == Occur::Must
+                                    } else {
+                                        c.occur == Occur::Should
+                                    }
+                                })
+                                .map(|c| match &c.matcher {
+                                    Matcher::Term(tokens)
+                                    | Matcher::Phrase(tokens)
+                                    | Matcher::FilteredPhrase { terms: tokens, .. } => {
+                                        tokens.iter().map(|t| df(t)).min().unwrap_or(0)
+                                    }
+                                    Matcher::Prefix(_) => stats.doc_count,
+                                })
+                                .collect::<Vec<_>>();
+                            if required {
+                                candidates.into_iter().min().unwrap_or(0)
+                            } else {
+                                candidates.into_iter().fold(0u64, u64::saturating_add)
+                            }
+                        } else {
+                            dfs.iter().copied().min().unwrap_or(0)
+                        }
+                    }
                 }
                 .min(stats.doc_count);
-                (estimated_docs as f64 / stats.doc_count as f64)
-                    .clamp(1.0 / total_rows.max(1.0), 1.0)
+                if estimated_docs == 0 {
+                    0.0
+                } else {
+                    (estimated_docs as f64 / stats.doc_count as f64)
+                        .clamp(1.0 / total_rows.max(1.0), 1.0)
+                }
             } else {
                 match spec.mode {
                     // Natural-language terms use OR candidate semantics.
@@ -1172,6 +1217,11 @@ pub(super) fn estimate_range_rows_for_column(
     });
     let first = first_owned.as_ref().map(|(op, value)| (*op, value));
     let second = second_owned.as_ref().map(|(op, value)| (*op, value));
+    if let Some(rows) =
+        estimate_sql_histogram_range_rows(table, &normalized, first, second, total_rows)
+    {
+        return rows;
+    }
     let Some(stats) = table.stats.columns.get(&normalized) else {
         return default_range_rows(total_rows);
     };
@@ -1305,6 +1355,127 @@ pub(super) fn estimate_range_rows_for_column(
         ((high - low) / (max_n - min_n)) * non_top_total
     };
     (top_in_range + non_top_in_range).clamp(0.0, total_rows)
+}
+
+/// Explicit SQL histograms describe the complete sampled distribution,
+/// including heavy hitters. Keep equality on its more precise frequency path.
+fn estimate_sql_histogram_range_rows(
+    table: &TableSchema,
+    column: &str,
+    first: Option<(BinaryOp, &Value)>,
+    second: Option<(BinaryOp, &Value)>,
+    total_rows: f64,
+) -> Option<f64> {
+    let histogram = table.stats.explicit_histograms.get(column)?;
+    let schema = table
+        .columns
+        .iter()
+        .find(|c| c.name.eq_ignore_ascii_case(column))?;
+    if matches!(
+        schema.data_type,
+        crate::storage::DataTypeKind::Enum { .. } | crate::storage::DataTypeKind::Set { .. }
+    ) {
+        return None;
+    }
+    let bounds = first.into_iter().chain(second).collect::<Vec<_>>();
+    if bounds.iter().any(|(_, value)| matches!(value, Value::Null)) {
+        return Some(0.0);
+    }
+    // Mixed SQL comparison domains cannot use the histogram's sort order.
+    let compatible = |a: &Value, b: &Value| match (a, b) {
+        (Value::String(_) | Value::SmallString(_), Value::String(_) | Value::SmallString(_))
+        | (Value::Bytes(_), Value::Bytes(_))
+        | (Value::Date(_), Value::Date(_))
+        | (Value::Time(_), Value::Time(_))
+        | (Value::DateTime(_), Value::DateTime(_))
+        | (Value::Timestamp(_), Value::Timestamp(_))
+        | (Value::Year(_), Value::Year(_)) => true,
+        _ => crate::storage::is_numeric_value(a) && crate::storage::is_numeric_value(b),
+    };
+    if let Some(bucket) = histogram.buckets.first() {
+        if bounds
+            .iter()
+            .any(|(_, value)| !compatible(&bucket.lower, value))
+        {
+            return None;
+        }
+    }
+    let compare =
+        |a: &Value, b: &Value| match (crate::types::value_str(a), crate::types::value_str(b)) {
+            (Some(a), Some(b)) => Some(crate::charset::compare_strings(
+                schema
+                    .collation
+                    .as_deref()
+                    .unwrap_or(crate::charset::DEFAULT_COLLATION),
+                a,
+                b,
+            )),
+            _ => crate::engine::expr::compare_values(a, b).ok(),
+        };
+    let cdf = |bound: &Value, inclusive: bool| {
+        let mut previous = 0.0_f64;
+        for bucket in &histogram.buckets {
+            let mass = (bucket.cumulative_frequency - previous).max(0.0);
+            let lower = compare(bound, &bucket.lower)?;
+            let upper = compare(bound, &bucket.upper)?;
+            if lower.is_lt() {
+                return Some(previous);
+            }
+            if upper.is_gt() {
+                previous = bucket.cumulative_frequency;
+                continue;
+            }
+            let ndv = bucket.distinct_count.max(1) as f64;
+            let fraction = if lower.is_eq() && upper.is_eq() {
+                u8::from(inclusive) as f64
+            } else if lower.is_eq() {
+                if inclusive {
+                    1.0 / ndv
+                } else {
+                    0.0
+                }
+            } else if upper.is_eq() {
+                if inclusive {
+                    1.0
+                } else {
+                    1.0 - 1.0 / ndv
+                }
+            } else if let Some((value, (low, high))) = (!matches!(
+                bucket.lower,
+                Value::String(_) | Value::SmallString(_) | Value::Bytes(_)
+            ))
+            .then(|| {
+                numeric_stat_value_opt(bound).zip(
+                    numeric_stat_value_opt(&bucket.lower)
+                        .zip(numeric_stat_value_opt(&bucket.upper)),
+                )
+            })
+            .flatten()
+            {
+                if high > low && (high - low).is_finite() {
+                    ((value - low) / (high - low)).clamp(0.0, 1.0)
+                } else {
+                    0.5
+                }
+            } else {
+                0.5
+            };
+            return Some(previous + mass * fraction);
+        }
+        Some(previous)
+    };
+    let mut low = 0.0_f64;
+    let mut high = (1.0 - histogram.null_fraction).clamp(0.0, 1.0);
+    for (op, value) in bounds {
+        match op {
+            BinaryOp::Gt => low = low.max(cdf(value, true)?),
+            BinaryOp::GtEq => low = low.max(cdf(value, false)?),
+            BinaryOp::Lt => high = high.min(cdf(value, false)?),
+            BinaryOp::LtEq => high = high.min(cdf(value, true)?),
+            _ => return None,
+        }
+    }
+    Some(((high - low).max(0.0) * total_rows).clamp(0.0, total_rows.max(0.0)))
 }
 
 pub(super) fn estimate_discrete_temporal_range_rows(

@@ -208,6 +208,8 @@ pub(crate) fn exclusive_lock(_path: &Path) -> Result<File, QueryError> {
 }
 
 pub fn promote(path: &Path) -> Result<(), QueryError> {
+    let resolved = resolved_destination(path)?;
+    let path = resolved.as_path();
     if crate::storage::image_io::repository_ancestor(path).is_some() {
         return Err(backup_err("repository bases cannot be promoted"));
     }

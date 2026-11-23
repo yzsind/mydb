@@ -627,6 +627,12 @@ impl Database {
             }
         }
         self.unregister_reorg_storage_locs(&build_sids);
+        if journal.phase == PartitionDdlPhase::Cleanup && self.is_operational() {
+            if let Err(err) = &result {
+                log_message(format_args!("committed ADD PARTITION cleanup pending; durable intent retained: {err}"));
+            }
+            return Ok(());
+        }
         result
     }
 
@@ -1083,6 +1089,10 @@ impl Database {
             // finishes source cleanup idempotently.
             if !pre_swap {
                 self.unregister_reorg_storage_locs(&build_sids);
+                if self.is_operational() && matches!(journal.phase, PartitionDdlPhase::Swapped | PartitionDdlPhase::Cleanup | PartitionDdlPhase::Done) {
+                    log_message(format_args!("committed partition DDL cleanup pending; durable intent retained: {failure}"));
+                    return Ok(());
+                }
                 return result;
             }
             self.evict_partition_vector_graphs(candidate.id, &build_sids);
@@ -1478,6 +1488,7 @@ impl Database {
             ));
             err
         })?;
+        journal.phase = PartitionDdlPhase::Swapped;
         // The published totals include all committed DML up to the cutover.
         // Clear the old sidecar before releasing the writer barrier, otherwise
         // metadata adds those inserts/deletes a second time.

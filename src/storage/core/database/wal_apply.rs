@@ -224,16 +224,36 @@ impl Database {
     ) -> Result<(), QueryError> {
         let lsn = record.lsn;
         let txn_id = record.txn_id;
-        if self.physical_replica_mode() && txn_id != 0 && matches!(record.payload,
-            WalPayload::HeapInsert { .. } | WalPayload::HeapInsertBatch { .. }
-            | WalPayload::HeapUpdate { .. } | WalPayload::HeapUpdateLogical { .. }
-            | WalPayload::HeapDelete { .. }) {
-            if let Some(storage_id) = replica_payload_path(&record.payload).and_then(Self::parse_heap_table_id) {
-                if self.table_by_id(storage_id).is_none()
-                    && !self.applier_dd_dirty_txns.lock().get(&txn_id).is_some_and(|delta|
-                        delta.dd_touched || delta.invalidate_all || !delta.object_ids.is_empty()) {
-                    return Err(error(crate::error::catalog::ER_NO_SUCH_TABLE,
+        if self.physical_replica_mode()
+            && txn_id != 0
+            && matches!(
+                record.payload,
+                WalPayload::HeapInsert { .. }
+                    | WalPayload::HeapInsertBatch { .. }
+                    | WalPayload::HeapUpdate { .. }
+                    | WalPayload::HeapUpdateLogical { .. }
+                    | WalPayload::HeapDelete { .. }
+            )
+        {
+            if let Some(path) = replica_payload_path(&record.payload) {
+                if let Some(storage_id) = Self::parse_heap_table_id(path) {
+                    // Streaming DDL fills private heaps before its catalog swap.
+                    // Their logged FileCreate is the durable declaration; never
+                    // let an unknown DML record implicitly create a missing heap.
+                    if self.table_by_id(storage_id).is_none()
+                        && !self
+                            .applier_dd_dirty_txns
+                            .lock()
+                            .get(&txn_id)
+                            .is_some_and(|delta| {
+                                delta.dd_touched || delta.invalidate_all || !delta.object_ids.is_empty()
+                            })
+                        && !heap_redo.files.contains_key(path)
+                        && !self.data_dir.join(path).is_file()
+                    {
+                        return Err(error(crate::error::catalog::ER_NO_SUCH_TABLE,
                         format!("replicated DML references unknown storage object {storage_id} at LSN {lsn}")));
+                    }
                 }
             }
         }

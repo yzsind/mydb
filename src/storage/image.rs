@@ -414,6 +414,7 @@ pub(crate) fn validate_restore_path(relative: &str) -> Result<(), QueryError> {
         || matches!(
             relative,
             "system/commit-ledger.v1"
+                | "system/mysqld-auto.cnf"
                 | "system/commit-clock.v1"
                 | "system/storage.control"
                 | "system/history-index.v1"

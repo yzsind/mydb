@@ -5682,8 +5682,26 @@ fn parse_change_source_onto(
     sql: &str,
     mut cfg: ReplicationChannelConfig,
 ) -> Result<ReplicationChannelConfig, QueryError> {
-    let mut body = if let Some(pos) = sql.to_ascii_uppercase().find(" TO ") {
-        sql[pos + 4..].trim()
+    // Read the fixed keyword prefix without rewriting quoted option values.
+    let mut tail = sql.trim_start();
+    for _ in 0..3 {
+        if tail
+            .get(..2)
+            .is_some_and(|word| word.eq_ignore_ascii_case("TO"))
+            && tail.as_bytes().get(2).is_some_and(u8::is_ascii_whitespace)
+        {
+            break;
+        }
+        tail = tail
+            .find(char::is_whitespace)
+            .map_or("", |pos| tail[pos..].trim_start());
+    }
+    let mut body = if tail
+        .get(..2)
+        .is_some_and(|word| word.eq_ignore_ascii_case("TO"))
+        && tail.as_bytes().get(2).is_some_and(u8::is_ascii_whitespace)
+    {
+        tail[2..].trim_start()
     } else {
         return Err(error(
             crate::error::catalog::ER_PARSE_ERROR,

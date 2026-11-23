@@ -2726,12 +2726,13 @@ pub(super) fn execute_analyze_table(
             let updated = db.update_table_histograms(&table_name, cols, buckets.unwrap_or(100))?;
             let rows = updated
                 .into_iter()
-                .map(|c| {
-                    analyze_row(
+                .map(|c| match c {
+                    Ok(c) => analyze_row(
                         "histogram",
                         "status",
                         format!("Histogram statistics created for column '{c}'."),
-                    )
+                    ),
+                    Err(err) => analyze_row("histogram", "Error", err.message().to_string()),
                 })
                 .collect();
             Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))
@@ -2740,12 +2741,13 @@ pub(super) fn execute_analyze_table(
             let dropped = db.drop_table_histograms(&table_name, cols)?;
             let rows = dropped
                 .into_iter()
-                .map(|c| {
-                    analyze_row(
+                .map(|c| match c {
+                    Ok(c) => analyze_row(
                         "histogram",
                         "status",
                         format!("Histogram statistics removed for column '{c}'."),
-                    )
+                    ),
+                    Err(err) => analyze_row("histogram", "Error", err.message().to_string()),
                 })
                 .collect();
             Ok(QueryResponse::ResultSet(ResultSet { columns, rows }))

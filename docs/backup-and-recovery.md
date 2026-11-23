@@ -18,7 +18,9 @@ MyDB 1.0.1 is a public-preview release; see the [Feature Overview](feature-overv
 
 `BACKUP DATABASE` covers **the persistent database state of the entire instance**, regardless of the current `USE` database. It does not accept an individual database or table name. There is currently no separate incremental backup command based on changed data-file blocks; incremental recovery after a full backup relies on WAL archiving.
 
-A full base contains the catalog, table and LOB data, undo, indexes, sequences, temporal history, and persistent system-object state needed for recovery and queries. Save server startup configuration, TLS files, runtime logs, and external keys separately. An independently restored instance does not inherit the source's node identity, replication role, or archive binding.
+A full base contains the catalog, table and LOB data, undo, indexes, sequences, temporal history, persisted SQL variables (`system/mysqld-auto.cnf`), and persistent system-object state needed for recovery and queries. Save server startup configuration, TLS files, runtime logs, and external keys separately. An independently restored instance does not inherit the source's node identity, replication role, archive binding, binary-log files, or local binary-log execution history. Imported upstream GTID receipts stored in the catalog remain part of the restored data dictionary.
+
+Persisted SQL variables are copied as a full-base configuration snapshot. WAL continuation does not reconstruct later `SET PERSIST` or `SET PERSIST_ONLY` changes; retain configuration history separately when recovering to a later target time.
 
 Sequences retain their durable reservation high-water marks. With SQL `CACHE 1`, recovery may skip up to `MYDB_SEQUENCE_WAL_BATCH` additional values (32 by default). Larger session caches can cause further gaps. The WAL look-ahead is separate from SQL `CACHE`; sequence numbering is not gapless.
 
@@ -69,7 +71,7 @@ The repository filesystem must support the file locking, durable synchronization
 
 Reserve separate space for source WAL retention, full bases, backup sealing, recovery workspaces, and query temporary files. A full backup performs a checkpoint, file copying, image recovery, index preparation, and verification. Its final size and duration depend on the data and indexes; no fixed size multiplier or throughput can be promised.
 
-Most data-copying stages allow concurrent DML, but capture boundaries pause new writes and wait for conflicting transactions to finish. DDL or maintenance statements may be rejected during capture. Long write transactions, heavy DDL, I/O pressure, or space pressure may cause backup timeouts or failures. Create full backups during quieter periods and monitor application latency and backup job errors.
+Most data-copying stages allow concurrent DML. Initial and final capture barriers pause writes and wait for conflicting work. The initial drain can wait up to 30 seconds; a write waiting on a frozen barrier can fail with a lock-wait timeout after two seconds and should be retried. DDL or maintenance statements may be rejected during capture. Long write transactions, heavy DDL, I/O pressure, or space pressure may cause backup timeouts or failures. Create full backups during quieter periods and monitor application latency and backup job errors. `backup_freeze_budget_ms` limits the final drain and rejects a completed barrier that exceeded its budget; it is not a hard upper bound on write-pause duration because checkpoint, lock, and filesystem operations cannot always be interrupted. An index corruption fence requires repairing or dropping the affected index before a backup can be sealed.
 
 ## 3. Create and Confirm a Full Backup
 
@@ -251,7 +253,7 @@ mydb-backup restore --repository /tmp/mydb/repository \
 
 Alternatively, use `--base BASE_ID --target latest` to recover along the specified base's archive stream. `latest` means the repository's latest confirmed coverage visible during this recovery plan, not the source instance's latest current commit.
 
-If neither `--base` nor a target is specified, the default is the latest coverage. If the repository has multiple eligible branches, explicitly specify `--stream` or `--base`; the tool does not guess the recovery source.
+If neither `--base` nor a target is specified, the default is the latest coverage. A repository may contain independently identified sources and streams. If the repository has multiple eligible branches, explicitly specify `--stream` or `--base`; the tool does not guess the recovery source. Use separate directories when operational isolation between sources is required.
 
 ### 6.4 Recover by Time
 
@@ -448,6 +450,8 @@ mydb-backup restore --repository /tmp/mydb/imported \
 
 The import target must not exist or must be empty; merging into an existing repository is unsupported. Import checks the bundle and dependencies in a private workspace before publication. Truncation, trailing data, conflicting paths, and objects exceeding limits are rejected. For encrypted repositories, add the corresponding `--key-file` to export, import, verification, and WAL recovery commands. Bundles do not contain keys.
 
+Bundle checksums establish content integrity, not the authenticity of the producer; accept bundles only from trusted sources.
+
 ## 11. Retention Windows and History Pruning
 
 First preview the pruning plan:
@@ -536,7 +540,7 @@ First restore repository availability, resolve archive errors, or submit and awa
 | Checksum mismatch, archive gap, or identity error | Preserve error details and use another complete backup with a continuous recovery chain. Do not bypass checks or edit the manifest manually |
 | `promote` reports an active instance or hard links | Stop the instance using that directory; restore a hard-linked image again with independent files before retrying |
 
-The implementation sets explicit resource limits, such as 64 MiB per metadata object, 4 MiB per WAL blob, and controlled metadata and temporary-space budgets. File generation leases and bounded streaming have replaced the old limits of 1024 files and 512 WAL segments. Exceeding a budget fails explicitly; see Section 14 for scale verification and verifiable resumption.
+The implementation sets explicit resource limits, such as 64 MiB per metadata object, 4 MiB per WAL blob, and controlled metadata and temporary-space budgets. The live catalog admits at most 100,000 objects, also subject to the configured metadata-memory budget; plan repository rotation before reaching this admission limit. File generation leases and bounded streaming have replaced the old limits of 1024 files and 512 WAL segments. Exceeding a budget fails explicitly; see Section 14 for scale verification and verifiable resumption.
 
 WAL protection also fixes the temporal history retention window at capture time. Before changing that window, switching source lineage, or selecting a nonpersistent mode, stop protection as required to avoid breaking the recovery chain. Recovery uses strict validation; do not rely on forced tolerance or salvage settings to bypass corruption.
 
@@ -571,6 +575,8 @@ mydb-backup checkpoint --repository /tmp/mydb/repository --gc
 `inspect-operation` checks the ownership journal with its digest and the OS lock. `--apply` cleans only private workspaces with proven ownership and no active holder; it neither skips object validation nor deletes arbitrary unknown files. Other kinds include `repository-init`, `control-init`, `import-work`, `export-work`, `range-work`, `generation-pins`, `wal-pins`, and `catalog-checkpoint`. `confirm` fully verifies an installed image or repository and reconfirms synchronization; it does not advance archive ACKs for the source. `gc` cleans committed deletion intents and leftover artifacts with proven ownership, without implicitly setting a retention window. `checkpoint --gc` compacts the cold catalog chain into history packs backed by digest proofs and removes packed loose files under an exclusive GC lease. Old source receipts must still pass membership proofs for their original generation/digest. Automatic checkpoints run every 1024 generations.
 
 After repairing missing or corrupt objects, explicitly reapply the original MANUAL/CONTINUOUS policy on a BROKEN source. Before restarting protection, the system checks source/timeline, ancestry of old receipts, and all live dependencies; protection is not restored while objects remain corrupt. Increasing the WAL budget alone does not constitute a repair. Abandoning the tail first persists a source-side closure intent. An offline repository may show `CLOSED_PENDING_REPOSITORY`; repository closure is recorded only after reconciliation. An abandoned position is never reported as backed up.
+
+`gc` authenticates catalog reachability before deleting unreferenced objects. It does not require live payloads to pass data verification; damaged reachable objects remain protected and must still be diagnosed with `verify`. `prune` continues to verify retained recovery payloads before changing retention.
 
 ## 14. Fixed-Input Resumption, Resources, and Keys
 

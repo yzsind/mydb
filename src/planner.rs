@@ -4442,6 +4442,7 @@ impl MetadataNamePolicy {
 
 #[derive(Debug, Clone)]
 struct ScopeTable {
+    base_schema: Option<Arc<TableSchema>>,
     canonical_metadata_names: MetadataNamePolicy,
     name: String,
     alias: Option<String>,
@@ -5312,6 +5313,7 @@ fn scope_table_for_ref(
             })?;
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            base_schema: None,
             canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
@@ -5329,6 +5331,7 @@ fn scope_table_for_ref(
             .collect::<Vec<_>>();
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            base_schema: None,
             canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
@@ -5354,6 +5357,7 @@ fn scope_table_for_ref(
         let mut columns = select_output_column_names(inner, &inner_scope)?;
         apply_derived_column_aliases(table, columns.iter_mut())?;
         return Ok(ScopeTable {
+            base_schema: None,
             canonical_metadata_names: inner_scope.projected_metadata_names(inner),
             name: table.name.clone(),
             alias: table.alias.clone(),
@@ -5365,6 +5369,7 @@ fn scope_table_for_ref(
     if let Some(spec) = table.generate_series.as_deref() {
         let columns = generate_series_column_names(spec);
         return Ok(ScopeTable {
+            base_schema: None,
             canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
             name: table.name.clone(),
             alias: table.alias.clone(),
@@ -5377,6 +5382,7 @@ fn scope_table_for_ref(
         let canonical_metadata_names = MetadataNamePolicy::from_columns(&columns);
         let columns: Vec<String> = columns.into_iter().map(|column| column.name).collect();
         return Ok(ScopeTable {
+            base_schema: None,
             canonical_metadata_names,
             name: table.name.clone(),
             alias: table.alias.clone(),
@@ -5388,6 +5394,7 @@ fn scope_table_for_ref(
     if let Ok(columns) = crate::engine::information_schema::columns_for_table_name(&table.name) {
         let columns: Vec<String> = columns.into_iter().map(|column| column.name).collect();
         return Ok(ScopeTable {
+            base_schema: None,
             canonical_metadata_names: MetadataNamePolicy::PublishedSpelling,
             name: crate::storage::split_table_name(crate::storage::DEFAULT_DATABASE, &table.name).1,
             alias: table.alias.clone(),
@@ -5412,6 +5419,7 @@ fn scope_table_for_ref(
         addressable.push("ROWID".into());
     }
     Ok(ScopeTable {
+        base_schema: Some(schema.clone()),
         canonical_metadata_names: MetadataNamePolicy::QuerySpelling,
         name: schema.name.clone(),
         alias: table.alias.clone(),
@@ -10019,12 +10027,17 @@ fn group_by_contains_unique_key_from_plan(plan: &PhysicalPlan, group_by: &[Expr]
         table
             .schema
             .iter_queryable_indexes()
-            .filter(|index| index.unique && !index.columns.is_empty())
+            .filter(|index| index.unique && !index.columns.is_empty() && index.predicate.is_none())
             .any(|index| {
                 index.columns.iter().all(|column| {
-                    group_by.iter().any(|expr| {
-                        expr_matches_grouping_table_column(expr, table, column, &tables)
-                    })
+                    table
+                        .schema
+                        .columns
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(column) && !c.nullable)
+                        && group_by.iter().any(|expr| {
+                            expr_matches_grouping_table_column(expr, table, column, &tables)
+                        })
                 })
             })
     })
@@ -20709,6 +20722,30 @@ fn apply_inlj_right_only_residual_selectivity(
         let stored = concrete_key_part_value(&part, &right_table.schema.columns[slot].data_type)?;
         (stored == original).then_some(stored)
     };
+    let outer_filter = extract_scan_filter(left_plan);
+    let outer_enforces = |binding: &Expr, constant: &Value, pos: usize| {
+        outer_filter.as_ref().is_some_and(|filter| {
+            expr_conjuncts(filter).into_iter().any(|predicate| {
+                let Expr::Binary {
+                    left,
+                    op: BinaryOp::Eq | BinaryOp::NullSafeEq,
+                    right,
+                } = predicate
+                else {
+                    return false;
+                };
+                [
+                    (left.as_ref(), right.as_ref()),
+                    (right.as_ref(), left.as_ref()),
+                ]
+                .into_iter()
+                .any(|(column, value)| {
+                    expr_order_key_eq(column, binding)
+                        && lossless_constant(value, pos).is_some_and(|value| &value == constant)
+                })
+            })
+        })
+    };
     let residuals = expr_conjuncts(&combined)
         .into_iter()
         .filter(|conjunct| {
@@ -20738,6 +20775,7 @@ fn apply_inlj_right_only_residual_selectivity(
                     })
                     .all(|binding| {
                         lossless_constant(&binding, pos).is_some_and(|value| value == constant)
+                            || outer_enforces(&binding, &constant, pos)
                     })
             })
         })
@@ -23848,6 +23886,21 @@ fn subquery_correlation_only_uses_table(
     subquery: &Select,
     table: &PlanTable,
 ) -> bool {
+    // Output aliases in HAVING/ORDER BY belong to this query block, not
+    // to a correlated outer table. Normalize only those alias-visible clauses
+    // before proving whether the predicate can move to a single input.
+    let mut resolved;
+    let subquery = if projection_aliases(subquery).is_empty() {
+        subquery
+    } else {
+        resolved = subquery.clone();
+        resolve_having_aliases(&mut resolved);
+        let aliases = projection_alias_exprs(&resolved);
+        for order in &mut resolved.order_by {
+            order.expr = resolve_having_alias_expr(order.expr.clone(), &aliases);
+        }
+        &resolved
+    };
     let mut sub_tables: HashSet<String> = HashSet::new();
     let mut sub_columns: HashSet<String> = HashSet::new();
     // Derived output names belong to this lexical scope. Validate every
@@ -24924,7 +24977,7 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
             }
         }
         for (table_index, table) in &base_tables {
-            let Ok(schema) = db.table(&table.name) else {
+            let Some(schema) = table.base_schema.as_ref() else {
                 continue;
             };
             let determines = {
@@ -25706,7 +25759,9 @@ pub(crate) fn normalize_select_predicates(db: &Database, select: &mut Select) {
     // subquery path. NOT IN is intentionally NOT rewritten yet —
     // SQL NULL semantics make it unsafe without column-nullability
     // information.
-    rewrite_subqueries_to_semi_anti(db, select);
+    if decorrelate_enabled() {
+        rewrite_subqueries_to_semi_anti(db, select);
+    }
 }
 
 /// MySQL's legacy zero-date compatibility rule is clause-sensitive:

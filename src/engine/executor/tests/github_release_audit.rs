@@ -444,3 +444,368 @@ fn release_audit_index_count_merges_active_and_prepared_old_keys() {
         .execute_with_session(&mut reader, "XA ROLLBACK 'counter'")
         .unwrap();
 }
+
+#[test]
+fn audit1123_nullable_unique_join_grouping_deduplicates_null_runs() {
+    let (_dir, engine, mut session) = setup();
+    for sql in [
+        "CREATE TABLE l(id INT PRIMARY KEY,a INT UNIQUE)",
+        "CREATE TABLE r(k INT PRIMARY KEY)",
+        "INSERT INTO l VALUES(1,NULL),(2,7),(3,NULL)",
+        "INSERT INTO r VALUES(1),(2),(3)",
+        "ANALYZE TABLE l",
+        "ANALYZE TABLE r",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    for join in ["JOIN", "LEFT JOIN"] {
+        for having in ["", " HAVING TRUE"] {
+            let sql = format!("SELECT l.a FROM l {join} r ON r.k=l.id GROUP BY l.a{having}");
+            let mut result = rows(&engine, &mut session, &sql);
+            result.sort();
+            assert_eq!(result, vec![vec!["7"], vec!["NULL"]], "{sql}");
+        }
+    }
+}
+
+#[test]
+fn audit1123_group_dependency_keeps_qualified_relation_identity() {
+    let (_dir, engine, mut session) = setup();
+    for sql in [
+        "CREATE DATABASE fd_scope",
+        "USE fd_scope",
+        "CREATE TABLE t(id INT PRIMARY KEY,u INT NOT NULL UNIQUE,v INT)",
+        "INSERT INTO t VALUES(1,10,7),(2,20,8)",
+    ] {
+        engine.execute_with_session(&mut session, sql).unwrap();
+    }
+    for sql in [
+        "SELECT id,v FROM t GROUP BY id ORDER BY id",
+        "SELECT x.id,x.v FROM t x GROUP BY x.id ORDER BY x.id",
+        "SELECT id,v FROM t GROUP BY u ORDER BY id",
+        "SELECT id,v FROM fd_scope.t GROUP BY id ORDER BY id",
+    ] {
+        assert_eq!(
+            rows(&engine, &mut session, sql),
+            vec![vec!["1", "7"], vec!["2", "8"]],
+            "{sql}"
+        );
+    }
+    engine
+        .execute_with_session(&mut session, "CREATE TABLE other(id INT PRIMARY KEY,v INT)")
+        .unwrap();
+    assert_eq!(
+        engine
+            .execute_with_session(
+                &mut session,
+                "SELECT x.id,y.v FROM t x JOIN other y ON TRUE GROUP BY x.id"
+            )
+            .unwrap_err()
+            .code(),
+        1055
+    );
+}
+
+#[test]
+fn audit1123_semi_lift_qualifies_nested_predicate_operands() {
+    let (_dir, engine, mut session) = setup();
+    for sql in [
+        "CREATE TABLE t1(k INT)",
+        "CREATE TABLE t2(k INT)",
+        "CREATE TABLE t3(k INT)",
+        "INSERT INTO t1 VALUES(2),(3)",
+        "INSERT INTO t2 VALUES(1),(2)",
+        "INSERT INTO t3 VALUES(2),(3)",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    for predicate in [
+        "k+1 IN (SELECT t3.k FROM t3 WHERE t3.k=t1.k)",
+        "k+1 = ANY (SELECT t3.k FROM t3 WHERE t3.k=t1.k)",
+    ] {
+        let sql = format!(
+            "SELECT t1.k FROM t1 WHERE EXISTS(SELECT 1 FROM t2 WHERE {predicate}) ORDER BY t1.k"
+        );
+        assert_eq!(
+            rows(&engine, &mut session, &sql),
+            vec![vec!["2"], vec!["3"]],
+            "{sql}"
+        );
+    }
+}
+
+#[test]
+fn audit1123_empty_use_index_disables_lookup_and_aggregate_index_paths() {
+    let (_dir, engine, mut session) = setup();
+    engine
+        .execute("CREATE TABLE t(id INT PRIMARY KEY,k INT,KEY(k))")
+        .unwrap();
+    engine.execute("INSERT INTO t VALUES(1,5),(2,6)").unwrap();
+    for query in [
+        "SELECT * FROM t USE INDEX() WHERE k=5",
+        "SELECT MIN(k) FROM t USE INDEX()",
+    ] {
+        let sql = format!("EXPLAIN {query}");
+        let result = rows(&engine, &mut session, &sql);
+        assert_eq!(result[0][6], "NULL", "{result:?}");
+    }
+}
+
+#[test]
+fn audit1123_partition_conversion_rejects_both_foreign_key_roles() {
+    let (_dir, engine, mut session) = setup();
+    for sql in ["CREATE TABLE p(id INT PRIMARY KEY)",
+        "CREATE TABLE c(id INT PRIMARY KEY,pid INT,FOREIGN KEY(pid) REFERENCES p(id) ON DELETE CASCADE)",
+        "INSERT INTO p VALUES(1),(2)", "INSERT INTO c VALUES(10,1),(20,2)"] { engine.execute(sql).unwrap(); }
+    for table in ["p", "c"] {
+        let err = engine
+            .execute(&format!(
+                "ALTER TABLE {table} PARTITION BY HASH(id) PARTITIONS 2"
+            ))
+            .unwrap_err();
+        assert_eq!(err.code(), 1506);
+    }
+    engine.execute("DELETE FROM p WHERE id=1").unwrap();
+    assert_eq!(
+        rows(&engine, &mut session, "SELECT * FROM c"),
+        vec![vec!["20", "2"]]
+    );
+    assert_eq!(
+        engine
+            .execute("INSERT INTO c VALUES(30,999)")
+            .unwrap_err()
+            .code(),
+        1452
+    );
+}
+
+#[test]
+fn audit1123_histogram_partial_success_and_missing_drop_are_explicit() {
+    let (_dir, engine, mut session) = setup();
+    engine
+        .execute("CREATE TABLE t(id INT,v VARCHAR(20),j JSON)")
+        .unwrap();
+    engine
+        .execute("INSERT INTO t VALUES(1,'a','{}'),(2,'b','{}')")
+        .unwrap();
+    let result = rows(
+        &engine,
+        &mut session,
+        "ANALYZE TABLE t UPDATE HISTOGRAM ON v,j,missing WITH 5 BUCKETS",
+    );
+    assert_eq!(result.len(), 3);
+    assert_eq!(
+        result.iter().map(|r| r[2].as_str()).collect::<Vec<_>>(),
+        vec!["status", "Error", "Error"]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT COLUMN_NAME FROM information_schema.column_statistics WHERE TABLE_NAME='t'"
+        ),
+        vec![vec!["v"]]
+    );
+    let result = rows(
+        &engine,
+        &mut session,
+        "ANALYZE TABLE t DROP HISTOGRAM ON v,id,missing",
+    );
+    assert_eq!(
+        result.iter().map(|r| r[2].as_str()).collect::<Vec<_>>(),
+        vec!["status", "Error", "Error"]
+    );
+    assert!(rows(
+        &engine,
+        &mut session,
+        "SELECT COLUMN_NAME FROM information_schema.column_statistics WHERE TABLE_NAME='t'"
+    )
+    .is_empty());
+}
+
+#[test]
+fn audit1123_implicit_stats_refresh_respects_global_read_lock_and_capture() {
+    let (_dir, engine, mut owner) = setup();
+    owner.connection_id = 1123001;
+    engine.execute("CREATE TABLE gated(k INT)").unwrap();
+    engine.execute("INSERT INTO gated VALUES(1),(2)").unwrap();
+    let db = engine.database();
+    let before = db.table("gated").unwrap().stats.analyzed_at_unix_ms;
+    engine
+        .execute_with_session(&mut owner, "FLUSH TABLES WITH READ LOCK")
+        .unwrap();
+    db.refresh_stale_stats_for_tables(["test.gated"]).unwrap();
+    assert_eq!(db.table("gated").unwrap().stats.analyzed_at_unix_ms, before);
+    engine
+        .execute_with_session(&mut owner, "UNLOCK TABLES")
+        .unwrap();
+    db.capture
+        .active
+        .store(true, std::sync::atomic::Ordering::Release);
+    let outcome = db.refresh_stale_stats_for_tables(["test.gated"]);
+    db.capture
+        .active
+        .store(false, std::sync::atomic::Ordering::Release);
+    outcome.unwrap();
+    assert_eq!(db.table("gated").unwrap().stats.analyzed_at_unix_ms, before);
+    db.refresh_stale_stats_for_tables(["test.gated"]).unwrap();
+    assert!(db
+        .table("gated")
+        .unwrap()
+        .stats
+        .analyzed_at_unix_ms
+        .is_some());
+}
+
+#[test]
+fn audit1123_fulltext_metadata_cardinality_uses_documents() {
+    let (_dir, engine, mut session) = setup();
+    engine
+        .execute("CREATE TABLE ft(id INT PRIMARY KEY,s TEXT,FULLTEXT KEY f(s))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO ft VALUES(1,'alpha beta'),(2,'gamma delta'),(3,'gamma epsilon')")
+        .unwrap();
+    engine.execute("ANALYZE TABLE ft").unwrap();
+    let result = rows(&engine,&mut session,"SELECT CARDINALITY FROM information_schema.statistics WHERE TABLE_NAME='ft' AND INDEX_NAME='f'");
+    assert_eq!(result, vec![vec!["3"]]);
+    let result = rows(&engine, &mut session, "SHOW INDEX FROM ft");
+    assert_eq!(result.iter().find(|r| r[2] == "f").unwrap()[6], "3");
+}
+
+#[test]
+fn audit1123_complex_scalar_filter_runs_on_dimension_before_join() {
+    let (_dir, engine, mut session) = setup();
+    for sql in [
+        "CREATE TABLE fact(k INT,KEY(k))",
+        "CREATE TABLE dim(id INT PRIMARY KEY)",
+        "INSERT INTO fact SELECT MOD(n,100) FROM generate_series(1,10000) s(n)",
+        "INSERT INTO dim SELECT n FROM generate_series(0,99) s(n)",
+        "ANALYZE TABLE fact",
+        "ANALYZE TABLE dim",
+    ] {
+        engine.execute(sql).unwrap();
+    }
+    let sql="SELECT COUNT(*) FROM dim d JOIN fact f ON f.k=d.id WHERE d.id=(SELECT k FROM(SELECT k,COUNT(*) c FROM fact GROUP BY k ORDER BY c DESC,k LIMIT 1) z)";
+    assert_eq!(rows(&engine, &mut session, sql), vec![vec!["100"]]);
+    let plan = rows(&engine, &mut session, &format!("EXPLAIN ANALYZE {sql}"))[0][0].clone();
+    assert!(!plan.contains("fallback_expression_rows=10000"), "{plan}");
+    assert!(plan.contains("Apply"), "{plan}");
+    let plan = rows(
+        &engine,
+        &mut session,
+        "EXPLAIN FORMAT=TREE SELECT COUNT(*) FROM fact f JOIN dim d ON f.k=d.id WHERE d.id=7",
+    )[0][0]
+        .clone();
+    let join = plan
+        .lines()
+        .find(|line| line.contains("Index nested loop join"))
+        .unwrap();
+    assert!(join.contains("rows=100)"), "{plan}");
+}
+
+#[test]
+fn audit1123_fast_select_lanes_record_optimizer_trace() {
+    let (_dir, engine, mut session) = setup();
+    session.connection_id = 1123002;
+    session.sysvars.optimizer_trace = "enabled=on".into();
+    engine
+        .execute("CREATE TABLE trace_fast(id INT PRIMARY KEY,k INT)")
+        .unwrap();
+    let sql = "SELECT k FROM trace_fast WHERE id=1";
+    let statement = Arc::new(crate::parser::parse_statement(sql).unwrap());
+    crate::engine::QueryEngine::execute_parsed(&engine, &mut session, sql, statement.clone())
+        .unwrap()
+        .materialize()
+        .unwrap();
+    assert_eq!(
+        rows(
+            &engine,
+            &mut session,
+            "SELECT QUERY FROM information_schema.optimizer_trace"
+        ),
+        vec![vec![sql]]
+    );
+    let mut memo = crate::engine::api::PreparedSelectMemoState::default();
+    for _ in 0..2 {
+        if let Some(result) = crate::engine::QueryEngine::execute_prepared_select(
+            &engine,
+            &mut session,
+            &mut memo,
+            &statement,
+            sql,
+            &[],
+        ) {
+            result.unwrap().materialize().unwrap();
+        }
+        assert_eq!(
+            rows(
+                &engine,
+                &mut session,
+                "SELECT QUERY FROM information_schema.optimizer_trace"
+            ),
+            vec![vec![sql]]
+        );
+    }
+}
+
+#[test]
+fn audit1123_exchange_metadata_counts_survive_cold_reopen() {
+    let dir = tempfile::tempdir_in(crate::util::file::test_temp_dir()).unwrap();
+    let query="SELECT TABLE_NAME,TABLE_ROWS FROM information_schema.tables WHERE TABLE_SCHEMA='test' AND TABLE_NAME IN('pt','stg') ORDER BY TABLE_NAME";
+    {
+        let engine = StorageQueryEngine::open(dir.path()).unwrap();
+        for sql in ["CREATE TABLE pt(k INT) PARTITION BY RANGE(k)(PARTITION p0 VALUES LESS THAN(10),PARTITION pmax VALUES LESS THAN MAXVALUE)",
+            "CREATE TABLE stg(k INT)","INSERT INTO pt VALUES(1),(2),(11)","INSERT INTO stg VALUES(3),(4),(5)",
+            "ANALYZE TABLE pt","ANALYZE TABLE stg","ALTER TABLE pt EXCHANGE PARTITION p0 WITH TABLE stg"] {engine.execute(sql).unwrap();}
+        assert_eq!(
+            rows(&engine, &mut SessionContext::default(), query),
+            vec![vec!["pt", "4"], vec!["stg", "2"]]
+        );
+        engine.shutdown().unwrap();
+    }
+    let engine = StorageQueryEngine::open(dir.path()).unwrap();
+    assert_eq!(
+        rows(&engine, &mut SessionContext::default(), query),
+        vec![vec!["pt", "4"], vec!["stg", "2"]]
+    );
+}
+
+#[test]
+fn audit1123_sql_histogram_encodes_text_and_enum_set_endpoints() {
+    let (_dir, engine, mut session) = setup();
+    engine
+        .execute("CREATE TABLE h(v VARCHAR(20),e ENUM('zz','aa','mm'),s SET('a','b','c'))")
+        .unwrap();
+    engine
+        .execute("INSERT INTO h VALUES('中文','zz','a,c'),('A','aa','b'),('B','mm','c')")
+        .unwrap();
+    engine
+        .execute("ANALYZE TABLE h UPDATE HISTOGRAM ON v,e,s")
+        .unwrap();
+    let result=rows(&engine,&mut session,"SELECT COLUMN_NAME,HISTOGRAM FROM information_schema.column_statistics WHERE TABLE_NAME='h'");
+    for row in result {
+        let histogram: serde_json::Value = serde_json::from_str(&row[1]).unwrap();
+        if row[0] == "v" {
+            assert!(histogram["buckets"][0][0]
+                .as_str()
+                .unwrap()
+                .starts_with("base64:type254:"));
+        } else {
+            let expected = if row[0] == "e" {
+                vec![1, 2, 3]
+            } else {
+                vec![2, 4, 5]
+            };
+            assert_eq!(
+                histogram["buckets"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|b| b[0].as_u64().unwrap())
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+    }
+}

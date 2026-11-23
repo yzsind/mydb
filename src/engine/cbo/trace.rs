@@ -64,6 +64,28 @@ pub(crate) fn activate(connection_id: u32, enabled: bool) -> TraceSessionGuard {
     TraceSessionGuard(previous)
 }
 
+/// Fast protocol lanes bypass the ordinary statement wrapper. Give them
+/// the same trace lifetime, retaining an already active enclosing wrapper.
+pub(crate) fn statement(
+    connection_id: u32,
+    enabled: bool,
+    sql: &str,
+) -> Option<StatementTraceGuard> {
+    if !enabled || ACTIVE_CONNECTION.with(Cell::get) == Some(connection_id) {
+        return None;
+    }
+    let guard = activate(connection_id, true);
+    begin(sql);
+    Some(StatementTraceGuard(guard))
+}
+
+pub(crate) struct StatementTraceGuard(#[allow(dead_code)] TraceSessionGuard);
+impl Drop for StatementTraceGuard {
+    fn drop(&mut self) {
+        complete_statement();
+    }
+}
+
 fn enabled_connection() -> Option<u32> {
     crate::engine::expr::current_optimizer_trace_context()
         .and_then(|(connection_id, enabled)| enabled.then_some(connection_id))
