@@ -86,6 +86,26 @@ aliases.
 
 ## Diagnostic Details
 
+Syntax diagnostics report a one-based line and column when the parser can
+locate the failure. A column counts Unicode characters. REST and MCP also
+return a zero-based UTF-8 byte range with an exclusive end. An unexpected end
+of SQL has an empty range. MySQL text batches use coordinates in the entire
+decoded request. REST and MCP use coordinates in the failing SQL item.
+
+Name resolution and writes can report the schema, table, column, constraint,
+index, or SQL clause. A row number identifies the one-based input row when the
+executor can track it. It counts logical records after skipped header records
+for `LOAD DATA`. `SHOW WARNINGS` exposes the text of each retained condition.
+`GET DIAGNOSTICS CONDITION` exposes the standard schema, table, column, and
+constraint fields when known.
+
+REST and MCP return available context in an optional `details` object. A
+`value_preview` is limited to 128 bytes of rendered text. It escapes control
+characters and represents binary data as hexadecimal. `value_truncated`
+indicates a shortened preview. Previews are supplied when a value can be
+traced to the current statement's literals, bound parameters, or input file
+fields. A missing field indicates that the source information was unavailable.
+
 OS failures, corruption details, and worker failures can be associated with
 stable `MYDB-DIAG-*` identifiers in server diagnostics. Clients receive the
 corresponding MySQL condition and a message suitable for applications.

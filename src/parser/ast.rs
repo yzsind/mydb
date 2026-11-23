@@ -3811,6 +3811,7 @@ pub struct ParseError {
     pub line: usize,
     pub column: usize,
     pub expected: Vec<String>,
+    pub(super) location_known: bool,
 }
 
 impl ParseError {
@@ -3833,6 +3834,7 @@ impl ParseError {
             line: 1,
             column: 1,
             expected: Vec::new(),
+            location_known: false,
         }
     }
 
@@ -3864,15 +3866,30 @@ impl ParseError {
             line,
             column,
             expected,
+            location_known: true,
         }
     }
 
     /// Translate a child statement's coordinates into its enclosing source.
     pub(crate) fn rebase(mut self, source: &str, offset: usize) -> Self {
+        if !self.location_known {
+            return self;
+        }
         self.span.start = self.span.start.saturating_add(offset).min(source.len());
         self.span.end = self.span.end.saturating_add(offset).min(source.len());
         (self.line, self.column) = line_column(source, self.span.start);
         self
+    }
+
+    pub(super) fn rebase_slice(mut self, source: &str, fragment: &str) -> Self {
+        let offset = (fragment.as_ptr() as usize).checked_sub(source.as_ptr() as usize);
+        match offset.filter(|&offset| offset <= source.len().saturating_sub(fragment.len())) {
+            Some(offset) => self.rebase(source, offset),
+            None => {
+                self.location_known = false;
+                self
+            }
+        }
     }
 
     pub(super) fn from_sqlparser(input: &str, err: ParserError) -> Self {
@@ -3899,6 +3916,7 @@ impl ParseError {
                     let mut error =
                         Self::new(input, Span { start: 0, end: 0 }, message, Vec::new());
                     error.spec = spec;
+                    error.location_known = false;
                     return error;
                 }
             }
@@ -3911,29 +3929,41 @@ impl ParseError {
                 Vec::new(),
             );
             error.spec = crate::error::catalog::ER_STACK_OVERRUN_NEED_MORE;
+            error.location_known = false;
             return error;
         }
         let mut message = super::adapter::display_sql(&err);
         let location = sqlparser_error_location(&message);
+        let is_eof = message.ends_with("found: EOF");
         let offset = location
             .and_then(|(line, column)| position_in_source(input, line, column))
-            // Location-less errors normally mean unexpected EOF. Point at the
-            // end rather than reporting the unrelated first byte.
-            .unwrap_or(input.len());
-        // Display uses our mapped coordinates. Do not keep a second,
-        // potentially transformed location embedded in the parser message.
+            .or_else(|| is_eof.then_some(input.len()));
+        // Use the original parser's coordinates but map the complete token
+        // where our lexer can identify it. An EOF position stays zero-width.
         if location.is_some() {
             message.truncate(message.rfind(" at Line: ").unwrap());
         }
-        Self::new(
-            input,
-            Span {
-                start: offset,
-                end: offset,
-            },
-            message,
-            Vec::new(),
-        )
+        let expected = message
+            .split_once("Expected: ")
+            .and_then(|(_, tail)| tail.split_once(", found: "))
+            .map_or_else(Vec::new, |(expected, _)| vec![expected.to_owned()]);
+        let start = offset.unwrap_or(0);
+        let mode =
+            crate::sql_lex::SqlLexMode::from_parser_bits(super::current_parser_sql_mode_bits());
+        let end = input
+            .get(start..)
+            .filter(|_| !is_eof && offset.is_some())
+            .and_then(|tail| {
+                crate::sql_lex::SqlTokenCursor::new(tail, mode, MYSQL_VERSION_ID)
+                    .next()
+                    .ok()
+                    .flatten()
+            })
+            .filter(|token| token.span.start == 0)
+            .map_or(start, |token| start + token.span.end);
+        let mut error = Self::new(input, Span { start, end }, message, expected);
+        error.location_known = offset.is_some();
+        error
     }
 
     pub(super) fn unsupported_at(input: &str, span: Span, message: impl Into<String>) -> Self {
@@ -3949,6 +3979,44 @@ fn sqlparser_error_location(message: &str) -> Option<(u64, u64)> {
     let start = message.rfind(marker)? + marker.len();
     let (line, column) = message[start..].split_once(", Column: ")?;
     Some((line.parse().ok()?, column.parse().ok()?))
+}
+
+impl ParseError {
+    pub(crate) fn into_query_error(self) -> crate::error::QueryError {
+        let err = self;
+        use crate::error::catalog;
+        // Resource and semantic failures can be detected during parsing too.
+        let located = err.location_known
+            && ![
+                catalog::ER_WRONG_ARGUMENTS,
+                catalog::ER_INVALID_GROUP_FUNC_USE,
+                catalog::ER_PK_INDEX_CANT_BE_INVISIBLE,
+                catalog::ER_STACK_OVERRUN_NEED_MORE,
+                catalog::ER_TOO_HIGH_LEVEL_OF_NESTING_FOR_SELECT,
+            ]
+            .contains(&err.spec)
+            && !err.message.starts_with("invalid vector WITH ")
+            && !err.message.starts_with("duplicate vector WITH ");
+        let position = located.then_some(crate::error::SqlPosition {
+            line: err.line,
+            column: err.column,
+            byte_start: err.span.start,
+            byte_end: err.span.end,
+        });
+        let message = if located {
+            err.to_string()
+        } else {
+            err.message
+        };
+        let error = err.spec.error(message);
+        if position.is_none() && err.expected.is_empty() {
+            return error;
+        }
+        error.with_details(|details| {
+            details.position = position;
+            details.expected = err.expected;
+        })
+    }
 }
 
 impl fmt::Display for ParseError {

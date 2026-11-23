@@ -247,7 +247,7 @@ pub(super) fn qualify_select_tables(
             &stmt.joins,
             Some(&session.current_database),
         )
-        .map_err(|err| err.spec.error(err.message))?;
+        .map_err(crate::parser::ParseError::into_query_error)?;
     }
     stmt.table = stmt.from.first().map(|table| table.name.clone());
     Ok(())

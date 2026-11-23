@@ -1278,7 +1278,8 @@ fn routine_stmt_has_return(stmt: &RoutineStmt) -> bool {
 fn validate_function_stmt(stmt: &RoutineStmt) -> Result<(), QueryError> {
     match stmt {
         RoutineStmt::Sql(sql) => {
-            let statement = parse_statement(sql).map_err(|err| err.spec.error(err.message))?;
+            let statement =
+                parse_statement(sql).map_err(crate::parser::ParseError::into_query_error)?;
             let mut body = &statement;
             while let crate::parser::Statement::WithCte(with) = body {
                 body = &with.body;
@@ -1362,7 +1363,7 @@ fn validate_function_stmt(stmt: &RoutineStmt) -> Result<(), QueryError> {
 /// Events share stored-program control flow, but have no CALL parameters or
 /// EXECUTE privilege requirement. Their caller already established the definer.
 pub(super) fn validate_event_body(sql: &str) -> Result<(), QueryError> {
-    let body = parse_routine_body_sql(sql).map_err(|err| err.spec.error(format!("{err}")))?;
+    let body = parse_routine_body_sql(sql).map_err(crate::parser::ParseError::into_query_error)?;
     validate_routine_structure(&body.statements, &mut Vec::new(), &BTreeMap::new())?;
     if body.statements.iter().any(routine_stmt_has_return) {
         return Err(error(
@@ -1657,7 +1658,7 @@ fn collect_static_statements(
                     continue;
                 }
                 let mut statement =
-                    parse_statement(sql).map_err(|err| err.spec.error(err.message))?;
+                    parse_statement(sql).map_err(crate::parser::ParseError::into_query_error)?;
                 if let crate::parser::Statement::Unsupported { kind, .. } = &statement {
                     return Err(error(
                         crate::error::catalog::ER_NOT_SUPPORTED_YET,
@@ -3194,7 +3195,7 @@ fn exec_block_inner(
                             format!("invalid warning condition: {invalid}"),
                         ))
                     })?
-                    .with_condition_information(warning.condition_information());
+                    .with_shared_metadata(warning.shared_metadata());
                     let warning = RoutineExecError::Warning(condition_from_query_error(&err), err);
                     if find_matching_handler(frame, &handlers, &warning).is_some()
                         || find_outer_handler(frame, &warning).is_some()
@@ -3973,12 +3974,14 @@ fn exec_stmt(
                     format!("Invalid RESIGNAL condition: {invalid}"),
                 )
             })?;
-            let err = err.with_condition_information(signal_information_values(
-                session,
-                &frame.locals,
-                information,
-                active_error.condition_information(),
-            )?);
+            let err = err
+                .with_shared_metadata(active_error.shared_metadata())
+                .with_condition_information(signal_information_values(
+                    session,
+                    &frame.locals,
+                    information,
+                    active_error.condition_information(),
+                )?);
             if resolved.is_some() {
                 let original = crate::engine::api::SqlWarning::from_error(
                     crate::error::ConditionLevel::Error,
@@ -4465,8 +4468,8 @@ fn execute_sql_in_routine(
         let _mode = crate::parser::ParserSqlModeGuard::activate(session.temporal_sql_mode_bits);
         let mut statement = parse_statement(sql).map_err(|err| {
             RoutineExecError::Query(
-                err.spec
-                    .error(format!("routine SQL parse error: {}", err.message)),
+                err.into_query_error()
+                    .map_message(|message| format!("routine SQL parse error: {message}")),
             )
         })?;
         let mut next_placeholder = 0;

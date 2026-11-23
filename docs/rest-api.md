@@ -275,6 +275,14 @@ errors retain completed prefix results. Confirmed rollback is reported
 separately. A failed response or timeout does not establish that a write was
 not committed. Neither the server nor examples automatically retry SQL POST.
 
+SQL errors and retained warnings can include an optional `details` object.
+`position` contains `line`, `column`, `byte_start`, and `byte_end` in the SQL
+item identified by `statement_index`. Lines and Unicode columns start at 1.
+Byte offsets start at 0 and the end is exclusive. Other available fields are
+`expected`, `schema`, `table`, `column`, `clause`, `index`, `constraint`,
+`row_number`, `value_preview`, and `value_truncated`. See
+[Error codes and diagnostics](error-codes.md#diagnostic-details).
+
 Status codes: 400 invalid request; 401 authentication failure; 403 privilege
 failure; 404 inaccessible resource; 406/415 unsupported format; 409 busy,
 duplicate ID or SQL conflict; 413 oversized request; 422 SQL/typing errors;

@@ -115,7 +115,7 @@ fn coerce_ignorable_insert_nulls(
     }
     let table = db.table(table_name)?;
     let target_columns = insert_column_indexes(&table, supplied_columns)?;
-    for row in rows {
+    for (ordinal, row) in rows.iter_mut().enumerate() {
         for (value_idx, &column_idx) in target_columns.iter().enumerate() {
             let column = &table.columns[column_idx];
             if column.nullable
@@ -125,13 +125,15 @@ fn coerce_ignorable_insert_nulls(
             {
                 continue;
             }
+            let error = crate::error::messages::bad_null(&column.name)
+                .with_table(&table.database, &table.name)
+                .with_input_row(ordinal as u64 + 1);
             let Some(default) = implicit_default_for_type(&column.data_type) else {
-                return Err(crate::error::messages::bad_null(&column.name));
+                return Err(error);
             };
-            crate::engine::api::push_statement_warning(
+            crate::engine::api::push_statement_condition(
                 crate::error::ConditionLevel::Warning,
-                crate::error::catalog::ER_BAD_NULL_ERROR,
-                format!("Column '{}' cannot be null", column.name),
+                &error,
             );
             if ignore {
                 db.dml_stats().record_ignore_warning();
@@ -194,10 +196,12 @@ fn explicit_lob_default(
     {
         return Ok(None);
     }
-    let err = crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD.error(format!(
-        "Field '{}' doesn't have a default value",
-        column.name
-    ));
+    let err = crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD
+        .error(format!(
+            "Field '{}' doesn't have a default value",
+            column.name
+        ))
+        .with_column(&column.name);
     if insert_strict_mode() {
         return Err(err);
     }
@@ -288,6 +292,12 @@ pub(super) fn enforce_missing_required_columns(
     for &idx in missing {
         let column = &table.columns[idx];
         let msg = format!("Field '{}' doesn't have a default value", column.name);
+        let condition = || {
+            crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD
+                .error(msg.clone())
+                .with_table(&table.database, &table.name)
+                .with_column(&column.name)
+        };
         match implicit_default_for_type(&column.data_type) {
             Some(default) if downgrade => {
                 // MySQL reports one 1364 condition per omitted column for the
@@ -298,16 +308,20 @@ pub(super) fn enforce_missing_required_columns(
                 crate::engine::expr::with_expression_warning_dedup(
                     0x4d49_5353_494e_475f_u64,
                     || {
-                        crate::engine::api::push_statement_warning(
-                            crate::error::ConditionLevel::Warning,
-                            crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD,
-                            msg,
-                        );
+                        if crate::engine::expr::expression_warning_should_publish(
+                            crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD.code().get(),
+                            &msg,
+                        ) {
+                            crate::engine::api::push_statement_condition(
+                                crate::error::ConditionLevel::Warning,
+                                &condition(),
+                            );
+                        }
                     },
                 );
                 values[idx] = default;
             }
-            _ => return Err(error(crate::error::catalog::ER_NO_DEFAULT_FOR_FIELD, msg)),
+            _ => return Err(condition()),
         }
     }
     Ok(())
@@ -351,6 +365,7 @@ pub(super) fn execute_insert(
     mut stmt: Insert,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    let _outer_input = crate::error::InputRows::default().enter();
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
     if let Some(predicate) = &mut stmt.view_check_predicate {
         let table = db.table(&stmt.table)?;
@@ -379,8 +394,10 @@ pub(super) fn execute_insert(
     let source = std::mem::replace(&mut stmt.source, InsertSource::Values(Vec::new()));
     match source {
         InsertSource::Values(mut rows) => {
+            let mut direct = true;
             for row in &mut rows {
                 for expr in row {
+                    direct &= is_direct_insert_input(expr);
                     if super::prepared_dml::expr_contains_subquery(expr) {
                         super::dml::materialize_subqueries(db, txn, expr)?;
                     }
@@ -399,6 +416,7 @@ pub(super) fn execute_insert(
             }
             let records = rows.len() as u64;
             let ctx = InsertChunkCtx::compute(db, session, &stmt);
+            let _input = insert_diagnostic_input(&stmt, &ctx, direct).enter();
             let resp = dispatch_insert_chunk(db, session, txn, &stmt, &ctx, rows, registry)?;
             finalize_insert_info(records, false);
             Ok(resp)
@@ -442,6 +460,7 @@ pub(super) fn execute_insert_borrowed(
     parameter_insert: Option<&crate::engine::api::PreparedParameterInsert>,
     registry: &SessionRegistry,
 ) -> Result<QueryResponse, QueryError> {
+    let _outer_input = crate::error::InputRows::default().enter();
     let _dml_expression_guard = crate::engine::expr::DmlExpressionGuard::new();
     // The compiled target and its trigger eligibility have been revalidated
     // under statement MDL. Multi-row non-strict NULL repair still needs the
@@ -471,6 +490,8 @@ pub(super) fn execute_insert_borrowed(
             }
             let records = rows.len() as u64;
             let ctx = InsertChunkCtx::compute(db, session, stmt);
+            let direct = expr_rows.iter().flatten().all(is_direct_insert_input);
+            let _input = insert_diagnostic_input(stmt, &ctx, direct).enter();
             let resp = dispatch_insert_chunk(db, session, txn, stmt, &ctx, rows, registry)?;
             finalize_insert_info(records, false);
             Ok(resp)
@@ -567,6 +588,7 @@ fn execute_parameter_insert(
         Ok::<_, QueryError>(rows)
     })?;
     let _ignore_coercion = crate::storage::DmlIgnoreCoercionGuard::new(false);
+    let _input = crate::error::InputRows::new(1, true).enter();
     let inserted = db.insert_rows_detailed(txn, &stmt.table, rows)?;
     crate::engine::api::set_statement_insert_id(inserted.first_insert_id);
     finalize_insert_info(binding.row_count as u64, false);
@@ -609,6 +631,28 @@ impl InsertChunkCtx {
             autoinc_fast,
         }
     }
+}
+
+fn is_direct_insert_input(expr: &Expr) -> bool {
+    matches!(
+        expr,
+        Expr::Literal(_) | Expr::BoundValue(_) | Expr::Placeholder(_)
+    )
+}
+
+fn insert_diagnostic_input(
+    stmt: &Insert,
+    ctx: &InsertChunkCtx,
+    direct: bool,
+) -> crate::error::InputRows {
+    if stmt.ignore && stmt.view_check_predicate.is_some() && !ctx.needs_trigger_path {
+        // View filtering compacts the source batch before it reaches storage.
+        return crate::error::InputRows::default();
+    }
+    crate::error::InputRows::new(
+        1,
+        direct && !ctx.needs_trigger_path && stmt.on_duplicate_key_update.is_none(),
+    )
 }
 
 fn dispatch_insert_chunk(
@@ -1963,13 +2007,14 @@ where
         .any(|&column| table.columns[column].generated_expr.is_some());
     let expr_rows = expr_rows.into_iter();
     let mut rows = Vec::with_capacity(expr_rows.size_hint().0);
-    for row in expr_rows {
+    for (ordinal, row) in expr_rows.enumerate() {
         crate::engine::cancel::check_cancelled()?;
         let expressions = row.as_ref();
         if expressions.len() != column_indexes.len() {
-            return Err(error(
-                crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                "column count does not match value count",
+            return Err(crate::error::messages::wrong_value_count(
+                &table.database,
+                &table.name,
+                Some(ordinal as u64 + 1),
             ));
         }
         let simple = !has_generated_target
@@ -2016,7 +2061,12 @@ where
             .into_iter()
             .zip(column_indexes.iter().copied())
             .map(|(expr, column)| {
-                let explicit_default = explicit_lob_default(expr.borrow(), &table.columns[column])?;
+                let explicit_default = explicit_lob_default(expr.borrow(), &table.columns[column])
+                    .map_err(|error| {
+                        error
+                            .with_table(&table.database, &table.name)
+                            .with_input_row(ordinal as u64 + 1)
+                    })?;
                 if !simple && table.columns[column].generated_expr.is_some() {
                     if !expr_is_default_for_column(expr.borrow(), &table.columns[column].name) {
                         return Err(generated_column_assignment_error());
@@ -2317,12 +2367,12 @@ fn execute_batch_odku(
             .enumerate()
             .all(|(expected, actual)| expected == *actual);
     let row_defaults = row_default_plans(&table, &column_indexes)?;
-    for row in source_rows {
+    let input = crate::error::InputRows::current();
+    for (ordinal, row) in source_rows.into_iter().enumerate() {
         crate::engine::cancel::check_cancelled()?;
         if row.len() != column_indexes.len() {
-            return Err(error(
-                crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                "column count does not match value count",
+            return Err(crate::error::messages::wrong_value_count(
+                &table.database, &table.name, input.row(ordinal),
             ));
         }
         if full_width_identity {
@@ -2338,7 +2388,8 @@ fn execute_batch_odku(
             values[idx] = value;
         }
         materialize_row_defaults(db, &table, &mut values, &row_defaults)?;
-        enforce_missing_required_columns(table, &mut values, &missing_required, false)?;
+        enforce_missing_required_columns(table, &mut values, &missing_required, false)
+            .map_err(|error| input.annotate(ordinal, error))?;
         full_rows.push(values);
     }
 
@@ -2353,6 +2404,7 @@ fn execute_batch_odku(
     let mut cursor = 0usize;
     let mut low_yield_probes = 0usize;
     while cursor < total_rows {
+        let _input = input.offset(cursor).enter();
         crate::engine::cancel::check_cancelled()?;
         let remaining = total_rows - cursor;
         if remaining < BATCH_ODKU_MIN_ROWS || low_yield_probes >= BATCH_ODKU_MAX_LOW_YIELD_PROBES {
@@ -2444,6 +2496,7 @@ fn execute_batch_odku(
         } else {
             conflict_ordinal + 1
         };
+        let _conflict_input = input.offset(cursor).enter();
         let end = (cursor + rows_through_conflict).min(total_rows);
         let fallback = prepared.rows[cursor..end].to_vec();
         db.dml_stats().record_upsert_batch_conflict_row();
@@ -2705,7 +2758,17 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
     let probe_first = replace && replace_probe_first();
     let needs_image = TRIGGERS || returning_clause.is_some();
     let row_defaults = row_default_plans(&table, &column_indexes)?;
-    'source: for row in source_rows {
+    let mut input = crate::error::InputRows::current();
+    input.direct_values &= !TRIGGERS
+        && !rows_prepared
+        && column_indexes.len() == table.columns.len()
+        && table
+            .columns
+            .iter()
+            .all(|column| column.generated_expr.is_none());
+    'source: for (ordinal, row) in source_rows.into_iter().enumerate() {
+        let row_input = input.offset(ordinal);
+        let _input = row_input.enter();
         crate::engine::cancel::check_cancelled()?;
         let expected = if rows_prepared {
             table.columns.len()
@@ -2713,9 +2776,10 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
             column_indexes.len()
         };
         if row.len() != expected {
-            return Err(error(
-                crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                "column count does not match value count",
+            return Err(crate::error::messages::wrong_value_count(
+                &table.database,
+                &table.name,
+                row_input.row(0),
             ));
         }
         let mut values = if rows_prepared {
@@ -2761,12 +2825,12 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
         // strings. Conflict probes must see the same typed keys as storage,
         // including when only DELETE triggers activated this path.
         if on_duplicate.is_some() || replace {
-            db.coerce_row_for_load(&table, &mut values)?;
+            db.coerce_insert_row(&table, &mut values, row_input)?;
             db.materialize_generated_columns_for_insert(&table, &mut values)?;
         }
         if TRIGGERS {
             if let Some(predicate) = view_check_predicate {
-                db.coerce_row_for_load(&table, &mut values)?;
+                db.coerce_insert_row(&table, &mut values, row_input)?;
                 db.materialize_generated_columns_for_insert(&table, &mut values)?;
                 if !super::dml::eval_view_check(db, txn, predicate, &table, &values, None)? {
                     let err = error(
@@ -2799,7 +2863,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                     view_check_predicate,
                     needs_image,
                     &mut returning,
-                )?;
+                ).map_err(|error| row_input.annotate(0, error))?;
                 if changed {
                     ids.last_updated = updated_id;
                 }
@@ -2836,7 +2900,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
             } else {
                 db.insert_rows_detailed(txn, table_name, vec![values.clone()])
             };
-            let inserted = match insertion {
+            let inserted = match insertion.map_err(|error| row_input.annotate(0, error)) {
                 Ok(inserted) => inserted,
                 Err(err) if err.is(crate::error::catalog::ER_DUP_ENTRY) && !probe_first => {
                     // A failed speculative insert may own unique reservations.
@@ -2863,7 +2927,7 @@ fn execute_insert_rows_with_ids<const TRIGGERS: bool>(
                             view_check_predicate,
                             needs_image,
                             &mut returning,
-                        )?;
+                        ).map_err(|error| row_input.annotate(0, error))?;
                         if changed {
                             ids.last_updated = updated_id;
                         }
@@ -3488,12 +3552,16 @@ pub(super) fn execute_insert_values(
         .columns
         .iter()
         .any(|column| column.generated_expr.is_some());
-    for row in &mut rows {
+    let mut input = crate::error::InputRows::current();
+    input.direct_values &= !has_generated;
+    let _input = input.enter();
+    for (ordinal, row) in rows.iter_mut().enumerate() {
         crate::engine::cancel::check_cancelled()?;
         if row.len() != column_indexes.len() {
-            return Err(error(
-                crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-                "column count does not match value count",
+            return Err(crate::error::messages::wrong_value_count(
+                &table.database,
+                &table.name,
+                input.row(ordinal),
             ));
         }
         if full_width_identity {
@@ -3504,7 +3572,8 @@ pub(super) fn execute_insert_values(
         }
         if expand_in_place {
             expand_ordered_insert_row(&table, &column_indexes, &missing_positions, row);
-            enforce_missing_required_columns(&table, row, &missing_required, false)?;
+            enforce_missing_required_columns(&table, row, &missing_required, false)
+                .map_err(|error| input.annotate(ordinal, error))?;
             if has_generated {
                 db.materialize_generated_columns_for_insert(&table, row)?;
             }
@@ -3534,10 +3603,14 @@ pub(super) fn execute_insert_values(
         materialize_row_defaults(db, &table, &mut values, &row_defaults)?;
         // The plain (non-IGNORE) VALUES path: IGNORE/REPLACE/ODKU are routed to
         // `execute_insert_with_conflict`, so `ignore` is always false here.
-        enforce_missing_required_columns(&table, &mut values, &missing_required, false)?;
+        enforce_missing_required_columns(&table, &mut values, &missing_required, false)
+            .map_err(|error| input.annotate(ordinal, error))?;
         db.materialize_generated_columns_for_insert(&table, &mut values)?;
         *row = values;
     }
+    let _preview_columns = crate::error::InputPreviewColumns::enter(
+        (input.direct_values && !full_width_identity).then_some(column_indexes),
+    );
     let inserted = if autoinc_fast {
         db.insert_rows_autoinc_fast_detailed(txn, table_name, rows)?
     } else {

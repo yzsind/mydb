@@ -148,6 +148,12 @@ when the inspected SQL request failed; its stored `error` is execution status
 data. `cancel_requested` is false when no cancellation was issued, including
 when the request was already complete.
 
+SQL errors and warnings in `structuredContent` can include a `details`
+object with a syntax position, target object, input row, or bounded input
+value preview. Use `mysql_errno` and `sqlstate` to classify conditions and
+`statement_index` to identify the failed SQL item. See
+[Error codes and diagnostics](error-codes.md#diagnostic-details).
+
 The delivery deadline begins after tool completion; it does not shorten the
 SQL execution timeout. Completed responses have a 30-second delivery deadline independent of body
 polling. An expired or abandoned response closes its SQL session and rolls back

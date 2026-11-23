@@ -1063,7 +1063,21 @@ impl<E: QueryEngine> Output<E> {
     }
 }
 fn diagnostics(ctx: &SessionContext) -> J {
-    let warnings:Vec<_>=ctx.warnings.iter().take(64).map(|w|json!({"level":format!("{:?}",w.level()),"mysql_errno":w.code(),"sqlstate":w.sql_state().as_str(),"message":w.message()})).collect();
+    let warnings: Vec<_> = ctx
+        .warnings
+        .iter()
+        .take(64)
+        .map(|condition| {
+            let mut value = json!({
+                "level": format!("{:?}", condition.level()), "mysql_errno": condition.code(),
+                "sqlstate": condition.sql_state().as_str(), "message": condition.message()
+            });
+            if let Some(details) = condition.details() {
+                value["details"] = json!(details);
+            }
+            value
+        })
+        .collect();
     json!({"warning_count":ctx.warnings.total_len(),"warnings_truncated":ctx.warnings.total_len()>warnings.len(),"warnings":warnings,"autocommit":ctx.autocommit,"in_transaction":ctx.in_transaction(),"time_zone":ctx.sysvars.time_zone})
 }
 fn emit<E: QueryEngine>(
@@ -1149,7 +1163,7 @@ fn emit<E: QueryEngine>(
 }
 fn parse_item(
     item: &SqlItem,
-    ctx: &SessionContext,
+    ctx: &mut SessionContext,
 ) -> Result<(crate::parser::Statement, Vec<crate::types::Value>)> {
     let _mode = crate::parser::ParserSqlModeGuard::activate(api::parse_temporal_sql_mode_bits(
         &ctx.sql_mode,
@@ -1170,8 +1184,15 @@ fn parse_item(
             "Each SQL item must contain exactly one statement",
         ));
     }
-    let mut statement = crate::parser::parse_statement(&item.sql)
-        .map_err(|e| Failure::from(e.spec.error(e.to_string())))?;
+    let mut statement = crate::parser::parse_statement(&item.sql).map_err(|parse_error| {
+        let error = parse_error.into_query_error();
+        ctx.set_warnings(vec![crate::error::SqlCondition::from_error(
+            crate::error::ConditionLevel::Error,
+            &error,
+        )]);
+        ctx.diagnostics_row_count = -1;
+        error
+    })?;
     if matches!(statement, crate::parser::Statement::MultiStatement { .. }) {
         return Err(Failure::new(
             StatusCode::UNPROCESSABLE_ENTITY,

@@ -4687,10 +4687,8 @@ impl TableSchema {
 
     pub fn column_index(&self, name: &str) -> Result<usize, QueryError> {
         self.find_column_index(name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_BAD_FIELD_ERROR,
-                format!("unknown column '{name}'"),
-            )
+            crate::error::messages::bad_field(name, "field list")
+                .with_table(&self.database, &self.name)
         })
     }
 

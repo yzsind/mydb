@@ -898,3 +898,75 @@ async fn rest_audit_no_implicit_database_and_sequential_batch_sql_mode() {
     assert_eq!(result["results"][1]["rows"], json!([["7"]]));
     session.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rest_sql_diagnostics_carry_locations_and_warning_details() {
+    let (_dir, engine) = engine();
+    let state = runtime::State::new(
+        RestConfig::from_startup().unwrap(),
+        engine.clone(),
+        engine.registry().clone(),
+    );
+    let session = create_session(state.clone(), identity(&engine), Some("test".into()))
+        .await
+        .unwrap();
+    let sql = "SELECT '中文',\n  1 +";
+    for stream in [false, true] {
+        let (_, bytes) = query(
+            state.clone(),
+            session.clone(),
+            json!({
+                "statements": [{"sql":"SELECT 1"}, {"sql":sql}]
+            }),
+            stream,
+        )
+        .await;
+        let body: Value = if stream {
+            let text = std::str::from_utf8(&bytes).unwrap();
+            serde_json::from_str(text.lines().last().unwrap()).unwrap()
+        } else {
+            serde_json::from_slice(&bytes).unwrap()
+        };
+        let error = &body["error"];
+        assert_eq!(error["mysql_errno"], 1064, "{body}");
+        assert_eq!(error["sqlstate"], "42000");
+        assert_eq!(error["statement_index"], 1);
+        assert_eq!(
+            error["details"]["position"],
+            json!({
+                "line": 2, "column": 6, "byte_start": sql.len(), "byte_end": sql.len()
+            })
+        );
+    }
+
+    let (status, _) = query(
+        state.clone(),
+        session.clone(),
+        json!({"sql":
+            "CREATE TABLE rest_diagnostic (v TINYINT)"
+        }),
+        false,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, bytes) = query(state, session.clone(), json!({"sql":
+        "INSERT IGNORE INTO rest_diagnostic VALUES (1),(?)", "params":[{"type":"int64","value":"999"}]
+    }), false).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    let body: Value = serde_json::from_slice(&bytes).unwrap();
+    let warning = &body["results"][0]["diagnostics"]["warnings"][0];
+    assert_eq!(warning["mysql_errno"], 1264, "{body}");
+    assert_eq!(
+        warning["details"],
+        json!({
+            "schema":"test", "table":"rest_diagnostic", "column":"v", "row_number":2,
+            "value_preview":"999", "value_truncated":false
+        })
+    );
+    session.close().await;
+}

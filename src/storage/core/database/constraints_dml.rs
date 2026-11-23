@@ -3,12 +3,23 @@
 const UNIQUE_SCAN_ENTRIES_PER_KEY: usize = 4;
 
 fn duplicate_entry_error(table: &TableSchema, index: &IndexSchema, key: &IndexKey) -> QueryError {
-    duplicate_entry_error_for_index(&format!("{}.{}", table.name, index.name), key)
+    crate::error::messages::duplicate_entry(
+        &duplicate_entry_value(key),
+        &format!("{}.{}", table.name, index.name),
+    )
+    .with_table(&table.database, &table.name)
+    .with_details(|details| {
+        details.index = Some(index.name.clone());
+    })
 }
 
 fn duplicate_entry_error_for_index(index_name: &str, key: &IndexKey) -> QueryError {
-    let value = key
-        .0
+    crate::error::messages::duplicate_entry(&duplicate_entry_value(key), index_name)
+        .with_details(|details| details.index = Some(index_name.to_owned()))
+}
+
+fn duplicate_entry_value(key: &IndexKey) -> String {
+    key.0
         .iter()
         .map(|part| match part {
             KeyPart::Null => "NULL".to_string(),
@@ -31,8 +42,59 @@ fn duplicate_entry_error_for_index(index_name: &str, key: &IndexKey) -> QueryErr
             KeyPart::Statement { value, .. } => crate::parser::expr_to_sql(value.expression()),
         })
         .collect::<Vec<_>>()
-        .join("-");
-    crate::error::messages::duplicate_entry(&value, index_name)
+        .join("-")
+}
+
+fn annotate_unique_error(
+    table: &TableSchema,
+    index: &IndexSchema,
+    values: &[Value],
+    input: crate::error::InputRows,
+    ordinal: usize,
+    error: QueryError,
+) -> QueryError {
+    let mut error = input.annotate(ordinal, error);
+    if error.is(crate::error::catalog::ER_DUP_ENTRY)
+        && input.direct_values
+        && !index.has_expression_parts()
+    {
+        if let [column] = index.columns.as_slice() {
+            if let Some(position) = table.find_column_index(column) {
+                if !table.columns[position].auto_increment
+                    && crate::error::InputPreviewColumns::includes(position)
+                {
+                    error = error
+                        .with_column(column)
+                        .with_value_preview(&values[position]);
+                }
+            }
+        }
+    }
+    error
+}
+
+fn annotate_merged_unique_error(
+    table: &TableSchema,
+    index: &IndexSchema,
+    rows: &[Vec<Value>],
+    key: &IndexKey,
+    error: QueryError,
+) -> QueryError {
+    let input = crate::error::InputRows::current();
+    // Recover the source from the candidate key only after a failure. This
+    // avoids carrying a second ordinal index or exposing a pre-existing key.
+    if input.row(0).is_some() && error.is(crate::error::catalog::ER_DUP_ENTRY) {
+        for (ordinal, values) in rows.iter().enumerate() {
+            if matches!(table.index_contains_row(index, values), Ok(true))
+                && table
+                    .index_key(index, values)
+                    .is_ok_and(|candidate| candidate == *key)
+            {
+                return annotate_unique_error(table, index, values, input, ordinal, error);
+            }
+        }
+    }
+    error
 }
 
 impl Database {
@@ -187,7 +249,9 @@ impl Database {
                 }
             }
             if !check_constraint_passes(table, check, values)? {
-                return Err(check_constraint_error(&check.name));
+                return Err(
+                    check_constraint_error(&check.name).with_table(&table.database, &table.name)
+                );
             }
         }
         Ok(())
@@ -208,6 +272,15 @@ impl Database {
         coerce_row(table, values)
     }
 
+    pub(crate) fn coerce_insert_row(
+        &self,
+        table: &TableSchema,
+        values: &mut [Value],
+        input: crate::error::InputRows,
+    ) -> Result<(), QueryError> {
+        coerce_row_at(table, values, input)
+    }
+
     pub(crate) fn check_not_null_constraints(
         &self,
         table: &TableSchema,
@@ -218,7 +291,8 @@ impl Database {
                 && !column.nullable
                 && matches!(values[idx], Value::Null)
             {
-                return Err(crate::error::messages::bad_null(&column.name));
+                return Err(crate::error::messages::bad_null(&column.name)
+                    .with_table(&table.database, &table.name));
             }
         }
         Ok(())
@@ -258,10 +332,15 @@ impl Database {
         if non_nullable.is_empty() {
             return Ok(());
         }
-        for row in rows {
+        let input = crate::error::InputRows::current();
+        for (ordinal, row) in rows.iter().enumerate() {
             for &idx in &non_nullable {
                 if matches!(row.get(idx), Some(Value::Null) | None) {
-                    return Err(crate::error::messages::bad_null(&table.columns[idx].name));
+                    return Err(input.annotate(
+                        ordinal,
+                        crate::error::messages::bad_null(&table.columns[idx].name)
+                            .with_table(&table.database, &table.name),
+                    ));
                 }
             }
         }
@@ -306,10 +385,15 @@ impl Database {
         if active.is_empty() {
             return Ok(());
         }
-        for row in rows {
+        let input = crate::error::InputRows::current();
+        for (ordinal, row) in rows.iter().enumerate() {
             for check in &active {
                 if !check_constraint_passes(table, check, row)? {
-                    return Err(check_constraint_error(&check.name));
+                    return Err(input.annotate(
+                        ordinal,
+                        check_constraint_error(&check.name)
+                            .with_table(&table.database, &table.name),
+                    ));
                 }
             }
         }
@@ -333,7 +417,8 @@ impl Database {
                 && !column.nullable
                 && matches!(values[idx], Value::Null)
             {
-                return Err(crate::error::messages::bad_null(&column.name));
+                return Err(crate::error::messages::bad_null(&column.name)
+                    .with_table(&table.database, &table.name));
             }
         }
         Ok(())
@@ -347,6 +432,7 @@ impl Database {
         batch_unique_keys: &BTreeMap<String, crate::util::fast_hash::AhHashSet<IndexKey>>,
         cached_keys: Option<&ScalarInsertKeys>,
     ) -> Result<(), QueryError> {
+        let input = crate::error::InputRows::current();
         for (index_position, index) in table
             .indexes
             .iter()
@@ -415,7 +501,10 @@ impl Database {
                 if key.0.iter().any(|part| matches!(part, KeyPart::Null)) && !index.primary {
                     continue;
                 }
-                self.check_unique_constraint(table, txn, None, index, key)?;
+                self.check_unique_constraint(table, txn, None, index, key)
+                    .map_err(|error| {
+                        annotate_unique_error(table, index, values, input, row, error)
+                    })?;
             }
         }
         Ok(())
@@ -715,15 +804,11 @@ impl Database {
 
         if let Some(matches) = self.probe_unique_keys_routed(table, txn, index, &sorted_keys)? {
             for (key_index, row_id) in matches {
-                self.check_unique_conflict_at_row(
-                    table,
-                    txn,
-                    None,
-                    index,
-                    &sorted_keys[key_index as usize],
-                    table.id,
-                    row_id,
-                )?;
+                let key = &sorted_keys[key_index as usize];
+                self.check_unique_conflict_at_row(table, txn, None, index, key, table.id, row_id)
+                    .map_err(|error| {
+                        annotate_merged_unique_error(table, index, rows, key, error)
+                    })?;
             }
             return Ok(());
         }
@@ -782,7 +867,10 @@ impl Database {
                     // `table.id`.
                     self.check_unique_conflict_at_row(
                         table, txn, None, index, &idx_key, table.id, idx_row_id,
-                    )?;
+                    )
+                    .map_err(|error| {
+                        annotate_merged_unique_error(table, index, rows, &idx_key, error)
+                    })?;
                     // Keep `batch_ptr` on this key. Deferred index
                     // maintenance can leave old and new row_ids beside
                     // each other for the same unique key; a stale
@@ -795,7 +883,10 @@ impl Database {
                 // Keep the current key: a chunk can end between stale and live
                 // entries for that same key. Exact probes retain MVCC semantics.
                 for key in &sorted_keys[batch_ptr..] {
-                    self.check_unique_constraint(table, txn, None, index, key.clone())?;
+                    self.check_unique_constraint(table, txn, None, index, key.clone())
+                        .map_err(|error| {
+                            annotate_merged_unique_error(table, index, rows, key, error)
+                        })?;
                 }
                 return Ok(());
             }

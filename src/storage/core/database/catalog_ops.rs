@@ -486,12 +486,7 @@ impl Database {
             .tables
             .get(&key)
             .cloned()
-            .ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_NO_SUCH_TABLE,
-                    format!("Table '{name}' doesn't exist"),
-                )
-            })?;
+            .ok_or_else(|| crate::error::messages::no_such_table(name))?;
         let table = if !header.columns.is_empty() || header.system {
             header
         } else {

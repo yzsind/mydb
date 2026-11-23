@@ -52,10 +52,11 @@ pub(super) fn validate_expr_columns(
     scope: &ColumnScope<'_>,
     aliases: Option<&HashSet<String>>,
     output_only: bool,
+    clause: &'static str,
 ) -> Result<(), QueryError> {
     crate::util::stack::with_stack(
         crate::engine::executor::mem_budget::ControlledMemoryCategory::Executor,
-        || validate_expr_columns_checked(db, expr, scope, aliases, output_only),
+        || validate_expr_columns_checked(db, expr, scope, aliases, output_only, clause),
     )?
 }
 
@@ -65,14 +66,16 @@ fn validate_expr_columns_checked(
     scope: &ColumnScope<'_>,
     aliases: Option<&HashSet<String>>,
     output_only: bool,
+    clause: &'static str,
 ) -> Result<(), QueryError> {
-    let validate = move |expr: &Expr| validate_expr_columns(db, expr, scope, aliases, output_only);
+    let validate =
+        move |expr: &Expr| validate_expr_columns(db, expr, scope, aliases, output_only, clause);
     match expr {
         Expr::Identifier(name) => {
             if aliases.is_some_and(|aliases| aliases.contains(&name.to_ascii_lowercase())) {
                 Ok(())
             } else {
-                scope.resolve_column(None, name, output_only)
+                scope.resolve_column(None, name, output_only, clause)
             }
         }
         Expr::CompoundIdentifier(parts) => {
@@ -84,7 +87,7 @@ fn validate_expr_columns_checked(
             } else {
                 None
             };
-            scope.resolve_column(qualifier, column, output_only)
+            scope.resolve_column(qualifier, column, output_only, clause)
         }
         Expr::Unary { expr, .. }
         | Expr::IsNull(expr)
@@ -155,6 +158,7 @@ fn validate_expr_columns_checked(
                 parts.iter().rev().nth(1).map(String::as_str),
                 name,
                 output_only,
+                clause,
             )
         }
         Expr::Default(Some(name)) => {
@@ -164,7 +168,7 @@ fn validate_expr_columns_checked(
                     format!("Field '{name}' doesn't have a default value"),
                 ));
             }
-            scope.resolve_column(None, name, output_only)
+            scope.resolve_column(None, name, output_only, clause)
         }
         Expr::Default(None) => Ok(()),
         Expr::Grouping(_) => Ok(()),
@@ -212,7 +216,7 @@ fn validate_window_frame_bound_columns(
     match bound {
         crate::parser::WindowFrameBound::Preceding(expr)
         | crate::parser::WindowFrameBound::Following(expr) => {
-            validate_expr_columns(db, expr, scope, None, true)
+            validate_expr_columns(db, expr, scope, None, true, "window frame")
         }
         crate::parser::WindowFrameBound::UnboundedPreceding
         | crate::parser::WindowFrameBound::UnboundedFollowing

@@ -3914,7 +3914,7 @@ impl QueryEngine for StorageQueryEngine {
             let _mode = crate::parser::ParserSqlModeGuard::activate(parse_bits);
             return parse_statement(sql)
                 .map(Arc::new)
-                .map_err(parse_error_to_query_error);
+                .map_err(crate::parser::ParseError::into_query_error);
         }
         let key = crate::engine::cache::ParsedStatementKey::new(sql, parse_bits);
         if let Some(ast) = self.statement_cache.get(&key) {
@@ -3924,7 +3924,12 @@ impl QueryEngine for StorageQueryEngine {
         let parsed = {
             let _mode_guard = crate::parser::ParserSqlModeGuard::activate(parse_bits);
             let source = crate::parser::strip_comments_in_explain_header(sql);
-            parse_statement(source.as_ref()).map_err(parse_error_to_query_error)?
+            match parse_statement(source.as_ref()) {
+                Err(_) if matches!(source, std::borrow::Cow::Owned(_)) => {
+                    parse_statement(sql).map_err(crate::parser::ParseError::into_query_error)?
+                }
+                parsed => parsed.map_err(crate::parser::ParseError::into_query_error)?,
+            }
         };
         Ok(self.statement_cache.insert(key, Arc::new(parsed)))
     }
@@ -6263,12 +6268,7 @@ impl StorageQueryEngine {
         } else if bulk_dml_kind {
             match parse_statement(sql) {
                 Ok(statement) => statement,
-                Err(err) => {
-                    return (
-                        Err(parse_error_to_query_error(err)),
-                        QueryLogMetadata::default(),
-                    )
-                }
+                Err(err) => return (Err(err.into_query_error()), QueryLogMetadata::default()),
             }
         } else {
             // Drop comments sitting in an `EXPLAIN`/`DESCRIBE` header *before*
@@ -6344,7 +6344,12 @@ impl StorageQueryEngine {
             let child_sql = &effective[range.clone()];
             let mut statement = match parse_statement(child_sql) {
                 Ok(statement) => statement,
-                Err(error) => return (Err(parse_error_to_query_error(error)), metadata),
+                Err(error) => {
+                    return (
+                        Err(error.rebase(sql, base + range.start).into_query_error()),
+                        metadata,
+                    )
+                }
             };
             if let Err(err) = validate_text_bind_markers(child_sql, &statement) {
                 return (Err(err), metadata);
@@ -6785,7 +6790,7 @@ impl StorageQueryEngine {
                             if waited_for_lock {
                                 clear_session_lock_wait(&self.db, session);
                             }
-                            return (Err(parse_error_to_query_error(err)), wait_stats);
+                            return (Err(err.into_query_error()), wait_stats);
                         }
                     }
                 }
@@ -7252,27 +7257,6 @@ fn process_state_for_sql(sql: &str) -> crate::engine::session_registry::ProcessS
     }
 }
 
-fn parse_error_to_query_error(err: crate::parser::ParseError) -> QueryError {
-    if err.spec == crate::error::catalog::ER_WRONG_ARGUMENTS
-        || err.spec == crate::error::catalog::ER_INVALID_GROUP_FUNC_USE
-        || err.spec == crate::error::catalog::ER_PK_INDEX_CANT_BE_INVISIBLE
-        || err.spec == crate::error::catalog::ER_STACK_OVERRUN_NEED_MORE
-        || err.spec == crate::error::catalog::ER_TOO_HIGH_LEVEL_OF_NESTING_FOR_SELECT
-        || err.message.starts_with("invalid vector WITH ")
-        || err.message.starts_with("duplicate vector WITH ")
-    {
-        // This semantic validation and these resource bounds are detected
-        // while parsing, but have canonical standalone messages rather than
-        // syntax location/expectation details.
-        err.spec.error(err.message)
-    } else {
-        err.spec.error(if err.expected.is_empty() {
-            err.to_string()
-        } else {
-            format!("{}; expected {:?}", err, err.expected)
-        })
-    }
-}
 
 fn is_lock_wait_pending(err: &QueryError) -> bool {
     crate::storage::is_lock_wait_pending_error(err)

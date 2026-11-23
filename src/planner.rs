@@ -2953,9 +2953,9 @@ pub(crate) fn resolve_wildcard_order_ordinals(
                 .and_then(|idx| usize::try_from(idx).ok())
                 .and_then(|idx| projection.get(idx));
             let Some(SelectItem::Expr { expr, .. }) = item else {
-                return Err(error(
-                    crate::error::catalog::ER_BAD_FIELD_ERROR,
-                    format!("Unknown column '{pos}' in 'order clause'"),
+                return Err(crate::error::messages::bad_field(
+                    &pos.to_string(),
+                    "order clause",
                 ));
             };
             order.expr = expr.clone();
@@ -2969,9 +2969,9 @@ pub(crate) fn resolve_wildcard_order_ordinals(
                 .and_then(|idx| usize::try_from(idx).ok())
                 .and_then(|idx| projection.get(idx));
             let Some(SelectItem::Expr { expr, .. }) = item else {
-                return Err(error(
-                    crate::error::catalog::ER_BAD_FIELD_ERROR,
-                    format!("Unknown column '{pos}' in 'group statement'"),
+                return Err(crate::error::messages::bad_field(
+                    &pos.to_string(),
+                    "group statement",
                 ));
             };
             if expr_has_aggregate(expr) {
@@ -4716,15 +4716,12 @@ fn build_using_join_condition(
         let left_matches = columns_matching(left, column);
         let right_matches = columns_matching(right, column);
         if left_matches.is_empty() || right_matches.is_empty() {
-            return Err(error(
-                crate::error::catalog::ER_BAD_FIELD_ERROR,
-                format!("unknown column '{column}' in 'from clause'"),
-            ));
+            return Err(crate::error::messages::bad_field(column, "from clause"));
         }
         if left_matches.len() != 1 || right_matches.len() != 1 {
-            return Err(error(
-                crate::error::catalog::ER_NON_UNIQ_ERROR,
-                format!("Column '{column}' in from clause is ambiguous"),
+            return Err(crate::error::messages::ambiguous_field(
+                column,
+                "from clause",
             ));
         }
         conjuncts.push(Expr::Binary {
@@ -4752,10 +4749,7 @@ fn merge_join_output_columns(
         let left_matches = columns_matching(left, column);
         let right_matches = columns_matching(right, column);
         if left_matches.is_empty() || right_matches.is_empty() {
-            return Err(error(
-                crate::error::catalog::ER_BAD_FIELD_ERROR,
-                format!("unknown column '{column}' in 'from clause'"),
-            ));
+            return Err(crate::error::messages::bad_field(column, "from clause"));
         }
         let name = left_matches
             .first()
@@ -5114,24 +5108,24 @@ fn validate_select_in_column_scope(
             SelectItem::Wildcard => {}
             SelectItem::QualifiedWildcard(qualifier) => scope.resolve_qualifier(qualifier)?,
             SelectItem::Expr { expr, .. } => {
-                validate_expr_columns(db, expr, &scope, None, true)?;
+                validate_expr_columns(db, expr, scope, None, true, "field list")?;
                 validate_window_output_aliases(expr, scope, &aliases)?;
             }
         }
     }
     if let Some(selection) = &select.selection {
-        validate_expr_columns(db, selection, &scope, None, false)?;
+        validate_expr_columns(db, selection, scope, None, false, "where clause")?;
     }
     for join in &select.joins {
         if let Some(condition) = &join.condition {
-            validate_expr_columns(db, condition, &scope, None, false)?;
+            validate_expr_columns(db, condition, scope, None, false, "on clause")?;
         }
     }
     for expr in &select.group_by {
         if let Expr::Identifier(name) = expr {
             if scope.column_matches(None, name, true) > 1 {
                 if let Some(target) = group_by_selected_column(&select.projection, scope, name) {
-                    validate_expr_columns(db, &target, scope, None, true)?;
+                    validate_expr_columns(db, &target, scope, None, true, "group statement")?;
                     continue;
                 }
             }
@@ -5143,16 +5137,23 @@ fn validate_select_in_column_scope(
         // at this early validation boundary; the executable/planner-owned
         // SELECT still runs `resolve_group_by_refs`, which enforces MySQL's
         // FROM-column-before-alias precedence and emits ambiguity warnings.
-        validate_expr_columns(db, expr, &scope, Some(&aliases), true)?;
+        validate_expr_columns(db, expr, scope, Some(&aliases), true, "group statement")?;
     }
     if let Some(having) = &select.having {
-        validate_expr_columns(db, having, &scope, Some(&aliases), true)?;
+        validate_expr_columns(db, having, scope, Some(&aliases), true, "having clause")?;
     }
     // MySQL permits hidden sort keys when ONLY_FULL_GROUP_BY is disabled.
     // Name resolution remains mandatory in either mode, including nested scopes.
     let check_distinct_order = select.distinct && crate::engine::expr::session_only_full_group_by();
     for (index, order_by) in select.order_by.iter().enumerate() {
-        validate_expr_columns(db, &order_by.expr, &scope, Some(&aliases), true)?;
+        validate_expr_columns(
+            db,
+            &order_by.expr,
+            scope,
+            Some(&aliases),
+            true,
+            "order clause",
+        )?;
         if check_distinct_order && !distinct_order_is_selected(db, &order_by.expr, select, scope) {
             return Err(error(crate::error::catalog::ER_FIELD_IN_ORDER_NOT_SELECT,
                 format!("Expression #{} of ORDER BY clause is not in SELECT list; this is incompatible with DISTINCT", index + 1)));
@@ -5160,11 +5161,11 @@ fn validate_select_in_column_scope(
     }
     for window in &select.named_windows {
         for expr in &window.partition_by {
-            validate_expr_columns(db, expr, &scope, None, true)?;
+            validate_expr_columns(db, expr, scope, None, true, "window expression")?;
             validate_window_operand_aliases(expr, scope, &aliases)?;
         }
         for order_by in &window.order_by {
-            validate_expr_columns(db, &order_by.expr, &scope, None, true)?;
+            validate_expr_columns(db, &order_by.expr, scope, None, true, "window expression")?;
             validate_window_operand_aliases(&order_by.expr, scope, &aliases)?;
         }
         if let Some(frame) = &window.frame {
@@ -5651,21 +5652,29 @@ impl ColumnScope<'_> {
         qualifier: Option<&str>,
         column: &str,
         output_only: bool,
+        clause: &'static str,
     ) -> Result<(), QueryError> {
         let matches = self.column_matches(qualifier, column, output_only);
         if matches == 1 {
             return Ok(());
         }
         if matches > 1 {
-            return Err(error(
-                crate::error::catalog::ER_NON_UNIQ_ERROR,
-                format!("column '{column}' is ambiguous"),
-            ));
+            return Err(crate::error::messages::ambiguous_field(column, clause));
         }
         if let Some(outer) = self.outer {
-            return outer.resolve_column(qualifier, column, output_only);
+            return outer.resolve_column(qualifier, column, output_only, clause);
         }
-        Err(crate::error::messages::bad_field(column, "field list"))
+        let mut candidates = self
+            .tables
+            .iter()
+            .filter(|table| !output_only || table.visible)
+            .filter(|table| qualifier.is_none_or(|name| table.matches_name(name)));
+        let mut error = crate::error::messages::bad_field(column, clause);
+        if let Some(table) = candidates.next().filter(|_| candidates.next().is_none()) {
+            let (schema, name) = crate::storage::naming::split_table_name("", &table.name);
+            error = error.with_table(&schema, &name);
+        }
+        Err(error)
     }
 
     fn column_matches(&self, qualifier: Option<&str>, column: &str, output_only: bool) -> usize {
@@ -24764,7 +24773,14 @@ pub(crate) fn check_only_full_group_by(db: &Database, select: &Select) -> Result
     // Diagnose an unknown grouping key before reporting unrelated SELECT
     // columns as not functionally dependent on that nonexistent key.
     for group in &select.group_by {
-        validate_expr_columns(db, group, &outer_scope, Some(&order_having_aliases), true)?;
+        validate_expr_columns(
+            db,
+            group,
+            &outer_scope,
+            Some(&order_having_aliases),
+            true,
+            "group statement",
+        )?;
     }
     let is_grouped_expr = |expr: &Expr| {
         select.group_by.iter().any(|group| {

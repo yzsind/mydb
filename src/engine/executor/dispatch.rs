@@ -6050,7 +6050,7 @@ fn execute_table_maintenance_status(
                 db_name.replace('`', "``"),
                 name.replace('`', "``")
             ))
-            .map_err(parse_error_to_query_error)?;
+            .map_err(crate::parser::ParseError::into_query_error)?;
             let checked = expand_views(db, session, &mut statement, 0).and_then(|()| {
                 super::select::describe_statement_columns(db, session, &statement).map(|_| ())
             });
@@ -7672,7 +7672,8 @@ pub(super) fn execute_sql_prepare(
     }
     let sql = crate::storage::value_to_string(&source_value);
     let _mode = crate::parser::ParserSqlModeGuard::activate(session.temporal_sql_mode_bits);
-    let mut statement = parse_statement(&sql).map_err(parse_error_to_query_error)?;
+    let mut statement =
+        parse_statement(&sql).map_err(crate::parser::ParseError::into_query_error)?;
     if matches!(statement, Statement::LoadData(_)) {
         return Err(error(
             crate::error::catalog::ER_UNSUPPORTED_PS,
@@ -10726,8 +10727,8 @@ pub(super) fn execute_qualified_statement(
             // effects of already-executed non-transactional statements remain,
             // matching MySQL. Nested MultiResults (e.g. a CALL among the
             // statements) are flattened so the wire layer never sees nesting.
-            let statements =
-                crate::parser::parse_statements(&sql).map_err(super::parse_error_to_query_error)?;
+            let statements = crate::parser::parse_statements(&sql)
+                .map_err(crate::parser::ParseError::into_query_error)?;
             let additional = statements.len().saturating_sub(1) as u64;
             crate::mysql::connection_manager::record_statements(additional);
             crate::engine::status_counters::add_session_counter(
@@ -10800,8 +10801,8 @@ fn execute_explain_for_connection(
             format!("connection {connection_id} has no active statement to explain"),
         ));
     }
-    let mut inner =
-        crate::parser::parse_statement(current_sql).map_err(super::parse_error_to_query_error)?;
+    let mut inner = crate::parser::parse_statement(current_sql)
+        .map_err(crate::parser::ParseError::into_query_error)?;
     // EXPLAIN FOR CONNECTION uses the target connection's default database
     // and only applies the PROCESS/self check above. It must not accidentally
     // demand the caller's privileges on every object referenced by the target

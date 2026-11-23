@@ -54,27 +54,55 @@ fn defer_ignored_load_conversion(bytes: &[u8], err: QueryError) -> Result<Value,
     Ok(value)
 }
 
+fn contiguous_load_input(first: usize, last: usize, count: usize) -> crate::error::InputRows {
+    if first != 0 && last - first + 1 == count {
+        crate::error::InputRows::new(first as u64, false)
+    } else {
+        crate::error::InputRows::default()
+    }
+}
+
+fn decoded_load_input(row_count: usize) -> crate::error::InputRows {
+    let last = LOAD_DIAGNOSTIC_ROW.get();
+    if last == 0 || last < row_count as u64 {
+        return crate::error::InputRows::default();
+    }
+    crate::error::InputRows::new(last - row_count as u64 + 1, false)
+}
+
 fn coerce_deferred_load_rows(
     db: &Database,
     table: &TableSchema,
     rows: &mut [Vec<Value>],
+    all_columns_supplied: bool,
 ) -> Result<(), QueryError> {
     let deferred = LOAD_DECODE_POLICY.with(|policy| {
         let (ignore, deferred) = policy.get();
         policy.set((ignore, false));
         deferred
     });
+    let first = LOAD_DIAGNOSTIC_ROW
+        .get()
+        .saturating_sub(rows.len() as u64)
+        .saturating_add(1);
     if LOAD_DECODE_POLICY.with(|policy| policy.get().0) {
-        for row in rows.iter_mut() {
-            coerce_load_nulls(table, row)?;
+        for (ordinal, row) in rows.iter_mut().enumerate() {
+            coerce_load_nulls(table, row, first + ordinal as u64)?;
         }
     }
     if deferred {
+        let all_columns_supplied = all_columns_supplied
+            && table.columns.iter().all(|column| {
+                column.default.is_none()
+                    && column.default_expr.is_none()
+                    && column.generated_expr.is_none()
+            });
+        let input = crate::error::InputRows::new(first, all_columns_supplied);
         // Keep error classification, clamping and warnings in the shared
         // storage coercer. Complete conversion before triggers or partition
         // routing inspect the row, including generated-column dependencies.
-        for row in rows {
-            db.coerce_row_for_load(table, row)?;
+        for (ordinal, row) in rows.iter_mut().enumerate() {
+            db.coerce_insert_row(table, row, input.offset(ordinal))?;
         }
     }
     Ok(())
@@ -156,6 +184,55 @@ thread_local! {
     static LOAD_RECORDS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LOAD_DELETED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
     static LOAD_SKIPPED: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    static LOAD_TARGET: std::cell::RefCell<Option<(String, String)>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+struct LoadTargetDiagnosticGuard(Option<(String, String)>);
+
+impl LoadTargetDiagnosticGuard {
+    fn new(table: &TableSchema) -> Self {
+        Self(LOAD_TARGET.replace(Some((table.database.clone(), table.name.clone()))))
+    }
+}
+
+impl Drop for LoadTargetDiagnosticGuard {
+    fn drop(&mut self) {
+        LOAD_TARGET.replace(self.0.take());
+    }
+}
+
+fn load_condition(error: QueryError, column: Option<&str>) -> QueryError {
+    let error = LOAD_TARGET.with(|target| match &*target.borrow() {
+        Some((schema, table)) => error.with_table(schema, table),
+        None => error,
+    });
+    let error = match column {
+        Some(column) => error.with_column(column),
+        None => error,
+    };
+    let row = LOAD_DIAGNOSTIC_ROW.get();
+    if row == 0 {
+        error
+    } else if error.message().starts_with("Row ") {
+        error.with_details(|details| details.row_number = Some(row))
+    } else {
+        error.with_input_row(row)
+    }
+}
+
+fn load_field_condition(error: QueryError, field: &[u8], op: &CoercionOp) -> QueryError {
+    load_condition(error, op.column()).with_field_preview(
+        field,
+        matches!(
+            op,
+            CoercionOp::BinaryPad(_) | CoercionOp::VarBinaryLimit(_) | CoercionOp::PassThroughBytes
+        ),
+    )
 }
 
 fn reset_load_counters() {
@@ -263,6 +340,7 @@ pub(super) fn execute_load_data_with_reader(
             }
         })?
         .clone();
+    let _diagnostic_target = LoadTargetDiagnosticGuard::new(&table);
     let partition_filter =
         super::partition_clause::resolve_partition_clause(db, &table_name, &stmt.partitions)?;
 
@@ -562,19 +640,25 @@ fn load_has_triggers(db: &Arc<Database>, table_name: &str, stmt: &crate::parser:
 }
 
 /// Repair explicit NULL using the type default, never a declared DEFAULT.
-fn coerce_load_nulls(table: &TableSchema, row: &mut [Value]) -> Result<(), QueryError> {
+fn coerce_load_nulls(
+    table: &TableSchema,
+    row: &mut [Value],
+    row_number: u64,
+) -> Result<(), QueryError> {
     for (column, value) in table.columns.iter().zip(row.iter_mut()) {
         if !column.nullable
             && !column.auto_increment
             && column.generated_expr.is_none()
             && matches!(value, Value::Null)
         {
+            let condition = crate::error::messages::bad_null(&column.name)
+                .with_table(&table.database, &table.name)
+                .with_input_row(row_number);
             *value = super::insert::implicit_default_for_type(&column.data_type)
-                .ok_or_else(|| crate::error::messages::bad_null(&column.name))?;
-            crate::engine::api::push_statement_warning(
+                .ok_or_else(|| condition.clone())?;
+            crate::engine::api::push_statement_condition(
                 crate::error::ConditionLevel::Warning,
-                crate::error::catalog::ER_BAD_NULL_ERROR,
-                format!("Column '{}' cannot be null", column.name),
+                &condition,
             );
         }
     }
@@ -794,6 +878,8 @@ fn execute_load_data_general(
         let batch_limit =
             (mem_budget::memory_target_bytes() / 16).clamp(1024 * 1024, 256 * 1024 * 1024);
         let mut row_index = 0usize;
+        let mut batch_first = 0usize;
+        let mut batch_last = 0usize;
         loop {
             // DATA is consumed in record-aligned chunks, including from a FIFO.
             // XML still needs the complete document, but its input is admitted
@@ -886,7 +972,7 @@ fn execute_load_data_general(
                 }
 
                 if stmt.ignore_duplicates || !load_is_strict() {
-                    if let Err(err) = coerce_load_nulls(table, &mut row) {
+                    if let Err(err) = coerce_load_nulls(table, &mut row, row_index as u64) {
                         if !stmt.ignore_duplicates {
                             return Err(err);
                         }
@@ -915,9 +1001,15 @@ fn execute_load_data_general(
                     batch_charge.try_grow(additional * std::mem::size_of::<Vec<Value>>())?;
                     batch.reserve_exact(additional);
                 }
+                if batch.is_empty() {
+                    batch_first = row_index;
+                }
+                batch_last = row_index;
                 batch.push(row);
 
                 if batch.len() >= batch_rows || batch_charge.bytes() >= batch_limit {
+                    let _diagnostic_rows =
+                        contiguous_load_input(batch_first, batch_last, batch.len()).enter();
                     total_rows += flush_general_batch(
                         db,
                         session,
@@ -938,6 +1030,8 @@ fn execute_load_data_general(
             }
         }
         if !batch.is_empty() {
+            let _diagnostic_rows =
+                contiguous_load_input(batch_first, batch_last, batch.len()).enter();
             total_rows += flush_general_batch(
                 db,
                 session,
@@ -1172,7 +1266,9 @@ fn flush_general_batch(
             {
                 db.rollback_to_statement_savepoint(txn.txn_id, batch_savepoint)?;
                 let mut affected = 0u64;
-                for row in rows {
+                let input = crate::error::InputRows::current();
+                for (ordinal, row) in rows.into_iter().enumerate() {
+                    let _diagnostic_row = input.offset(ordinal).enter();
                     crate::engine::cancel::check_cancelled()?;
                     let result = execute_load_rows_with_conflict(
                         db,
@@ -2503,6 +2599,7 @@ fn execute_load_data_fast_parallel_inner(
             // `coerce_row`). Send the actual error before returning.
             let err_tx = result_tx.clone();
             let run = move || -> Result<(), QueryError> {
+                let _diagnostic_target = LoadTargetDiagnosticGuard::new(&table);
                 let _ignore =
                     ignore_trial.then(|| crate::storage::DmlIgnoreCoercionGuard::new(false));
                 let _decode = ignore_trial.then(|| LoadDecodePolicyGuard::new(false));
@@ -2725,7 +2822,14 @@ fn execute_load_data_fast_parallel_inner(
                                     validate_canonical_load_row(&table, values_ref)?;
                                 }
                             } else {
-                                db.coerce_row_for_load(&table, values_ref)?;
+                                db.coerce_insert_row(
+                                    &table,
+                                    values_ref,
+                                    crate::error::InputRows::new(
+                                        raw_batch.first_row + offset as u64,
+                                        false,
+                                    ),
+                                )?;
                             }
                         }
                         validate_load_data_partition_row(
@@ -2854,6 +2958,7 @@ fn execute_load_data_fast_parallel_inner(
                     }
                     let prepared = LoadDataPreparedBatch {
                         batch_idx,
+                        first_row: raw_batch.first_row,
                         rows,
                         index_keys: per_index_keys,
                         zone_map_worker_batch,
@@ -3151,6 +3256,7 @@ fn execute_preraw_load_data_fast(
         let index_keys = precompute_index_keys(table, &prepared_indexes, &mapped_rows)?;
         prepared.push(LoadDataPreparedBatch {
             batch_idx,
+            first_row: raw_batch.first_row,
             rows: BatchRows::Decoded(mapped_rows),
             index_keys,
             zone_map_worker_batch: crate::storage::ZoneMapWorkerBatch::default(),
@@ -3263,6 +3369,8 @@ impl<'a> LoadDataPreparedWriter<'a> {
         if batch.rows.is_empty() {
             return Ok(());
         }
+        let input = crate::error::InputRows::new(batch.first_row, false);
+        let _diagnostic_rows = input.enter();
         if self.table.auto_increment_column_index().is_some() {
             self.db.record_load_auto_increment_batch(
                 batch.rows.len() as u64,
@@ -3287,8 +3395,9 @@ impl<'a> LoadDataPreparedWriter<'a> {
                 if self.first_insert_id == 0 {
                     self.first_insert_id = first;
                 }
-                for values in rows.iter_mut() {
-                    self.db.coerce_row_for_load(self.table, values)?;
+                for (ordinal, values) in rows.iter_mut().enumerate() {
+                    self.db
+                        .coerce_insert_row(self.table, values, input.offset(ordinal))?;
                 }
                 materialize_generated_rows(self.db, self.table, rows)?;
                 validate_load_data_partition_set(
@@ -3296,9 +3405,11 @@ impl<'a> LoadDataPreparedWriter<'a> {
                     self.partition_filter.as_deref(),
                     rows,
                 )?;
-                for values in rows.iter() {
-                    self.db.check_not_null_constraints(self.table, values)?;
-                    self.db.check_check_constraints(self.table, values, None)?;
+                for (ordinal, values) in rows.iter().enumerate() {
+                    self.db
+                        .check_not_null_constraints(self.table, values)
+                        .and_then(|()| self.db.check_check_constraints(self.table, values, None))
+                        .map_err(|error| input.annotate(ordinal, error))?;
                 }
                 let indexes = prepare_load_indexes(self.table)?;
                 batch.index_keys = precompute_index_keys(self.table, &indexes, rows)?;
@@ -3456,6 +3567,7 @@ impl<'a> LoadDataPreparedWriter<'a> {
 
 struct LoadDataPreparedBatch {
     batch_idx: usize,
+    first_row: u64,
     rows: BatchRows,
     /// Index keys for the batch, materialised per-index in row order.
     /// For each index by ordinal, the inner `Vec<IndexKeysForRow>` holds
@@ -3988,8 +4100,9 @@ fn execute_load_data_with_conflict(
                 break;
             }
 
+            let _diagnostic_rows = decoded_load_input(rows.len()).enter();
             let mut mapped_rows = map_rows(rows, table, column_indexes, full_width_identity);
-            coerce_deferred_load_rows(db, table, &mut mapped_rows)?;
+            coerce_deferred_load_rows(db, table, &mut mapped_rows, full_width_identity)?;
             materialize_generated_rows(db, table, &mut mapped_rows)?;
             validate_load_data_partition_set(table, partition_filter, &mapped_rows)?;
             // G8 — every source row in the chunk counts toward Records.
@@ -4012,7 +4125,9 @@ fn execute_load_data_with_conflict(
                             ])) =>
                 {
                     db.rollback_to_statement_savepoint(txn.txn_id, batch_savepoint)?;
-                    for row in mapped_rows {
+                    let input = crate::error::InputRows::current();
+                    for (ordinal, row) in mapped_rows.into_iter().enumerate() {
+                        let _diagnostic_row = input.offset(ordinal).enter();
                         crate::engine::cancel::check_cancelled()?;
                         let result = execute_load_rows_with_conflict(
                             db,
@@ -4116,8 +4231,9 @@ fn execute_load_data_with_triggers(
             if rows.is_empty() {
                 break;
             }
+            let _diagnostic_rows = decoded_load_input(rows.len()).enter();
             let mut mapped_rows = map_rows(rows, table, column_indexes, full_width_identity);
-            coerce_deferred_load_rows(db, table, &mut mapped_rows)?;
+            coerce_deferred_load_rows(db, table, &mut mapped_rows, full_width_identity)?;
             materialize_generated_rows(db, table, &mut mapped_rows)?;
             validate_load_data_partition_set(table, partition_filter, &mapped_rows)?;
             add_load_records(mapped_rows.len() as u64);
@@ -4509,11 +4625,13 @@ impl CompiledLoadRowProgram {
             } else {
                 raw_field
             };
-            match &self.coercion_plan[field_idx] {
+            let op = &self.coercion_plan[field_idx];
+            let diagnostic = |error| load_field_condition(error, field, op);
+            match op {
                 CoercionOp::SignedInt { min, max, column } => {
                     if let Some(value) = parse_i64_fast(field) {
                         if !(*min..=*max).contains(&value) {
-                            return Err(load_out_of_range(column));
+                            return Err(diagnostic(load_out_of_range(column)));
                         }
                         if self.indexed_columns[field_idx] {
                             index_value_scratch[field_idx] = Value::Int(value);
@@ -4530,7 +4648,7 @@ impl CompiledLoadRowProgram {
                 CoercionOp::UnsignedInt { max, column } => {
                     if let Some(value) = parse_u64_fast(field) {
                         if value > *max {
-                            return Err(load_out_of_range(column));
+                            return Err(diagnostic(load_out_of_range(column)));
                         }
                         if self.indexed_columns[field_idx] {
                             index_value_scratch[field_idx] = Value::UInt(value);
@@ -4565,7 +4683,8 @@ impl CompiledLoadRowProgram {
                             target_scale,
                             *unsigned,
                             column,
-                        )?;
+                        )
+                        .map_err(diagnostic)?;
                         if self.indexed_columns[field_idx] {
                             index_value_scratch[field_idx] =
                                 Value::DecimalCompact(magnitude, value_scale);
@@ -4580,7 +4699,8 @@ impl CompiledLoadRowProgram {
                     }
                 }
                 CoercionOp::Date => {
-                    let days = crate::storage::parse_date_to_days_bytes(field)?;
+                    let days =
+                        crate::storage::parse_date_to_days_bytes(field).map_err(diagnostic)?;
                     if self.indexed_columns[field_idx] {
                         index_value_scratch[field_idx] = Value::Date(days);
                     }
@@ -4590,7 +4710,8 @@ impl CompiledLoadRowProgram {
                     let value = match std::str::from_utf8(field) {
                         Ok(text) => {
                             let wall = crate::storage::quantize_datetime_text_micros(
-                                crate::storage::parse_datetime_to_micros(text)?,
+                                crate::storage::parse_datetime_to_micros(text)
+                                    .map_err(diagnostic)?,
                                 text,
                                 *fsp,
                             );
@@ -4617,10 +4738,10 @@ impl CompiledLoadRowProgram {
                 } => {
                     let text = load_utf8(field)?;
                     if text.len() as u64 > u64::from(*max_len) {
-                        return Err(error(
+                        return Err(diagnostic(error(
                             crate::error::catalog::ER_DATA_TOO_LONG,
-                            format!("data too long for column '{column}'"),
-                        ));
+                            format!("Data too long for column '{column}'"),
+                        )));
                     }
                     if let Some(charset) = charset.as_deref() {
                         crate::charset::validate_text_for_charset(charset, &text)?;
@@ -4634,10 +4755,10 @@ impl CompiledLoadRowProgram {
                 } if plain_ascii_batch || field.is_ascii() => {
                     let compact = crate::util::pad_space::pad_space_trim_end(field);
                     if compact.len() > *len {
-                        return Err(error(
+                        return Err(diagnostic(error(
                             crate::error::catalog::ER_DATA_TOO_LONG,
-                            format!("data too long for column '{column}'"),
-                        ));
+                            format!("Data too long for column '{column}'"),
+                        )));
                     }
                     payload.push_string_bytes(compact)?;
                 }
@@ -4651,10 +4772,10 @@ impl CompiledLoadRowProgram {
                     } else {
                         let (kept, removed) = field.split_at(*len);
                         if !removed.iter().all(|byte| *byte == b' ') {
-                            return Err(error(
+                            return Err(diagnostic(error(
                                 crate::error::catalog::ER_DATA_TOO_LONG,
-                                format!("data too long for column '{column}'"),
-                            ));
+                                format!("Data too long for column '{column}'"),
+                            )));
                         }
                         truncation_warnings += 1;
                         kept
@@ -5004,14 +5125,11 @@ fn publish_load_conversion_condition(
     spec: crate::error::ErrorSpec,
     message: String,
 ) -> Result<(), QueryError> {
+    let condition = load_condition(spec.error(message), None);
     if load_is_strict() && !LOAD_DECODE_POLICY.with(|policy| policy.get().0) {
-        return Err(spec.error(message));
+        return Err(condition);
     }
-    crate::engine::api::push_statement_warning(
-        crate::error::ConditionLevel::Warning,
-        spec,
-        message,
-    );
+    crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Warning, &condition);
     Ok(())
 }
 
@@ -5066,6 +5184,7 @@ fn unescape_field(field: &[u8]) -> Vec<u8> {
 fn coerce_field_borrowed(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, QueryError> {
     coerce_field_borrowed_strict(field_bytes, op)
         .or_else(|err| defer_ignored_load_conversion(field_bytes, err))
+        .map_err(|error| load_field_condition(error, field_bytes, op))
 }
 
 fn coerce_field_borrowed_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, QueryError> {
@@ -5972,6 +6091,23 @@ enum CoercionOp {
     Bit,
 }
 
+impl CoercionOp {
+    fn column(&self) -> Option<&str> {
+        match self {
+            Self::SignedInt { column, .. }
+            | Self::UnsignedInt { column, .. }
+            | Self::FloatF32 { column }
+            | Self::FloatF64 { column }
+            | Self::Decimal { column, .. }
+            | Self::CharPad { column, .. }
+            | Self::VarCharLimit { column, .. }
+            | Self::Text { column, .. }
+            | Self::Timestamp { column, .. } => Some(column),
+            _ => None,
+        }
+    }
+}
+
 fn build_coercion_plan(table: &TableSchema, column_indexes: &[usize]) -> Vec<CoercionOp> {
     column_indexes
         .iter()
@@ -6283,11 +6419,17 @@ fn round_load_decimal_text(text: &str, scale: u8) -> Option<String> {
 
 #[cold]
 fn warn_load_empty_number(kind: &str, column: &str) -> Result<(), QueryError> {
-    let row = LOAD_DIAGNOSTIC_ROW.with(|row| row.get().max(1));
-    publish_load_conversion_condition(
-        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-        format!("Incorrect {kind} value: '' for column '{column}' at row {row}"),
+    let condition = load_condition(
+        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+            .error(format!("Incorrect {kind} value: '' for column '{column}'")),
+        Some(column),
     )
+    .with_text_preview("");
+    if load_is_strict() && !LOAD_DECODE_POLICY.with(|policy| policy.get().0) {
+        return Err(condition);
+    }
+    crate::engine::api::push_statement_condition(crate::error::ConditionLevel::Warning, &condition);
+    Ok(())
 }
 
 fn warn_load_decimal_scale() {
@@ -6533,6 +6675,7 @@ fn parse_year_byte(s: &str) -> Result<u8, QueryError> {
 fn coerce_field(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, QueryError> {
     coerce_field_strict(field_bytes, op)
         .or_else(|err| defer_ignored_load_conversion(field_bytes, err))
+        .map_err(|error| load_field_condition(error, field_bytes, op))
 }
 
 fn coerce_field_strict(field_bytes: &[u8], op: &CoercionOp) -> Result<Value, QueryError> {
@@ -8304,7 +8447,7 @@ mod tests {
             input.push_str(tail);
             let mut outputs = Vec::new();
             for degree in [1, 4] {
-                let table = format!("warn_{case}_{degree}");
+                let table = format!("warn_{case}");
                 engine.execute(&format!("CREATE TABLE {table} (id INT PRIMARY KEY, n TINYINT NOT NULL, amount DECIMAL(8,2), note VARCHAR(8))")).unwrap();
                 let before = engine.db.load_shadow_perf_snapshot()[0];
                 let diagnostics = import_local_for_test(&engine, &table, degree, &input);
@@ -8320,7 +8463,19 @@ mod tests {
                 else {
                     panic!("expected rows")
                 };
+                if case == "range" {
+                    let warning = diagnostics
+                        .1
+                        .iter()
+                        .find(|warning| warning.code() == 1264)
+                        .unwrap();
+                    let details = warning.details().unwrap();
+                    assert_eq!(details.table.as_deref(), Some(table.as_str()));
+                    assert_eq!(details.column.as_deref(), Some("n"));
+                    assert_eq!(details.row_number, Some(5001));
+                }
                 outputs.push((rows.rows, diagnostics));
+                engine.execute(&format!("DROP TABLE {table}")).unwrap();
             }
             assert_eq!(outputs[0], outputs[1], "case={case}");
         }

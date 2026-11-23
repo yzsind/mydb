@@ -151,17 +151,126 @@ fn zero_date_policy(what: &str) -> Result<(), QueryError> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+struct AssignmentDiagnostic<'a> {
+    table: &'a TableSchema,
+    column: &'a ColumnSchema,
+    column_index: usize,
+    input: crate::error::InputRows,
+}
+
+thread_local! {
+    static ASSIGNMENT_DIAGNOSTIC: std::cell::Cell<Option<std::ptr::NonNull<AssignmentDiagnostic<'static>>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+fn with_assignment_diagnostic<T>(
+    diagnostic: AssignmentDiagnostic<'_>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(Option<std::ptr::NonNull<AssignmentDiagnostic<'static>>>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            ASSIGNMENT_DIAGNOSTIC.set(self.0);
+        }
+    }
+    let _restore =
+        Restore(ASSIGNMENT_DIAGNOSTIC.replace(Some(std::ptr::NonNull::from(&diagnostic).cast())));
+    run()
+}
+
+fn assignment_context(error: QueryError) -> QueryError {
+    ASSIGNMENT_DIAGNOSTIC.with(|slot| match slot.get() {
+        None => error,
+        Some(ptr) => {
+            // SAFETY: with_assignment_diagnostic keeps the borrowed descriptor
+            // alive on this thread and restores the previous pointer on unwind.
+            let diagnostic = unsafe { ptr.as_ref() };
+            diagnostic
+                .input
+                .annotate(
+                    0,
+                    error
+                        .with_table(&diagnostic.table.database, &diagnostic.table.name)
+                        .with_column(&diagnostic.column.name),
+                )
+                .describe_target()
+        }
+    })
+}
+
+#[derive(Clone, Copy)]
+enum AssignmentValue<'a> {
+    Value(&'a Value),
+    Text(&'a str),
+    Bytes(&'a [u8]),
+}
+
+fn assignment_preview(error: QueryError, value: Option<AssignmentValue<'_>>) -> QueryError {
+    let direct = ASSIGNMENT_DIAGNOSTIC.get().is_some_and(|ptr| {
+        // SAFETY: the pointer is installed by with_assignment_diagnostic.
+        let diagnostic = unsafe { ptr.as_ref() };
+        diagnostic.input.direct_values
+            && crate::error::InputPreviewColumns::includes(diagnostic.column_index)
+    });
+    if !direct {
+        return error;
+    }
+    match value {
+        Some(AssignmentValue::Value(value)) => error.with_value_preview(value),
+        Some(AssignmentValue::Text(value)) => error.with_text_preview(value),
+        Some(AssignmentValue::Bytes(value)) => error.with_field_preview(value, true),
+        None => error,
+    }
+}
+
+fn push_assignment_warning(
+    level: crate::error::ConditionLevel,
+    spec: crate::error::ErrorSpec,
+    message: impl Into<String>,
+) {
+    push_assignment_warning_with_value(level, spec, message.into(), None);
+}
+
+fn push_assignment_warning_with_value(
+    level: crate::error::ConditionLevel,
+    spec: crate::error::ErrorSpec,
+    message: String,
+    value: Option<AssignmentValue<'_>>,
+) {
+    if !crate::engine::expr::expression_warning_should_publish(spec.code().get(), &message) {
+        return;
+    }
+    let error = assignment_preview(assignment_context(spec.error(message)), value);
+    crate::engine::api::push_statement_condition(level, &error);
+}
+
 fn coerce_row(table: &TableSchema, values: &mut [Value]) -> Result<(), QueryError> {
+    coerce_row_at(table, values, crate::error::InputRows::default())
+}
+
+fn coerce_row_at(
+    table: &TableSchema,
+    values: &mut [Value],
+    input: crate::error::InputRows,
+) -> Result<(), QueryError> {
     let _engine_policy = NonTransactionalCoercionGuard::new(&table.engine);
     if values.len() != table.columns.len() {
-        return Err(error(
-            crate::error::catalog::ER_WRONG_VALUE_COUNT_ON_ROW,
-            "column count does not match value count",
+        return Err(crate::error::messages::wrong_value_count(
+            &table.database,
+            &table.name,
+            input.row(0),
         ));
     }
-    for (value, column) in values.iter_mut().zip(&table.columns) {
+    for (column_index, (value, column)) in values.iter_mut().zip(&table.columns).enumerate() {
         let current = std::mem::replace(value, Value::Null);
-        *value = coerce_column_value_for_schema(current, column)?;
+        let diagnostic = AssignmentDiagnostic {
+            table,
+            column,
+            column_index,
+            input,
+        };
+        *value = coerce_column_value_with_diagnostic(current, column, Some(diagnostic))?;
     }
     validate_row_domain_constraints(table, values)?;
     Ok(())
@@ -191,12 +300,13 @@ pub(crate) fn coerce_updated_row(
             let Some(default) =
                 crate::engine::executor::insert::implicit_default_for_type(&column.data_type)
             else {
-                return Err(crate::error::messages::bad_null(&column.name));
+                return Err(crate::error::messages::bad_null(&column.name)
+                    .with_table(&table.database, &table.name));
             };
-            crate::engine::api::push_statement_warning(
+            crate::engine::api::push_statement_condition(
                 crate::error::ConditionLevel::Warning,
-                crate::error::catalog::ER_BAD_NULL_ERROR,
-                format!("Column '{}' cannot be null", column.name),
+                &crate::error::messages::bad_null(&column.name)
+                    .with_table(&table.database, &table.name),
             );
             values[idx] = default;
         }
@@ -209,7 +319,16 @@ pub(crate) fn coerce_updated_row(
             continue;
         };
         let current = std::mem::replace(&mut values[idx], Value::Null);
-        values[idx] = coerce_column_value_for_schema(current, column)?;
+        values[idx] = coerce_column_value_with_diagnostic(
+            current,
+            column,
+            Some(AssignmentDiagnostic {
+                table,
+                column,
+                column_index: idx,
+                input: Default::default(),
+            }),
+        )?;
     }
     compact_char_columns_for_storage(table, values);
     validate_row_domain_constraints(table, values)?;
@@ -433,6 +552,7 @@ fn check_constraint_error(name: &str) -> QueryError {
         crate::error::catalog::ER_CHECK_CONSTRAINT_VIOLATED,
         format!("Check constraint '{name}' is violated."),
     )
+    .with_details(|details| details.constraint = Some(name.to_owned()))
 }
 
 fn build_check_constraints_for_table(
@@ -1328,13 +1448,7 @@ fn coerce_column_value(
     data_type: &DataTypeKind,
     unsigned: bool,
 ) -> Result<Value, QueryError> {
-    coerce_value_with_unsigned(value, data_type, unsigned, column_name).map_err(|err| {
-        if err.is(crate::error::catalog::ER_DATA_TOO_LONG) {
-            err.with_message(format!("data too long for column '{column_name}'"))
-        } else {
-            err
-        }
-    })
+    coerce_value_with_unsigned(value, data_type, unsigned, column_name)
 }
 
 /// Partition boundaries must never use INSERT's warning-and-clamp fallback.
@@ -1376,8 +1490,16 @@ fn normalize_string_assignment(value: Value, target: &DataTypeKind) -> Value {
 }
 
 fn coerce_column_value_for_schema(
+    value: Value,
+    column: &ColumnSchema,
+) -> Result<Value, QueryError> {
+    coerce_column_value_with_diagnostic(value, column, None)
+}
+
+fn coerce_column_value_with_diagnostic(
     mut value: Value,
     column: &ColumnSchema,
+    diagnostic: Option<AssignmentDiagnostic<'_>>,
 ) -> Result<Value, QueryError> {
     value = normalize_string_assignment(value, &column.data_type);
     // Already typed text within the byte bound is also within the character
@@ -1394,7 +1516,15 @@ fn coerce_column_value_for_schema(
             _ => false,
         };
         if fits {
-            validate_column_charset_value(column, &value)?;
+            validate_column_charset_value(column, &value).map_err(|error| match diagnostic {
+                Some(diagnostic) => with_assignment_diagnostic(diagnostic, || {
+                    assignment_preview(
+                        assignment_context(error),
+                        Some(AssignmentValue::Value(&value)),
+                    )
+                }),
+                None => error,
+            })?;
             return Ok(value);
         }
     }
@@ -1404,6 +1534,19 @@ fn coerce_column_value_for_schema(
     if integer_value_fits_column(&value, column) {
         return Ok(value);
     }
+    if matches!(value, Value::Null) {
+        return Ok(Value::Null);
+    }
+    match diagnostic {
+        Some(diagnostic) => with_assignment_diagnostic(diagnostic, || {
+            coerce_untyped_column_value(value, column)
+                .map_err(|error| assignment_context(error).describe_value())
+        }),
+        None => coerce_untyped_column_value(value, column),
+    }
+}
+
+fn coerce_untyped_column_value(value: Value, column: &ColumnSchema) -> Result<Value, QueryError> {
     if matches!(
         (&value, &column.data_type),
         (Value::Bytes(bytes), DataTypeKind::Enum { .. }) if bytes.is_empty()
@@ -1730,7 +1873,7 @@ fn enum_set_truncation(fallback: Value, kind: &str, column: &str) -> Result<Valu
             format!("data truncated for {kind} column '{column}'"),
         ))
     } else {
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::WARN_DATA_TRUNCATED,
             message,
@@ -2055,7 +2198,7 @@ pub(crate) fn validate_enum_set_members(
                 message,
             ));
         }
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning(
             crate::error::ConditionLevel::Note,
             crate::error::catalog::ER_DUPLICATED_VALUE_IN_TYPE,
             message,
@@ -2392,7 +2535,7 @@ fn warn_deprecated_datetime_delimiter(value: &Value) {
     let deprecated = (bytes[13].is_ascii_punctuation() && bytes[13] != b':')
         || (bytes[16].is_ascii_punctuation() && bytes[16] != b':');
     if deprecated {
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_WARN_DEPRECATED_DATETIME_DELIMITER,
             format!(
@@ -2494,7 +2637,7 @@ fn format_decimal(
             if !coercion_strict() {
                 let (prefix, clean) = decimal_numeric_prefix(raw);
                 if !clean {
-                    crate::engine::api::push_statement_warning(
+                    push_assignment_warning(
                         crate::error::ConditionLevel::Warning,
                         crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
                         format!("Incorrect decimal value: '{raw}' for column '{column}' at row 1"),
@@ -2680,19 +2823,27 @@ pub(crate) fn coercion_strict() -> bool {
 /// plus warning 1264 (non-strict), matching MySQL's saturating store.
 #[cold]
 fn out_of_range_1264<T>(clamped: T, column: &str) -> Result<T, QueryError> {
+    out_of_range_value(clamped, column, None)
+}
+
+#[cold]
+fn out_of_range_value<T>(
+    clamped: T,
+    column: &str,
+    value: Option<AssignmentValue<'_>>,
+) -> Result<T, QueryError> {
+    let condition = crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE;
+    let message = format!("Out of range value for column '{column}'");
     if coercion_strict() {
-        Err(error(
-            crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE,
-            "out of range value for column",
-        ))
-    } else {
-        crate::engine::api::push_statement_warning(
-            crate::error::ConditionLevel::Warning,
-            crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE,
-            format!("Out of range value for column '{column}' at row 1"),
-        );
-        Ok(clamped)
+        return Err(assignment_preview(condition.error(message), value));
     }
+    push_assignment_warning_with_value(
+        crate::error::ConditionLevel::Warning,
+        condition,
+        format!("{message} at row 1"),
+        value,
+    );
+    Ok(clamped)
 }
 
 /// BIT width overflow is 1406 in strict mode. Strict INSERT IGNORE retains
@@ -2712,7 +2863,7 @@ fn bit_data_too_long_1406<T>(clamped: T, column: &str) -> Result<T, QueryError> 
         {
             return out_of_range_1264(clamped, column);
         }
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_DATA_TOO_LONG,
             format!("Data too long for column '{column}' at row 1"),
@@ -2824,7 +2975,12 @@ pub(crate) fn enum_set_numeric_assignment(value: Value, source: &DataTypeKind) -
 /// removed suffix is only trailing spaces (CHAR/VARCHAR), which MySQL
 /// truncates silently.
 #[cold]
-fn too_long_1406<T>(truncated: T, column: &str, warn: bool) -> Result<T, QueryError> {
+fn too_long_1406<T>(
+    truncated: T,
+    column: &str,
+    warn: bool,
+    value: Option<AssignmentValue<'_>>,
+) -> Result<T, QueryError> {
     // SQL string types ignore excess pad spaces even in strict mode. This is
     // distinct from BINARY/VARBINARY, where every byte is significant and an
     // over-width 0x20 still warns/errors.
@@ -2832,15 +2988,17 @@ fn too_long_1406<T>(truncated: T, column: &str, warn: bool) -> Result<T, QueryEr
         return Ok(truncated);
     }
     if coercion_strict() {
-        Err(error(
-            crate::error::catalog::ER_DATA_TOO_LONG,
-            format!("data too long for column '{column}'"),
+        Err(assignment_preview(
+            crate::error::catalog::ER_DATA_TOO_LONG
+                .error(format!("Data too long for column '{column}'")),
+            value,
         ))
     } else {
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning_with_value(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::WARN_DATA_TRUNCATED,
             format!("Data truncated for column '{column}' at row 1"),
+            value,
         );
         Ok(truncated)
     }
@@ -2852,7 +3010,7 @@ fn too_long_1406<T>(truncated: T, column: &str, warn: bool) -> Result<T, QueryEr
 /// remains silent.
 #[cold]
 fn varchar_pad_space_truncation<T>(truncated: T, column: &str) -> T {
-    crate::engine::api::push_statement_warning(
+    push_assignment_warning(
         crate::error::ConditionLevel::Note,
         crate::error::catalog::WARN_DATA_TRUNCATED,
         format!("Data truncated for column '{column}' at row 1"),
@@ -2923,6 +3081,7 @@ fn check_uint_range(v: u64, max: u64, column: &str) -> Result<u64, QueryError> {
 fn rounded_integer_assignment_text(
     raw: &str,
     column: &str,
+    value: &Value,
 ) -> Result<(num_bigint::BigInt, bool), QueryError> {
     use num_bigint::BigInt;
     use num_traits::Zero;
@@ -2930,22 +3089,25 @@ fn rounded_integer_assignment_text(
     let (prefix, clean) = decimal_numeric_prefix(raw);
     let Some(prefix) = prefix else {
         if coercion_strict() {
-            return Err(error(
-                crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-                "incorrect integer value",
+            return Err(assignment_preview(
+                crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+                    .error(format!("Incorrect integer value for column '{column}'")),
+                Some(AssignmentValue::Value(value)),
             ));
         }
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning_with_value(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
             format!("Incorrect integer value: '{}' for column '{column}' at row 1", crate::engine::expr::diagnostic_value(raw)),
+            Some(AssignmentValue::Value(value)),
         );
         return Ok((BigInt::zero(), true));
     };
     if !clean && coercion_strict() {
-        return Err(error(
-            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-            "incorrect integer value",
+        return Err(assignment_preview(
+            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD
+                .error(format!("Incorrect integer value for column '{column}'")),
+            Some(AssignmentValue::Value(value)),
         ));
     }
 
@@ -2982,9 +3144,7 @@ fn integer_assignment_json(json: &[u8], column: &str) -> Result<Value, QueryErro
         if coercion_strict() {
             return Err(condition.error(message));
         }
-        crate::engine::api::push_statement_warning(
-            crate::error::ConditionLevel::Warning, condition, message,
-        );
+        push_assignment_warning(crate::error::ConditionLevel::Warning, condition, message);
     }
     Ok(value)
 }
@@ -3006,11 +3166,12 @@ fn integer_assignment_text(value: &Value) -> Option<std::borrow::Cow<'_, str>> {
 }
 
 #[cold]
-fn warn_integer_assignment_truncation(column: &str) {
-    crate::engine::api::push_statement_warning(
+fn warn_integer_assignment_truncation(column: &str, value: &Value) {
+    push_assignment_warning_with_value(
         crate::error::ConditionLevel::Warning,
         crate::error::catalog::WARN_DATA_TRUNCATED,
         format!("Data truncated for column '{column}' at row 1"),
+        Some(AssignmentValue::Value(value)),
     );
 }
 
@@ -3031,10 +3192,14 @@ fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i6
         let rounded = number.round_ties_even();
         let integer = rounded as i128;
         if !rounded.is_finite() || integer > i128::from(max) {
-            return out_of_range_1264(if number.is_sign_negative() { min } else { max }, column);
+            return out_of_range_value(
+                if number.is_sign_negative() { min } else { max },
+                column,
+                Some(AssignmentValue::Value(&value)),
+            );
         }
         if integer < i128::from(min) {
-            return out_of_range_1264(min, column);
+            return out_of_range_value(min, column, Some(AssignmentValue::Value(&value)));
         }
         return Ok(integer as i64);
     }
@@ -3042,15 +3207,15 @@ fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i6
         use num_bigint::BigInt;
         use num_traits::ToPrimitive;
 
-        let (number, clean) = rounded_integer_assignment_text(&text, column)?;
+        let (number, clean) = rounded_integer_assignment_text(&text, column, &value)?;
         if number < BigInt::from(min) {
-            return out_of_range_1264(min, column);
+            return out_of_range_value(min, column, Some(AssignmentValue::Value(&value)));
         }
         if number > BigInt::from(max) {
-            return out_of_range_1264(max, column);
+            return out_of_range_value(max, column, Some(AssignmentValue::Value(&value)));
         }
         if !clean {
-            warn_integer_assignment_truncation(column);
+            warn_integer_assignment_truncation(column, &value);
         }
         return Ok(number
             .to_i64()
@@ -3068,10 +3233,10 @@ fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i6
             .expect("binary decimal variants are exact");
         let (rounded, _) = crate::util::decimal::rescale_exact(exact, 0, true).into_big_parts();
         if rounded < BigInt::from(min) {
-            return out_of_range_1264(min, column);
+            return out_of_range_value(min, column, Some(AssignmentValue::Value(&value)));
         }
         if rounded > BigInt::from(max) {
-            return out_of_range_1264(max, column);
+            return out_of_range_value(max, column, Some(AssignmentValue::Value(&value)));
         }
         return Ok(rounded
             .to_i64()
@@ -3079,9 +3244,20 @@ fn coerce_to_signed(value: Value, min: i64, max: i64, column: &str) -> Result<i6
     }
     if let Value::UInt(number) = value {
         return if number > max as u64 {
-            out_of_range_1264(max, column)
+            out_of_range_value(max, column, Some(AssignmentValue::Value(&value)))
         } else {
             Ok(number as i64)
+        };
+    }
+    if let Value::Int(number) = value {
+        return if number < min || number > max {
+            out_of_range_value(
+                number.clamp(min, max),
+                column,
+                Some(AssignmentValue::Value(&value)),
+            )
+        } else {
+            Ok(number)
         };
     }
     let number = to_i64(value)?;
@@ -3105,31 +3281,31 @@ fn coerce_to_unsigned(value: Value, max: u64, column: &str) -> Result<u64, Query
         let rounded = number.round_ties_even();
         let integer = rounded as i128;
         if rounded < 0.0 {
-            return out_of_range_1264(0, column);
+            return out_of_range_value(0, column, Some(AssignmentValue::Value(&value)));
         }
         if !rounded.is_finite() || integer > i128::from(max) {
-            return out_of_range_1264(max, column);
+            return out_of_range_value(max, column, Some(AssignmentValue::Value(&value)));
         }
         return Ok(integer as u64);
     }
     if matches!(&value, Value::Int(v) if *v < 0) {
-        return out_of_range_1264(0, column);
+        return out_of_range_value(0, column, Some(AssignmentValue::Value(&value)));
     }
     if let Some(text) = integer_assignment_text(&value) {
         use num_bigint::BigInt;
         use num_traits::{Signed, ToPrimitive};
 
-        let (number, clean) = rounded_integer_assignment_text(&text, column)?;
+        let (number, clean) = rounded_integer_assignment_text(&text, column, &value)?;
         if number.is_negative()
             || (matches!(value, Value::Decimal(_)) && negative_decimal_prefix(&text).0)
         {
-            return out_of_range_1264(0, column);
+            return out_of_range_value(0, column, Some(AssignmentValue::Value(&value)));
         }
         if number > BigInt::from(max) {
-            return out_of_range_1264(max, column);
+            return out_of_range_value(max, column, Some(AssignmentValue::Value(&value)));
         }
         if !clean {
-            warn_integer_assignment_truncation(column);
+            warn_integer_assignment_truncation(column, &value);
         }
         return Ok(number
             .to_u64()
@@ -3151,18 +3327,32 @@ fn coerce_to_unsigned(value: Value, max: u64, column: &str) -> Result<u64, Query
             crate::util::decimal::ExactDecimal::Big(magnitude, _) => magnitude.is_negative(),
         };
         if negative {
-            return out_of_range_1264(0, column);
+            return out_of_range_value(0, column, Some(AssignmentValue::Value(&value)));
         }
         let (rounded, _) = crate::util::decimal::rescale_exact(exact, 0, true).into_big_parts();
         if rounded.is_negative() {
-            return out_of_range_1264(0, column);
+            return out_of_range_value(0, column, Some(AssignmentValue::Value(&value)));
         }
         if rounded > BigInt::from(max) {
-            return out_of_range_1264(max, column);
+            return out_of_range_value(max, column, Some(AssignmentValue::Value(&value)));
         }
         return Ok(rounded
             .to_u64()
             .expect("unsigned integer assignment range was checked"));
+    }
+    if let Value::UInt(number) = value {
+        return if number > max {
+            out_of_range_value(max, column, Some(AssignmentValue::Value(&value)))
+        } else {
+            Ok(number)
+        };
+    }
+    if let Value::Int(number) = value {
+        return if number as u64 > max {
+            out_of_range_value(max, column, Some(AssignmentValue::Value(&value)))
+        } else {
+            Ok(number as u64)
+        };
     }
     let v = to_u64(value)?;
     check_uint_range(v, max, column)
@@ -3542,8 +3732,9 @@ fn coerce_value_with_unsigned(
                 other => value_to_coercion_string(&other)?.into_bytes(),
             };
             if bytes.len() as u64 > u64::from(*max_len) {
+                too_long_1406((), column, true, Some(AssignmentValue::Bytes(&bytes)))?;
                 bytes.truncate(*max_len as usize);
-                return too_long_1406(Value::Bytes(bytes), column, true);
+                return Ok(Value::Bytes(bytes));
             }
             Ok(Value::Bytes(bytes))
         }
@@ -3555,8 +3746,9 @@ fn coerce_value_with_unsigned(
             };
             let max_len = len.unwrap_or(1);
             if bytes.len() > max_len {
+                too_long_1406((), column, true, Some(AssignmentValue::Bytes(&bytes)))?;
                 bytes.truncate(max_len);
-                return too_long_1406(Value::Bytes(bytes), column, true);
+                return Ok(Value::Bytes(bytes));
             }
             bytes.resize(max_len, 0);
             Ok(Value::Bytes(bytes))
@@ -3569,8 +3761,9 @@ fn coerce_value_with_unsigned(
             };
             if let Some(max_len) = *len {
                 if bytes.len() > max_len {
+                    too_long_1406((), column, true, Some(AssignmentValue::Bytes(&bytes)))?;
                     bytes.truncate(max_len);
-                    return too_long_1406(Value::Bytes(bytes), column, true);
+                    return Ok(Value::Bytes(bytes));
                 }
             }
             Ok(Value::Bytes(bytes))
@@ -3594,7 +3787,12 @@ fn coerce_value_with_unsigned(
             text.truncate(trimmed_len);
             if text.len() > max_len && text.chars().count() > max_len {
                 let (truncated, warn) = truncate_chars(&text, max_len);
-                return too_long_1406(Value::String(truncated), column, warn);
+                return too_long_1406(
+                    Value::String(truncated),
+                    column,
+                    warn,
+                    Some(AssignmentValue::Text(&text)),
+                );
             }
             Ok(Value::String(text))
         }
@@ -3621,7 +3819,12 @@ fn coerce_value_with_unsigned(
                             column,
                         ));
                     }
-                    return too_long_1406(Value::String(truncated), column, warn);
+                    return too_long_1406(
+                        Value::String(truncated),
+                        column,
+                        warn,
+                        Some(AssignmentValue::Text(&text)),
+                    );
                 }
             }
             Ok(Value::String(text))
@@ -3953,9 +4156,9 @@ fn coerce_value_with_unsigned(
                 Value::String(text) | Value::Decimal(text) => {
                     use num_traits::ToPrimitive;
 
-                    let (number, clean) = rounded_integer_assignment_text(text, column)?;
+                    let (number, clean) = rounded_integer_assignment_text(text, column, &value)?;
                     if !clean {
-                        warn_integer_assignment_truncation(column);
+                        warn_integer_assignment_truncation(column, &value);
                     }
                     number.to_i64().unwrap_or_else(|| {
                         if number.sign() == num_bigint::Sign::Minus {
@@ -3969,9 +4172,9 @@ fn coerce_value_with_unsigned(
                     use num_traits::ToPrimitive;
 
                     let text = unsafe { std::str::from_utf8_unchecked(bytes) };
-                    let (number, clean) = rounded_integer_assignment_text(text, column)?;
+                    let (number, clean) = rounded_integer_assignment_text(text, column, &value)?;
                     if !clean {
-                        warn_integer_assignment_truncation(column);
+                        warn_integer_assignment_truncation(column, &value);
                     }
                     number.to_i64().unwrap_or_else(|| {
                         if number.sign() == num_bigint::Sign::Minus {
@@ -3985,9 +4188,9 @@ fn coerce_value_with_unsigned(
                     use num_traits::ToPrimitive;
 
                     let text = String::from_utf8_lossy(bytes);
-                    let (number, clean) = rounded_integer_assignment_text(&text, column)?;
+                    let (number, clean) = rounded_integer_assignment_text(&text, column, &value)?;
                     if !clean {
-                        warn_integer_assignment_truncation(column);
+                        warn_integer_assignment_truncation(column, &value);
                     }
                     number.to_i64().unwrap_or_else(|| {
                         if number.sign() == num_bigint::Sign::Minus {
@@ -4090,7 +4293,12 @@ fn coerce_value_with_unsigned(
             if s.len() as u64 > u64::from(*max_len) {
                 let truncated = truncate_bytes_on_char_boundary(&s, *max_len as usize);
                 let warn = s[truncated.len()..].chars().any(|c| c != ' ');
-                return too_long_1406(Value::String(truncated), column, warn);
+                return too_long_1406(
+                    Value::String(truncated),
+                    column,
+                    warn,
+                    Some(AssignmentValue::Text(&s)),
+                );
             }
             Ok(Value::String(s))
         }
@@ -4288,7 +4496,7 @@ fn coerce_floating_text_assignment(text: &str, column: &str) -> Result<f64, Quer
     }
     let parsed = crate::util::decimal::parse_lenient_f64(text);
     if !parsed.clean {
-        crate::engine::api::push_statement_warning(
+        push_assignment_warning(
             crate::error::ConditionLevel::Warning,
             crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
             format!("Incorrect double value for column '{column}' at row 1"),

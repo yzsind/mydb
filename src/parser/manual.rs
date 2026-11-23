@@ -3835,13 +3835,19 @@ pub(super) fn parse_manual_routine_statement(sql: &str) -> Result<Option<Stateme
         ));
     }
     if starts_with_keyword(trimmed, "CREATE") && looks_like_create_routine(trimmed) {
-        return parse_create_routine_statement(sql, trimmed).map(Some);
+        return parse_create_routine_statement(sql, trimmed)
+            .map(Some)
+            .map_err(|error| error.rebase_slice(sql, trimmed));
     }
     if starts_with_keyword(trimmed, "CREATE") && looks_like_create_trigger(trimmed) {
-        return parse_create_trigger_statement(sql, trimmed).map(Some);
+        return parse_create_trigger_statement(sql, trimmed)
+            .map(Some)
+            .map_err(|error| error.rebase_slice(sql, trimmed));
     }
     if starts_with_keyword(trimmed, "CREATE") && looks_like_create_event(trimmed) {
-        return parse_create_event_statement(sql, trimmed).map(Some);
+        return parse_create_event_statement(sql, trimmed)
+            .map(Some)
+            .map_err(|error| error.rebase_slice(sql, trimmed));
     }
     if starts_with_keyword(trimmed, "ALTER") {
         if let Some(statement) = parse_alter_event_statement(sql, trimmed)? {
@@ -4048,7 +4054,8 @@ fn parse_create_routine_statement(_original_sql: &str, sql: &str) -> Result<Stat
         idx = body_or_char_pos;
     }
     let (characteristics, body_sql) = parse_routine_characteristics_and_body(sql, idx)?;
-    let body = parse_routine_body_sql(body_sql)?;
+    let body =
+        parse_routine_body_sql(body_sql).map_err(|error| error.rebase_slice(sql, body_sql))?;
     Ok(Statement::CreateRoutine(RoutineDef {
         kind,
         name,
@@ -4135,7 +4142,8 @@ fn parse_create_trigger_statement(original_sql: &str, sql: &str) -> Result<State
         None
     };
     let body_sql = sql[idx..].trim();
-    let body = parse_routine_body_sql(body_sql)?;
+    let body =
+        parse_routine_body_sql(body_sql).map_err(|error| error.rebase_slice(sql, body_sql))?;
     Ok(Statement::CreateTrigger(TriggerDef {
         name,
         definer,
@@ -4480,7 +4488,7 @@ fn parse_create_event_statement(original_sql: &str, sql: &str) -> Result<Stateme
     }
     // Validate the body so we surface syntax errors at DDL time.  The
     // executor re-parses it per fire.
-    let _ = parse_routine_body_sql(body_sql)?;
+    let _ = parse_routine_body_sql(body_sql).map_err(|error| error.rebase_slice(sql, body_sql))?;
     Ok(Statement::CreateEvent(EventDef {
         name,
         definer,
@@ -4835,7 +4843,7 @@ pub fn parse_routine_body_sql(sql: &str) -> Result<RoutineBody, ParseError> {
     if trimmed.is_empty() {
         return Err(parse_error_at_zero("routine body is empty"));
     }
-    let stmt = parse_routine_stmt(trimmed)?;
+    let stmt = parse_routine_stmt(trimmed).map_err(|error| error.rebase_slice(sql, trimmed))?;
     let statements = match stmt {
         RoutineStmt::Block {
             label: None,
@@ -5013,6 +5021,7 @@ fn parse_routine_stmt(sql: &str) -> Result<RoutineStmt, ParseError> {
 
 #[inline(never)]
 fn parse_routine_stmt_inner(sql: &str) -> Result<RoutineStmt, ParseError> {
+    let original = sql;
     let sql = trim_sql_statement(sql);
     // Statement splitting deliberately returns slices of the original SQL so
     // SHOW CREATE can retain comments.  Classification, however, must begin at
@@ -5030,6 +5039,10 @@ fn parse_routine_stmt_inner(sql: &str) -> Result<RoutineStmt, ParseError> {
             "a nonempty label may only introduce BEGIN, LOOP, WHILE or REPEAT",
         ));
     }
+    parse_routine_stmt_body(body, label).map_err(|error| error.rebase_slice(original, body))
+}
+
+fn parse_routine_stmt_body(body: &str, label: Option<String>) -> Result<RoutineStmt, ParseError> {
     if starts_with_keyword(body, "BEGIN") {
         let inner = strip_compound_tail(
             consume_keyword_at(body, 0, "BEGIN").unwrap_or(0),
@@ -5039,7 +5052,7 @@ fn parse_routine_stmt_inner(sql: &str) -> Result<RoutineStmt, ParseError> {
         )?;
         return Ok(RoutineStmt::Block {
             label,
-            statements: parse_routine_stmt_list(inner)?,
+            statements: parse_routine_stmt_list(body, inner)?,
         });
     }
     if starts_with_keyword(body, "DECLARE") {
@@ -5084,7 +5097,7 @@ fn parse_routine_stmt_inner(sql: &str) -> Result<RoutineStmt, ParseError> {
         )?;
         return Ok(RoutineStmt::Loop {
             label,
-            statements: parse_routine_stmt_list(inner)?,
+            statements: parse_routine_stmt_list(body, inner)?,
         });
     }
     if starts_with_keyword(body, "WHILE") {
@@ -5104,7 +5117,8 @@ fn parse_routine_stmt_inner(sql: &str) -> Result<RoutineStmt, ParseError> {
         )?));
     }
     if let Some(next) = consume_keyword_at(body, 0, "RETURN") {
-        return Ok(RoutineStmt::Return(parse_expr_fragment(
+        return Ok(RoutineStmt::Return(parse_routine_expr(
+            body,
             body[next..].trim(),
         )?));
     }
@@ -5241,12 +5255,19 @@ pub(super) fn parse_routine_get_diagnostics(sql: &str) -> Result<RoutineStmt, Pa
     }
 }
 
-fn parse_routine_stmt_list(sql: &str) -> Result<Vec<RoutineStmt>, ParseError> {
+fn parse_routine_stmt_list(source: &str, sql: &str) -> Result<Vec<RoutineStmt>, ParseError> {
     split_routine_statements(sql)
         .into_iter()
         .filter(|part| !sql_is_effectively_empty(part))
-        .map(|part| parse_routine_stmt(part.trim()))
+        .map(|part| {
+            let part = part.trim();
+            parse_routine_stmt(part).map_err(|error| error.rebase_slice(source, part))
+        })
         .collect()
+}
+
+fn parse_routine_expr(source: &str, sql: &str) -> Result<Expr, ParseError> {
+    parse_expr_fragment(sql).map_err(|error| error.rebase_slice(source, sql))
 }
 
 fn parse_routine_declare(sql: &str) -> Result<RoutineStmt, ParseError> {
@@ -5419,7 +5440,7 @@ fn parse_routine_if(sql: &str) -> Result<RoutineStmt, ParseError> {
     let body = strip_compound_tail(body_start, sql, "END IF", None)?;
     let then_pos = routine_expression_keyword_pos(body, "THEN")
         .ok_or_else(|| parse_error_at_zero("IF statement requires THEN"))?;
-    let first_cond = parse_expr_fragment(body[..then_pos].trim())?;
+    let first_cond = parse_routine_expr(sql, body[..then_pos].trim())?;
     let mut branches = Vec::new();
     let mut remainder = body[then_pos + "THEN".len()..].trim();
     loop {
@@ -5429,21 +5450,21 @@ fn parse_routine_if(sql: &str) -> Result<RoutineStmt, ParseError> {
             None => (remainder, None, remainder.len()),
         };
         if branches.is_empty() {
-            branches.push((first_cond.clone(), parse_routine_stmt_list(stmts_sql)?));
+            branches.push((first_cond.clone(), parse_routine_stmt_list(sql, stmts_sql)?));
         }
         match marker_kind {
             Some("ELSEIF") => {
                 let tail = remainder[after_marker..].trim();
                 let then_pos = routine_expression_keyword_pos(tail, "THEN")
                     .ok_or_else(|| parse_error_at_zero("ELSEIF requires THEN"))?;
-                let cond = parse_expr_fragment(tail[..then_pos].trim())?;
+                let cond = parse_routine_expr(sql, tail[..then_pos].trim())?;
                 let after_then = then_pos + "THEN".len();
                 let next_remainder = tail[after_then..].trim();
                 let next_marker = find_if_marker(next_remainder);
                 let branch_sql = next_marker
                     .map(|(pos, _, _)| &next_remainder[..pos])
                     .unwrap_or(next_remainder);
-                branches.push((cond, parse_routine_stmt_list(branch_sql)?));
+                branches.push((cond, parse_routine_stmt_list(sql, branch_sql)?));
                 if let Some((pos, _, _)) = next_marker {
                     remainder = next_remainder[pos..].trim();
                     continue;
@@ -5454,7 +5475,7 @@ fn parse_routine_if(sql: &str) -> Result<RoutineStmt, ParseError> {
                 });
             }
             Some("ELSE") => {
-                let else_branch = parse_routine_stmt_list(remainder[after_marker..].trim())?;
+                let else_branch = parse_routine_stmt_list(sql, remainder[after_marker..].trim())?;
                 return Ok(RoutineStmt::If {
                     branches,
                     else_branch,
@@ -5480,7 +5501,7 @@ fn parse_routine_case(sql: &str) -> Result<RoutineStmt, ParseError> {
     let operand = if operand_sql.is_empty() {
         None
     } else {
-        Some(parse_expr_fragment(operand_sql)?)
+        Some(parse_routine_expr(sql, operand_sql)?)
     };
     let mut branches = Vec::new();
     let mut else_branch = Vec::new();
@@ -5489,19 +5510,19 @@ fn parse_routine_case(sql: &str) -> Result<RoutineStmt, ParseError> {
         let after_when = consume_keyword_at(rest, 0, "WHEN").unwrap();
         let then_pos = routine_expression_keyword_pos(rest, "THEN")
             .ok_or_else(|| parse_error_at_zero("CASE WHEN requires THEN"))?;
-        let cond = parse_expr_fragment(rest[after_when..then_pos].trim())?;
+        let cond = parse_routine_expr(sql, rest[after_when..then_pos].trim())?;
         let after_then = then_pos + "THEN".len();
         let marker = find_case_marker(&rest[after_then..]);
         let (stmts_sql, next_offset) = match marker {
             Some((pos, _, _)) => (&rest[after_then..after_then + pos], after_then + pos),
             None => (&rest[after_then..], rest.len()),
         };
-        branches.push((cond, parse_routine_stmt_list(stmts_sql)?));
+        branches.push((cond, parse_routine_stmt_list(sql, stmts_sql)?));
         rest = rest[next_offset..].trim();
     }
     if starts_with_keyword(rest, "ELSE") {
         let after_else = consume_keyword_at(rest, 0, "ELSE").unwrap();
-        else_branch = parse_routine_stmt_list(rest[after_else..].trim())?;
+        else_branch = parse_routine_stmt_list(sql, rest[after_else..].trim())?;
     }
     Ok(RoutineStmt::Case {
         operand,
@@ -5517,8 +5538,8 @@ fn parse_routine_while(label: Option<String>, sql: &str) -> Result<RoutineStmt, 
         .ok_or_else(|| parse_error_at_zero("WHILE statement requires DO"))?;
     Ok(RoutineStmt::While {
         label,
-        condition: parse_expr_fragment(inner[..do_pos].trim())?,
-        statements: parse_routine_stmt_list(inner[do_pos + "DO".len()..].trim())?,
+        condition: parse_routine_expr(sql, inner[..do_pos].trim())?,
+        statements: parse_routine_stmt_list(sql, inner[do_pos + "DO".len()..].trim())?,
     })
 }
 
@@ -5529,8 +5550,8 @@ fn parse_routine_repeat(label: Option<String>, sql: &str) -> Result<RoutineStmt,
         .ok_or_else(|| parse_error_at_zero("REPEAT statement requires UNTIL"))?;
     Ok(RoutineStmt::Repeat {
         label,
-        statements: parse_routine_stmt_list(inner[..until_pos].trim())?,
-        until: parse_expr_fragment(inner[until_pos + "UNTIL".len()..].trim())?,
+        statements: parse_routine_stmt_list(sql, inner[..until_pos].trim())?,
+        until: parse_routine_expr(sql, inner[until_pos + "UNTIL".len()..].trim())?,
     })
 }
 

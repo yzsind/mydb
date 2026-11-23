@@ -2779,6 +2779,7 @@ pub(super) fn parse_error_from_sql_span<T>(
         line,
         column,
         expected,
+        location_known: byte_span.is_some(),
     })
 }
 
@@ -2796,6 +2797,7 @@ pub(super) fn parse_error_at_span(
         line,
         column,
         expected: Vec::new(),
+        location_known: byte_span.is_some(),
     }
 }
 
@@ -2814,6 +2816,7 @@ pub(super) fn parse_error_with_spec_at_zero(
         line: 1,
         column: 1,
         expected: Vec::new(),
+        location_known: false,
     }
 }
 

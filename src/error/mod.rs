@@ -245,6 +245,183 @@ pub(crate) enum InternalErrorKind {
     ShutdownRecoveryRequired,
 }
 
+/// A span in the original SQL supplied by the client.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct SqlPosition {
+    pub line: usize,
+    pub column: usize,
+    pub byte_start: usize,
+    pub byte_end: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct ConditionDetails {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position: Option<SqlPosition>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub expected: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub schema: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub table: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub column: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clause: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub index: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub constraint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub row_number: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value_truncated: Option<bool>,
+}
+
+impl ConditionDetails {
+    fn information_item(&self, name: &str) -> Option<&str> {
+        match name {
+            "SCHEMA_NAME" => self.schema.as_deref(),
+            "TABLE_NAME" => self.table.as_deref(),
+            "COLUMN_NAME" => self.column.as_deref(),
+            "CONSTRAINT_NAME" => self.constraint.as_deref(),
+            "CONSTRAINT_SCHEMA" if self.constraint.is_some() => self.schema.as_deref(),
+            _ => None,
+        }
+    }
+}
+
+/// Optional SQL condition data. Keeping it behind one pointer avoids
+/// growing the error arm of results on storage and execution hot paths.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConditionMetadata {
+    details: Option<ConditionDetails>,
+    information: std::collections::BTreeMap<&'static str, String>,
+}
+
+impl ConditionMetadata {
+    pub(crate) fn details(&self) -> Option<&ConditionDetails> {
+        self.details.as_ref()
+    }
+}
+
+/// Source ordinals for INSERT/REPLACE. A fragment may carry the starting
+/// ordinal of a contiguous range, or no ordinal when the order is unknown.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct InputRows {
+    first: Option<u64>,
+    pub direct_values: bool,
+}
+
+thread_local! {
+    static INPUT_ROWS: std::cell::Cell<InputRows> = const {
+        std::cell::Cell::new(InputRows { first: None, direct_values: false })
+    };
+}
+
+pub(crate) struct InputRowsGuard(InputRows, std::marker::PhantomData<std::rc::Rc<()>>);
+
+impl InputRows {
+    pub(crate) fn new(first: u64, direct_values: bool) -> Self {
+        Self {
+            first: Some(first),
+            direct_values,
+        }
+    }
+
+    pub(crate) fn current() -> Self {
+        INPUT_ROWS.get()
+    }
+
+    pub(crate) fn enter(self) -> InputRowsGuard {
+        InputRowsGuard(INPUT_ROWS.replace(self), std::marker::PhantomData)
+    }
+
+    pub(crate) fn row(self, offset: usize) -> Option<u64> {
+        self.first.map(|first| first + offset as u64)
+    }
+
+    pub(crate) fn offset(self, offset: usize) -> Self {
+        Self {
+            first: self.row(offset),
+            ..self
+        }
+    }
+
+    pub(crate) fn annotate(self, offset: usize, error: QueryError) -> QueryError {
+        match self.row(offset) {
+            Some(row) => error.with_input_row(row),
+            None => error,
+        }
+    }
+}
+
+impl Drop for InputRowsGuard {
+    fn drop(&mut self) {
+        INPUT_ROWS.set(self.0);
+    }
+}
+
+thread_local! {
+    static INPUT_PREVIEW_COLUMNS: std::cell::RefCell<Option<Vec<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) struct InputPreviewColumns(Option<Vec<usize>>, std::marker::PhantomData<std::rc::Rc<()>>);
+
+impl InputPreviewColumns {
+    /// Take ownership of the INSERT projection after the row has been
+    /// expanded. The existing column indexes stay available on failure.
+    pub(crate) fn enter(columns: Option<Vec<usize>>) -> Self {
+        Self(INPUT_PREVIEW_COLUMNS.replace(columns), std::marker::PhantomData)
+    }
+
+    pub(crate) fn includes(index: usize) -> bool {
+        INPUT_PREVIEW_COLUMNS.with(|columns| {
+            columns.borrow().as_ref().is_none_or(|columns| columns.contains(&index))
+        })
+    }
+}
+
+impl Drop for InputPreviewColumns {
+    fn drop(&mut self) {
+        INPUT_PREVIEW_COLUMNS.replace(self.0.take());
+    }
+}
+
+const MAX_VALUE_PREVIEW_BYTES: usize = 128;
+
+fn text_preview(value: &str) -> (String, bool) {
+    let mut preview = String::new();
+    for ch in value.chars() {
+        if ch.is_control() {
+            let escaped = ch.escape_default();
+            if preview.len() + escaped.len() > MAX_VALUE_PREVIEW_BYTES {
+                return (preview, true);
+            }
+            preview.extend(escaped);
+        } else {
+            if preview.len() + ch.len_utf8() > MAX_VALUE_PREVIEW_BYTES {
+                return (preview, true);
+            }
+            preview.push(ch);
+        }
+    }
+    (preview, false)
+}
+
+fn binary_preview(value: &[u8]) -> (String, bool) {
+    use std::fmt::Write;
+    let limit = (MAX_VALUE_PREVIEW_BYTES - 2) / 2;
+    let mut preview = String::from("0x");
+    for byte in value.iter().take(limit) {
+        write!(preview, "{byte:02X}").expect("writing to String");
+    }
+    (preview, value.len() > limit)
+}
+
 /// Error returned through the query engine and MySQL protocol.
 ///
 /// Fields are private: callers can only inspect a condition through the
@@ -259,7 +436,7 @@ pub struct QueryError {
     diagnostic: Option<InternalDiagnostic>,
     followup_errors: Option<std::sync::Arc<Vec<QueryError>>>,
     internal_kind: Option<InternalErrorKind>,
-    condition_information: Option<std::sync::Arc<std::collections::BTreeMap<&'static str, String>>>,
+    metadata: Option<std::sync::Arc<ConditionMetadata>>,
 }
 
 impl QueryError {
@@ -272,7 +449,7 @@ impl QueryError {
             diagnostic: None,
             followup_errors: None,
             internal_kind: None,
-            condition_information: None,
+            metadata: None,
         }
     }
 
@@ -296,7 +473,7 @@ impl QueryError {
             diagnostic: None,
             followup_errors: None,
             internal_kind: None,
-            condition_information: None,
+            metadata: None,
         })
     }
 
@@ -304,16 +481,187 @@ impl QueryError {
         mut self,
         information: std::collections::BTreeMap<&'static str, String>,
     ) -> Self {
-        self.condition_information =
-            (!information.is_empty()).then(|| std::sync::Arc::new(information));
+        if information.is_empty() && self.details().is_none() {
+            self.metadata = None;
+        } else {
+            std::sync::Arc::make_mut(self.metadata.get_or_insert_with(Default::default))
+                .information = information;
+        }
         self
     }
 
     pub(crate) fn condition_information(&self) -> std::collections::BTreeMap<&'static str, String> {
-        self.condition_information
-            .as_deref()
-            .cloned()
+        self.metadata
+            .as_ref()
+            .map(|metadata| metadata.information.clone())
             .unwrap_or_default()
+    }
+
+    pub(crate) fn details(&self) -> Option<&ConditionDetails> {
+        self.metadata
+            .as_deref()
+            .and_then(ConditionMetadata::details)
+    }
+
+    pub(crate) fn shared_metadata(&self) -> Option<std::sync::Arc<ConditionMetadata>> {
+        self.metadata.clone()
+    }
+
+    pub(crate) fn with_shared_metadata(
+        mut self,
+        metadata: Option<std::sync::Arc<ConditionMetadata>>,
+    ) -> Self {
+        self.metadata = metadata;
+        self
+    }
+
+    pub(crate) fn with_details(mut self, update: impl FnOnce(&mut ConditionDetails)) -> Self {
+        let metadata = std::sync::Arc::make_mut(self.metadata.get_or_insert_with(Default::default));
+        update(metadata.details.get_or_insert_with(Default::default));
+        self
+    }
+
+    pub(crate) fn with_table(self, schema: &str, table: &str) -> Self {
+        self.with_details(|details| {
+            if !schema.is_empty() {
+                details.schema.get_or_insert_with(|| schema.to_owned());
+            }
+            details.table.get_or_insert_with(|| table.to_owned());
+        })
+    }
+
+    pub(crate) fn describe_target(mut self) -> Self {
+        use std::fmt::Write;
+        if let Some(details) = self
+            .metadata
+            .as_deref()
+            .and_then(ConditionMetadata::details)
+        {
+            if let Some(table) = &details.table {
+                self.message.push_str(" (table '");
+                if let Some(schema) = &details.schema {
+                    write!(self.message, "{schema}.").expect("writing to String");
+                }
+                write!(self.message, "{table}')").expect("writing to String");
+            }
+        }
+        self
+    }
+
+    pub(crate) fn describe_value(mut self) -> Self {
+        use std::fmt::Write;
+        if let Some(details) = self
+            .metadata
+            .as_deref()
+            .and_then(ConditionMetadata::details)
+        {
+            if let Some(value) = &details.value_preview {
+                let suffix = if details.value_truncated == Some(true) {
+                    "…"
+                } else {
+                    ""
+                };
+                write!(self.message, " (value {value:?}{suffix})").expect("writing to String");
+            }
+        }
+        self
+    }
+
+    pub(crate) fn with_column(self, column: &str) -> Self {
+        self.with_details(|details| {
+            details.column.get_or_insert_with(|| column.to_owned());
+        })
+    }
+
+    pub(crate) fn with_input_row(mut self, row: u64) -> Self {
+        if self
+            .details()
+            .is_some_and(|details| details.row_number.is_some())
+        {
+            return self;
+        }
+        if let Some(base) = self.message.strip_suffix(" at row 1") {
+            self.message.truncate(base.len());
+        }
+        use std::fmt::Write;
+        write!(self.message, " at row {row}").expect("writing to String");
+        self.with_details(|details| details.row_number = Some(row))
+    }
+
+    pub(crate) fn with_value_preview(self, value: &crate::types::Value) -> Self {
+        use crate::types::Value;
+        let preview = match value {
+            Value::String(text) | Value::Decimal(text) => text_preview(text),
+            Value::SmallString(_) => {
+                text_preview(crate::types::value_str(value).unwrap_or_default())
+            }
+            Value::Bytes(bytes) | Value::Json(bytes) | Value::Geometry(bytes) => {
+                binary_preview(bytes)
+            }
+            Value::Vector(vector) => binary_preview(&vector.payload),
+            value => text_preview(&value.to_display_string()),
+        };
+        self.with_preview(preview)
+    }
+
+    pub(crate) fn with_text_preview(self, value: &str) -> Self {
+        self.with_preview(text_preview(value))
+    }
+
+    pub(crate) fn with_field_preview(self, value: &[u8], binary: bool) -> Self {
+        let preview = match std::str::from_utf8(value) {
+            Ok(text) if !binary => text_preview(text),
+            _ => binary_preview(value),
+        };
+        self.with_preview(preview)
+    }
+
+    fn with_preview(self, (preview, truncated): (String, bool)) -> Self {
+        self.with_details(|details| {
+            details.value_preview = Some(preview);
+            details.value_truncated = Some(truncated);
+        })
+    }
+
+    /// Translate a syntax position in a statement suffix to the full request.
+    pub(crate) fn rebase_sql_position(mut self, source: &str, byte_offset: usize) -> Self {
+        let Some(position) = self.details().and_then(|details| details.position) else {
+            return self;
+        };
+        let byte_start = byte_offset + position.byte_start;
+        let byte_end = byte_offset + position.byte_end;
+        let Some(prefix) = source.get(..byte_start) else {
+            return self;
+        };
+        if !source.is_char_boundary(byte_end) {
+            return self;
+        }
+        let line = prefix.bytes().filter(|&byte| byte == b'\n').count() + 1;
+        let column = prefix
+            .rsplit('\n')
+            .next()
+            .unwrap_or_default()
+            .chars()
+            .count()
+            + 1;
+        if byte_offset == 0 && line == position.line && column == position.column {
+            return self;
+        }
+        let location = format!(" at line {}, column {}", position.line, position.column);
+        if let Some(index) = self.message.rfind(&location) {
+            self.message.replace_range(
+                index..index + location.len(),
+                &format!(" at line {line}, column {column}"),
+            );
+        }
+        self.with_details(|details| {
+            details.position = Some(SqlPosition {
+                line,
+                column,
+                byte_start,
+                byte_end,
+            });
+        })
     }
 
     /// Additional server conditions reported after the primary failure.
@@ -443,7 +791,7 @@ pub struct SqlCondition {
     sql_state: SqlState,
     symbol: Option<&'static str>,
     message: std::borrow::Cow<'static, str>,
-    condition_information: Option<std::sync::Arc<std::collections::BTreeMap<&'static str, String>>>,
+    metadata: Option<std::sync::Arc<ConditionMetadata>>,
 }
 
 impl SqlCondition {
@@ -454,7 +802,7 @@ impl SqlCondition {
             sql_state: spec.sql_state,
             symbol: Some(spec.symbol),
             message: std::borrow::Cow::Owned(message.into()),
-            condition_information: None,
+            metadata: None,
         }
     }
 
@@ -467,7 +815,7 @@ impl SqlCondition {
             sql_state: spec.sql_state,
             symbol: Some(spec.symbol),
             message: std::borrow::Cow::Borrowed(message),
-            condition_information: None,
+            metadata: None,
         }
     }
 
@@ -479,28 +827,33 @@ impl SqlCondition {
             symbol: error.symbol(),
             message: std::borrow::Cow::Owned(
                 error
-                    .condition_information
+                    .metadata
                     .as_ref()
-                    .and_then(|items| items.get("MESSAGE_TEXT"))
+                    .and_then(|metadata| metadata.information.get("MESSAGE_TEXT"))
                     .cloned()
                     .unwrap_or_else(|| error.message().to_string()),
             ),
-            condition_information: error.condition_information.clone(),
+            metadata: error.metadata.clone(),
         }
     }
 
-    pub(crate) fn condition_information(&self) -> std::collections::BTreeMap<&'static str, String> {
-        self.condition_information
-            .as_deref()
-            .cloned()
-            .unwrap_or_default()
-    }
-
     pub(crate) fn information_item(&self, name: &str) -> Option<&str> {
-        self.condition_information
-            .as_ref()?
+        let metadata = self.metadata.as_deref()?;
+        metadata
+            .information
             .get(name)
             .map(String::as_str)
+            .or_else(|| metadata.details()?.information_item(name))
+    }
+
+    pub(crate) fn details(&self) -> Option<&ConditionDetails> {
+        self.metadata
+            .as_deref()
+            .and_then(ConditionMetadata::details)
+    }
+
+    pub(crate) fn shared_metadata(&self) -> Option<std::sync::Arc<ConditionMetadata>> {
+        self.metadata.clone()
     }
 
     pub const fn level(&self) -> ConditionLevel {
@@ -549,6 +902,40 @@ mod tests {
         let retained = SqlCondition::known(ConditionLevel::Warning, spec, dynamic.as_str());
         drop(dynamic);
         assert_eq!(retained.message(), "dynamic diagnostic");
+    }
+
+    #[test]
+    fn shared_condition_metadata_preserves_details_when_information_changes() {
+        let original = catalog::ER_BAD_NULL_ERROR
+            .error("cannot be null")
+            .with_table("test", "orders")
+            .with_column("customer_id");
+        let resignaled = QueryError::user_defined(1644, "45000", "raised by handler")
+            .unwrap()
+            .with_shared_metadata(original.shared_metadata())
+            .with_condition_information(std::collections::BTreeMap::from([(
+                "TABLE_NAME",
+                "reported_orders".to_owned(),
+            )]));
+        let condition = SqlCondition::from_error(ConditionLevel::Error, &resignaled);
+
+        assert_eq!(condition.details(), original.details());
+        assert_eq!(
+            condition.information_item("TABLE_NAME"),
+            Some("reported_orders")
+        );
+        assert_eq!(
+            condition.information_item("COLUMN_NAME"),
+            Some("customer_id")
+        );
+        assert!(original.condition_information().is_empty());
+
+        let signal = QueryError::user_defined(1644, "45000", "signal")
+            .unwrap()
+            .with_condition_information(resignaled.condition_information());
+        let signal = SqlCondition::from_error(ConditionLevel::Error, &signal);
+        assert!(signal.details().is_none());
+        assert_eq!(signal.information_item("TABLE_NAME"), Some("reported_orders"));
     }
 
     #[test]

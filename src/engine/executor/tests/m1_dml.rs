@@ -205,3 +205,84 @@ fn rollback_after_insert_with_lob_reclaims_chains() {
         assert_eq!(stored, vec![vec![Value::Int(0)]]);
     });
 }
+
+#[test]
+fn sql_diagnostics_identify_input_rows_and_retain_warning_count() {
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    let run = |s: &mut SessionContext, sql| engine.execute_with_session(s, sql);
+    run(&mut session, "CREATE TABLE diagnostic_t (id INT PRIMARY KEY, v TINYINT NOT NULL, CONSTRAINT positive CHECK (v > 0))").unwrap();
+    let error = run(
+        &mut session,
+        "INSERT INTO diagnostic_t VALUES (1, 3), (2, 999)",
+    )
+    .unwrap_err();
+    assert_eq!((error.code(), error.sql_state().as_str()), (1264, "22003"));
+    assert!(error.message().contains("column 'v' at row 2"));
+    let details = error.details().unwrap();
+    assert_eq!(details.schema.as_deref(), Some("test"));
+    assert_eq!(details.table.as_deref(), Some("diagnostic_t"));
+    assert_eq!(details.column.as_deref(), Some("v"));
+    assert_eq!(details.row_number, Some(2));
+    assert_eq!(details.value_preview.as_deref(), Some("999"));
+
+    run(
+        &mut session,
+        "GET DIAGNOSTICS CONDITION 1 @db=SCHEMA_NAME, @t=TABLE_NAME, @c=COLUMN_NAME",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(run(&mut session, "SELECT @db, @t, @c").unwrap())[0]
+            .iter()
+            .map(Value::to_display_string)
+            .collect::<Vec<_>>(),
+        ["test", "diagnostic_t", "v"]
+    );
+
+    run(&mut session, "SET max_error_count = 2").unwrap();
+    run(
+        &mut session,
+        "INSERT IGNORE INTO diagnostic_t VALUES (1, 1), (2, 999), (3, 998), (4, 997)",
+    )
+    .unwrap();
+    assert_eq!(session.warning_count(), 3);
+    assert_eq!(session.warnings.len(), 2);
+    for (ordinal, warning) in session.warnings.iter().enumerate() {
+        assert_eq!(warning.code(), 1264);
+        assert_eq!(
+            warning.details().unwrap().row_number,
+            Some(ordinal as u64 + 2)
+        );
+    }
+
+    let error = run(
+        &mut session,
+        "INSERT INTO diagnostic_t VALUES (5, 1), (6, 0)",
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), 3819);
+    let details = error.details().unwrap();
+    assert_eq!(details.constraint.as_deref(), Some("positive"));
+    assert_eq!(details.row_number, Some(2));
+
+    run(
+        &mut session,
+        "CREATE TABLE diagnostic_partial (id INT AUTO_INCREMENT PRIMARY KEY, v TINYINT)",
+    )
+    .unwrap();
+    let error = run(
+        &mut session,
+        "INSERT INTO diagnostic_partial (v) VALUES (999)",
+    )
+    .unwrap_err();
+    assert_eq!(error.details().unwrap().value_preview.as_deref(), Some("999"));
+
+    let error = run(
+        &mut session,
+        "UPDATE diagnostic_t SET v = v + 900 WHERE id = 1",
+    )
+    .unwrap_err();
+    assert_eq!(error.code(), 1264);
+    assert_eq!(error.details().unwrap().value_preview, None);
+}

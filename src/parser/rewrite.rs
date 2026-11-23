@@ -1928,6 +1928,7 @@ pub(super) fn validate_enum_set_member_lengths(sql: &str) -> Result<(), ParseErr
                             line: 1,
                             column: 1,
                             expected: Vec::new(),
+                            location_known: true,
                         });
                     }
                     index = end;
@@ -3802,6 +3803,7 @@ pub(super) fn rewrite_legacy_text_lengths(
                         line: 1,
                         column: number_start + 1,
                         expected: Vec::new(),
+                        location_known: true,
                     });
                 }
                 if !is_text {
@@ -3911,6 +3913,7 @@ pub(super) fn validate_cast_type_widths(sql: &str) -> Result<(), ParseError> {
             line,
             column,
             expected: Vec::new(),
+            location_known: true,
         }
     }
 

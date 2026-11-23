@@ -72,7 +72,7 @@ impl AdminCommand {
         })?;
         if command == Self::Profile {
             crate::parser::validate_show_profile(sql)
-                .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.message))?;
+                .map_err(crate::parser::ParseError::into_query_error)?;
         }
         Ok(command)
     }

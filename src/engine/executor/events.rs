@@ -791,7 +791,7 @@ fn validate_event_body(body_sql: &str) -> Result<(), QueryError> {
 }
 
 fn parse_err(err: crate::parser::ParseError) -> QueryError {
-    err.spec.error(format!("{err}"))
+    err.into_query_error()
 }
 
 fn finalize_completed_event(inner: &Arc<EventSchedulerInner>, event: &EventSchema) {

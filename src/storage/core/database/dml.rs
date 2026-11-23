@@ -276,12 +276,9 @@ impl Database {
         table_name: &str,
         values: Vec<Value>,
     ) -> Result<RowId, QueryError> {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         let row_id = self.insert_row_in_table(txn, &table, values)?;
         Ok(row_id)
     }
@@ -791,12 +788,9 @@ impl Database {
         table_name: &str,
         rows: Vec<Vec<Value>>,
     ) -> Result<PreparedInsertBatch, QueryError> {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
 
@@ -805,8 +799,9 @@ impl Database {
             .iter()
             .any(|column| column.generated_expr.is_some());
         let mut prepared_rows = Vec::with_capacity(rows.len());
-        for mut values in rows {
-            coerce_row(&table, &mut values)?;
+        let input = crate::error::InputRows::current();
+        for (ordinal, mut values) in rows.into_iter().enumerate() {
+            coerce_row_at(&table, &mut values, input.offset(ordinal))?;
             if has_generated_columns {
                 materialize_generated_columns(&table, &mut values, None)?;
             }
@@ -874,12 +869,9 @@ impl Database {
         rows: Vec<Vec<Value>>,
         hints: InsertHints,
     ) -> Result<InsertRowsResult, QueryError> {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         if table.is_partitioned() {
@@ -952,9 +944,10 @@ impl Database {
                 } else {
                     Vec::new()
                 };
-            for values in &mut rows {
+            let input = crate::error::InputRows::current();
+            for (ordinal, values) in rows.iter_mut().enumerate() {
                 if !hints.rows_prepared {
-                    coerce_row(&table, values)?;
+                    coerce_row_at(&table, values, input.offset(ordinal))?;
                     if has_generated_columns {
                         materialize_generated_columns(&table, values, None)?;
                     }
@@ -968,10 +961,13 @@ impl Database {
                             continue;
                         }
                         if !batch_unique_keys_vec[slot].insert(key) {
-                            return Err(duplicate_entry_error(
+                            let error = duplicate_entry_error(
                                 &table,
                                 index,
-                                &table.index_key(index, &values)?,
+                                &table.index_key(index, values)?,
+                            );
+                            return Err(annotate_unique_error(
+                                &table, index, values, input, ordinal, error,
                             ));
                         }
                     }
@@ -1059,7 +1055,17 @@ impl Database {
                             // our locks were acquired. Recheck every generated
                             // row unless the whole batch is beyond the index.
                             if prepared_rows.len() == 1 {
-                                self.check_unique_constraint(&table, txn, None, index, key)?;
+                                self.check_unique_constraint(&table, txn, None, index, key)
+                                    .map_err(|error| {
+                                        annotate_unique_error(
+                                            &table,
+                                            index,
+                                            &prepared_rows[0],
+                                            input,
+                                            0,
+                                            error,
+                                        )
+                                    })?;
                             } else {
                                 for (row, values) in prepared_rows.iter().enumerate() {
                                     self.check_unique_constraint(
@@ -1259,8 +1265,9 @@ impl Database {
                 values: Vec<Value>,
             }
             let mut prepared: Vec<Prepared> = Vec::with_capacity(rows.len());
+            let input = crate::error::InputRows::current();
             for (orig_idx, mut values) in rows.into_iter().enumerate() {
-                coerce_row(table, &mut values)?;
+                coerce_row_at(table, &mut values, input.offset(orig_idx))?;
                 materialize_generated_columns(table, &mut values, None)?;
                 for index in table
                     .indexes
@@ -1278,10 +1285,9 @@ impl Database {
                         .get_mut(&index.name)
                         .expect("unique index batch should exist");
                     if !seen.insert(key) {
-                        return Err(duplicate_entry_error(
-                            &table,
-                            index,
-                            &table.index_key(index, &values)?,
+                        return Err(input.annotate(
+                            orig_idx,
+                            duplicate_entry_error(table, index, &table.index_key(index, &values)?),
                         ));
                     }
                 }
@@ -1518,12 +1524,9 @@ impl Database {
         rows: Vec<Vec<Value>>,
         skip_unique_check: bool,
     ) -> Result<InsertRowsResult, QueryError> {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         self.insert_rows_bulk_detailed_for(txn, table, rows, skip_unique_check)
@@ -1604,6 +1607,7 @@ impl Database {
                 0
             };
             let mut row_ids = Vec::with_capacity(rows.len());
+            let input = crate::error::InputRows::current();
             let mut prepared_rows = Vec::with_capacity(rows.len());
             if !skip_unique_check {
                 let mut batch_unique_keys = table
@@ -1612,8 +1616,8 @@ impl Database {
                     .filter(|index| index.enforces_uniqueness())
                     .map(|index| (index.name.clone(), crate::util::fast_hash::ah_hash_set()))
                     .collect::<BTreeMap<_, crate::util::fast_hash::AhHashSet<IndexKey>>>();
-                for mut values in rows {
-                    coerce_row(&table, &mut values)?;
+                for (ordinal, mut values) in rows.into_iter().enumerate() {
+                    coerce_row_at(&table, &mut values, input.offset(ordinal))?;
                     materialize_generated_columns(&table, &mut values, None)?;
                     for index in table
                         .indexes
@@ -1630,10 +1634,13 @@ impl Database {
                             .get_mut(&index.name)
                             .expect("unique index batch should exist");
                         if !seen.insert(key) {
-                            return Err(duplicate_entry_error(
+                            let error = duplicate_entry_error(
                                 &table,
                                 index,
                                 &table.index_key(index, &values)?,
+                            );
+                            return Err(annotate_unique_error(
+                                &table, index, &values, input, ordinal, error,
                             ));
                         }
                     }
@@ -1664,8 +1671,8 @@ impl Database {
                     None,
                 )?;
             } else {
-                for mut values in rows {
-                    coerce_row(&table, &mut values)?;
+                for (ordinal, mut values) in rows.into_iter().enumerate() {
+                    coerce_row_at(&table, &mut values, input.offset(ordinal))?;
                     materialize_generated_columns(&table, &mut values, None)?;
                     prepared_rows.push(values);
                 }
@@ -1764,12 +1771,9 @@ impl Database {
         table_name: &str,
         payloads: Vec<Vec<u8>>,
     ) -> Result<InsertRowsResult, QueryError> {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         // Pre-encoded row payloads can't be partition-routed without
@@ -1861,12 +1865,9 @@ impl Database {
         table_name: &str,
         rows: Vec<Vec<Value>>,
     ) -> Result<InsertRowsResult, QueryError> {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         // Partitioned tables go through the partition-aware insert
@@ -1889,9 +1890,10 @@ impl Database {
                 &table,
                 &mut rows,
             )?;
+            let input = crate::error::InputRows::current();
             let mut prepared_rows = Vec::with_capacity(rows.len());
-            for mut values in rows {
-                coerce_row(&table, &mut values)?;
+            for (ordinal, mut values) in rows.into_iter().enumerate() {
+                coerce_row_at(&table, &mut values, input.offset(ordinal))?;
                 materialize_generated_columns(&table, &mut values, None)?;
                 prepared_rows.push(values);
             }
@@ -2019,12 +2021,9 @@ impl Database {
         F: FnMut(&[Value]) -> Result<bool, QueryError>,
         G: FnMut(&[Value]) -> Result<Vec<Value>, QueryError>,
     {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         if table.is_partitioned() {
@@ -2598,12 +2597,9 @@ impl Database {
     where
         F: FnMut(&[Value]) -> Result<bool, QueryError>,
     {
-        let table = self.table_by_key(table_name).ok_or_else(|| {
-            error(
-                crate::error::catalog::ER_NO_SUCH_TABLE,
-                format!("Table '{table_name}' doesn't exist"),
-            )
-        })?;
+        let table = self
+            .table_by_key(table_name)
+            .ok_or_else(|| crate::error::messages::no_such_table(table_name))?;
         if table.database == crate::recyclebin::DATABASE { return Err(crate::recyclebin::failure("recycle-bin objects are read only")); }
         self.check_dml_allowed_for_table(txn, table.id)?;
         if table.is_partitioned() {

@@ -253,8 +253,13 @@ fn txn_audit_duplicate_diagnostics_include_key_value_for_batch_and_single_rows()
     engine.execute("INSERT INTO t VALUES(17)").unwrap();
     let single = engine.execute("INSERT INTO t VALUES(17)").unwrap_err();
     assert_eq!(batch.code(), 1062);
-    assert_eq!(batch.message(), single.message());
-    assert!(batch.message().contains("17"));
+    assert_eq!(single.code(), 1062);
+    let base = "Duplicate entry '17' for key 't.PRIMARY'";
+    assert!(batch.message().starts_with(base));
+    assert!(single.message().starts_with(base));
+    assert_eq!(batch.details().unwrap().row_number, Some(2));
+    assert_eq!(single.details().unwrap().row_number, Some(1));
+    assert_eq!(batch.details().unwrap().index.as_deref(), Some("PRIMARY"));
 }
 
 #[test]

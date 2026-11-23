@@ -2402,7 +2402,7 @@ pub(crate) fn create_table_sql_with_auto_increment(
                         Some(ast) => ast,
                         None => {
                             rebuilt = crate::parser::parse_catalog_expr(&expr.expr_sql)
-                                .map_err(|err| err.spec.error(err.message))?;
+                                .map_err(crate::parser::ParseError::into_query_error)?;
                             &rebuilt
                         }
                     };

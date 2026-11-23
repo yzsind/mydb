@@ -40,8 +40,15 @@ fn column_validation_preserves_scalar_coverage_and_query_alias_boundaries() {
         "SUM(a) OVER (PARTITION BY b ORDER BY output_alias ROWS 1 PRECEDING)",
     ] {
         let expr = crate::parser::parse_expr_fragment(sql).unwrap();
-        validate_expr_columns(engine.db_for_tests(), &expr, &scope, Some(&aliases), true)
-            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+        validate_expr_columns(
+            engine.db_for_tests(),
+            &expr,
+            &scope,
+            Some(&aliases),
+            true,
+            "field list",
+        )
+        .unwrap_or_else(|err| panic!("{sql}: {err}"));
     }
     for (sql, code, name) in [
         ("a + missing", 1054, "missing"),
@@ -53,8 +60,15 @@ fn column_validation_preserves_scalar_coverage_and_query_alias_boundaries() {
         ("other.a", 1054, "a"),
     ] {
         let expr = crate::parser::parse_expr_fragment(sql).unwrap();
-        let err = validate_expr_columns(engine.db_for_tests(), &expr, &scope, Some(&aliases), true)
-            .unwrap_err();
+        let err = validate_expr_columns(
+            engine.db_for_tests(),
+            &expr,
+            &scope,
+            Some(&aliases),
+            true,
+            "field list",
+        )
+        .unwrap_err();
         assert_eq!(err.code(), code, "{sql}: {err}");
         assert!(err.to_string().contains(name), "{sql}: {err}");
     }
@@ -82,8 +96,15 @@ fn column_validation_keeps_first_error_across_case_and_query_hooks() {
         ("ABS(missing_left) + missing_right", "missing_left"),
     ] {
         let expr = crate::parser::parse_expr_fragment(sql).unwrap();
-        let err =
-            validate_expr_columns(engine.db_for_tests(), &expr, &scope, None, true).unwrap_err();
+        let err = validate_expr_columns(
+            engine.db_for_tests(),
+            &expr,
+            &scope,
+            None,
+            true,
+            "field list",
+        )
+        .unwrap_err();
         assert_eq!(err.code(), 1054, "{sql}: {err}");
         assert!(err.to_string().contains(first), "{sql}: {err}");
     }
@@ -118,9 +139,15 @@ fn column_validation_window_frames_exclude_aliases_and_hidden_sources() {
         args[0] = Expr::Identifier(arg.into());
         frame.as_mut().unwrap().start =
             crate::parser::WindowFrameBound::Preceding(Box::new(Expr::Identifier(bound.into())));
-        let err =
-            validate_expr_columns(engine.db_for_tests(), &expr, &scope, Some(&aliases), false)
-                .unwrap_err();
+        let err = validate_expr_columns(
+            engine.db_for_tests(),
+            &expr,
+            &scope,
+            Some(&aliases),
+            false,
+            "where clause",
+        )
+        .unwrap_err();
         assert_eq!(err.code(), 1054);
         assert!(err.to_string().contains(first), "{err}");
     }

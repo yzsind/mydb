@@ -30,7 +30,7 @@ Reads the current diagnostics area at top level or in a stored program; STACKED 
                    | 'COLUMN_NAME' | 'CURSOR_NAME'
 ```
 
-ROW_COUNT and NUMBER are statement-area items and cannot be requested as CONDITION fields. Condition items require a valid CONDITION number. Unspecified source fields are empty diagnostic strings, not evidence that the corresponding object was checked.
+ROW_COUNT and NUMBER are statement-area items and cannot be requested as CONDITION fields. Condition items require a valid CONDITION number. Server conditions populate known source fields such as `SCHEMA_NAME`, `TABLE_NAME`, `COLUMN_NAME`, and `CONSTRAINT_NAME`. Stored programs can also set these fields with `SIGNAL` or `RESIGNAL`. Unavailable fields return empty diagnostic strings.
 
 ```sql
 GET CURRENT DIAGNOSTICS @rows=ROW_COUNT, @conditions=NUMBER;

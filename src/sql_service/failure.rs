@@ -14,6 +14,7 @@ pub struct Failure {
     pub message_truncated: bool,
     pub mysql_errno: Option<u16>,
     pub sqlstate: Option<String>,
+    metadata: Option<std::sync::Arc<crate::error::ConditionMetadata>>,
     pub request_id: Option<String>,
     pub execution_outcome: &'static str,
 }
@@ -35,6 +36,7 @@ impl Failure {
             message_truncated: truncated,
             mysql_errno: None,
             sqlstate: None,
+            metadata: None,
             request_id: None,
             execution_outcome: "not_started",
         }
@@ -64,7 +66,19 @@ impl Failure {
         Self::new(StatusCode::NOT_FOUND, "NOT_FOUND", "Resource not found")
     }
     pub fn value(&self) -> Value {
-        json!({"code":self.code,"message":self.message,"message_truncated":self.message_truncated,"mysql_errno":self.mysql_errno,"sqlstate":self.sqlstate})
+        let mut value = json!({
+            "code": self.code, "message": self.message,
+            "message_truncated": self.message_truncated, "mysql_errno": self.mysql_errno,
+            "sqlstate": self.sqlstate
+        });
+        if let Some(details) = self
+            .metadata
+            .as_deref()
+            .and_then(crate::error::ConditionMetadata::details)
+        {
+            value["details"] = json!(details);
+        }
+        value
     }
 }
 impl From<QueryError> for Failure {
@@ -92,6 +106,7 @@ impl From<QueryError> for Failure {
         failure.message_truncated = end < e.message().len();
         failure.mysql_errno = Some(e.code());
         failure.sqlstate = Some(e.sql_state().as_str().into());
+        failure.metadata = e.shared_metadata();
         failure
     }
 }

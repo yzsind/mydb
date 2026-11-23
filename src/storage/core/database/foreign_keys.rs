@@ -713,6 +713,13 @@ fn fk_child_violation_err(child: &TableSchema, fk: &ForeignKeySchema) -> QueryEr
             fk_constraint_clause(child, fk)
         ),
     )
+    .with_table(&child.database, &child.name)
+    .with_details(|details| {
+        details.constraint = Some(fk.name.clone());
+        if let [column] = fk.columns.as_slice() {
+            details.column = Some(column.clone());
+        }
+    })
 }
 
 fn fk_parent_violation_err(child: &TableSchema, inbound: &InboundFk) -> QueryError {
@@ -726,6 +733,10 @@ fn fk_parent_violation_err(child: &TableSchema, inbound: &InboundFk) -> QueryErr
         crate::error::catalog::ER_ROW_IS_REFERENCED_2,
         format!("Cannot delete or update a parent row: a foreign key constraint fails {clause}"),
     )
+    .with_table(&child.database, &child.name)
+    .with_details(|details| {
+        details.constraint = Some(inbound.fk_name.clone());
+    })
 }
 
 // ===========================================================================
@@ -1076,8 +1087,11 @@ impl Database {
         if table.foreign_keys.is_empty() || !fk_checks_enabled() || rows.is_empty() {
             return Ok(());
         }
+        let input = crate::error::InputRows::current();
         if let [row] = rows {
-            return self.fk_check_child_references(table, txn, row, None);
+            return self
+                .fk_check_child_references(table, txn, row, None)
+                .map_err(|error| input.annotate(0, error));
         }
         // Resolve (parent, index) once per FK; skip unresolved (deferred) FKs.
         let mut resolved: Vec<(
@@ -1123,7 +1137,7 @@ impl Database {
             prior_keys.resize_with(resolved.len(), Default::default);
         }
         // Row-outer / FK-inner preserves the single-row path's report order.
-        for values in rows {
+        for (ordinal, values) in rows.iter().enumerate() {
             for (position, (fk, parent, index, referenced_columns)) in resolved.iter().enumerate() {
                 let index = &parent.indexes[*index];
                 let Some(key) =
@@ -1138,7 +1152,8 @@ impl Database {
                 {
                     continue;
                 }
-                self.fk_enforce_child_key(table, fk, parent, index, referenced_columns, txn, &key)?;
+                self.fk_enforce_child_key(table, fk, parent, index, referenced_columns, txn, &key)
+                    .map_err(|error| input.annotate(ordinal, error))?;
                 if let Some(previous) = last_satisfied[position].replace(key) {
                     if let Some(seen) = prior_keys.get_mut(position) {
                         let bytes = previous.heap_capacity_bytes();

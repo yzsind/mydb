@@ -1663,3 +1663,16 @@ fn refactor_subquery_inspection_covers_window_children_and_excludes_derived_scop
     };
     assert!(!visit::select_body_contains_subquery(&select));
 }
+
+#[test]
+fn sql_diagnostics_map_nested_routine_errors_to_the_original_sql() {
+    let sql = "  CREATE FUNCTION b() RETURNS INT
+BEGIN
+  /* 中文 */ RETURN 1 +;
+END";
+    let error = parse_statement(sql).unwrap_err().into_query_error();
+    let position = error.details().unwrap().position.unwrap();
+    assert_eq!(position.line, 3, "{error}");
+    assert_eq!(position.byte_start, sql.find("+;").unwrap() + 1);
+    assert_eq!(position.byte_end, position.byte_start);
+}

@@ -353,28 +353,20 @@ impl InputSchema {
                 .get(&(qualifier.to_ascii_lowercase(), col_key))
                 .copied();
             if index == Some(usize::MAX) {
-                return Err(error(
-                    crate::error::catalog::ER_NON_UNIQ_ERROR,
-                    format!("column '{column}' is ambiguous"),
+                return Err(crate::error::messages::ambiguous_field(
+                    column,
+                    "field list",
                 ));
             }
-            return index.ok_or_else(|| {
-                error(
-                    crate::error::catalog::ER_BAD_FIELD_ERROR,
-                    format!("unknown column '{column}'"),
-                )
-            });
+            return index.ok_or_else(|| crate::error::messages::bad_field(column, "field list"));
         }
         match self.by_column.get(&col_key) {
             Some(indices) if indices.len() == 1 => Ok(indices[0]),
-            Some(_) => Err(error(
-                crate::error::catalog::ER_NON_UNIQ_ERROR,
-                format!("column '{column}' is ambiguous"),
+            Some(_) => Err(crate::error::messages::ambiguous_field(
+                column,
+                "field list",
             )),
-            None => Err(error(
-                crate::error::catalog::ER_BAD_FIELD_ERROR,
-                format!("unknown column '{column}'"),
-            )),
+            None => Err(crate::error::messages::bad_field(column, "field list")),
         }
     }
 

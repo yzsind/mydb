@@ -732,11 +732,39 @@
         },
         "additionalProperties": false
       },
+      "ConditionDetails": {
+        "type": "object",
+        "properties": {
+          "position": {
+            "type": "object",
+            "properties": {
+              "line": {"type": "integer", "minimum": 1},
+              "column": {"type": "integer", "minimum": 1},
+              "byte_start": {"type": "integer", "minimum": 0},
+              "byte_end": {"type": "integer", "minimum": 0}
+            },
+            "required": ["line", "column", "byte_start", "byte_end"]
+          },
+          "expected": {"type": "array", "items": {"type": "string"}},
+          "schema": {"type": "string"},
+          "table": {"type": "string"},
+          "column": {"type": "string"},
+          "clause": {"type": "string"},
+          "index": {"type": "string"},
+          "constraint": {"type": "string"},
+          "row_number": {"type": "integer", "minimum": 1},
+          "value_preview": {"type": "string", "maxLength": 128},
+          "value_truncated": {"type": "boolean"}
+        }
+      },
       "Error": {
         "type": "object",
         "properties": {
           "code": {
             "type": "string"
+          },
+          "details": {
+            "$ref": "#/components/schemas/ConditionDetails"
           },
           "message": {
             "type": "string"
@@ -1022,6 +1050,9 @@
                 },
                 "sqlstate": {
                   "type": "string"
+                },
+                "details": {
+                  "$ref": "#/components/schemas/ConditionDetails"
                 },
                 "message": {
                   "type": "string"

@@ -260,6 +260,9 @@ impl SourceMap {
 
     pub(super) fn error(&self, original: &str, error: ParseError) -> ParseError {
         debug_assert_eq!(original.len(), self.original_len);
+        if !error.location_known {
+            return error;
+        }
         let mut mapped = ParseError::new(
             original,
             self.span(error.span),
@@ -315,6 +318,9 @@ impl RewriteTrace {
         }
     }
     pub(super) fn error(&self, original: &str, mut error: ParseError) -> ParseError {
+        if !error.location_known {
+            return error;
+        }
         REWRITE_MAPS.with(|slot| {
             if let Some(maps) = slot.borrow().as_ref() {
                 for map in maps.iter().rev() {

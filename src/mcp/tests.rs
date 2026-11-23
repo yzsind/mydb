@@ -708,3 +708,29 @@ async fn mcp_http2_cancel_has_transport_capacity_when_sql_slots_are_full() {
 
 #[path = "audit_tests.rs"]
 mod audit;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn mcp_sql_diagnostics_are_structured_and_bound_values_are_bounded() {
+    let h = Harness::new(McpConfig::default());
+    h.sql("CREATE TABLE mcp_diagnostic (v VARCHAR(1))").await;
+    let input = format!("\n{}", "汉".repeat(120));
+    let result = h
+        .call(
+            "execute_sql",
+            json!({
+                "database":"test", "sql":"INSERT INTO mcp_diagnostic VALUES (?)", "params":[input]
+            }),
+        )
+        .await;
+    assert_eq!(result["isError"], true);
+    let error = &result["structuredContent"]["error"];
+    assert_eq!(error["mysql_errno"], 1406, "{result}");
+    assert_eq!(error["sqlstate"], "22001");
+    assert_eq!(error["details"]["column"], "v");
+    assert_eq!(error["details"]["row_number"], 1);
+    assert_eq!(error["details"]["value_truncated"], true);
+    let preview = error["details"]["value_preview"].as_str().unwrap();
+    assert!(preview.starts_with("\\n"));
+    assert!(preview.len() <= 128);
+    h.close().await;
+}

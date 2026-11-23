@@ -394,7 +394,8 @@ fn validate_trigger_stmt(session: &SessionContext, stmt: &RoutineStmt) -> Result
             "dynamic SQL is not allowed in triggers",
         )),
         RoutineStmt::Sql(sql) => {
-            let statement = parse_statement(sql).map_err(|err| err.spec.error(err.message))?;
+            let statement =
+                parse_statement(sql).map_err(crate::parser::ParseError::into_query_error)?;
             if trigger_statement_returns_rows(&statement) {
                 return Err(error(
                     crate::error::catalog::ER_SP_NO_RETSET,
@@ -505,7 +506,8 @@ impl TriggerRowValidator<'_> {
     }
 
     fn sql(&mut self, sql: &str) -> Result<(), QueryError> {
-        let mut statement = parse_statement(sql).map_err(|err| err.spec.error(err.message))?;
+        let mut statement =
+            parse_statement(sql).map_err(crate::parser::ParseError::into_query_error)?;
         crate::parser::visit::visit_statement_mut(self, &mut statement);
         Ok(())
     }

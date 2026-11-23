@@ -3848,7 +3848,9 @@ where
             more: true,
             failed: false,
         });
-        let result = self.handle_query_parts(&batch.0, batch.1, mode_bits).await;
+        let result = self
+            .handle_query_parts(&sql, &batch.0, batch.1, mode_bits)
+            .await;
         let flush = if result.is_ok() {
             self.flush_text_batch_packets().await
         } else {
@@ -3968,11 +3970,13 @@ where
     async fn handle_query_parts(
         &mut self,
         sql: &str,
+        effective_sql: &str,
         ranges: Vec<std::ops::Range<usize>>,
         mut mode_bits: u16,
     ) -> io::Result<()> {
         let mut remaining = ranges;
-        let mut effective = std::borrow::Cow::Borrowed(sql);
+        let mut effective = std::borrow::Cow::Borrowed(effective_sql);
+        let mut base = 0;
         let mut index = 0;
         let mut executed = 0;
         while index < remaining.len() {
@@ -3992,7 +3996,8 @@ where
                 crate::engine::status_counters::record_session_com(&self.context, kind);
             }
             self.context.refresh_cancel_generations();
-            self.handle_single_query(child).await?;
+            self.handle_single_query_at(child, Some((sql, base + range.start)))
+                .await?;
             executed += 1;
             if self.text_batch.as_ref().unwrap().failed
                 || self.context.close_after_response
@@ -4005,7 +4010,11 @@ where
                 crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode);
             if next_mode != mode_bits && index < remaining.len() {
                 // A preceding SET sql_mode controls how the remaining source is split.
-                let tail = &effective[range.end + 1..];
+                base += range.end;
+                if sql.as_bytes().get(base) == Some(&b';') {
+                    base += 1;
+                }
+                let tail = &sql[base..];
                 let (next_sql, next_ranges) =
                     crate::parser::split_query_statements(tail, next_mode);
                 effective = std::borrow::Cow::Owned(next_sql.into_owned());
@@ -4018,6 +4027,14 @@ where
     }
 
     async fn handle_single_query(&mut self, sql: String) -> io::Result<()> {
+        self.handle_single_query_at(sql, None).await
+    }
+
+    async fn handle_single_query_at(
+        &mut self,
+        sql: String,
+        source: Option<(&str, usize)>,
+    ) -> io::Result<()> {
         let parser_mode_bits =
             crate::engine::api::parse_temporal_sql_mode_bits(&self.context.sql_mode);
         if let Some(cache) = self.text_shape_memos.as_mut() {
@@ -4098,7 +4115,7 @@ where
             if self.kill_flag.load(Ordering::Acquire) {
                 return Ok(());
             }
-            return self.write_query_response(result).await;
+            return self.write_text_query_response(result, source).await;
         }
         // PROCESSLIST is an operational escape hatch. Running this tiny,
         // read-only registry snapshot through the blocking executor pool can
@@ -4110,7 +4127,7 @@ where
                 Ok(_permit) => self.engine.execute(&mut self.context, &sql),
                 Err(err) => Err(err),
             };
-            return self.write_query_response(result).await;
+            return self.write_text_query_response(result, source).await;
         }
         // A replica advertises semi-sync capability by issuing
         // `SET @rpl_semi_sync_slave=1` (8.0.26+: `@rpl_semi_sync_replica`)
@@ -4148,7 +4165,7 @@ where
         };
         if http && !looks_like_load_data_local(&sql, lex_mode) {
             let result = self.execute_engine_on_worker(sql, http).await;
-            return self.write_query_response(result).await;
+            return self.write_text_query_response(result, source).await;
         }
 
         // A plain session-variable SET evaluates no subquery or function.
@@ -4160,7 +4177,7 @@ where
             if self.kill_flag.load(Ordering::Acquire) {
                 return Ok(());
             }
-            return self.write_query_response(result).await;
+            return self.write_text_query_response(result, source).await;
         }
 
         // Row-lock eligibility and catalog admission are separate. An inline
@@ -4336,7 +4353,7 @@ where
                                         Some((params, shape_sql)),
                                     )
                                     .await;
-                                return self.write_query_response(result).await;
+                                return self.write_text_query_response(result, source).await;
                             }
                             match compiled {
                                 Some(result) => result,
@@ -4354,7 +4371,7 @@ where
                             .execute_parsed(&mut self.context, sql.as_str(), parsed),
                     };
                     drop(catalog);
-                    return self.write_query_response(result).await;
+                    return self.write_text_query_response(result, source).await;
                 }
                 // A parsed SELECT that cannot use the non-blocking route may
                 // acquire row locks (FOR UPDATE / FOR SHARE). Gate it before
@@ -4437,7 +4454,7 @@ where
                 if self.kill_flag.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                return self.write_query_response(result).await;
+                return self.write_text_query_response(result, source).await;
             }
         }
 
@@ -4509,7 +4526,7 @@ where
         if self.kill_flag.load(Ordering::Acquire) && !self.context.close_after_response {
             return Ok(());
         }
-        self.write_query_response(result).await
+        self.write_text_query_response(result, source).await
     }
 
     async fn flush_text_batch_packets(&mut self) -> io::Result<()> {
@@ -4521,6 +4538,26 @@ where
             writer.write_packet(sequence, &payload).await?;
         }
         writer.finish().await
+    }
+
+    async fn write_text_query_response(
+        &mut self,
+        result: Result<QueryResponse, QueryError>,
+        source: Option<(&str, usize)>,
+    ) -> io::Result<()> {
+        let result = match (result, source) {
+            (Err(error), Some((source, offset)))
+                if error
+                    .details()
+                    .is_some_and(|details| details.position.is_some()) =>
+            {
+                let rebased = error.clone().rebase_sql_position(source, offset);
+                self.context.warnings.replace_error(&error, &rebased);
+                Err(rebased)
+            }
+            (result, _) => result,
+        };
+        self.write_query_response(result).await
     }
 
     async fn write_query_response(
@@ -4968,6 +5005,26 @@ where
         self.write_query_response_at(result, response_seq).await
     }
 
+    async fn write_prepare_error(&mut self, error: QueryError) -> io::Result<()> {
+        if !self.context.warnings.iter().any(|condition| {
+            condition.level() == crate::error::ConditionLevel::Error
+                && condition.code() == error.code()
+                && condition.message() == error.message()
+        }) {
+            self.context
+                .warnings
+                .push(crate::error::SqlCondition::from_error(
+                    crate::error::ConditionLevel::Error,
+                    &error,
+                ));
+            self.context
+                .warnings
+                .set_limit(self.context.sysvars.max_error_count as usize);
+        }
+        self.write_error_packet(self.command_response_sequence, &error)
+            .await
+    }
+
     async fn handle_stmt_prepare(&mut self, sql_bytes: &[u8]) -> io::Result<()> {
         let prepare_started = std::time::Instant::now();
         self.context.clear_warnings();
@@ -5000,14 +5057,8 @@ where
             {
                 Ok(prepared) => prepared,
                 Err(err) => {
-                    let packet = command_err_packet_for_spec(
-                        crate::mysql::errors::ER_PARSE_ERROR,
-                        format!("{} at position {}", err.message, err.offset),
-                    );
-                    self.codec
-                        .write_packet(&mut self.stream, self.command_response_sequence, &packet)
-                        .await?;
-                    return Ok(());
+                    let error = crate::parser::ParseError::from_lex(&sql, err).into_query_error();
+                    return self.write_prepare_error(error).await;
                 }
             };
         if crate::sql_lex::effective_is_empty(
@@ -5037,10 +5088,8 @@ where
         let param_count = match count_placeholders(&effective_sql, lex_mode) {
             Ok(count) => count,
             Err(err) => {
-                let err = error(crate::error::catalog::ER_PARSE_ERROR, err.to_string());
-                self.write_error_packet(self.command_response_sequence, &err)
-                    .await?;
-                return Ok(());
+                let error = crate::parser::ParseError::from_lex(&sql, err).into_query_error();
+                return self.write_prepare_error(error).await;
             }
         };
         if param_count > u16::MAX as usize {
@@ -5082,9 +5131,9 @@ where
         let (parsed, columns) = match preparation {
             Ok((parsed, columns)) => (Some(parsed), columns),
             Err(err) => {
-                self.write_error_packet(self.command_response_sequence, &err)
-                    .await?;
-                return Ok(());
+                let error = err.clone().rebase_sql_position(&sql, 0);
+                self.context.warnings.replace_error(&err, &error);
+                return self.write_prepare_error(error).await;
             }
         };
         if columns.len() > u16::MAX as usize {
@@ -10499,7 +10548,7 @@ fn query_requires_multi_statements(sql: &str, sql_mode_bits: u16) -> Result<bool
     let _mode = crate::parser::ParserSqlModeGuard::activate(sql_mode_bits);
     crate::parser::parse_statements(sql)
         .map(|statements| statements.len() > 1)
-        .map_err(|err| error(crate::error::catalog::ER_PARSE_ERROR, err.to_string()))
+        .map_err(crate::parser::ParseError::into_query_error)
 }
 
 /// Run server-supplied SQL through the ordinary executor as the login user.
@@ -11596,6 +11645,61 @@ mod tests {
         }));
         assert_eq!(engine.0.load(Ordering::Relaxed), 1);
         assert!(registry.snapshot().is_empty());
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn sql_diagnostics_on_mysql_wire_use_original_batch_and_prepare_source() {
+        use crate::mysql::packet::read_packet;
+
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let engine = Arc::new(crate::engine::StorageQueryEngine::open(dir.path()).unwrap());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap())
+            .await
+            .unwrap();
+        let (stream, peer) = listener.accept().await.unwrap();
+        let mut session = Session::try_new(
+            4272,
+            peer,
+            stream,
+            None,
+            engine,
+            Arc::new(SessionRegistry::new()),
+        )
+        .unwrap();
+        session.authenticated = true;
+        session.context.current_database = "test".into();
+        let flags = crate::mysql::protocol::CLIENT_PROTOCOL_41 | CLIENT_MULTI_STATEMENTS;
+        session.capabilities = NegotiatedCapabilities::new(flags, flags);
+        let sql = "SET @message='中文';
+SET sql_mode='ANSI_QUOTES';
+SELECT 1 +";
+        session.handle_query(sql.as_bytes()).await.unwrap();
+        for _ in 0..2 {
+            let packet = read_packet(&mut client).await.unwrap().unwrap();
+            assert_eq!(packet.payload[0], 0, "{:?}", packet.payload);
+        }
+        let packet = &read_packet(&mut client).await.unwrap().unwrap().payload;
+        assert_eq!(&packet[..9], b"\xff\x28\x04#42000");
+        let message = std::str::from_utf8(&packet[9..]).unwrap();
+        assert!(message.contains("at line 3, column 11"), "{message}");
+        let warning = session.context.warnings.iter().last().unwrap();
+        assert_eq!(warning.message(), message);
+        let position = warning.details().unwrap().position.unwrap();
+        assert_eq!((position.line, position.byte_start), (3, sql.len()));
+
+        let sql = "SELECT 1,
+ '未关闭";
+        session.handle_stmt_prepare(sql.as_bytes()).await.unwrap();
+        let packet = &read_packet(&mut client).await.unwrap().unwrap().payload;
+        assert_eq!(&packet[..9], b"\xff\x28\x04#42000");
+        let message = std::str::from_utf8(&packet[9..]).unwrap();
+        assert!(message.contains("at line 2, column 2"), "{message}");
+        let warning = session.context.warnings.iter().last().unwrap();
+        assert_eq!(
+            warning.details().unwrap().position.unwrap().byte_start,
+            sql.find('\'').unwrap()
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]

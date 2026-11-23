@@ -2689,6 +2689,7 @@ fn convert_projection_order(
                 line: 1,
                 column: 1,
                 expected: Vec::new(),
+                location_known: false,
             });
         }
         Err(SelectListRefError::Wildcard(pos)) => {
@@ -2979,6 +2980,7 @@ fn convert_select(
                 line: 1,
                 column: 1,
                 expected: Vec::new(),
+                location_known: false,
             });
         }
         Err(GroupByRefError::Ref(SelectListRefError::Wildcard(_))) => {}
@@ -2991,6 +2993,7 @@ fn convert_select(
                 line: 1,
                 column: 1,
                 expected: Vec::new(),
+                location_known: false,
             });
         }
     }
@@ -5244,6 +5247,7 @@ fn convert_expr_inner(expr: &SqlExpr) -> Result<Expr, ParseError> {
                                             line: item.expr.span().start.line.max(1) as usize,
                                             column: item.expr.span().start.column.max(1) as usize,
                                             expected: Vec::new(),
+                                            location_known: false,
                                         });
                                     }
                                     if let Expr::Literal(Literal::Int(position)) = &order_expr {
@@ -6348,6 +6352,7 @@ fn validate_cast_character_length(
             line: 1,
             column: 1,
             expected: Vec::new(),
+            location_known: false,
         });
     }
     Ok(())
@@ -8873,6 +8878,7 @@ fn validate_year_display_width(modifiers: &[String], sql: &str) -> Result<(), Pa
         line: 1,
         column: 1,
         expected: Vec::new(),
+        location_known: true,
     })
 }
 

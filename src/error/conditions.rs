@@ -106,6 +106,21 @@ impl SqlConditions {
         other.discarded_errors = 0;
     }
 
+    pub(crate) fn replace_error(
+        &mut self,
+        original: &super::QueryError,
+        rebased: &super::QueryError,
+    ) {
+        if let Some(run) = self.runs.iter_mut().rev().find(|run| {
+            run.condition.level() == super::ConditionLevel::Error
+                && run.condition.code() == original.code()
+                && run.condition.details() == original.details()
+                && run.condition.message() == original.message()
+        }) {
+            run.condition = SqlCondition::from_error(super::ConditionLevel::Error, rebased);
+        }
+    }
+
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &SqlCondition> + Clone {
         self.runs
             .iter()

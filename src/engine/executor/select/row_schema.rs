@@ -213,10 +213,7 @@ pub(super) fn field_matches_qualifier(field: &PlanField, qualifier: &str) -> boo
 }
 
 fn ambiguous_column(column: &str) -> crate::types::QueryError {
-    crate::storage::error(
-        crate::error::catalog::ER_NON_UNIQ_ERROR,
-        format!("column '{column}' is ambiguous"),
-    )
+    crate::error::messages::ambiguous_field(column, "field list")
 }
 
 fn unknown_column(column: &str) -> crate::types::QueryError {
