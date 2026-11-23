@@ -1691,6 +1691,7 @@ pub fn plan_select(db: &Database, select: &Select) -> Result<PlannedSelect, Quer
     let mut select_owned = select.clone();
     resolve_wildcard_order_ordinals(db, &mut select_owned)?;
     resolve_join_using_natural(db, &mut select_owned)?;
+    expand_grouped_select_wildcards(db, &mut select_owned)?;
     resolve_group_by_refs(db, &mut select_owned);
     prune_redundant_constant_group_keys(&mut select_owned);
     prune_redundant_functional_group_keys(db, &mut select_owned);
@@ -3732,7 +3733,7 @@ fn bind_rollup_expr(
                     .position(|group_expr| expr_semantically_eq(group_expr, &resolved))
                 else {
                     return Err(error(
-                        crate::error::catalog::ER_WINDOW_CIRCULARITY_IN_WINDOW_GRAPH,
+                        crate::error::catalog::ER_FIELD_IN_GROUPING_NOT_GROUP_BY,
                         format!(
                             "argument '{}' of GROUPING function is not in GROUP BY",
                             crate::parser::expr_to_sql(arg)
@@ -3762,7 +3763,11 @@ fn bind_rollup_expr(
     }
     if let Some(idx) = group_by
         .iter()
-        .position(|group_expr| expr_semantically_eq(group_expr, &expr))
+        .position(|group_expr| expr_semantically_eq(group_expr, &expr)
+            || matches!((group_expr, &expr),
+                (Expr::BoundValue(Value::Int(a)), Expr::Literal(crate::parser::Literal::Int(b))) if a == b)
+            || matches!((group_expr, &expr),
+                (Expr::BoundValue(Value::UInt(a)), Expr::Literal(crate::parser::Literal::UInt(b))) if a == b))
     {
         return Ok(Expr::GroupKeyRef {
             index: idx,
@@ -5495,11 +5500,40 @@ fn scope_table_for_ref(
     })
 }
 
+/// Expand grouped wildcards without manufacturing SELECT aliases. This keeps
+/// GROUP BY ambiguity diagnostics ahead of unrelated grouping violations.
+pub(crate) fn expand_grouped_select_wildcards(
+    db: &Database,
+    select: &mut Select,
+) -> Result<(), QueryError> {
+    if (!select.group_by.is_empty()
+        || !select.grouping_sets.is_empty()
+        || select_has_aggregate(db, select))
+        && select.projection.iter().any(|item| {
+            matches!(
+                item,
+                SelectItem::Wildcard | SelectItem::QualifiedWildcard(_)
+            )
+        })
+    {
+        expand_select_wildcards(db, select, false)?;
+    }
+    Ok(())
+}
+
 /// Freeze wildcard projection slots from the same scopes used for column binding.
 /// Source restrictions (partition, snapshot and hints) remain on their relations.
 pub(crate) fn freeze_select_wildcards(
     db: &Database,
     select: &mut Select,
+) -> Result<(), QueryError> {
+    expand_select_wildcards(db, select, true)
+}
+
+fn expand_select_wildcards(
+    db: &Database,
+    select: &mut Select,
+    freeze_names: bool,
 ) -> Result<(), QueryError> {
     if select.values.is_some() {
         return Ok(());
@@ -5515,6 +5549,9 @@ pub(crate) fn freeze_select_wildcards(
                 continue;
             }
         };
+        if let Some(qualifier) = requested_qualifier {
+            scope.resolve_qualifier(qualifier)?;
+        }
         for table in scope.tables.iter().filter(|table| {
             table.visible && requested_qualifier.is_none_or(|name| table.matches_name(name))
         }) {
@@ -5528,7 +5565,7 @@ pub(crate) fn freeze_select_wildcards(
             for name in &table.wildcard_columns {
                 projection.push(SelectItem::Expr {
                     expr: Expr::CompoundIdentifier(vec![qualifier.to_owned(), name.clone()]),
-                    alias: Some(name.clone()),
+                    alias: freeze_names.then(|| name.clone()),
                 });
             }
         }

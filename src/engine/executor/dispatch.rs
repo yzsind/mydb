@@ -8205,6 +8205,7 @@ pub(super) fn execute_qualified_statement(
         }
         Statement::SetAutocommit(value) => {
             apply_autocommit(db, session, value)?;
+            session::track_sysvar_session_change(session, db, "autocommit");
             Ok(QueryResponse::Ok)
         }
         Statement::SetTransactionIsolation { scope, isolation } => {

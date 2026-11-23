@@ -456,7 +456,7 @@ async fn rest_protocol_session_transactions_parameters_and_ndjson() {
         json!([["0"]])
     );
     assert!(!s.closed.load(std::sync::atomic::Ordering::Acquire));
-    s.close().await;
+    s.close().await.unwrap();
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn rest_protocol_busy_cancellation_and_revocation() {
@@ -570,7 +570,7 @@ async fn rest_protocol_json_ceiling_includes_metadata_and_envelope() {
     assert_eq!(result["error"]["code"], "RESULT_TOO_LARGE");
     assert_eq!(result["execution_outcome"], "succeeded");
     assert_eq!(result["results_omitted"], true);
-    session.close().await;
+    session.close().await.unwrap();
 }
 
 #[test]
@@ -699,7 +699,7 @@ async fn rest_protocol_transport_deadline_retains_worker_until_cleanup() {
         was_owned,
         "engine resources remain owned until the worker exits"
     );
-    session.close().await;
+    session.close().await.unwrap();
     assert!(state.registry.snapshot().is_empty());
 }
 
@@ -904,7 +904,7 @@ async fn rest_protocol_resource_error_uses_reserved_reply_and_retains_execution_
     assert_eq!(result["results_omitted"], true);
     assert!(state.used.load(std::sync::atomic::Ordering::Acquire) <= 65536);
     drop(pressure);
-    session.close().await;
+    session.close().await.unwrap();
 }
 #[test]
 fn rest_protocol_cancellation_targets_handle_instead_of_reused_connection_id() {
@@ -1081,7 +1081,7 @@ async fn release_audit_rest_bound_dml_and_atomic_rollback() {
     .await;
     let result: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result["results"][0]["rows"], json!([["2"]]));
-    s.close().await;
+    s.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1124,7 +1124,7 @@ async fn release_audit_rest_returning_overflow_confirms_commit_and_batch_rollbac
     .await;
     let result: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(result["results"][0]["rows"], json!([["2"]]));
-    s.close().await;
+    s.close().await.unwrap();
 }
 
 #[test]
@@ -1137,6 +1137,7 @@ fn release_audit_rest_accept_negotiation() {
         ("*/*;q=0.8", Some(false)),
         ("application/*", Some(false)),
         ("application/json;q=0, */*;q=1", Some(true)),
+        ("application/json;q=0.5, */*", Some(true)),
         (
             "application/json;q=0.2, application/x-ndjson;q=0.8",
             Some(true),
@@ -1185,7 +1186,7 @@ async fn release_audit_rest_chunked_body_memory_and_transaction_expiry() {
     s.transaction
         .store(false, std::sync::atomic::Ordering::Release);
     assert_eq!(session_info(&s, &state.config)["expires_at_ms"], 610000);
-    s.close().await;
+    s.close().await.unwrap();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1211,5 +1212,67 @@ async fn rest_audit_no_implicit_database_and_sequential_batch_sql_mode() {
     let result: Value = serde_json::from_slice(&bytes).unwrap();
     assert!(result["error"].is_null(), "{result}");
     assert_eq!(result["results"][1]["rows"], json!([["7"]]));
-    session.close().await;
+    session.close().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn audit1123_persistent_cleanup_failure_is_bounded_and_retriable() {
+    use crate::engine::api::{QueryResponse, SessionContext};
+    use crate::engine::auth::AccountKey;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    struct FailingEngine {
+        inner: Arc<StorageQueryEngine>,
+        fail: AtomicBool,
+    }
+    impl QueryEngine for FailingEngine {
+        fn execute(
+            &self,
+            context: &mut SessionContext,
+            sql: &str,
+        ) -> std::result::Result<QueryResponse, crate::types::QueryError> {
+            self.inner.execute_with_session(context, sql)
+        }
+        fn api_key_is_valid(&self, id: &str, owner: &AccountKey) -> bool {
+            self.inner.api_key_is_valid(id, owner)
+        }
+        fn close_session(
+            &self,
+            context: &mut SessionContext,
+        ) -> std::result::Result<(), crate::types::QueryError> {
+            if self.fail.load(Ordering::Acquire) {
+                return Err(
+                    crate::error::catalog::ER_UNKNOWN_ERROR.error("persistent cleanup fault")
+                );
+            }
+            self.inner.close_session(context)
+        }
+    }
+    let (_dir, engine) = engine();
+    let identity = identity(&engine);
+    let proxy = Arc::new(FailingEngine {
+        inner: engine.clone(),
+        fail: AtomicBool::new(true),
+    });
+    let state = runtime::State::new(
+        RestConfig::from_startup().unwrap(),
+        proxy.clone(),
+        engine.registry().clone(),
+    );
+    let session = create_session(state.clone(), identity, None).await.unwrap();
+    state
+        .sessions
+        .lock()
+        .insert(session.id.clone(), session.clone());
+    let close = tokio::time::timeout(Duration::from_secs(2), session.close()).await;
+    let err = close
+        .expect("close must return on persistent storage failure")
+        .unwrap_err();
+    assert_eq!(err.code, "SESSION_CLEANUP_FAILED");
+    assert_eq!(err.execution_outcome, "unknown");
+    assert!(session.context.lock().is_some());
+    assert_eq!(state.sessions.lock().len(), 1);
+    proxy.fail.store(false, Ordering::Release);
+    state.sweep().await;
+    assert!(state.sessions.lock().is_empty());
+    assert!(state.registry.snapshot().is_empty());
 }

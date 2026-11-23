@@ -1087,3 +1087,103 @@ fn binary_columns_accept_high_bytes_in_all_hex_literal_forms() {
         assert_eq!(rows.rows.len(), 1);
     }
 }
+
+#[test]
+fn audit1123_non_utf8_literal_binary_comparison() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for (charset, text, hex) in [
+        ("gbk", "中文", "D6D0CEC4"),
+        ("latin1", "é", "E9"),
+        ("utf8mb4", "中文", "E4B8ADE69687"),
+    ] {
+        engine
+            .execute_with_session(&mut session, &format!("SET NAMES {charset}"))
+            .unwrap();
+        for sql in [
+            format!("SELECT '{text}'=0x{hex},0x{hex}='{text}','{text}'<=>0x{hex}"),
+            format!("SELECT '{text}' IN (0x{hex}),'{text}' BETWEEN 0x{hex} AND 0x{hex}"),
+        ] {
+            let QueryResponse::ResultSet(result) =
+                engine.execute_with_session(&mut session, &sql).unwrap()
+            else {
+                panic!()
+            };
+            assert!(
+                result.rows[0].iter().all(|v| *v == Value::Int(1)),
+                "{charset}: {sql}: {:?}",
+                result.rows
+            );
+        }
+    }
+}
+
+#[test]
+fn audit1123_cached_text_shape_keeps_non_utf8_binary_derivation() {
+    let dir = tempfile::tempdir().unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    let shape = "SELECT ? = ?, ? IN (?), ? BETWEEN ? AND ?";
+    for (charset, text, bytes) in [
+        ("gbk", "中文", vec![0xD6, 0xD0, 0xCE, 0xC4]),
+        ("latin1", "é", vec![0xE9]),
+        ("utf8mb4", "中文", "中文".as_bytes().to_vec()),
+    ] {
+        engine
+            .execute_with_session(&mut session, &format!("SET NAMES {charset}"))
+            .unwrap();
+        let parsed = engine.parse_cached_statement(&session, shape).unwrap();
+        let oracle_params = vec![
+            Value::String(text.into()),
+            Value::Bytes(bytes.clone()),
+            Value::String(text.into()),
+            Value::Bytes(bytes.clone()),
+            Value::String(text.into()),
+            Value::Bytes(bytes.clone()),
+            Value::Bytes(bytes.clone()),
+        ];
+        crate::engine::expr::with_session_expr_info(&session, || {
+            crate::engine::params::with_auto_params_slice(&oracle_params, || {
+                let Statement::Select(select) = parsed.as_ref() else {
+                    panic!()
+                };
+                for item in &select.projection {
+                    if let SelectItem::Expr { expr, .. } = item {
+                        assert_eq!(
+                            crate::engine::expr::eval_const(expr).unwrap(),
+                            Value::Int(1),
+                            "oracle {charset}: {expr:?}"
+                        );
+                    }
+                }
+            })
+        });
+        for _ in 0..3 {
+            let string = Value::String(text.into());
+            let binary = Value::Bytes(bytes.clone());
+            let result = QueryEngine::execute_parsed_with_params(
+                &engine,
+                &mut session,
+                shape,
+                parsed.clone(),
+                vec![
+                    string.clone(),
+                    binary.clone(),
+                    string.clone(),
+                    binary.clone(),
+                    string,
+                    binary.clone(),
+                    binary,
+                ],
+                Arc::from(shape),
+            )
+            .and_then(QueryResponse::materialize)
+            .unwrap();
+            let QueryResponse::ResultSet(result) = result else {
+                panic!()
+            };
+            assert_eq!(result.rows, vec![vec![Value::Int(1); 3]], "{charset}");
+        }
+    }
+}

@@ -810,6 +810,30 @@ fn hidden_group_cache_value(
     }
 }
 
+/// Compare character values with binary operands in their source encoding.
+/// PlanRow evaluators must retain the same octets as the scalar/compiled lanes.
+fn bind_plan_binary_value(
+    expr: &Expr,
+    row: &PlanRow,
+    collation: Option<u16>,
+    value: Value,
+) -> Result<Value, QueryError> {
+    if collation != Some(crate::charset::BINARY_COLLATION_ID)
+        || !matches!(value, Value::String(_) | Value::SmallString(_))
+    {
+        return Ok(value);
+    }
+    let charset = super::plan::plan_bound_expr_type(expr, row)
+        .collation_id
+        .and_then(crate::charset::resolve_collation_id)
+        .map(|info| info.charset)
+        .unwrap_or_else(crate::engine::expr::connection_charset);
+    if matches!(charset, "utf8mb4" | "utf8mb3" | "binary") {
+        return Ok(value);
+    }
+    crate::engine::expr::encode_binary_assignment_value(value, charset)
+}
+
 #[inline]
 fn eval_plan_in_list(
     expr: &Expr,
@@ -824,12 +848,17 @@ fn eval_plan_in_list(
     let value = eval(expr)?;
     let mut iter = list.iter();
     let collation_id = plan_in_list_collation(expr, list, row);
+    let value = bind_plan_binary_value(expr, row, collation_id, value)?;
     crate::engine::expr::with_constant_in_warning_dedup(list, || {
         crate::engine::expr::with_compare_collation(collation_id, || {
             crate::engine::expr::eval_in_list_compared(
                 value,
                 negated,
-                || iter.next().map(&mut eval).transpose(),
+                || {
+                    iter.next()
+                        .map(|item| bind_plan_binary_value(item, row, collation_id, eval(item)?))
+                        .transpose()
+                },
                 |value, item, index| {
                     crate::engine::expr::with_numeric_comparison_context(
                         expr,
@@ -870,6 +899,9 @@ fn eval_plan_between(
     let low_value = eval(low)?;
     let high_value = eval(high)?;
     let collation = early_collation.unwrap_or_else(|| plan_between_collation(expr, low, high, row));
+    let value = bind_plan_binary_value(expr, row, collation, value)?;
+    let low_value = bind_plan_binary_value(low, row, collation, low_value)?;
+    let high_value = bind_plan_binary_value(high, row, collation, high_value)?;
     crate::engine::expr::with_compare_collation(collation, || {
         crate::engine::expr::eval_between_with_provenance(
             &value,
@@ -2396,6 +2428,8 @@ fn eval_plan_expr_with_db_inner(
                     &mut right_value,
                 );
                 let collation_id = eval_ctx.binary_collation_id(expr, left, right, row);
+                left_value = bind_plan_binary_value(left, row, collation_id, left_value)?;
+                right_value = bind_plan_binary_value(right, row, collation_id, right_value)?;
                 let evaluate = || {
                     crate::engine::expr::with_numeric_comparison_context(
                         left,
@@ -3198,6 +3232,8 @@ pub(super) fn eval_plan_binary_legacy(
             &mut right_value,
         );
         let collation_id = plan_binary_collation_id(left, right, row);
+        left_value = bind_plan_binary_value(left, row, collation_id, left_value)?;
+        right_value = bind_plan_binary_value(right, row, collation_id, right_value)?;
         let evaluate = || {
             crate::engine::expr::with_numeric_comparison_context(
                 left,

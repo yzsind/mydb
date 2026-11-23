@@ -176,7 +176,7 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
                     return order;
                 }
             }
-            left.key_values.len().cmp(&right.key_values.len())
+            right.key_values.len().cmp(&left.key_values.len())
         });
     }
     // Keep the established addition order for approximate SUM/AVG. Exact
@@ -283,16 +283,6 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
     // state per prefix instead of constructing a second hash table for the
     // finest level and retaining every level's boxed accumulator maps.
     let mut live: Vec<Option<VecRollupFinestGroup>> = (0..group_by_len).map(|_| None).collect();
-    let mut completed: Vec<Vec<VecRollupFinestGroup>> =
-        (0..group_by_len).map(|_| Vec::new()).collect();
-    // RANK and DENSE_RANK depend on complete peer sets, not arrival order.
-    // Their bounded collector can consume an exact subtotal as soon as it
-    // closes. ROW_NUMBER and the full row result retain level-major order.
-    let stream_subtotals = cascade
-        && having.is_none()
-        && matches!(&out,
-        RollupEmitTarget::TopK(collector) if matches!(collector.hint.kind,
-            crate::engine::executor::dispatch::RankKind::Rank | crate::engine::executor::dispatch::RankKind::DenseRank));
     let mut previous: Option<Vec<Value>> = None;
     // Feed only the immediate parent. When a prefix closes, merge its
     // completed subtotal into the next parent once. Updating every live
@@ -330,11 +320,7 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
                 if cascade {
                     fold_parent(&mut live, &state, prefix - 1)?;
                 }
-                if stream_subtotals {
-                    emit(&mut out, state, prefix)?;
-                } else {
-                    completed[prefix].push(state);
-                }
+                emit(&mut out, state, prefix)?;
             }
         }
         if cascade {
@@ -356,21 +342,13 @@ pub(in crate::engine::executor::select) fn rollup_emit_from_vec_finest(
         }
         emit(&mut out, group, group_by_len)?;
     }
-    // Retain level-major, key-sorted output and the original representative
-    // values, including real NULL keys versus subtotal NULL markers.
+    // Close the remaining prefixes from the innermost group to the total.
     for prefix in (0..group_by_len).rev() {
         if let Some(state) = live[prefix].take() {
             if cascade && prefix > 0 {
                 fold_parent(&mut live, &state, prefix - 1)?;
             }
-            if stream_subtotals {
-                emit(&mut out, state, prefix)?;
-            } else {
-                completed[prefix].push(state);
-            }
-        }
-        for group in std::mem::take(&mut completed[prefix]) {
-            emit(&mut out, group, prefix)?;
+            emit(&mut out, state, prefix)?;
         }
     }
     Ok(out.into_rows())
@@ -1123,11 +1101,12 @@ pub(in crate::engine::executor::select) fn emit_parallel_rollup_group_states(
     group_by: &[Expr],
     slots: &[super::aggregate::AggregateSlot],
     group_by_len: usize,
-    states: Vec<RollupGroupState>,
+    mut states: Vec<RollupGroupState>,
     having: Option<&Expr>,
     topk_hint: Option<RollupWindowTopKHint>,
 ) -> Result<Vec<PlanRow>, QueryError> {
     let _topk_guard = super::set_rollup_window_topk_hint(topk_hint);
+    sort_rollup_states(&mut states)?;
     let mut out = RollupEmitTarget::new(group_by, group_by_len, slots);
     for state in states {
         out.push_state(slots, group_by_len, state, having)?;
@@ -1494,12 +1473,13 @@ pub(in crate::engine::executor::select) fn aggregate_rollup_plan_rows(
     // `finer` now holds the last level (the grand total `()`, or — when
     // group_by_len == 0 — the single finest group, which is itself `()`).
     levels.push(finer);
-    for level in levels {
-        let mut states = level.into_values().collect::<Vec<_>>();
-        sort_rollup_states(&mut states)?;
-        for state in states {
-            emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
-        }
+    let mut states = levels
+        .into_iter()
+        .flat_map(|level| level.into_values())
+        .collect::<Vec<_>>();
+    sort_rollup_states(&mut states)?;
+    for state in states {
+        emit_rollup_group_state_to_target(&mut out, slots, group_by_len, state, having)?;
     }
     Ok(out.into_rows())
 }
@@ -1571,17 +1551,7 @@ fn aggregate_rollup_plan_rows_per_row(
         }
     }
     let mut states = groups.into_values().collect::<Vec<_>>();
-    states.sort_by(|left, right| right.prefix_len.cmp(&left.prefix_len));
-    let mut start = 0;
-    while start < states.len() {
-        let prefix_len = states[start].prefix_len;
-        let end = states[start..]
-            .iter()
-            .position(|state| state.prefix_len != prefix_len)
-            .map_or(states.len(), |offset| start + offset);
-        sort_rollup_states(&mut states[start..end])?;
-        start = end;
-    }
+    sort_rollup_states(&mut states)?;
     let mut out = Vec::with_capacity(states.len());
     for state in states {
         emit_rollup_group_state(&mut out, slots, group_by_len, state, having)?;
@@ -1590,10 +1560,8 @@ fn aggregate_rollup_plan_rows_per_row(
 }
 
 /// Hash aggregation deliberately uses randomized maps, but ROLLUP is emitted
-/// as an ordered sequence of grouping levels. Sort the states within each
-/// level by their SQL group-key values so row/vector/spill paths agree and the
-/// output does not depend on hash seeds. Any comparison failure is preserved
-/// rather than silently choosing an arbitrary order.
+/// in nested key order, with descendants before their subtotal. The key length
+/// distinguishes subtotal NULL markers from real NULL grouping values.
 fn sort_rollup_states<T: std::borrow::Borrow<RollupGroupState>>(
     states: &mut [T],
 ) -> Result<(), QueryError> {
@@ -1615,7 +1583,7 @@ fn sort_rollup_states<T: std::borrow::Borrow<RollupGroupState>>(
                 return ordering;
             }
         }
-        left.key_values.len().cmp(&right.key_values.len())
+        right.key_values.len().cmp(&left.key_values.len())
     });
     Ok(())
 }

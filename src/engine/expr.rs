@@ -4528,11 +4528,22 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                 empty_expr_schema(),
                 "in",
             )?;
-            let value = eval_const(expr)?;
+            let value = bind_binary_comparison_value(
+                expr,
+                empty_expr_schema(),
+                collation_id,
+                eval_const(expr)?,
+            )?;
             let mut iter = list.iter();
             with_compare_collation(collation_id, || {
                 eval_in_list(value, *negated, || match iter.next() {
-                    Some(item) => Ok(Some(eval_const(item)?)),
+                    Some(item) => bind_binary_comparison_value(
+                        item,
+                        empty_expr_schema(),
+                        collation_id,
+                        eval_const(item)?,
+                    )
+                    .map(Some),
                     None => Ok(None),
                 })
             })
@@ -20109,6 +20120,15 @@ fn expr_collation_checked(
     memo: Option<&CollationValidationMemo>,
 ) -> Option<ExprCollation> {
     if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let ty = crate::engine::expr_type::typed_constant_descriptor(args)?;
+            let info = crate::charset::resolve_collation_id(ty.collation_id?)?;
+            return Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility: ty.coercibility,
+            });
+        }
         let result_type = function_result_type(name);
         if result_type == ColumnType::Geometry {
             return Some(ExprCollation {
@@ -20307,6 +20327,24 @@ fn expr_collation_checked(
     }
 
     match expr {
+        Expr::Placeholder(index) => crate::engine::params::with_current_param(*index, |value| {
+            // Cached text shapes replace literals with parameters. Keep the
+            // same string/binary derivation as their bound literal values.
+            let (info, coercibility) = match value? {
+                Value::String(_) | Value::SmallString(_) => (connection_collation_info(), 4),
+                Value::Bytes(_) | Value::Geometry(_) => (
+                    crate::charset::resolve_collation_id(crate::charset::BINARY_COLLATION_ID)?,
+                    4,
+                ),
+                Value::Null => return None,
+                _ => (connection_collation_info(), 5),
+            };
+            Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility,
+            })
+        }),
         Expr::Literal(Literal::String(_))
         | Expr::UserVariable(_)
         | Expr::BoundValue(Value::String(_) | Value::SmallString(_)) => {

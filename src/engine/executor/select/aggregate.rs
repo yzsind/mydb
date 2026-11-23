@@ -2498,6 +2498,7 @@ impl Accumulator for FirstValueAcc {
 #[derive(Clone)]
 struct GroupConcatPart {
     ordinal: u64,
+    original_len: usize,
     sort_keys: Vec<Value>,
     distinct_key: Option<Vec<u8>>,
     bytes: Vec<u8>,
@@ -2505,6 +2506,9 @@ struct GroupConcatPart {
 }
 
 struct GroupConcatAcc {
+    // Increasing byte endpoints retain only the bounded output prefix. Empty
+    // contributions need no entry, but ordinals still count them for warnings.
+    prefix_ends: Vec<(usize, u64)>,
     parts: Vec<GroupConcatPart>,
     parts_heap_bytes: usize,
     seen_heap_bytes: usize,
@@ -2529,9 +2533,7 @@ struct GroupConcatAcc {
     /// boundary is rounded back to a UTF-8 codepoint so we never split a
     /// multibyte sequence.
     max_len_bytes: usize,
-    /// `true` when finalize truncated the joined result. Surfaced to
-    /// the executor so the warning channel can carry a `1260` "Some
-    /// rows were cut by GROUPCONCAT()" diagnostic when wiring is added.
+    /// Whether the complete input exceeds the retained output prefix.
     truncated: bool,
 }
 
@@ -2550,6 +2552,7 @@ impl Clone for GroupConcatAcc {
         let parts = self.parts.clone();
         let seen = self.seen.clone();
         Self {
+            prefix_ends: self.prefix_ends.clone(),
             parts_heap_bytes: parts.iter().map(GroupConcatPart::heap_bytes).sum(),
             seen_heap_bytes: seen.iter().map(Vec::capacity).sum(),
             parts,
@@ -2576,6 +2579,7 @@ impl GroupConcatAcc {
         max_len_bytes: usize,
     ) -> Self {
         Self {
+            prefix_ends: Vec::new(),
             parts: Vec::new(),
             parts_heap_bytes: 0,
             seen_heap_bytes: 0,
@@ -2662,6 +2666,40 @@ impl GroupConcatAcc {
         binary: bool,
         sort_keys: Vec<Value>,
     ) -> Result<(), QueryError> {
+        let original_len = bytes.len();
+        self.push_part_with_len(bytes, binary, sort_keys, original_len)
+    }
+
+    fn record_prefix_end(&mut self, end: usize, ordinal: u64) -> Result<(), QueryError> {
+        if self
+            .prefix_ends
+            .last()
+            .is_none_or(|(last, _)| *last <= self.max_len_bytes && end > *last)
+        {
+            if self.prefix_ends.len() == self.prefix_ends.capacity() {
+                let target = self.prefix_ends.capacity().saturating_mul(2).max(4);
+                let _growth = crate::engine::executor::mem_budget::force_charge_scoped(
+                    target.saturating_mul(std::mem::size_of::<(usize, u64)>()),
+                )?;
+                let additional = target - self.prefix_ends.len();
+                crate::engine::executor::mem_budget::try_reserve_vec_exact(
+                    &mut self.prefix_ends,
+                    additional,
+                    "GROUP_CONCAT warning prefix",
+                )?;
+            }
+            self.prefix_ends.push((end, ordinal));
+        }
+        Ok(())
+    }
+
+    fn push_part_with_len(
+        &mut self,
+        bytes: Vec<u8>,
+        binary: bool,
+        sort_keys: Vec<Value>,
+        original_len: usize,
+    ) -> Result<(), QueryError> {
         let distinct_key = self.distinct.then(|| match sort_keys.last() {
             Some(Value::Bytes(key)) => key.clone(),
             _ => Self::distinct_key(&bytes, binary),
@@ -2678,7 +2716,7 @@ impl GroupConcatAcc {
         if self.next_ordinal > 0 {
             self.logical_len = self.logical_len.saturating_add(self.separator.len());
         }
-        self.logical_len = self.logical_len.saturating_add(bytes.len());
+        self.logical_len = self.logical_len.saturating_add(original_len);
         self.truncated |= self.logical_len > self.max_len_bytes;
         let ordinal = self.next_ordinal;
         self.next_ordinal = self.next_ordinal.checked_add(1).ok_or_else(|| {
@@ -2688,10 +2726,12 @@ impl GroupConcatAcc {
             )
         })?;
         if !self.distinct && self.order_fields.is_empty() {
+            self.record_prefix_end(self.logical_len, ordinal + 1)?;
             if self.parts.is_empty() {
                 self.reserve_part()?;
                 self.parts.push(GroupConcatPart {
                     ordinal: 0,
+                    original_len: 0,
                     bytes: Vec::new(),
                     sort_keys: Vec::new(),
                     distinct_key: None,
@@ -2716,6 +2756,7 @@ impl GroupConcatAcc {
         }
         let mut part = GroupConcatPart {
             ordinal,
+            original_len,
             distinct_key,
             sort_keys,
             bytes,
@@ -2867,7 +2908,15 @@ impl Accumulator for GroupConcatAcc {
             total.min(self.max_len_bytes),
             "GROUP_CONCAT final output",
         )?;
+        let mut output_len = 0usize;
+        let mut truncated_row = None;
         for (index, part) in self.parts.iter().enumerate() {
+            output_len = output_len
+                .saturating_add(part.original_len)
+                .saturating_add(if index > 0 { self.separator.len() } else { 0 });
+            if output_len > self.max_len_bytes && truncated_row.is_none() {
+                truncated_row = Some(index as u64 + 1);
+            }
             if index > 0 {
                 Self::append_prefix(&mut out, &self.separator, self.max_len_bytes)?;
             }
@@ -2891,7 +2940,16 @@ impl Accumulator for GroupConcatAcc {
         }
         if self.truncated {
             let spec = crate::error::catalog::ER_CUT_VALUE_GROUP_CONCAT;
-            let message = "Row was cut by GROUP_CONCAT()";
+            let row = if !self.distinct && self.order_fields.is_empty() {
+                self.prefix_ends
+                    .iter()
+                    .find(|(end, _)| *end > self.max_len_bytes)
+                    .map(|(_, row)| *row)
+                    .unwrap_or(self.next_ordinal.max(1))
+            } else {
+                truncated_row.unwrap_or(self.parts.len() as u64 + 1)
+            };
+            let message = format!("Row {row} was cut by GROUP_CONCAT()");
             if crate::engine::expr::strict_dml_expression() {
                 return Err(spec.error(message));
             }
@@ -2910,22 +2968,27 @@ impl Accumulator for GroupConcatAcc {
         }
     }
     fn heap_bytes(&self) -> usize {
-        self.parts
+        self.prefix_ends
             .capacity()
-            .saturating_mul(std::mem::size_of::<GroupConcatPart>())
-            .saturating_add(self.parts_heap_bytes)
-            .saturating_add(self.separator.capacity())
+            .saturating_mul(std::mem::size_of::<(usize, u64)>())
             .saturating_add(
-                self.order_fields
+                self.parts
                     .capacity()
-                    .saturating_mul(std::mem::size_of::<SortField>()),
+                    .saturating_mul(std::mem::size_of::<GroupConcatPart>())
+                    .saturating_add(self.parts_heap_bytes)
+                    .saturating_add(self.separator.capacity())
+                    .saturating_add(
+                        self.order_fields
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<SortField>()),
+                    )
+                    .saturating_add(
+                        self.seen
+                            .capacity()
+                            .saturating_mul(std::mem::size_of::<Vec<u8>>() + 8),
+                    )
+                    .saturating_add(self.seen_heap_bytes),
             )
-            .saturating_add(
-                self.seen
-                    .capacity()
-                    .saturating_mul(std::mem::size_of::<Vec<u8>>() + 8),
-            )
-            .saturating_add(self.seen_heap_bytes)
     }
     fn into_any(self: Box<Self>) -> Box<dyn std::any::Any + Send> {
         self
@@ -2940,6 +3003,29 @@ impl Accumulator for GroupConcatAcc {
         if let Some(error) = other.pending_error.take() {
             self.pending_error = Some(error);
             return;
+        }
+        let previous_count = self.next_ordinal;
+        let prefix_offset =
+            self.logical_len
+                .saturating_add(if previous_count > 0 && other.next_ordinal > 0 {
+                    self.separator.len()
+                } else {
+                    0
+                });
+        let merged_count = previous_count.saturating_add(other.next_ordinal);
+        let mut merged_prefix = std::mem::take(&mut self.prefix_ends);
+        if !self.distinct && self.order_fields.is_empty() {
+            std::mem::swap(&mut merged_prefix, &mut self.prefix_ends);
+            for &(end, ordinal) in &other.prefix_ends {
+                if let Err(error) = self.record_prefix_end(
+                    prefix_offset.saturating_add(end),
+                    previous_count.saturating_add(ordinal),
+                ) {
+                    self.pending_error = Some(error);
+                    return;
+                }
+            }
+            merged_prefix = std::mem::take(&mut self.prefix_ends);
         }
         let merged_len = self
             .logical_len
@@ -2975,7 +3061,9 @@ impl Accumulator for GroupConcatAcc {
                 }
                 self.parts_heap_bytes = self.parts_heap_bytes.saturating_add(part.heap_bytes());
                 self.parts.push(part);
-            } else if let Err(error) = self.push_part(part.bytes, part.binary, part.sort_keys) {
+            } else if let Err(error) =
+                self.push_part_with_len(part.bytes, part.binary, part.sort_keys, part.original_len)
+            {
                 self.pending_error = Some(error);
                 return;
             }
@@ -2983,8 +3071,9 @@ impl Accumulator for GroupConcatAcc {
         if !self.distinct {
             self.logical_len = merged_len;
             self.truncated |= merged_len > self.max_len_bytes;
-            if has_input && self.next_ordinal == 0 {
-                self.next_ordinal = 1;
+            self.next_ordinal = if has_input { merged_count } else { 0 };
+            if self.order_fields.is_empty() {
+                self.prefix_ends = merged_prefix;
             }
         }
     }

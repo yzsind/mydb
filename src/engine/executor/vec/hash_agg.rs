@@ -11376,6 +11376,17 @@ fn update_numeric_from_typed_lane(
     true
 }
 
+/// Match the canonical converter while hoisting the common decimal divisor
+/// out of the typed lane loop. Only large mantissas/high scales need parsing.
+#[inline]
+fn decimal_variance_input(magnitude: i128, scale: u8, factor: f64) -> f64 {
+    if scale == 0 || (scale <= 22 && magnitude.unsigned_abs() <= (1u128 << 53)) {
+        magnitude as f64 / factor
+    } else {
+        crate::util::decimal::parts_to_f64(magnitude, scale)
+    }
+}
+
 /// Direct primitive-lane update for BIT_* and variance/stddev. Returns false
 /// when conversion semantics are not trivially equivalent; the caller then
 /// invokes the legacy evaluator for that lane.
@@ -11422,7 +11433,10 @@ fn update_extra_from_typed_lane(
             let factor = 10f64.powi(i32::from(*scale));
             for_lane_rows(data.len(), selection, |row| {
                 if !col.is_null(row) {
-                    variance_update(state.extra_mut(), data[row] as f64 / factor);
+                    variance_update(
+                        state.extra_mut(),
+                        decimal_variance_input(data[row] as i128, *scale, factor),
+                    );
                 }
             });
         }
@@ -11430,7 +11444,10 @@ fn update_extra_from_typed_lane(
             let factor = 10f64.powi(i32::from(*scale));
             for_lane_rows(data.len(), selection, |row| {
                 if !col.is_null(row) {
-                    variance_update(state.extra_mut(), data[row] as f64 / factor);
+                    variance_update(
+                        state.extra_mut(),
+                        decimal_variance_input(data[row] as i128, *scale, factor),
+                    );
                 }
             });
         }
@@ -11438,7 +11455,10 @@ fn update_extra_from_typed_lane(
             let factor = 10f64.powi(i32::from(*scale));
             for_lane_rows(data.len(), selection, |row| {
                 if !col.is_null(row) {
-                    variance_update(state.extra_mut(), data[row] as f64 / factor);
+                    variance_update(
+                        state.extra_mut(),
+                        decimal_variance_input(data[row] as i128, *scale, factor),
+                    );
                 }
             });
         }

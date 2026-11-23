@@ -592,7 +592,7 @@ impl<E: QueryEngine> Handler<E> {
                 let a: SessionArgs = decode(raw)?;
                 let session = self.state.sql.session(&a.session_id, &lease.identity)?;
                 if name == "close_session" {
-                    session.close().await;
+                    session.close().await?;
                     return Ok(
                         json!({"session_id":a.session_id,"closed":true,"transaction_state":"idle"}),
                     );

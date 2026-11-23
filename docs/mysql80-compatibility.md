@@ -1084,6 +1084,8 @@ restoring raw system privilege-table DDL/DML: use account/role DDL and GRANT/REV
 for those catalogs; unsupported direct catalog writes remain explicit errors.
 
 - **Multiple statements per packet**: a single `COM_QUERY` under `CLIENT_MULTI_STATEMENTS` can mix session state, DDL, and DML; autocommit DML each forms its own GTID/XID, explicit transactions are aggregated and published once, and DDL writes an independent QUERY_EVENT at implicit-commit boundaries; the first error stops processing and subsequent statements are not logged.
+- **Semisynchronous transport**: semi-sync binlog dumps require an uncompressed connection. A compressed semi-sync dump returns error 1235 before sending events; it never silently degrades ACK handling. Ordinary compressed SQL and asynchronous binlog dumps remain supported.
+- **Packet limits**: existing connections retain their `max_allowed_packet` snapshot, including accumulated prepared long data. `SET GLOBAL max_allowed_packet` seeds new connections; RESET CONNECTION and CHANGE USER refresh session defaults.
 - **Semisynchronous source side**: `rpl_semi_sync_source_*` (+ the legacy `master_*` aliases) are real sysvars, `Rpl_semi_sync_source_*` SHOW STATUS is real, and the synchronous-ack release-commit loop works end to end. **OFF by default**.
 - ❌ The source supports only `binlog_row_image=FULL` (no MINIMAL/NOBLOB or `PARTIAL_JSON`); ❌ the source supports only the ROW format (no STATEMENT/MIXED).
 

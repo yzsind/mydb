@@ -3120,6 +3120,7 @@ pub(super) fn prepare_select_for_planning(
     // validation below — otherwise a legal `GROUP BY <alias>` is
     // rejected as an unknown column, and the row-pipeline paths that
     // evaluate `stmt.group_by` directly would never see the resolution.
+    planner::expand_grouped_select_wildcards(db, stmt)?;
     planner::resolve_group_by_refs(db, stmt);
     // Positional references may resolve to a constant select item (for
     // example ClickBench's `SELECT 1, url ... GROUP BY 1, url`). Prune that
