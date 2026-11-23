@@ -7337,11 +7337,10 @@ where
                 values[2] = Value::String("en_US".into());
             }
             null_if_any(values, |values| {
-                // MySQL 8.0: D is clamped to [0, 30]; negative D is 0
-                // and D > 30 is 30. Without this clamp the exact decimal
-                // kernel would raise 1690 for scale > 38, which MySQL
-                // itself never does for FORMAT.
-                let raw_d = integer_arg_value(&values[1])?;
+                // MySQL narrows D to a signed 32-bit integer before
+                // clamping it to [0, 30]. Preserve that order even when
+                // integer conversion saturated an overflowing DECIMAL.
+                let raw_d = integer_arg_value(&values[1])? as i32;
                 let decimals = raw_d.clamp(0, 30) as usize;
                 let locale = values
                     .get(2)
@@ -10470,6 +10469,7 @@ pub(crate) fn clamp_round_decimals(d: i64) -> i32 {
 /// must not share it; functions such as `BIN`/`OCT` deliberately truncate
 /// and keep using `int_value`.
 fn integer_arg_value(value: &Value) -> Result<i64, QueryError> {
+    use crate::util::decimal::ExactDecimal;
     use num_traits::{Signed, ToPrimitive};
 
     match value {
@@ -10486,14 +10486,99 @@ fn integer_arg_value(value: &Value) -> Result<i64, QueryError> {
                 )
             })?;
             let rounded = crate::util::decimal::rescale_exact(exact, 0, true);
-            let (magnitude, _) = rounded.into_big_parts();
-            Ok(magnitude.to_i64().unwrap_or(if magnitude.is_negative() {
-                i64::MIN
-            } else {
-                i64::MAX
-            }))
+            // Keep fixed-width coefficients allocation-free. Formatting
+            // the original argument is only necessary on overflow.
+            Ok(match rounded {
+                ExactDecimal::I64(magnitude, _) => magnitude,
+                ExactDecimal::I128(magnitude, _) => i64::try_from(magnitude)
+                    .unwrap_or_else(|_| decimal_integer_arg_overflow(value, magnitude < 0)),
+                ExactDecimal::Big(magnitude, _) => magnitude.to_i64().unwrap_or_else(|| {
+                    decimal_integer_arg_overflow(value, magnitude.is_negative())
+                }),
+            })
         }
         _ => int_value(value),
+    }
+}
+
+#[cold]
+fn decimal_integer_arg_overflow(value: &Value, negative: bool) -> i64 {
+    crate::engine::api::push_statement_warning(
+        crate::error::ConditionLevel::Warning,
+        crate::error::catalog::ER_TRUNCATED_WRONG_VALUE,
+        format!(
+            "Truncated incorrect DECIMAL value: '{}'",
+            value.to_display_string()
+        ),
+    );
+    if negative {
+        i64::MIN
+    } else {
+        i64::MAX
+    }
+}
+
+#[cfg(test)]
+mod integer_argument_tests {
+    use super::*;
+
+    #[test]
+    fn decimal_lanes_round_before_checking_signed_integer_bounds() {
+        for (magnitude, scale, expected, overflow) in [
+            (5i128, 1, 1, false),
+            (25, 1, 3, false),
+            (-25, 1, -3, false),
+            (2, 0, 2, false),
+            (1, 72, 0, false),
+            (92_233_720_368_547_758_074, 1, i64::MAX, false),
+            (92_233_720_368_547_758_075, 1, i64::MAX, true),
+            (-92_233_720_368_547_758_084, 1, i64::MIN, false),
+            (-92_233_720_368_547_758_085, 1, i64::MIN, true),
+            (i128::MAX, 0, i64::MAX, true),
+            (i128::MIN, 0, i64::MIN, true),
+        ] {
+            let text = crate::util::decimal::format_decimal_parts(magnitude, scale);
+            let mut values = vec![
+                Value::Decimal128(magnitude, scale),
+                Value::DecimalWide(Box::new(crate::types::DecimalWide {
+                    magnitude: magnitude.into(),
+                    scale,
+                })),
+                Value::Decimal(text.clone()),
+            ];
+            if let Ok(compact) = i64::try_from(magnitude) {
+                values.push(Value::DecimalCompact(compact, scale));
+            }
+            for value in values {
+                crate::engine::api::clear_statement_warnings();
+                assert_eq!(integer_arg_value(&value).unwrap(), expected, "{value:?}");
+                let warnings = crate::engine::api::take_statement_warnings();
+                assert_eq!(warnings.len(), usize::from(overflow), "{value:?}");
+                if overflow {
+                    assert!(warnings[0].is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE));
+                    assert_eq!(
+                        warnings[0].message(),
+                        format!("Truncated incorrect DECIMAL value: '{text}'")
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn approximate_arguments_round_ties_to_even_and_strings_still_truncate() {
+        crate::engine::api::clear_statement_warnings();
+        for (number, expected) in [(0.5, 0), (1.5, 2), (2.5, 2), (-1.5, -2), (-2.5, -2)] {
+            for value in [Value::Float(number as f32), Value::Double(number)] {
+                assert_eq!(integer_arg_value(&value).unwrap(), expected);
+                assert_eq!(int_value(&value).unwrap(), number as i64);
+            }
+        }
+        assert!(crate::engine::api::take_statement_warnings().is_empty());
+        assert_eq!(integer_arg_value(&Value::String("1.5".into())).unwrap(), 1);
+        let warnings = crate::engine::api::take_statement_warnings();
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].is(crate::error::catalog::ER_TRUNCATED_WRONG_VALUE));
     }
 }
 

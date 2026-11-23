@@ -554,3 +554,112 @@ fn mysql_integer_argument_coercion_for_round_truncate_format_and_conv() {
         assert_eq!(*value, Value::Int(1), "column {index}");
     }
 }
+
+#[test]
+fn mysql_integer_argument_decimal_overflow_preserves_diagnostics() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    let mut session = SessionContext::default();
+    for argument in [
+        "9223372036854775807.5",
+        "9223372036854775808.0",
+        "-9223372036854775808.5",
+        "99999999999999999999999999999999999999999999999999999999999999999",
+        "-99999999999999999999999999999999999999999999999999999999999999999",
+        "9999999999999999999999999999999999999999.5",
+        "-9999999999999999999999999999999999999999.5",
+    ] {
+        for sql in [
+            format!("SELECT ROUND(123.456,{argument})"),
+            format!("SELECT TRUNCATE(123.456,{argument})"),
+            format!("SELECT FORMAT(123.456,{argument})"),
+            format!("SELECT CONV('10',{argument},10)"),
+            format!("SELECT CONV('10',16,{argument})"),
+        ] {
+            // Cached expressions must replay conversion diagnostics too.
+            for _ in 0..2 {
+                engine.execute_with_session(&mut session, &sql).unwrap();
+                let QueryResponse::ResultSet(warnings) = engine
+                    .execute_with_session(&mut session, "SHOW WARNINGS")
+                    .unwrap()
+                else {
+                    panic!("expected warnings: {sql}");
+                };
+                assert!(!warnings.rows.is_empty(), "missing overflow warning: {sql}");
+                for warning in warnings.rows {
+                    assert_eq!(warning[0].to_display_string(), "Warning", "{sql}");
+                    assert_eq!(warning[1].to_display_string(), "1292", "{sql}");
+                    assert_eq!(
+                        warning[2].to_display_string(),
+                        format!("Truncated incorrect DECIMAL value: '{argument}'"),
+                        "{sql}"
+                    );
+                }
+            }
+        }
+    }
+    engine
+        .execute_with_session(
+            &mut session,
+            "SELECT ROUND(123.456,9223372036854775807.4), \
+                    TRUNCATE(123.456,-9223372036854775808.4)",
+        )
+        .unwrap();
+    let QueryResponse::ResultSet(warnings) = engine
+        .execute_with_session(&mut session, "SHOW WARNINGS")
+        .unwrap()
+    else {
+        panic!("expected a warning result set");
+    };
+    assert!(warnings.rows.is_empty());
+}
+
+#[test]
+fn mysql_format_narrows_integer_argument_before_clamping() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    for (argument, expected) in [
+        ("2147483647.5", "123"),
+        ("4294967296.5", "123.5"),
+        ("9223372036854775808.0", "123"),
+        ("-9223372036854775808.5", "123"),
+    ] {
+        assert_eq!(
+            row(&engine, &format!("SELECT FORMAT(123.456,{argument})")),
+            vec![Value::String(expected.into())],
+            "{argument}"
+        );
+    }
+}
+
+#[test]
+fn mysql_integer_argument_coercion_for_decimal_and_float_columns() {
+    std::fs::create_dir_all("/tmp/mydb").unwrap();
+    let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+    let engine = open_test_engine(dir.path());
+    engine
+        .execute("CREATE TABLE integer_args(d DECIMAL(5,1), f FLOAT, z DOUBLE)")
+        .unwrap();
+    engine
+        .execute(
+            "INSERT INTO integer_args VALUES \
+             (0.5,0.5,0.5),(1.5,1.5,1.5),(2.5,2.5,2.5),(-1.5,-1.5,-1.5)",
+        )
+        .unwrap();
+    assert_eq!(
+        row(
+            &engine,
+            "SELECT SUM(ROUND(123.456,d))=470.416, \
+                    SUM(ROUND(123.456,f))=469.92, \
+                    SUM(ROUND(123.456,z))=469.92, \
+                    SUM(TRUNCATE(123.456,d))=470.306 FROM integer_args",
+        ),
+        vec![Value::Int(1); 4]
+    );
+    assert_eq!(
+        row(&engine, "SELECT BIN(1.5),OCT(1.5),BIN(1.5e0),OCT(1.5e0)"),
+        vec![Value::String("1".into()); 4]
+    );
+}
