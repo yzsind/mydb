@@ -5,6 +5,10 @@ on:
     tags: ['v*']
   workflow_dispatch:
     inputs:
+      run_asan:
+        description: Run the ASan fuzz job
+        type: boolean
+        default: true
       seconds:
         description: 'Per-target fuzz seconds (keep at or below 400 to fit the job timeout)'
         type: number
@@ -30,9 +34,21 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: tsan
+      - name: Verify release source fingerprint
+        run: |
+          python3 - <<'PYTHON'
+          from pathlib import Path
+          import sys
+          sys.path.insert(0, 'scripts')
+          from build_linux_glibc217 import source_hash
+          actual = source_hash(Path.cwd())
+          assert actual == 'd9425b7480a0b8e6042e86ca1189747a38936171dd3036e323b82ffabdfa491b', actual
+          print('Release source fingerprint:', actual)
+          PYTHON
       - run: scripts/run_tsan_btree.sh
 
   decoder-fuzz:
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.run_asan }}
     name: ASan decoder fuzz deep run
     runs-on: ubuntu-24.04
     timeout-minutes: 120
