@@ -143,10 +143,36 @@ impl FileMapping {
         self.address
     }
 
-    #[cfg(test)]
+    #[cfg(any(target_os = "linux", test))]
     #[inline]
     pub(crate) fn len(&self) -> usize {
         self.len
+    }
+
+    /// Advisory only; callers do not depend on this for correctness.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prefetch_range(&self, offset: usize, bytes: usize) {
+        if offset >= self.len || bytes == 0 {
+            return;
+        }
+        static PAGE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let page = *PAGE.get_or_init(|| {
+            // SAFETY: sysconf has no pointer arguments.
+            usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })
+                .unwrap_or(4096)
+                .max(1)
+        });
+        let start = offset / page * page;
+        let end = offset.saturating_add(bytes).min(self.len).div_ceil(page) * page;
+        // SAFETY: the view owns the page-rounded range. This only queues
+        // reads; it neither changes protection nor alters mapped bytes.
+        unsafe {
+            libc::madvise(
+                self.address.add(start).cast(),
+                end - start,
+                libc::MADV_WILLNEED,
+            );
+        }
     }
 
     /// Advisory only; callers do not depend on this for correctness.

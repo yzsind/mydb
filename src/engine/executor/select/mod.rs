@@ -4874,7 +4874,19 @@ pub(super) fn describe_statement_columns<'q>(
 ) -> Result<Vec<Column>, QueryError> {
     let statement = statement.into();
     match statement {
-        crate::parser::QueryRef::Select(stmt) => describe_select_columns(db, stmt),
+        crate::parser::QueryRef::Select(stmt) => {
+            // PREPARE binds constant and column charset constraints without
+            // executing the query, including SQL and binary protocol prepares.
+            validate_select_static_collations(stmt)?;
+            if stmt.derived.is_none() && stmt.joins.is_empty() && stmt.from.len() == 1 {
+                if let Ok(table) = db.table(&stmt.from[0].name) {
+                    validate_select_collations_with(stmt, |expr| {
+                        crate::engine::expr::validate_expr_collations(expr, &table)
+                    })?;
+                }
+            }
+            describe_select_columns(db, stmt)
+        }
         crate::parser::QueryRef::Rrf(rrf) => hybrid::describe_columns(db, rrf),
         crate::parser::QueryRef::SetOperation(set) => {
             let left = describe_statement_columns(db, session, &set.left)?;

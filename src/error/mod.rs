@@ -340,6 +340,18 @@ impl QueryError {
         self
     }
 
+    /// Replace the terminal input-row ordinal on a conversion error. Callers
+    /// apply this only after failure, leaving successful row loops allocation-free.
+    #[cold]
+    pub(crate) fn with_input_row_number(mut self, row: usize) -> Self {
+        if let Some((prefix, previous)) = self.message.rsplit_once(" at row ") {
+            if !previous.is_empty() && previous.bytes().all(|byte| byte.is_ascii_digit()) {
+                self.message = format!("{prefix} at row {row}");
+            }
+        }
+        self
+    }
+
     pub(crate) fn map_message(mut self, map: impl FnOnce(&str) -> String) -> Self {
         self.message = map(&self.message);
         self

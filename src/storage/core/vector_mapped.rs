@@ -12,6 +12,10 @@ pub(crate) struct MappedVectorNavigation {
     /// Per-dimension navigation scan code named by `meta`, if any.
     codec: Option<std::sync::Arc<crate::engine::vector::scan_codes::ScanCodec>>,
     source_revision: u64,
+    exact_navigation: bool,
+    bounded_streaming: bool,
+    prefetch: Option<crate::engine::vector::spill_rows::MappedPrefetch>,
+    random_navigation: std::sync::atomic::AtomicBool,
     verified: Vec<AtomicU64>,
     records: Option<MappedRecordCache>,
     norms: Option<MappedScalarCache>,
@@ -163,6 +167,18 @@ impl Drop for VectorNavigationWrite<'_> {
 }
 
 impl VectorIndexFile {
+    /// A complete private navigator no longer reads the interleaved source.
+    /// Release its clean mapping/cache rather than competing for both images.
+    pub(crate) fn retire_navigation_source_cache(&self) {
+        let Some(mut view) = self.mapped_navigation.try_write() else {
+            return;
+        };
+        view.take();
+        if let Some(file) = self.file.lock().as_ref() {
+            crate::platform::file::advise_completed_read(file);
+        }
+    }
+
     /// Optional cache reclamation must not wait for a reader that may itself
     /// be requesting memory admission while holding the mapping read guard.
     pub(crate) fn evict_navigation_mapping(&self) -> bool {
@@ -200,6 +216,12 @@ impl VectorIndexFile {
     }
 
     pub(crate) fn prepare_navigation_mapping(&self) -> Result<bool, QueryError> {
+        self.prepare_navigation_mapping_for_target(
+            crate::engine::executor::mem_budget::memory_target_bytes(),
+        )
+    }
+
+    fn prepare_navigation_mapping_for_target(&self, target: usize) -> Result<bool, QueryError> {
         use crate::engine::executor::mem_budget::{
             ControlledMemoryCategory, ControlledMemoryCharge,
         };
@@ -264,12 +286,21 @@ impl VectorIndexFile {
                 "truncated vector navigation file",
             ));
         }
-        // An interleaved f32/SQ8 image has a wider random-I/O working set
-        // than the compact navigator. Preserve that path for indexes larger
-        // than the configured working-set target instead of forcing mmap.
-        if len > crate::engine::executor::mem_budget::memory_target_bytes() {
+        // Calibrated FLOAT32 indexes already have a compact navigator that
+        // avoids the interleaved vector pages. Preserve that preferred path
+        // when it is available, including its bounded spill fallback.
+        if len > target
+            && native_geometry(meta.dim as usize).is_none()
+            && meta.nav_quant_valid
+            && meta.nav_exact_nodes == 0
+        {
             return Ok(false);
         }
+        // Virtual extent is not resident memory. Let the OS reclaim cold
+        // pages instead of duplicating random reads in the data buffer.
+        // Preserve the exact traversal used by the oversized per-axis
+        // fallback; admission must not silently change its scoring space.
+        let exact_navigation = len > target && codec.is_some() && !meta.nav_quant_valid;
         let words = (len / PAGE_SIZE).div_ceil(64);
         // Grow the FLOAT32 query memo under the native path's bounded budget.
         // A larger optional memo must never prevent the mapping's admission:
@@ -354,6 +385,17 @@ impl VectorIndexFile {
             })
             .flatten()
         });
+        // Keep the existing read policy when the complete image fits its
+        // working-set target. Streaming hints replace the oversized image's
+        // former buffered fallback, rather than perturbing resident readers.
+        let prefetch = (len > target)
+            .then(|| {
+                crate::engine::vector::spill_rows::MappedPrefetch::for_view(
+                    &image,
+                    crate::engine::executor::mem_budget::memory_target_bytes() / 64,
+                )
+            })
+            .flatten();
         let mapping = MappedVectorNavigation {
             address: image.as_ptr().cast(),
             _mapping: image,
@@ -361,6 +403,10 @@ impl VectorIndexFile {
             meta,
             codec,
             source_revision: revision,
+            exact_navigation,
+            bounded_streaming: len > target,
+            prefetch,
+            random_navigation: std::sync::atomic::AtomicBool::new(false),
             verified: (0..words).map(|_| AtomicU64::new(0)).collect(),
             records,
             norms,
@@ -379,6 +425,48 @@ impl VectorIndexFile {
 }
 
 impl MappedVectorNavigation {
+    pub(crate) fn refresh_prefetch(&self) {
+        // Native startup scans build adjacency/payload caches in file order.
+        // Retain normal readahead until actual random graph probes begin.
+        if self.bounded_streaming
+            && !self.random_navigation.load(Ordering::Relaxed)
+            && self
+                .random_navigation
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+        {
+            self._mapping.advise_random();
+        }
+        if let Some(prefetch) = &self.prefetch {
+            prefetch.refresh_view(&self._mapping);
+        }
+    }
+
+    pub(crate) fn prefetch_record(&self, vid: VecId) {
+        let page = vid_page(vid) as usize;
+        if page != 0 && page < self.len / PAGE_SIZE {
+            if let Some(prefetch) = &self.prefetch {
+                let (offset, bytes) = self.prefetch_record_range(vid);
+                prefetch.prefetch_view(&self._mapping, offset, bytes);
+            }
+        }
+    }
+
+    fn prefetch_record_range(&self, vid: VecId) -> (usize, usize) {
+        let page = vid_page(vid) as usize * PAGE_SIZE;
+        if let Some(offset) = self.records.as_ref().and_then(|cache| cache.get(vid)) {
+            // A memoized location has already passed whole-page checksum
+            // and record bounds validation. Score only needs the header and
+            // payload; adjacency is demanded if this node is later expanded.
+            let bytes = native_geometry(self.meta.dim as usize)
+                .map_or(10 + self.meta.dim as usize * 4, |(datatype, dimension)| {
+                    18 + datatype.payload_len(dimension)
+                });
+            return (page + offset, bytes);
+        }
+        // First access must validate every byte covered by the page checksum.
+        (page, PAGE_SIZE)
+    }
     pub(crate) fn source_revision(&self) -> u64 {
         self.source_revision
     }
@@ -450,14 +538,20 @@ impl MappedVectorNavigation {
         query_norm: i32,
         biased: Option<&crate::engine::vector::distance::BiasedSq8Dot>,
     ) -> Result<Option<(RowId, bool, f64)>, QueryError> {
-        Ok(self.navigation_record(vid)?.map(|(row, deleted, codes, norm)| {
-            let dot = if let Some(biased) = biased {
-                biased.dot([codes])[0] - self.sq8_bias(vid, codes)
-            } else {
-                crate::engine::vector::distance::dot_i8(query_codes, codes)
-            };
-            (row, deleted, self.navigation_distance(query_norm, norm, dot))
-        }))
+        Ok(self
+            .navigation_record(vid)?
+            .map(|(row, deleted, codes, norm)| {
+                let dot = if let Some(biased) = biased {
+                    biased.dot([codes])[0] - self.sq8_bias(vid, codes)
+                } else {
+                    crate::engine::vector::distance::dot_i8(query_codes, codes)
+                };
+                (
+                    row,
+                    deleted,
+                    self.navigation_distance(query_norm, norm, dot),
+                )
+            }))
     }
 
     pub(crate) fn navigation_nodes4(
@@ -487,14 +581,21 @@ impl MappedVectorNavigation {
         };
         Ok(std::array::from_fn(|index| {
             rows[index].map(|(row, deleted, _, norm)| {
-                (row, deleted, self.navigation_distance(query_norm, norm, dots[index]))
+                (
+                    row,
+                    deleted,
+                    self.navigation_distance(query_norm, norm, dots[index]),
+                )
             })
         }))
     }
 
     #[inline]
     fn sq8_bias(&self, vid: VecId, codes: &[i8]) -> i32 {
-        let cell = self.records.as_ref().and_then(|records| records.position(vid))
+        let cell = self
+            .records
+            .as_ref()
+            .and_then(|records| records.position(vid))
             .and_then(|position| self.sq8_biases.as_ref()?.values.get(position));
         let cached = cell.map_or(0, |cell| cell.load(Ordering::Relaxed));
         if cached != 0 {
@@ -514,7 +615,10 @@ impl MappedVectorNavigation {
     }
 
     #[inline]
-    fn navigation_record(&self, vid: VecId) -> Result<Option<(RowId, bool, &[i8], i32)>, QueryError> {
+    fn navigation_record(
+        &self,
+        vid: VecId,
+    ) -> Result<Option<(RowId, bool, &[i8], i32)>, QueryError> {
         let (page, offset) = self.record(vid)?;
         let flags = page[offset];
         if flags & REC_FLAG_INITIALIZED == 0 {
@@ -850,6 +954,7 @@ impl MappedVectorNavigation {
         // Exact probes need the vector prefix, not only the page header. A
         // validated location can overlap those misses with neighboring rows.
         for &vid in vids {
+            self.prefetch_record(vid);
             let page = vid_page(vid) as usize;
             if page < self.len / PAGE_SIZE {
                 // SAFETY: prefetch targets an address inside the live mapping.
@@ -1053,6 +1158,10 @@ impl MappedVectorNavigation {
         k: usize,
         ef: usize,
     ) -> Result<Vec<(RowId, f64)>, QueryError> {
+        self.refresh_prefetch();
+        if self.exact_navigation {
+            return self.search_impl::<true>(query, k, ef, None);
+        }
         if let Some(codec) = &self.codec {
             if self.meta.nav_exact_nodes < self.meta.node_count && query.len() == codec.dimension()
             {

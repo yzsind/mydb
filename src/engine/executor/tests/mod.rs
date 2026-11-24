@@ -610,3 +610,5 @@ mod dump_compatibility;
 mod partial_index;
 
 mod fulltext_incremental;
+
+mod github_issues_1123;

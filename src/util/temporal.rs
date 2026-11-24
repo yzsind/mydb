@@ -145,6 +145,9 @@ pub fn parse_delimited_datetime_components(s: &str) -> Option<DateTimeParts> {
         if let Some(index) = trimmed.bytes().position(|byte| matches!(byte, b' ' | b'T')) {
             let date = &trimmed[..index];
             let time = trimmed[index + 1..].trim();
+            // Redundant punctuation before the hour is accepted with a SQL
+            // deprecation diagnostic, rather than interpreted as a negative hour.
+            let time = time.trim_start_matches(|ch: char| ch.is_ascii_punctuation());
             if time.is_empty() || time.bytes().any(|byte| byte.is_ascii_whitespace()) {
                 return None;
             }

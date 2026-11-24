@@ -4466,6 +4466,10 @@ mod vector_page_tests {
                     .expect("small optional location cache");
                 assert_eq!(cache.get(good), None);
                 assert_eq!(cache.get(bad), None);
+                assert_eq!(
+                    view.prefetch_record_range(good),
+                    (vid_page(good) as usize * PAGE_SIZE, PAGE_SIZE)
+                );
                 for id in [good, bad, vid_make(0, 0), vid_make(u32::MAX as u64, 255)] {
                     view.prefetch_navigation_node(id);
                 }
@@ -4487,6 +4491,17 @@ mod vector_page_tests {
                     }
                 });
                 assert!(cache.get(good).is_some());
+                let (start, bytes) = view.prefetch_record_range(good);
+                assert_eq!(
+                    start,
+                    vid_page(good) as usize * PAGE_SIZE + cache.get(good).unwrap()
+                );
+                assert_eq!(bytes, 10 + view.meta.dim as usize * 4);
+                assert!(bytes < PAGE_SIZE);
+                assert_eq!(
+                    view.prefetch_record_range(bad),
+                    (vid_page(bad) as usize * PAGE_SIZE, PAGE_SIZE)
+                );
                 view.prefetch_navigation_node(good);
                 view.prefetch_navigation_node(bad);
                 assert_eq!(cache.get(bad), None);
@@ -4512,6 +4527,19 @@ mod vector_page_tests {
             graph.suppress_query_navigation_builds_for_test();
             let query = vectors[17].clone();
             let expected = graph.search(&query, 10, 64).unwrap();
+            if metric == 0 {
+                let meta = graph.file().meta();
+                assert!(meta.nav_quant_valid && meta.nav_exact_nodes == 0);
+                graph.file().evict_navigation_mapping();
+                assert!(!graph
+                    .file()
+                    .prepare_navigation_mapping_for_target(1)
+                    .unwrap());
+            }
+            assert!(graph.file().prepare_navigation_mapping().unwrap());
+            assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
+            graph.file().retire_navigation_source_cache();
+            assert!(graph.file().with_navigation_mapping(|_| ()).is_none());
             assert!(graph.file().prepare_navigation_mapping().unwrap());
             assert_eq!(graph.search(&query, 10, 64).unwrap(), expected);
             // Exercise an exact-query memo hit before revoking the view.
@@ -4595,7 +4623,7 @@ mod vector_page_tests {
                 .prefix("scan-code-nav-")
                 .tempdir_in("/tmp/mydb")
                 .unwrap();
-            let dim = 16usize;
+            let dim = 96usize;
             let mut vectors = gen_vectors(160, dim, 4242 + u64::from(metric));
             for v in &mut vectors {
                 for x in &mut v[dim / 2..] {
@@ -4674,6 +4702,10 @@ mod vector_page_tests {
             };
             let check = |graph: &crate::engine::vector::hnsw_paged::PagedHnsw| {
                 assert!(graph.file().prepare_navigation_mapping().unwrap());
+                assert!(!graph
+                    .file()
+                    .with_navigation_mapping(|view| view.bounded_streaming)
+                    .unwrap());
                 assert!(graph
                     .file()
                     .with_navigation_mapping(|view| view.codec.is_some())
@@ -4698,6 +4730,38 @@ mod vector_page_tests {
                         .count();
                 }
                 assert!(hits >= 36, "metric {metric}: recall {hits}/40");
+                // A virtual extent larger than the advisory working set
+                // must retain the fallback's exact traversal, not switch
+                // to the per-axis approximation during cache admission.
+                assert!(graph.file().evict_navigation_mapping());
+                let probes = [3usize, 41, 97, 150];
+                let expected: Vec<_> = probes
+                    .iter()
+                    .map(|&q| graph.search(&vectors[q], 10, 96).unwrap())
+                    .collect();
+                assert!(graph
+                    .file()
+                    .prepare_navigation_mapping_for_target(1)
+                    .unwrap());
+                assert!(graph
+                    .file()
+                    .with_navigation_mapping(|view| view.exact_navigation)
+                    .unwrap());
+                assert!(graph
+                    .file()
+                    .with_navigation_mapping(|view| view.bounded_streaming)
+                    .unwrap());
+                for (&q, expected) in probes.iter().zip(&expected) {
+                    let actual = graph.search(&vectors[q], 10, 96).unwrap();
+                    assert_eq!(
+                        actual.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        expected.iter().map(|x| x.0).collect::<Vec<_>>(),
+                        "metric {metric}"
+                    );
+                    for (actual, expected) in actual.iter().zip(expected) {
+                        assert!((actual.1 - expected.1).abs() <= 1e-6 * expected.1.abs().max(1.0));
+                    }
+                }
             };
             check(&graph);
             // A reopened file decodes the codec from its overflow chain.

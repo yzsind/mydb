@@ -654,8 +654,8 @@ fn show_create_table_echoes_column_collation() {
         "column inheriting the table default renders bare: {ddl}"
     );
     assert!(
-        ddl.contains("`b` varchar(10) COLLATE utf8mb4_bin"),
-        "explicit non-default collation echoes COLLATE only: {ddl}"
+        ddl.contains("`b` varchar(10) CHARACTER SET utf8mb4 COLLATE utf8mb4_bin"),
+        "a different column collation echoes its character set and collation: {ddl}"
     );
     assert!(
         ddl.contains("`c` varchar(10) CHARACTER SET latin1"),

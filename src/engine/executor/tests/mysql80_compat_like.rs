@@ -131,8 +131,8 @@ fn explicit_collate_predicates_match_legacy_across_indexes_types_and_parameters(
         "dt COLLATE utf8mb4_bin LIKE '%123%'",
         "e COLLATE utf8mb4_bin LIKE '%alpha%'",
         "j COLLATE utf8mb4_bin LIKE '%数据%'",
-        "bt COLLATE utf8mb4_bin LIKE '%'",
-        "b COLLATE utf8mb4_bin LIKE '%'",
+        "bt COLLATE `binary` LIKE '%'",
+        "b COLLATE `binary` LIKE '%'",
     ] {
         let ast = crate::parser::parse_expr_fragment(predicate).unwrap();
         let expected = source

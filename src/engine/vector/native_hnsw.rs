@@ -34,13 +34,220 @@ struct Node {
     value: Option<VectorValue>,
     links: Vec<Vec<usize>>,
 }
+/// Immutable dense ordinals, packed without changing edge order or identity.
+#[derive(Debug)]
+struct NativeEdges {
+    bytes: Vec<u8>,
+    wide: Vec<u32>,
+    bits: usize,
+    len: usize,
+    capacity: usize,
+    nodes: usize,
+}
+impl NativeEdges {
+    fn width(nodes: usize) -> usize {
+        if nodes <= 1 << 16 {
+            16
+        } else if nodes <= 1 << 20 {
+            20
+        } else if nodes <= 1 << 24 {
+            24
+        } else {
+            32
+        }
+    }
+    fn bytes_for(capacity: usize, nodes: usize) -> Option<usize> {
+        if Self::width(nodes) == 20 {
+            capacity.checked_add(1)?.checked_div(2)?.checked_mul(5)
+        } else {
+            capacity.checked_mul(Self::width(nodes) / 8)
+        }
+    }
+    fn new(capacity: usize, nodes: usize, compact: bool) -> Result<Self, QueryError> {
+        if !compact {
+            let mut wide = Vec::new();
+            wide.try_reserve_exact(capacity).map_err(|_| {
+                crate::storage::error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "native adjacency allocation failed",
+                )
+            })?;
+            return Ok(Self {
+                bytes: Vec::new(),
+                wide,
+                bits: 32,
+                len: 0,
+                capacity,
+                nodes,
+            });
+        }
+        let length = Self::bytes_for(capacity, nodes).ok_or_else(super::persistence::corrupt)?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(length).map_err(|_| {
+            crate::storage::error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "native compact adjacency allocation failed",
+            )
+        })?;
+        Ok(Self {
+            bytes,
+            wide: Vec::new(),
+            bits: Self::width(nodes),
+            len: 0,
+            capacity,
+            nodes,
+        })
+    }
+    fn push(&mut self, value: usize) -> Result<(), QueryError> {
+        if self.len >= self.capacity || value >= self.nodes || value > u32::MAX as usize {
+            return Err(super::persistence::corrupt());
+        }
+        if self.bits == 32 && self.bytes.capacity() == 0 {
+            self.wide.push(value as u32);
+            self.len += 1;
+            return Ok(());
+        }
+        let needed = if self.bits == 20 {
+            (self.len / 2 + 1) * 5
+        } else {
+            (self.len + 1) * (self.bits / 8)
+        };
+        if self.bytes.len() < needed {
+            self.bytes.resize(needed, 0);
+        }
+        if self.bits == 20 {
+            let pair = self.len / 2 * 5;
+            let offset = pair + (self.len % 2) * 2;
+            self.bytes[offset..offset + 2].copy_from_slice(&(value as u16).to_le_bytes());
+            let shift = (self.len % 2) * 4;
+            self.bytes[pair + 4] =
+                (self.bytes[pair + 4] & !(15 << shift)) | (((value >> 16) as u8) << shift);
+        } else {
+            let width = self.bits / 8;
+            self.bytes[self.len * width..(self.len + 1) * width]
+                .copy_from_slice(&(value as u32).to_le_bytes()[..width]);
+        }
+        self.len += 1;
+        Ok(())
+    }
+    fn allocated_bytes(&self) -> usize {
+        self.bytes.capacity() + self.wide.capacity() * 4
+    }
+    fn wide_slice(&self, begin: usize, end: usize) -> Option<&[u32]> {
+        (!self.wide.is_empty() || self.capacity == 0).then(|| &self.wide[begin..end])
+    }
+    #[inline]
+    fn get(&self, index: usize) -> usize {
+        debug_assert!(index < self.len);
+        if !self.wide.is_empty() {
+            return self.wide[index] as usize;
+        }
+        if self.bits == 20 {
+            let pair = index / 2 * 5;
+            let offset = pair + (index % 2) * 2;
+            usize::from(u16::from_le_bytes([
+                self.bytes[offset],
+                self.bytes[offset + 1],
+            ])) | (usize::from((self.bytes[pair + 4] >> ((index % 2) * 4)) & 15) << 16)
+        } else {
+            let offset = index * (self.bits / 8);
+            let mut value = [0u8; 4];
+            value[..self.bits / 8].copy_from_slice(&self.bytes[offset..offset + self.bits / 8]);
+            u32::from_le_bytes(value) as usize
+        }
+    }
+}
+
+#[derive(Debug)]
+enum NativePayloads {
+    Resident(Vec<u8>),
+    Mapped {
+        bytes: super::spill_rows::MappedSpillBytes,
+    },
+}
+impl std::ops::Deref for NativePayloads {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        match self {
+            Self::Resident(bytes) => bytes,
+            Self::Mapped { bytes, .. } => bytes,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct NativeUpper {
+    bits: Vec<u64>,
+    ranks: Vec<usize>,
+    starts: Vec<usize>,
+    offsets: Vec<usize>,
+    edges: NativeEdges,
+}
+impl NativeUpper {
+    fn allocation(
+        nodes: usize,
+        upper_nodes: usize,
+        layers: usize,
+        m: usize,
+        compact: bool,
+    ) -> Option<usize> {
+        let edge_capacity = layers.checked_mul(m)?;
+        let edges = if compact {
+            NativeEdges::bytes_for(edge_capacity, nodes)?
+        } else {
+            edge_capacity.checked_mul(4)?
+        };
+        nodes
+            .div_ceil(64)
+            .checked_mul(8 + std::mem::size_of::<usize>())?
+            .checked_add(upper_nodes.checked_mul(std::mem::size_of::<usize>())?)?
+            .checked_add(
+                layers
+                    .checked_add(1)?
+                    .checked_mul(std::mem::size_of::<usize>())?,
+            )?
+            .checked_add(edges)
+    }
+    fn allocated_bytes(&self) -> usize {
+        self.bits.capacity() * 8
+            + (self.ranks.capacity() + self.starts.capacity() + self.offsets.capacity())
+                * std::mem::size_of::<usize>()
+            + self.edges.allocated_bytes()
+    }
+    fn range(&self, id: usize, level: usize) -> std::ops::Range<usize> {
+        let word = self.bits[id / 64];
+        let mask = 1u64 << (id % 64);
+        debug_assert!(word & mask != 0 && level != 0);
+        let ordinal = self.ranks[id / 64] + (word & (mask - 1)).count_ones() as usize;
+        let row = self.starts[ordinal] + level - 1;
+        self.offsets[row]..self.offsets[row + 1]
+    }
+    fn neighbors(&self, id: usize, level: usize) -> Vec<usize> {
+        let range = self.range(id, level);
+        if let Some(wide) = self.edges.wide_slice(range.start, range.end) {
+            wide.iter().map(|&id| id as usize).collect()
+        } else {
+            range.map(|edge| self.edges.get(edge)).collect()
+        }
+    }
+}
+
 #[derive(Debug)]
 struct NativeCsr {
     offsets: Vec<usize>,
-    edges: Vec<u32>,
-    payloads: Option<Vec<u8>>,
+    edges: NativeEdges,
+    upper: NativeUpper,
+    payloads: Option<NativePayloads>,
     payload_stride: usize,
     _charge: ControlledMemoryCharge,
+}
+impl NativeCsr {
+    fn neighbors(&self, id: usize) -> impl ExactSizeIterator<Item = usize> + '_ {
+        (self.offsets[id]..self.offsets[id + 1]).map(|edge| self.edges.get(edge))
+    }
+    fn degree(&self, id: usize) -> usize {
+        self.offsets[id + 1] - self.offsets[id]
+    }
 }
 const NATIVE_MEMO_MAX_CANDIDATES: usize = 1024;
 const NATIVE_MEMO_GATES: usize = 64;
@@ -234,6 +441,8 @@ pub(crate) struct NativeHnsw {
     candidates_returned: std::sync::atomic::AtomicU64,
     heap_reranks: std::sync::atomic::AtomicU64,
     exact_fallbacks: std::sync::atomic::AtomicU64,
+    #[cfg(test)]
+    csr_build_failure: Mutex<Option<QueryError>>,
 }
 
 impl NativeHnsw {
@@ -282,6 +491,8 @@ impl NativeHnsw {
             candidates_returned: std::sync::atomic::AtomicU64::new(0),
             heap_reranks: std::sync::atomic::AtomicU64::new(0),
             exact_fallbacks: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            csr_build_failure: Mutex::new(None),
         })
     }
     fn definition_bytes(&self) -> Result<Vec<u8>, QueryError> {
@@ -1039,6 +1250,22 @@ impl NativeHnsw {
             state.by_vid.insert(vid, id);
         }
         state.entry = topology.entry().map(|(id, _)| id as usize);
+        if self.quantizer().is_none() {
+            self.restore_coordinate_heads(&mut state)?;
+        }
+        Ok(())
+    }
+
+    fn restore_coordinate_heads(&self, state: &mut State) -> Result<(), QueryError> {
+        state.group_heads.clear();
+        for group in 0..state.groups.len() {
+            if group % 256 == 0 {
+                crate::engine::cancel::check_cancelled()?;
+            }
+            let value = self.value(state, state.groups[group].representative)?;
+            let hash = self.coordinate_hash(state, &value);
+            state.groups[group].next_collision = state.group_heads.insert(hash, group);
+        }
         Ok(())
     }
     pub(crate) fn file(&self) -> Option<&Arc<VectorIndexFile>> {
@@ -1101,7 +1328,19 @@ impl NativeHnsw {
     }
     pub(crate) fn prepare_navigation(&self) -> Result<(), QueryError> {
         if let Some(file) = &self.file {
-            file.prepare_navigation_mapping()?;
+            let private_codes = self
+                .state
+                .read()
+                .csr
+                .as_ref()
+                .is_some_and(|csr| matches!(csr.payloads, Some(NativePayloads::Mapped { .. })));
+            if private_codes {
+                if file.with_navigation_mapping(|_| ()).is_some() {
+                    file.retire_navigation_source_cache();
+                }
+            } else {
+                file.prepare_navigation_mapping()?;
+            }
             // Dense adjacency avoids per-edge vid hashing even when payloads
             // are borrowed directly from the authoritative mapped image.
             self.prepare_csr()?;
@@ -1146,6 +1385,20 @@ impl NativeHnsw {
         }
     }
     fn prepare_csr(&self) -> Result<(), QueryError> {
+        match self.try_prepare_csr() {
+            Err(err) if err.code() == 1037 => {
+                // CSR is derived acceleration. A physical-pressure race while
+                // scanning pages must not invalidate a durable paged index.
+                if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
+                    eprintln!("[hnsw] optional query navigator declined: {err}");
+                }
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    fn try_prepare_csr(&self) -> Result<(), QueryError> {
         if self.state.read().csr.is_some() {
             return Ok(());
         }
@@ -1156,21 +1409,52 @@ impl NativeHnsw {
         if state.csr.is_some() || state.nodes.is_empty() || state.nodes.len() > u32::MAX as usize {
             return Ok(());
         }
+        let upper_nodes = state.nodes.iter().filter(|node| node.level != 0).count();
+        let Some(upper_layers) = state
+            .nodes
+            .iter()
+            .try_fold(0usize, |total, node| total.checked_add(node.level))
+        else {
+            return Ok(());
+        };
+        let Some(wide_upper) =
+            NativeUpper::allocation(state.nodes.len(), upper_nodes, upper_layers, self.m, false)
+        else {
+            return Ok(());
+        };
+        let Some(packed_upper) =
+            NativeUpper::allocation(state.nodes.len(), upper_nodes, upper_layers, self.m, true)
+        else {
+            return Ok(());
+        };
+        let edge_capacity = state.nodes.len().saturating_mul(self.m.saturating_mul(2));
+        let Some(edge_bytes) = NativeEdges::bytes_for(edge_capacity, state.nodes.len()) else {
+            return Ok(());
+        };
         let bytes = state
             .nodes
             .len()
-            .saturating_mul(
-                self.m
-                    .saturating_mul(2)
-                    .saturating_mul(std::mem::size_of::<u32>())
-                    .saturating_add(std::mem::size_of::<usize>()),
-            )
-            .saturating_add(8);
+            .saturating_add(1)
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(edge_capacity.saturating_mul(4))
+            .saturating_add(wide_upper)
+            .saturating_add(std::mem::size_of::<NativeCsr>());
+        let compact_bytes = state
+            .nodes
+            .len()
+            .saturating_add(1)
+            .saturating_mul(std::mem::size_of::<usize>())
+            .saturating_add(edge_bytes)
+            .saturating_add(packed_upper)
+            .saturating_add(std::mem::size_of::<NativeCsr>());
         let limit = super::hnsw_paged::PagedHnsw::query_navigation_limit_bytes();
         let stride = self.quantizer().map_or(0, |quant| quant.record_len());
         let payload_bytes = state.nodes.len().saturating_mul(stride);
         let combined = bytes.saturating_add(payload_bytes);
-        let reserve = |bytes| {
+        let headroom = (crate::engine::executor::mem_budget::memory_target_bytes() / 32)
+            .clamp(4 * 1024 * 1024, 32 * 1024 * 1024);
+        let reserve = |bytes: usize| {
+            let bytes = bytes.saturating_add(headroom);
             self.file.as_ref().map_or_else(
                 || {
                     ControlledMemoryCharge::try_new_optional(
@@ -1187,10 +1471,12 @@ impl NativeHnsw {
         if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
             eprintln!("[hnsw] query navigator: nodes={} stride={stride} bytes={combined} limit={limit} payloads={}", state.nodes.len(), resident.is_some());
         }
+        let compact = resident.is_none() && stride != 0;
+        let adjacency_bytes = if compact { compact_bytes } else { bytes };
         let (mut charge, reserve_payloads) = if let Some(charge) = resident {
             (charge, true)
-        } else if bytes <= limit {
-            let Some(charge) = reserve(bytes) else {
+        } else if adjacency_bytes <= limit {
+            let Some(charge) = reserve(adjacency_bytes) else {
                 return Ok(());
             };
             (charge, false)
@@ -1198,18 +1484,30 @@ impl NativeHnsw {
             return Ok(());
         };
         let mut state = parking_lot::RwLockUpgradableReadGuard::upgrade(state);
-        let reserved = if reserve_payloads { combined } else { bytes };
+        let reserved = (if reserve_payloads {
+            combined
+        } else {
+            adjacency_bytes
+        })
+        .saturating_add(headroom);
+        #[cfg(test)]
+        if let Some(err) = self.csr_build_failure.lock().take() {
+            return Err(err);
+        }
         let mut payloads = if reserve_payloads {
             let mut payloads = Vec::new();
-            payloads
-                .try_reserve_exact(payload_bytes)
-                .map_err(|_| codec::vector_err("native HNSW payload cache allocation failed"))?;
+            payloads.try_reserve_exact(payload_bytes).map_err(|_| {
+                crate::storage::error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "native HNSW payload cache allocation failed",
+                )
+            })?;
             Some(payloads)
         } else {
             None
         };
         let mut offsets = Vec::new();
-        let mut edges = Vec::new();
+        let mut edges = NativeEdges::new(edge_capacity, state.nodes.len(), compact)?;
         offsets
             .try_reserve_exact(state.nodes.len() + 1)
             .map_err(|_| {
@@ -1218,21 +1516,61 @@ impl NativeHnsw {
                     "native CSR offsets allocation failed",
                 )
             })?;
-        edges
-            .try_reserve_exact(state.nodes.len().saturating_mul(self.m * 2))
-            .map_err(|_| {
-                crate::storage::error(
-                    crate::error::catalog::ER_OUTOFMEMORY,
-                    "native CSR edges allocation failed",
-                )
-            })?;
+        let reserve_error = |_| {
+            crate::storage::error(
+                crate::error::catalog::ER_OUTOFMEMORY,
+                "native upper adjacency allocation failed",
+            )
+        };
+        let mut upper = NativeUpper {
+            bits: Vec::new(),
+            ranks: Vec::new(),
+            starts: Vec::new(),
+            offsets: Vec::new(),
+            edges: NativeEdges::new(
+                upper_layers.saturating_mul(self.m),
+                state.nodes.len(),
+                compact,
+            )?,
+        };
+        upper
+            .bits
+            .try_reserve_exact(state.nodes.len().div_ceil(64))
+            .map_err(reserve_error)?;
+        upper.bits.resize(state.nodes.len().div_ceil(64), 0);
+        upper
+            .ranks
+            .try_reserve_exact(upper.bits.len())
+            .map_err(reserve_error)?;
+        upper
+            .starts
+            .try_reserve_exact(upper_nodes)
+            .map_err(reserve_error)?;
+        upper
+            .offsets
+            .try_reserve_exact(upper_layers + 1)
+            .map_err(reserve_error)?;
+        upper.offsets.push(0);
         offsets.push(0);
         for id in 0..state.nodes.len() {
             crate::engine::cancel::check_cancelled()?;
-            for edge in self.links(&state, id, 0)? {
-                edges.push(u32::try_from(edge).map_err(|_| super::persistence::corrupt())?);
+            if id % 64 == 0 {
+                upper.ranks.push(upper.starts.len());
             }
-            offsets.push(edges.len());
+            if state.nodes[id].level != 0 {
+                upper.bits[id / 64] |= 1u64 << (id % 64);
+                upper.starts.push(upper.offsets.len() - 1);
+                for level in 1..=state.nodes[id].level {
+                    for edge in self.links(&state, id, level)? {
+                        upper.edges.push(edge)?;
+                    }
+                    upper.offsets.push(upper.edges.len);
+                }
+            }
+            for edge in self.links(&state, id, 0)? {
+                edges.push(edge)?;
+            }
+            offsets.push(edges.len);
             if let Some(payloads) = &mut payloads {
                 let node = &state.nodes[id];
                 let mut append = |bytes: &[u8]| {
@@ -1252,19 +1590,111 @@ impl NativeHnsw {
                 }
             }
         }
+        let mut payload_cache = payloads.map(NativePayloads::Resident);
+        if payload_cache.is_none() && stride != 0 && payload_bytes <= limit {
+            if let Some(file) = &self.file {
+                payload_cache = self.map_compact_payloads(
+                    file.spill_data_dir(),
+                    &state,
+                    stride,
+                    payload_bytes,
+                )?;
+            }
+        }
         let actual = (offsets.capacity() * std::mem::size_of::<usize>()
-            + edges.capacity() * std::mem::size_of::<u32>())
-        .saturating_add(payloads.as_ref().map_or(0, Vec::capacity));
-        charge.shrink(reserved.saturating_sub(actual));
+            + edges.allocated_bytes()
+            + upper.allocated_bytes())
+        .saturating_add(std::mem::size_of::<NativeCsr>())
+        .saturating_add(payload_cache.as_ref().map_or(0, |payloads| match payloads {
+            NativePayloads::Resident(bytes) => bytes.capacity(),
+            NativePayloads::Mapped { .. } => 0,
+        }));
+        if actual > reserved {
+            charge.try_grow_recoverable(actual - reserved)?;
+        } else {
+            charge.shrink(reserved - actual);
+        }
         state.csr = Some(NativeCsr {
             offsets,
             edges,
-            payloads,
+            upper,
+            payloads: payload_cache,
             payload_stride: stride,
             _charge: charge,
         });
+        if state
+            .csr
+            .as_ref()
+            .is_some_and(|csr| matches!(csr.payloads, Some(NativePayloads::Mapped { .. })))
+        {
+            if let Some(file) = &self.file {
+                file.retire_navigation_source_cache();
+            }
+        }
         Ok(())
     }
+    /// A private immutable copy keeps the original code bytes while removing
+    /// page headers, adjacency and padding from the random-I/O working set.
+    fn map_compact_payloads(
+        &self,
+        data_dir: &std::path::Path,
+        state: &State,
+        stride: usize,
+        expected: usize,
+    ) -> Result<Option<NativePayloads>, QueryError> {
+        use crate::engine::executor::{
+            select::grace::SpillTmpDir, spill_quota::TrackedSpillWriter,
+        };
+        use std::io::Write;
+        let Ok(tmp) = SpillTmpDir::create_kind(data_dir, "vector-nav") else {
+            return Ok(None);
+        };
+        let path = tmp.path().join("native-codes");
+        let Ok(mut writer) = TrackedSpillWriter::create_new(&path, tmp.charger(), 64 * 1024) else {
+            return Ok(None);
+        };
+        for node in &state.nodes {
+            crate::engine::cancel::check_cancelled()?;
+            let mut write_failed = false;
+            let mut append = |bytes: &[u8]| {
+                if bytes.len() != stride {
+                    return Err(super::persistence::corrupt());
+                }
+                if writer.write_all(bytes).is_err() {
+                    write_failed = true;
+                }
+                Ok(())
+            };
+            if let Some(value) = &node.value {
+                append(&value.payload)?;
+            } else {
+                self.file
+                    .as_ref()
+                    .ok_or_else(super::persistence::corrupt)?
+                    .with_native_vector(node.vid, |value| append(value.payload))?;
+            }
+            if write_failed {
+                return Ok(None);
+            }
+        }
+        if !matches!(writer.finish(), Ok(length) if length == expected as u64) {
+            return Ok(None);
+        }
+        let Ok(input) = crate::platform::file::File::open(&path) else {
+            return Ok(None);
+        };
+        let Ok(bytes) = super::spill_rows::MappedSpillBytes::open(input, tmp) else {
+            return Ok(None);
+        };
+        if std::env::var_os("MYDB_HNSW_BUILD_TIMING").is_some() {
+            eprintln!(
+                "[hnsw] compact mapped payloads: rows={} stride={stride} bytes={expected}",
+                state.nodes.len()
+            );
+        }
+        Ok(Some(NativePayloads::Mapped { bytes }))
+    }
+
     fn navigation_score(
         &self,
         state: &State,
@@ -1466,13 +1896,15 @@ impl NativeHnsw {
         }
         if level == 0 {
             if let Some(csr) = &state.csr {
-                return Ok(csr.edges[csr.offsets[id]..csr.offsets[id + 1]]
-                    .iter()
-                    .map(|&id| id as usize)
-                    .collect());
+                return Ok(csr.neighbors(id).collect());
             }
         }
 
+        if level != 0 {
+            if let Some(csr) = &state.csr {
+                return Ok(csr.upper.neighbors(id, level));
+            }
+        }
         if let Some(file) = &self.file {
             let mut out = Vec::new();
             file.read_neighbors_into(node.vid, level, &mut out)?;
@@ -1517,11 +1949,8 @@ impl NativeHnsw {
         let mut best = self.navigation_score(state, entry, query, query_code, exact)?;
         loop {
             let mut improved = false;
-            let compact = state
-                .csr
-                .as_ref()
-                .filter(|_| level == 0)
-                .map(|csr| &csr.edges[csr.offsets[entry]..csr.offsets[entry + 1]]);
+            let current_entry = entry;
+            let compact = state.csr.as_ref().filter(|_| level == 0);
             let owned = if compact.is_none() {
                 self.links(state, entry, level)?
             } else {
@@ -1529,7 +1958,7 @@ impl NativeHnsw {
             };
             for next in compact
                 .into_iter()
-                .flat_map(|edges| edges.iter().map(|&id| id as usize))
+                .flat_map(|csr| csr.neighbors(current_entry))
                 .chain(owned)
             {
                 let d = self.navigation_score(state, next, query, query_code, exact)?;
@@ -1563,6 +1992,7 @@ impl NativeHnsw {
             self.explore_query_ties(query),
             |id| self.navigation_score(state, id, query, query_code, exact),
             |ids| self.navigation_scores4(state, ids, query, query_code, exact),
+            |_| {},
         )
     }
 
@@ -1582,6 +2012,7 @@ impl NativeHnsw {
         explore_ties: bool,
         mut score_node: impl FnMut(usize) -> Result<f64, QueryError>,
         mut score_nodes4: impl FnMut([usize; 4]) -> Result<[f64; 4], QueryError>,
+        prefetch_nodes: impl Fn(&[usize]),
     ) -> Result<Vec<Scored<usize>>, QueryError> {
         let ef = ef.max(1).min(state.nodes.len());
         if ef == 0 {
@@ -1627,29 +2058,42 @@ impl NativeHnsw {
                 {
                     break;
                 }
-                let compact =
-                    state.csr.as_ref().filter(|_| level == 0).map(|csr| {
-                        &csr.edges[csr.offsets[current.id]..csr.offsets[current.id + 1]]
-                    });
+                let compact = state.csr.as_ref().filter(|_| level == 0);
                 let owned = if compact.is_none() {
                     self.links(state, current.id, level)?
                 } else {
                     Vec::new()
                 };
-                if let Some(edges) = compact.filter(|_| batch_navigation) {
+                if let Some(csr) = compact.filter(|_| batch_navigation) {
                     // Preserve edge and heap-admission order while exposing
                     // independent neighbor probes to prefetch and SIMD.
-                    scratch.prepare_neighbors(edges.len())?;
-                    for &id in edges {
-                        if scratch.visit(id as usize)? {
-                            scratch.unseen.push(id as usize);
+                    scratch.prepare_neighbors(csr.degree(current.id))?;
+                    if let Some(edges) = csr
+                        .edges
+                        .wide_slice(csr.offsets[current.id], csr.offsets[current.id + 1])
+                    {
+                        for &id in edges {
+                            if scratch.visit(id as usize)? {
+                                scratch.unseen.push(id as usize);
+                            }
+                        }
+                    } else {
+                        for id in csr.neighbors(current.id) {
+                            if scratch.visit(id)? {
+                                scratch.unseen.push(id);
+                            }
                         }
                     }
                     for &id in scratch.unseen.iter().take(8) {
                         Self::prefetch_candidate(state, id);
                     }
+                    prefetch_nodes(&scratch.unseen[..scratch.unseen.len().min(8)]);
                     let mut position = 0;
                     while position + 4 <= scratch.unseen.len() {
+                        let ahead = (position + 8).min(scratch.unseen.len());
+                        prefetch_nodes(
+                            &scratch.unseen[ahead..(ahead + 4).min(scratch.unseen.len())],
+                        );
                         for &id in scratch.unseen.iter().skip(position + 8).take(4) {
                             Self::prefetch_candidate(state, id);
                         }
@@ -1689,7 +2133,7 @@ impl NativeHnsw {
                 } else {
                     for id in compact
                         .into_iter()
-                        .flat_map(|edges| edges.iter().map(|&id| id as usize))
+                        .flat_map(|csr| csr.neighbors(current.id))
                         .chain(owned)
                     {
                         if scratch.visit(id)? {
@@ -2244,13 +2688,8 @@ impl NativeHnsw {
             cursor.hnsw.expanded += 1;
             cursor.work.visited += 1;
             let id = candidate.id as usize;
-            let links = if let Some(csr) = &state.csr {
-                &csr.edges[csr.offsets[id]..csr.offsets[id + 1]]
-            } else {
-                &[]
-            };
-            let neighbors: Vec<_> = if state.csr.is_some() {
-                links.iter().map(|&x| x as usize).collect()
+            let neighbors: Vec<_> = if let Some(csr) = &state.csr {
+                csr.neighbors(id).collect()
             } else {
                 state.nodes[id].links.first().cloned().unwrap_or_default()
             };
@@ -2374,6 +2813,7 @@ impl NativeHnsw {
         let mapped = if state.csr.as_ref().is_some_and(|csr| csr.payloads.is_none()) {
             if let (Some(file), Some(quant)) = (&self.file, self.quantizer()) {
                 file.with_navigation_mapping(|view| {
+                    view.refresh_prefetch();
                     let score_node = |id: usize| {
                         quant.score_payload(
                             view.native_payload(state.nodes[id].vid)?,
@@ -2405,6 +2845,11 @@ impl NativeHnsw {
                                 query,
                                 query_code.as_ref(),
                             )
+                        },
+                        |ids| {
+                            for &id in ids {
+                                view.prefetch_record(state.nodes[id].vid);
+                            }
                         },
                     )
                 })
@@ -2457,6 +2902,129 @@ impl NativeHnsw {
 #[cfg(test)]
 mod duplicate_regressions {
     use super::*;
+
+    #[test]
+    fn compact_edge_ids_preserve_order_at_every_width_and_pair_boundary() {
+        for nodes in [
+            1usize,
+            255,
+            65_536,
+            65_537,
+            1_048_576,
+            1_048_577,
+            16_777_216,
+            16_777_217,
+            u32::MAX as usize,
+        ] {
+            for compact in [false, true] {
+                let values: Vec<_> = [0, nodes - 1, nodes / 2]
+                    .into_iter()
+                    .chain((0..128usize).map(|i| (i.wrapping_mul(1_000_003) ^ (i << 16)) % nodes))
+                    .collect();
+                let mut edges = NativeEdges::new(values.len(), nodes, compact).unwrap();
+                for (i, &value) in values.iter().enumerate() {
+                    edges.push(value).unwrap();
+                    for j in 0..=i {
+                        assert_eq!(edges.get(j), values[j], "nodes={nodes} index={j}");
+                    }
+                }
+                assert!(edges.push(0).is_err());
+                assert!(edges.allocated_bytes() <= values.len() * 4 + 8);
+            }
+        }
+        assert!(NativeEdges::bytes_for(usize::MAX, 1 << 20).is_none());
+        let mut edges = NativeEdges::new(2, 65_537, true).unwrap();
+        assert!(edges.push(65_537).is_err());
+        edges.push(65_536).unwrap();
+        edges.push(1).unwrap();
+        assert_eq!(edges.get(0), 65_536);
+        assert_eq!(edges.get(1), 1);
+    }
+
+    #[test]
+    fn optional_csr_pressure_releases_its_charge_and_preserves_paged_fallback() {
+        let graph = NativeHnsw::new(VectorDataType::Float32, 2, Metric::L2, 4, 16, None).unwrap();
+        let value = codec::parse_text("[1,2]").unwrap();
+        graph
+            .insert(
+                RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                },
+                value.clone(),
+            )
+            .unwrap();
+        let before = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        *graph.csr_build_failure.lock() = Some(crate::storage::error(
+            crate::error::catalog::ER_OUTOFMEMORY,
+            "injected CSR page-read pressure",
+        ));
+        graph.prepare_csr().unwrap();
+        assert!(graph.state.read().csr.is_none());
+        assert!(
+            graph.csr_build_failure.lock().is_none(),
+            "failure must occur after cache admission"
+        );
+        assert_eq!(
+            crate::engine::executor::mem_budget::controlled_memory_snapshot().0,
+            before
+        );
+        let request = VectorSearchRequest {
+            candidate_limit: 1,
+            rerank_limit: 1,
+            effort: super::super::VectorSearchEffort::Hnsw { ef: 16 },
+        };
+        assert_eq!(
+            graph.search(&value, request).unwrap().candidates[0].0,
+            RowId {
+                page_id: 1,
+                slot_id: 0
+            }
+        );
+        for spec in [
+            crate::error::catalog::ER_QUERY_INTERRUPTED,
+            crate::error::catalog::ER_GET_ERRNO,
+        ] {
+            *graph.csr_build_failure.lock() =
+                Some(crate::storage::error(spec, "injected non-memory failure"));
+            assert_eq!(graph.prepare_csr().unwrap_err().code(), spec.code());
+            assert!(graph.state.read().csr.is_none());
+        }
+    }
+
+    #[test]
+    fn rebuilt_bulk_coordinate_heads_keep_later_duplicates_in_the_original_group() {
+        let graph = NativeHnsw::new(VectorDataType::Int8, 2, Metric::L2, 4, 16, None).unwrap();
+        let value = codec::from_build_f32(&[1.0, 2.0], VectorDataType::Int8).unwrap();
+        graph
+            .insert(
+                RowId {
+                    page_id: 1,
+                    slot_id: 0,
+                },
+                value.clone(),
+            )
+            .unwrap();
+        {
+            let mut state = graph.state.write();
+            state.group_heads.clear();
+            graph.restore_coordinate_heads(&mut state).unwrap();
+        }
+        for id in 2..=33 {
+            graph
+                .insert(
+                    RowId {
+                        page_id: id,
+                        slot_id: 0,
+                    },
+                    value.clone(),
+                )
+                .unwrap();
+        }
+        let state = graph.state.read();
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].members.len(), 33);
+    }
 
     #[test]
     fn pending_quantization_repeated_coordinates_remain_reachable() {
@@ -2627,6 +3195,72 @@ mod duplicate_regressions {
                 for (row, want) in rows[..8].iter().zip(&expected) {
                     assert_eq!(graph.search(row, request).unwrap().candidates, *want);
                 }
+                let full = VectorSearchRequest {
+                    candidate_limit: rows.len(),
+                    rerank_limit: rows.len(),
+                    effort: super::super::VectorSearchEffort::Hnsw { ef: rows.len() },
+                };
+                let full_expected = graph.search(&rows[11], full).unwrap().candidates;
+                let tmp = tempfile::tempdir_in("/tmp/mydb").unwrap();
+                let stride = graph.quantizer().unwrap().record_len();
+                let mapped = {
+                    let state = graph.state.read();
+                    let blocked = tmp.path().join("blocked");
+                    std::fs::write(&blocked, b"not a directory").unwrap();
+                    assert!(graph
+                        .map_compact_payloads(&blocked, &state, stride, stride * state.nodes.len())
+                        .unwrap()
+                        .is_none());
+                    assert!(graph
+                        .map_compact_payloads(
+                            tmp.path(),
+                            &state,
+                            stride + 1,
+                            (stride + 1) * state.nodes.len()
+                        )
+                        .is_err());
+                    graph
+                        .map_compact_payloads(
+                            tmp.path(),
+                            &state,
+                            stride,
+                            stride * state.nodes.len(),
+                        )
+                        .unwrap()
+                        .unwrap()
+                };
+                {
+                    let mut state = graph.state.write();
+                    let nodes = state.nodes.len();
+                    let csr = state.csr.as_mut().unwrap();
+                    let mut packed = NativeEdges::new(csr.edges.len, nodes, true).unwrap();
+                    for i in 0..csr.edges.len {
+                        packed.push(csr.edges.get(i)).unwrap();
+                    }
+                    let freed = csr.edges.allocated_bytes() - packed.allocated_bytes();
+                    csr._charge.shrink(freed);
+                    csr.edges = packed;
+                    let mut packed_upper =
+                        NativeEdges::new(csr.upper.edges.len, nodes, true).unwrap();
+                    for i in 0..csr.upper.edges.len {
+                        packed_upper.push(csr.upper.edges.get(i)).unwrap();
+                    }
+                    csr._charge
+                        .shrink(csr.upper.edges.allocated_bytes() - packed_upper.allocated_bytes());
+                    csr.upper.edges = packed_upper;
+                    if let Some(NativePayloads::Resident(bytes)) = csr.payloads.take() {
+                        csr._charge.shrink(bytes.capacity());
+                    }
+                    csr.payloads = Some(mapped);
+                    state.query_cache = None;
+                }
+                for (row, want) in rows[..8].iter().zip(&expected) {
+                    assert_eq!(graph.search(row, request).unwrap().candidates, *want);
+                }
+                assert_eq!(
+                    graph.search(&rows[11], full).unwrap().candidates,
+                    full_expected
+                );
                 let deleted = expected[0][0].0;
                 graph.delete(deleted).unwrap();
                 assert!(!graph
@@ -2645,6 +3279,14 @@ mod duplicate_regressions {
                     )
                     .unwrap();
                 assert!(graph.state.read().csr.is_none());
+                let temp_root = crate::storage::naming::system_tmp_dir(tmp.path());
+                assert_eq!(
+                    std::fs::read_dir(temp_root)
+                        .unwrap()
+                        .filter(|e| e.as_ref().unwrap().file_type().unwrap().is_dir())
+                        .count(),
+                    0
+                );
                 assert!(graph.search(&rows[0], request).is_ok());
             }
         }

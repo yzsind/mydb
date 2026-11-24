@@ -6864,7 +6864,8 @@ impl Database {
         lock: crate::parser::AlterLock,
         statement_mdl_owner: u64,
     ) -> Result<Vec<crate::engine::api::SqlWarning>, QueryError> {
-        if copy_required
+        let diagnostic_candidate = (strict && copy_required).then(|| candidate.clone());
+        let result = if copy_required
             && !Self::column_candidate_needs_validation_only(
                 &old_table,
                 &candidate,
@@ -6881,8 +6882,8 @@ impl Database {
                 strict,
                 lock,
                 statement_mdl_owner,
-            )?;
-            Ok(Vec::new())
+            )
+            .map(|_| Vec::new())
         } else {
             self.apply_column_candidate_policy(
                 table_name,
@@ -6892,6 +6893,49 @@ impl Database {
                 strict,
                 Some(statement_mdl_owner),
             )
+        };
+        result.map_err(|err| match diagnostic_candidate.as_ref() {
+            Some(candidate) => self.column_conversion_input_row(table_name, candidate, err),
+            None => err,
+        })
+    }
+
+    /// Locate a failed conversion only on the error path. Parallel COPY and
+    /// online validation may discover rows out of scan order; replaying pure
+    /// coercion avoids a contended per-row diagnostic counter in those workers.
+    #[cold]
+    fn column_conversion_input_row(
+        &self,
+        table_name: &str,
+        candidate: &TableSchema,
+        err: QueryError,
+    ) -> QueryError {
+        if ![1264, 1265, 1366, 1406].contains(&err.code()) {
+            return err;
+        }
+        let mut ordinal = 0;
+        let mut failed_row = None;
+        let txn = TxnView::read_only(u64::MAX, IsolationLevel::ReadCommitted);
+        let _ = crate::engine::expr::with_suppressed_expression_warnings(|| {
+            self.scan_rows_ordered_streaming_with_refs(table_name, txn, |_, values| {
+                ordinal += 1;
+                if failed_row.is_none() {
+                    let mut values = values.to_vec();
+                    let mut warnings = Vec::new();
+                    if coerce_row_for_alter_copy(candidate, &mut values, true, &mut warnings)
+                        .is_err_and(|conversion| {
+                            conversion.code() == err.code() && conversion.message() == err.message()
+                        })
+                    {
+                        failed_row = Some(ordinal);
+                    }
+                }
+                Ok(())
+            })
+        });
+        match failed_row {
+            Some(ordinal) => err.with_input_row_number(ordinal),
+            None => err,
         }
     }
 
@@ -7221,13 +7265,16 @@ impl Database {
         validate_mysql80_partition_compat(&candidate, false)?;
         candidate.build_column_index();
         candidate.bump_schema_version();
-        if let Some((owner, lock)) = online_owner {
-            return self
-                .run_online_type_copy(table_name, old_table, candidate, strict, owner, lock)
-                .map(Some);
-        }
-        self.rewrite_table_for_alter_copy(table_name, old_table, candidate, strict)
-            .map(Some)
+        let diagnostic_candidate = strict.then(|| candidate.clone());
+        let result = if let Some((owner, lock)) = online_owner {
+            self.run_online_type_copy(table_name, old_table, candidate, strict, owner, lock)
+        } else {
+            self.rewrite_table_for_alter_copy(table_name, old_table, candidate, strict)
+        };
+        result.map(Some).map_err(|err| match diagnostic_candidate.as_ref() {
+            Some(candidate) => self.column_conversion_input_row(table_name, candidate, err),
+            None => err,
+        })
     }
 
     fn reject_vector_index_column_change(

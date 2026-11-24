@@ -3226,11 +3226,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                                 .get_or_insert(context.connection_collation_id);
                         }
                         if let Some(fsp) = crate::engine::expr::expression_metadata_decimals(expr) {
-                            if let Temporal {
-                                fsp: result_fsp, ..
-                            } = &mut spec.result.kind
-                            {
-                                *result_fsp = fsp;
+                            match &mut spec.result.kind {
+                                Temporal {
+                                    fsp: result_fsp, ..
+                                } => *result_fsp = fsp,
+                                Float { scale, .. } => *scale = Some(fsp),
+                                _ => {}
                             }
                         }
                         spec.result
@@ -3247,11 +3248,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                             &source,
                         );
                         if let Some(fsp) = crate::engine::expr::expression_metadata_decimals(expr) {
-                            if let Temporal {
-                                fsp: result_fsp, ..
-                            } = &mut result.kind
-                            {
-                                *result_fsp = fsp;
+                            match &mut result.kind {
+                                Temporal {
+                                    fsp: result_fsp, ..
+                                } => *result_fsp = fsp,
+                                Float { scale, .. } => *scale = Some(fsp),
+                                _ => {}
                             }
                         }
                         result

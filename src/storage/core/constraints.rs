@@ -1330,7 +1330,7 @@ fn coerce_column_value(
 ) -> Result<Value, QueryError> {
     coerce_value_with_unsigned(value, data_type, unsigned, column_name).map_err(|err| {
         if err.is(crate::error::catalog::ER_DATA_TOO_LONG) {
-            err.with_message(format!("data too long for column '{column_name}'"))
+            err.with_message(format!("Data too long for column '{column_name}' at row 1"))
         } else {
             err
         }
@@ -1722,12 +1722,12 @@ fn coerce_set_assignment(
     }
 }
 
-fn enum_set_truncation(fallback: Value, kind: &str, column: &str) -> Result<Value, QueryError> {
+fn enum_set_truncation(fallback: Value, _kind: &str, column: &str) -> Result<Value, QueryError> {
     let message = format!("Data truncated for column '{column}' at row 1");
     if coercion_strict() {
         Err(error(
             crate::error::catalog::WARN_DATA_TRUNCATED,
-            format!("data truncated for {kind} column '{column}'"),
+            message,
         ))
     } else {
         crate::engine::api::push_statement_warning(
@@ -1772,7 +1772,7 @@ fn enum_set_recanonicalize_with_collation(
                 }
                 Err(error(
                     crate::error::catalog::WARN_DATA_TRUNCATED,
-                    format!("data truncated for ENUM column '{}'", column.name),
+                    format!("Data truncated for column '{}' at row 1", column.name),
                 ))
             }
             _ => Ok(value),
@@ -1797,7 +1797,7 @@ fn enum_set_recanonicalize_with_collation(
                     } else {
                         return Err(error(
                             crate::error::catalog::WARN_DATA_TRUNCATED,
-                            format!("data truncated for SET column '{}'", column.name),
+                            format!("Data truncated for column '{}' at row 1", column.name),
                         ));
                     }
                 }
@@ -2205,7 +2205,7 @@ fn coerce_to_datetime_string(value: Value) -> Result<String, QueryError> {
     }
     // Canonical, valid input already has the representation consumed by the
     // storage parser. Avoid a chrono parse -> format -> parse round trip.
-    // Keep unusual forms (including leap seconds) on the normalization path.
+    // Keep unusual forms on the normalization path; SQL does not accept leap seconds.
     // Preserve excess fraction digits until assignment precision is known.
     if datetime_needs_no_normalization(trimmed.as_bytes()) {
         return Ok(s);
@@ -2248,16 +2248,20 @@ fn coerce_to_datetime_string(value: Value) -> Result<String, QueryError> {
     // truncation step has microseconds to operate on. Formatting without
     // `%.f` (the prior code) silently dropped the fractional component,
     // which made `DATETIME(3)` look like `DATETIME(0)` on the read side.
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f") {
+    if let Some(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S%.f")
+        .ok().filter(|dt| chrono::Timelike::nanosecond(dt) < 1_000_000_000) {
         return Ok(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
     }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S") {
+    if let Some(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%d %H:%M:%S")
+        .ok().filter(|dt| chrono::Timelike::nanosecond(dt) < 1_000_000_000) {
         return Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string());
     }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f") {
+    if let Some(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S%.f")
+        .ok().filter(|dt| chrono::Timelike::nanosecond(dt) < 1_000_000_000) {
         return Ok(dt.format("%Y-%m-%d %H:%M:%S%.6f").to_string());
     }
-    if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S") {
+    if let Some(dt) = chrono::NaiveDateTime::parse_from_str(trimmed, "%Y-%m-%dT%H:%M:%S")
+        .ok().filter(|dt| chrono::Timelike::nanosecond(dt) < 1_000_000_000) {
         return Ok(dt.format("%Y-%m-%d %H:%M:%S").to_string());
     }
     if let Ok(d) = NaiveDate::parse_from_str(trimmed, "%Y-%m-%d") {
@@ -2381,6 +2385,11 @@ fn warn_deprecated_datetime_delimiter(value: &Value) {
         _ => return,
     };
     let bytes = text.trim().as_bytes();
+    if bytes.get(11).is_some_and(u8::is_ascii_punctuation)
+        && crate::util::temporal::parse_delimited_datetime_components(text).is_some()
+    {
+        crate::engine::expr::warn_superfluous_datetime_delimiter(text);
+    }
     if bytes.len() < 19
         || !matches!(bytes[10], b' ' | b'T')
         || !bytes[11..13].iter().all(u8::is_ascii_digit)
@@ -2683,7 +2692,7 @@ fn out_of_range_1264<T>(clamped: T, column: &str) -> Result<T, QueryError> {
     if coercion_strict() {
         Err(error(
             crate::error::catalog::ER_WARN_DATA_OUT_OF_RANGE,
-            "out of range value for column",
+            format!("Out of range value for column '{column}' at row 1"),
         ))
     } else {
         crate::engine::api::push_statement_warning(
@@ -2702,7 +2711,7 @@ fn bit_data_too_long_1406<T>(clamped: T, column: &str) -> Result<T, QueryError> 
     if coercion_strict() {
         Err(error(
             crate::error::catalog::ER_DATA_TOO_LONG,
-            format!("data too long for column '{column}'"),
+            format!("Data too long for column '{column}' at row 1"),
         ))
     } else {
         let bits = crate::engine::expr::session_temporal_sql_mode_bits();
@@ -2834,7 +2843,7 @@ fn too_long_1406<T>(truncated: T, column: &str, warn: bool) -> Result<T, QueryEr
     if coercion_strict() {
         Err(error(
             crate::error::catalog::ER_DATA_TOO_LONG,
-            format!("data too long for column '{column}'"),
+            format!("Data too long for column '{column}' at row 1"),
         ))
     } else {
         crate::engine::api::push_statement_warning(
@@ -2932,7 +2941,7 @@ fn rounded_integer_assignment_text(
         if coercion_strict() {
             return Err(error(
                 crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-                "incorrect integer value",
+                format!("Incorrect integer value: '{}' for column '{column}' at row 1", crate::engine::expr::diagnostic_value(raw)),
             ));
         }
         crate::engine::api::push_statement_warning(
@@ -2944,8 +2953,8 @@ fn rounded_integer_assignment_text(
     };
     if !clean && coercion_strict() {
         return Err(error(
-            crate::error::catalog::ER_TRUNCATED_WRONG_VALUE_FOR_FIELD,
-            "incorrect integer value",
+            crate::error::catalog::WARN_DATA_TRUNCATED,
+            format!("Data truncated for column '{column}' at row 1"),
         ));
     }
 

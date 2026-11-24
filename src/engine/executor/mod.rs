@@ -377,7 +377,7 @@ pub(crate) fn warn_successful_source_syntax_with_mode(sql: &str, parser_mode_bit
             crate::engine::api::push_statement_warning(
                 crate::error::ConditionLevel::Warning,
                 crate::error::catalog::ER_WARN_DEPRECATED_SYNTAX,
-                "'BINARY expr' is deprecated; use CAST(expr AS BINARY) instead",
+                "'BINARY expr' is deprecated and will be removed in a future release. Please use CAST instead",
             );
         } else if (first_word_is("CREATE") || first_word_is("ALTER"))
             // `BINARY[(n)]` is a real binary-string data type.  Only the

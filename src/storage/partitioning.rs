@@ -1343,6 +1343,9 @@ fn parse_datetime_value(s: &str) -> Option<Value> {
                 .map(|date| date.and_hms_opt(0, 0, 0).unwrap())
         })
         .ok()?;
+    if chrono::Timelike::nanosecond(&dt) >= 1_000_000_000 {
+        return None;
+    }
     Some(Value::DateTime(dt.and_utc().timestamp_micros()))
 }
 

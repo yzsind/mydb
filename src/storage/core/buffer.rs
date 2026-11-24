@@ -725,6 +725,10 @@ impl BufferPool {
             prefetch_queue_depth_peak: AtomicU64::new(0),
             worker_lock: Mutex::new(()),
             worker_cv: Condvar::new(),
+            #[cfg(feature = "fast-alloc")]
+            allocator_reclaim_epoch: AtomicU64::new(0),
+            #[cfg(feature = "fast-alloc")]
+            allocator_reclaim_completed: AtomicU64::new(0),
             kind_used_pages: std::array::from_fn(|_| CachePadded::new(AtomicU64::new(0))),
             kind_quota_pct: kind_quota_pct_from_env(),
             quota_evictions: AtomicU64::new(0),
@@ -744,6 +748,9 @@ impl BufferPool {
             let handle = thread::Builder::new()
                 .name(format!("mydb-buffer-pool-io-{worker_id}"))
                 .spawn(move || {
+                    crate::engine::memory_reclaimer::mark_allocator_thread_pool_worker();
+                    #[cfg(feature = "fast-alloc")]
+                    let mut allocator_epoch = 0;
                     let mut next_clean = Instant::now();
                     loop {
                         let Some(pool) = weak.upgrade() else {
@@ -782,6 +789,17 @@ impl BufferPool {
                             // B1 - bound the oldest-dirty heaps here (no frame lock is
                             // held in the worker loop, unlike the `note_dirty` callers).
                             pool.compact_oversized_dirty_oldest(worker_id, stride);
+                        }
+                        #[cfg(feature = "fast-alloc")]
+                        {
+                            let epoch = pool.allocator_reclaim_epoch.load(Ordering::Acquire);
+                            if epoch != allocator_epoch {
+                                // Drain remote frees on their allocation owner,
+                                // after page/flush latches have been released.
+                                crate::engine::memory_reclaimer::reclaim_current_thread_allocator();
+                                allocator_epoch = epoch;
+                                pool.allocator_reclaim_completed.fetch_add(1, Ordering::Release);
+                            }
                         }
                         if bulk_work {
                             continue;
@@ -1053,14 +1071,12 @@ impl BufferPool {
         ) else {
             return Ok(None);
         };
-        let mut bytes = Vec::new();
-        bytes.try_reserve_exact(PAGE_SIZE).map_err(|_| {
+        let bytes = RawPageBytes::try_zeroed(PAGE_SIZE).map_err(|_| {
             error(
                 crate::error::catalog::ER_OUTOFMEMORY,
                 format!("unable to allocate {PAGE_SIZE} bytes for a buffer-pool page"),
             )
         })?;
-        bytes.resize(PAGE_SIZE, 0);
         let extra = bytes.capacity().saturating_sub(PAGE_SIZE);
         if !charge.try_grow_optional(extra) {
             return Ok(None);
@@ -3159,7 +3175,7 @@ impl BufferPool {
                 return Ok(None);
             }
             let bytes = frame.read_materialized_index_bytes()?;
-            Ok(Some(bytes.clone()))
+            Ok(Some(bytes.to_vec()))
         })();
         frame.unpin();
         self.notify_frame_waiters();
@@ -3335,7 +3351,7 @@ impl BufferPool {
                         )
                     })?;
                     frame.invalidate_packed_leaf();
-                    std::mem::swap(&mut *frame_bytes, &mut bytes);
+                    frame_bytes.copy_from_slice(&bytes);
                     self.write_requests.fetch_add(1, Ordering::Relaxed);
                     frame.checksum_dirty.store(false, Ordering::Release);
                     if btree_logical_wal::is_deferred() {
@@ -3372,6 +3388,12 @@ impl BufferPool {
                 drop(shard);
                 continue;
             }
+            let bytes = RawPageBytes::try_copy(&bytes).map_err(|_| {
+                error(
+                    crate::error::catalog::ER_OUTOFMEMORY,
+                    "unable to allocate buffer-pool page",
+                )
+            })?;
             let frame = Arc::new(Frame::new_dirty_with_intent(
                 key.clone(),
                 bytes,
@@ -6108,7 +6130,7 @@ impl BufferPool {
                 frame.dirty_epoch.load(Ordering::Acquire),
                 dirty_lsn,
                 frame.generation.load(Ordering::Acquire),
-                bytes_guard.clone(),
+                bytes_guard.to_vec(),
             )
         };
         // Memory mode deliberately has no WAL/fsync durability promise, but
@@ -6174,7 +6196,7 @@ impl BufferPool {
         &self,
         key: &PageKey,
         intent: AccessIntent,
-        buf: &mut Vec<u8>,
+        buf: &mut RawPageBytes,
     ) -> Result<(), QueryError> {
         buf.resize(PAGE_SIZE, 0);
         let offset = key.page_id * PAGE_SIZE as u64;
@@ -8312,6 +8334,14 @@ impl BufferPool {
         self.worker_cv.notify_all();
     }
 
+    pub(crate) fn reclaim_worker_allocators(&self) {
+        #[cfg(feature = "fast-alloc")]
+        {
+            self.allocator_reclaim_epoch.fetch_add(1, Ordering::Release);
+            self.wake_workers();
+        }
+    }
+
     fn shard_index(&self, key: &PageKey) -> usize {
         self.shard_index_ref(key.borrowed())
     }
@@ -9234,7 +9264,7 @@ mod oldest_dirty_tests {
             0,
             AccessIntent::Normal,
             RawPageLease {
-                bytes,
+                bytes: bytes.into(),
                 charge: controlled_raw_page_charge().unwrap(),
                 scan_file_hash: None,
             },
@@ -9257,7 +9287,7 @@ mod oldest_dirty_tests {
             None,
         );
         *frame.write_bytes().unwrap() =
-            encode_index_tree_page(&IndexPage::Leaf(replacement)).unwrap();
+            encode_index_tree_page(&IndexPage::Leaf(replacement)).unwrap().into();
         frame.mark_dirty(1);
         let third = pool.index_page_for_read(&frame).unwrap();
         let IndexPage::Leaf(old) = first.as_ref() else {
@@ -9290,7 +9320,7 @@ mod oldest_dirty_tests {
             0,
             AccessIntent::Scan,
             RawPageLease {
-                bytes: vec![0; PAGE_SIZE],
+                bytes: vec![0; PAGE_SIZE].into(),
                 charge: controlled_raw_page_charge().unwrap(),
                 scan_file_hash: None,
             },
@@ -9341,7 +9371,7 @@ mod oldest_dirty_tests {
                 0,
                 AccessIntent::Normal,
                 RawPageLease {
-                    bytes: vec![0; PAGE_SIZE],
+                    bytes: vec![0; PAGE_SIZE].into(),
                     charge: controlled_raw_page_charge().unwrap(),
                     scan_file_hash: None,
                 },
@@ -10108,7 +10138,7 @@ mod oldest_dirty_tests {
             0,
             AccessIntent::Normal,
             RawPageLease {
-                bytes: vec![0; PAGE_SIZE],
+                bytes: vec![0; PAGE_SIZE].into(),
                 charge: controlled_raw_page_charge().unwrap(),
                 scan_file_hash: None,
             },
@@ -10932,7 +10962,7 @@ mod oldest_dirty_tests {
                 0,
                 AccessIntent::Scan,
                 RawPageLease {
-                    bytes: vec![0; PAGE_SIZE],
+                    bytes: vec![0; PAGE_SIZE].into(),
                     charge: controlled_raw_page_charge().unwrap(),
                     scan_file_hash: None,
                 },
@@ -11348,6 +11378,51 @@ mod oldest_dirty_tests {
             .as_ref()
             .and_then(|hint| hint.frame.upgrade())
             .is_none());
+    }
+
+    #[cfg(feature = "fast-alloc")]
+    #[test]
+    fn io_workers_collect_at_safe_boundaries_without_changing_pinned_pages() {
+        std::fs::create_dir_all("/tmp/mydb").unwrap();
+        let dir = tempfile::tempdir_in("/tmp/mydb").unwrap();
+        let path = dir.path().join("reclaim.heap");
+        std::fs::write(&path, vec![41u8; PAGE_SIZE]).unwrap();
+        let log = Arc::new(parking_lot::Mutex::new(
+            LogManager::open(dir.path()).unwrap(),
+        ));
+        let pool = BufferPool::new_with_options(
+            8,
+            log,
+            DurabilityMode::Relaxed,
+            Duration::from_secs(1),
+            2,
+            0,
+        );
+        struct Stop(Arc<BufferPool>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.shutdown_flusher();
+            }
+        }
+        let _stop = Stop(Arc::clone(&pool));
+        let key = PageKey {
+            file: Arc::new(BufferPool::heap_file_key(path, 1)),
+            page_id: 0,
+        };
+        let pinned = pool.pin_page(key).unwrap();
+        for round in 1..=2 {
+            pool.reclaim_worker_allocators();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while pool.allocator_reclaim_completed.load(Ordering::Acquire) < round * 2 {
+                assert!(
+                    Instant::now() < deadline,
+                    "idle I/O workers must acknowledge reclaim"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(pinned.frame.bytes.read().unwrap()[0], 41);
+            assert!(pinned.frame.is_ready());
+        }
     }
 
     #[test]
@@ -12180,7 +12255,7 @@ impl Frame {
     ) -> Self {
         Self::new_dirty_with_intent(
             key,
-            bytes,
+            bytes.into(),
             dirty_lsn,
             generation,
             raw_memory_charge,
@@ -12190,7 +12265,7 @@ impl Frame {
 
     fn new_dirty_with_intent(
         key: PageKey,
-        bytes: Vec<u8>,
+        bytes: RawPageBytes,
         dirty_lsn: u64,
         generation: u64,
         raw_memory_charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,

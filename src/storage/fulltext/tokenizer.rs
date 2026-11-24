@@ -79,6 +79,10 @@ fn parse_env_usize(key: &str, default: usize) -> usize {
 /// Full-text tokenizer. `tokenize` returns a **normalized (lowercased) and filtered** token sequence,
 /// **preserving duplicates and order**: duplicates feed document-length / term-frequency statistics; the indexing side deduplicates before writing inverted items.
 pub trait Tokenizer: Send + Sync {
+    /// Fixed character width of an ngram index, when applicable.
+    fn ngram_size(&self) -> Option<usize> {
+        None
+    }
     /// Normalize an unfiltered prefix without applying token-size limits.
     fn normalize_word(&self, word: &str) -> String {
         word.chars().flat_map(char::to_lowercase).collect()
@@ -391,6 +395,9 @@ impl CollatedTokenizer {
     }
 }
 impl Tokenizer for CollatedTokenizer {
+    fn ngram_size(&self) -> Option<usize> {
+        self.tokenizer.ngram_size()
+    }
     fn normalize_word(&self, word: &str) -> String {
         self.normalize(&self.tokenizer.normalize_word(word))
     }
@@ -456,6 +463,9 @@ impl NgramTokenizer {
 }
 
 impl Tokenizer for NgramTokenizer {
+    fn ngram_size(&self) -> Option<usize> {
+        Some(self.n)
+    }
     fn normalize_word(&self, word: &str) -> String {
         if self.cfg.preserve_case {
             word.to_string()

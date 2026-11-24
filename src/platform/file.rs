@@ -10,6 +10,23 @@ pub(crate) use std::fs::{File, OpenOptions};
 #[cfg(windows)]
 pub(crate) use windows::{File, OpenOptions};
 
+/// A completed one-pass input must not pin clean kernel pages in front of
+/// a random-access work area. Unwritten dirty data is never discarded.
+/// Advice is best effort and does not change the stream's position.
+pub(crate) fn advise_completed_read(file: &File) {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::fd::AsRawFd;
+        // SAFETY: the borrowed descriptor remains valid. Zero offset/length
+        // covers this inode; the kernel only drops discardable clean cache.
+        unsafe {
+            libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+}
+
 /// Bound a descriptor cache to a share of the process capacity. Zero keeps
 /// the caller's explicit unbounded setting. Detection runs only at cache setup.
 pub(crate) fn bounded_file_cache_capacity(configured: usize, share_divisor: usize) -> usize {
