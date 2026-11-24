@@ -155,20 +155,9 @@ pub fn batch_buffer_max_bytes() -> usize {
     })
 }
 
-/// Per-connection upper bound for inbound packet payloads, in bytes.
-///
-/// Single source of truth with the `max_allowed_packet` system variable:
-/// the enforced wire limit is exactly the value `SET GLOBAL
-/// max_allowed_packet = N` writes and `SHOW VARIABLES` / `@@max_allowed_packet`
-/// report. The backing atomic is seeded from `MYDB_MAX_ALLOWED_PACKET`
-/// at startup (see `connection::ensure_env_seeded`, default 64 MiB matching
-/// MySQL 8.0) and clamped to `[1 KiB, 1 GiB]` on both the seed and the
-/// `SET GLOBAL` path. The check happens *before* `read_packet` allocates
-/// the payload buffer, so a malicious or buggy client cannot trigger an
-/// oversized allocation per inbound packet across many concurrent
-/// connections. Historically this read a frozen `OnceLock` env value that
-/// diverged from the settable sysvar — a client that raised the sysvar to
-/// send a large packet still hit the stale startup limit.
+/// Global default for new connections' inbound packet limit. Established
+/// sessions enforce their own snapshot through PacketCodec::set_packet_limit.
+/// The value is bounded to [1 KiB, 1 GiB] by the sysvar registry.
 pub fn max_allowed_packet_bytes() -> usize {
     // Clamp defensively even though both seed and SET GLOBAL already
     // bound the atomic to <= 1 GiB, so the `as usize` cast is always
@@ -876,7 +865,11 @@ where
             self.memory_charge
                 .try_grow(requested_growth)
                 .map_err(|err| io::Error::new(io::ErrorKind::OutOfMemory, err.message()))?;
-            if self.buffer.try_reserve_exact(requested_growth).is_err() {
+            if self
+                .buffer
+                .try_reserve_exact(required - self.buffer.len())
+                .is_err()
+            {
                 self.memory_charge.shrink(requested_growth);
                 return Err(io::Error::new(
                     io::ErrorKind::OutOfMemory,
@@ -1123,6 +1116,7 @@ impl CompressionState {
 /// modes. Holds the compression state so the same `Session` reads /
 /// writes packets through a single object regardless of mode.
 pub struct PacketCodec {
+    packet_limit: Option<usize>,
     compression: Option<CompressionState>,
     status: Option<std::sync::Arc<crate::engine::status_counters::SessionStatus>>,
 }
@@ -1136,6 +1130,7 @@ impl Default for PacketCodec {
 impl PacketCodec {
     pub fn plain() -> Self {
         Self {
+            packet_limit: None,
             compression: None,
             status: None,
         }
@@ -1145,9 +1140,18 @@ impl PacketCodec {
         status: std::sync::Arc<crate::engine::status_counters::SessionStatus>,
     ) -> Self {
         Self {
+            packet_limit: None,
             compression: None,
             status: Some(status),
         }
+    }
+
+    pub(crate) fn is_compressed(&self) -> bool {
+        self.compression.is_some()
+    }
+
+    pub(crate) fn set_packet_limit(&mut self, limit: usize) {
+        self.packet_limit = Some(limit.min(MAX_ALLOWED_PACKET_CEILING));
     }
 
     /// Promote this codec to the zlib compression protocol. Subsequent
@@ -1216,7 +1220,7 @@ impl PacketCodec {
     where
         R: AsyncRead + Unpin,
     {
-        let limit = max_allowed_packet_bytes();
+        let limit = self.packet_limit.unwrap_or_else(max_allowed_packet_bytes);
         let result = match self.compression.as_mut() {
             None => read_packet_with_limit(reader, limit).await,
             Some(state) => read_packet_compressed(reader, state, limit).await,
@@ -1324,7 +1328,7 @@ where
 {
     // First, make sure we have at least 4 bytes of decompressed payload
     // for the inner MySQL frame header.
-    if !ensure_decompressed_bytes(reader, state, 4).await? {
+    if !ensure_decompressed_bytes(reader, state, 4, false).await? {
         return Ok(None);
     }
     let mut header = [0u8; 4];
@@ -1347,20 +1351,20 @@ where
             ));
         }
         let start = payload.len();
-        reserve_packet_payload(&mut payload, &mut memory_charge, new_total)?;
-        payload.resize(new_total, 0);
         // We have already consumed this frame's 4-byte header, so an EOF
         // before the declared payload arrives is a genuine mid-packet
         // truncation — return an error rather than letting the copy below
         // slice past `inflate_buf` and panic (matches the plaintext
         // `read_exact_with_timeout` behaviour). `ensure_decompressed_bytes`
         // returns `Ok(false)` only on a clean EOF with nothing buffered.
-        if !ensure_decompressed_bytes(reader, state, frame_len).await? {
+        if !ensure_decompressed_bytes(reader, state, frame_len, true).await? {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "compressed stream ended mid-frame",
             ));
         }
+        reserve_packet_payload(&mut payload, &mut memory_charge, new_total)?;
+        payload.resize(new_total, 0);
         copy_from_inflate_buf(state, &mut payload[start..]);
         if frame_len < MAX_PAYLOAD_LEN {
             break;
@@ -1368,7 +1372,7 @@ where
         // Continuation frame's own 4-byte header follows. Same reasoning:
         // a clean EOF here means the client promised more (>16 MiB) frames
         // but disappeared — that is a truncated packet, not a clean close.
-        if !ensure_decompressed_bytes(reader, state, 4).await? {
+        if !ensure_decompressed_bytes(reader, state, 4, true).await? {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "compressed stream ended before continuation frame header",
@@ -1410,13 +1414,17 @@ async fn ensure_decompressed_bytes<R>(
     reader: &mut R,
     state: &mut CompressionState,
     need: usize,
+    in_command: bool,
 ) -> io::Result<bool>
 where
     R: AsyncRead + Unpin,
 {
+    let mut started = in_command || state.available() != 0;
     while state.available() < need {
-        match read_one_compressed_packet(reader, state).await? {
-            true => {}
+        match read_one_compressed_packet(reader, state, started).await? {
+            true => {
+                started = true;
+            }
             false => {
                 if state.available() == 0 && need > 0 {
                     return Ok(false);
@@ -1438,17 +1446,25 @@ where
 async fn read_one_compressed_packet<R>(
     reader: &mut R,
     state: &mut CompressionState,
+    in_command: bool,
 ) -> io::Result<bool>
 where
     R: AsyncRead + Unpin,
 {
     let mut hdr = [0u8; COMPRESSED_HEADER_LEN];
-    match reader.read_exact(&mut hdr[..1]).await {
+    let first = if in_command {
+        read_exact_with_timeout(reader, &mut hdr[..1], net_read_timeout()).await
+    } else {
+        reader.read_exact(&mut hdr[..1]).await.map(|_| ())
+    };
+    match first {
         Ok(_) => {}
         Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(false),
         Err(err) => return Err(err),
     }
-    crate::engine::status_counters::add_bytes_received(1);
+    if !in_command {
+        crate::engine::status_counters::add_bytes_received(1);
+    }
     read_exact_with_timeout(reader, &mut hdr[1..], net_read_timeout()).await?;
     let comp_len = (hdr[0] as usize) | ((hdr[1] as usize) << 8) | ((hdr[2] as usize) << 16);
     let comp_seq = hdr[3];
@@ -1457,6 +1473,12 @@ where
     // Request and response share the outer counter; inner frame sequence
     // numbers cannot identify compressed packet boundaries.
 
+    if comp_len == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "empty compressed envelope",
+        ));
+    }
     if comp_len > MAX_COMPRESSED_PAYLOAD {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -2715,5 +2737,59 @@ mod audit1122_incremental_input {
         );
         drop(writer);
         assert!(reading.await.unwrap().is_err());
+    }
+}
+
+#[cfg(test)]
+mod audit1123 {
+    use super::*;
+    #[tokio::test]
+    async fn empty_compressed_envelope_is_malformed() {
+        let mut codec = PacketCodec::plain();
+        codec.enable_zlib_compression();
+        let err = codec
+            .read_packet(&mut [0u8; 7].as_slice())
+            .await
+            .unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+    #[tokio::test]
+    async fn compressed_header_does_not_allocate_unsent_inner_payload() {
+        let (mut writer, mut reader) = tokio::io::duplex(64);
+        writer
+            .write_all(&[4, 0, 0, 0, 0, 0, 0, 0xfa, 0xff, 0xff, 0])
+            .await
+            .unwrap();
+        let mut state = CompressionState::new_zlib();
+        let baseline = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        let mut reading = Box::pin(read_packet_compressed(
+            &mut reader,
+            &mut state,
+            32 * 1024 * 1024,
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(30), &mut reading)
+                .await
+                .is_err()
+        );
+        let current = crate::engine::executor::mem_budget::controlled_memory_snapshot().0;
+        assert!(
+            current.saturating_sub(baseline) < 1024 * 1024,
+            "header retained {} bytes",
+            current.saturating_sub(baseline)
+        );
+    }
+    #[tokio::test]
+    async fn batch_growth_accounts_for_reserved_capacity() {
+        let mut wire = Vec::new();
+        let mut writer = PacketBatchWriter::new(&mut wire);
+        writer.buffer.clear();
+        writer.flush_threshold = usize::MAX;
+        let capacity = writer.buffer.capacity();
+        writer
+            .write_packet_seq(0, &vec![1; capacity + 1])
+            .await
+            .unwrap();
+        assert_eq!(writer.memory_charge.bytes(), writer.buffer.capacity());
     }
 }

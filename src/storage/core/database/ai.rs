@@ -121,15 +121,23 @@ impl Database {
         crate::engine::cancel::check_cancelled()?;
         txn.commit()?;
         crate::engine::ai::catalog_faults::hit("after_durable")?;
-        {
+        let publication = (|| {
+            crate::engine::ai::catalog_faults::hit("before_publish")?;
             let mut catalog = self.catalog_write()?;
             catalog.ai = Arc::new(candidate);
-            if let Some(auth) = auth_candidate {
-                catalog.auth = auth;
-            }
+            if let Some(auth) = &auth_candidate { catalog.auth = auth.clone(); }
+            Ok::<_, QueryError>(())
+        })();
+        // A durable AI mutation cannot be reported as rolled back. If the
+        // catalog lock failed, stop serving statements and publish matching
+        // authorization retirement even while the catalog is unavailable.
+        if let Some(auth) = auth_candidate {
+            self.auth_snapshot.store(auth);
+            crate::engine::auth::invalidate_authorization_cache();
         }
-        if !deleted.is_empty() {
-            self.publish_auth_snapshot()?;
+        if let Err(err) = publication {
+            self.quarantine_mvcc("AI catalog publication failed after durable commit");
+            return Err(err);
         }
         crate::engine::ai::catalog_faults::hit("after_publish")?;
         Ok(result)

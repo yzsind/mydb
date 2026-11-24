@@ -25,11 +25,22 @@ pub(crate) enum IntrinsicFunction {
     FindInSet,
     CollationSortKey,
     CollatedValue,
+    GroupConcatValue,
+    DistinctTuple,
+    DistinctCollationKey,
+    TypedConstant,
 }
 
 impl IntrinsicFunction {
     pub(crate) fn from_name(name: &str) -> Option<Self> {
         const NAMES: &[(&str, IntrinsicFunction)] = &[
+            ("__TYPED_CONST", IntrinsicFunction::TypedConstant),
+            ("__GROUP_CONCAT_VALUE", IntrinsicFunction::GroupConcatValue),
+            ("__DISTINCT_TUPLE", IntrinsicFunction::DistinctTuple),
+            (
+                "__DISTINCT_COLLATION_KEY",
+                IntrinsicFunction::DistinctCollationKey,
+            ),
             ("__ENUM_ORDINAL", IntrinsicFunction::EnumOrdinal),
             ("__SET_ORDINAL", IntrinsicFunction::SetOrdinal),
             ("__SET_ORDINAL_BINARY", IntrinsicFunction::SetOrdinal),

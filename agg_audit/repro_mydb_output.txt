@@ -1,0 +1,64 @@
+mysql: [Warning] Using a password on the command line interface can be insecure.
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+g	h	COUNT(*)
+0	0	47
+0	1	48
+0	2	47
+1	0	47
+1	1	48
+1	2	48
+2	0	48
+2	1	47
+2	2	48
+3	0	48
+a	group_0
+1	1
+2	2
+NULL	NULL
+3	3
+group_0
+NULL
+1
+2
+3
+NULL
+STD(x)	VARIANCE(x)	STDDEV_POP(x)	STDDEV_SAMP(x)	VAR_POP(x)	VAR_SAMP(x)
+0.0000013486991523486091	0.0000000000018189894035458565	0.0000013486991523486091	0.0000019073486328125	0.0000000000018189894035458565	0.000000000003637978807091713
+id	VARIANCE(x)
+1	0
+BIT_AND(x)	BIT_OR(x)	BIT_XOR(x)
+18446744073709551615	0	0
+a	BIT_AND(c)
+1	18446744073709551615
+s	HEX(s)	COUNT(*)
+A	41	2
+a 	6120	1
+NULL	NULL	3
+s	HEX(s)	COUNT(*)
+a	61	2
+a 	6120	1
+x	COUNT(*)
+1	9
+1	9
+ERROR 3580 (HY000) at line 104: argument '`b`' of GROUPING function is not in GROUP BY
+GROUP_CONCAT(s ORDER BY s)
+a,bb,
+Level	Code	Message
+Warning	1260	Row was cut by GROUP_CONCAT()
+ERROR 2027 (HY000) at line 126: Malformed packet
+ERROR 2013 (HY000) at line 127: Lost connection to MySQL server during query
+ERROR 2013 (HY000) at line 128: Lost connection to MySQL server during query

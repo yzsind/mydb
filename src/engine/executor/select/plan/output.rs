@@ -395,6 +395,14 @@ pub(super) fn projection_result_columns(
                 }
                 column.source.round_decimal_result |=
                     crate::engine::expr::decimal_result_needs_shaping(expr);
+                if stmt.group_by_modifier != crate::parser::GroupByModifier::None
+                    && (crate::engine::expr::is_direct_column_reference(expr)
+                        || crate::parser::visit::any_expr(expr, |node| {
+                            matches!(node, Expr::GroupKeyRef { .. })
+                        }))
+                {
+                    column.source.flags &= !crate::mysql::protocol::NOT_NULL_FLAG;
+                }
                 columns.push(column);
             }
         }

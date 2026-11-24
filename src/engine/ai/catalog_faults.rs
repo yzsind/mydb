@@ -27,7 +27,7 @@ pub(crate) fn hit(stage: &str) -> Result<(), QueryError> {
     }
     if FAILURE.with(|value| value.get() == stage) {
         assert!(
-            matches!(stage, "before_dd" | "after_dd_rows"),
+            matches!(stage, "before_dd" | "after_dd_rows" | "before_publish"),
             "post-commit failures are crash-only"
         );
         return Err(crate::error::catalog::ER_GET_ERRNO

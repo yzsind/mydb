@@ -404,13 +404,17 @@ fn parser_release_1121_statement_functionality() {
         "SELECT * FROM (SELECT a,a FROM t) d",
         "SELECT * FROM (SELECT * FROM t x JOIN t y) d",
     ] {
-        assert!(!rows(&engine, &mut s, sql).is_empty(), "{sql}");
+        assert_eq!(
+            exec(&engine, &mut s, sql).unwrap_err().code(),
+            1060,
+            "{sql}"
+        );
     }
     assert_eq!(
         exec(&engine, &mut s, "SELECT d.x FROM (SELECT 1 x,2 x) d")
             .unwrap_err()
             .code(),
-        1052
+        1060
     );
     exec(&engine, &mut s, "CREATE TABLE iq(a INT)").unwrap();
     for sql in [

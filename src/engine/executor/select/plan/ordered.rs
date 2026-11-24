@@ -1460,17 +1460,7 @@ pub(super) fn emit_streaming_accum_group(
     }
     let mut fields = sample_fields;
     for (idx, value) in keys.into_iter().enumerate() {
-        fields.push(PlanField {
-            meta: intern_col_meta(ColMeta {
-                invisible: false,
-                table: "$group".to_string(),
-                alias: None,
-                column: format!("group_{idx}"),
-                column_type: ColumnType::VarString,
-                source: Default::default(),
-            }),
-            value,
-        });
+        fields.push(crate::engine::executor::select::aggregate::group_marker_field(idx, value));
     }
     let row = PlanRow {
         fields,

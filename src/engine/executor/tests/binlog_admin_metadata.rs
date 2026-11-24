@@ -40,8 +40,6 @@ fn prepared_binlog_admin_metadata_matches_each_response_kind() {
                 "Info",
             ],
         ),
-        ("SHOW PROFILES", vec!["Query_ID", "Duration", "Query"]),
-        ("SHOW PROFILE", vec!["Status", "Duration"]),
         ("FLUSH BINARY LOGS", vec![]),
         ("RESET MASTER", vec![]),
         ("PURGE BINARY LOGS TO 'mydb-bin.000001'", vec![]),
@@ -58,6 +56,15 @@ fn prepared_binlog_admin_metadata_matches_each_response_kind() {
                 .collect::<Vec<_>>(),
             names,
             "{sql}"
+        );
+    }
+    for sql in ["SHOW PROFILE", "SHOW PROFILES"] {
+        assert_eq!(
+            engine
+                .describe_prepared_statement(&mut session, sql)
+                .unwrap_err()
+                .code(),
+            1235
         );
     }
 }

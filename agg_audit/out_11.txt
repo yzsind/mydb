@@ -1,0 +1,323 @@
+=========== DIFF #1 ===========
+SQL: SELECT a, b, SUM(c), GROUPING(a), GROUPING(b) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(c)	GROUPING(a)	GROUPING(b)
+NULL	NULL	70	0	0
+NULL	y	60	0	0
+1	NULL	30	0	0
+1	x	10	0	0
+1	y	20	0	0
+2	NULL	50	0	0
+2	x	40	0	0
+3	x	-10	0	0
+3	y	NULL	0	0
+NULL	NULL	130	0	1
+1	NULL	60	0	1
+2	NULL	90	0	1
+3	NULL	-10	0	1
+NULL	NULL	270	1	1
+--- mysql ---
+a	b	SUM(c)	GROUPING(a)	GROUPING(b)
+NULL	NULL	70	0	0
+NULL	y	60	0	0
+NULL	NULL	130	0	1
+1	NULL	30	0	0
+1	x	10	0	0
+1	y	20	0	0
+1	NULL	60	0	1
+2	NULL	50	0	0
+2	x	40	0	0
+2	NULL	90	0	1
+3	x	-10	0	0
+3	y	NULL	0	0
+3	NULL	-10	0	1
+NULL	NULL	270	1	1
+
+=========== DIFF #2 ===========
+SQL: SELECT a, b, SUM(c), GROUPING(a, b) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(c)	GROUPING(a, b)
+NULL	NULL	70	0
+NULL	y	60	0
+1	NULL	30	0
+1	x	10	0
+1	y	20	0
+2	NULL	50	0
+2	x	40	0
+3	x	-10	0
+3	y	NULL	0
+NULL	NULL	130	1
+1	NULL	60	1
+2	NULL	90	1
+3	NULL	-10	1
+NULL	NULL	270	3
+--- mysql ---
+a	b	SUM(c)	GROUPING(a, b)
+NULL	NULL	70	0
+NULL	y	60	0
+NULL	NULL	130	1
+1	NULL	30	0
+1	x	10	0
+1	y	20	0
+1	NULL	60	1
+2	NULL	50	0
+2	x	40	0
+2	NULL	90	1
+3	x	-10	0
+3	y	NULL	0
+3	NULL	-10	1
+NULL	NULL	270	3
+
+=========== DIFF #4 ===========
+SQL: SELECT a, b, GROUPING(a) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	GROUPING(a)
+NULL	NULL	0
+NULL	y	0
+1	NULL	0
+1	x	0
+1	y	0
+2	NULL	0
+2	x	0
+3	x	0
+3	y	0
+NULL	NULL	0
+1	NULL	0
+2	NULL	0
+3	NULL	0
+NULL	NULL	1
+--- mysql ---
+a	b	GROUPING(a)
+NULL	NULL	0
+NULL	y	0
+NULL	NULL	0
+1	NULL	0
+1	x	0
+1	y	0
+1	NULL	0
+2	NULL	0
+2	x	0
+2	NULL	0
+3	x	0
+3	y	0
+3	NULL	0
+NULL	NULL	1
+
+=========== DIFF #7 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY a, b WITH ROLLUP HAVING SUM(c) > 30
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+2	NULL	50
+2	x	40
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+NULL	NULL	270
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+NULL	NULL	270
+
+=========== DIFF #12 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY a, b WITH ROLLUP LIMIT 3
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+
+=========== DIFF #13 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY a, b WITH ROLLUP ORDER BY GROUPING(b) DESC, a, b LIMIT 4
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	130
+NULL	NULL	270
+1	NULL	60
+2	NULL	90
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	270
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+
+=========== DIFF #16 ===========
+SQL: SELECT YEAR(f), MONTH(f), COUNT(*) FROM t1 GROUP BY YEAR(f), MONTH(f) WITH ROLLUP
+--- mydb ---
+YEAR(f)	MONTH(f)	COUNT(*)
+NULL	NULL	3
+2024	1	5
+2024	2	1
+NULL	NULL	3
+2024	NULL	6
+NULL	NULL	9
+--- mysql ---
+YEAR(f)	MONTH(f)	COUNT(*)
+NULL	NULL	3
+NULL	NULL	3
+2024	1	5
+2024	2	1
+2024	NULL	6
+NULL	NULL	9
+
+=========== DIFF #17 ===========
+SQL: SELECT COALESCE(a, -1) x, b, COUNT(*) FROM t1 GROUP BY COALESCE(a, -1), b WITH ROLLUP
+--- mydb ---
+x	b	COUNT(*)
+-1	NULL	1
+-1	y	1
+1	NULL	1
+1	x	1
+1	y	1
+2	NULL	1
+2	x	1
+3	x	1
+3	y	1
+-1	NULL	2
+1	NULL	3
+2	NULL	2
+3	NULL	2
+NULL	NULL	9
+--- mysql ---
+x	b	COUNT(*)
+-1	NULL	1
+-1	y	1
+-1	NULL	2
+1	NULL	1
+1	x	1
+1	y	1
+1	NULL	3
+2	NULL	1
+2	x	1
+2	NULL	2
+3	x	1
+3	y	1
+3	NULL	2
+NULL	NULL	9
+
+=========== DIFF #19 ===========
+SQL: SELECT IFNULL(a, 0), b, SUM(c) FROM t1 GROUP BY IFNULL(a,0), b WITH ROLLUP
+--- mydb ---
+IFNULL(a, 0)	b	SUM(c)
+0	NULL	70
+0	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+0	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+--- mysql ---
+IFNULL(a, 0)	b	SUM(c)
+0	NULL	70
+0	y	60
+0	NULL	130
+1	NULL	30
+1	x	10
+1	y	20
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+3	x	-10
+3	y	NULL
+3	NULL	-10
+NULL	NULL	270
+
+=========== DIFF #20 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY 1, 2 WITH ROLLUP
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+1	NULL	30
+1	x	10
+1	y	20
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+3	x	-10
+3	y	NULL
+3	NULL	-10
+NULL	NULL	270
+
+=========== DIFF #21 ===========
+SQL: SELECT a AS g1, b AS g2, SUM(c) FROM t1 GROUP BY g1, g2 WITH ROLLUP
+--- mydb ---
+g1	g2	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+--- mysql ---
+g1	g2	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+1	NULL	30
+1	x	10
+1	y	20
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+3	x	-10
+3	y	NULL
+3	NULL	-10
+NULL	NULL	270
+
+=========== DIFF #22 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY 1 WITH ROLLUP
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+RESULT: PASS=17 FAIL=12

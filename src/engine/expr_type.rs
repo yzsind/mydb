@@ -226,6 +226,131 @@ impl<'a> TypeContext<'a> {
     }
 }
 
+// Correlated constants retain their declared domain across lateral query
+// boundaries. The payload is evaluated normally; metadata never depends on
+// which outer row happened to be bound first (or on its NULL sample value).
+type ConstantDomain = (
+    ColumnType,
+    u16,
+    Option<u32>,
+    Option<u8>,
+    Option<u8>,
+    Option<u16>,
+    Option<(crate::vector::VectorDataType, Option<u32>)>,
+    Option<u8>,
+    Option<u8>,
+);
+
+pub(crate) fn typed_constant(value: Expr, kind: ColumnType, source: &ColumnSource) -> Expr {
+    let domain: ConstantDomain = (
+        kind,
+        source.flags,
+        source.length,
+        source.numeric_precision,
+        source.decimals,
+        source.collation_id,
+        source.vector_type,
+        source.wire_type,
+        Some(
+            source
+                .collation_coercibility
+                .unwrap_or(if source.org_name.is_empty() { 4 } else { 2 }),
+        ),
+    );
+    Expr::Function {
+        name: "__TYPED_CONST".into(),
+        args: vec![
+            value,
+            Expr::Literal(Literal::String(
+                serde_json::to_string(&domain).expect("column domain serializes"),
+            )),
+        ],
+        distinct: false,
+    }
+}
+
+pub(crate) fn typed_constant_descriptor(args: &[Expr]) -> Option<ExprType> {
+    let [_, Expr::Literal(Literal::String(domain))] = args else {
+        return None;
+    };
+    // Binding asks for the same immutable domain repeatedly for each outer
+    // row. Cache exact keys, with bounded and optionally admitted memory;
+    // eviction or admission failure only repeats decoding, never changes SQL.
+    struct CachedDomain {
+        key: Box<str>,
+        descriptor: ExprType,
+        _charge: crate::engine::executor::mem_budget::ControlledMemoryCharge,
+    }
+    thread_local! {
+        static DOMAINS: std::cell::RefCell<([Option<CachedDomain>; 8], usize)> =
+            const { std::cell::RefCell::new(([const { None }; 8], 0)) };
+    }
+    if let Some(descriptor) = DOMAINS.with(|cache| {
+        cache
+            .borrow()
+            .0
+            .iter()
+            .flatten()
+            .find(|entry| entry.key.as_ref() == domain)
+            .map(|entry| entry.descriptor)
+    }) {
+        return Some(descriptor);
+    }
+    let (
+        kind,
+        flags,
+        length,
+        numeric_precision,
+        decimals,
+        collation_id,
+        vector_type,
+        wire_type,
+        collation_coercibility,
+    ): ConstantDomain = serde_json::from_str(domain).ok()?;
+    let descriptor = ExprType::from_column_type(
+        kind,
+        &ColumnSource {
+            flags,
+            length,
+            numeric_precision,
+            decimals,
+            collation_id,
+            vector_type,
+            wire_type,
+            collation_coercibility,
+            ..Default::default()
+        },
+    );
+    if domain.len() <= 1024 {
+        use crate::engine::executor::mem_budget::{
+            ControlledMemoryCategory, ControlledMemoryCharge,
+        };
+        if let Some(charge) = ControlledMemoryCharge::try_new_optional(
+            ControlledMemoryCategory::SystemMetadata,
+            domain.len(),
+        ) {
+            DOMAINS.with(|cache| {
+                let mut cache = cache.borrow_mut();
+                let index = cache.1;
+                cache.0[index] = Some(CachedDomain {
+                    key: domain.clone().into_boxed_str(),
+                    descriptor,
+                    _charge: charge,
+                });
+                cache.1 = (index + 1) % cache.0.len();
+            });
+        }
+    }
+    Some(descriptor)
+}
+
+pub(crate) fn typed_constant_payload(args: &[Expr]) -> Result<&Expr, crate::types::QueryError> {
+    typed_constant_descriptor(args).ok_or_else(|| {
+        crate::error::catalog::ER_WRONG_ARGUMENTS.error("Invalid typed constant domain")
+    })?;
+    Ok(&args[0])
+}
+
 pub(crate) fn fixed_integer_result(
     width: IntegerWidth,
     unsigned: bool,
@@ -1346,8 +1471,14 @@ fn binary_type(
             true,
             Some(
                 left.max_octets
-                    .unwrap_or(1)
-                    .max(right.max_octets.unwrap_or(1))
+                    .or_else(|| display_octet_bound(&left))
+                    .unwrap_or(20)
+                    .max(
+                        right
+                            .max_octets
+                            .or_else(|| display_octet_bound(&right))
+                            .unwrap_or(20),
+                    )
                     .saturating_add(1),
             ),
         ),
@@ -2218,6 +2349,9 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     descriptor.coercibility = 0;
                     descriptor
                 }
+                "__TYPED_CONST" => {
+                    typed_constant_descriptor(args).unwrap_or_else(|| ExprType::new(Unknown, true))
+                }
                 "__COLLATED_CONST" if args.len() >= 3 => {
                     let mut descriptor = infer_expr_type(&args[0], context);
                     descriptor.collation_id =
@@ -2264,6 +2398,28 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     },
                     true,
                 ),
+                "YEAR" | "DATEDIFF" | "DAYOFWEEK" | "DAYOFMONTH" | "DAYOFYEAR" | "QUARTER"
+                | "MONTH" | "WEEKDAY" | "WEEK" | "WEEKOFYEAR" | "ASCII" | "STRCMP" => {
+                    fixed_integer_result(IntegerWidth::Int, false, true)
+                }
+                "ORD" if args.len() == 1 => fixed_integer_result(
+                    IntegerWidth::Big,
+                    false,
+                    infer_expr_type(&args[0], context).nullable,
+                ),
+                "INET_ATON" => fixed_integer_result(IntegerWidth::Big, true, true),
+                "EXTRACT" => {
+                    let wide = args.first().is_none_or(|unit| !matches!(unit, Expr::Literal(Literal::String(unit)) if !unit.ends_with("MICROSECOND") || unit == "MICROSECOND" || unit == "SECOND_MICROSECOND"));
+                    fixed_integer_result(
+                        if wide {
+                            IntegerWidth::Big
+                        } else {
+                            IntegerWidth::Int
+                        },
+                        false,
+                        true,
+                    )
+                }
                 "CHAR" => {
                     let mut result = ExprType::new(
                         String {
@@ -2271,6 +2427,7 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         },
                         true,
                     );
+                    result.max_octets = Some((args.len() as u32).saturating_mul(4));
                     result.collation_id = Some(crate::charset::BINARY_COLLATION_ID);
                     result
                 }
@@ -2476,7 +2633,9 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         })
                         .collect();
                     result.max_octets = widths.map(|widths| match normalized.as_str() {
-                        "CONCAT" => widths.into_iter().fold(0u32, u32::saturating_add),
+                        "CONCAT" | "__GROUP_CONCAT_VALUE" => {
+                            widths.into_iter().fold(0u32, u32::saturating_add)
+                        }
                         "CONCAT_WS" => {
                             let separators = widths.len().saturating_sub(2) as u32;
                             widths
@@ -2550,6 +2709,16 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                     }
                     result
                 }
+                "HEX" if args.len() == 1 => {
+                    let input = infer_expr_type(&args[0], context);
+                    let width = display_octet_bound(&input).map(|n| {
+                        n.saturating_mul(2)
+                            .saturating_mul(u32::from(context.connection_mbmaxlen))
+                    });
+                    let mut result = fixed_string_result(width, input.nullable);
+                    result.collation_id = Some(context.connection_collation_id);
+                    result
+                }
                 "DATE_FORMAT" | "TIME_FORMAT" => {
                     let bound = args.get(1).and_then(|format| match format {
                         Expr::Literal(Literal::String(format))
@@ -2565,7 +2734,12 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
                         other => display_octet_bound(&infer_expr_type(other, context))
                             .map(|bytes| bytes.saturating_mul(64)),
                     });
-                    let mut result = fixed_string_result(bound, true);
+                    let mut result = fixed_string_result(
+                        bound.map(|width| {
+                            width.saturating_mul(u32::from(context.connection_mbmaxlen))
+                        }),
+                        true,
+                    );
                     result.collation_id = Some(context.connection_collation_id);
                     result
                 }
@@ -3130,9 +3304,10 @@ fn infer_expr_type_checked(expr: &Expr, context: &TypeContext<'_>) -> ExprType {
             let normalized = crate::engine::sys_schema::NormalizedFuncName::new(name);
             let argument = args.first().map(|arg| infer_expr_type(arg, context));
             match normalized.as_str() {
-                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" | "COUNT" => {
-                    fixed_integer_result(IntegerWidth::Big, false, false)
+                "ROW_NUMBER" | "RANK" | "DENSE_RANK" | "NTILE" => {
+                    fixed_integer_result(IntegerWidth::Big, true, false)
                 }
+                "COUNT" => fixed_integer_result(IntegerWidth::Big, false, false),
                 "SUM" | "AVG" | "MIN" | "MAX" => {
                     aggregate_result_type(normalized.as_str(), argument, context)
                 }
@@ -3368,7 +3543,7 @@ mod tests {
         assert_eq!(infer("LAG(d) OVER (ORDER BY u)"), nullable_date);
         assert_eq!(
             infer("ROW_NUMBER() OVER (ORDER BY d)"),
-            fixed_integer_result(IntegerWidth::Big, false, false)
+            fixed_integer_result(IntegerWidth::Big, true, false)
         );
     }
 

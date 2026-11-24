@@ -106,7 +106,7 @@ intentional differences, and migration boundaries.
   Foreign keys implement `MATCH SIMPLE`; unsupported `MATCH FULL` and
   `MATCH PARTIAL` return 1235 instead of silently applying SIMPLE semantics.
 - **INSTANT DROP and LOB space**: dropping a column preserves old row layouts and their LOB data without rewriting the heap. OPTIMIZE TABLE or a physical COPY rebuild removes the dropped values and reclaims their LOB space; the instantaneous drop itself does not promise immediate disk reclamation.
-- **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statement/metadata/show-tables.md). UPDATE_TIME is NULL when no reliable modification timestamp is available. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
+- **Metadata differences**: SHOW FULL TABLES has seven columns, as documented in [SHOW TABLES](statement/metadata/show-tables.md). UPDATE_TIME tracks committed local INSERT/UPDATE/DELETE operations; uncommitted changes and rollback do not publish timestamps. This runtime statistic may be NULL after restart or TRUNCATE. User-view CREATE_TIME is persisted at creation and does not change merely because the server restarts.
 - **Expression defaults during ALTER**: column-dependent defaults are evaluated for existing rows during COPY, including partitioned tables and concurrent-write replay. RENAME COLUMN and CHANGE COLUMN rewrite dependent DEFAULT expressions along with generated expressions. A DEFAULT expression that references an AUTO_INCREMENT column is rejected with error 3768.
 - **Adding AUTO_INCREMENT columns**: a compound ALTER can add the column and its key together, assigning values to existing rows and preserving the session increment/offset. This requires COPY with writes blocked; explicit `LOCK=NONE` is rejected.
 - **CHECK constraints**: ✅ all actions
@@ -242,6 +242,7 @@ for syntax and operational limits.
 
 - Column aliases, `IF NOT EXISTS`, view expansion, cycle detection, and explicit depth limits: 32 expanded view levels and at most 16 residual non-mergeable query levels.
 - **Semantic definition persistence**: the query AST parsed at CREATE/ALTER is saved to the catalog and shared via immutable objects; execution uses that AST. The SHOW CREATE text is for display only. Quoting/escaping semantics from creation survive SQL mode changes and restarts; the view dependency key includes a digest of the query semantics.
+- **Online view DDL**: ALTER VIEW and CREATE OR REPLACE VIEW publish complete definitions without waiting for readers' transactions to end. View references bind immutable definitions before execution; a later statement in the same transaction may observe a newly published definition. Repeatable-read data snapshots do not freeze view definitions. Applications that require identical definitions across statements must coordinate view changes with their transactions.
 - **Encoding resource bounds**: semantic query encoding is capped at 64 MiB, 1,000,000 JSON containers, and 4,000,000 scalars. Scalar expression depth is 1,024 and SELECT nesting is 63; semantic query depth is `1,024 + 63 = 1,087`, and encoded JSON depth is `4 × (1,024 + 1,087) = 8,444`. The compiled-expression depth limit of 64 is separate: deeper admitted expressions use the stack-extending scalar evaluator. Exceeding the encoding limits returns a clear error before the catalog write; corrupted or unknown-version semantic queries fail at catalog read time instead of being replaced with an empty query. Encoding capacity is charged to SystemMetadata; decode scratch space and stack segments are charged to ParserTransient.
 - **ALGORITHM tri-state**: `MERGE` / `UNDEFINED` / `TEMPTABLE` (genuinely materialized under `no_merge`).
 - **SQL SECURITY DEFINER / INVOKER**: ✅ the read path switches the privilege account. EXPLAIN additionally requires the caller to hold SHOW VIEW on referenced views and SELECT on their recursive dependencies; DEFINER execution privileges do not authorize plan disclosure.
@@ -254,7 +255,7 @@ for syntax and operational limits.
 - **Dependency revalidation**: ALTER/REPLACE VIEW propagates invalidation and rebinds dependent views; DROP DATABASE invalidates cross-database dependencies; missing dependencies report 1356.
 - **Normalized definition echo**: `SHOW CREATE VIEW` / `IS.views.VIEW_DEFINITION` echo the normalized definition (identifier backquoting, `db.tbl` qualification, `*` expansion, adding `AS alias`); constructs that cannot round-trip (subqueries/windows/CTE/MATCH/GROUP_CONCAT) conservatively fall back to the original text.
 - **Column types frozen at CREATE**: expression column types and nullability are determined when the view is created.
-- **Join-view DML**: single-base-table UPDATE over INNER/CROSS JOIN views with direct column projections is supported, preserving the join and WHERE conditions; duplicate matches modify each target row only once; cross-base-table assignments report 1393 and DELETE reports 1395. Single-base-table INSERT with an explicit column list remains supported. Outer joins, NATURAL/USING, computed columns, extra outer joins, and CHECK OPTION/RETURNING on join views — shapes not yet supported — are explicitly rejected.
+- **Join-view DML**: single-base-table UPDATE over INNER/CROSS JOIN views with direct column projections is supported, including NATURAL/USING joins, preserving the join and WHERE conditions; duplicate matches modify each target row only once; cross-base-table assignments report 1393 and DELETE/REPLACE report 1395. Single-base-table INSERT with an explicit column list remains supported. Outer joins, computed columns, extra outer joins, CHECK OPTION/RETURNING on join views, and nested views over join views remain explicitly restricted. NATURAL/USING join-view INSERT remains restricted.
 - **View definition and dependency behavior**: TRIM special syntax round-trips through normalization; wildcard metadata follows logical column order and excludes dropped/INVISIBLE columns; recreated column names resolve to their current types and character metadata; multi-object DROP VIEW deletes in a single catalog transaction after unified validation; dependent views are revalidated after function rebuilds; source views of INSERT…SELECT go through expansion and privilege validation; CHECK OPTION on non-updatable views reports 1368.
 - **Retained differences**: SHOW CREATE VIEW keeps the correct full output column-name list so explicit column names are not lost on rebuild; FOR UPDATE on aggregate or materialized views remains explicitly rejected (1235) rather than disguising unimplemented base-table row locking as success.
 
@@ -947,6 +948,15 @@ and temporal column metadata.
 - `performance_schema`: `events_statements_*`, `events_waits_*`, `events_transactions_*`, `events_stages_*`, `data_locks`/`data_lock_waits`, `metadata_locks`, `threads`, `setup_*`, `global_status`/`session_status`, `*_variables`, `host_cache`, `file_summary_by_instance`, `status_by_{account,host,thread,user}`, etc.
 - `sys`: the `sys_config` base table + all summary/analysis views (`host_summary*`, `user_summary*`, `schema_*`, `statement_analysis`, `memory_*`, `io_*`, `waits_*`, …), each with an `x$` raw variant.
 
+Virtual system tables have no user-storage row identities. Locking reads of
+`information_schema` are rejected (1142 for FOR UPDATE, 3550 for FOR SHARE);
+`performance_schema` permits FOR SHARE over its immutable instrumentation
+snapshot and rejects FOR UPDATE. Row locking of virtual `mysql` catalog tables
+returns 1235; use account DDL/DCL rather than direct catalog writes. LOCK TABLES
+rejects `information_schema` and `performance_schema`. FILES and InnoDB file
+metadata use paths relative to the data directory. TABLE_CONSTRAINTS_EXTENSIONS
+lists actual public indexes; heap tables do not invent an implicit PRIMARY index.
+
 `sys.sys_config` settings are written to `system/sys_config.json` under the
 data directory, with a single statement committing via atomic file replacement;
 DML inside explicit transactions/XA returns a not-supported error to avoid a
@@ -974,7 +984,7 @@ synchronization state, filtered by SELECT/UPDATE privileges on each sequence.
   the `Mydb_*` extensions; GLOBAL/SESSION, `FLUSH STATUS`, PFS `status_by_*`, and
   `sys.metrics` share one unified registry. Per-item design and the documented gaps are in
   [`show-status.md`](show-status.md).
-- ◑ Deferred: `SHOW TABLE STATUS` Checksum and real `SHOW PROFILE(S)` data.
+- `SHOW PROFILE(S)` returns 1235 because statement profiling is not implemented; use performance_schema statement instrumentation. `SHOW TABLE STATUS` Checksum remains unavailable.
 
 ### Observability
 
@@ -1074,6 +1084,8 @@ restoring raw system privilege-table DDL/DML: use account/role DDL and GRANT/REV
 for those catalogs; unsupported direct catalog writes remain explicit errors.
 
 - **Multiple statements per packet**: a single `COM_QUERY` under `CLIENT_MULTI_STATEMENTS` can mix session state, DDL, and DML; autocommit DML each forms its own GTID/XID, explicit transactions are aggregated and published once, and DDL writes an independent QUERY_EVENT at implicit-commit boundaries; the first error stops processing and subsequent statements are not logged.
+- **Semisynchronous transport**: semi-sync binlog dumps require an uncompressed connection. A compressed semi-sync dump returns error 1235 before sending events; it never silently degrades ACK handling. Ordinary compressed SQL and asynchronous binlog dumps remain supported.
+- **Packet limits**: existing connections retain their `max_allowed_packet` snapshot, including accumulated prepared long data. `SET GLOBAL max_allowed_packet` seeds new connections; RESET CONNECTION and CHANGE USER refresh session defaults.
 - **Semisynchronous source side**: `rpl_semi_sync_source_*` (+ the legacy `master_*` aliases) are real sysvars, `Rpl_semi_sync_source_*` SHOW STATUS is real, and the synchronous-ack release-commit loop works end to end. **OFF by default**.
 - ❌ The source supports only `binlog_row_image=FULL` (no MINIMAL/NOBLOB or `PARTIAL_JSON`); ❌ the source supports only the ROW format (no STATEMENT/MIXED).
 

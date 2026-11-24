@@ -19,6 +19,10 @@ pub(in crate::engine::executor) fn response_into_cursor(
             Box::new(crate::engine::api::VecResultCursor::new(rs.rows)),
         )),
         QueryResponse::StreamingResultSet(s) => Ok((s.columns, s.cursor)),
+        QueryResponse::SharedResultSet(rs) => Ok((
+            rs.columns.to_vec(),
+            Box::new(crate::engine::api::VecResultCursor::new(rs.rows)),
+        )),
         _ => Err(error(
             crate::error::catalog::ER_NOT_SUPPORTED_YET,
             "set operation requires a SELECT result",

@@ -2052,7 +2052,7 @@ pub(super) fn plan_semantics(
 ) -> crate::engine::cache::PlanSemantics {
     crate::engine::cache::PlanSemantics {
         execution_parallelism: session.sysvars.mydb_parallel_degree,
-        rls_authorization: Some(crate::engine::rls::session_signature(db, session)),
+        rls_authorization: Some(crate::engine::rls::shared_signature(db, session)),
         sql_mode_fingerprint: crate::binlog::sql_mode_str_to_bits(&session.sql_mode),
         optimizer_switch_fingerprint: crate::engine::cache::optimizer_switch_fingerprint(
             &session.sysvars.optimizer_switch,
@@ -6627,6 +6627,7 @@ impl StorageQueryEngine {
     ) -> (Result<QueryResponse, QueryError>, QueryLogMetadata) {
         let _rls_statement = crate::engine::rls::EvaluationScope::enter_statement(&self.db);
         let is_ddl = is_ddl_statement(&statement);
+        let refresh_statistics = matches!(statement, Statement::AnalyzeTable { .. });
         let wake_purge = is_ddl
             || matches!(
                 &statement,
@@ -6716,6 +6717,9 @@ impl StorageQueryEngine {
             result,
         );
         drop(ddl_binlog_context);
+        if refresh_statistics && result.is_ok() {
+            self.plan_cache.bump_epoch();
+        }
         (result, metadata.with_lock_wait_stats(wait_stats))
     }
 

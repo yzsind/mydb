@@ -236,7 +236,7 @@ individual metrics are available from `information_schema.MYDB_ENGINE_STATUS`
 | --- | --- |
 | `Event` | VARCHAR |
 | `sql_mode` | VARCHAR |
-| `time zone` | VARCHAR |
+| `time_zone` | VARCHAR |
 | `Create Event` | VARCHAR |
 | `character_set_client` | VARCHAR |
 | `collation_connection` | VARCHAR |
@@ -251,11 +251,11 @@ individual metrics are available from `information_schema.MYDB_ENGINE_STATUS`
 | `Definer` | VARCHAR |
 | `Time zone` | VARCHAR |
 | `Type` | VARCHAR |
-| `Execute at` | VARCHAR |
+| `Execute at` | DATETIME |
 | `Interval value` | VARCHAR |
 | `Interval field` | VARCHAR |
-| `Starts` | VARCHAR |
-| `Ends` | VARCHAR |
+| `Starts` | DATETIME |
+| `Ends` | DATETIME |
 | `Status` | VARCHAR |
 | `Originator` | BIGINT |
 | `character_set_client` | VARCHAR |

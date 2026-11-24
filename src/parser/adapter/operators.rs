@@ -56,6 +56,7 @@ pub(in crate::parser) fn parse_sql(
     }
     super::literals::concatenate(&mut tokens);
     validate_complexity(&tokens)?;
+    super::table_groups::lower(&mut tokens);
     super::locks::expand_lists(&mut tokens);
     super::parameters::assign(&mut tokens)?;
     super::sampling::lower(dialect, sql, &mut tokens)?;
@@ -79,6 +80,7 @@ fn parse_ordinary_sql(
     }
     super::literals::concatenate(&mut tokens);
     validate_complexity(&tokens)?;
+    super::table_groups::lower(&mut tokens);
     super::locks::expand_lists(&mut tokens);
     super::parameters::assign(&mut tokens)?;
     super::sampling::lower(dialect, sql, &mut tokens)?;

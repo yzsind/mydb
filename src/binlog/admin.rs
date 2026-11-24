@@ -149,7 +149,11 @@ impl AdminCommand {
 /// Describe the response without accessing the binlog manager or executing any
 /// command. In particular, administrative OK responses have no result columns.
 pub(crate) fn admin_result_columns(sql: &str) -> Result<Vec<Column>, QueryError> {
-    Ok(AdminCommand::parse(sql)?.columns())
+    let command = AdminCommand::parse(sql)?;
+    if matches!(command, AdminCommand::Profile | AdminCommand::Profiles) {
+        return Err(crate::error::catalog::ER_NOT_SUPPORTED_YET.error("Statement profiling is not supported; use performance_schema statement instrumentation"));
+    }
+    Ok(command.columns())
 }
 
 #[cfg(test)]
@@ -259,8 +263,6 @@ mod tests {
         for sql in [
             "SHOW MASTER STATUS",
             "SHOW BINARY LOG STATUS",
-            "SHOW PROFILES",
-            "SHOW PROFILE",
             "SHOW BINLOG EVENTS LIMIT 0",
         ] {
             let QueryResponse::ResultSet(result) = handle_admin_sql(sql, &session).unwrap() else {

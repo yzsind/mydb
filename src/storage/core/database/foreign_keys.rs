@@ -357,6 +357,7 @@ fn fk_find_child_backing_index(
         .find(|idx| {
             idx.predicate.is_none() && idx.state == IndexState::Public
                 && !idx.is_fulltext()
+                && (0..columns.len()).all(|p| idx.column_prefix_len(p).is_none())
                 && idx.columns.len() >= columns.len()
                 && columns
                     .iter()
@@ -1002,6 +1003,9 @@ impl Database {
     /// The outermost exit drains the visited set so it never bleeds into
     /// the next statement.
     fn fk_with_depth<R>(&self, f: impl FnOnce() -> Result<R, QueryError>) -> Result<R, QueryError> {
+        // Replicas execute the parent action themselves. Logging child images
+        // too would apply ON UPDATE CASCADE twice or violate the parent FK.
+        let _binlog = crate::binlog::SessionSqlLogBinGuard::new(false);
         let depth = FK_CASCADE_DEPTH.with(|c| {
             let d = c.get() + 1;
             c.set(d);
@@ -1487,7 +1491,8 @@ impl Database {
                 // key being removed before we look for (or cascade to) children.
                 self.fk_lock_parent_reference_key(parent, inbound, old_values, txn)?;
                 let Some(child) = self.fk_table_descriptor(&inbound.child_table_key)? else {
-                    continue;
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                        format!("foreign key child descriptor missing: {}", inbound.child_table_key)));
                 };
                 let Some(index) = child
                     .indexes
@@ -1495,7 +1500,8 @@ impl Database {
                     .find(|i| i.index_id == inbound.child_backing_index_id)
                     .cloned()
                 else {
-                    continue;
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                        format!("foreign key backing index missing: {}.{}", inbound.child_table_key, inbound.child_backing_index)));
                 };
                 let Some(key) = self.fk_child_lookup_key(&child, &index, inbound, old_values)?
                 else {
@@ -1606,7 +1612,8 @@ impl Database {
                 // existence checks on the OLD key before we act on children.
                 self.fk_lock_parent_reference_key(parent, inbound, old_values, txn)?;
                 let Some(child) = self.fk_table_descriptor(&inbound.child_table_key)? else {
-                    continue;
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                        format!("foreign key child descriptor missing: {}", inbound.child_table_key)));
                 };
                 let Some(index) = child
                     .indexes
@@ -1614,7 +1621,8 @@ impl Database {
                     .find(|i| i.index_id == inbound.child_backing_index_id)
                     .cloned()
                 else {
-                    continue;
+                    return Err(error(crate::error::catalog::ER_GET_ERRNO,
+                        format!("foreign key backing index missing: {}.{}", inbound.child_table_key, inbound.child_backing_index)));
                 };
                 let Some(key) = self.fk_child_lookup_key(&child, &index, inbound, old_values)?
                 else {
@@ -1791,7 +1799,8 @@ impl Database {
                 let alt = table.indexes.iter().any(|i| {
                     !i.name.eq_ignore_ascii_case(index_name)
                         && i.state == IndexState::Public
-                        && !i.is_fulltext()
+                        && !i.is_fulltext() && i.predicate.is_none()
+                        && (0..fk.columns.len()).all(|p| i.column_prefix_len(p).is_none())
                         && i.columns.len() >= fk.columns.len()
                         && fk
                             .columns
@@ -1834,16 +1843,9 @@ impl Database {
             if !this_covers {
                 continue;
             }
-            let alt = table.indexes.iter().any(|i| {
-                !i.name.eq_ignore_ascii_case(index_name)
-                    && (i.unique || i.primary)
-                    && i.state == IndexState::Public
-                    && i.columns.len() >= ref_cols.len()
-                    && ref_cols
-                        .iter()
-                        .zip(i.columns.iter())
-                        .all(|(r, c)| r.eq_ignore_ascii_case(c))
-            });
+            let mut remaining = table.clone();
+            remaining.indexes.retain(|i| !i.name.eq_ignore_ascii_case(index_name));
+            let alt = fk_find_referenced_index(&remaining, &ref_cols).is_some();
             if !alt {
                 return Err(error(
                     crate::error::catalog::ER_DROP_INDEX_FK,
@@ -2020,6 +2022,11 @@ impl Database {
         }
         let key = table_key(&database, &table_only);
 
+        let _child_definition = self.pin_ddl_table(&key)?;
+        let (parent_db, parent_name) = split_table_name(&database, &def.referenced_table);
+        let parent_key = table_key(&parent_db, &parent_name);
+        let parent_exists = self.catalog_read()?.tables.contains_key(&parent_key);
+        let _parent_definition = if parent_exists { Some(self.pin_ddl_table(&parent_key)?) } else { None };
         // Phase 1: validate + decide whether a backing index is needed.
         let (mut fk_schema, backing_index) = {
             let catalog = self.catalog_read()?;

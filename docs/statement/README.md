@@ -130,7 +130,7 @@ The table lists canonical statement entry points; slash-separated names share a 
 | --- | --- |
 | Explicitly unsupported | RESOURCE GROUP, TABLESPACE, HANDLER, RESOURCE scheduling/management, X Protocol, plugin ABI and group replication; recognized management forms return an error rather than creating catalog objects |
 | Client-only | DELIMITER; rejected if sent as server SQL |
-| Diagnostic compatibility | SHOW PROFILE/PROFILES returns empty result schemas; FLUSH/RESET QUERY CACHE returns warning 1287 without a result cache |
+| Diagnostic compatibility | SHOW PROFILE/PROFILES returns error 1235; use performance_schema for measured statement instrumentation. FLUSH/RESET QUERY CACHE returns warning 1287 without a result cache |
 | Accepted options with no distinct effect | CHECK/REPAIR compatibility modifiers, CHECKSUM QUICK, and DROP TABLE/VIEW RESTRICT/CASCADE; each owning page states the current limitation |
 | Metadata-only/declarative properties | Declared routine determinism/data-access characteristics and documented table compatibility options do not promise a separate physical engine or purity proof |
 

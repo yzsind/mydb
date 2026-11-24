@@ -1151,6 +1151,9 @@ pub(crate) fn function_has_external_effect(name: &str) -> bool {
 /// sees the generic `Expr::Function` shape, so it must consult this context
 /// before treating an unknown zero/constant-argument function as pure.
 fn is_stored_function_name(name: &str) -> bool {
+    if crate::parser::IntrinsicFunction::from_name(name).is_some() {
+        return false;
+    }
     if RESOLVED_STORED_FUNCTIONS
         .with(|functions| functions.borrow().contains_key(&name.to_ascii_lowercase()))
     {
@@ -4320,6 +4323,12 @@ pub(crate) fn eval_scalar_context(
 
 #[inline]
 pub(crate) fn eval_const(expr: &Expr) -> Result<Value, QueryError> {
+    if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let _depth = ExpressionDepthGuard::enter()?;
+            return eval_const(crate::engine::expr_type::typed_constant_payload(args)?);
+        }
+    }
     eval_scalar_context(expr, || eval_const_inner(expr))
 }
 
@@ -4519,11 +4528,22 @@ fn eval_const_inner(expr: &Expr) -> Result<Value, QueryError> {
                 empty_expr_schema(),
                 "in",
             )?;
-            let value = eval_const(expr)?;
+            let value = bind_binary_comparison_value(
+                expr,
+                empty_expr_schema(),
+                collation_id,
+                eval_const(expr)?,
+            )?;
             let mut iter = list.iter();
             with_compare_collation(collation_id, || {
                 eval_in_list(value, *negated, || match iter.next() {
-                    Some(item) => Ok(Some(eval_const(item)?)),
+                    Some(item) => bind_binary_comparison_value(
+                        item,
+                        empty_expr_schema(),
+                        collation_id,
+                        eval_const(item)?,
+                    )
+                    .map(Some),
                     None => Ok(None),
                 })
             })
@@ -4684,6 +4704,16 @@ pub(crate) fn eval_expr_legacy(
     table: &TableSchema,
     values: &[Value],
 ) -> Result<Value, QueryError> {
+    if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let _depth = ExpressionDepthGuard::enter()?;
+            return eval_expr_legacy(
+                crate::engine::expr_type::typed_constant_payload(args)?,
+                table,
+                values,
+            );
+        }
+    }
     eval_scalar_context(expr, || eval_expr_legacy_inner(expr, table, values))
 }
 
@@ -6059,6 +6089,7 @@ where
         // but retains its charset/collation/coercibility metadata for binding
         // and comparison. Runtime evaluation is therefore just the normal
         // bound-value clone, with no per-row charset conversion.
+        "__TYPED_CONST" => eval_arg(crate::engine::expr_type::typed_constant_payload(args)?),
         "__COLLATED_CONST" => {
             if args.len() < 3 {
                 expect_arg_count(name, args, 3)?;
@@ -20089,6 +20120,15 @@ fn expr_collation_checked(
     memo: Option<&CollationValidationMemo>,
 ) -> Option<ExprCollation> {
     if let Expr::Function { name, args, .. } = expr {
+        if name.eq_ignore_ascii_case("__TYPED_CONST") {
+            let ty = crate::engine::expr_type::typed_constant_descriptor(args)?;
+            let info = crate::charset::resolve_collation_id(ty.collation_id?)?;
+            return Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility: ty.coercibility,
+            });
+        }
         let result_type = function_result_type(name);
         if result_type == ColumnType::Geometry {
             return Some(ExprCollation {
@@ -20287,6 +20327,24 @@ fn expr_collation_checked(
     }
 
     match expr {
+        Expr::Placeholder(index) => crate::engine::params::with_current_param(*index, |value| {
+            // Cached text shapes replace literals with parameters. Keep the
+            // same string/binary derivation as their bound literal values.
+            let (info, coercibility) = match value? {
+                Value::String(_) | Value::SmallString(_) => (connection_collation_info(), 4),
+                Value::Bytes(_) | Value::Geometry(_) => (
+                    crate::charset::resolve_collation_id(crate::charset::BINARY_COLLATION_ID)?,
+                    4,
+                ),
+                Value::Null => return None,
+                _ => (connection_collation_info(), 5),
+            };
+            Some(ExprCollation {
+                charset: info.charset,
+                collation_id: info.id,
+                coercibility,
+            })
+        }),
         Expr::Literal(Literal::String(_))
         | Expr::UserVariable(_)
         | Expr::BoundValue(Value::String(_) | Value::SmallString(_)) => {
@@ -22062,8 +22120,20 @@ fn prune_lazy_constant_branches_checked(expr: &mut Expr) {
 /// Pre-evaluate constant sub-expressions so they are not recomputed per row.
 pub(crate) fn fold_constant_subexprs(expr: &mut Expr) {
     let _memo = StoredFunctionNameMemo::enter();
-    prune_lazy_constant_branches(expr);
+    // Correlated values are constant for this binding, but pruning a branch
+    // based on that value must not narrow the declared output domain.
+    if !contains_typed_constant(expr) {
+        prune_lazy_constant_branches(expr);
+    }
     fold_constant_subexprs_inner(expr);
+}
+
+fn contains_typed_constant(expr: &Expr) -> bool {
+    crate::parser::visit::any_expr_matching(
+        expr,
+        |node| matches!(node, Expr::Function { name, .. } if name.eq_ignore_ascii_case("__TYPED_CONST")),
+        |_| true,
+    )
 }
 
 /// Fold deterministic temporal arithmetic when it appears as a predicate
@@ -22135,6 +22205,9 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     if matches!(expr, Expr::Literal(_) | Expr::BoundValue(_)) {
         return;
     }
+    if matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("__TYPED_CONST")) {
+        return;
+    }
     // A unary minus around an overwide exact DECIMAL carries the source
     // magnitude needed by comparison. Folding it independently would first
     // clamp the child to DECIMAL(65), then replace the subtree with that
@@ -22167,6 +22240,11 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     // evaluated. Folding its children independently would execute unreachable
     // expressions and leak their conversion warnings before the parent gets a
     // chance to short-circuit.
+    if matches!(expr, Expr::Function { name, .. } if name.eq_ignore_ascii_case("MAKE_SET"))
+        && contains_typed_constant(expr)
+    {
+        return;
+    }
     if let Expr::Function { name, args, .. } = expr {
         if name.eq_ignore_ascii_case("MAKE_SET") {
             if args.first().is_some_and(expr_is_constant) {
@@ -22330,8 +22408,25 @@ fn fold_constant_subexprs_inner_checked(expr: &mut Expr) {
     }
     // If the whole subtree is constant, evaluate once.
     if is_constant {
+        let typed_domain = contains_typed_constant(expr).then(|| {
+            let no_column = |_: &Expr| None;
+            let no_placeholder = |_: usize| None;
+            crate::engine::expr_type::infer_expr_type(
+                expr,
+                &crate::engine::expr_type::TypeContext::context_free(&no_column, &no_placeholder),
+            )
+        });
         if let Ok(value) = eval_const(expr) {
-            *expr = if expr_is_boolean_typed(expr) && !matches!(value, Value::Null) {
+            *expr = if let Some(descriptor) = typed_domain {
+                let mut source = crate::types::ColumnSource::default();
+                descriptor.apply_to_source(&mut source);
+                source.collation_coercibility = Some(descriptor.coercibility);
+                crate::engine::expr_type::typed_constant(
+                    Expr::BoundValue(value),
+                    descriptor.column_type(),
+                    &source,
+                )
+            } else if expr_is_boolean_typed(expr) && !matches!(value, Value::Null) {
                 Expr::Literal(Literal::Bool(truthy(&value)))
             } else {
                 Expr::BoundValue(value)

@@ -530,7 +530,7 @@ pub(in crate::engine::executor) fn execute_set_statement(
 /// queue its new session-visible value for the next OK packet's
 /// `SESSION_TRACK_SYSTEM_VARIABLES` block. Reads the SESSION-scope
 /// effective value so the client mirrors exactly what it would observe.
-fn track_sysvar_session_change(
+pub(super) fn track_sysvar_session_change(
     session: &mut crate::engine::api::SessionContext,
     db: &crate::storage::Database,
     name: &str,

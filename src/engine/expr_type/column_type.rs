@@ -343,6 +343,10 @@ fn infer_column_type_checked<const SCHEMA: bool>(
         Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("CAST") => {
             cast_result_type(args)
         }
+        Expr::Function { name, args, .. } if name.eq_ignore_ascii_case("__TYPED_CONST") => {
+            crate::engine::expr_type::typed_constant_descriptor(args)
+                .map_or(ColumnType::VarString, |descriptor| descriptor.column_type())
+        }
         Expr::Function { name, args, .. } => {
             if let Some(descriptor) = resolved_stored_function_type(name) {
                 return descriptor.column_type();

@@ -9,7 +9,7 @@ pub(crate) mod sql;
 use crate::types::QueryError;
 pub(crate) use config::*;
 pub(crate) use crypto::{decrypt_secret, encrypt_secret, load_keys};
-pub(crate) use runtime::{call, is_function, with_calls};
+pub(crate) use runtime::{call, is_function};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
@@ -56,6 +56,7 @@ pub(crate) struct AiCatalog {
     pub secrets: BTreeMap<String, Secret>,
     pub connections: BTreeMap<String, Connection>,
     pub models: BTreeMap<String, Model>,
+    // Reserved serialized field; model permissions live in AuthCatalog grants.
     pub grants: BTreeMap<String, Vec<u64>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize)]

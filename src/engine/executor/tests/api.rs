@@ -779,10 +779,20 @@ fn binlog_variables_and_disabled_status_are_visible() {
         vec![vec![Value::Int(0), Value::String("OFF".into())]]
     );
 
-    let err = engine
+    let response = engine
         .execute_with_session(&mut session, "SHOW MASTER STATUS")
-        .unwrap_err();
-    assert_eq!(err.message(), "binary logging is disabled");
+        .unwrap();
+    let QueryResponse::ResultSet(status) = response else {
+        panic!("master status");
+    };
+    assert!(status.rows.is_empty());
+    assert_eq!(
+        engine
+            .execute_with_session(&mut session, "SHOW BINARY LOGS")
+            .unwrap_err()
+            .code(),
+        1381
+    );
 }
 
 #[test]
@@ -1299,7 +1309,7 @@ fn show_full_tables_includes_table_statistics_and_metadata() {
             .map(|column| column.name.as_str())
             .collect::<Vec<_>>(),
         vec![
-            "Tables_in_test",
+            "Tables_in_test (orders%)",
             "Table_type",
             "TABLE_ROWS",
             "DATA_LENGTH",
@@ -1741,7 +1751,7 @@ fn show_table_status_supports_dbeaver_metadata_sql() {
         Value::String(crate::charset::DEFAULT_COLLATION.to_string())
     );
     assert!(matches!(&row[11], Value::String(ts) if !ts.is_empty()));
-    assert_eq!(row[12], Value::Null);
+    assert!(matches!(&row[12],Value::String(ts) if !ts.is_empty()));
     assert_eq!(row[17], Value::String("tpch lineitem".to_string()));
 
     let QueryResponse::ResultSet(where_status) = engine

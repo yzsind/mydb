@@ -115,6 +115,8 @@ scripts/render_storage_format_versions.sh --check
 
 `run_script_tests.py` automatically loads `test_*.py` modules declaring unittest
 cases, while keeping standalone integration drivers out of import discovery.
+Server-backed unittest drivers declare `REQUIRES_SERVER = True` at module level
+and run separately with their documented CLI arguments.
 Import errors and failing cases fail the command. Its JSON evidence records
 Python/platform, dependency versions, source hashes and per-run test counts.
 CI uses the same entry point and dependency pins. Exported source trees without

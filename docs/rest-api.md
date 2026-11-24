@@ -130,6 +130,8 @@ SQL statement. Unknown fields, duplicate JSON fields, incorrect parameter
 counts, invalid types and unsupported protocol operations produce errors.
 Batches contain 1 through 1024 items and stop at the first failure.
 
+Request body reads have a fixed 10-second deadline to bound slow uploads.
+
 `timeout_ms` defaults to 30000 and cannot exceed `rest_max_timeout_ms`.
 `database` selects the default database for an independent request. Omitting it
 leaves no database selected, including when creating a persistent session. Each
@@ -182,6 +184,11 @@ active transaction to use an atomic batch. Database rollback does not undo
 external HTTP or other external SQL effects.
 
 ## Persistent sessions
+
+Session deletion waits up to 500 ms for cleanup. If cleanup cannot complete, the
+server returns 503 `SESSION_CLEANUP_FAILED` with `execution_outcome: unknown`;
+the closed session retains its transaction context and resource charges for
+background cleanup retries. A failed deletion does not confirm rollback.
 
 | Method and path | Behavior |
 | --- | --- |

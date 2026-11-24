@@ -2526,6 +2526,16 @@ impl ColumnAccumulator {
             };
         }
         match field.column_type {
+            // The BLOB wire family also carries TEXT. Its internal values
+            // remain UTF-8 strings when the descriptor has a text collation.
+            ColumnType::Blob
+                if field
+                    .source
+                    .collation_id
+                    .is_some_and(|id| id != crate::charset::BINARY_COLLATION_ID) =>
+            {
+                Self::for_type(ColumnType::VarString, capacity)
+            }
             ColumnType::Tiny
             | ColumnType::Short
             | ColumnType::MediumInt
@@ -3029,6 +3039,7 @@ impl ColumnAccumulator {
                     Value::SmallString(b) => data.extend_from_slice(b.as_slice()),
                     // Decimal(String) stored as Utf8 in older schemas
                     Value::Decimal(s) => data.extend_from_slice(s.as_bytes()),
+                    Value::Bytes(bytes) => data.extend_from_slice(bytes),
                     _ => {
                         // unexpected: treat as empty string
                     }
@@ -3048,6 +3059,10 @@ impl ColumnAccumulator {
                         *any_null = true;
                     }
                     Value::Bytes(b) => data.extend_from_slice(b),
+                    Value::String(text) | Value::Decimal(text) => {
+                        data.extend_from_slice(text.as_bytes())
+                    }
+                    Value::SmallString(text) => data.extend_from_slice(text.as_slice()),
                     _ => {}
                 }
                 offsets.push(data.len() as u32);

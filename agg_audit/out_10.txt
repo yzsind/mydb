@@ -1,0 +1,460 @@
+=========== DIFF #1 ===========
+SQL: SELECT a, b, SUM(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+1	NULL	30
+1	x	10
+1	y	20
+2	NULL	50
+2	x	40
+3	x	-10
+3	y	NULL
+NULL	NULL	130
+1	NULL	60
+2	NULL	90
+3	NULL	-10
+NULL	NULL	270
+--- mysql ---
+a	b	SUM(c)
+NULL	NULL	70
+NULL	y	60
+NULL	NULL	130
+1	NULL	30
+1	x	10
+1	y	20
+1	NULL	60
+2	NULL	50
+2	x	40
+2	NULL	90
+3	x	-10
+3	y	NULL
+3	NULL	-10
+NULL	NULL	270
+
+=========== DIFF #4 ===========
+SQL: SELECT a, b, c, COUNT(*) FROM t1 GROUP BY a, b, c WITH ROLLUP
+--- mydb ---
+a	b	c	COUNT(*)
+NULL	NULL	70	1
+NULL	y	60	1
+1	NULL	30	1
+1	x	10	1
+1	y	20	1
+2	NULL	50	1
+2	x	40	1
+3	x	-10	1
+3	y	NULL	1
+NULL	NULL	NULL	1
+NULL	y	NULL	1
+1	NULL	NULL	1
+1	x	NULL	1
+1	y	NULL	1
+2	NULL	NULL	1
+2	x	NULL	1
+3	x	NULL	1
+3	y	NULL	1
+NULL	NULL	NULL	2
+1	NULL	NULL	3
+2	NULL	NULL	2
+3	NULL	NULL	2
+NULL	NULL	NULL	9
+--- mysql ---
+a	b	c	COUNT(*)
+NULL	NULL	70	1
+NULL	NULL	NULL	1
+NULL	y	60	1
+NULL	y	NULL	1
+NULL	NULL	NULL	2
+1	NULL	30	1
+1	NULL	NULL	1
+1	x	10	1
+1	x	NULL	1
+1	y	20	1
+1	y	NULL	1
+1	NULL	NULL	3
+2	NULL	50	1
+2	NULL	NULL	1
+2	x	40	1
+2	x	NULL	1
+2	NULL	NULL	2
+3	x	-10	1
+3	x	NULL	1
+3	y	NULL	1
+3	y	NULL	1
+3	NULL	NULL	2
+NULL	NULL	NULL	9
+
+=========== DIFF #5 ===========
+SQL: SELECT a, b, COUNT(*), COUNT(a), COUNT(b), COUNT(DISTINCT a, b) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	COUNT(*)	COUNT(a)	COUNT(b)	COUNT(DISTINCT a, b)
+NULL	NULL	1	0	0	0
+NULL	y	1	0	1	0
+1	NULL	1	1	0	0
+1	x	1	1	1	1
+1	y	1	1	1	1
+2	NULL	1	1	0	0
+2	x	1	1	1	1
+3	x	1	1	1	1
+3	y	1	1	1	1
+NULL	NULL	2	0	1	0
+1	NULL	3	3	2	2
+2	NULL	2	2	1	1
+3	NULL	2	2	2	2
+NULL	NULL	9	7	6	5
+--- mysql ---
+a	b	COUNT(*)	COUNT(a)	COUNT(b)	COUNT(DISTINCT a, b)
+NULL	NULL	1	0	0	0
+NULL	y	1	0	1	0
+NULL	NULL	2	0	1	0
+1	NULL	1	1	0	0
+1	x	1	1	1	1
+1	y	1	1	1	1
+1	NULL	3	3	2	2
+2	NULL	1	1	0	0
+2	x	1	1	1	1
+2	NULL	2	2	1	1
+3	x	1	1	1	1
+3	y	1	1	1	1
+3	NULL	2	2	2	2
+NULL	NULL	9	7	6	5
+
+=========== DIFF #6 ===========
+SQL: SELECT a, b, AVG(c), MIN(c), MAX(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	AVG(c)	MIN(c)	MAX(c)
+NULL	NULL	70.0000	70	70
+NULL	y	60.0000	60	60
+1	NULL	30.0000	30	30
+1	x	10.0000	10	10
+1	y	20.0000	20	20
+2	NULL	50.0000	50	50
+2	x	40.0000	40	40
+3	x	-10.0000	-10	-10
+3	y	NULL	NULL	NULL
+NULL	NULL	65.0000	60	70
+1	NULL	20.0000	10	30
+2	NULL	45.0000	40	50
+3	NULL	-10.0000	-10	-10
+NULL	NULL	33.7500	-10	70
+--- mysql ---
+a	b	AVG(c)	MIN(c)	MAX(c)
+NULL	NULL	70.0000	70	70
+NULL	y	60.0000	60	60
+NULL	NULL	65.0000	60	70
+1	NULL	30.0000	30	30
+1	x	10.0000	10	10
+1	y	20.0000	20	20
+1	NULL	20.0000	10	30
+2	NULL	50.0000	50	50
+2	x	40.0000	40	40
+2	NULL	45.0000	40	50
+3	x	-10.0000	-10	-10
+3	y	NULL	NULL	NULL
+3	NULL	-10.0000	-10	-10
+NULL	NULL	33.7500	-10	70
+
+=========== DIFF #7 ===========
+SQL: SELECT a, b, SUM(d), AVG(d) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(d)	AVG(d)
+NULL	NULL	7.50	7.500000
+NULL	y	6.50	6.500000
+1	NULL	3.50	3.500000
+1	x	1.50	1.500000
+1	y	2.50	2.500000
+2	NULL	5.50	5.500000
+2	x	4.50	4.500000
+3	x	-1.50	-1.500000
+3	y	NULL	NULL
+NULL	NULL	14.00	7.000000
+1	NULL	7.50	2.500000
+2	NULL	10.00	5.000000
+3	NULL	-1.50	-1.500000
+NULL	NULL	30.00	3.750000
+--- mysql ---
+a	b	SUM(d)	AVG(d)
+NULL	NULL	7.50	7.500000
+NULL	y	6.50	6.500000
+NULL	NULL	14.00	7.000000
+1	NULL	3.50	3.500000
+1	x	1.50	1.500000
+1	y	2.50	2.500000
+1	NULL	7.50	2.500000
+2	NULL	5.50	5.500000
+2	x	4.50	4.500000
+2	NULL	10.00	5.000000
+3	x	-1.50	-1.500000
+3	y	NULL	NULL
+3	NULL	-1.50	-1.500000
+NULL	NULL	30.00	3.750000
+
+=========== DIFF #8 ===========
+SQL: SELECT a, b, SUM(e), AVG(e) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(e)	AVG(e)
+NULL	NULL	7.5	7.5
+NULL	y	6.5	6.5
+1	NULL	3.5	3.5
+1	x	1.5	1.5
+1	y	2.5	2.5
+2	NULL	5.5	5.5
+2	x	4.5	4.5
+3	x	-1.5	-1.5
+3	y	NULL	NULL
+NULL	NULL	14	7
+1	NULL	7.5	2.5
+2	NULL	10	5
+3	NULL	-1.5	-1.5
+NULL	NULL	30	3.75
+--- mysql ---
+a	b	SUM(e)	AVG(e)
+NULL	NULL	7.5	7.5
+NULL	y	6.5	6.5
+NULL	NULL	14	7
+1	NULL	3.5	3.5
+1	x	1.5	1.5
+1	y	2.5	2.5
+1	NULL	7.5	2.5
+2	NULL	5.5	5.5
+2	x	4.5	4.5
+2	NULL	10	5
+3	x	-1.5	-1.5
+3	y	NULL	NULL
+3	NULL	-1.5	-1.5
+NULL	NULL	30	3.75
+
+=========== DIFF #9 ===========
+SQL: SELECT a, b, SUM(g), AVG(g) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	SUM(g)	AVG(g)
+NULL	NULL	700	700.0000
+NULL	y	600	600.0000
+1	NULL	300	300.0000
+1	x	100	100.0000
+1	y	200	200.0000
+2	NULL	500	500.0000
+2	x	400	400.0000
+3	x	-100	-100.0000
+3	y	NULL	NULL
+NULL	NULL	1300	650.0000
+1	NULL	600	200.0000
+2	NULL	900	450.0000
+3	NULL	-100	-100.0000
+NULL	NULL	2700	337.5000
+--- mysql ---
+a	b	SUM(g)	AVG(g)
+NULL	NULL	700	700.0000
+NULL	y	600	600.0000
+NULL	NULL	1300	650.0000
+1	NULL	300	300.0000
+1	x	100	100.0000
+1	y	200	200.0000
+1	NULL	600	200.0000
+2	NULL	500	500.0000
+2	x	400	400.0000
+2	NULL	900	450.0000
+3	x	-100	-100.0000
+3	y	NULL	NULL
+3	NULL	-100	-100.0000
+NULL	NULL	2700	337.5000
+
+=========== DIFF #10 ===========
+SQL: SELECT a, b, GROUP_CONCAT(b) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	GROUP_CONCAT(b)
+NULL	NULL	NULL
+NULL	y	y
+1	NULL	NULL
+1	x	x
+1	y	y
+2	NULL	NULL
+2	x	x
+3	x	x
+3	y	y
+NULL	NULL	y
+1	NULL	x,y
+2	NULL	x
+3	NULL	x,y
+NULL	NULL	y,x,y,x,x,y
+--- mysql ---
+a	b	GROUP_CONCAT(b)
+NULL	NULL	NULL
+NULL	y	y
+NULL	NULL	y
+1	NULL	NULL
+1	x	x
+1	y	y
+1	NULL	x,y
+2	NULL	NULL
+2	x	x
+2	NULL	x
+3	x	x
+3	y	y
+3	NULL	x,y
+NULL	NULL	y,x,y,x,x,y
+
+=========== DIFF #11 ===========
+SQL: SELECT a, b, GROUP_CONCAT(b ORDER BY c SEPARATOR '|') FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	GROUP_CONCAT(b ORDER BY c SEPARATOR '|')
+NULL	NULL	NULL
+NULL	y	y
+1	NULL	NULL
+1	x	x
+1	y	y
+2	NULL	NULL
+2	x	x
+3	x	x
+3	y	y
+NULL	NULL	y
+1	NULL	x|y
+2	NULL	x
+3	NULL	y|x
+NULL	NULL	y|x|x|y|x|y
+--- mysql ---
+a	b	GROUP_CONCAT(b ORDER BY c SEPARATOR '|')
+NULL	NULL	NULL
+NULL	y	y
+NULL	NULL	y
+1	NULL	NULL
+1	x	x
+1	y	y
+1	NULL	x|y
+2	NULL	NULL
+2	x	x
+2	NULL	x
+3	x	x
+3	y	y
+3	NULL	x|y
+NULL	NULL	x|y|x|y|x|y
+
+=========== DIFF #12 ===========
+SQL: SELECT a, b, GROUP_CONCAT(DISTINCT b ORDER BY b) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+=========== DIFF #18 ===========
+SQL: SELECT a, b, STD(c), STDDEV_SAMP(c), VARIANCE(c), VAR_SAMP(c) FROM t1 GROUP BY a, b WITH RELLUP
+--- mydb ---
+ERROR 1064 (42000) at line 1: sql parser error: Expected: one of ROLLUP or CUBE or TOTALS, found: RELLUP at line 1, column 90
+--- mysql ---
+ERROR 1064 (42000) at line 1: You have an error in your SQL syntax; check the manual that corresponds to your MySQL server version for the right syntax to use near 'WITH RELLUP' at line 1
+
+=========== DIFF #19 ===========
+SQL: SELECT a, b, STD(c), STDDEV_SAMP(c), VARIANCE(c), VAR_SAMP(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	STD(c)	STDDEV_SAMP(c)	VARIANCE(c)	VAR_SAMP(c)
+NULL	NULL	0	NULL	0	NULL
+NULL	y	0	NULL	0	NULL
+1	NULL	0	NULL	0	NULL
+1	x	0	NULL	0	NULL
+1	y	0	NULL	0	NULL
+2	NULL	0	NULL	0	NULL
+2	x	0	NULL	0	NULL
+3	x	0	NULL	0	NULL
+3	y	NULL	NULL	NULL	NULL
+NULL	NULL	5	7.0710678118654755	25	50
+1	NULL	8.16496580927726	10	66.66666666666667	100
+2	NULL	5	7.0710678118654755	25	50
+3	NULL	0	NULL	0	NULL
+NULL	NULL	24.968730444297723	26.692695630078276	623.4375	712.5
+--- mysql ---
+a	b	STD(c)	STDDEV_SAMP(c)	VARIANCE(c)	VAR_SAMP(c)
+NULL	NULL	0	NULL	0	NULL
+NULL	y	0	NULL	0	NULL
+NULL	NULL	5	7.0710678118654755	25	50
+1	NULL	0	NULL	0	NULL
+1	x	0	NULL	0	NULL
+1	y	0	NULL	0	NULL
+1	NULL	8.16496580927726	10	66.66666666666667	100
+2	NULL	0	NULL	0	NULL
+2	x	0	NULL	0	NULL
+2	NULL	5	7.0710678118654755	25	50
+3	x	0	NULL	0	NULL
+3	y	NULL	NULL	NULL	NULL
+3	NULL	0	NULL	0	NULL
+NULL	NULL	24.968730444297723	26.692695630078276	623.4375	712.5
+
+=========== DIFF #20 ===========
+SQL: SELECT a, b, BIT_AND(c), BIT_OR(c), BIT_XOR(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	BIT_AND(c)	BIT_OR(c)	BIT_XOR(c)
+NULL	NULL	70	70	70
+NULL	y	60	60	60
+1	NULL	30	30	30
+1	x	10	10	10
+1	y	20	20	20
+2	NULL	50	50	50
+2	x	40	40	40
+3	x	18446744073709551606	18446744073709551606	18446744073709551606
+3	y	18446744073709551615	0	0
+NULL	NULL	4	126	122
+1	NULL	0	30	0
+2	NULL	32	58	26
+3	NULL	18446744073709551606	18446744073709551606	18446744073709551606
+NULL	NULL	0	18446744073709551614	18446744073709551510
+--- mysql ---
+a	b	BIT_AND(c)	BIT_OR(c)	BIT_XOR(c)
+NULL	NULL	70	70	70
+NULL	y	60	60	60
+NULL	NULL	4	126	122
+1	NULL	30	30	30
+1	x	10	10	10
+1	y	20	20	20
+1	NULL	0	30	0
+2	NULL	50	50	50
+2	x	40	40	40
+2	NULL	32	58	26
+3	x	18446744073709551606	18446744073709551606	18446744073709551606
+3	y	18446744073709551615	0	0
+3	NULL	18446744073709551606	18446744073709551606	18446744073709551606
+NULL	NULL	0	18446744073709551614	18446744073709551510
+
+=========== DIFF #21 ===========
+SQL: SELECT a, b, JSON_ARRAYAGG(c) FROM t1 GROUP BY a, b WITH ROLLUP
+--- mydb ---
+a	b	JSON_ARRAYAGG(c)
+NULL	NULL	[70]
+NULL	y	[60]
+1	NULL	[30]
+1	x	[10]
+1	y	[20]
+2	NULL	[50]
+2	x	[40]
+3	x	[-10]
+3	y	[null]
+NULL	NULL	[70, 60]
+1	NULL	[30, 10, 20]
+2	NULL	[50, 40]
+3	NULL	[-10, null]
+NULL	NULL	[70, 60, 30, 10, 20, 50, 40, -10, null]
+--- mysql ---
+a	b	JSON_ARRAYAGG(c)
+NULL	NULL	[70]
+NULL	y	[60]
+NULL	NULL	[70, 60]
+1	NULL	[30]
+1	x	[10]
+1	y	[20]
+1	NULL	[30, 10, 20]
+2	NULL	[50]
+2	x	[40]
+2	NULL	[50, 40]
+3	x	[-10]
+3	y	[null]
+3	NULL	[-10, null]
+NULL	NULL	[70, 60, 30, 10, 20, 50, 40, -10, null]
+
+=========== DIFF #22 ===========
+SQL: SELECT a, b, JSON_OBJECTAGG(b, c) FROM t1 GROUP BY a WITH ROLLUP
+--- mydb ---
+ERROR 1055 (42000) at line 1: Expression of SELECT list is not in GROUP BY clause and contains nonaggregated column 'b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+--- mysql ---
+ERROR 1055 (42000) at line 1: Expression #2 of SELECT list is not in GROUP BY clause and contains nonaggregated column 'agg_audit.t1.b' which is not functionally dependent on columns in GROUP BY clause; this is incompatible with sql_mode=only_full_group_by
+
+RESULT: PASS=7 FAIL=15

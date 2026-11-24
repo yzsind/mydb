@@ -1782,29 +1782,16 @@ fn hash_aggregate_node(plan: &PhysicalPlan) -> Option<&PhysicalPlan> {
         | PhysicalPlan::ParallelIndexAggregate { .. }) => Some(node),
         PhysicalPlan::Projection {
             input,
-            projection,
             distinct: true,
             ..
         }
-        | PhysicalPlan::StreamingDistinct {
-            input, projection, ..
-        } if projection.iter().all(|item| {
-            matches!(
-                item,
-                SelectItem::Expr {
-                    expr: Expr::GroupKeyRef { .. },
-                    ..
-                }
-            )
-        }) =>
-        {
-            hash_aggregate_node(input)
-        }
+        | PhysicalPlan::StreamingDistinct { input, .. } => hash_aggregate_node(input),
         PhysicalPlan::Projection {
             input,
             distinct: false,
             ..
         }
+        | PhysicalPlan::Filter { input, .. }
         | PhysicalPlan::Limit { input, .. }
         | PhysicalPlan::Sort { input, .. }
         | PhysicalPlan::IncrementalSort { input, .. }

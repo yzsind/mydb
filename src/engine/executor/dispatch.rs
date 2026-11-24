@@ -1519,7 +1519,9 @@ fn type_derived_ctas_column(
         && src.collation_id.map_or(src.flags & BINARY_FLAG != 0, |id| {
             id == crate::charset::BINARY_COLLATION_ID
         });
-    let data_type = if binary_string {
+    let data_type = if src.wire_type == Some(6) {
+        crate::parser::DataType::Binary(Some(0))
+    } else if binary_string {
         if let Some(bytes) = length.filter(|length| *length <= u16::MAX as u32) {
             crate::parser::DataType::VarBinary(Some(bytes as usize))
         } else {
@@ -3566,7 +3568,7 @@ pub(super) fn dispatch_execute_statement(
     execute_statement(db, session, statement, registry)
 }
 
-fn account_key(account: &AccountIdent) -> AccountKey {
+pub(super) fn account_key(account: &AccountIdent) -> AccountKey {
     AccountKey::new(account.user.clone(), account.host.clone())
 }
 
@@ -7542,6 +7544,18 @@ fn collect_lock_table_dependencies(
         out.push(qualified);
         return Ok(());
     }
+    if let Some(def) = crate::engine::information_schema::find_system_table_name(&qualified) {
+        if def.schema.eq_ignore_ascii_case("information_schema") {
+            return Err(crate::error::catalog::ER_DBACCESS_DENIED_ERROR
+                .error("Access denied to database 'information_schema' for LOCK TABLES"));
+        }
+        return Err(
+            crate::error::catalog::ER_TABLEACCESS_DENIED_ERROR.error(format!(
+                "LOCK TABLES command denied for table '{}'",
+                def.name
+            )),
+        );
+    }
     if let Some(view) = db.view_definition(&schema, &table) {
         if view.invalid {
             return Err(error(
@@ -8191,6 +8205,7 @@ pub(super) fn execute_qualified_statement(
         }
         Statement::SetAutocommit(value) => {
             apply_autocommit(db, session, value)?;
+            session::track_sysvar_session_change(session, db, "autocommit");
             Ok(QueryResponse::Ok)
         }
         Statement::SetTransactionIsolation { scope, isolation } => {
@@ -8207,11 +8222,19 @@ pub(super) fn execute_qualified_statement(
                 .iter()
                 .any(|a| crate::engine::ai::sql::expr_has_ai(&a.value))
             {
-                let value = crate::engine::ai::with_calls(db.clone(), session, || {
-                    crate::engine::expr::with_session_expr_info(session, || {
-                        crate::engine::expr::eval_const(&assignments[0].value)
-                    })
-                })?;
+                let projection = Select {
+                    projection: vec![SelectItem::Expr {
+                        expr: assignments[0].value.clone(),
+                        alias: None,
+                    }],
+                    ..Select::default()
+                };
+                let QueryResponse::ResultSet(mut result) =
+                    ai::project(db, session, projection, registry)?.materialize()?
+                else {
+                    unreachable!("AI SET projection returns one row")
+                };
+                let value = result.rows.remove(0).remove(0);
                 session.set_user_variable(assignments[0].name.trim_start_matches('@'), value)?;
                 return Ok(QueryResponse::Ok);
             }
@@ -8377,6 +8400,13 @@ pub(super) fn execute_qualified_statement(
                 ));
             }
             implicit_commit_for_ddl(db, session)?;
+            if ["mysql", "information_schema", "performance_schema"]
+                .iter()
+                .any(|schema| name.eq_ignore_ascii_case(schema))
+            {
+                return Err(crate::error::catalog::ER_NO_SYSTEM_SCHEMA_ACCESS
+                    .error(format!("Access to system schema '{name}' is rejected.")));
+            }
             db.alter_database_defaults(
                 &name,
                 default_charset.as_deref(),
@@ -10309,7 +10339,7 @@ pub(super) fn execute_qualified_statement(
             &using_roles.iter().map(account_key).collect::<Vec<_>>(),
         ),
         Statement::ShowCreateUser { account } => {
-            show_create_user_result(db, &show_account_key(&account, session))
+            show_create_user_result(db, session, &show_account_key(&account, session))
         }
         Statement::Kill {
             target,

@@ -1,0 +1,16 @@
+# 二进制与分组键的精确比较(HEX 化)
+SELECT HEX(SUM(bt)), HEX(MAX(bt)), HEX(MIN(bt)) FROM tnum
+SELECT id, HEX(MIN(blobty)) mn, HEX(MAX(blobty)) mx, COUNT(*) FROM tagg GROUP BY id WITH ROLLUP
+SELECT HEX(blobty), COUNT(*) FROM tagg GROUP BY blobty WITH ROLLUP
+SELECT HEX(GROUP_CONCAT(s, blobty)) FROM tagg
+SELECT HEX(s), COUNT(*) FROM tstr GROUP BY s WITH ROLLUP
+SELECT HEX(cs), COUNT(*) FROM tstr GROUP BY cs WITH ROLLUP
+# 分组键代表值: 插入顺序 a 在 A 前
+SELECT s, COUNT(*) FROM tstr WHERE s IN ('a','A','a ') GROUP BY s WITH ROLLUP
+SELECT s, MIN(s), MAX(s), GROUP_CONCAT(s ORDER BY s) FROM tstr WHERE s IN ('a','A') GROUP BY s WITH ROLLUP
+# GROUP_CONCAT tie 顺序(仅观察)
+SELECT GROUP_CONCAT(s ORDER BY s) FROM tstr WHERE s IN ('a','A','a ')
+SELECT GROUP_CONCAT(tx ORDER BY s) FROM tstr WHERE s IN ('a','A','a ')
+# ROLLUP 汇总行键值
+SELECT s, COUNT(*) FROM tstr GROUP BY s WITH ROLLUP
+SELECT cs, COUNT(*), GROUP_CONCAT(tx ORDER BY tx) FROM tstr GROUP BY cs WITH ROLLUP
